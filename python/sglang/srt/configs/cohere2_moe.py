@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cohere2Moe text config used by the Cohere Command-A Plus checkpoints.
-
-Mirrors transformers.models.cohere2_moe.configuration_cohere2_moe, registering
-with HF AutoConfig so a Cohere2VisionConfig can build the text sub-config when
-the installed transformers package is older than the one Cohere shipped the
-model with.
-"""
+"""Cohere2Moe text config used by the Cohere Command-A Plus checkpoints."""
 
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
@@ -91,8 +85,6 @@ class Cohere2MoeConfig(PreTrainedConfig):
         super().__post_init__(**kwargs)
 
 
-# Register with transformers CONFIG_MAPPING so AutoConfig.from_pretrained()
-# can instantiate our config class when loading models with model_type="cohere2_moe"
 try:
     CONFIG_MAPPING.register("cohere2_moe", Cohere2MoeConfig)
 except Exception:

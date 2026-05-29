@@ -1,31 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 SGLang Team
-"""Tool-call detector for the Cohere Command 4 family (Command A / Command A
-Plus / Command A Vision, including the published ``CohereLabs/command-a-plus-
-05-2026-{bf16,fp8,w4a4}`` checkpoints).
-
-Wire format produced by these models when ``tool_calls`` are emitted
-(verbatim from the model's ``chat_template.jinja``)::
-
-    <|START_THINKING|>...optional tool-plan thinking...<|END_THINKING|>
-    <|START_ACTION|>[
-        {"tool_call_id": "0", "tool_name": "fn_a", "parameters": {...}},
-        {"tool_call_id": "1", "tool_name": "fn_b", "parameters": {...}}
-    ]<|END_ACTION|>
-
-The action block is the only ``tool_calls`` carrier — when the model is calling
-tools it does *not* emit a ``<|START_TEXT|>``/``<|END_TEXT|>`` block. The
-``<|START_THINKING|>``/``<|END_THINKING|>`` block is handled by the
-``cohere_command4`` reasoning parser (see
-``sglang/srt/parser/reasoning_parser.py``) and stripped from the content
-before it reaches us here. Two parsers should normally be used together:
-``--reasoning-parser cohere_command4 --tool-call-parser cohere_command4``.
-
-vLLM ships its own implementation backed by the ``cohere_melody`` Rust filter
-(``vllm/tool_parsers/cohere_command_tool_parser.py``); this is the pure-Python
-equivalent for sglang.
-"""
-
 import json
 import logging
 from typing import List
@@ -159,13 +131,6 @@ class CohereCommand4Detector(BaseFormatDetector):
         return result
 
     def supports_structural_tag(self) -> bool:
-        # The wire format is non-trivial (whole-array container with custom
-        # field names and a tool_call_id). The structural_tag scaffolding in
-        # the base class is geared toward a single ``begin/<json>/end`` shape;
-        # leaving it off here lets the reasoning-parser path own grammar
-        # constraints for Cohere tool calls (see
-        # ``cohere_command_reasoning_parser.convert_schema_to_structural_tags``
-        # on the vLLM side for the analogous reference).
         return False
 
     def structure_info(self) -> _GetInfoFunc:

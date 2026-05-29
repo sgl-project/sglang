@@ -618,8 +618,7 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
       - ``normal_text`` = the content between ``<|START_TEXT|>`` and
         ``<|END_TEXT|>``, with both markers stripped. If no ``<|START_TEXT|>``
         appears (the model exhausted max_new_tokens still inside thinking),
-        ``normal_text`` is the empty string -- mirrors what vLLM's
-        ``cohere_command4`` reasoning parser produces.
+        ``normal_text`` is the empty string.
 
     Matches the public token names from the model's
     ``special_tokens_map.json`` (``<|START_THINKING|>`` etc.).

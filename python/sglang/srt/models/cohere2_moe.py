@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 SGLang Team
 # Adapted from:
-#  - vllm/model_executor/models/cohere2_moe.py
-#  - sglang/srt/models/commandr.py
+# https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/model_executor/models/cohere2_moe.py
 """Inference-only Cohere2Moe (Command A Plus) model compatible with HuggingFace weights."""
 
 from typing import Iterable, Optional, Tuple
@@ -47,8 +46,7 @@ def _cohere_layer_norm(hidden_states, weight, variance_epsilon):
 
 
 class Cohere2MoeLayerNorm(nn.Module):
-    """Centered layer norm with learnable scale only (no bias). Matches
-    transformers.models.cohere2.Cohere2LayerNorm."""
+    """Centered layer norm with learnable scale only (no bias)."""
 
     def __init__(self, hidden_size, eps=1e-5):
         super().__init__()
@@ -65,8 +63,7 @@ def cohere2_sigmoid_topk(
     topk: int,
     renormalize: bool,
 ):
-    """Sigmoid -> top-k (-> renormalize). Matches the vLLM
-    ``token_choice_with_bias`` used for Cohere2Moe sigmoid routing."""
+    """Sigmoid -> top-k (-> renormalize) routing."""
     scores = gating_output.float().sigmoid()
     topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1, sorted=False)
     if renormalize:
@@ -301,12 +298,9 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         )
         assert self.shared_expert_combination_strategy in ("average", "sum")
 
-        # Auxiliary CUDA stream so shared_experts and (gate + routed_experts)
-        # can execute in parallel inside a captured CUDA graph. Mirrors the
-        # vLLM SharedExperts MULTI_STREAM_OVERLAPPED path and the existing
-        # sglang olmo2 alt_stream pattern. Only used when we're capturing /
-        # replaying a CUDA graph; outside of capture, stream-sync overhead
-        # is usually larger than the work we'd overlap.
+        # Auxiliary CUDA stream so shared_experts can overlap with the
+        # gate + routed-experts path inside a captured CUDA graph. Only used
+        # during capture/replay; outside capture the sync overhead outweighs it.
         self.alt_stream = (
             torch.cuda.Stream()
             if is_cuda() and self.shared_experts is not None
@@ -323,11 +317,9 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
             return final_hidden_states.view(orig_shape)
 
-        # FusedMoE.experts can write back into the input buffer when the
-        # MoeRunner reuses the input as its dispatcher scratch (observed for
-        # the unquantized triton backend on BF16). Snapshot the post-norm
-        # input so the shared-expert branch sees the original layernorm
-        # output and not whatever the routed kernel left behind.
+        # FusedMoE.experts can write back into its input buffer (observed for
+        # the unquantized triton BF16 path). Snapshot the post-norm input so
+        # the shared-expert branch sees the original layernorm output.
         shared_input = hidden_states.clone()
 
         if self.alt_stream is not None and get_is_capture_mode():
@@ -351,10 +343,8 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         final_hidden_states = routed_out + shared_out
         if self.shared_expert_combination_strategy == "average":
             final_hidden_states = final_hidden_states / 2
-        # NOTE: caller (Cohere2MoeDecoderLayer) folds attention and MoE TP-partials
-        # into one all-reduce because the parallel residual structure makes the
-        # two allreduces redundant: norm(x) is shared by attn and mlp, and only
-        # the sum of their outputs is added to the residual.
+        # Returned un-reduced: the decoder layer folds attn + MoE TP-partials
+        # into a single all-reduce.
         return final_hidden_states.view(orig_shape)
 
 
@@ -387,8 +377,7 @@ class Cohere2MoeDecoderLayer(nn.Module):
                     config, "prefix_dense_intermediate_size", config.intermediate_size
                 ),
                 quant_config=quant_config,
-                # The decoder layer below folds attn+mlp TP-partials into one
-                # all-reduce, so the MLP itself must return un-reduced output.
+                # Folded into the decoder layer's single all-reduce.
                 reduce_results=False,
                 prefix=add_prefix("mlp", prefix),
             )
@@ -410,10 +399,9 @@ class Cohere2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Cohere2 parallel structure: y = x + attn(norm(x)) + mlp(norm(x)).
-        # Because the residual is added once at the end, the two TP all-reduces
-        # (one in attn.o_proj, one in mlp) reduce to a single sum-then-allreduce.
-        # Folding here cuts the all-reduce count per layer from 2 to 1.
+        # Parallel structure: y = x + attn(norm(x)) + mlp(norm(x)). The single
+        # residual lets the two TP all-reduces (attn.o_proj, mlp) fold into one
+        # sum-then-allreduce, halving per-layer all-reduces.
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(
@@ -458,8 +446,7 @@ class Cohere2MoeModel(nn.Module):
 
     def get_input_embeddings(self, input_ids: Optional[torch.Tensor] = None):
         """Return the embedding module, or the embedded tensor if ``input_ids``
-        is provided. SGLang's mm utilities call this with no args to fetch the
-        underlying ``embed_tokens`` module."""
+        is given (SGLang's mm utils call this with no args)."""
         if input_ids is None:
             return self.embed_tokens
         return self.embed_tokens(input_ids)
@@ -543,7 +530,6 @@ class Cohere2MoeForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params = set()
-        skipped_ckpt_keys: list[str] = []
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -608,24 +594,12 @@ class Cohere2MoeForCausalLM(nn.Module):
             if "lm_head.weight" in name:
                 continue
             if name not in params_dict:
-                skipped_ckpt_keys.append(name)
                 continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        import os
-
-        if os.environ.get("SGLANG_COHERE_DEBUG_LOAD"):
-            unloaded = sorted(set(params_dict.keys()) - loaded_params)
-            print(
-                f"[cohere2_moe] loaded {len(loaded_params)}/{len(params_dict)} params, "
-                f"{len(skipped_ckpt_keys)} ckpt keys skipped",
-                flush=True,
-            )
-            print(f"[cohere2_moe] first 5 unloaded: {unloaded[:5]}", flush=True)
-            print(f"[cohere2_moe] first 5 skipped: {skipped_ckpt_keys[:5]}", flush=True)
         return loaded_params
 
 

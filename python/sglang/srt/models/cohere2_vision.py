@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 SGLang Team
 # Adapted from:
-#  - vllm/model_executor/models/cohere2_vision.py
-#  - sglang/srt/models/jet_vlm.py
+# https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/model_executor/models/cohere2_vision.py
 """Inference-only Cohere2Vision (Command-A-Vision) multimodal model."""
 
 import math
@@ -37,18 +36,14 @@ from sglang.srt.utils import add_prefix
 
 
 class Cohere2VisionMultiModalProjector(nn.Module):
-    """Pixel-shuffle downsample -> SwiGLU MLP -> text hidden dim.
-
-    Mirrors transformers.models.cohere2_vision.Cohere2VisionMultiModalProjector.
-    """
+    """Pixel-shuffle downsample -> SwiGLU MLP -> text hidden dim."""
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.downsample_factor = config.downsample_factor
         input_dim = config.vision_config.hidden_size * (config.downsample_factor**2)
-        # The HF projector stores a single ``linear_1`` whose output is split
-        # halves for the SwiGLU gate / value. We mirror that with a merged
-        # column-parallel linear of two equal-size shards.
+        # HF stores a single ``linear_1`` split into SwiGLU gate/value halves;
+        # represent it as a 2-shard merged column-parallel linear.
         self.intermediate_size = config.alignment_intermediate_size // 2
         self.linear_1 = MergedColumnParallelLinear(
             input_dim,
@@ -97,11 +92,9 @@ class Cohere2VisionMultiModalProjector(nn.Module):
 
 
 def _remap_quant_config_for_sglang(quant_config):
-    """The HF checkpoint stores quantization metadata using HF module names
-    (e.g. ``model.language_model.layers.X.self_attn.q_proj``).  Our SGLang
-    module hierarchy uses ``language_model.model.layers.X.self_attn.q_proj``
-    for the same parameter.  We rewrite the ``ignore`` list and any
-    target-scheme keys so that ``should_ignore_layer`` matches our prefixes."""
+    """Rewrite the quant config ``ignore`` / target-scheme keys from HF module
+    names (``model.language_model.*``) to SGLang's layout
+    (``language_model.model.*``) so ``should_ignore_layer`` matches our prefixes."""
     if quant_config is None or not hasattr(quant_config, "ignore"):
         return
 
@@ -126,9 +119,6 @@ def _remap_quant_config_for_sglang(quant_config):
 
 
 class Cohere2VisionForConditionalGeneration(nn.Module):
-    # Used by the model loader to fan out fused Linear modules
-    # (e.g. ``qkv_proj`` -> ``[q_proj, k_proj, v_proj]``) when matching
-    # against the quantization config's ignore list.
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -143,16 +133,12 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
 
-        # Rewrite the quant config's ignore list to match the SGLang module
-        # prefix layout.  Must happen before any Linear is instantiated.
+        # Must run before any Linear is instantiated.
         _remap_quant_config_for_sglang(quant_config)
 
-        # TODO: switch to sglang.srt.models.siglip.SiglipVisionModel (uses
-        # VisionAttention) per the porting guide once sglang's SiglipMLP can
-        # be parameterized with gelu_pytorch_tanh (it hardcodes QuickGELU) and
-        # the qkv_proj weight loading is verified. The HF SiglipVisionModel
-        # below is correct and benchmarks faster than the in-tree path right
-        # now (221s vs 246s on MMMU 900-sample TP=8 B200 bf16).
+        # TODO: switch to sglang.srt.models.siglip.SiglipVisionModel once its
+        # SiglipMLP supports gelu_pytorch_tanh (it hardcodes QuickGELU) and
+        # qkv_proj weight loading is verified. The HF model below is correct.
         self.vision_tower = SiglipVisionModel(config.vision_config)
         self.multi_modal_projector = Cohere2VisionMultiModalProjector(config)
         self.language_model = Cohere2MoeForCausalLM(
@@ -160,11 +146,9 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        # Alias so SGLang's piecewise-CUDA-graph setup (model_runner.py:2800)
-        # can locate the transformer layers. The runner does
-        # ``hasattr(self.model, "model")`` to decide whether to capture
-        # piecewise graphs, and then walks ``model.model.layers`` through the
-        # text backbone.
+        # Alias the text backbone as ``self.model`` so SGLang's piecewise
+        # CUDA-graph capture (checks ``hasattr(self.model, "model")`` then
+        # walks ``model.model.layers``) can locate the transformer layers.
         self.model = self.language_model.model
 
     def pad_input_ids(
@@ -174,7 +158,6 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, mm_input: List[MultimodalDataItem]) -> torch.Tensor:
-        # Concatenate pixel patches from all images.
         pixel_values = torch.cat(
             [
                 torch.as_tensor(item.feature, device=self.vision_tower.device)
@@ -213,18 +196,16 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # The HF / quantized checkpoint stores tensors under the
-        # `model.language_model.`, `model.vision_tower.`, and
-        # `model.multi_modal_projector.` prefixes.  Re-map them to our
-        # SGLang module names, then dispatch.
+        # The checkpoint stores tensors under ``model.language_model.``,
+        # ``model.vision_tower.``, and ``model.multi_modal_projector.``
+        # prefixes; re-map them to our SGLang module names, then dispatch.
         lm_weights: List[Tuple[str, torch.Tensor]] = []
         vision_weights: List[Tuple[str, torch.Tensor]] = []
         projector_weights: List[Tuple[str, torch.Tensor]] = []
 
         for name, w in weights:
             if name.startswith("model.language_model."):
-                # Drop the leading "model." so the LM sees the "language_model."
-                # prefix already stripped; the LM expects "model.layers..." names.
+                # LM expects ``model.<...>`` names.
                 stripped = name[len("model.language_model.") :]
                 lm_weights.append((f"model.{stripped}", w))
             elif name.startswith("language_model."):
@@ -247,11 +228,9 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
 
         self.language_model.load_weights(lm_weights)
 
-        # Load vision tower weights. transformers >=5 SiglipVisionModel
-        # exposes the inner encoder directly, so its parameters are at
-        # ``embeddings.*`` / ``encoder.layers.*`` / ``post_layernorm.*`` (no
-        # leading ``vision_model.``).  The checkpoint stores them as
-        # ``vision_tower.vision_model.<...>``.
+        # transformers >=5 SiglipVisionModel exposes the encoder directly
+        # (params at ``embeddings.*`` / ``encoder.layers.*`` / ``post_layernorm.*``,
+        # no leading ``vision_model.``); the checkpoint keeps ``vision_model.``.
         vt_params = dict(self.vision_tower.named_parameters())
         for name, w in vision_weights:
             assert name.startswith("vision_tower.")
@@ -267,11 +246,9 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
                 )
             vt_params[stripped].data.copy_(w)
 
-        # Load projector. Names look like multi_modal_projector.linear_1.weight
-        # — we use the merged-column linear, which has its own weight_loader.
-        # The HF checkpoint stores the merged ``linear_1`` weight as one tensor
-        # of shape [2*N, in], matching MergedColumnParallelLinear's combined
-        # storage. So a normal copy_ via default_weight_loader works.
+        # The HF checkpoint stores the merged ``linear_1`` as one [2*N, in]
+        # tensor matching MergedColumnParallelLinear, so the param's own
+        # weight_loader (or default_weight_loader) handles it.
         proj_params = dict(self.multi_modal_projector.named_parameters())
         for name, w in projector_weights:
             assert name.startswith("multi_modal_projector.")
