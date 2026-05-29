@@ -207,26 +207,46 @@ class WaveAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
         if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(
+            assert forward_batch.encoder_lens is None, "Not supported"
+            # Multi-step speculative decode: kv buffers come from spec_info
+            # rather than the cuda-graph pool, so replay is not involved.
+            if forward_mode.is_decode_or_idle() and spec_info is not None:
+                self.forward_metadata = ForwardMetadata(
+                    attn_logits=self.cuda_graph_attn_logits,
+                    attn_lse=self.cuda_graph_attn_lse,
+                    max_extend_len=None,
+                    num_kv_splits=self.cuda_graph_num_kv_splits,
+                    kv_indptr=spec_info.kv_indptr,
+                    kv_indices=spec_info.kv_indices,
+                    qo_indptr=None,
+                    custom_mask=None,
+                    mask_indptr=None,
+                )
+                return
+
+            self._apply_cuda_graph_metadata(
                 bs=bs,
-                num_tokens=forward_batch.positions.numel(),
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+            )
+            self.forward_metadata = self._build_cuda_graph_forward_metadata(
+                bs, forward_mode, spec_info
             )
         else:
-            self.init_forward_metadata_replay_cuda_graph(
+            self._apply_cuda_graph_metadata(
                 bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                seq_lens_sum=forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
