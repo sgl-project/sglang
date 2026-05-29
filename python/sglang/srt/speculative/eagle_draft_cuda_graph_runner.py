@@ -350,6 +350,12 @@ class EAGLEDraftCudaGraphRunner:
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
+            # In-graph metadata step (recordable companion to the
+            # out-of-graph init that ran above with in_capture=True).
+            # Default ABC impl is no-op; DSV4 MultiStep fans out the
+            # Raw→Full upgrade to each per-step inner backend.
+            self.draft_attn_backend.init_forward_data_in_graph(forward_batch)
+
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
