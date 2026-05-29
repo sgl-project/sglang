@@ -245,6 +245,60 @@ class TestSWA(unittest.TestCase):
         result = alloc.translate_loc_from_full_to_swa(index)
         print(result)
 
+    def test_free_swa_clears_paged_mappings_by_page(self):
+        size = 16
+        size_swa = 16
+        page_size = 4
+        head_num = 8
+        head_dim = 128
+        num_layers = 48
+        global_interval = 4
+        dtype = torch.bfloat16
+        device = get_device()
+        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
+        full_attention_layer_ids_set = set(full_attention_layer_ids)
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids_set
+        ]
+        pool = SWAKVPool(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        full_indices = alloc.full_attn_allocator.alloc(page_size)
+        swa_indices = alloc.swa_attn_allocator.alloc(page_size)
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_indices)
+        alloc.full_to_swa_index_mapping[full_indices] = swa_indices
+
+        swa_available_before = alloc.swa_available_size()
+        alloc.free_swa(full_indices[:1])
+
+        self.assertEqual(alloc.swa_available_size(), swa_available_before + page_size)
+        self.assertTrue(
+            torch.all(alloc.full_to_swa_index_mapping[full_indices] == 0).item()
+        )
+
+        alloc.free_swa(full_indices[1:])
+        self.assertEqual(alloc.swa_available_size(), swa_available_before + page_size)
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10
