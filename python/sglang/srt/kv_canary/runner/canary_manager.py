@@ -18,10 +18,8 @@ from sglang.srt.kv_canary.endpoint import (
 )
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.runner.health import (
-    KernelRunCounterHealthChecker,
-    PeriodicCanaryStatsLogger,
-)
+from sglang.srt.kv_canary.runner.health_checker import KernelRunCounterHealthChecker
+from sglang.srt.kv_canary.runner.stats_logger import PeriodicCanaryStatsLogger
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
