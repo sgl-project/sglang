@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -58,6 +58,9 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    _grouped_foreach_copy_,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -104,8 +107,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-_has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
 def build_replay_fb_view(
@@ -157,27 +158,6 @@ def build_replay_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         spec_info=forward_batch.spec_info,
     )
-
-
-def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
-
-    def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-        if _has_foreach_copy:
-            torch._foreach_copy_(dsts, srcs)
-        else:
-            for dst, src in zip(dsts, srcs):
-                dst.copy_(src)
-
-    groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
-    for dst, src in zip(dsts, srcs):
-        key = (dst.dtype, src.dtype)
-        if key not in groups:
-            groups[key] = ([], [])
-        groups[key][0].append(dst)
-        groups[key][1].append(src)
-    for group_dsts, group_srcs in groups.values():
-        foreach_copy(group_dsts, group_srcs)
 
 
 @dataclass
