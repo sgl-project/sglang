@@ -119,7 +119,7 @@ class TestScriptedHttpServerDirtyRefusesRun(CustomTestCase):
             session.shutdown()
 
 
-class TestScriptedRuntimeTestCaseSmoke(ScriptedTestCase):
+class TestScriptedTestCaseSmoke(ScriptedTestCase):
     """Smallest possible class using ScriptedTestCase end-to-end."""
 
     ENGINE_KWARGS = _ENGINE_KWARGS
