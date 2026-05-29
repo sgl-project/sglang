@@ -27,11 +27,11 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
-from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
-import psutil
+import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
@@ -144,6 +144,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.managers.prefill_delayer import (
@@ -164,26 +165,18 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import (
-    SchedulerDPAttnAdapter,
-)
-from sglang.srt.managers.scheduler_components.flush_wrapper import (
-    SchedulerFlushWrapper,
-)
+from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
 )
-from sglang.srt.managers.scheduler_components.ipc_channels import (
-    SchedulerIpcChannels,
-)
+from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
-from sglang.srt.managers.scheduler_components.load_inquirer import (
-    SchedulerLoadInquirer,
-)
+from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
@@ -606,6 +599,22 @@ class Scheduler(
             ),
         )
 
+        self.load_snapshot_writer = None
+        if not is_rank_zero:
+            return
+
+        dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        try:
+            self.load_snapshot_writer = create_load_snapshot_writer(
+                self.server_args,
+                port_args,
+                self.ps.dp_size,
+                dp_rank,
+                publish_interval=self.server_args.load_snapshot_publish_interval,
+            )
+        except Exception as e:
+            logger.warning("load snapshot writer init failed: %s", e)
+
     def init_idle_sleeper(self) -> None:
         if (
             self.ps.pp_rank == 0
@@ -621,6 +630,24 @@ class Scheduler(
             )
         else:
             self.idle_sleeper = None
+
+    def publish_load_snapshot(self, force: bool = False):
+        writer = self.load_snapshot_writer
+        if writer is None:
+            return
+        if not force:
+            writer.publish_counter += 1
+            if writer.publish_counter < writer.publish_interval:
+                return
+        writer.publish_counter = 0
+        try:
+            result = self.load_inquirer.get_loads(GetLoadsReqInput(include=["all"]))
+            writer.write(LoadSnapshot.from_get_loads_output(result))
+        except Exception as e:
+            logger.warning("load snapshot publish failed: %s", e)
+
+    def handle_get_loads_req(self, req: GetLoadsReqInput):
+        return self.load_inquirer.get_loads(req)
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -1313,10 +1340,7 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (
-                    GetLoadsReqInput,
-                    lambda req: self.load_inquirer.get_loads(req),
-                ),
+                (GetLoadsReqInput, self.handle_get_loads_req),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -3100,6 +3124,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -3204,6 +3230,9 @@ class Scheduler(
 
         # reset device timer window so idle time isn't counted
         self.metrics_reporter.reset_device_timer_window()
+
+        # Publish the idle state so /get_loads and DP balancing do not see stale load.
+        self.publish_load_snapshot(force=True)
 
         # sleep until next event
         self.maybe_sleep_on_idle()

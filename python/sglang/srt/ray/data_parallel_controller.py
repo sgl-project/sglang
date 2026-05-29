@@ -73,6 +73,7 @@ class RayDataParallelController(DataParallelController):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.instance_id = port_args.instance_id
 
             # Hold NCCL port so the next DP rank gets a different one
             sockets.append(bind_port(tmp_port_args.nccl_port))
@@ -159,6 +160,7 @@ class RayDataParallelController(DataParallelController):
                         )
                         # All DP ranks share the same NCCL port (reuse TP group)
                         rank_port_args.nccl_port = port_args.nccl_port
+                        rank_port_args.instance_id = port_args.instance_id
                         # The detokenizer and tokenizer bind using the
                         # original port_args addresses (127.0.0.1 when
                         # dist_init_addr is unset).  Scheduler actors must
