@@ -1,0 +1,15 @@
+{
+  "length_tokens": 65536,
+  "num_prompts": 20,
+  "dsa_served": 20,
+  "ds_served": 0,
+  "dsa_hits": 20,
+  "ds_hits": 0,
+  "dsa_recall_pct": 100.0,
+  "ds_recall_pct": 0.0,
+  "delta_pct": 100.0,
+  "threshold_pp": 5.0,
+  "dsa_error": null,
+  "ds_error": "HTTP 400: Bad Request | body={\"object\":\"error\",\"message\":\"Input length (69970 tokens) exceeds the maximum allowed length (53050 tokens). Use a shorter input or enable --allow-auto-truncate.\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}",
+  "verdict": "FAIL"
+}

@@ -25,3 +25,10 @@ FAILED test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::te
 FAILED test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_4k
 FAILED test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_64k
 ======== 3 failed, 1 passed, 2 skipped, 1 warning in 366.23s (0:06:06) =========
+# AC-12 64K rerun (2026-05-29T09:39:38Z) — #L artifact-safe path
+test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_64k FAILED [100%]
+________________ TestDoubleSparsityV32Quality.test_niah_at_64k _________________
+test/manual/test_double_sparsity_v32.py:770: in test_niah_at_64k
+E   AssertionError: False is not true : NIAH @ 65536: DS could not serve the prompt (served 0/20); DS error: HTTP 400: Bad Request | body={"object":"error","message":"Input length (69970 tokens) exceeds the maximum allowed length (53050 tokens). Use a shorter input or enable --allow-auto-truncate.","type":"BadRequestError","param":null,"code":400}. DSA served 20/20, recall 100.0%.
+FAILED test/manual/test_double_sparsity_v32.py::TestDoubleSparsityV32Quality::test_niah_at_64k
+=================== 1 failed, 1 warning in 194.83s (0:03:14) ===================

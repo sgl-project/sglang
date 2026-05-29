@@ -62,9 +62,11 @@ comparator JSON/Markdown are committed and carry every locked field + the measur
   sidecars `smoke_results/*.meta.json` (6).
 - AC-11 sweep: raw `runs/20260528_dsv32_mvp/ac11_results/*.jsonl` (node 0, local, 18 files, each
   `duration ≥ 602s`) → sidecars `ac11_results/*.meta.json` (18) + `mvp_compare_ac11.{md,json}`.
-- AC-12: per-gate JSON artifacts `ac12_results/ac12_{mmlu_5shot,niah_4096,niah_16384}_*.json`
-  (committed) + `ac12_results/ac12_pytest_summary.txt` + `ac12_results/ds_boot_log_excerpt.txt`.
-  (NIAH 64K wrote no artifact — DS rejected the >53K-token request; see AC-12 below.)
+- AC-12: per-gate JSON artifacts `ac12_results/ac12_{mmlu_5shot,niah_4096,niah_16384,niah_65536}_*.json`
+  (all four committed) + `ac12_results/ac12_pytest_summary.txt` + `ac12_results/ds_boot_log_excerpt.txt`.
+  The 64K artifact (`ac12_niah_65536_*.json`, Round-12 #L artifact-safe path) records DSA served
+  20/20 at 100% recall and DS `ds_served=0` / `verdict=FAIL` with the HTTP 400 rejection body
+  (`Input length (69970 tokens) exceeds the maximum allowed length (53050 tokens)`).
 
 ## Server args / server_info
 
@@ -99,7 +101,7 @@ comparator's effective-vs-nominal table). Per DEC-7 this is a recorded AC-11 fai
 | MMLU 5-shot (200) | 89.00% | 89.00% | 0.00 pp | ≤1.0 | **PASS** |
 | NIAH 4K | 100% | 75% | 25.0 pp | ≤5 | FAIL |
 | NIAH 16K | 100% | 5% | 95.0 pp | ≤5 | FAIL |
-| NIAH 64K | served | HTTP 400 unservable | — | ≤5 | FAIL |
+| NIAH 64K | served 20/20 (100%) | 0/20 served — HTTP 400 unservable | 100.0 pp | ≤5 | FAIL |
 
 Two mechanisms (both real, neither a bug): (1) DS sparse decode is `top_k=2048`-bounded → needle
 recall degrades monotonically with context (BL-20260529-ds-longcontext-needle-recall-vs-topk,

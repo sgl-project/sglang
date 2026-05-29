@@ -48,12 +48,18 @@ actually answers. 47 AC-12 helper CPU regressions still pass.
 | MMLU 5-shot (200 ex) | 89.00% | 89.00% | 0.00 pp | ≤ 1.0 pp | **PASS** |
 | NIAH @ 4K (20) | 100% (20/20) | 75% (15/20) | 25.0 pp | ≤ 5 pp | **FAIL** |
 | NIAH @ 16K (20) | 100% (20/20) | 5% (1/20) | 95.0 pp | ≤ 5 pp | **FAIL** |
-| NIAH @ 64K (20) | served 20/20 | **HTTP 400 (unservable)** | — | ≤ 5 pp | **FAIL** |
+| NIAH @ 64K (20) | served 20/20, 100% recall | **0/20 served — HTTP 400 (unservable)** | 100.0 pp | ≤ 5 pp | **FAIL** |
 
-Artifacts: `ac12_results/ac12_mmlu_5shot_*.json`, `ac12_niah_4096_*.json`, `ac12_niah_16384_*.json`
-(64K wrote no artifact — DS rejected the request before generation). pytest summary:
-`ac12_results/ac12_pytest_summary.txt` (`3 failed, 1 passed, 2 skipped` — the 2 skips are the
-optional corrupt-mask / zero-signature negative-sensitivity servers, not booted).
+Artifacts (all four per-gate JSONs present): `ac12_results/ac12_mmlu_5shot_*.json`,
+`ac12_niah_4096_*.json`, `ac12_niah_16384_*.json`, `ac12_niah_65536_*.json`. The 64K artifact
+(`ac12_niah_65536_20260529T093912Z.json`) was produced by the Round-12 artifact-safe NIAH path
+(#L): it records `dsa_served=20, dsa_hits=20, dsa_recall_pct=100.0` and `ds_served=0,
+ds_recall_pct=0.0, verdict=FAIL` with the DS rejection body
+(`Input length (69970 tokens) exceeds the maximum allowed length (53050 tokens)`). pytest
+summaries: `ac12_results/ac12_pytest_summary.txt` (the original full-gate run
+`3 failed, 1 passed, 2 skipped` — the 2 skips are the optional corrupt-mask / zero-signature
+negative-sensitivity servers, not booted — plus the Round-12 64K rerun `1 failed`, the clean
+admission-failure assertion).
 
 ## Two distinct, both-real failure mechanisms
 
