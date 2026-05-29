@@ -329,7 +329,6 @@ class ModelConfig:
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
-            or is_deepseek_dsa(self.hf_text_config)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -427,11 +426,13 @@ class ModelConfig:
             self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] in [
-            "Glm4MoeForCausalLM",
-            "Glm4MoeLiteForCausalLM",
-        ]:
+        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Glm4MoeLiteForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "Glm4MoeLiteForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "GlmOcrForConditionalGeneration",
@@ -451,6 +452,12 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
+        ):
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["Step3p5MTP"]
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -479,7 +486,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+        ]:
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
@@ -602,6 +612,7 @@ class ModelConfig:
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
+            or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
@@ -1451,15 +1462,15 @@ def _get_and_verify_dtype(
     if torch_dtype != config_dtype:
         if torch_dtype == torch.float32:
             # Upcasting to float32 is allowed.
-            logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Upcasting %s to %s.", config_dtype, torch_dtype)
             pass
         elif config_dtype == torch.float32:
             # Downcasting from float32 to float16 or bfloat16 is allowed.
-            logger.info("Downcasting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Downcasting %s to %s.", config_dtype, torch_dtype)
             pass
         else:
             # Casting between float16 and bfloat16 is allowed with a warning.
-            logger.warning("Casting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Casting %s to %s.", config_dtype, torch_dtype)
 
     return torch_dtype
 
@@ -1552,15 +1563,14 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
+    "Step3p7ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
-    "DeepseekV32ForCausalLM",
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
     "Qwen3NextForCausalLM",
-    "GlmMoeDsaForCausalLM",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]
@@ -1668,6 +1678,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
+        "Step3p7ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
         "LagunaForCausalLM",
@@ -1706,7 +1717,10 @@ def get_hybrid_layer_ids(
     elif "MiMoV2MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
-    elif "Step3p5ForCausalLM" in model_architectures:
+    elif (
+        "Step3p5ForCausalLM" in model_architectures
+        or "Step3p7ForConditionalGeneration" in model_architectures
+    ):
         layer_types = hf_text_config.layer_types
         swa_attention_layer_ids = [
             i

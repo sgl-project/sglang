@@ -298,4 +298,5 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         batch_info.weight_indices_cpu = weight_indices_tensor
         batch_info.scalings_cpu = scalings_tensor
 
+        batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info

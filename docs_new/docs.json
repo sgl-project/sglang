@@ -905,7 +905,10 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_faq"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -1031,6 +1034,7 @@
                   {
                     "group": "StepFun",
                     "pages": [
+                      "cookbook/autoregressive/StepFun/Step-3.7-Flash",
                       "cookbook/autoregressive/StepFun/Step3.5",
                       "cookbook/autoregressive/StepFun/Step3-VL-10B"
                     ]

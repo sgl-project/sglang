@@ -41,6 +41,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    apply_eagle_prefill_input_rotation,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -53,10 +54,10 @@ from sglang.srt.speculative.spec_utils import (
     fast_topk,
     generate_token_bitmask,
     load_token_map,
-    maybe_detect_nan,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -651,7 +652,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
+        apply_eagle_prefill_input_rotation(batch, next_token_ids)
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.speculative_algorithm.is_standalone()
