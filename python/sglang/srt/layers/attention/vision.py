@@ -802,10 +802,6 @@ class VisionIntelXPUAttention(nn.Module):
         if not (_is_xpu):
             raise Exception("VisionIntelXPUAttention is only available for Intel XPU")
         super().__init__()
-        use_data_parallel = (
-            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
-        )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
 
     def forward(
         self,
