@@ -41,7 +41,7 @@ class ReqDllmMixin:
         prefix_length = len(self.prefix_indices)
         min_required_length = prefix_length + self.dllm_config.block_size
 
-        if self.fill_len < min_required_length:
+        if self.get_full_untruncated_fill_len() < min_required_length:
             # still incoming stage
             return
 
@@ -60,11 +60,6 @@ class ReqDllmMixin:
             0
             if self.fill_len == 0
             else self.dllm_block_offset + self.dllm_config.block_size
-        )
-        self.fill_len = (
-            len(self.origin_input_ids)
-            + len(self.output_ids)
-            + self.dllm_config.block_size
         )
 
     def _update_block_offset_for_dllm(self):
