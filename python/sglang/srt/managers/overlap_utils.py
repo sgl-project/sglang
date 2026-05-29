@@ -34,8 +34,10 @@ def decide_needs_cpu_seq_lens(
       over every backend a spec_v2 forward touches.
     """
     if server_args.enable_two_batch_overlap:
+        # FIXME: support TBO without seq lens cpu value
         return True
     if not server_args.disable_piecewise_cuda_graph:
+        # FIXME: support PCG without seq lens cpu value
         return True
     return any(b.needs_cpu_seq_lens for b in attn_backends)
 

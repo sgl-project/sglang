@@ -421,11 +421,19 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse = None
 
         elif forward_batch.forward_mode.is_draft_extend():
+            # Eager only (CG replay bypasses init); explicit D2H here instead of
+            # letting torch.empty inside generate_attn_arg_prefill .item() on a
+            # GPU cumsum tensor.
+            seq_lens_sum = (
+                forward_batch.seq_lens_sum
+                if forward_batch.seq_lens_sum is not None
+                else int(forward_batch.seq_lens.sum())
+            )
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
-                    None,
+                    seq_lens_sum,
                     self.req_to_token,
                 )
             )
@@ -443,14 +451,8 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens, dim=0
             )
             kv_indptr = kv_indptr[: bs + 1]
-            # Eager already syncs; recover the sum from GPU when *_cpu is absent.
-            kv_indices_len = (
-                sum(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.extend_prefix_lens_cpu is not None
-                else int(forward_batch.extend_prefix_lens.sum())
-            )
             kv_indices = torch.empty(
-                kv_indices_len,
+                sum(forward_batch.extend_prefix_lens_cpu),
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -488,11 +490,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            max_extend_len = (
-                max(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.extend_seq_lens_cpu is not None
-                else int(forward_batch.extend_seq_lens.max())
-            )
+            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(
