@@ -80,18 +80,14 @@ def _prompt_tokens(base_url, input_ids, image):
     return resp.json()["meta_info"]["prompt_tokens"]
 
 
-class _TokenIdRetokenizeBase(CustomTestCase):
-    """Subclasses set: model, image_token, other_args."""
-
-    model: str
-    image_token: str
-    other_args: list = []
+class TestQwenVLTokenIdRetokenize(CustomTestCase):
+    model = "Qwen/Qwen2.5-VL-3B-Instruct"
+    image_token = "<|vision_start|><|image_pad|><|vision_end|>"
+    other_args = ["--trust-remote-code", "--mem-fraction-static", "0.7"]
 
     def test_flag_off_drifts_flag_on_does_not(self):
         input_ids, drift_delta = _build_drift_prompt(self.model, self.image_token)
-        self.assertGreater(
-            drift_delta, 0, "prompt is canonical; cannot exercise retokenize drift"
-        )
+        self.assertGreater(drift_delta, 0, "prompt is canonical; no drift to exercise")
         image = _data_uri()
 
         prompt_tokens = {}
@@ -110,22 +106,11 @@ class _TokenIdRetokenizeBase(CustomTestCase):
             finally:
                 kill_process_tree(process.pid)
 
+        # ON keeps the user's original tokens; OFF loses the drift_delta tokens.
         pt_off, pt_on = prompt_tokens["0"], prompt_tokens["1"]
-        # ON keeps the user's original tokens; OFF re-tokenizes and loses the
-        # drift_delta extra tokens.
-        self.assertNotEqual(pt_on, pt_off, "flag had no effect on prompt_tokens")
         self.assertEqual(
-            pt_on - pt_off,
-            drift_delta,
-            f"expected ON to keep {drift_delta} extra tokens vs OFF "
-            f"(on={pt_on}, off={pt_off})",
+            pt_on - pt_off, drift_delta, f"on={pt_on}, off={pt_off}"
         )
-
-
-class TestQwenVLTokenIdRetokenize(_TokenIdRetokenizeBase):
-    model = "Qwen/Qwen2.5-VL-3B-Instruct"
-    image_token = "<|vision_start|><|image_pad|><|vision_end|>"
-    other_args = ["--trust-remote-code", "--mem-fraction-static", "0.7"]
 
 
 if __name__ == "__main__":
