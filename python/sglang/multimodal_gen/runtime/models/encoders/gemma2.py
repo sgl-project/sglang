@@ -287,7 +287,7 @@ class Gemma2Model(nn.Module, LayerwiseOffloadableModuleMixin):
     """Gemma2 text encoder model for SANA pipeline."""
 
     _fsdp_shard_conditions = []
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = ["layers"]
 
     def __init__(self, config: Gemma2Config, **kwargs):

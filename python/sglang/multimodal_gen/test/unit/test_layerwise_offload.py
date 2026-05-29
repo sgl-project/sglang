@@ -10,9 +10,13 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _ModelOptFp8OffloadAdapter,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    component_resident_strategies as component_resident_strategies_mod,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
     build_component_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
@@ -24,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
     configure_layerwise_offload_modules,
+    get_layerwise_offload_component_names_for_pipeline,
     is_layerwise_offloaded_module,
 )
 
@@ -108,8 +113,34 @@ class _SharedBufferModel(torch.nn.Module):
         )
 
 
+class _OrderedLinearLayer(torch.nn.Module):
+    def __init__(self, scale: float) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.eye(2, dtype=torch.float32) * scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weight
+
+
+class _ReverseLayerwiseModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            [
+                _OrderedLinearLayer(2.0),
+                _OrderedLinearLayer(3.0),
+                _OrderedLinearLayer(5.0),
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in reversed(self.blocks):
+            x = block(x)
+        return x
+
+
 class _NestedEncoderDummyModel(_NestedDummyModel):
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
 
 
 class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
@@ -173,6 +204,30 @@ def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
     assert torch.equal(reloaded_weight, original_weight)
 
 
+def test_layerwise_offload_uses_normal_tensors_under_inference_mode(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _DummyModel()
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    with torch.inference_mode():
+        manager.release_layer(0)
+        manager.prefetch_layer(0, non_blocking=False)
+
+    assert model.blocks[0].weight._version >= 0
+    assert model.blocks[0].bias._version >= 0
+
+
 def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -203,6 +258,28 @@ def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
     assert torch.equal(cache.index_select(0, torch.tensor([2])), original_cache[2:3])
 
 
+def test_layerwise_offload_loads_current_layer_for_reverse_execution(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _ReverseLayerwiseModel()
+    x = torch.ones(1, 2, dtype=torch.float32)
+    expected = model(x)
+
+    LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=3,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    assert torch.equal(model(x), expected)
+
+
 def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():
     server_args = SimpleNamespace(
         dit_cpu_offload=True,
@@ -230,7 +307,7 @@ def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
     assert isinstance(strategy, LayerwiseOffloadStrategy)
 
 
-def test_layerwise_configuration_uses_legacy_default_components(monkeypatch):
+def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
@@ -242,8 +319,10 @@ def test_layerwise_configuration_uses_legacy_default_components(monkeypatch):
         "scheduler": object(),
     }
 
+    selected = get_layerwise_offload_component_names_for_pipeline(modules)
     configured = configure_layerwise_offload_modules(modules, _server_args())
 
+    assert selected == ["text_encoder", "text_encoder_alias"]
     assert configured == ["text_encoder"]
     assert is_layerwise_offloaded_module(layerwise_module)
 
@@ -272,7 +351,7 @@ def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     assert not is_layerwise_offloaded_module(vae)
 
 
-def test_layerwise_configuration_default_marker_extends_legacy_defaults(monkeypatch):
+def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
@@ -280,36 +359,62 @@ def test_layerwise_configuration_default_marker_extends_legacy_defaults(monkeypa
     text_encoder = _NestedEncoderDummyModel()
     text_encoder_2 = _NestedEncoderDummyModel()
     transformer = _NestedDummyModel()
+    image_encoder = _NestedEncoderDummyModel()
     vae = _NestedEncoderDummyModel()
     audio_vae = _NestedEncoderDummyModel()
+    vocoder = _NestedEncoderDummyModel()
+    spatial_upsampler = _NestedEncoderDummyModel()
     condition_image_encoder = _NestedEncoderDummyModel()
     modules = {
         "text_encoder": text_encoder,
         "text_encoder_2": text_encoder_2,
         "transformer": transformer,
+        "image_encoder": image_encoder,
         "vae": vae,
         "audio_vae": audio_vae,
+        "vocoder": vocoder,
+        "spatial_upsampler": spatial_upsampler,
         "condition_image_encoder": condition_image_encoder,
     }
 
     configured = configure_layerwise_offload_modules(
-        modules, _server_args(), component_names=["default", "text_encoder", "vae"]
+        modules, _server_args(), component_names=["default"]
     )
 
+    assert get_layerwise_offload_component_names_for_pipeline(modules, ["default"]) == [
+        "text_encoder",
+        "text_encoder_2",
+        "image_encoder",
+        "vae",
+        "condition_image_encoder",
+    ]
     assert configured == [
         "text_encoder",
         "text_encoder_2",
-        "transformer",
+        "image_encoder",
         "vae",
-        "audio_vae",
         "condition_image_encoder",
     ]
     assert is_layerwise_offloaded_module(text_encoder)
     assert is_layerwise_offloaded_module(text_encoder_2)
-    assert is_layerwise_offloaded_module(transformer)
+    assert not is_layerwise_offloaded_module(transformer)
+    assert is_layerwise_offloaded_module(image_encoder)
     assert is_layerwise_offloaded_module(vae)
-    assert is_layerwise_offloaded_module(audio_vae)
+    assert not is_layerwise_offloaded_module(audio_vae)
+    assert not is_layerwise_offloaded_module(vocoder)
+    assert not is_layerwise_offloaded_module(spatial_upsampler)
     assert is_layerwise_offloaded_module(condition_image_encoder)
+
+    for component_name, module in (
+        ("audio_vae", audio_vae),
+        ("vocoder", vocoder),
+        ("spatial_upsampler", spatial_upsampler),
+    ):
+        configured = configure_layerwise_offload_modules(
+            modules, _server_args(), component_names=[component_name]
+        )
+        assert configured == [component_name]
+        assert is_layerwise_offloaded_module(module)
 
 
 def test_layerwise_configuration_all_selects_every_capable_component(monkeypatch):
@@ -344,6 +449,50 @@ def test_component_cpu_offload_strategy_remains_flag_driven():
         "unknown_component", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
     )
     assert isinstance(strategy, ResidentStrategy)
+
+
+def test_resident_strategy_prepares_local_device_without_dtype(monkeypatch):
+    calls = []
+
+    def fake_module_to_local_device(module, *, dtype=None):
+        calls.append((module, dtype))
+
+    monkeypatch.setattr(
+        component_resident_strategies_mod,
+        "_module_to_local_device",
+        fake_module_to_local_device,
+    )
+    module = _DummyModel()
+
+    ResidentStrategy().prepare_for_use(
+        module,
+        ComponentUse(stage_name="DenoisingStage", component_name="transformer"),
+        SimpleNamespace(),
+    )
+
+    assert calls == [(module, None)]
+
+
+def test_resident_strategy_keeps_fsdp_managed_module_owned_by_fsdp(monkeypatch):
+    calls = []
+
+    def fake_module_to_local_device(module, *, dtype=None):
+        calls.append((module, dtype))
+
+    monkeypatch.setattr(
+        component_resident_strategies_mod,
+        "_module_to_local_device",
+        fake_module_to_local_device,
+    )
+    module = type("FSDPDummyModel", (_DummyModel,), {})()
+
+    ResidentStrategy().prepare_for_use(
+        module,
+        ComponentUse(stage_name="TextEncodingStage", component_name="text_encoder"),
+        SimpleNamespace(),
+    )
+
+    assert calls == []
 
 
 def test_layerwise_offload_aligns_contiguous_tensor_offsets(monkeypatch):

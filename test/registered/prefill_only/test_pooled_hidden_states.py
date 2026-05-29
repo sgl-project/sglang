@@ -17,8 +17,8 @@ import requests
 import torch
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -28,6 +28,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+
 
 _SEQCLS_MODEL = "Qwen/Qwen3-0.6B"
 _CAUSAL_LM_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -183,6 +185,11 @@ class TestPooledHiddenStatesEngine(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
+@unittest.skipIf(
+    is_hip(),
+    "Multi-Item Scoring (enable_mis) requires the flashinfer prefill/decode "
+    "backend, which is NVIDIA-only.",
+)
 class TestPooledHiddenStatesMISEngine(CustomTestCase):
     """Validates return_pooled_hidden_states in MIS (delimiter) scoring mode.
 

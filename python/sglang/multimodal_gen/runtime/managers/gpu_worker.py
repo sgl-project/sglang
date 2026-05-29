@@ -170,6 +170,12 @@ class GPUWorker:
                 self.pipeline.modules,
                 self.server_args,
                 component_names=self.server_args.layerwise_offload_components,
+                warn_missing=(
+                    self.server_args.is_arg_explicitly_set(
+                        "layerwise_offload_components"
+                    )
+                    or self.server_args.is_arg_explicitly_set("dit_layerwise_offload")
+                ),
             )
 
         logger.info(

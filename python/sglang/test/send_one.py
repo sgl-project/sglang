@@ -105,7 +105,11 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def send_one_prompt(args: BenchArgs):
+def send_one_prompt(
+    args: BenchArgs,
+    label: Optional[str] = None,
+    print_output: bool = True,
+):
     base_url = f"http://{args.host}:{args.port}"
 
     # Construct the input
@@ -235,10 +239,12 @@ def send_one_prompt(args: BenchArgs):
     speed = ret["meta_info"]["completion_tokens"] / latency
     tokens = ret["meta_info"]["completion_tokens"]
 
-    if not args.stream:
+    if not args.stream and print_output:
         print(ret["text"])
 
     print()
+    if label is not None:
+        print(label)
     headers = ["Latency (s)", "Tokens", "Acc Length", "Speed (token/s)"]
     rows = [[f"{latency:.3f}", f"{tokens}", f"{acc_length:.3f}", f"{speed:.2f}"]]
     msg = tabulate.tabulate(rows, headers=headers, tablefmt="pretty")

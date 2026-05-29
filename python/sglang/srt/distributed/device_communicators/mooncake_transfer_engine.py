@@ -111,7 +111,12 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
-        self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
+        # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,
+        # in which case RDMA HCA selection is irrelevant; pass empty device.
+        if os.environ.get("MC_FORCE_TCP") == "1":
+            self.ib_device = ""
+        else:
+            self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
 
         self.initialize(
             hostname=self.hostname,
@@ -178,23 +183,20 @@ class MooncakeTransferEngine:
         """Initialize the mooncake instance."""
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
-            if npu_phy_id == -1:
-                hostname += f":{get_free_port()}:npu_{self.gpu_id}"
-            else:
-                hostname += f":{get_free_port()}:npu_{npu_phy_id}"
-            ret_value = self.engine.initialize(
-                hostname,
-                "P2PHANDSHAKE",
-                "ascend",
-                device_name if device_name is not None else "",
-            )
+            suffix = self.gpu_id if npu_phy_id == -1 else npu_phy_id
+            hostname += f":{get_free_port()}:npu_{suffix}"
+            protocol = "ascend"
         else:
-            ret_value = self.engine.initialize(
-                hostname,
-                "P2PHANDSHAKE",
-                "rdma",
-                device_name if device_name is not None else "",
-            )
+            # MOONCAKE_PROTOCOL selects the transport (rdma | efa | tcp | ...).
+            # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
+            protocol = envs.MOONCAKE_PROTOCOL.get()
+
+        ret_value = self.engine.initialize(
+            hostname,
+            "P2PHANDSHAKE",
+            protocol,
+            device_name if device_name is not None else "",
+        )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
@@ -253,6 +255,9 @@ class MooncakeTransferEngine:
 
     def get_session_id(self):
         return self.session_id
+
+    def send_probe(self, peer_session_id: str) -> int:
+        return self.engine.send_probe(peer_session_id)
 
     def get_engine(self):
         return self.engine.get_engine()
