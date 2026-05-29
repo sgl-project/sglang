@@ -1419,7 +1419,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return False
 
-        avail = self.token_to_kv_pool_allocator.available_size()
+        if self.supports_swa():
+            avail = self.token_to_kv_pool_allocator.full_available_size()
+        else:
+            avail = self.token_to_kv_pool_allocator.available_size()
         if avail < kv_tokens:
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
