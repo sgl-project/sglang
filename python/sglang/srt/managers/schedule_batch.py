@@ -1042,6 +1042,16 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def get_full_len(self) -> int:
+        if self.is_dllm():
+            return len(self.fill_ids)
+        return len(self.origin_input_ids) + len(self.output_ids)
+
+    def build_full_token_ids(self) -> array:
+        if self.is_dllm():
+            return self.fill_ids
+        return self.origin_input_ids + self.output_ids
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1439,6 +1449,13 @@ class Req(ReqDllmMixin):
             f"{self.grammar=}, "
             f"{self.sampling_params=})"
         )
+
+
+def truncate_fill_ids(req: Req, target_len: int) -> None:
+    if req.is_dllm():
+        req.fill_ids = req.fill_ids[:target_len]
+    else:
+        req.fill_ids = (req.origin_input_ids + req.output_ids)[:target_len]
 
 
 class _MambaRadixCacheV2TrackEntry(NamedTuple):
