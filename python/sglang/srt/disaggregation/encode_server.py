@@ -254,7 +254,7 @@ class MMEncoder:
         # Dedicated executor for image preprocessing (resize/normalize).
         # Separate from self.executor (ZMQ sends) to avoid contention under high concurrency.
         self.preproc_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_ENCODER_PREPROC_WORKERS", 32))
+            max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
         )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
