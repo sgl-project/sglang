@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache.contiguous_cache import Contiguous
 _thread_local = threading.local()
 
 
+# TODO: Move from threading to multiprocessing or asyncio
 @dataclass
 class BatchedDecodeContext:
     """Context set before batched decode, read by attention wrappers."""

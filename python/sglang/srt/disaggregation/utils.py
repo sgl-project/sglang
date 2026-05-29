@@ -5,17 +5,18 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, Optional, Tuple, Type, overload
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.base.conn import KVArgs
+    from sglang.srt.disaggregation.base.conn import KVArgs, StateType
     from sglang.srt.disaggregation.common.conn import (
         CommonKVBootstrapServer,
         CommonKVManager,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
 
 #########################
 # Constants & Enums
@@ -35,6 +37,14 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+    @staticmethod
+    def to_engine_type(mode: str) -> str:
+        if mode == DisaggregationMode.PREFILL.value:
+            return "prefill"
+        elif mode == DisaggregationMode.DECODE.value:
+            return "decode"
+        return "unified"
+
 
 #########################
 # Synchronization
@@ -44,17 +54,54 @@ class DisaggregationMode(Enum):
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
-def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
+def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
+    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+        req.bootstrap_host is None
+        and server_args.disaggregation_transfer_backend == "fake"
+    )
+
+
+def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> None:
+    """Downgrade Success → Transferring for requests whose metadata hasn't landed.
+
+    Mutates `polls` in-place. Called before all-reduce so that MIN across TP
+    ranks naturally prevents any rank from committing before all ranks are ready.
+    """
+    for i, poll_val in enumerate(polls):
+        if poll_val == int(KVPoll.Success):
+            decode_req = decode_reqs[i]
+            if _is_fake_transfer(decode_req.req, server_args):
+                continue
+            actual_room = metadata_buffers.bootstrap_room[
+                decode_req.metadata_buffer_index, 0
+            ].item()
+            if actual_room == 0:
+                polls[i] = int(KVPoll.Transferring)
+
+
+def poll_and_all_reduce(
+    pollers,
+    gloo_group: dist.ProcessGroup,
+    decode_reqs=None,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    server_args: Optional[ServerArgs] = None,
+):
     # at a certain prob, the poll is failed to simulate failure
     if FAILURE_PROB > 0:
-        from sglang.srt.disaggregation.base import KVPoll
-
         polls = [
             int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll())
             for poller in pollers
         ]
     else:
         polls = [int(poller.poll()) for poller in pollers]
+
+    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    if (
+        decode_reqs is not None
+        and metadata_buffers is not None
+        and server_args is not None
+    ):
+        _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
     return tensor_to_reduce.tolist()
@@ -81,11 +128,13 @@ def poll_and_all_reduce_attn_cp_tp_group(
 
 
 def poll_and_all_reduce_with_staging(
-    decode_reqs, staging_handler, gloo_group: dist.ProcessGroup
+    decode_reqs,
+    staging_handler,
+    gloo_group: dist.ProcessGroup,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    server_args: Optional[ServerArgs] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
-    from sglang.srt.disaggregation.base import KVPoll
-
     for decode_req in decode_reqs:
         if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
             decode_req
@@ -99,6 +148,9 @@ def poll_and_all_reduce_with_staging(
                 decode_req
             ):
                 raw_polls[i] = int(KVPoll.Transferring)
+    # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
+    if metadata_buffers is not None and server_args is not None:
+        _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
     poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
     return poll_tensor.tolist()
@@ -235,16 +287,16 @@ class MetadataBuffers:
 
     def get_buf(self, idx: int):
         return (
-            self.output_ids[idx],
-            self.cached_tokens[idx],
-            self.output_token_logprobs_val[idx],
-            self.output_token_logprobs_idx[idx],
-            self.output_top_logprobs_val[idx],
-            self.output_top_logprobs_idx[idx],
-            self.output_topk_p[idx],
-            self.output_topk_index[idx],
-            self.output_hidden_states[idx],
-            self.bootstrap_room[idx],
+            self.output_ids[idx].clone(),
+            self.cached_tokens[idx].clone(),
+            self.output_token_logprobs_val[idx].clone(),
+            self.output_token_logprobs_idx[idx].clone(),
+            self.output_top_logprobs_val[idx].clone(),
+            self.output_top_logprobs_idx[idx].clone(),
+            self.output_topk_p[idx].clone(),
+            self.output_topk_index[idx].clone(),
+            self.output_hidden_states[idx].clone(),
+            self.bootstrap_room[idx].clone(),
         )
 
     def set_buf(self, req: Req):
@@ -255,26 +307,30 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
         if req.return_logprob:
-            if req.output_token_logprobs_val:  # not none or empty list
+            if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_val[0]
+                    req.logprob.output_token_logprobs_val[0]
                 )
-            if req.output_token_logprobs_idx:  # not none or empty list
+            if req.logprob.output_token_logprobs_idx:  # not none or empty list
                 self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_idx[0]
+                    req.logprob.output_token_logprobs_idx[0]
                 )
 
-            if req.output_top_logprobs_val:  # not none or empty list
+            if req.logprob.output_top_logprobs_val:  # not none or empty list
                 self.output_top_logprobs_val[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_val[0])
+                    : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
+                    req.logprob.output_top_logprobs_val[0],
+                    dtype=torch.float32,
+                    device="cpu",
                 )
-            if req.output_top_logprobs_idx:  # not none or empty list
+            if req.logprob.output_top_logprobs_idx:  # not none or empty list
                 self.output_top_logprobs_idx[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_idx[0])
+                    : len(req.logprob.output_top_logprobs_idx[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
+                    req.logprob.output_top_logprobs_idx[0],
+                    dtype=torch.int32,
+                    device="cpu",
                 )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
@@ -431,26 +487,6 @@ def get_kv_class(
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 
-#########################
-# KV Pages
-#########################
-
-
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # 1. The page is guaranteed to be full except the last page.
-    # 2. page index = kv_index // page_size
-    # The return vector is kv_indices[::page_size] // page_size
-    if page_size == 1:  # shortcut
-        return kv_indices
-
-    return kv_indices[::page_size] // page_size
-
-
-def kv_to_page_num(num_kv_indices: int, page_size: int):
-    # ceil(num_kv_indices / page_size)
-    return (num_kv_indices + page_size - 1) // page_size
-
-
 def page_indices_to_cp_rank_page_indices(
     page_indices: np.ndarray,
     total_pages: int,
@@ -538,9 +574,106 @@ def filter_kv_indices_for_cp_rank(
 
 
 def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-    return isinstance(target_kv_pool, MLATokenToKVPool)
+    return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
+
+
+def append_state_component(
+    kv_args: KVArgs,
+    state_type: StateType,
+    data_ptrs: List[int],
+    data_lens: List[int],
+    item_lens: List[int],
+    dim_per_tensor: Optional[List[int]] = None,
+) -> None:
+    """Append one state component. Caller orders state_types consistently
+    on prefill and decode sides."""
+    kv_args.state_types.append(state_type)
+    kv_args.state_data_ptrs.append(data_ptrs)
+    kv_args.state_data_lens.append(data_lens)
+    kv_args.state_item_lens.append(item_lens)
+    kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+
+
+def setup_state_kv_args(
+    kv_args: KVArgs,
+    token_to_kv_pool,
+    draft_token_to_kv_pool=None,
+    total_kv_layers: int = None,
+    req_to_token_pool=None,
+) -> None:
+    """Populate ``kv_args`` state-buffer fields from the given pool.
+    Shared by prefill and decode bootstrap paths so the state_type dispatch
+    lives in one place.
+    """
+    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+
+    kv_args.state_types = []
+    kv_args.state_data_ptrs = []
+    kv_args.state_data_lens = []
+    kv_args.state_item_lens = []
+    kv_args.state_dim_per_tensor = []
+
+    if hasattr(token_to_kv_pool, "get_state_buf_infos"):
+        data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
+
+        # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
+        # state list is described per-entry via get_state_buf_infos.
+        if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            append_state_component(
+                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+            )
+        elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+            dim = (
+                token_to_kv_pool.get_state_dim_per_tensor()
+                if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
+                else None
+            )
+            append_state_component(
+                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+            )
+        elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
+            if draft_token_to_kv_pool is not None and isinstance(
+                draft_token_to_kv_pool, DSATokenToKVPool
+            ):
+                (
+                    draft_data_ptrs,
+                    draft_data_lens,
+                    draft_item_lens,
+                ) = draft_token_to_kv_pool.get_state_buf_infos()
+                data_ptrs = data_ptrs + draft_data_ptrs
+                data_lens = data_lens + draft_data_lens
+                item_lens = item_lens + draft_item_lens
+            if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
+                kv_args.kv_buf_groups = (
+                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                )
+                kv_args.total_kv_layers = total_kv_layers
+            else:
+                append_state_component(
+                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                )
+
+    if (
+        StateType.MAMBA not in kv_args.state_types
+        and req_to_token_pool is not None
+        and hasattr(req_to_token_pool, "get_state_buf_infos")
+    ):
+        data_ptrs, data_lens, item_lens = req_to_token_pool.get_state_buf_infos()
+        if data_ptrs:
+            dim = (
+                req_to_token_pool.get_state_dim_per_tensor()
+                if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
+                else None
+            )
+            append_state_component(
+                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+            )
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
@@ -550,9 +683,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 
     if req.return_logprob:
-        req.input_token_logprobs_val = []
-        req.input_token_logprobs_idx = []
-        req.input_top_logprobs_val = []
-        req.input_top_logprobs_idx = []
-        req.input_token_ids_logprobs_val = []
-        req.input_token_ids_logprobs_idx = []
+        req.logprob.input_token_logprobs_val = []
+        req.logprob.input_token_logprobs_idx = []
+        req.logprob.input_top_logprobs_val = []
+        req.logprob.input_top_logprobs_idx = []
+        req.logprob.input_token_ids_logprobs_val = []
+        req.logprob.input_token_ids_logprobs_idx = []

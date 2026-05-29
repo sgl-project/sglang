@@ -17,15 +17,18 @@ classifiers = [
 dependencies = [
   "IPython",
   "aiohttp",
+  "apache-tvm-ffi==0.1.9",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
   "av",
   "build",
   "compressed-tensors",
   "datasets",
+  "distro",
   "einops",
   "fastapi",
-  "easydict",
+  "flashinfer_python[cu13]==0.6.11.post1", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.11.post1",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -35,6 +38,8 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
+  "nvidia-cutlass-dsl[cu13]==4.5.1",
+  "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
   "orjson",
@@ -49,22 +54,40 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "quack-kernels>=0.4.1",
   "requests",
   "scipy",
   "sentencepiece",
   "setproctitle",
+  "flash-attn-4>=4.0.0b9",
+  "sgl-deep-gemm==0.1.0",
+  "sglang-kernel==0.4.3",
   "soundfile==0.13.1",
   "tiktoken",
+  "tilelang==0.1.8",
   "timm==1.0.16",
-  "torchao==0.9.0",
+  "tokenspeed_mla==0.1.1",
+  "torch_memory_saver>=0.0.9.post1",
+  "torch==2.11.0",
+  "torchao==0.17.0",
+  "torchaudio==2.11.0",
+  "torchcodec==0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.11.1 for torch 2.11.x (0.10 is ABI-incompatible: references the pre-2.11 c10::MessageLogger ctor signature). Not available on Linux ARM.
+  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "torchvision",
   "tqdm",
   "mistral_common>=1.11.0",
-  "transformers==5.5.4",
+  "transformers==5.8.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.32",
+  "watchfiles",
+  "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
 ]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
@@ -91,6 +114,14 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+http2 = [
+  "granian>=2.6.0",
+]
+
+fastokens = [
+  "fastokens>=0.1.1,<0.2.0",
+]
+
 test = [
   "accelerate",
   "expecttest",
@@ -101,6 +132,7 @@ test = [
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
+  "sglang[fastokens]",
   "tabulate",
 ]
 

@@ -19,6 +19,7 @@ metrics for load balancing, monitoring, and capacity planning.
 """
 
 import dataclasses
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -153,6 +154,7 @@ async def get_loads(
     """
     include_list = [s.strip() for s in include.split(",")] if include else None
 
+    start = time.perf_counter()
     try:
         load_results = await tokenizer_manager.get_loads(
             include=include_list,
@@ -160,6 +162,12 @@ async def get_loads(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        mc = getattr(tokenizer_manager, "metrics_collector", None)
+        if mc is not None:
+            mc.get_loads_duration_seconds.labels(**mc.labels).observe(
+                time.perf_counter() - start
+            )
 
     if format == "prometheus":
         return _format_loads_prometheus(load_results)

@@ -14,6 +14,7 @@
 
 """Inference-only Qwen3_5 MTP model."""
 
+import copy
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -31,7 +32,8 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +52,29 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if self.is_multimodal:
             config = config.text_config
 
+        # Deep-copy so MTP mutations below don't leak into the target's config.
+        config = copy.deepcopy(config)
+
         # The MTP model is unquantized in the nvfp4 checkpoint.
         if quant_config and quant_config.get_name() == "modelopt_fp4":
             quant_config = None
+        if (
+            is_npu()
+            and get_global_server_args().speculative_draft_model_quantization is None
+        ):
+            quant_config = None
+
+        # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in
+        # bf16; every `mtp.*` layer appears under the quantization exclude
+        # list. Detect that and skip quantization here so linear/MoE weight
+        # loaders allocate bf16 shapes (see sgl-project/sglang#23113).
+        if quant_config and quant_config.get_name() == "quark":
+            exclude_layers = getattr(quant_config, "exclude_layers", [])
+            if any(
+                isinstance(layer, str) and layer.startswith("mtp.")
+                for layer in exclude_layers
+            ):
+                quant_config = None
 
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -118,6 +140,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
         if (

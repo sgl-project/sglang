@@ -8,8 +8,10 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -239,7 +241,7 @@ class SanaTransformerBlock(nn.Module):
         return hidden_states
 
 
-class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _fsdp_shard_conditions = [
         lambda n, m: isinstance(m, SanaTransformerBlock),

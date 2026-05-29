@@ -34,33 +34,38 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.utils import (
-    FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _is_fake_transfer,
     get_kv_class,
     is_mla_backend,
-    kv_to_page_indices,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    setup_state_kv_args,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.common import (
+    kv_to_page_indices,
+    page_align_floor,
+    release_kv_cache,
+)
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
-    NSATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -68,6 +73,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -76,16 +82,8 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
-
-
-def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
-    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-        req.bootstrap_host is None
-        and server_args.disaggregation_transfer_backend == "fake"
-    )
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -118,17 +116,19 @@ class DecodeReqToTokenPool:
         )
 
         self.size = size
+        # +1 padding row at index 0; see ReqToTokenPool for rationale.
+        self._alloc_size = size + pre_alloc_size + 1
         self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (size + pre_alloc_size, max_context_len),
+                (self._alloc_size, max_context_len),
                 dtype=torch.int32,
                 device=device,
             )
 
-        self.free_slots = list(range(size + pre_alloc_size))
+        self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -144,7 +144,8 @@ class DecodeReqToTokenPool:
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
+            for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
         need_size = len(reqs) - len(reusing)
@@ -165,11 +166,10 @@ class DecodeReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        self.free_slots = list(range(1, self._alloc_size))
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
-
     def __init__(
         self,
         size: int,
@@ -197,22 +197,30 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
+        # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
+        slots_per_req = 1 + (
+            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
+        )
+        max_slots_needed = (size + pre_alloc_size) * slots_per_req
         if mamba_size is not None:
-            effective_mamba_size = min(mamba_size, size + pre_alloc_size)
-            if mamba_size > size + pre_alloc_size:
+            effective_mamba_size = max(mamba_size, max_slots_needed)
+            if mamba_size < max_slots_needed:
                 logger.warning(
-                    "mamba_size (%d) exceeds size + pre_alloc_size (%d), "
-                    "capping effective_mamba_size to %d",
+                    "mamba_size (%d) is less than decode side's max_slots_needed (%d = %d reqs * %d slots/req), "
+                    "raising effective_mamba_size to %d",
                     mamba_size,
+                    max_slots_needed,
                     size + pre_alloc_size,
+                    slots_per_req,
                     effective_mamba_size,
                 )
         else:
-            effective_mamba_size = size + pre_alloc_size
+            effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
-            size=effective_mamba_size,
+            mamba_size=effective_mamba_size,
             mamba_spec_state_size=size + pre_alloc_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
@@ -222,7 +230,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
 
     def clear(self):
-        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        self.free_slots = list(range(1, self._alloc_size))
         self.mamba_pool.clear()
 
 
@@ -236,6 +244,10 @@ class DecodeRequest:
     @property
     def seqlen(self) -> int:
         return self.req.seqlen
+
+    @property
+    def priority(self) -> Optional[int]:
+        return self.req.priority
 
 
 class DecodePreallocQueue:
@@ -273,7 +285,7 @@ class DecodePreallocQueue:
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
         self.transfer_queue = transfer_queue
-        self.tree_cache = tree_cache  # this is always a chunk cache
+        self.tree_cache = tree_cache
         self.gloo_group = gloo_group
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -302,12 +314,54 @@ class DecodePreallocQueue:
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
-        if self.scheduler.tp_worker.is_hybrid_swa:
-            # FIXME: current SWA allocation allocate full kv cache size in prefill
+        if (
+            self.scheduler.tp_worker.is_hybrid_swa
+            and not self._uses_swa_tail_prealloc()
+        ):
+            # Fallback for SWA allocators that still allocate the SWA pool at
+            # full prompt length.
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+    def _uses_swa_tail_prealloc(self) -> bool:
+        return (
+            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+            and self.token_to_kv_pool_allocator.page_size > 1
+            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+        )
+
+    def _swa_tail_len(self, seq_len: int) -> int:
+        if not self._uses_swa_tail_prealloc() or seq_len <= 0:
+            return max(seq_len, 0)
+
+        window_size = self.scheduler.sliding_window_size
+        if window_size is None or window_size <= 0:
+            return seq_len
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        window_start = max(0, seq_len - window_size)
+        window_start = (window_start // page_size) * page_size
+        return seq_len - window_start
+
+    def _swa_retractable_len(self, req: Req) -> int:
+        if not self._uses_swa_tail_prealloc():
+            return len(req.origin_input_ids) + len(req.output_ids)
+        return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
+
+    def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
+        allocated_kv_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        if self._uses_swa_tail_prealloc():
+            return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
+        return allocated_kv_len, allocated_kv_len
+
+    def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
+        full_len, swa_len = self._prealloc_kv_lens(req)
+        return (
+            full_len + self.num_reserved_decode_tokens,
+            swa_len + self.num_reserved_decode_tokens,
+        )
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -317,17 +371,15 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.dp_rank
-        if self.scheduler.enable_hisparse:
-            # Direct-to-host: register host pool pointers so P writes to D's host memory
-            host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                host_pool.get_contiguous_buf_infos()
-            )
-        else:
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                self.token_to_kv_pool.get_contiguous_buf_infos()
-            )
+        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        transfer_kv_pool = (
+            self.scheduler.hisparse_coordinator.mem_pool_host
+            if self.scheduler.enable_hisparse
+            else self.token_to_kv_pool
+        )
+        kv_data_ptrs, kv_data_lens, kv_item_lens = (
+            transfer_kv_pool.get_contiguous_buf_infos()
+        )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -341,44 +393,22 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        # HiSparse Host pool has page_size=1; use it when hisparse is enabled
-        kv_args.page_size = (
-            1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
-        )
+        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
 
-        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
-            state_data_ptrs, state_data_lens, state_item_lens = (
-                self.token_to_kv_pool.get_state_buf_infos()
-            )
-            kv_args.state_data_ptrs = state_data_ptrs
-            kv_args.state_data_lens = state_data_lens
-            kv_args.state_item_lens = state_item_lens
-
-            if isinstance(self.token_to_kv_pool, SWAKVPool):
-                kv_args.state_type = "swa"
-            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                kv_args.state_type = "mamba"
-                # Get state dimension info for cross-TP slice transfer
-                if hasattr(self.token_to_kv_pool, "get_state_dim_per_tensor"):
-                    kv_args.state_dim_per_tensor = (
-                        self.token_to_kv_pool.get_state_dim_per_tensor()
-                    )
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                kv_args.state_type = "nsa"
-            else:
-                kv_args.state_type = "none"
-        else:
-            kv_args.state_data_ptrs = []
-            kv_args.state_data_lens = []
-            kv_args.state_item_lens = []
-            kv_args.state_type = "none"
+        setup_state_kv_args(
+            kv_args,
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            total_kv_layers=self.scheduler.model_config.num_hidden_layers,
+            req_to_token_pool=getattr(self, "req_to_token_pool", None),
+        )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_args.gpu_id = self.scheduler.ps.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -428,6 +458,25 @@ class DecodePreallocQueue:
 
             self.pending_reqs.append(decode_req)
 
+    def _match_prefix_and_lock(self, req: Req) -> Tuple[torch.Tensor, int]:
+        """
+        Match a request against the decode-side radix cache, lock the matched
+        node to prevent eviction, and return the matched prefix information.
+        """
+        result = match_prefix_for_req(
+            self.tree_cache,
+            req,
+            req.origin_input_ids,
+            cow_mamba=self.tree_cache.supports_mamba(),
+            include_req=True,
+        )
+        prefix_indices = result.device_indices
+        last_device_node = result.last_device_node
+        # Always lock to match aggregated scheduling behavior
+        self.tree_cache.inc_lock_ref(last_device_node)
+
+        return prefix_indices, len(prefix_indices)
+
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
@@ -471,8 +520,20 @@ class DecodePreallocQueue:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.stream_output([req], req.return_logprob)
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
+        if self._uses_swa_tail_prealloc():
+            _, swa_required = self._prealloc_required_tokens(req)
+            swa_capacity = self.token_to_kv_pool_allocator.size_swa
+            if swa_required > swa_capacity:
+                message = (
+                    f"Request {req.rid} requires too many SWA KV tokens for "
+                    f"decode preallocation: {swa_required} > {swa_capacity}"
+                )
+                logger.error(message)
+                prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                return True
         return False
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
@@ -488,7 +549,15 @@ class DecodePreallocQueue:
         # allocate memory
         resumed_reqs = []
         indices_to_remove = set()
-        allocatable_tokens = self._allocatable_tokens(count_retracted=False)
+        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        if uses_swa_tail_prealloc:
+            full_allocatable_tokens, swa_allocatable_tokens = (
+                self._swa_aware_allocatable_token_budgets(count_retracted=False)
+            )
+        else:
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                count_retracted=False
+            )
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
@@ -497,19 +566,19 @@ class DecodePreallocQueue:
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            required_tokens_for_request = (
-                len(req.origin_input_ids)
-                + len(req.output_ids)
-                + self.num_reserved_decode_tokens
-            )
-            if required_tokens_for_request > allocatable_tokens:
+            full_required, swa_required = self._prealloc_required_tokens(req)
+            if full_required > full_allocatable_tokens:
+                break
+            if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
-            allocatable_tokens -= required_tokens_for_request
+            full_allocatable_tokens -= full_required
+            if uses_swa_tail_prealloc:
+                swa_allocatable_tokens -= swa_required
 
             # load from cpu, release the cpu copy
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
@@ -528,7 +597,11 @@ class DecodePreallocQueue:
         if not self.queue:
             return
 
-        if all(decode_req.waiting_for_input for decode_req in self.queue):
+        # Still poll if any receiver was aborted, otherwise it stays stuck.
+        if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
+            decode_req.kv_receiver.conclude_state == KVPoll.Failed
+            for decode_req in self.queue
+        ):
             return
 
         polls = poll_and_all_reduce(
@@ -556,7 +629,7 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                if self.scheduler.enable_metrics:
+                if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
@@ -664,16 +737,42 @@ class DecodePreallocQueue:
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
-        allocatable_tokens = self._allocatable_tokens(
-            retractable_tokens=retractable_tokens, count_retracted=True
-        )
+
+        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        swa_allocatable_tokens = 0
+        if uses_swa_tail_prealloc:
+            retractable_swa_tokens = sum(
+                self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
+            )
+            full_allocatable_tokens, swa_allocatable_tokens = (
+                self._swa_aware_allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    retractable_swa_tokens=retractable_swa_tokens,
+                    count_retracted=True,
+                )
+            )
+        else:
+            retractable_swa_tokens = 0
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens, count_retracted=True
+            )
+
+        # Sort by priority before any index-based bookkeeping so that both the
+        # abort-scan loop and the preallocation loop operate on the same order.
+        if self.scheduler.enable_priority_scheduling:
+            priority_sign = (
+                1 if self.scheduler.schedule_low_priority_values_first else -1
+            )
+            self.queue.sort(key=lambda r: r.req.priority * priority_sign)
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                self.scheduler.stream_output(
-                    [decode_req.req], decode_req.req.return_logprob
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req],
+                    decode_req.req.return_logprob,
                 )
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
@@ -716,84 +815,158 @@ class DecodePreallocQueue:
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                # Match prefix against decode's radix cache.
+                prefix_indices, prefix_len = self._match_prefix_and_lock(decode_req.req)
+                # Align prefix_len down to page boundary so both prefill and
+                # decode agree on the page-aligned split point for KV transfer.
+                page_size = self.token_to_kv_pool_allocator.page_size
+                if page_size > 1 and prefix_len % page_size != 0:
+                    prefix_len = page_align_floor(prefix_len, page_size)
+                    prefix_indices = prefix_indices[:prefix_len]
+
+                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
+                required_alloc_tokens = self._required_alloc_tokens(
+                    fill_len=fill_len, prefix_len=prefix_len
+                )
+                # Matching may lock previously-evictable radix pages, so refresh
+                # the admission budget against the post-lock pool state before we
+                # decide whether this request still fits.
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=len(preallocated_reqs),
+                )
+            else:
+                prefix_indices = None
+                prefix_len = 0
+                required_alloc_tokens = origin_input_len
+
             required_tokens_for_request = (
-                origin_input_len + self.num_reserved_decode_tokens
+                required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
             if (
                 max(
                     required_tokens_for_request,
                     origin_input_len
+                    - prefix_len
                     + min(
                         decode_req.req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKEN,
                     )
                     - retractable_tokens,
                 )
-                > allocatable_tokens
+                > full_allocatable_tokens
             ):
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
-            if required_tokens_for_request > allocatable_tokens:
+            if required_tokens_for_request > full_allocatable_tokens:
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
 
-            allocatable_tokens -= required_tokens_for_request
-            hisparse_req_budget -= 1
-            dst_kv_indices = self._pre_alloc(decode_req.req)
-
-            origin_input_len = len(decode_req.req.origin_input_ids)
-            if self.scheduler.enable_hisparse:
-                # Must cast to int32 for ZMQ serialization — from_zmq reads np.int32.
-                kv_indices = (
-                    dst_kv_indices[:origin_input_len].cpu().numpy().astype(np.int32)
+            if uses_swa_tail_prealloc:
+                _, swa_required = self._prealloc_required_tokens(decode_req.req)
+                _, swa_len = self._prealloc_kv_lens(decode_req.req)
+                max_new_tokens = min(
+                    decode_req.req.sampling_params.max_new_tokens,
+                    CLIP_MAX_NEW_TOKEN,
                 )
-                page_size = 1  # host pool page_size
-            else:
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx
-                ][:origin_input_len]
-                kv_indices = kv_indices_full.cpu().numpy()
-                page_size = self.token_to_kv_pool_allocator.page_size
+                if (
+                    max(
+                        swa_required,
+                        swa_len + max_new_tokens - retractable_swa_tokens,
+                    )
+                    > swa_allocatable_tokens
+                ):
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    break
 
-            # Prepare extra pool indices for hybrid models
-            if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                # Mamba hybrid model: single mamba state index
-                state_indices = [
+            dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
+            hisparse_req_budget -= 1
+            # Recompute from actual pool state for the next queue entry.
+            # This accounts for page rounding and newly locked evictable cache.
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens,
+                count_retracted=True,
+                extra_reserved_reqs=len(preallocated_reqs) + 1,
+            )
+            if uses_swa_tail_prealloc:
+                # SWA budget uses simple decrement (no radix cache eviction in
+                # the SWA pool, so page-rounding drift is negligible).
+                swa_allocatable_tokens -= swa_required
+            decode_req.req.cache_protected_len = prefix_len
+
+            page_size = self.token_to_kv_pool_allocator.page_size
+            if self.scheduler.enable_hisparse:
+                # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
+                kv_indices = (
+                    dst_kv_indices[: origin_input_len - prefix_len]
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
+                )
+            else:
+                # Only send delta indices (beyond prefix) to prefill.
+                kv_indices = (
+                    self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
+                        prefix_len:origin_input_len
+                    ]
+                    .cpu()
+                    .numpy()
+                )
+
+            seq_len = len(decode_req.req.origin_input_ids)
+
+            def _mamba_payload():
+                return [
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         decode_req.req.req_pool_idx
                     ]
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(self.token_to_kv_pool, SWAKVPool):
-                # SWA hybrid model: send decode-side SWA window indices
-                seq_len = len(decode_req.req.origin_input_ids)
-                window_size = self.scheduler.sliding_window_size
 
+            def _swa_payload():
+                window_size = self.scheduler.sliding_window_size
                 window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
+                window_start = page_align_floor(window_start, page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
-
-                # Translate to SWA pool indices
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                         window_kv_indices_full
                     )
                 )
-                state_indices = window_kv_indices_swa.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                seq_len = len(decode_req.req.origin_input_ids)
+                return kv_to_page_indices(
+                    window_kv_indices_swa.cpu().numpy(), page_size
+                )
+
+            def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
-                state_indices = kv_indices_full.cpu().numpy()
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
-                state_indices = kv_to_page_indices(state_indices, device_page_size)
-            else:
-                state_indices = None
+                return kv_to_page_indices(
+                    kv_indices_full.cpu().numpy(), device_page_size
+                )
+
+            state_types = self.kv_manager.kv_args.state_types
+            state_indices: Optional[List] = []
+            for st in state_types:
+                if st == StateType.MAMBA:
+                    state_indices.append(_mamba_payload())
+                elif st == StateType.SWA:
+                    state_indices.append(_swa_payload())
+                elif st == StateType.DSA:
+                    state_indices.append(_dsa_payload())
+                else:
+                    state_indices.append(None)
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -801,7 +974,10 @@ class DecodePreallocQueue:
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.send_metadata(
-                page_indices, decode_req.metadata_buffer_index, state_indices
+                page_indices,
+                decode_req.metadata_buffer_index,
+                state_indices,
+                decode_prefix_len=prefix_len,
             )
             if (
                 self.transfer_queue.enable_staging
@@ -827,8 +1003,8 @@ class DecodePreallocQueue:
             len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
         )
 
-    def _allocatable_tokens(
-        self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
+    def _need_space_for_single_req(
+        self, retractable_tokens: Optional[int] = None
     ) -> int:
         need_space_for_single_req = (
             max(
@@ -843,24 +1019,77 @@ class DecodePreallocQueue:
             and len(self.scheduler.running_batch.reqs) > 0
             else 0
         )
+        return need_space_for_single_req
+
+    def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
+        return (
+            len(self.scheduler.running_batch.reqs)
+            + len(self.transfer_queue.queue)
+            + len(self.scheduler.waiting_queue)
+            + extra_reserved_reqs
+        )
+
+    def _active_reserved_tokens(
+        self, n_active: Optional[int] = None, extra_reserved_reqs: int = 0
+    ) -> int:
+        if n_active is None:
+            n_active = self._active_req_count(extra_reserved_reqs)
+        return self.num_reserved_decode_tokens * n_active
+
+    def _swa_aware_allocatable_token_budgets(
+        self,
+        retractable_tokens: Optional[int] = None,
+        retractable_swa_tokens: Optional[int] = None,
+        count_retracted: bool = True,
+    ) -> Tuple[int, int]:
+        n_active = self._active_req_count()
+        reserved_tokens = self._active_reserved_tokens(n_active)
+
+        full_allocatable_tokens = self._allocatable_token_budgets(
+            retractable_tokens=retractable_tokens,
+            count_retracted=count_retracted,
+            reserved_tokens=reserved_tokens,
+        )
+
+        return full_allocatable_tokens, self._swa_tail_allocatable_token_budget(
+            retractable_tokens=retractable_tokens,
+            retractable_swa_tokens=retractable_swa_tokens,
+            count_retracted=count_retracted,
+            n_active=n_active,
+            reserved_tokens=reserved_tokens,
+        )
+
+    def _allocatable_token_budgets(
+        self,
+        retractable_tokens: Optional[int] = None,
+        count_retracted: bool = True,
+        extra_reserved_reqs: int = 0,
+        reserved_tokens: Optional[int] = None,
+    ) -> int:
+        need_space_for_single_req = self._need_space_for_single_req(retractable_tokens)
+        if reserved_tokens is None:
+            reserved_tokens = self._active_reserved_tokens(
+                extra_reserved_reqs=extra_reserved_reqs
+            )
+
         if self.scheduler.enable_hisparse:
             # HiSparse pre-alloc only allocates logical indices (alloc_logical_only),
             # so the logical pool is the binding constraint for admission control.
             available_size = (
                 self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
             )
+        elif self._uses_swa_tail_prealloc():
+            available_size = self.token_to_kv_pool_allocator.full_available_size()
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                available_size += self.tree_cache.evictable_size()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
+            # Include evictable decode-radix cache entries in the budget -- they
+            # can be freed on demand before allocation.
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                available_size += self.tree_cache.evictable_size()
         allocatable_tokens = available_size - max(
-            # preserve some space for future decode
-            self.num_reserved_decode_tokens
-            * (
-                len(self.scheduler.running_batch.reqs)
-                + len(self.transfer_queue.queue)
-                + len(self.scheduler.waiting_queue)
-            ),
-            # make sure each request can finish if reach max_tokens with all other requests retracted
-            need_space_for_single_req,
+            reserved_tokens, need_space_for_single_req
         )
 
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
@@ -874,30 +1103,146 @@ class DecodePreallocQueue:
             )
 
         if count_retracted:
-            allocatable_tokens -= sum(
-                [
-                    len(req.origin_input_ids)
-                    + len(req.output_ids)
-                    + self.num_reserved_decode_tokens
-                    for req in self.retracted_queue
-                ]
-            )
+            for req in self.retracted_queue:
+                full_required, _ = self._prealloc_required_tokens(req)
+                allocatable_tokens -= full_required
+
         return allocatable_tokens
 
-    def _pre_alloc(self, req: Req) -> torch.Tensor:
+    def _swa_tail_allocatable_token_budget(
+        self,
+        retractable_tokens: Optional[int] = None,
+        retractable_swa_tokens: Optional[int] = None,
+        count_retracted: bool = True,
+        n_active: Optional[int] = None,
+        reserved_tokens: Optional[int] = None,
+    ) -> int:
+        need_swa_space_for_single_req = self._need_space_for_single_req(
+            retractable_tokens
+        )
+        if (
+            retractable_swa_tokens is not None
+            and len(self.scheduler.running_batch.reqs) > 0
+        ):
+            need_swa_space_for_single_req = max(
+                self._swa_tail_len(len(x.origin_input_ids))
+                + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                - retractable_swa_tokens
+                for x in self.scheduler.running_batch.reqs
+            )
+
+        if n_active is None:
+            n_active = self._active_req_count()
+        if reserved_tokens is None:
+            reserved_tokens = self._active_reserved_tokens(n_active)
+
+        # SWA growth is bounded by the sliding window: once a req's SWA
+        # footprint reaches `sliding_window_size`, further decode tokens
+        # evict old ones and net growth is zero. The linear reservation
+        # `num_reserved_decode_tokens * n_active` (correct for the full
+        # pool) over-reserves SWA in steady state. Cap by the actual
+        # remaining headroom up to per-req window cap.
+        window_size = self.scheduler.sliding_window_size or 0
+        swa_total = self.token_to_kv_pool_allocator.size_swa
+        swa_used = swa_total - self.token_to_kv_pool_allocator.swa_available_size()
+        swa_growth_potential = max(0, n_active * window_size - swa_used)
+        swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)
+        swa_allocatable_tokens = (
+            self.token_to_kv_pool_allocator.swa_available_size()
+            - max(swa_reserved_tokens, need_swa_space_for_single_req)
+        )
+
+        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
+        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
+        if (
+            self.scheduler.last_batch
+            and self.scheduler.last_batch.forward_mode.is_prebuilt()
+        ):
+            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
+                self.scheduler.last_batch.reqs
+            )
+            prebuilt_n = len(self.scheduler.last_batch.reqs)
+            prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
+            swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
+
+        if count_retracted:
+            for req in self.retracted_queue:
+                _, swa_required = self._prealloc_required_tokens(req)
+                swa_allocatable_tokens -= swa_required
+
+        return swa_allocatable_tokens
+
+    def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size == 1:
+            return fill_len - prefix_len
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=torch.tensor([fill_len], dtype=torch.int64),
+            prefix_lens=torch.tensor([prefix_len], dtype=torch.int64),
+            page_size=page_size,
+        )
+        return num_new_pages * page_size
+
+    def _pre_alloc(
+        self,
+        req: Req,
+        prefix_indices: Optional[torch.Tensor] = None,
+        prefix_len: Optional[int] = None,
+    ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
+        if prefix_len is None:
+            prefix_len = 0
+
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
-        # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
+        if prefix_len > 0:
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
+            )
+
+        # TODO(retraction): when retraction is implemented with radix cache
+        # awareness, a retracted request should re-match the tree here
+        # instead of re-allocating from scratch. See resume_retracted_reqs.
+        delta_len = fill_len - prefix_len
+        required_alloc_tokens = self._required_alloc_tokens(
+            fill_len=fill_len, prefix_len=prefix_len
+        )
+
+        # Evict cached entries if the pool doesn't have enough free pages.
+        if (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
+        ):
+            num_to_evict = (
+                required_alloc_tokens - self.token_to_kv_pool_allocator.available_size()
+            )
+            result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+            if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
+                logger.warning(
+                    f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
+                    f"available {self.token_to_kv_pool_allocator.available_size()} "
+                    f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
+                    f"evictable_size={self.tree_cache.evictable_size()}, "
+                    f"protected_size={self.tree_cache.protected_size()}, "
+                    f"fill_len={fill_len}, prefix_len={prefix_len}, delta_len={delta_len}, "
+                    f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+                    f"req={req.rid}"
+                )
+
         if self.scheduler.enable_hisparse:
+            # HiSparse is incompatible with decode-side L1 radix cache. Keep
+            # this path on the upstream full-allocation semantics.
+            assert prefix_len == 0
+
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
@@ -910,37 +1255,76 @@ class DecodePreallocQueue:
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-            # Allocate host indices for the RDMA transfer target
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
-            if host_indices is None:
-                raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
-                )
-            host_indices = host_indices.to(device=coordinator.device)
-            coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+            # Allocate host indices for the RDMA transfer target.
+            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                coordinator.req_to_host_pool,
+                coordinator.req_to_host_pool_allocated_len,
+                req.req_pool_idx,
+                0,
+                fill_len,
+            )
         elif self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+            kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
+            last_loc = (
+                prefix_indices[-1:].to(dtype=torch.int64, device=device)
+                if prefix_len > 0
+                else torch.tensor([-1], dtype=torch.int64, device=device)
             )
+            if self._uses_swa_tail_prealloc() and prefix_len == 0:
+                # Tail-only SWA allocation: only valid when prefix_len == 0.
+                # When prefix_len > 0 (radix cache hit), we fall back to
+                # alloc_extend which allocates SWA at full page count; the
+                # SWA budget in that case may slightly under-estimate.
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=last_loc,
+                    extend_num_tokens=fill_len,
+                    swa_tail_len=self._swa_tail_len(fill_len),
+                )
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                    prefix_lens=torch.tensor(
+                        [prefix_len], dtype=torch.int64, device=device
+                    ),
+                    prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=last_loc,
+                    extend_num_tokens=delta_len,
+                )
 
-        assert (
-            kv_loc is not None
-        ), "KV cache is full! There is a bug in memory estimation."
+        assert kv_loc is not None, (
+            f"KV cache is full! Bug in memory estimation. "
+            f"available={self.token_to_kv_pool_allocator.available_size()}, "
+            f"evictable={self.tree_cache.evictable_size()}, "
+            f"protected={self.tree_cache.protected_size()}, "
+            f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
+            f"fill={fill_len}, prefix={prefix_len}, "
+            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+            f"req={req.rid}"
+        )
 
-        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(prefix_len, prefix_len + len(kv_loc))), kv_loc
+        )
 
-        # populate metadata
-        req.fill_ids = req.origin_input_ids + req.output_ids
-        req.set_extend_input_len(len(req.fill_ids))
+        # Truncate fill_ids to kv_committed_len so cache_unfinished_req only
+        # inserts committed KV into the radix tree. The last output token
+        # hasn't had KV committed yet (fill_ids is 1 ahead).
+        req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
+        # Set prefix_indices so downstream consumers (init_next_round_input,
+        # prepare_for_extend) see the correct prefix length. In the agg path
+        # this is done inside init_next_round_input, but decode-disagg needs
+        # allocation info before batch assembly so we set it here.
+        req.prefix_indices = (
+            prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
+        )
+        req.set_extend_input_len(len(req.fill_ids) - prefix_len)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -986,12 +1370,7 @@ class DecodeTransferQueue:
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
-        """
-        Returns:
-            True if the request should be removed from the queue (success or corruption)
-            False if metadata not ready yet (keep in queue for next poll)
-        """
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -1017,11 +1396,25 @@ class DecodeTransferQueue:
         if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
             pass
         elif actual_room == 0:
-            # Case 1: Metadata not ready yet (actual_room == 0)
-            # Keep request in queue and wait for next poll
-            return False
+            # Should never happen: _poll_with_metadata_gate already confirmed
+            # readiness on all TP ranks. Abort deterministically to avoid
+            # cross-rank queue divergence.
+            logger.error(
+                f"Metadata unexpectedly not ready after readiness gate: "
+                f"request {decode_req.req.rid}, bootstrap_room={expected_room}, "
+                f"metadata_buffer_index={idx}"
+            )
+            prepare_abort(
+                decode_req.req,
+                "Metadata unexpectedly not ready after readiness gate "
+                "(bootstrap_room=0)",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
         elif actual_room != expected_room:
-            # Case 2: Real corruption detected (mismatch)
+            # Real corruption detected (mismatch)
             # Abort the request and remove from the queue
             error_msg = (
                 f"Context corruption detected: Request {decode_req.req.rid} "
@@ -1038,11 +1431,18 @@ class DecodeTransferQueue:
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
-            return True
+            return
 
-        # Case 3: Success - commit the transfer
+        # Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
+        # The prefill node already reported its prefix-cache hit in
+        # cached_tokens[0]. Seed already_computed with it so that
+        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
+        # only adds decode-side reuse *beyond* what prefill counted, instead of
+        # double-counting the shared prompt prefix (which would make
+        # cached_tokens exceed prompt_tokens when decode radix cache is on).
+        decode_req.req.already_computed = decode_req.req.cached_tokens
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
@@ -1052,27 +1452,44 @@ class DecodeTransferQueue:
             decode_req.req.hidden_states_tensor = output_hidden_states
 
         if decode_req.req.return_logprob:
-            decode_req.req.output_token_logprobs_val.append(
+            decode_req.req.logprob.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
-            decode_req.req.output_token_logprobs_idx.append(
+            decode_req.req.logprob.output_token_logprobs_idx.append(
                 output_token_logprobs_idx[0].item()
             )
-            decode_req.req.output_top_logprobs_val.append(
-                output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
+            decode_req.req.logprob.output_top_logprobs_val.append(
+                output_top_logprobs_val[
+                    : decode_req.req.logprob.top_logprobs_num
+                ].tolist()
             )
-            decode_req.req.output_top_logprobs_idx.append(
-                output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
+            decode_req.req.logprob.output_top_logprobs_idx.append(
+                output_top_logprobs_idx[
+                    : decode_req.req.logprob.top_logprobs_num
+                ].tolist()
             )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
-        return True
+        return
+
+    def _poll_with_metadata_gate(self) -> List[int]:
+        return poll_and_all_reduce(
+            [dr.kv_receiver for dr in self.queue],
+            self.gloo_group,
+            decode_reqs=self.queue,
+            metadata_buffers=self.metadata_buffers,
+            server_args=self.scheduler.server_args,
+        )
 
     def _poll_with_staging(self) -> list:
         return poll_and_all_reduce_with_staging(
-            self.queue, self.staging_handler, self.gloo_group
+            self.queue,
+            self.staging_handler,
+            self.gloo_group,
+            metadata_buffers=self.metadata_buffers,
+            server_args=self.scheduler.server_args,
         )
 
     def _init_staging_handler(self, kv_manager):
@@ -1093,9 +1510,7 @@ class DecodeTransferQueue:
         if self.enable_staging:
             polls = self._poll_with_staging()
         else:
-            polls = poll_and_all_reduce(
-                [dr.kv_receiver for dr in self.queue], self.gloo_group
-            )
+            polls = self._poll_with_metadata_gate()
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -1115,37 +1530,36 @@ class DecodeTransferQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                self.scheduler.stream_output(
-                    [decode_req.req], decode_req.req.return_logprob
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req],
+                    decode_req.req.return_logprob,
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
-                if self.scheduler.enable_metrics:
+                if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                should_remove = self._commit_transfer_to_req(decode_req)
-                if should_remove:
-                    indices_to_remove.add(i)
-                    # Check if request was aborted due to corruption
-                    if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        self.scheduler.stream_output(
-                            [decode_req.req], decode_req.req.return_logprob
+                self._commit_transfer_to_req(decode_req)
+                indices_to_remove.add(i)
+                # Check if request was aborted due to corruption
+                if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req],
+                        decode_req.req.return_logprob,
+                    )
+                    if self.scheduler.enable_hisparse:
+                        self.scheduler.hisparse_coordinator.request_finished(
+                            decode_req.req
                         )
-                        if self.scheduler.enable_hisparse:
-                            self.scheduler.hisparse_coordinator.request_finished(
-                                decode_req.req
-                            )
-                        release_kv_cache(
-                            decode_req.req, self.tree_cache, is_insert=False
-                        )
-                        if self.scheduler.enable_metrics:
-                            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
-                    else:
-                        transferred_reqs.append(decode_req.req)
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                else:
+                    transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -1174,14 +1588,13 @@ class DecodeTransferQueue:
 
 
 class SchedulerDisaggregationDecodeMixin:
-
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
@@ -1209,11 +1622,14 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
             if self._engine_paused:
                 continue
+
+            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
+            self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -1259,7 +1675,9 @@ class SchedulerDisaggregationDecodeMixin:
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
             assert self.chunked_req is None
-            self.process_batch_result_prebuilt(new_prebuilt_batch)
+            self.batch_result_processor.process_batch_result_prebuilt(
+                new_prebuilt_batch
+            )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():
@@ -1278,7 +1696,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.running_batch = self.update_running_batch(self.running_batch)
             ret = self.running_batch if not self.running_batch.is_empty() else None
 
-        ret = self.maybe_prepare_mlp_sync_batch(ret)
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
         return ret
@@ -1292,6 +1710,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         if len(self.waiting_queue) == 0:
             return None
+
+        if self.enable_priority_scheduling:
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         curr_batch_size = self.running_batch.batch_size()
 
@@ -1308,7 +1729,27 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                req.init_next_round_input(self.tree_cache)
+                # Decode-radix path: do NOT re-match prefix here.
+                # `pop_preallocated` already took a tree snapshot and used it
+                # to (1) pre-allocate KV, (2) choose delta pages for transfer,
+                # and (3) set cache_protected_len/last_node for correct frees.
+                # Re-matching now can observe a newer tree (other reqs may have
+                # inserted the same prefix) and overwrite cache_protected_len,
+                # making `cache_unfinished_req` free the wrong range (leak).
+                # Non-radix decode keeps the original behavior.
+                tree_cache = (
+                    None
+                    if self.server_args.disaggregation_decode_enable_radix_cache
+                    else self.tree_cache
+                )
+                req.init_next_round_input(tree_cache)
+                # Truncate fill_ids to kv_committed_len so cache_unfinished_req
+                # only sees committed KV (fill_ids includes one uncommitted token).
+                if req.kv_committed_len is not None:
+                    req.fill_ids = req.fill_ids[: req.kv_committed_len]
+                    req.set_extend_input_len(
+                        len(req.fill_ids) - len(req.prefix_indices)
+                    )
             else:
                 waiting_queue.append(req)
 
@@ -1364,6 +1805,4 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-                self.waiting_queue.extend(transferred_reqs)
-            else:
-                self.waiting_queue.extend(transferred_reqs)
+            self.waiting_queue.extend(transferred_reqs)
