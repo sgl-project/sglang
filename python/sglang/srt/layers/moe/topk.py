@@ -118,119 +118,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-
-# ----------------------------------------------------------------------------
-# DSV4 marlin NaN debug (gated by SGLANG_DEBUG_TOPK_NAN). Fires at most once
-# per process for each condition.
-# ----------------------------------------------------------------------------
-_DSV4_TOPK_NAN_DEBUG_FIRED = {"bias": False, "out": False}
-
-
-def _maybe_diagnose_dsv4_topk_nan(
-    *,
-    gating_output: torch.Tensor,
-    correction_bias: Optional[torch.Tensor],
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    scoring_func: str,
-) -> None:
-    import os
-
-    if not os.environ.get("SGLANG_DEBUG_TOPK_NAN"):
-        return
-    if scoring_func != "sqrtsoftplus":
-        return
-    # .item() syncs the host with CUDA, which is forbidden while a CUDA graph
-    # is being captured. Skip the diagnostic during capture.
-    if torch.cuda.is_current_stream_capturing():
-        return
-    try:
-        import torch.distributed as dist
-
-        rank = dist.get_rank() if dist.is_initialized() else -1
-    except Exception:
-        rank = -1
-
-    if (
-        not _DSV4_TOPK_NAN_DEBUG_FIRED["bias"]
-        and correction_bias is not None
-    ):
-        bias_nan = int(torch.isnan(correction_bias).sum().item())
-        bias_inf = int(torch.isinf(correction_bias).sum().item())
-        if bias_nan or bias_inf:
-            _DSV4_TOPK_NAN_DEBUG_FIRED["bias"] = True
-            logger.error(
-                "[topk-nan-debug rank=%d] correction_bias has bad values: "
-                "shape=%s dtype=%s nan=%d inf=%d min=%s max=%s",
-                rank,
-                tuple(correction_bias.shape),
-                correction_bias.dtype,
-                bias_nan,
-                bias_inf,
-                correction_bias.float().nan_to_num().min().item(),
-                correction_bias.float().nan_to_num().max().item(),
-            )
-
-    if _DSV4_TOPK_NAN_DEBUG_FIRED["out"]:
-        return
-    out_nan = int(torch.isnan(topk_weights).sum().item())
-    if out_nan == 0:
-        return
-    _DSV4_TOPK_NAN_DEBUG_FIRED["out"] = True
-
-    nan_rows_mask = torch.isnan(topk_weights).any(dim=-1)
-    nan_row_idx = nan_rows_mask.nonzero(as_tuple=True)[0]
-    first_row = int(nan_row_idx[0].item()) if nan_row_idx.numel() > 0 else -1
-
-    g_min = gating_output[first_row].float().min().item() if first_row >= 0 else float("nan")
-    g_max = gating_output[first_row].float().max().item() if first_row >= 0 else float("nan")
-    g_mean = gating_output[first_row].float().mean().item() if first_row >= 0 else float("nan")
-
-    if scoring_func == "sqrtsoftplus":
-        scores_row = (
-            torch.nn.functional.softplus(gating_output[first_row].float()).sqrt()
-            if first_row >= 0
-            else None
-        )
-    else:
-        scores_row = None
-
-    if scores_row is not None and topk_ids is not None and first_row >= 0:
-        ids_row = topk_ids[first_row].long().clamp(0, gating_output.shape[1] - 1)
-        gathered = scores_row.gather(0, ids_row)
-        gathered_sum = float(gathered.sum().item())
-        gathered_min = float(gathered.min().item())
-        gathered_max = float(gathered.max().item())
-    else:
-        gathered_sum = gathered_min = gathered_max = float("nan")
-
-    bias_nan = (
-        int(torch.isnan(correction_bias).sum().item())
-        if correction_bias is not None
-        else -1
-    )
-
-    logger.error(
-        "[topk-nan-debug rank=%d] biased_topk produced NaN topk_weights "
-        "(scoring=%s): topk_weights nan=%d, num_nan_rows=%d, first_nan_row=%d, "
-        "gating_row[min=%g max=%g mean=%g], "
-        "score_at_topk_ids[min=%g max=%g sum=%g], correction_bias_nan=%d",
-        rank,
-        scoring_func,
-        out_nan,
-        int(nan_rows_mask.sum().item()),
-        first_row,
-        g_min,
-        g_max,
-        g_mean,
-        gathered_min,
-        gathered_max,
-        gathered_sum,
-        bias_nan,
-    )
-
-
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
@@ -955,13 +842,7 @@ def biased_topk_impl(
     if scoring_func == "sigmoid":
         scores = gating_output.sigmoid()
     elif scoring_func == "sqrtsoftplus":
-        # Stable softplus: relu(x) + log1p(exp(-|x|)) — exp(-|x|) never overflows.
-        # Inductor drops PyTorch's threshold short-circuit when fusing softplus,
-        # so the naive log1p(exp(x)) form overflows for large gating values
-        # (even in fp32, since exp(92.66) > fp32_max).
-        scores = (
-            gating_output.relu() + torch.log1p((-gating_output.abs()).exp())
-        ).sqrt()
+        scores = torch.nn.functional.softplus(gating_output).sqrt()
 
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
@@ -1602,13 +1483,6 @@ def select_experts(
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            )
-            _maybe_diagnose_dsv4_topk_nan(
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                scoring_func=scoring_func,
             )
         elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()

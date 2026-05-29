@@ -109,67 +109,6 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
-import os as _os
-
-_DBG_LAYER_STATS = _os.environ.get("SGLANG_DEBUG_LAYER_STATS", "0") == "1"
-_DBG_SEEN: set = set()
-_DBG_RESET_PATH = _os.environ.get(
-    "SGLANG_DEBUG_LAYER_STATS_RESET_PATH", "/tmp/sglang_dbg_reset"
-)
-_DBG_RESET_MTIME: float = -1.0
-
-
-def _dbg_hs(layer_id: int, stage: str, x: "torch.Tensor") -> None:
-    if not _DBG_LAYER_STATS:
-        return
-    try:
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized()
-            else 0
-        )
-    except Exception:
-        rank = 0
-    if rank != 0:
-        return
-    # File-marker reset: `touch $SGLANG_DEBUG_LAYER_STATS_RESET_PATH` to clear
-    # the dedup set so the next forward re-logs every (layer, stage) once.
-    global _DBG_RESET_MTIME
-    try:
-        m = _os.path.getmtime(_DBG_RESET_PATH)
-        if m != _DBG_RESET_MTIME:
-            _DBG_RESET_MTIME = m
-            _DBG_SEEN.clear()
-            print(f"[hs] === reset (mtime={m}) ===", flush=True)
-    except OSError:
-        pass
-    key = (layer_id, stage)
-    if key in _DBG_SEEN:
-        return
-    _DBG_SEEN.add(key)
-    if x is None:
-        print(f"[hs] layer={layer_id} stage={stage} x=None", flush=True)
-        return
-    shape = tuple(x.shape)
-    if x.numel() == 0:
-        print(f"[hs] layer={layer_id} stage={stage} EMPTY shape={shape}", flush=True)
-        return
-    xf = x.detach().float()
-    flat = xf.reshape(-1)
-    n_nan = int(torch.isnan(flat).sum().item())
-    n_inf = int(torch.isinf(flat).sum().item())
-    max_abs = float(flat.abs().max().item())
-    abs_mean = float(flat.abs().mean().item())
-    sl = xf.reshape(xf.shape[0], -1)[0, :16].tolist()
-    sl_str = "[" + ",".join(f"{v:+.4e}" for v in sl) + "]"
-    print(
-        f"[hs] layer={layer_id} stage={stage} shape={shape} "
-        f"max_abs={max_abs:.4e} abs_mean={abs_mean:.4e} "
-        f"nan={n_nan} inf={n_inf} slice={sl_str}",
-        flush=True,
-    )
-
-
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -1187,7 +1126,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        _dbg_hs(self.layer_id, "entry", hidden_states)
         residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
@@ -1208,7 +1146,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x_quant = None
         else:
             x_quant = None
-        _dbg_hs(self.layer_id, "post_input_norm", hidden_states)
 
         hidden_states = self.self_attn(
             x=hidden_states,
@@ -1216,7 +1153,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             x_quant=x_quant,
         )
-        _dbg_hs(self.layer_id, "post_attn", hidden_states)
 
         fused_mhc = try_fused_hc_post_pre(
             hidden_states,
@@ -1247,7 +1183,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             )  # -> [n, d]
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
-        _dbg_hs(self.layer_id, "post_ffn_norm", hidden_states)
 
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -1289,23 +1224,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
-        _dbg_hs(self.layer_id, "post_mlp", hidden_states)
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
-            _dbg_hs(self.layer_id, "post_dp_scatter", hidden_states)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
-            _dbg_hs(self.layer_id, "post_a2a_gather", hidden_states)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        _dbg_hs(self.layer_id, "exit", hidden_states)
 
         return hidden_states
 

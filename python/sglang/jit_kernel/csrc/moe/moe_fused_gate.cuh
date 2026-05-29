@@ -43,9 +43,8 @@ __device__ __forceinline__ float compute_score(float x) {
     // sigmoid(x) = 1 / (1 + exp(-x))
     return 1.0f / (1.0f + expf(-x));
   } else {
-    // sqrt(softplus(x)) — stable form: softplus(x) = max(x,0) + log1p(exp(-|x|))
-    // Avoids expf overflow for large x (fp32 expf saturates above ~88).
-    float softplus = fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x)));
+    // sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
+    float softplus = log1pf(expf(x));
     return sqrtf(softplus);
   }
 }
