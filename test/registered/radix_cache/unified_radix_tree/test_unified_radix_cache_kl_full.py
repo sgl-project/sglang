@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=250, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
 
 FULL_MODEL = "Qwen/Qwen3-32B"
 
@@ -31,7 +31,7 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "4",
+                "2",
                 "--mem-fraction-static",
                 "0.80",
                 "--page-size",
