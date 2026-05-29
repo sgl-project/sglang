@@ -10,7 +10,7 @@ from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
+from sglang.srt.kv_canary.runner import kernel_launcher as kernel_launcher_module
 from sglang.srt.kv_canary.state import ViolationLog
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
@@ -28,7 +28,7 @@ class TestManagerPerForward(CanaryManagerTestCase):
         """Verify per-forward execution launches plan, head/tail verify kernels, and write kernels in order."""
         calls: list[object] = []
         with patch.object(
-            kernel_launch_module,
+            kernel_launcher_module,
             "launch_canary_plan_kernels",
             lambda **kwargs: calls.append("plan"),
         ), patch.object(
@@ -88,7 +88,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         )
         forward_batch.num_token_non_padded_cpu = 1
 
-        kernel_launch_module.launch_endpoints_per_forward(
+        kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,
@@ -141,7 +141,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         )
         forward_batch.num_token_non_padded_cpu = 1
 
-        kernel_launch_module.launch_endpoints_per_forward(
+        kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,
@@ -179,7 +179,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         )
         forward_batch.num_token_non_padded_cpu = 1
 
-        kernel_launch_module.launch_endpoints_per_forward(
+        kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,
@@ -215,7 +215,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         )[:, 0]
         forward_batch.num_token_non_padded_cpu = 1
 
-        kernel_launch_module.launch_endpoints_per_forward(
+        kernel_launcher_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,

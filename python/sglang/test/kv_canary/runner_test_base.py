@@ -12,7 +12,7 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
-from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
+from sglang.srt.kv_canary.runner import kernel_launcher as kernel_launcher_module
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
@@ -104,7 +104,7 @@ class CanaryManagerTestCase(CustomTestCase):
         # Stub plan/verify/write kernels so CPU runs don't need CUDA JIT.
         self._patchers = [
             patch.object(
-                kernel_launch_module,
+                kernel_launcher_module,
                 "launch_canary_plan_kernels",
                 lambda **kwargs: None,
             ),

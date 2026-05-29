@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
-from sglang.srt.kv_canary.runner.kernel_launch import launch_endpoints_sweep
+from sglang.srt.kv_canary.runner.kernel_launcher import launch_endpoints_sweep
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.sweep_plan_builder import build_verify_plan_radix_sweep
 

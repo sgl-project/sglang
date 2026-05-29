@@ -17,7 +17,7 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     populate_req_to_expected_token_ids,
 )
 from sglang.srt.kv_canary.runner.enable_warner import CanaryEnableWarner
-from sglang.srt.kv_canary.runner.kernel_launch import (
+from sglang.srt.kv_canary.runner.kernel_launcher import (
     invoke_plan,
     launch_endpoints_per_forward,
 )

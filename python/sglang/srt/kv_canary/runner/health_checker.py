@@ -9,7 +9,7 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
-from sglang.srt.kv_canary.runner.kernel_launch import passes_v_half_gate
+from sglang.srt.kv_canary.runner.kernel_launcher import passes_v_half_gate
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
