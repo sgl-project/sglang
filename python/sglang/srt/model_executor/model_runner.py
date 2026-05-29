@@ -121,6 +121,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -249,6 +250,7 @@ MLA_ATTENTION_BACKENDS = [
     "fa4",
     "triton",
     "flashmla",
+    "cutedsl_mla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
@@ -263,6 +265,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "fa3",
     "fa4",
     "flashmla",
+    "cutedsl_mla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
@@ -1432,7 +1435,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_prepared = 0
         num_routed_experts = None
         for module in self.model.modules():
-            if not isinstance(module, TopK):
+            if not isinstance(module, (TopK, HashTopK)):
                 continue
             if (
                 not module.enable_deepep_waterfill
@@ -1459,15 +1462,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_physical_routed_experts = (
                 num_routed_experts + self.server_args.ep_num_redundant_experts
             )
+            if isinstance(module, TopK):
+                routed_scaling_factor = module.topk_config.routed_scaling_factor
+            else:
+                routed_scaling_factor = module.routed_scaling_factor
             module.deepep_waterfill_balancer = balancer_cls(
                 num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=self.moe_ep_rank,
                 layer_id=module.layer_id,
                 routed_scaling_factor=(
-                    module.topk_config.routed_scaling_factor
-                    if module.topk_config.routed_scaling_factor is not None
-                    else 1.0
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
             )
             num_prepared += 1
@@ -2302,20 +2307,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Covers framework-level warmups and optional model-specific warmups.
+        Currently only doing FlashInfer autotune.
         """
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
-
-        # Models may need their own warmup for model-specific kernels or JIT paths.
-        # Register those hooks on the model class so ModelRunner can keep this
-        # warmup entry point generic.
-        model_kernel_warmup = getattr(self.model, "kernel_warmup", None)
-        if model_kernel_warmup is not None:
-            model_kernel_warmup(self)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
@@ -2383,13 +2381,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from flashinfer.autotuner import autotune
 
         cache_path = self._flashinfer_autotune_cache_path()
-        logger.info("Running FlashInfer autotune with cache: %s", cache_path)
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+            autotune_cache = cache_path
+            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            runs_dir = cache_path.parent / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            autotune_cache = (
+                runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+            )
+            logger.info(
+                "Running FlashInfer autotune (cache reuse DISABLED via "
+                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
+                autotune_cache,
+            )
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
+            with torch.inference_mode(), autotune(True, cache=str(autotune_cache)):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
@@ -3101,11 +3113,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
-        # in this case, we need to reinit the forward metadata, otherwise the stale
-        # metadata causes batch_size mismatch in attention kernel(e.g. DSA Indexer).
+        # In DP Attention, IDLE batches may be padded (batch_size > 0) for MLP
+        # sync. Reinit metadata for the padded case so attention kernels see
+        # the right batch_size (e.g. DSA Indexer). For the unpadded case
+        # (batch_size == 0) explicitly drop any stale forward_metadata left
+        # over from the previous forward — without this, attention layers
+        # called from the idle path can re-read a prior batch's req_pool
+        # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
             self.attn_backend.init_forward_metadata(forward_batch)
+        else:
+            self.attn_backend.forward_metadata = None
 
         kwargs = {}
         if self.support_pp:

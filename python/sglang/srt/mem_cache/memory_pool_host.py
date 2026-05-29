@@ -187,9 +187,11 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        torch.cuda.cudart().cudaHostRegister(
+        ret = torch.cuda.cudart().cudaHostRegister(
             buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
         )
+        if ret != 0:
+            raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
     return buffer
 
 
