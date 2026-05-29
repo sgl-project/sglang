@@ -564,11 +564,13 @@ class Engine(EngineScoreMixin, EngineBase):
     def _launch_weight_cache_daemons(cls, server_args: ServerArgs):
         """Launch weight cache daemon processes for each GPU/TP rank.
 
-        Each daemon loads model weights into GPU memory and serves them
-        via CUDA IPC handles. Engine processes then load from daemons
-        instead of disk, enabling fast restart.
+        All daemon processes join the same NCCL distributed group so that
+        TP-sharded model loading works correctly. Each daemon holds its
+        rank's weight shard in GPU memory and serves IPC handles.
         """
         import multiprocessing as mp
+
+        from sglang.srt.utils.network import NetworkAddress
 
         from sglang.srt.weight_cache.daemon import run_weight_cache_daemon
         from sglang.srt.weight_cache.protocol import get_ready_path
@@ -576,9 +578,15 @@ class Engine(EngineScoreMixin, EngineBase):
         tp_size = server_args.tp_size
         gpu_ids = list(range(tp_size))
 
+        # Allocate a shared port for daemon distributed group
+        # All daemons must connect to the same init_method to form a process group
+        dist_port = PortArgs.init_new(server_args).nccl_port
+        dist_init_method = NetworkAddress("127.0.0.1", dist_port).to_tcp()
+
         daemon_procs = []
         logger.info(
-            f"Launching {tp_size} weight cache daemon(s) for model={server_args.model_path}"
+            f"Launching {tp_size} weight cache daemon(s) for model={server_args.model_path}, "
+            f"dist_init_method={dist_init_method}"
         )
 
         for gpu_id in gpu_ids:
@@ -596,6 +604,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     model_loader_extra_config=server_args.model_loader_extra_config,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    dist_init_method=dist_init_method,
                 ),
                 daemon=True,
                 name=f"weight_cache_daemon_gpu{gpu_id}",

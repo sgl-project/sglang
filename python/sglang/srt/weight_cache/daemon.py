@@ -61,6 +61,7 @@ class WeightCacheDaemon:
         model_loader_extra_config: str = "{}",
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
+        dist_init_method: Optional[str] = None,
     ):
         self.model_path = model_path
         self.gpu_id = gpu_id
@@ -73,6 +74,7 @@ class WeightCacheDaemon:
         self.model_loader_extra_config = model_loader_extra_config
         self.trust_remote_code = trust_remote_code
         self.revision = revision
+        self.dist_init_method = dist_init_method
 
         self.socket_path = get_socket_path(gpu_id)
         self.ready_path = get_ready_path(gpu_id)
@@ -85,8 +87,8 @@ class WeightCacheDaemon:
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
 
-        Models expect TP/PP groups, DP attention, and other distributed
-        state to be initialized.
+        All daemon processes for the same TP group must join the same
+        distributed process group with world_size=tp_size and rank=tp_rank.
         """
         from sglang.srt.distributed.parallel_state import (
             init_distributed_environment,
@@ -105,15 +107,18 @@ class WeightCacheDaemon:
         import torch.distributed as dist
 
         if not dist.is_initialized():
-            import socket as sock_mod
-            with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", 0))
-                free_port = s.getsockname()[1]
+            if self.dist_init_method is None:
+                # Fallback: auto-assign a port. This only works for tp_size=1.
+                import socket as sock_mod
+                with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
+                    s.bind(("127.0.0.1", 0))
+                    free_port = s.getsockname()[1]
+                self.dist_init_method = f"tcp://127.0.0.1:{free_port}"
 
             init_distributed_environment(
-                world_size=1,
-                rank=0,
-                distributed_init_method=f"tcp://127.0.0.1:{free_port}",
+                world_size=self.tp_size,
+                rank=self.tp_rank,
+                distributed_init_method=self.dist_init_method,
                 local_rank=self.gpu_id,
                 backend="nccl" if torch.cuda.is_available() else "gloo",
             )
@@ -128,8 +133,9 @@ class WeightCacheDaemon:
         initialize_dp_attention(server_args, model_config)
 
         logger.info(
-            f"[WeightCacheDaemon gpu={self.gpu_id}] "
-            f"Distributed backend initialized (tp_size={self.tp_size})"
+            f"[WeightCacheDaemon gpu={self.gpu_id} rank={self.tp_rank}] "
+            f"Distributed backend initialized (tp_size={self.tp_size}, "
+            f"world_size={self.tp_size})"
         )
 
     def load(self):
@@ -359,11 +365,12 @@ def run_weight_cache_daemon(
     model_loader_extra_config: str = "{}",
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
+    dist_init_method: Optional[str] = None,
 ):
     """Entry point for running a weight cache daemon process."""
     logging.basicConfig(
         level=logging.INFO,
-        format=f"%(asctime)s [Daemon gpu={gpu_id}] %(levelname)s %(message)s",
+        format=f"%(asctime)s [Daemon gpu={gpu_id} rank={tp_rank}] %(levelname)s %(message)s",
     )
 
     daemon = WeightCacheDaemon(
@@ -378,6 +385,7 @@ def run_weight_cache_daemon(
         model_loader_extra_config=model_loader_extra_config,
         trust_remote_code=trust_remote_code,
         revision=revision,
+        dist_init_method=dist_init_method,
     )
 
     daemon.load()
@@ -398,6 +406,9 @@ if __name__ == "__main__":
     parser.add_argument("--quantization", default=None, help="Quantization method")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--revision", default=None, help="Model revision")
+    parser.add_argument("--dist-init-method", default=None,
+                        help="Distributed init method (e.g. tcp://127.0.0.1:PORT). "
+                             "Required for tp_size > 1. All daemons must share the same address.")
 
     args = parser.parse_args()
 
@@ -412,4 +423,5 @@ if __name__ == "__main__":
         quantization=args.quantization,
         trust_remote_code=args.trust_remote_code,
         revision=args.revision,
+        dist_init_method=args.dist_init_method,
     )
