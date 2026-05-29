@@ -475,48 +475,6 @@ class WaveAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        assert encoder_lens is None, "Not supported"
-
-        # Multi-step speculative decode: kv buffers come from spec_info rather than
-        # the cuda-graph pool, so replay is not involved for this path.
-        if forward_mode.is_decode_or_idle() and spec_info is not None:
-            self.forward_metadata = ForwardMetadata(
-                attn_logits=self.cuda_graph_attn_logits,
-                attn_lse=self.cuda_graph_attn_lse,
-                max_extend_len=None,
-                num_kv_splits=self.cuda_graph_num_kv_splits,
-                kv_indptr=spec_info.kv_indptr,
-                kv_indices=spec_info.kv_indices,
-                qo_indptr=None,
-                custom_mask=None,
-                mask_indptr=None,
-            )
-            return
-
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=None,
-        )
-        self.forward_metadata = self._build_cuda_graph_forward_metadata(
-            bs, forward_mode, spec_info
-        )
-
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -582,26 +540,6 @@ class WaveAttnBackend(AttentionBackend):
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        # Thin shim — body lives in _apply_cuda_graph_metadata.
-        self._apply_cuda_graph_metadata(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
