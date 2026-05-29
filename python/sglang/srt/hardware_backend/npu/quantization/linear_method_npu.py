@@ -121,7 +121,6 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
         weight.data = weight.data.transpose(-2, -1).contiguous()        
         weight.data = npu_format_cast(weight.data)                                          
         weight.data = self._pack_to_int32(weight.data)
-        )
 
     def _pack_int4(self, weight) -> torch.Tensor:
         """
