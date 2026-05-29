@@ -698,7 +698,8 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        # fill_ids = origin_input_ids + output_ids. Updated if chunked.
+        # Committed truncated input tokens for the current/last forward.
+        # DLLM: container with mask block; non-DLLM: (origin + output)[:committed_len].
         self.fill_ids = array("q")
 
         self.session = session
@@ -1056,14 +1057,15 @@ class Req(ReqDllmMixin):
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
-    ):
+    ) -> array:
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
+            full_token_ids = self.fill_ids
         else:
-            self.fill_ids = self.origin_input_ids + self.output_ids
+            full_token_ids = self.origin_input_ids + self.output_ids
 
-        input_len = len(self.fill_ids)
+        input_len = len(full_token_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1081,7 +1083,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.fill_ids[: self._compute_max_prefix_len(input_len)]
+        token_ids_to_match = full_token_ids[: self._compute_max_prefix_len(input_len)]
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
@@ -1140,7 +1142,8 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+        self.set_extend_input_len(input_len - len(self.prefix_indices))
+        return full_token_ids
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
