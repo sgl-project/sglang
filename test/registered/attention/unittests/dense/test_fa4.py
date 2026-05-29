@@ -5,7 +5,6 @@ from pathlib import Path
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import get_device_sm
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,25 +37,21 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_dense_split_op_extend_case,
 )
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-@unittest.skipIf(
-    get_device_sm() >= 100,
-    "FA3 backend requires SM 80-90; skipping on Blackwell+ (B200/GB200/GB300)",
-)
-class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
+class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
     # FlashAttention kernels are most stable in this harness with FA-friendly dims.
     HEAD_DIM = 64
     HIDDEN_SIZE = 256
 
-    CASES = make_dense_cases("fa3")
+    CASES = make_dense_cases("fa4")
     CUDA_GRAPH_CASES = (
         DenseAttentionCase(
-            name="runner_cuda_graph_fa3_mha_decode_page_boundary",
-            backend="fa3",
+            name="runner_cuda_graph_fa4_mha_decode_page_boundary",
+            backend="fa4",
             forward_mode=ForwardMode.DECODE,
             num_heads=4,
             num_kv_heads=4,
@@ -67,8 +62,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     DRAFT_EXTEND_CASES = (
         (
             DenseAttentionCase(
-                name="runner_fa3_eagle_draft_extend",
-                backend="fa3",
+                name="runner_fa4_eagle_draft_extend",
+                backend="fa4",
                 forward_mode=ForwardMode.DRAFT_EXTEND,
                 num_heads=4,
                 num_kv_heads=4,
@@ -80,8 +75,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
-                name="runner_fa3_frozen_kv_mtp_draft_extend",
-                backend="fa3",
+                name="runner_fa4_frozen_kv_mtp_draft_extend",
+                backend="fa4",
                 forward_mode=ForwardMode.DRAFT_EXTEND,
                 num_heads=4,
                 num_kv_heads=4,
@@ -95,8 +90,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     DRAFT_EXTEND_CUDA_GRAPH_CASES = (
         (
             DenseAttentionCase(
-                name="runner_cuda_graph_fa3_eagle_draft_extend",
-                backend="fa3",
+                name="runner_cuda_graph_fa4_eagle_draft_extend",
+                backend="fa4",
                 forward_mode=ForwardMode.DRAFT_EXTEND,
                 num_heads=4,
                 num_kv_heads=4,
@@ -108,8 +103,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
-                name="runner_cuda_graph_fa3_frozen_kv_mtp_draft_extend",
-                backend="fa3",
+                name="runner_cuda_graph_fa4_frozen_kv_mtp_draft_extend",
+                backend="fa4",
                 forward_mode=ForwardMode.DRAFT_EXTEND,
                 num_heads=4,
                 num_kv_heads=4,
@@ -122,8 +117,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     )
     DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
         DenseAttentionCase(
-            name="runner_cuda_graph_fa3_eagle_draft_extend_v2_fixed_tokens",
-            backend="fa3",
+            name="runner_cuda_graph_fa4_eagle_draft_extend_v2_fixed_tokens",
+            backend="fa4",
             forward_mode=ForwardMode.DRAFT_EXTEND_V2,
             num_heads=4,
             num_kv_heads=4,
@@ -142,8 +137,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     SPEC_VERIFY_CHAIN_CASES = (
         (
             DenseAttentionCase(
-                name="runner_fa3_eagle_verify_chain",
-                backend="fa3",
+                name="runner_fa4_eagle_verify_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=4,
                 num_kv_heads=4,
@@ -155,8 +150,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
-                name="runner_fa3_frozen_kv_mtp_verify_chain",
-                backend="fa3",
+                name="runner_fa4_frozen_kv_mtp_verify_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=4,
                 num_kv_heads=4,
@@ -168,8 +163,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
-                name="runner_fa3_dflash_verify_chain",
-                backend="fa3",
+                name="runner_fa4_dflash_verify_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=4,
                 num_kv_heads=4,
@@ -181,8 +176,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
-                name="runner_fa3_ngram_verify_chain",
-                backend="fa3",
+                name="runner_fa4_ngram_verify_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=4,
                 num_kv_heads=4,
@@ -196,8 +191,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     SPEC_VERIFY_CHAIN_CUDA_GRAPH_CASES = (
         (
             DenseAttentionCase(
-                name="runner_cuda_graph_fa3_eagle_verify_chain",
-                backend="fa3",
+                name="runner_cuda_graph_fa4_eagle_verify_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=4,
                 num_kv_heads=4,
@@ -209,8 +204,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
-                name="runner_cuda_graph_fa3_frozen_kv_mtp_verify_chain",
-                backend="fa3",
+                name="runner_cuda_graph_fa4_frozen_kv_mtp_verify_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=4,
                 num_kv_heads=4,
@@ -222,8 +217,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
-                name="runner_cuda_graph_fa3_dflash_verify_chain",
-                backend="fa3",
+                name="runner_cuda_graph_fa4_dflash_verify_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=4,
                 num_kv_heads=4,
@@ -235,8 +230,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         (
             DenseAttentionCase(
-                name="runner_cuda_graph_fa3_ngram_verify_chain",
-                backend="fa3",
+                name="runner_cuda_graph_fa4_ngram_verify_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_heads=4,
                 num_kv_heads=4,
@@ -249,8 +244,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     )
     EAGLE_DRAFT_EXTEND_RUNNER_CASES = (
         DenseAttentionCase(
-            name="runner_fa3_eagle_draft_extend_cuda_graph_runner",
-            backend="fa3",
+            name="runner_fa4_eagle_draft_extend_cuda_graph_runner",
+            backend="fa4",
             forward_mode=ForwardMode.DRAFT_EXTEND,
             num_heads=4,
             num_kv_heads=4,
@@ -261,8 +256,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     )
     EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES = (
         DenseAttentionCase(
-            name="runner_fa3_eagle_draft_extend_v2_cuda_graph_runner_fixed_tokens",
-            backend="fa3",
+            name="runner_fa4_eagle_draft_extend_v2_cuda_graph_runner_fixed_tokens",
+            backend="fa4",
             forward_mode=ForwardMode.DRAFT_EXTEND_V2,
             num_heads=4,
             num_kv_heads=4,
@@ -274,8 +269,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     EAGLE_DRAFT_RUNNER_CASES = (
         (
             DenseAttentionCase(
-                name="runner_fa3_eagle_draft_decode_cuda_graph_chain",
-                backend="fa3",
+                name="runner_fa4_eagle_draft_decode_cuda_graph_chain",
+                backend="fa4",
                 forward_mode=ForwardMode.DECODE,
                 num_heads=4,
                 num_kv_heads=4,
@@ -288,8 +283,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     )
     FROZEN_KV_MTP_RUNNER_CASES = (
         DenseAttentionCase(
-            name="runner_fa3_frozen_kv_mtp_decode_cuda_graph",
-            backend="fa3",
+            name="runner_fa4_frozen_kv_mtp_decode_cuda_graph",
+            backend="fa4",
             forward_mode=ForwardMode.DECODE,
             num_heads=4,
             num_kv_heads=4,
@@ -301,7 +296,7 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         (
             DenseAttentionCase(
                 name="runner_split_op_mha_extend_ragged_page_boundary",
-                backend="fa3",
+                backend="fa4",
                 forward_mode=ForwardMode.EXTEND,
                 num_heads=4,
                 num_kv_heads=4,
@@ -314,7 +309,7 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         (
             DenseAttentionCase(
                 name="runner_split_op_gqa_extend_cross_page_boundary",
-                backend="fa3",
+                backend="fa4",
                 forward_mode=ForwardMode.EXTEND,
                 num_heads=4,
                 num_kv_heads=2,
@@ -326,20 +321,14 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
-    # Layout-robustness: catches backend bugs in page-table derivation
-    # from non-tidy (req_to_token, out_cache_loc) mappings. See
-    # dense/test_triton.py for the full rationale. FA3 passes
-    # shuffled_pages and interleaved_pages but FAILS on
-    # non_monotonic_extend for EXTEND — FA3's prefill metadata appears
-    # to assume out_cache_loc is monotonic within an extend, so when
-    # the test scatters extend-token slots inside a request the kernel
-    # reads stale K from the wrong physical positions. Documented as a
-    # known production limitation that fragmented allocator state
-    # could surface.
+    # Layout-robustness. See dense/test_triton.py for full rationale and
+    # dense/test_fa3.py for the FA-family non_monotonic_extend known
+    # failure. FA4 inherits FA3's prefill metadata convention and shows
+    # the same divergence on scattered extend-token slots.
     LAYOUT_ROBUSTNESS_CASES = (
         DenseAttentionCase(
             name="layout_extend_two_request_ragged",
-            backend="fa3",
+            backend="fa4",
             forward_mode=ForwardMode.EXTEND,
             num_heads=12,
             num_kv_heads=12,
@@ -349,7 +338,7 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
         ),
         DenseAttentionCase(
             name="layout_decode_page_boundary",
-            backend="fa3",
+            backend="fa4",
             forward_mode=ForwardMode.DECODE,
             num_heads=12,
             num_kv_heads=12,
@@ -359,8 +348,8 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
     )
     LAYOUT_KNOWN_FAILURES = {
         ("layout_extend_two_request_ragged", "non_monotonic_extend"): (
-            "FA3 prefill metadata assumes out_cache_loc is monotonic "
-            "within an extend; a fragmented allocator could trip this."
+            "FA4 inherits FA3's prefill metadata assumption that "
+            "out_cache_loc is monotonic within an extend."
         ),
     }
 
@@ -429,19 +418,32 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
         self.skipTest(
-            "deferred: FA3 DRAFT_EXTEND_V2 CUDA-graph replay requires "
+            "deferred: FA4 DRAFT_EXTEND_V2 CUDA-graph replay requires "
             "`cache_seqlens = prefix + extend` in init_forward_metadata_replay_cuda_graph "
             "(flashattention_backend.py); without that fix the kernel reads prefix-only KV "
             "and produces ~82 % wrong attention values. Tracked in KNOWN_FAILURES.md §C.3."
         )
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dense_draft_extend_v2_cuda_graph_case(
-                    self,
-                    case,
-                    head_dim=self.HEAD_DIM,
-                    hidden_size=self.HIDDEN_SIZE,
-                )
+            for pad_style in ("small_real", "prod_fill"):
+                for capture_bs in (
+                    case.batch_size,
+                    case.batch_size * 2,
+                    case.batch_size * 4,
+                ):
+                    with self.subTest(
+                        case=case.name,
+                        backend=case.backend,
+                        pad_style=pad_style,
+                        capture_bs=capture_bs,
+                    ):
+                        run_dense_draft_extend_v2_cuda_graph_case(
+                            self,
+                            case,
+                            head_dim=self.HEAD_DIM,
+                            hidden_size=self.HIDDEN_SIZE,
+                            cuda_graph_capture_batch_size=capture_bs,
+                            pad_style=pad_style,
+                        )
 
     def test_runner_mode_eagle_draft_extend_cases(self):
         for case, spec_kind in self.DRAFT_EXTEND_CASES:

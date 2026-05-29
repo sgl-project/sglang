@@ -6,13 +6,13 @@ unit-test suite, **organized by the action needed to address it**.
 
 Anything failing that is not listed here should be treated as a regression.
 
-Last updated: 2026-05-27
+Last updated: 2026-05-29
 
 ## Reference runs
 
 | Host | Hardware | Result |
 |---|---|---|
-| H200 | SM 9.0 (Hopper) | **176 tests, 30 skipped, 0 failures** in ~40 s |
+| H200 | SM 9.0 (Hopper) | **172 passed, 23 skipped, 0 failures, 536 subtests passed** in ~51 s |
 | GB300 | SM 10.3 (Grace-Blackwell) | After `cf482d662`: all §A/§B/§C.3-Blackwell failures now skip cleanly with documented reasons. Previously: 21 failed, 160 passed, 87 skipped, 436 subtests passed in ~215 s. |
 
 ## Top-level structure
