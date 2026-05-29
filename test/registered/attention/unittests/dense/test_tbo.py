@@ -94,14 +94,15 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         "FA3 backend requires SM 80-90",
     )
     def test_tbo_target_verify_cuda_graph_capture_delegates_to_primary_capture(self):
-        """TBO capture must invoke ``primary.init_forward_metadata_capture_cuda_graph``,
-        not ``primary.init_forward_metadata_replay_cuda_graph``.
+        """TBO capture must dispatch primary's
+        ``init_forward_data_out_graph(fb, in_capture=True)`` (the capture
+        path), not the replay path.
 
         Backends like FlashAttention store per-bs metadata in dicts populated
-        only by their capture path (via ``_bind_metadata_buffers``). If TBO
-        short-circuits its capture to its own replay (which delegates to
-        ``primary.replay``), those dicts are empty and replay raises
-        ``KeyError: bs``. Reproduces the deepep-4-gpu-h100 failure where
+        only by the in_capture=True branch (via ``_bind_metadata_buffers``).
+        If TBO short-circuits its capture to its own replay path, those dicts
+        are empty and replay raises ``KeyError: bs``. Reproduces the
+        deepep-4-gpu-h100 failure where
         ``flashattention_backend.target_verify_metadata[bs]`` lookup blew up
         during ``init_device_graphs``.
 
@@ -126,18 +127,10 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         capture_bs = case.batch_size
         num_tokens = sum(case.extend_lens)
         wrapper.init_cuda_graph_state(max_bs=capture_bs, max_num_tokens=num_tokens)
-        # This is the failing call before the fix: TBO.capture delegating to
-        # primary.replay (instead of primary.capture) reads an unpopulated
+        # This is the failing call before the fix: TBO dispatching to
+        # primary's replay path (instead of capture) reads an unpopulated
         # ``target_verify_metadata[bs]`` dict and raises KeyError.
-        wrapper.init_forward_metadata_capture_cuda_graph(
-            bs=capture_bs,
-            num_tokens=num_tokens,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            encoder_lens=batch.encoder_lens,
-            forward_mode=batch.forward_mode,
-            spec_info=batch.spec_info,
-        )
+        wrapper.init_forward_data_out_graph(batch, in_capture=True)
 
 
 if __name__ == "__main__":
