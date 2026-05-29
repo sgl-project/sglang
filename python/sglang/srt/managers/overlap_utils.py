@@ -21,17 +21,10 @@ def decide_needs_cpu_seq_lens(
     server_args: "ServerArgs",
     attn_backends: Sequence["AttentionBackend"],
 ) -> bool:
-    """Decide whether the overlap scheduler must produce seq_lens_cpu / sum.
+    """Whether FutureMap must publish seq_lens_cpu / sum.
 
-    Returns True (safe default) when any consumer in the spec_v2 forward path
-    reads the CPU mirror; False only when every consumer opts out, in which
-    case `FutureMap.resolve_seq_lens_cpu` skips the D2H sync.
-
-    Sources of truth, in order:
-    - Feature-level forced-True: features that read seq_lens_cpu in code
-      paths the backend capability flag cannot speak for (TBO, piecewise CG).
-    - Per-backend capability: AttentionBackend.needs_cpu_seq_lens, OR-ed
-      over every backend a spec_v2 forward touches.
+    OR over per-backend needs_cpu_seq_lens; force True under TBO / piecewise CG
+    (they read the CPU mirror outside the backend layer).
     """
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
