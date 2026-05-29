@@ -143,9 +143,10 @@ class RealtimeVideoInitRequest(VideoGenerationsRequest):
 
 
 class RealtimeEvent(BaseModel):
-    type: Literal["prompt", "control"]
+    type: Literal["prompt", "control", "camera"]
     prompt: Optional[str] = None
     control_chunk: Optional[List[List[str]]] = None
+    camera: Optional[Any] = None
 
 
 # Mesh API protocol models
