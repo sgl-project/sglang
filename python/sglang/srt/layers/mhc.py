@@ -672,8 +672,6 @@ def mhc_pre(
     )
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-        import deep_gemm
-
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -683,12 +681,14 @@ def mhc_pre(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
-        deep_gemm.tf32_hc_prenorm_gemm(
+        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+        tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
             gemm_out_mul,
             gemm_out_sqrsum,
-            num_splits=n_splits,
+            n_splits,
         )
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits

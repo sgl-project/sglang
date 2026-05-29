@@ -13,6 +13,8 @@
 # ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import dataclasses
@@ -24,6 +26,7 @@ import signal
 import socket
 import sys
 import threading
+from array import array
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -82,7 +85,11 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
 )
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
-from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_TOKENIZER,
+    TokenizerMetricsCollector,
+    resolve_collector_class,
+)
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -216,6 +223,16 @@ class InputFormat(Enum):
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    @property
+    def serving_chat_class(self):
+        """Return the serving chat class for OpenAI API.
+
+        Override in subclass to provide custom serving behavior.
+        """
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        return OpenAIServingChat
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -280,7 +297,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # so we need to reserve the space for the draft tokens.
             self.num_reserved_tokens = max(
                 server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-                server_args.speculative_num_draft_tokens,
+                server_args.max_speculative_num_draft_tokens,
             )
         else:
             self.num_reserved_tokens = 0
@@ -444,7 +461,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        start_disagg_service(self.server_args)
+        # Keep a reference so the bootstrap server is not garbage-collected.
+        self.bootstrap_server = start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
@@ -474,7 +492,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     labels[label] = ""
             if self.server_args.extra_metric_labels:
                 labels.update(self.server_args.extra_metric_labels)
-            self.metrics_collector = TokenizerMetricsCollector(
+            tokenizer_collector_cls = resolve_collector_class(
+                self.server_args,
+                STAT_LOGGER_ROLE_TOKENIZER,
+                TokenizerMetricsCollector,
+            )
+            self.metrics_collector = tokenizer_collector_cls(
                 server_args=self.server_args,
                 labels=labels,
                 bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
@@ -769,8 +792,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if (
                 not self.server_args.language_only
-                or self.server_args.encoder_transfer_backend
-                in ["zmq_to_tokenizer", "mooncake"]
+                or self.server_args.encoder_transfer_backend == "zmq_to_tokenizer"
             ):
                 if self.server_args.language_only:
                     mm_inputs = await self.mm_receiver.recv_mm_data(
@@ -794,10 +816,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
             elif (
                 self.server_args.language_only
-                and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+                and self.server_args.encoder_transfer_backend
+                in ["zmq_to_scheduler", "mooncake"]
                 and not obj.need_wait_for_mm_inputs
             ):
-                # In language_only mode with zmq_to_scheduler, if we didn't dispatch
+                # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
@@ -976,12 +999,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
-        input_ids: List[int],
+        input_ids: Optional[List[int]],
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        input_ids_arr: Optional[array[int]] = (
+            array("q", input_ids) if input_ids is not None else None
+        )
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -1009,7 +1035,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
-                input_ids,
+                input_ids_arr,
                 mm_inputs,
                 sampling_params,
                 obj.return_logprob,
@@ -1041,6 +1067,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                mm_data_mooncake=obj.mm_data_mooncake,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1051,12 +1078,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and obj.embed_override_token_id is not None
             ):
                 positional_embed_overrides = self._resolve_embed_overrides(
-                    input_ids, obj.embed_override_token_id, obj.embed_overrides
+                    input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,
-                input_ids,
+                input_ids_arr,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
@@ -1077,7 +1104,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     @staticmethod
     def _resolve_embed_overrides(
-        input_ids: List[int],
+        input_ids: array[int],
         token_id: int,
         embeds: List[torch.Tensor],
     ) -> PositionalEmbeds:
@@ -1776,7 +1803,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self.server_args.incremental_streaming_output and is_stream
                 )
                 delta_text = recv_obj.output_strs[i]
-                delta_output_ids = recv_obj.output_ids[i]
+                delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
                 state.output_ids.extend(delta_output_ids)
@@ -1819,7 +1846,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 incremental = (
                     self.server_args.incremental_streaming_output and is_stream
                 )
-                delta_output_ids = recv_obj.output_ids[i]
+                delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
 
@@ -2686,7 +2713,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This flag will be used in _tokenize_one_request to determine processing path
             if should_dispatch:
                 obj.need_wait_for_mm_inputs = True
-                if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+                if self.server_args.encoder_transfer_backend in [
+                    "zmq_to_scheduler",
+                    "mooncake",
+                ]:
                     self.mm_receiver.send_encode_request(obj)
             else:
                 obj.need_wait_for_mm_inputs = False

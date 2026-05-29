@@ -4,7 +4,7 @@ Launches TP=4 with Marlin FP4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: base-c-test-dsv4-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
+Registry: base-c-test-deepep-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=370, stage="base-c", runner_config="dsv4-8-gpu-h200")
+register_cuda_ci(est_time=370, stage="base-c", runner_config="deepep-8-gpu-h200")
 
 
 def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:
@@ -122,6 +122,38 @@ class TestDSV4FlashFP4H200FlashInferCutlass(
                 "1",
                 "--speculative-num-draft-tokens",
                 "4",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+class TestDSV4FlashFP4NonMTPH200(
+    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
+):
+    """LowLatency recipe without MTP: TP=4, Marlin FP4, no speculative decoding."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--moe-runner-backend",
+                "marlin",
+                "--watchdog-timeout",
+                "900",
             ],
         )
 

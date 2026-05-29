@@ -191,7 +191,7 @@ class TestGLM5MXFP4EvalMI35x(unittest.TestCase):
     def setUpClass(cls):
         cls.models = get_glm5_mxfp4_models()
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_glm5_mxfp4_accuracy(self):
         """Test GLM-5-MXFP4 with GSM8K completion benchmark."""
