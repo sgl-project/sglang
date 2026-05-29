@@ -107,9 +107,8 @@ class FutureMap:
         )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
         # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # this exists to recover occupancy lost to the WAR barrier, which is itself
-        # CUDA-only (HIP wait_stream serializes instead of overlapping). On AMD there
-        # is no barrier, so the plain .cpu() bootstrap path is used.
+        # recovers occupancy lost to the WAR barrier (also CUDA-only); AMD has no
+        # barrier and uses the plain .cpu() bootstrap path.
         if _is_cuda:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
