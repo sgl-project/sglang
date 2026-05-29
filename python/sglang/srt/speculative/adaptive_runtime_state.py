@@ -1,9 +1,8 @@
-import bisect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from sglang.srt.speculative.adaptive_spec_params import build_per_bs_params
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -67,33 +66,28 @@ class AdaptiveController:
     """Facade that owns adaptive decision-making and runtime state switching.
 
     Works with any worker that implements ``AdaptiveSpecWorker`` protocol:
-      - ``build_adaptive_runtime_state(steps, draft_tokens)`` → runtime state
-      - ``apply_runtime_state(state)`` → apply it to the worker
+      - ``build_adaptive_runtime_state()`` → runtime state
+      - ``apply_runtime_state()`` → apply it to the worker
 
     The worker only needs to:
       1. Call ``register()`` for the initial state, then ``init_states()``
          once during startup.
-      2. Call ``on_verify_complete(num_correct_drafts_per_req, batch_size)`` after each decode verify.
+      2. Call ``on_verify_complete()`` after each decode verify.
     """
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
         self.worker = worker
-        self._bs_list, self._bs_params = build_per_bs_params(config_path)
+        self.params = AdaptiveSpeculativeParams(config_path)
         self._states: dict[int, SpecRuntimeState] = {}
-        self._cuda_graph_bs: list[int] | None = None
 
         logger.info(
-            f"AdaptiveController initialized: bs_list={self._bs_list}, "
+            f"AdaptiveController initialized: "
             f"candidate_steps={self.candidate_steps}"
         )
 
     @property
     def candidate_steps(self) -> list[int]:
-        """Union of all BS slots' candidate steps."""
-        all_steps: set[int] = set()
-        for params in self._bs_params.values():
-            all_steps.update(params.candidate_steps)
-        return sorted(all_steps)
+        return self.params.candidate_steps
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
@@ -104,38 +98,15 @@ class AdaptiveController:
         self._states[key] = state
 
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
-        """Build and register runtime states for all candidate steps.
-
-        Args:
-            cuda_graph_bs: Full list of batch sizes for which CUDA graphs may be
-                captured.  When provided, each step only captures graphs for the
-                batch-size values that can actually reach it, saving GPU memory.
-                When ``None``, all batch sizes are captured for every step
-                (original behaviour).
-        """
-        self._cuda_graph_bs = (
-            sorted(cuda_graph_bs) if cuda_graph_bs is not None else None
-        )
-
-        # All steps share the same init_max_bs so that each draft attention
-        # backend allocates _sched_meta_buf with a consistent shape.
+        """Build and register runtime states for all candidate steps."""
+        self.params.set_cuda_graph_bs(cuda_graph_bs)
         init_max_bs = max(cuda_graph_bs) if cuda_graph_bs is not None else None
 
         for steps in self.candidate_steps:
-            pruned_bs = (
-                self._cuda_graph_bs_for_step(steps, cuda_graph_bs)
-                if cuda_graph_bs is not None
-                else None
-            )
             if steps in self._states:
-                logger.info(
-                    f"init_states: step={steps}, cuda_graph_bs={pruned_bs} (pre-registered)"
-                )
                 continue
-            logger.info(
-                f"init_states: step={steps}, cuda_graph_bs={pruned_bs}, "
-                f"init_max_bs={init_max_bs}"
-            )
+
+            pruned_bs = self.params.cuda_graph_bs_for_step(steps)
             state = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,
                 speculative_num_draft_tokens=steps + 1,
@@ -144,64 +115,22 @@ class AdaptiveController:
             )
             self._states[steps] = state
 
-        self._activate(self._get_steps_for_batch(1))
+        self._activate(self.params.get_steps_for_batch(1))
 
     def activate_step_by_batch(self, batch_size: int, current_steps: int) -> None:
-        """Activate the optimal step for *batch_size* if it differs from *current_steps*.
-
-        Called before each draft round so that cross-BS-range switches
-        take effect before drafting begins.
-        """
-        target = self._get_steps_for_batch(batch_size)
+        target = self.params.get_steps_for_batch(batch_size)
         if target != current_steps:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
         """Feed verify results; switch runtime state if EMA warrants it."""
-        if batch_size <= 0:
-            return
-
-        bs = self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
-        params = self._bs_params[bs]
-        if params.update(num_correct_drafts_per_req):
-            self._activate(params.current_steps)
-
-    def _find_closest_bs(self, target: int) -> int:
-        """Find largest BS key <= target (lower-bound range match)."""
-        idx = bisect.bisect_right(self._bs_list, target) - 1
-        return self._bs_list[max(0, idx)]
-
-    def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
-        """Round batch_size up to the nearest CUDA graph batch size."""
-        bs_list = self._cuda_graph_bs
-        if bs_list is None:
-            return batch_size
-
-        idx = bisect.bisect_left(bs_list, batch_size)
-        return bs_list[idx] if idx < len(bs_list) else batch_size
-
-    def _get_steps_for_batch(self, batch_size: int) -> int:
-        """Get the current optimal step count for a given batch size."""
-        bs = self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
-        return self._bs_params[bs].current_steps
-
-    def _cuda_graph_bs_for_step(
-        self, step: int, all_cuda_graph_bs: list[int]
-    ) -> list[int]:
-        """Return the cuda_graph_bs values that need to be *captured* for *step*.
-
-        For each CUDA graph batch size *v*, we check which BS config slot *v*
-        maps to at runtime (via ``_find_closest_bs``), and include *v* only if
-        that slot's candidate_steps contains *step*.  This matches the runtime
-        lookup path exactly, so we never capture graphs that can't be reached.
-        """
-        return [
-            v
-            for v in sorted(all_cuda_graph_bs)
-            if step in self._bs_params[self._find_closest_bs(v)].candidate_steps
-        ]
+        new_step = self.params.on_verify_complete(
+            num_correct_drafts_per_req, batch_size
+        )
+        if new_step is not None:
+            self._activate(new_step)
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

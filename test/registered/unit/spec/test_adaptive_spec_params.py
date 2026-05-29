@@ -4,7 +4,7 @@ import unittest
 
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
-    build_per_bs_params,
+    SpecSlotParams,
     resolve_candidate_steps_from_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -12,40 +12,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class TestAdaptiveSpeculativeParams(unittest.TestCase):
+class TestSpecSlotParams(unittest.TestCase):
     def _make_params_from_config(self, initial_steps: int, config: dict):
-        """Create params from a dict (the per-slot config passed by _init_per_bs)."""
-        return AdaptiveSpeculativeParams(initial_steps=initial_steps, bs_cfg=config)
-
-    def test_params_from_dict(self):
-        params = self._make_params_from_config(
-            5,
-            {
-                "candidate_steps": [1, 5],
-                "ema_alpha": 0.75,
-                "warmup_batches": 2,
-            },
-        )
-        self.assertEqual(params.candidate_steps, [1, 5])
-        self.assertEqual(params.ema_alpha, 0.75)
-        self.assertEqual(params.warmup_batches, 2)
-
-    def test_params_loads_config_path(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump(
-                {
-                    "candidate_steps": [1, 5],
-                    "ema_alpha": 0.75,
-                    "warmup_batches": 2,
-                },
-                f,
-            )
-            f.flush()
-            params = AdaptiveSpeculativeParams(initial_steps=5, bs_cfg=f.name)
-
-        self.assertEqual(params.candidate_steps, [1, 5])
-        self.assertEqual(params.ema_alpha, 0.75)
-        self.assertEqual(params.warmup_batches, 2)
+        return SpecSlotParams(initial_steps=initial_steps, bs_cfg=config)
 
     def test_initial_steps_snaps_to_middle_when_missing(self):
         params = self._make_params_from_config(2, {"candidate_steps": [1, 3, 7]})
@@ -258,12 +227,13 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.ceiling_coeff, 0)
 
 
-class TestBuildPerBsParams(unittest.TestCase):
+class TestAdaptiveSpeculativeParams(unittest.TestCase):
     def test_default_config_loads(self):
-        bs_list, bs_params = build_per_bs_params()
-        self.assertEqual(bs_list, [1, 8])
-        self.assertEqual(bs_params[1].candidate_steps, [1, 3, 7])
-        self.assertEqual(bs_params[8].candidate_steps, [1])
+        params = AdaptiveSpeculativeParams()
+        self.assertEqual(params._bs_list, [1, 8, 32])
+        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
+        self.assertEqual(params._slots[8].candidate_steps, [1, 3])
+        self.assertEqual(params._slots[32].candidate_steps, [1])
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -275,25 +245,25 @@ class TestBuildPerBsParams(unittest.TestCase):
                 f,
             )
             f.flush()
-            bs_list, bs_params = build_per_bs_params(f.name)
-        self.assertEqual(bs_list, [1, 32])
-        self.assertEqual(bs_params[1].candidate_steps, [1, 5])
-        self.assertEqual(bs_params[1].up_hysteresis, 0.3)
-        self.assertEqual(bs_params[32].candidate_steps, [1, 2])
+            params = AdaptiveSpeculativeParams(f.name)
+        self.assertEqual(params._bs_list, [1, 32])
+        self.assertEqual(params._slots[1].candidate_steps, [1, 5])
+        self.assertEqual(params._slots[1].up_hysteresis, 0.3)
+        self.assertEqual(params._slots[32].candidate_steps, [1, 2])
 
-    def test_invalid_config_falls_back_to_default(self):
+    def test_invalid_config_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump({"not_a_bs": "bad"}, f)
             f.flush()
-            bs_list, bs_params = build_per_bs_params(f.name)
-        self.assertEqual(bs_list, [1, 8])
+            with self.assertRaises(ValueError):
+                AdaptiveSpeculativeParams(f.name)
 
-    def test_invalid_steps_falls_back_to_default(self):
+    def test_invalid_steps_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump({"1": {"candidate_steps": "bad"}}, f)
             f.flush()
-            bs_list, bs_params = build_per_bs_params(f.name)
-        self.assertEqual(bs_list, [1, 8])
+            with self.assertRaises(ValueError):
+                AdaptiveSpeculativeParams(f.name)
 
     def test_global_hysteresis_inherited(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -305,8 +275,8 @@ class TestBuildPerBsParams(unittest.TestCase):
                 f,
             )
             f.flush()
-            _, bs_params = build_per_bs_params(f.name)
-        self.assertEqual(bs_params[1].up_hysteresis, 0.5)
+            params = AdaptiveSpeculativeParams(f.name)
+        self.assertEqual(params._slots[1].up_hysteresis, 0.5)
 
     def test_entry_hysteresis_overrides_global(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -318,37 +288,66 @@ class TestBuildPerBsParams(unittest.TestCase):
                 f,
             )
             f.flush()
-            _, bs_params = build_per_bs_params(f.name)
-        self.assertEqual(bs_params[1].up_hysteresis, 0.1)
+            params = AdaptiveSpeculativeParams(f.name)
+        self.assertEqual(params._slots[1].up_hysteresis, 0.1)
 
-    def test_global_ema_params_inherited(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump(
-                {
-                    "ema_alpha": 0.3,
-                    "warmup_batches": 20,
-                    "update_interval": 10,
-                    "1": {"candidate_steps": [1, 3, 7]},
-                    "64": {"candidate_steps": [1, 3]},
-                },
-                f,
-            )
-            f.flush()
-            _, bs_params = build_per_bs_params(f.name)
-        for bs in [1, 64]:
-            self.assertEqual(bs_params[bs].ema_alpha, 0.3)
-            self.assertEqual(bs_params[bs].warmup_batches, 20)
-            self.assertEqual(bs_params[bs].update_interval, 10)
 
-    def test_ceiling_coeff_passthrough(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump(
-                {"1": {"candidate_steps": [1, 3], "ceiling_coeff": 2.5}},
-                f,
-            )
-            f.flush()
-            _, bs_params = build_per_bs_params(f.name)
-        self.assertEqual(bs_params[1].ceiling_coeff, 2.5)
+class TestBatchSizeRouting(unittest.TestCase):
+    """BS-aware routing: batch size selects the slot, CUDA-graph BS pads first."""
+
+    def _params(self):
+        # Slots: bs=1 -> [1,3,7], bs=8 -> [1,3], bs=32 -> [1].
+        return AdaptiveSpeculativeParams()
+
+    def test_routes_to_floor_slot_without_cuda_graph(self):
+        params = self._params()
+        # A batch maps to the largest slot BS <= batch (floor), capped at the top slot.
+        self.assertEqual(params._route(1).candidate_steps, [1, 3, 7])
+        self.assertEqual(params._route(7).candidate_steps, [1, 3, 7])
+        self.assertEqual(params._route(8).candidate_steps, [1, 3])
+        self.assertEqual(params._route(31).candidate_steps, [1, 3])
+        self.assertEqual(params._route(32).candidate_steps, [1])
+        self.assertEqual(params._route(1000).candidate_steps, [1])
+
+    def test_large_batch_is_capped_to_single_step(self):
+        params = self._params()
+        # The bs=32 slot only allows step=1, so large batches can never upshift.
+        self.assertEqual(params.get_steps_for_batch(64), 1)
+
+    def test_cuda_graph_bs_pads_batch_up_before_routing(self):
+        params = self._params()
+        params.set_cuda_graph_bs([4, 8, 16, 32])
+        # bs=5 pads up to the captured graph BS 8 -> slot bs=8.
+        self.assertEqual(params._route(5).candidate_steps, [1, 3])
+        # bs=17 pads up to 32 -> slot bs=32.
+        self.assertEqual(params._route(17).candidate_steps, [1])
+        # A batch larger than every captured BS keeps its own value -> top slot.
+        self.assertEqual(params._route(100).candidate_steps, [1])
+
+    def test_cuda_graph_bs_for_step_prunes_unreachable_graphs(self):
+        params = self._params()
+        params.set_cuda_graph_bs([4, 8, 16, 32])
+        # step=1 is reachable from every slot.
+        self.assertEqual(params.cuda_graph_bs_for_step(1), [4, 8, 16, 32])
+        # step=3 lives in the bs=1 and bs=8 slots: graphs 4,8,16 floor into them.
+        self.assertEqual(params.cuda_graph_bs_for_step(3), [4, 8, 16])
+        # step=7 lives only in the bs=1 slot: only graph BS 4 floors into it.
+        self.assertEqual(params.cuda_graph_bs_for_step(7), [4])
+
+    def test_cuda_graph_bs_for_step_returns_none_when_disabled(self):
+        params = self._params()
+        self.assertIsNone(params.cuda_graph_bs_for_step(7))
+        params.set_cuda_graph_bs(None)
+        self.assertIsNone(params.cuda_graph_bs_for_step(7))
+
+    def test_observe_verify_feeds_the_routed_slot(self):
+        params = self._params()
+        # Drive the bs=1 slot up with perfect acceptance; the bs=32 slot is
+        # untouched and stays at its single candidate step.
+        for _ in range(40):
+            params.on_verify_complete([7, 7, 7], batch_size=1)
+        self.assertGreater(params.get_steps_for_batch(1), 1)
+        self.assertEqual(params.get_steps_for_batch(32), 1)
 
 
 class TestResolveCandidateSteps(unittest.TestCase):
@@ -371,38 +370,26 @@ class TestResolveCandidateSteps(unittest.TestCase):
             )
         self.assertEqual(steps, [2, 3, 4])
 
-    def test_invalid_config_falls_back(self):
+    def test_invalid_config_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump({"bad": "config"}, f)
             f.flush()
-            steps = resolve_candidate_steps_from_config(
-                initial_steps=3, cfg_path=f.name
-            )
-        # Falls back to default, which has steps [1,3,7] + initial_steps=3
-        self.assertIn(1, steps)
-        self.assertIn(7, steps)
+            with self.assertRaises(ValueError):
+                resolve_candidate_steps_from_config(initial_steps=3, cfg_path=f.name)
 
-    def test_empty_steps_falls_back(self):
+    def test_empty_steps_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump({"1": {"candidate_steps": []}}, f)
             f.flush()
-            steps = resolve_candidate_steps_from_config(
-                initial_steps=3, cfg_path=f.name
-            )
-        # Falls back to default
-        self.assertIn(1, steps)
-        self.assertIn(7, steps)
+            with self.assertRaises(ValueError):
+                resolve_candidate_steps_from_config(initial_steps=3, cfg_path=f.name)
 
-    def test_zero_steps_falls_back(self):
+    def test_zero_steps_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump({"1": {"candidate_steps": [0]}}, f)
             f.flush()
-            steps = resolve_candidate_steps_from_config(
-                initial_steps=3, cfg_path=f.name
-            )
-        # Falls back to default (step=0 not supported yet)
-        self.assertIn(1, steps)
-        self.assertIn(7, steps)
+            with self.assertRaises(ValueError):
+                resolve_candidate_steps_from_config(initial_steps=3, cfg_path=f.name)
 
 
 if __name__ == "__main__":

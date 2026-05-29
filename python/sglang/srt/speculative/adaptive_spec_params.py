@@ -5,9 +5,11 @@ Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import math
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 from sglang.srt.utils import log_info_on_rank0
@@ -17,25 +19,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Default adaptive config (conservative).
-# Used when --speculative-adaptive is enabled without --speculative-adaptive-config.
-#
-# Config format: integer-keyed dict where each key is a BS lower bound.
-# BS lookup uses bisect (largest key <= actual padded BS).
-# See docs/advanced_features/adaptive_speculative_decoding_per_bs.md for
-# recommended configs for different draft model qualities.
-# ---------------------------------------------------------------------------
-# TODO: add step=0 (nospec fallback) for BS>=64 once supported —
-# on hard workloads, even step=1 loses to nospec at high batch sizes.
+_DEFAULT_CANDIDATE_STEPS: list[int] = [1, 3, 7]
+
+# TODO: add step=0 (nospec fallback) for BS>=8 once supported.
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
-        "candidate_steps": [1, 3, 7],
+        "candidate_steps": _DEFAULT_CANDIDATE_STEPS,
         "up_hysteresis": 0.0,
         "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
     },
     "8": {
+        "candidate_steps": [1, 3],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+    "32": {
         "candidate_steps": [1],
         "up_hysteresis": 0.0,
         "down_hysteresis": 0.0,
@@ -79,134 +79,57 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
-def load_adaptive_config(path: str | None) -> dict:
-    """Load adaptive speculative config from a JSON file.
-
-    The file is a JSON object with integer-string keys as BS lower bounds::
-
-        {"1": {"candidate_steps": [1,3,7], ...}, "64": {"candidate_steps": [1,2,5], ...}}
-
-    Non-integer keys (``ema_alpha``, ``update_interval``, …) are global
-    overrides applied to every BS slot.
-
-    Returns an empty dict when *path* is ``None``.
-    """
-    if path is None:
-        return {}
-    with open(path) as f:
-        cfg = json.load(f)
-    if not isinstance(cfg, dict):
-        raise ValueError(
-            "speculative_adaptive_config must be a JSON object, "
-            f"got {type(cfg).__name__}"
-        )
-    return cfg
-
-
-def _resolve_candidate_steps(config: dict) -> dict[int, dict] | None:
-    """Extract per-BS entries from a config dict.
-
-    Integer-string keys (``"1"``, ``"64"``, …) become ``{1: {...}, 64: {...}}``.
-    Non-integer keys are ignored (they are global overrides).
-
-    Returns ``None`` when no BS entries found.
-    """
-    result: dict[int, dict] = {}
-    for key, entry in config.items():
-        try:
-            bs = int(key)
-        except ValueError:
-            continue
-        if not isinstance(entry, dict):
-            raise ValueError(
-                f"Invalid adaptive config for BS {bs}: "
-                f"expected a dict, got {type(entry).__name__}"
-            )
-        result[bs] = entry
-    return result if result else None
-
-
-def _load_validated_config(
+def _load_adaptive_config(
     cfg_path: str | None,
 ) -> tuple[dict, dict[int, dict]]:
     """Load and validate adaptive config.
 
     Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
     """
-    cfg = load_adaptive_config(cfg_path) if cfg_path else DEFAULT_ADAPTIVE_CONFIG
-    bs_config = _resolve_candidate_steps(cfg)
-    if bs_config is None:
-        raise ValueError(
-            "speculative_adaptive_config must contain at least one integer-string "
-            'BS key, e.g. {"1": {"candidate_steps": [1,3,7]}}. '
-            f"Got keys: {list(cfg.keys())}"
-        )
+    if cfg_path is not None:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    else:
+        cfg = DEFAULT_ADAPTIVE_CONFIG
 
-    for bs, entry in bs_config.items():
-        steps = entry.get("candidate_steps")
-        if steps is not None and (
+    bs_entries: dict[int, dict] = {}
+    for key, entry in cfg.items():
+        if not key.isdigit():
+            continue
+
+        steps = entry.setdefault("candidate_steps", _DEFAULT_CANDIDATE_STEPS)
+        if (
             not isinstance(steps, list)
             or not steps
             or not all(isinstance(s, int) and s > 0 for s in steps)
         ):
             raise ValueError(
-                f"BS {bs}: 'candidate_steps' must be a non-empty list of "
-                f"positive ints, got {steps!r}"
+                f"BS {key}: candidate_steps must be a list of positive ints, got {steps!r}"
             )
-    return cfg, bs_config
+        bs_entries[int(key)] = entry
+
+    if not bs_entries:
+        raise ValueError(
+            "speculative_adaptive_config must contain at least one integer-string "
+            'BS key, e.g. {"1": {"candidate_steps": [1,3,7]}}. '
+            f"Got keys: {list(cfg.keys())}"
+        )
+    return cfg, bs_entries
 
 
 def resolve_candidate_steps_from_config(
     initial_steps: int,
     cfg_path: str | None = None,
 ) -> list[int]:
-    """Resolve the union of all candidate steps from config.
-
-    Used by ``ServerArgs.effective_max_speculative_num_draft_tokens()``
-    to determine the max draft-token count without building the full
-    AdaptiveController.
-    """
-    _, bs_config = _load_validated_config(cfg_path)
-    all_steps: set[int] = set()
-    for entry in bs_config.values():
-        all_steps.update(entry.get("candidate_steps", [1, 3, 7]))
-    all_steps.add(initial_steps)
+    """Load adaptive config and resolve candidate steps."""
+    _, bs_entries = _load_adaptive_config(cfg_path)
+    all_steps: set[int] = {initial_steps}
+    for entry in bs_entries.values():
+        all_steps.update(entry["candidate_steps"])
     return sorted(all_steps)
 
 
-def build_per_bs_params(
-    cfg_path: str | None = None,
-) -> tuple[list[int], dict[int, "AdaptiveSpeculativeParams"]]:
-    """Parse config and build one ``AdaptiveSpeculativeParams`` per BS slot.
-
-    Returns ``(bs_list, bs_params)`` where *bs_list* is the sorted list of
-    BS lower-bound keys and *bs_params* maps each key to its params instance.
-    """
-    cfg, bs_config = _load_validated_config(cfg_path)
-
-    bs_list = sorted(bs_config.keys())
-    bs_params: dict[int, AdaptiveSpeculativeParams] = {}
-    for bs, entry in sorted(bs_config.items()):
-        steps = entry.get("candidate_steps", [1, 3, 7])
-        initial = steps[len(steps) // 2]
-        params_cfg = {
-            **cfg,
-            "candidate_steps": steps,
-            "up_hysteresis": entry.get("up_hysteresis", cfg.get("up_hysteresis", 0.0)),
-            "down_hysteresis": entry.get(
-                "down_hysteresis", cfg.get("down_hysteresis", -0.25)
-            ),
-        }
-        if "ceiling_coeff" in entry:
-            params_cfg["ceiling_coeff"] = entry["ceiling_coeff"]
-        bs_params[bs] = AdaptiveSpeculativeParams(
-            initial_steps=initial,
-            bs_cfg=params_cfg,
-        )
-    return bs_list, bs_params
-
-
-class AdaptiveSpeculativeParams:
+class SpecSlotParams:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
     The core idea: if drafts are consistently accepted, try more steps;
@@ -219,26 +142,17 @@ class AdaptiveSpeculativeParams:
     - num_steps can be selected from different candidate sets on different batch_sizes
     """
 
-    def __init__(
-        self,
-        initial_steps: int,
-        bs_cfg: str | dict | None = None,
-    ):
-        if isinstance(bs_cfg, dict):
-            cfg = bs_cfg
-        else:
-            cfg = load_adaptive_config(bs_cfg)
-        candidates = sorted(set(cfg.get("candidate_steps", [1, 3, 7])))
-
+    def __init__(self, initial_steps: int, bs_cfg: dict):
+        candidates = sorted(set(bs_cfg["candidate_steps"]))
         assert len(candidates) >= 1, "candidate_steps must have at least 1 value"
         self.candidate_steps = candidates
 
-        self.ema_alpha = cfg.get("ema_alpha", 0.2)
-        self.update_interval = cfg.get("update_interval", 5)
-        self.warmup_batches = cfg.get("warmup_batches", 10)
-        self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
-        self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
-        self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
+        self.ema_alpha = bs_cfg.get("ema_alpha", 0.2)
+        self.update_interval = bs_cfg.get("update_interval", 5)
+        self.warmup_batches = bs_cfg.get("warmup_batches", 10)
+        self.down_hysteresis = bs_cfg.get("down_hysteresis", -0.25)
+        self.up_hysteresis = bs_cfg.get("up_hysteresis", 0.0)
+        self.ceiling_coeff = bs_cfg.get("ceiling_coeff", 0)
 
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
@@ -257,7 +171,7 @@ class AdaptiveSpeculativeParams:
 
         log_info_on_rank0(
             logger,
-            f"AdaptiveSpeculativeParams initialized: "
+            f"SpecSlotParams initialized: "
             f"steps={self.current_steps}, candidate_steps={self.candidate_steps}",
         )
 
@@ -325,3 +239,75 @@ class AdaptiveSpeculativeParams:
             )
             return True
         return False
+
+
+class AdaptiveSpeculativeParams:
+    """Routes ``batch_size`` to the correct per-BS ``SpecSlotParams``."""
+
+    def __init__(self, cfg_path: str | None = None):
+        cfg, bs_entries = _load_adaptive_config(cfg_path)
+        self._bs_list: list[int] = sorted(bs_entries)
+        self._slots: dict[int, SpecSlotParams] = {}
+        for bs, entry in sorted(bs_entries.items()):
+            merged = {**cfg, **entry}
+            steps = merged["candidate_steps"]
+            self._slots[bs] = SpecSlotParams(
+                initial_steps=steps[len(steps) // 2],
+                bs_cfg=merged,
+            )
+        self._cuda_graph_bs: list[int] | None = None
+
+    @cached_property
+    def candidate_steps(self) -> list[int]:
+        """Union of all BS slots' candidate steps."""
+        return sorted({s for p in self._slots.values() for s in p.candidate_steps})
+
+    def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
+        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
+
+    def get_steps_for_batch(self, batch_size: int) -> int:
+        return self._route(batch_size).current_steps
+
+    def on_verify_complete(
+        self, num_correct_drafts_per_req: list[int], batch_size: int
+    ) -> int | None:
+        """Feed verify results to the matching BS slot's EMA.
+
+        Returns the new step if a switch is warranted, else ``None``.
+        """
+        params = self._route(batch_size)
+        if params.update(num_correct_drafts_per_req):
+            return params.current_steps
+        return None
+
+    def cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
+        """Return cuda_graph_bs values that can reach *step* at runtime.
+
+        Returns ``None`` when CUDA graphs are disabled (``set_cuda_graph_bs``
+        was never called or was called with ``None``).
+        """
+        if self._cuda_graph_bs is None:
+            return None
+        return [
+            v
+            for v in self._cuda_graph_bs
+            if step in self._slots[self._find_closest_bs(v)].candidate_steps
+        ]
+
+    def _route(self, batch_size: int) -> SpecSlotParams:
+        """Map *batch_size* → pad to CUDA-graph BS → closest slot."""
+        return self._slots[
+            self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
+        ]
+
+    def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
+        if self._cuda_graph_bs is None:
+            return batch_size
+        idx = bisect.bisect_left(self._cuda_graph_bs, batch_size)
+        return (
+            self._cuda_graph_bs[idx] if idx < len(self._cuda_graph_bs) else batch_size
+        )
+
+    def _find_closest_bs(self, target: int) -> int:
+        idx = bisect.bisect_right(self._bs_list, target) - 1
+        return self._bs_list[max(0, idx)]
