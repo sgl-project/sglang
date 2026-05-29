@@ -325,6 +325,15 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "11px", fontStyle: "italic",
       color: isDark ? "#9ca3af" : "#6b7280",
     },
+    // Small legend row below a bench block — used today to define
+    // `interactivity = 1000 / TPOT(ms)`. Muted, italic, mono for the
+    // formula so the equality reads as a definition not a metric.
+    benchLegend: {
+      fontSize: "10px", fontStyle: "italic",
+      color: isDark ? "#6b7280" : "#9ca3af",
+      marginTop: "6px",
+      fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+    },
     benchEmpty: {
       fontSize: "12px", fontStyle: "italic",
       color: isDark ? "#9ca3af" : "#6b7280",
@@ -626,11 +635,15 @@ export const Deployment = ({ config, benchmarks }) => {
   //              present (GSM8K today; add more via ACCURACY_LABELS).
   //              Comes BEFORE speed — model quality leads serving speed.
   //   speed    : metric × workload table. Rows are TTFT / TPOT /
-  //              tokens/sec/GPU / interactivity (1000/TPOT_ms). Columns
-  //              are per-workload measurements (typically varying
+  //              tokens/sec/GPU / interactivity (1000/TPOT_ms) — all
+  //              four ALWAYS render so every cell shares the same
+  //              schema; unmeasured entries show "—". Columns are
+  //              per-workload measurements (typically varying
   //              max-concurrency). Shared workload context (dataset,
   //              in/out) is lifted to an italic line above the table;
   //              the differing parts become the column headers.
+  //              A small `legend` strip below the table defines
+  //              derived metrics (e.g. `interactivity = 1000/TPOT(ms)`).
   //   notes    : optional italic line
   //   empty    : when the entry has no measured numbers
   //
@@ -751,7 +764,7 @@ export const Deployment = ({ config, benchmarks }) => {
     // wrappers with negative horizontal margins, which mis-align
     // inside our nested card. `.not-prose` only disables prose
     // typography, NOT the table component wrapping.
-    const renderBenchTable = ({ title, sharedText, colHeaders, rows, colCount }) => {
+    const renderBenchTable = ({ title, sharedText, colHeaders, rows, colCount, legend }) => {
       if (rows.length === 0) return null;
       const showColHeaders = colHeaders.length > 0
         && colHeaders.some((h) => h !== "");
@@ -790,14 +803,22 @@ export const Deployment = ({ config, benchmarks }) => {
               )),
             ])}
           </div>
+          {legend && (
+            <div style={s.benchLegend}>{legend}</div>
+          )}
         </div>
       );
     };
 
     // Build the speed-table data structure: rows are metrics (TTFT,
     // TPOT, …), columns are per-workload measurements (typically
-    // varying max-concurrency). Drop metric rows where every
-    // measurement is null so partial sweeps stay tight.
+    // varying max-concurrency). All four metric rows ALWAYS render —
+    // unmeasured cells show "—" — so the table shape is identical
+    // across every cell of the catalog (low-latency, balanced,
+    // high-throughput). Without this, partial sweeps would look like
+    // two different benchmark schemas (a "latency table" with no
+    // tokens/sec row vs a "throughput table" with no TTFT/TPOT rows),
+    // which is exactly the confusion this design unifies.
     const buildSpeedTable = (measurements) => {
       if (measurements.length === 0) return null;
       const { shared, differing } = partitionWorkload(measurements);
@@ -805,20 +826,17 @@ export const Deployment = ({ config, benchmarks }) => {
         measurements[0] && measurements[0].workload, shared);
       const colHeaders = measurements.map((m) =>
         formatWorkloadParts(m && m.workload, differing));
-      const rows = SPEED_LABELS
-        .map((tup) => {
-          const [key, label, unit, compute] = tup;
-          const values = measurements.map((m) => {
-            const raw = compute ? compute(m) : m[key];
-            return fmt(raw, unit);
-          });
-          if (values.every((v) => v === null)) return null;
-          return { label, values };
-        })
-        .filter((r) => r !== null);
-      if (rows.length === 0) return null;
+      const rows = SPEED_LABELS.map((tup) => {
+        const [key, label, unit, compute] = tup;
+        const values = measurements.map((m) => {
+          const raw = compute ? compute(m) : m[key];
+          return fmt(raw, unit);
+        });
+        return { label, values };
+      });
       return { title: "Speed", sharedText, colHeaders, rows,
-               colCount: measurements.length };
+               colCount: measurements.length,
+               legend: "interactivity = 1000 / TPOT(ms)" };
     };
 
     // Build the accuracy-table data structure. One row per benchmark
