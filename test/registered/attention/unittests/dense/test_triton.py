@@ -413,9 +413,27 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
                 )
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
+        # pad_ratio is expressed as the captured batch size relative to the
+        # case's real batch size: 1.0x = no padding, 2.0x = 50% padded, etc.
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dense_draft_extend_v2_cuda_graph_case(self, case)
+            for pad_style in ("small_real", "prod_fill"):
+                for capture_bs in (
+                    case.batch_size,
+                    case.batch_size * 2,
+                    case.batch_size * 4,
+                ):
+                    with self.subTest(
+                        case=case.name,
+                        backend=case.backend,
+                        pad_style=pad_style,
+                        capture_bs=capture_bs,
+                    ):
+                        run_dense_draft_extend_v2_cuda_graph_case(
+                            self,
+                            case,
+                            cuda_graph_capture_batch_size=capture_bs,
+                            pad_style=pad_style,
+                        )
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_runner_cases(self):
         for case in self.EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES:
