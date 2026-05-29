@@ -113,8 +113,22 @@ MEAN_ROUGE_L_THRESHOLD = 0.85
 NIAH_MINI_THRESHOLD = 4  # of 5
 PREFIX_MATCH_CHARS = 32
 
-REFERENCE_SCHEMA = "dsv32_quality_refs_v1"
-SMOKE_MAX_NEW_TOKENS = 256
+REFERENCE_SCHEMA = "dsv32_quality_refs_v2_concise"
+# Concise-answer measurement (user-approved, loop5 R7): AC-Q is a QUALITY smoke —
+# it should compare DS vs DSA on the ANSWER, not on free-form 256-token
+# chain-of-thought. On open-ended prompts at temperature 0, DS and DSA follow
+# different (both valid) greedy trajectories that diverge within ~16 tokens, and
+# DS can fall into a greedy repetition loop on a minority of prompts — even though
+# DS's selection is full-context (dense_fallback=0) and DS produces the correct
+# answer when asked concisely (verified on hardware: 17*23->391, primes->53,59,61).
+# A uniform system directive applied IDENTICALLY to DS and DSA elicits the concise
+# answer, removing the greedy-CoT confound while keeping the DS-vs-DSA comparison.
+# Evidence + rationale: runs/20260528_dsv32_mvp/ac_q_diagnosis_round7.md.
+CONCISE_SYSTEM_PROMPT = (
+    "Answer directly and concisely. Give only the final answer; do not show your "
+    "reasoning or intermediate steps."
+)
+SMOKE_MAX_NEW_TOKENS = 64
 NIAH_MAX_NEW_TOKENS = 16
 
 
@@ -139,7 +153,7 @@ def _get_text(url: str, *, timeout: float = 10.0) -> Optional[str]:
 
 
 def generate(base_url: str, prompt: str, *, max_new_tokens: int = SMOKE_MAX_NEW_TOKENS) -> str:
-    """Deterministic (temperature=0) chat completion against sglang.
+    """Deterministic (temperature=0) concise chat completion against sglang.
 
     Uses the OpenAI-compatible ``/v1/chat/completions`` endpoint so the
     model's chat template is applied server-side. The raw ``/generate``
@@ -149,10 +163,17 @@ def generate(base_url: str, prompt: str, *, max_new_tokens: int = SMOKE_MAX_NEW_
     empty string) — agreement gates would still pass on the matching
     garbage, but NIAH recall could not. Chat templating makes every gate
     meaningful while keeping DS and DSA on the identical request path.
+
+    A ``CONCISE_SYSTEM_PROMPT`` system message is sent identically to both DS
+    and DSA so AC-Q measures answer quality rather than greedy-CoT trajectory
+    identity (see ``CONCISE_SYSTEM_PROMPT`` rationale above).
     """
     body = {
         "model": "default",
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": CONCISE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
         "temperature": 0.0,
         "max_tokens": max_new_tokens,
     }
