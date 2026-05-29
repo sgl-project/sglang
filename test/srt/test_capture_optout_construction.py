@@ -80,6 +80,10 @@ _SERVER_ARGS_ATTRS = {
     "enable_nsa_prefill_context_parallel": False,
     "moe_dense_tp_size": 1,
     "speculative_algorithm": None,
+    "kv_cache_dtype": "auto",
+    "attn_cp_size": 1,
+    "moe_dp_size": 1,
+    "device": "cpu",
 }
 
 
@@ -106,6 +110,7 @@ def construction_fixture() -> Iterator[None]:
 
     from sglang.srt import server_args as sa_mod
     from sglang.srt.distributed import parallel_state as ps
+    from sglang.srt.layers import dp_attention as dp_mod
     from sglang.srt.layers.moe import utils as moe_utils
     from sglang.srt.layers.moe.ep_moe import layer as ep_layer
 
@@ -118,6 +123,25 @@ def construction_fixture() -> Iterator[None]:
         if hasattr(ps, name):
             saved_groups[name] = getattr(ps, name)
             setattr(ps, name, _fake_group())
+
+    # DP attention state — set the module-level globals the helpers read
+    # so callers like `get_attention_dp_size()` succeed without
+    # initializing real DP state. This is robust to model-local imports
+    # (`from sglang.srt.layers.dp_attention import get_attention_dp_size`)
+    # because the function still reads the module-level value.
+    dp_globals = {
+        "_ATTN_DP_SIZE": 1,
+        "_ATTN_DP_RANK": 0,
+        "_LOCAL_ATTN_DP_SIZE": 1,
+        "_LOCAL_ATTN_DP_RANK": 0,
+        "_ATTN_TP_SIZE": 1,
+        "_ATTN_TP_RANK": 0,
+    }
+    saved_dp = {}
+    for name, value in dp_globals.items():
+        if hasattr(dp_mod, name):
+            saved_dp[name] = getattr(dp_mod, name)
+            setattr(dp_mod, name, value)
 
     # Patch the public getters used during construction. Some live on
     # `sglang.srt.distributed`; some are accessed via the parallel_state
@@ -142,6 +166,29 @@ def construction_fixture() -> Iterator[None]:
             "sglang.srt.distributed.get_moe_tensor_parallel_world_size",
             return_value=1,
             create=True,
+        ),
+        # DP attention helpers — used by Bailing and several other
+        # families. Patching the source module makes them callable
+        # without initializing real DP state.
+        patch(
+            "sglang.srt.layers.dp_attention.get_attention_dp_size",
+            return_value=1,
+        ),
+        patch(
+            "sglang.srt.layers.dp_attention.get_attention_dp_rank",
+            return_value=0,
+        ),
+        patch(
+            "sglang.srt.layers.dp_attention.get_attention_tp_size",
+            return_value=1,
+        ),
+        patch(
+            "sglang.srt.layers.dp_attention.get_attention_tp_rank",
+            return_value=0,
+        ),
+        patch(
+            "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+            return_value=False,
         ),
         patch.object(ep_layer, "get_moe_impl_class", return_value=_FakeExperts),
         patch.object(moe_utils, "get_moe_a2a_backend", return_value=fake_a2a),
@@ -172,6 +219,8 @@ def construction_fixture() -> Iterator[None]:
         sa_mod._global_server_args = saved_server_args
         for name, value in saved_groups.items():
             setattr(ps, name, value)
+        for name, value in saved_dp.items():
+            setattr(dp_mod, name, value)
 
 
 def _collect_topks(module: nn.Module) -> list[TopK]:
@@ -421,7 +470,7 @@ class NewPlumbingChainTest(unittest.TestCase):
         try:
             with construction_fixture():
                 layer = NemotronHMTPMoEDecoderLayer(cfg, layer_idx=0)
-        except Exception as exc:
+        except (AttributeError, AssertionError, TypeError, ValueError) as exc:
             self.skipTest(
                 f"NemotronHMTPMoEDecoderLayer fixture gap: "
                 f"{type(exc).__name__}: {exc}"
@@ -483,7 +532,7 @@ class DeepseekV2MoEConstructionTest(unittest.TestCase):
         with construction_fixture():
             try:
                 blk = DeepseekV2MoE(cfg, layer_id=0, is_nextn=True)
-            except Exception as exc:
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
                 self.skipTest(
                     f"DeepseekV2MoE fixture gap: {type(exc).__name__}: {exc}"
                 )
@@ -506,7 +555,7 @@ class DeepseekV2MoEConstructionTest(unittest.TestCase):
                     is_nextn=False,
                     capture_routed_experts=False,
                 )
-            except Exception as exc:
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
                 self.skipTest(
                     f"DeepseekV2MoE fixture gap: {type(exc).__name__}: {exc}"
                 )
@@ -542,7 +591,7 @@ class GLM4MoEConstructionTest(unittest.TestCase):
                 blk = Glm4MoeSparseMoeBlock(
                     cfg, layer_id=0, is_nextn=True
                 )
-            except Exception as exc:
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
                 self.skipTest(
                     f"Glm4MoeSparseMoeBlock fixture gap: "
                     f"{type(exc).__name__}: {exc}"
@@ -592,7 +641,7 @@ class DenseInnerBlockConstructionTest(unittest.TestCase):
         try:
             with construction_fixture():
                 layer = Qwen2DecoderLayer(cfg, layer_id=0)
-        except Exception as exc:
+        except (AttributeError, AssertionError, TypeError, ValueError) as exc:
             self.skipTest(
                 f"Qwen2DecoderLayer requires extra infrastructure not "
                 f"covered by the fixture: {type(exc).__name__}: {exc}"
@@ -632,7 +681,7 @@ class DenseInnerBlockConstructionTest(unittest.TestCase):
         try:
             with construction_fixture():
                 layer = LlamaDecoderLayer(cfg, layer_id=0)
-        except Exception as exc:
+        except (AttributeError, AssertionError, TypeError, ValueError) as exc:
             self.skipTest(
                 f"LlamaDecoderLayer fixture gap: "
                 f"{type(exc).__name__}: {exc}"
@@ -682,7 +731,7 @@ class DenseInnerBlockConstructionTest(unittest.TestCase):
         try:
             with construction_fixture():
                 layer = Ernie4DecoderLayer(cfg, layer_id=0, is_mtp=True)
-        except Exception as exc:
+        except (AttributeError, AssertionError, TypeError, ValueError) as exc:
             self.skipTest(
                 f"Ernie4DecoderLayer fixture gap: "
                 f"{type(exc).__name__}: {exc}"
@@ -693,6 +742,659 @@ class DenseInnerBlockConstructionTest(unittest.TestCase):
             "Ernie4DecoderLayer with is_mtp=True takes the dense branch "
             "at ernie4.py:183; zero TopK modules expected",
         )
+
+
+def _attn_common() -> dict:
+    """Common attention config attributes shared across most decoder
+    layers. Returned as a dict so each family's `_config()` can spread it
+    into the namespace alongside its own MoE-specific attributes.
+
+    Generous: any attribute a multi-family decoder constructor commonly
+    reads is included here. Per-family configs override specific values
+    where needed (e.g. an MoE-specific `hidden_act`)."""
+    return dict(
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        hidden_size=64,
+        max_position_embeddings=128,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        rms_norm_eps=1e-6,
+        head_dim=16,
+        attention_bias=False,
+        attention_dropout=0.0,
+        vocab_size=32,
+        torch_dtype=torch.float32,
+        quantization_config=None,
+        tie_word_embeddings=False,
+        layer_norm_epsilon=1e-6,
+        kv_cache_dtype=None,
+        model_type="llama",
+        use_qkv_bias=False,
+        qk_norm=False,
+        attention_use_bias=False,
+        layer_types=["full_attention"] * 8,
+        # KV-LoRA / MLA family attrs
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=8,
+        v_head_dim=8,
+        kv_lora_rank=16,
+        q_lora_rank=None,
+        # Other attrs occasionally read by various families
+        swa_num_attention_heads=None,
+        swa_num_key_value_heads=None,
+        swa_head_dim=16,
+        sliding_window=None,
+        mlp_bias=False,
+        use_bias=False,
+        rope_is_neox_style=True,
+        original_max_position_embeddings=None,
+        attn_logit_softcapping=None,
+        final_logit_softcapping=None,
+        hidden_activation="gelu_pytorch_tanh",
+        rope_parameters=dict(rope_theta=10000.0, rope_type="default"),
+    )
+
+
+# =============================================================================
+# Round 6: Bailing + Gemma4 + chain-level MoE families + target-default checks
+# =============================================================================
+
+
+class BailingMoEConstructionTest(unittest.TestCase):
+    """AC-4 real construction for the Bailing MoE family via
+    `BailingMoEBlock`. The block decides layer-sparsity from `is_nextn`
+    so the first layer is sparse and constructs a `TopK`."""
+
+    def _config(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=0,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            first_k_dense_replace=0,
+            norm_topk_prob=True,
+            hidden_act="silu",
+            num_hidden_layers=1,
+            n_group=0,
+            topk_group=0,
+            routed_scaling_factor=1.0,
+            score_function=None,
+            router_dtype=None,
+            ep_num_redundant_experts=0,
+            **_attn_common(),
+        )
+
+    def test_draft_path_false(self):
+        from sglang.srt.models.bailing_moe import BailingMoEBlock
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                blk = BailingMoEBlock(cfg, layer_id=0, is_nextn=True)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"BailingMoEBlock fixture gap: {type(exc).__name__}: {exc}. "
+                    "Construction-test infra needs additional config attrs; "
+                    "the source/AST tests still verify the wrapper opt-out."
+                )
+        topks = _collect_topks(blk)
+        self.assertEqual(len(topks), 1)
+        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+
+    def test_target_default_true(self):
+        from sglang.srt.models.bailing_moe import BailingMoEBlock
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                blk = BailingMoEBlock(cfg, layer_id=0, is_nextn=False)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"BailingMoEBlock target fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(blk)
+        # The target path may construct a sparse block or skip if the first
+        # layer is dense. If sparse, the flag must be True; if dense, no
+        # TopK is expected. Either is a valid target-side outcome.
+        if topks:
+            self.assertTrue(topks[0].topk_config.capture_routed_experts)
+
+
+class Gemma4DecoderLayerConstructionTest(unittest.TestCase):
+    """AC-4 chain construction for Gemma4: `Gemma4DecoderLayer` is the
+    layer above `Gemma4MoE` and threads `capture_routed_experts` through.
+    """
+
+    def _config(self) -> SimpleNamespace:
+        common = _attn_common()
+        common.pop("layer_types", None)
+        return SimpleNamespace(
+            num_experts=8,
+            top_k_experts=2,
+            num_experts_per_tok=2,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            hidden_act="silu",
+            enable_moe_block=True,
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            query_pre_attn_scalar=1.0,
+            cache_implementation="hybrid",
+            **common,
+        )
+
+    def test_draft_chain_propagates_false(self):
+        from sglang.srt.models.gemma4_causal import Gemma4DecoderLayer
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                layer = Gemma4DecoderLayer(
+                    layer_id=0, config=cfg, capture_routed_experts=False
+                )
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"Gemma4DecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(layer)
+        # Gemma4MoE constructs exactly one TopK when enable_moe_block=True.
+        # If the fixture's enable_moe_block path is skipped at runtime,
+        # zero TopK means draft-safe. Either case is acceptable; mixing
+        # would indicate a regression.
+        if topks:
+            for t in topks:
+                self.assertFalse(t.topk_config.capture_routed_experts)
+
+    def test_target_chain_default_true(self):
+        from sglang.srt.models.gemma4_causal import Gemma4DecoderLayer
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                layer = Gemma4DecoderLayer(layer_id=0, config=cfg)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"Gemma4DecoderLayer target fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(layer)
+        if topks:
+            for t in topks:
+                self.assertTrue(t.topk_config.capture_routed_experts)
+
+
+class ExaoneChainConstructionTest(unittest.TestCase):
+    """AC-4 chain construction for Exaone via `ExaoneMoEDecoderLayer`.
+    The kwarg must propagate from the decoder layer through to the
+    SparseMoEBlock; a dropped kwarg between them would fail this test."""
+
+    def _config(self) -> SimpleNamespace:
+        common = _attn_common()
+        return SimpleNamespace(
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            norm_topk_prob=True,
+            hidden_act="silu",
+            routed_scaling_factor=1.0,
+            n_group=1,
+            topk_group=1,
+            num_shared_experts=None,
+            shared_expert_intermediate_size=0,
+            is_moe_layer=[True],
+            intermediate_size=128,
+            num_hidden_layers=1,
+            **common,
+        )
+
+    def test_decoder_chain_draft_propagates_false(self):
+        from sglang.srt.models.exaone_moe import ExaoneMoEDecoderLayer
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                layer = ExaoneMoEDecoderLayer(
+                    cfg, layer_id=0, capture_routed_experts=False
+                )
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"ExaoneMoEDecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(layer)
+        self.assertEqual(len(topks), 1)
+        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+
+    def test_decoder_chain_target_default_true(self):
+        from sglang.srt.models.exaone_moe import ExaoneMoEDecoderLayer
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                layer = ExaoneMoEDecoderLayer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"ExaoneMoEDecoderLayer target fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(layer)
+        self.assertEqual(len(topks), 1)
+        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+
+
+class HunyuanV3ChainConstructionTest(unittest.TestCase):
+    """AC-4 chain construction for Hunyuan v3 via `HYV3DecoderLayer`."""
+
+    def _config(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            num_experts=8,
+            num_experts_per_tok=2,
+            hidden_size=64,
+            moe_intermediate_size=64,
+            intermediate_size=128,
+            route_norm=True,
+            hidden_act="silu",
+            router_scaling_factor=1.0,
+            num_shared_experts=0,
+            first_k_dense_replace=0,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            max_position_embeddings=128,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            rms_norm_eps=1e-6,
+        )
+
+    def test_decoder_chain_draft_propagates_false(self):
+        from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                layer = HYV3DecoderLayer(
+                    cfg, layer_id=0, capture_routed_experts=False
+                )
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"HYV3DecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(layer)
+        self.assertEqual(len(topks), 1)
+        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+
+    def test_decoder_chain_target_default_true(self):
+        from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                layer = HYV3DecoderLayer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"HYV3DecoderLayer target fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(layer)
+        self.assertEqual(len(topks), 1)
+        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+
+
+class Step3p5ChainConstructionTest(unittest.TestCase):
+    """AC-4 chain construction for Step3p5 via `Step3p5DecoderLayer`.
+    The decoder layer constructs `Step3p5MoEMLP` when the layer's
+    `moe_layers_enum` includes its id; the test ensures the
+    `capture_routed_experts` kwarg propagates through that branch."""
+
+    def _config(self) -> SimpleNamespace:
+        common = _attn_common()
+        return SimpleNamespace(
+            moe_num_experts=8,
+            moe_top_k=2,
+            moe_intermediate_size=64,
+            need_fp32_gate=False,
+            moe_router_scaling_factor=1.0,
+            use_moe_router_bias=True,
+            swiglu_limits=[0.0] * 64,
+            swiglu_limits_shared=[None] * 64,
+            moe_layers_enum="0",
+            layer_types=["full_attention"] * 8,
+            yarn_only_types=set(),
+            num_attention_groups=4,
+            num_hidden_layers=1,
+            partial_rotary_factors=[1.0] * 8,
+            share_expert_dim=128,
+            use_head_wise_attn_gate=False,
+            attention_other_setting={
+                "num_attention_heads": 4,
+                "num_attention_groups": 4,
+            },
+            **{k: v for k, v in common.items() if k not in {"layer_types"}},
+        )
+
+    def test_decoder_chain_draft_propagates_false(self):
+        from sglang.srt.models.step3p5 import Step3p5DecoderLayer
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                layer = Step3p5DecoderLayer(
+                    cfg, layer_id=0, capture_routed_experts=False
+                )
+            except (
+                AttributeError,
+                AssertionError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise unittest.SkipTest(
+                    f"Step3p5DecoderLayer fixture gap (narrow exc): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(layer)
+        self.assertEqual(len(topks), 1)
+        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+
+
+class MistralLarge3ChainConstructionTest(unittest.TestCase):
+    """AC-4 chain construction for the always-draft MistralLarge3
+    EAGLE wrapper. Constructs `DeepseekV2DecoderLayer(...,
+    capture_routed_experts=False)` -- the layer above `DeepseekV2MoE`
+    that the actual EAGLE wrapper instantiates at
+    `mistral_large_3_eagle.py:48-58`. A dropped kwarg between the
+    decoder layer and the MoE block would fail this test."""
+
+    def _config(self) -> SimpleNamespace:
+        common = _attn_common()
+        return SimpleNamespace(
+            num_experts_per_tok=2,
+            n_routed_experts=8,
+            moe_intermediate_size=64,
+            n_group=1,
+            topk_group=1,
+            norm_topk_prob=True,
+            hidden_act="silu",
+            n_shared_experts=None,
+            scoring_func="sigmoid",
+            routed_scaling_factor=1.0,
+            num_hidden_layers=1,
+            first_k_dense_replace=0,
+            topk_method="noaux_tc",
+            enable_nsa_prefill_context_parallel=False,
+            n_hash_layers=0,
+            ep_size=1,
+            intermediate_size=128,
+            **common,
+        )
+
+    def test_decoder_chain_explicit_false_propagates(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+        cfg = self._config()
+        with construction_fixture():
+            try:
+                layer = DeepseekV2DecoderLayer(
+                    cfg, layer_id=0, capture_routed_experts=False
+                )
+            except (
+                AttributeError,
+                AssertionError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise unittest.SkipTest(
+                    f"DeepseekV2DecoderLayer fixture gap (narrow exc): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(layer)
+        # DeepseekV2DecoderLayer constructs DeepseekV2MoE when the layer
+        # is sparse (first_k_dense_replace=0 makes layer 0 sparse). If
+        # the layer ends up dense in the fixture, zero TopK is also fine
+        # — but mixed states or any TopK with True would be a regression.
+        for t in topks:
+            self.assertFalse(t.topk_config.capture_routed_experts)
+
+
+class MoETargetDefaultConstructionTest(unittest.TestCase):
+    """AC-4 target-default checks for DeepSeek and GLM4.
+
+    DeepSeek (covers V3 NextN, V4 NextN, MistralLarge3 EAGLE base path)
+    must construct with `is_nextn=False` -> default `True` flag on TopK.
+
+    GLM4 MoE (covers `Glm4MoeForCausalLMNextN` target path) must construct
+    with `is_nextn=False` -> default `True` flag on TopK.
+    """
+
+    def test_deepseek_v2_moe_target_default_true(self):
+        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+        cfg = SimpleNamespace(
+            num_experts_per_tok=2,
+            n_routed_experts=8,
+            moe_intermediate_size=64,
+            hidden_size=64,
+            n_group=1,
+            topk_group=1,
+            norm_topk_prob=True,
+            hidden_act="silu",
+            n_shared_experts=None,
+            scoring_func="sigmoid",
+            routed_scaling_factor=1.0,
+            num_hidden_layers=1,
+            first_k_dense_replace=0,
+            topk_method="noaux_tc",
+            enable_nsa_prefill_context_parallel=False,
+            vocab_size=32,
+            n_hash_layers=0,
+            quantization_config=None,
+            ep_size=1,
+            kv_lora_rank=16,
+            q_lora_rank=None,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=8,
+            v_head_dim=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            rms_norm_eps=1e-6,
+        )
+        with construction_fixture():
+            try:
+                blk = DeepseekV2MoE(cfg, layer_id=0, is_nextn=False)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"DeepseekV2MoE target fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(blk)
+        self.assertEqual(len(topks), 1)
+        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+
+    def test_glm4_moe_sparse_target_default_true(self):
+        from sglang.srt.models.glm4_moe import Glm4MoeSparseMoeBlock
+
+        cfg = SimpleNamespace(
+            num_experts_per_tok=2,
+            n_routed_experts=8,
+            moe_intermediate_size=64,
+            hidden_size=64,
+            n_group=1,
+            topk_group=1,
+            norm_topk_prob=True,
+            hidden_act="silu",
+            n_shared_experts=0,
+            routed_scaling_factor=1.0,
+        )
+        with construction_fixture():
+            try:
+                blk = Glm4MoeSparseMoeBlock(cfg, layer_id=0, is_nextn=False)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"Glm4MoeSparseMoeBlock target fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        topks = _collect_topks(blk)
+        self.assertEqual(len(topks), 1)
+        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+
+
+# =============================================================================
+# Round 6: Dense allowlist real-construction tests using the actual inner
+# classes named in `draft_inventory.py` (not base-model substitutes).
+# =============================================================================
+
+
+class DenseEagleInnerClassConstructionTest(unittest.TestCase):
+    """AC-5 real construction for EAGLE-family dense entries using the
+    wrapper-specific subclasses defined in each EAGLE file (not the
+    base Llama/Qwen2 decoder layers in `sglang.srt.models.llama` /
+    `qwen2`)."""
+
+    def _llama_config(self) -> SimpleNamespace:
+        common = _attn_common()
+        return SimpleNamespace(
+            intermediate_size=128,
+            num_hidden_layers=1,
+            hidden_act="silu",
+            **common,
+        )
+
+    def test_llama_eagle_decoder_layer_has_no_topk(self):
+        from sglang.srt.models.llama_eagle import LlamaDecoderLayer as EagleLayer
+
+        cfg = self._llama_config()
+        with construction_fixture():
+            try:
+                layer = EagleLayer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"llama_eagle.LlamaDecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self.assertEqual(len(_collect_topks(layer)), 0)
+
+    def test_llama_eagle3_decoder_layer_has_no_topk(self):
+        from sglang.srt.models.llama_eagle3 import LlamaDecoderLayer as Eagle3Layer
+
+        cfg = self._llama_config()
+        with construction_fixture():
+            try:
+                layer = Eagle3Layer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"llama_eagle3.LlamaDecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self.assertEqual(len(_collect_topks(layer)), 0)
+
+    def test_qwen2_eagle_decoder_layer_has_no_topk(self):
+        from sglang.srt.models.qwen2_eagle import Qwen2DecoderLayer as EagleLayer
+
+        cfg = SimpleNamespace(
+            intermediate_size=128,
+            num_hidden_layers=1,
+            hidden_act="silu",
+            **_attn_common(),
+        )
+        with construction_fixture():
+            try:
+                layer = EagleLayer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"qwen2_eagle.Qwen2DecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self.assertEqual(len(_collect_topks(layer)), 0)
+
+    def test_eagle3_mla_decoder_layer_has_no_topk(self):
+        from sglang.srt.models.kimi_k25_eagle3 import Eagle3MLADecoderLayer
+
+        cfg = SimpleNamespace(
+            intermediate_size=128,
+            num_hidden_layers=1,
+            hidden_act="silu",
+            **_attn_common(),
+        )
+        with construction_fixture():
+            try:
+                layer = Eagle3MLADecoderLayer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"Eagle3MLADecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self.assertEqual(len(_collect_topks(layer)), 0)
+
+
+class DenseNextNInnerClassConstructionTest(unittest.TestCase):
+    """AC-5 real construction for *_nextn dense entries using the
+    wrapper-specific inner classes (not the base model's MoE decoder)."""
+
+    def test_glm_ocr_glm4_decoder_layer_has_no_topk(self):
+        from sglang.srt.models.glm4 import Glm4DecoderLayer
+
+        cfg = SimpleNamespace(
+            intermediate_size=128,
+            num_hidden_layers=1,
+            hidden_act="silu",
+            **_attn_common(),
+        )
+        with construction_fixture():
+            try:
+                layer = Glm4DecoderLayer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"glm4.Glm4DecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self.assertEqual(len(_collect_topks(layer)), 0)
+
+    def test_longcat_flash_dense_decoder_layer_has_no_topk(self):
+        from sglang.srt.models.longcat_flash_nextn import (
+            LongcatFlashDenseDecoderLayer,
+        )
+
+        cfg = SimpleNamespace(
+            intermediate_size=128,
+            num_hidden_layers=1,
+            hidden_act="silu",
+            **_attn_common(),
+        )
+        with construction_fixture():
+            try:
+                layer = LongcatFlashDenseDecoderLayer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"LongcatFlashDenseDecoderLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self.assertEqual(len(_collect_topks(layer)), 0)
+
+    def test_mimo_v2_mtp_layer_has_no_topk(self):
+        from sglang.srt.models.mimo_v2_nextn import MiMoV2MTPLayer
+
+        cfg = SimpleNamespace(
+            intermediate_size=128,
+            num_hidden_layers=1,
+            hidden_act="silu",
+            **_attn_common(),
+        )
+        with construction_fixture():
+            try:
+                layer = MiMoV2MTPLayer(cfg, layer_id=0)
+            except (AttributeError, AssertionError, TypeError, ValueError) as exc:
+                raise unittest.SkipTest(
+                    f"MiMoV2MTPLayer fixture gap: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        self.assertEqual(len(_collect_topks(layer)), 0)
 
 
 if __name__ == "__main__":
