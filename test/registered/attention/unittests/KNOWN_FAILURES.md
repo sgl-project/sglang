@@ -161,8 +161,6 @@ fixture investigation; no test in the suite).
 
 | Backend | Mode | Status | Root cause |
 |---|---|---|---|
-| FA3 | `DRAFT_EXTEND_V2` CUDA-graph replay | `[gated]` `dense/test_fa3.py::test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases` | `init_forward_metadata_replay_cuda_graph` sets `cache_seqlens_int32 = seq_lens` (prefix only); effective KV extent must be `prefix + extend` for DRAFT_EXTEND_V2. Kernel reads prefix-only KV → ~82% wrong values. Fix: `cache_seqlens = seq_lens + extend_seq_lens` in `flashattention_backend.py`. |
-| FA4 | `DRAFT_EXTEND_V2` CUDA-graph replay | `[gated]` `dense/test_fa4.py::test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases` | Same root cause as FA3 (FA4 inherits the same `init_forward_metadata_replay_cuda_graph` path). |
 | FlashInfer MLA | EAGLE draft CG, chain | `[gated on SM≥10]` `mla/test_flashinfer.py::test_runner_mode_eagle_draft_cuda_graph_runner_cases` | FlashInfer MLA decode kernel in container targets SM9x; on Blackwell falls back to a generic path that doesn't restore metadata buffers under graph replay (~22 abs-diff vs reference) |
 | FlashMLA | MLA `DRAFT_EXTEND` CUDA-graph replay | `[no test]` (`mla/README.md` Next Work) | Capture falls through to `FlashInferMLAAttnBackend.init_forward_metadata_capture_cuda_graph` (1D `cuda_graph_kv_indices`); FlashMLA decode uses 2D `[max_bs, (max_context + PAGE_SIZE) // PAGE_SIZE]` layout — buffer mismatch |
 | GDN / KDA / Lightning / Mamba2 | `DRAFT_EXTEND` and `DRAFT_EXTEND_V2` graph capture | `[no test]` for CG; eager-only paths covered | `HybridLinearAttnBackend` raises `ValueError("Invalid forward mode")` at `hybrid_linear_attn_backend.py:509,572` |
