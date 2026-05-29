@@ -488,7 +488,7 @@ def all_gather_kv_cache_for_mha_extend(
     prefix_kv_a, prefix_k_pe = gathered_kv_cache.split(
         [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
     )
-
+    prefix_kv_a = prefix_kv_a.squeeze(1)
     # re-organize kv with query orders
     prefix_lens_cu = torch.zeros(
         len(seq_lens) + 1,
@@ -511,7 +511,7 @@ def all_gather_kv_cache_for_mha_extend(
         )
     kv_a = torch.cat(kv_a_tuple, dim=0)
     k_pe = torch.cat(k_pe_tuple, dim=0)
-    return kv_a.squeeze(1).contiguous(), k_pe
+    return kv_a.contiguous(), k_pe
 
 
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
