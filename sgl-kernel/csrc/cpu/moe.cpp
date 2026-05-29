@@ -861,10 +861,14 @@ at::Tensor fused_experts_cpu(
   constexpr int64_t BLOCK_N = block_size_n();
 
   const auto st = hidden_states.scalar_type();
+  // TODO: fused_topk_torch_native (CPU fallback for models like MiniMax)
+  // returns int64 topk_ids; fused_experts_cpu requires int32. Remove the typecast after topk kernel is provided
+  auto topk_ids_ = topk_ids.scalar_type() == at::kInt ? topk_ids : topk_ids.to(at::kInt);
+
   CHECK_INPUT(hidden_states);
   CHECK_INPUT(w1);
   CHECK_INPUT(w2);
-  CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
+  CHECK_EQ(topk_weights.sizes(), topk_ids_.sizes());
   CHECK_DIM(2, hidden_states);
   if (moe_comp_method == CPUQuantMethod::INT4_W4A8 && is_vnni) {
     CHECK_DIM(4, w1);
@@ -874,9 +878,8 @@ at::Tensor fused_experts_cpu(
     CHECK_DIM(3, w2);
   }
   CHECK_DIM(2, topk_weights);
-  CHECK_DIM(2, topk_ids);
-
-  CHECK_EQ(topk_ids.scalar_type(), at::kInt);
+  CHECK_DIM(2, topk_ids_);
+  CHECK_EQ(topk_ids_.scalar_type(), at::kInt);
 
   // TODO: support topk_weights to be bf16 or fp16 in the kernel.
   // The topk_weights of llama4 is computed via Llama4MoE:custom_routing_function and is bf16/fp16
@@ -924,7 +927,7 @@ at::Tensor fused_experts_cpu(
   int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
   auto buffer = at::empty(
       {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
-      topk_ids.options());
+      topk_ids_.options());
 
   int32_t* __restrict__ sorted_ids = buffer.data_ptr<int32_t>();
   int32_t* __restrict__ expert_ids = sorted_ids + max_num_tokens_padded;
@@ -948,7 +951,7 @@ at::Tensor fused_experts_cpu(
 
   // align experts index
   int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
-      sorted_ids, expert_ids, topk_ids.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+      sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
 
   // unlike triton kernel, we fuse silu with gemm1 so only need 2 intermediate_caches:
   //   1. intermediate_cache1 : [M * topk, N]

@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import tempfile
+from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.arg_groups.argparse_actions import (
@@ -46,7 +47,6 @@ from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
-    get_device_name,
     get_device_sm,
     get_int_env_var,
     get_nvidia_driver_version,
@@ -167,6 +167,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flashinfer",
     "flashmla",
     "trtllm_mla",
+    "cutedsl_mla",
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
@@ -590,8 +591,6 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
-    speculative_adaptive: bool = False
-    speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
@@ -604,6 +603,10 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
+
+    # Adaptive speculative decoding
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -674,6 +677,7 @@ class ServerArgs:
 
     # LMCache
     enable_lmcache: bool = False
+    lmcache_config_file: Optional[str] = None
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -2207,7 +2211,21 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
                 )
-        elif "Step3p5ForCausalLM" in model_arch:
+        elif (
+            "Step3p5ForCausalLM" in model_arch
+            or "Step3p7ForConditionalGeneration" in model_arch
+        ):
+            if self.is_attention_backend_not_set():
+                if is_blackwell_supported():
+                    self.attention_backend = "fa4"
+                    logger.info(
+                        "Auto-select fa4 attention backend for Step3p7 on Blackwell."
+                    )
+                elif is_sm90_supported():
+                    self.attention_backend = "fa3"
+                    logger.info(
+                        "Auto-select fa3 attention backend for Step3p7 on Hopper."
+                    )
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(
@@ -2360,7 +2378,7 @@ class ServerArgs:
                 support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=True,
             )
-        elif model_arch in ["NemotronHForCausalLM"]:
+        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
             from sglang.srt.arg_groups.nemotron_h_hook import (
                 apply_nemotron_h_defaults,
             )
@@ -2516,11 +2534,7 @@ class ServerArgs:
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
         # MistralLarge3, Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
-        # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
-        device_name = get_device_name()
-        is_h20_device = (
-            device_name and "H20" in device_name and "H200" not in device_name
-        )
+
         if (
             not self.enable_flashinfer_allreduce_fusion
             and model_arch
@@ -2543,7 +2557,6 @@ class ServerArgs:
             and self.tp_size > 1
             and not self.enable_dp_attention
             and self.nnodes == 1
-            and not is_h20_device
             and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
@@ -2826,6 +2839,35 @@ class ServerArgs:
                     "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
                     f"got {self.kv_cache_dtype}."
                 )
+
+        if (
+            self.attention_backend == "cutedsl_mla"
+            or self.decode_attention_backend == "cutedsl_mla"
+            or self.prefill_attention_backend == "cutedsl_mla"
+        ):
+            assert (
+                self.prefill_attention_backend != "cutedsl_mla"
+            ), "CuteDSL MLA only supports decoding for now"
+            if not is_sm100_supported():
+                raise ValueError(
+                    "CuteDSL MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                )
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"CuteDSL MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+            if self.kv_cache_dtype not in [
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "auto",
+            ]:
+                raise ValueError(
+                    "CuteDSL MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
+                )
+            if self.prefill_attention_backend is None:
+                self.prefill_attention_backend = "trtllm_mla"
 
         if (
             self.attention_backend == "trtllm_mha"
@@ -6093,6 +6135,12 @@ class ServerArgs:
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
         )
+        parser.add_argument(
+            "--lmcache-config-file",
+            type=str,
+            default=ServerArgs.lmcache_config_file,
+            help="Path to the LMCache YAML configuration file",
+        )
 
         # Ktransformer server args
         parser.add_argument(
@@ -7019,8 +7067,9 @@ class ServerArgs:
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
 
-    def effective_max_speculative_num_draft_tokens(self) -> Optional[int]:
-        """Return the maximum draft-token count runtime speculative decoding may use."""
+    @cached_property
+    def max_speculative_num_draft_tokens(self) -> Optional[int]:
+        """Return the maximum draft-token count speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:
