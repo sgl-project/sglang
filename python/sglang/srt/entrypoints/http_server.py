@@ -164,6 +164,7 @@ from sglang.srt.utils import (
     add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
+    is_mps,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -173,7 +174,6 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
-from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -1905,7 +1905,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    is_vlm = bool(model_info.get("has_image_understanding", False)) and not use_mlx()
+    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"

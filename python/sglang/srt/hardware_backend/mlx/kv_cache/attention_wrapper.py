@@ -69,7 +69,6 @@ class BatchedDecodeContext:
         cls,
         *,
         caches: list[list[Any]],
-        num_layers: int,
         req_ids: list[str],
         aot_kernels: MlxAOTKernelSet,
         kv_pool: Any | None,
@@ -78,7 +77,6 @@ class BatchedDecodeContext:
         attention_layer_indices: list[int] | None = None,
         attention_pool_index_by_layer: dict[int, int] | None = None,
     ) -> "BatchedDecodeContext":
-        del num_layers
         batch_size = len(req_ids)
         if attention_layer_indices is None:
             attention_layer_indices = list(range(len(caches[0])))

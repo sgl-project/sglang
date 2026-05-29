@@ -19,6 +19,11 @@ if _HAS_MLX:
     import torch
     from mlx_lm.models.cache import ArraysCache
 
+    import sglang.srt.hardware_backend.mlx.aot as mlx_aot
+    from sglang.srt.hardware_backend.mlx.aot import (
+        MlxAOTKernelSet,
+        MlxAOTRoPEKernel,
+    )
     from sglang.srt.hardware_backend.mlx.kv_cache import (
         BatchedDecodeContext,
         ContiguousAttentionKVCache,
@@ -74,6 +79,13 @@ def _set_runner_cache_layout(
     runner._cache_layout = MlxModelCacheLayout.from_attention_discovery(layers, attrs)
 
 
+def _set_runner_decode_context_defaults(runner) -> None:
+    runner._aot_kernels = MlxAOTKernelSet()
+    runner._attention_kv_pool = None
+    runner._req_pool_idx = {}
+    runner._req_to_token_pool = None
+
+
 def _set_dummy_server_args_for_auxiliary_state_tests() -> None:
     server_args = ServerArgs(model_path="dummy", page_size=1)
     server_args._mamba_cache_chunk_size = 64
@@ -107,6 +119,25 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(attrs, ["attention"])
         self.assertEqual(patch_model_attention(model), 1)
         self.assertIsInstance(model.layers[0].attention, MLXAttentionWrapper)
+
+    def test_aot_rope_kernel_build_uses_head_aliases(self):
+        attn = FakeAttention(use_aliases=True)
+        attn.rope = SimpleNamespace(dims=2, traditional=False, base=10000.0)
+        original_loader = mlx_aot._load_metal_rope_pool_fused
+        mlx_aot._load_metal_rope_pool_fused = lambda: object()
+        try:
+            kernel = mlx_aot._build_rope_kernel(
+                mlx_aot.MlxAOTKernelBuildInputs(
+                    sample_attn=attn,
+                    n_kv_heads=1,
+                    head_dim=2,
+                )
+            )
+        finally:
+            mlx_aot._load_metal_rope_pool_fused = original_loader
+
+        self.assertTrue(kernel.enabled)
+        self.assertEqual(kernel.config["num_qo_heads"], 2)
 
     def test_auxiliary_state_model_returns_per_layer_attention_attrs(self):
         model = FakeModel(
@@ -292,8 +323,10 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
                 }
                 calls = []
 
-                def fake_batched(caches, batched_input):
-                    calls.append((len(caches), batched_input.tolist()))
+                def fake_batched(caches, batched_input, helper_req_ids):
+                    calls.append(
+                        (len(caches), batched_input.tolist(), list(helper_req_ids))
+                    )
                     return mx.array(list(range(len(caches))), dtype=mx.int32)
 
                 def fail_native(*args, **kwargs):
@@ -310,6 +343,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
                         (
                             len(req_ids),
                             [[idx + 10] for idx in range(len(req_ids))],
+                            req_ids,
                         )
                     ],
                 )
@@ -327,8 +361,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         calls = []
 
-        def fake_batched(caches, batched_input):
-            calls.append((len(caches), batched_input.tolist()))
+        def fake_batched(caches, batched_input, helper_req_ids):
+            calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
             return mx.array([8], dtype=mx.int32)
 
         def fail_native(*args, **kwargs):
@@ -344,7 +378,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         pending = runner.decode_batch_start_chained(prev)
 
-        self.assertEqual(calls, [(1, [[7]])])
+        self.assertEqual(calls, [(1, [[7]], ["r0"])])
         self.assertEqual(pending.lazy_tokens.tolist(), [8])
 
     def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
@@ -391,6 +425,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             num_layers=1,
             attention_layer_indices=[0],
         )
+        _set_runner_decode_context_defaults(runner)
         cache = [
             [
                 ContiguousAttentionKVCache(
@@ -405,6 +440,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         lazy_tokens = runner._decode_with_batched_attention(
             cache,
             mx.array([[7]], dtype=mx.int32),
+            ["r0"],
         )
         mx.eval(lazy_tokens, *MlxModelRunner._cache_state_arrays(cache))
 
@@ -412,6 +448,56 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(cache[0][0].offset, 1)
         self.assertEqual(model.seen_inputs, [[[7]]])
         self.assertEqual(model.seen_cache_types, [["AttentionOffsetCache"]])
+
+    def test_batched_decode_context_resolves_aot_rope_slots_from_request_ids(self):
+        cache0 = ContiguousAttentionKVCache(
+            n_kv_heads=1,
+            head_dim=2,
+            max_seq_len=4,
+            dtype=mx.float32,
+        )
+        cache1 = ContiguousAttentionKVCache(
+            n_kv_heads=1,
+            head_dim=2,
+            max_seq_len=4,
+            dtype=mx.float32,
+        )
+        cache0.offset = 1
+        cache1.offset = 2
+        kernel_set = MlxAOTKernelSet(
+            rope=MlxAOTRoPEKernel(
+                base=10000.0,
+                config={
+                    "head_dim": 2,
+                    "num_qo_heads": 1,
+                    "num_kv_heads": 1,
+                },
+                rope_pool_fused=object(),
+            )
+        )
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor(
+                [
+                    [0, 41, 42],
+                    [0, 51, 52],
+                ],
+                dtype=torch.int64,
+            )
+        )
+
+        ctx = BatchedDecodeContext.from_decode(
+            caches=[[cache0], [cache1]],
+            req_ids=["r0", "r1"],
+            aot_kernels=kernel_set,
+            kv_pool=object(),
+            req_pool_idx={"r0": 0, "r1": 1},
+            req_to_token_pool=req_to_token_pool,
+            attention_layer_indices=[0],
+        )
+
+        self.assertEqual(ctx.seq_lens, [1, 2])
+        self.assertIsNotNone(ctx.aot.rope)
+        self.assertEqual(ctx.aot.rope.new_token_slots.tolist(), [41, 52])
 
     def test_auxiliary_decode_uses_hybrid_batching_for_multi_request(self):
         runner = object.__new__(MlxModelRunner)
@@ -425,8 +511,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {rid: [idx + 20] for idx, rid in enumerate(req_ids)}
         calls = []
 
-        def fake_hybrid(caches, batched_input):
-            calls.append((len(caches), batched_input.tolist()))
+        def fake_hybrid(caches, batched_input, helper_req_ids):
+            calls.append((len(caches), batched_input.tolist(), list(helper_req_ids)))
             return mx.array([4, 5], dtype=mx.int32)
 
         def fail_batched(*args, **kwargs):
@@ -439,7 +525,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         pending = runner.decode_batch_start(req_ids)
 
-        self.assertEqual(calls, [(2, [[20], [21]])])
+        self.assertEqual(calls, [(2, [[20], [21]], req_ids)])
         self.assertEqual(pending.lazy_tokens.tolist(), [4, 5])
 
     def test_auxiliary_layer_batches_mergeable_native_cache(self):

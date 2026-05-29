@@ -920,19 +920,7 @@ class MlxModelRunner:
 
         hidden_states = self._model_embed(batched_input)
 
-        ctx = BatchedDecodeContext.from_decode(
-            caches=caches,
-            num_layers=self._cache_layout.num_layers,
-            req_ids=req_ids,
-            aot_kernels=self._aot_kernels,
-            kv_pool=self._attention_kv_pool,
-            req_pool_idx=self._req_pool_idx,
-            req_to_token_pool=self._req_to_token_pool,
-            attention_layer_indices=self._cache_layout.attention_layer_indices,
-            attention_pool_index_by_layer=(
-                self._cache_layout.attention_pool_index_by_layer
-            ),
-        )
+        ctx = self._build_batched_decode_context(caches, req_ids)
         seq_lens = ctx.seq_lens
         max_offset = max(seq_lens)
 
@@ -1109,19 +1097,7 @@ class MlxModelRunner:
         batched_input: mx.array,
         req_ids: list[str],
     ) -> mx.array:
-        ctx = BatchedDecodeContext.from_decode(
-            caches=caches,
-            num_layers=self._cache_layout.num_layers,
-            req_ids=req_ids,
-            aot_kernels=self._aot_kernels,
-            kv_pool=self._attention_kv_pool,
-            req_pool_idx=self._req_pool_idx,
-            req_to_token_pool=self._req_to_token_pool,
-            attention_layer_indices=self._cache_layout.attention_layer_indices,
-            attention_pool_index_by_layer=(
-                self._cache_layout.attention_pool_index_by_layer
-            ),
-        )
+        ctx = self._build_batched_decode_context(caches, req_ids)
         seq_lens = ctx.seq_lens
         set_context(ctx)
         try:
@@ -1135,6 +1111,25 @@ class MlxModelRunner:
             return mx.argmax(logits[:, -1, :], axis=-1)
         finally:
             clear_context()
+
+    def _build_batched_decode_context(
+        self,
+        caches: list[list[Any]],
+        req_ids: list[str],
+    ) -> BatchedDecodeContext:
+        """Build the shared attention/AOT context for one decode step."""
+        return BatchedDecodeContext.from_decode(
+            caches=caches,
+            req_ids=req_ids,
+            aot_kernels=self._aot_kernels,
+            kv_pool=self._attention_kv_pool,
+            req_pool_idx=self._req_pool_idx,
+            req_to_token_pool=self._req_to_token_pool,
+            attention_layer_indices=self._cache_layout.attention_layer_indices,
+            attention_pool_index_by_layer=(
+                self._cache_layout.attention_pool_index_by_layer
+            ),
+        )
 
     def decode_batch_start(self, req_ids: list[str]) -> MlxPendingDecode:
         """Queue a decode forward pass without evaluating.
