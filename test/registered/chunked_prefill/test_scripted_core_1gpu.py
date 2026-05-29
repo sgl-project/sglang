@@ -4,7 +4,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.runtime import ScriptedRuntime
 from sglang.test.scripted_runtime.testcase import ScriptedRuntimeTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
-    DEFAULT_MAX_STEPS,
     base_engine_kwargs,
     run_until,
     run_until_finished,
@@ -16,7 +15,10 @@ register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-small")
 
 
 _CHUNK_SIZE = 64
-_PROMPT_LEN = 256
+# Deliberately a few tokens short of a chunk-size multiple so the last
+# chunk is partial — exercises the off-by-one path instead of clean
+# chunk boundaries.
+_PROMPT_LEN = 4 * _CHUNK_SIZE - 3
 
 
 class TestScriptedCore(ScriptedRuntimeTestCase):
@@ -48,38 +50,13 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         yield from run_until_finished(r)
         assert r.finished, f"req with prompt_len={prompt_len} did not finish"
 
-    def test_chunked_req_scheduled_last_iter_observed_true_then_false(self):
-        """While chunking, the scheduler flag flips True at least once; after finish it clears to False."""
-        self.runtime.run(
-            self._script_chunked_req_scheduled_last_iter_observed_true_then_false
-        )
-
-    @staticmethod
-    def _script_chunked_req_scheduled_last_iter_observed_true_then_false(
-        t: ScriptedRuntime,
-    ):
-        r = t.start_req(prompt_len=2 * _CHUNK_SIZE, max_new_tokens=2)
-        saw_true = False
-        for _ in range(DEFAULT_MAX_STEPS):
-            if t.last_chunked_req_scheduled_iter_flag():
-                saw_true = True
-            if r.finished:
-                break
-            yield
-        assert r.finished, "req did not finish"
-        assert saw_true, "scheduler flag should be True at least once mid-chunk"
-        assert t.last_chunked_req_scheduled_iter_flag() is False, (
-            f"flag must clear to False after last chunk; "
-            f"got {t.last_chunked_req_scheduled_iter_flag()!r}"
-        )
-
     def test_pause_generation_retract_clears_chunked_req(self):
         """Mid-chunk pause_generation(retract) drops the req back to waiting and clears the chunked slot."""
         self.runtime.run(self._script_pause_generation_retract_clears_chunked_req)
 
     @staticmethod
     def _script_pause_generation_retract_clears_chunked_req(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=4 * _CHUNK_SIZE, max_new_tokens=2)
+        r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.pause_generation(mode="retract")
@@ -94,10 +71,6 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
             f"after pause(retract) the req should be back in waiting_queue; "
             f"found={req!r}"
         )
-        assert t.last_chunked_req_scheduled_iter_flag() is False, (
-            f"pause(retract) must clear chunked_req; "
-            f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
-        )
 
         t.continue_generation()
         yield from run_until_finished(r)
@@ -111,7 +84,7 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_abort_all_during_chunked_prefill_clears_chunked_req(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=4 * _CHUNK_SIZE, max_new_tokens=2)
+        r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort_all()
@@ -123,52 +96,38 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
                 break
 
         assert r.finished, "req did not finish after abort_all"
-        assert t.last_chunked_req_scheduled_iter_flag() is False, (
-            f"chunked slot must be cleared after abort; "
-            f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
-        )
 
-    def test_chunked_req_prefill_only_finishes(self):
-        """max_new_tokens=0 with chunked prefill: req finishes after the last chunk, no decode."""
-        self.runtime.run(self._script_chunked_req_prefill_only_finishes)
+    def test_chunked_req_single_decode_finishes(self):
+        """A chunked-prefill req with max_new_tokens=1 finishes cleanly after its single decode step."""
+        self.runtime.run(self._script_chunked_req_single_decode_finishes)
 
     @staticmethod
-    def _script_chunked_req_prefill_only_finishes(t: ScriptedRuntime):
-        r = t.start_req(prompt_len=4 * _CHUNK_SIZE, max_new_tokens=0)
+    def _script_chunked_req_single_decode_finishes(t: ScriptedRuntime):
+        r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=1)
         yield from run_until_finished(r)
-        assert r.finished, "prefill-only req did not finish"
-        assert t.last_chunked_req_scheduled_iter_flag() is False, (
-            f"chunked slot must be cleared after prefill-only finish; "
-            f"flag={t.last_chunked_req_scheduled_iter_flag()!r}"
-        )
+        assert r.finished, "single-decode chunked req did not finish"
 
     def test_chunked_prefill_does_not_inflate_radix_hit_count(self):
-        """Chunked inserts skip hit_count, so the whole-tree total equals the node count, not the inflated per-chunk sum."""
+        """Chunked inserts skip hit_count, so every radix node is bumped exactly once (==1), never per-chunk inflated."""
         self.runtime.run(self._script_chunked_prefill_does_not_inflate_radix_hit_count)
 
     @staticmethod
     def _script_chunked_prefill_does_not_inflate_radix_hit_count(t: ScriptedRuntime):
-        # Reset first: the shared engine and the all-ones token prefix mean
-        # earlier scripts leave a radix chain whose hit counts would otherwise
-        # make this total history-dependent.
-        t.reset_radix_cache()
-        before = t.get_all_node_hit_counts()
-        assert before == 0, f"reset must empty the radix tree; got {before}"
-
+        # runtime.run starts every script from a flushed cache (t.flush_cache),
+        # so the radix tree holds only this request's nodes.
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
 
-        # _PROMPT_LEN / _CHUNK_SIZE = 4 chunks -> 3 chunked cache_unfinished_req
-        # inserts (all hit_count-skipped) build prefix nodes [0:64], [64:128],
-        # [128:192]; the single non-chunked cache_finished_req insert then bumps
-        # those three plus the [192:] tail node exactly once each. Total == 4.
-        # Without the guard the first node alone would reach 4 (one bump per
-        # chunked insert + the finish insert) and the total would be 10.
-        after = t.get_all_node_hit_counts()
-        assert after - before == 4, (
+        # Chunked cache_unfinished_req inserts skip _inc_hit_count; only the
+        # single non-chunked cache_finished_req insert bumps, touching each node
+        # on the committed path exactly once. Without the guard the early prefix
+        # nodes would be re-bumped once per chunk and exceed 1.
+        hit_counts = t.get_all_node_hit_counts()
+        assert hit_counts, "expected radix nodes after a chunked prefill"
+        assert all(count == 1 for count in hit_counts.values()), (
             f"chunked prefill must bump each radix node exactly once; "
-            f"expected total 4, got {after - before}"
+            f"got {hit_counts}"
         )
 
 

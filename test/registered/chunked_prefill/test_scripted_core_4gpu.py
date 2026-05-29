@@ -50,7 +50,9 @@ class TestScriptedPpChunkSweep(ScriptedRuntimeTestCase):
 
     @staticmethod
     def _script_pp_one_combo(t: ScriptedRuntime, num_chunks: int, num_conc_reqs: int):
-        prompt_len = num_chunks * _CHUNK_SIZE
+        # A few tokens short of a clean chunk multiple so the last chunk is
+        # partial — exercises the off-by-one path under PP.
+        prompt_len = num_chunks * _CHUNK_SIZE - 3
         reqs = [
             t.start_req(prompt_len=prompt_len, max_new_tokens=2)
             for _ in range(num_conc_reqs)
