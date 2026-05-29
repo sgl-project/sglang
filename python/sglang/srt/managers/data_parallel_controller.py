@@ -79,7 +79,7 @@ def _fast_chain_hash(token_ids: List[int], start: int, end: int, prior: bytes) -
     h = hashlib.sha256()
     if prior:
         h.update(prior)
-    h.update(repr(token_ids[start:end]).encode())
+    h.update(repr(list(token_ids[start:end])).encode())
     return h.digest()
 
 
