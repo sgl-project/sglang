@@ -2211,7 +2211,21 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
                 )
-        elif "Step3p5ForCausalLM" in model_arch:
+        elif (
+            "Step3p5ForCausalLM" in model_arch
+            or "Step3p7ForConditionalGeneration" in model_arch
+        ):
+            if self.is_attention_backend_not_set():
+                if is_blackwell_supported():
+                    self.attention_backend = "fa4"
+                    logger.info(
+                        "Auto-select fa4 attention backend for Step3p7 on Blackwell."
+                    )
+                elif is_sm90_supported():
+                    self.attention_backend = "fa3"
+                    logger.info(
+                        "Auto-select fa3 attention backend for Step3p7 on Hopper."
+                    )
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(

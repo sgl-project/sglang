@@ -1,9 +1,8 @@
 import unittest
 
-from test_unified_radix_cache_kl import UnifiedRadixTreeTestMixin
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import (
     get_input_ids,
     make_mamba_decode_assert,

@@ -688,6 +688,7 @@ class Scheduler(
             "num_experts_per_tok",
             "num_experts_per_token",
             "top_k_experts",
+            "moe_top_k",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)

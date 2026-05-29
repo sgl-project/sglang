@@ -503,33 +503,10 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
         ):
-            # DRAFT_EXTEND_V2: seq_lens = prefix_lens; effective KV extent is prefix + extend.
-            if forward_batch.forward_mode.is_draft_extend_v2():
-                effective_cache_seqlens = (
-                    seqlens_in_batch + forward_batch.extend_seq_lens
-                )
-                seq_lens_cpu = forward_batch.seq_lens_cpu
-                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-                if extend_seq_lens_cpu is not None:
-                    extend_cpu_tensor = torch.as_tensor(
-                        extend_seq_lens_cpu, dtype=seq_lens_cpu.dtype
-                    )
-                    effective_max_seq_len_k = int(
-                        (seq_lens_cpu + extend_cpu_tensor)
-                        .max()
-                        .item()  # per-request sum, not max+max
-                    )
-                else:
-                    effective_max_seq_len_k = int(effective_cache_seqlens.max().item())
-            else:
-                effective_cache_seqlens = seqlens_in_batch
-                effective_max_seq_len_k = int(forward_batch.seq_lens_cpu.max().item())
-
-            metadata.cache_seqlens_int32 = effective_cache_seqlens.to(torch.int32)
-            metadata.max_seq_len_k = effective_max_seq_len_k
+            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(effective_cache_seqlens, dim=0, dtype=torch.int32),
-                (1, 0),
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
 
             # MLA/MHA CP: prepare_mlp_sync_batch pads extend tokens up to
@@ -2290,8 +2267,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
+            metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            # DRAFT_EXTEND_V2: seq_lens = prefix_lens; effective KV extent is prefix + extend.
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
+
             extend_seq_lens_tensor = getattr(spec_info, "extend_seq_lens_tensor", None)
             extend_seq_lens_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
             if extend_seq_lens_tensor is not None:
@@ -2310,25 +2292,6 @@ class FlashAttentionBackend(AttentionBackend):
                     (bs,), default_extend, dtype=torch.int32, device=device
                 )
                 extend_seq_lens_cpu = [default_extend] * bs
-
-            effective_cache_seqlens = seq_lens.to(torch.int32) + extend_seq_lens
-            metadata.cache_seqlens_int32.copy_(effective_cache_seqlens)
-
-            if extend_seq_lens_cpu is not None:
-                extend_cpu_tensor = torch.as_tensor(
-                    extend_seq_lens_cpu, dtype=seq_lens_cpu.dtype
-                )
-                metadata.max_seq_len_k = int(
-                    (seq_lens_cpu + extend_cpu_tensor)
-                    .max()
-                    .item()  # per-request sum, not max+max
-                )
-            else:
-                metadata.max_seq_len_k = int(effective_cache_seqlens.max().item())
-
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
 
             if extend_seq_lens_cpu:
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
