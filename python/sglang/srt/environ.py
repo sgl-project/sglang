@@ -751,9 +751,6 @@ class Envs:
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
-    # ===================================================================
-    # /KV-Canary / Token-Oracle
-    # ===================================================================
 
 
 envs = Envs()
