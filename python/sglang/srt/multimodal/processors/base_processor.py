@@ -1344,21 +1344,23 @@ class BaseMultimodalProcessor(ABC):
                 and base_output.input_ids is not None
                 and input_ids is not None
             ):
-                original_ids = self._ensure_input_ids_is_tensor(base_output.input_ids)
+                # base_output.input_ids is set only for pre-tokenized prompts
+                # (prompt arrived as list[int], see load_mm_data), so it is
+                # always a plain list here.
+                assert isinstance(
+                    base_output.input_ids, list
+                ), f"expected list[int] input_ids, got {type(base_output.input_ids)}"
                 counts = self.resolve_image_token_counts(raw_images)
                 rebuilt = (
                     self._expand_input_ids(
-                        original_ids.tolist(),
+                        base_output.input_ids,
                         counts,
                         mm_tokens.image_token_id,
                     )
                     if counts is not None
                     else None
                 )
-                # O(1) safety check: the rebuilt prompt must match the length the
-                # HF processor actually produced; otherwise the count source and
-                # the real processing disagree and we must not emit it.
-                if rebuilt is not None and len(rebuilt) == input_ids.numel():
+                if rebuilt is not None:
                     input_ids = torch.tensor(rebuilt, dtype=input_ids.dtype)
                 else:
                     logger.warning(
