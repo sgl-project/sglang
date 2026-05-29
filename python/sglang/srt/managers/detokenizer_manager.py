@@ -37,11 +37,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    configure_logger,
-    freeze_gc,
-    kill_itself_when_parent_died,
-)
+from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -396,7 +392,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
-            load=recv_obj.load,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
