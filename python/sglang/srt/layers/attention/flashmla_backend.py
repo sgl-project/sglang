@@ -95,28 +95,20 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        bs = forward_batch.batch_size
-        if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(
-                bs=bs,
-                num_tokens=forward_batch.positions.numel(),
+        forward_mode = forward_batch.forward_mode
+        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
+            # Decode + target-verify share the same body between capture and
+            # replay (legacy capture was a thin pass-through to replay).
+            self._apply_decode_target_verify_metadata(
+                bs=forward_batch.batch_size,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                forward_mode=forward_mode,
             )
         else:
-            self.init_forward_metadata_replay_cuda_graph(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                seq_lens_sum=forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=forward_batch.forward_mode,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+            # Prefill / draft-extend: fall back to FlashInferMLA parent.
+            super().init_forward_data_out_graph(forward_batch, in_capture=in_capture)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -217,50 +209,21 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
-            self.init_forward_metadata_replay_cuda_graph(
-                bs=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_sum=None,
-                encoder_lens=encoder_lens,
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-                seq_lens_cpu=None,
-            )
-        else:
-            super().init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_decode_target_verify_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
     ):
-        if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
+        """Shared decode/target-verify capture+replay body.
+
+        Public entry: :py:meth:`init_forward_data_out_graph` (which routes
+        to this helper for decode/target-verify and falls back to the
+        FlashInferMLA parent for prefill/draft-extend).
+        """
+        if True:
             seq_lens = seq_lens[:bs]
             seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
 
@@ -326,17 +289,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_mla_metadata_view,
                 self.cuda_graph_num_splits_view,
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-            )
-        else:
-            super().init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -557,47 +509,20 @@ class FlashMLAMultiStepDraftBackend:
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # MultiStep uses custom signatures (fb-only / fb+bs).
-        if in_capture:
-            self.init_forward_metadata_capture_cuda_graph(forward_batch)
-        else:
-            self.init_forward_metadata_replay_cuda_graph(
-                forward_batch, forward_batch.batch_size
-            )
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardMode,
+            build_inner_fb_view,
+        )
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            # EAGLE draft worker uses DECODE mode for draft steps
-            from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+        )
 
-            # Create a dummy forward_mode for draft step
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-        self.common_template(forward_batch, call_fn)
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        def call_fn(i, forward_batch):
-            from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
+        def call_fn(i, _forward_batch):
+            self.attn_backends[i].init_forward_data_out_graph(
+                inner_fb, in_capture=in_capture
             )
 
         self.common_template(forward_batch, call_fn)
