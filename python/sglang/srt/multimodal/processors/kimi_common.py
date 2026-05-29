@@ -28,8 +28,6 @@ class KimiGridMMDataMixin:
         transformers ``_get_num_multimodal_tokens`` convention; use its
         ``media_tokens_calculator`` instead.
 
-        Raises if the processor lacks ``media_tokens_calculator`` or the
-        computation fails; the caller catches, warns, and falls back.
         """
         assert images is not None
         media_tokens_calculator = self._processor.media_processor.media_tokens_calculator

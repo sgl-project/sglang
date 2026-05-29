@@ -1227,8 +1227,6 @@ class BaseMultimodalProcessor(ABC):
         VLM processors, e.g. Qwen-VL, Gemma3, GLM4V). Models whose processor
         does not implement it (e.g. Kimi) override this method.
 
-        Raises if the processor lacks the API or the computation fails; the
-        caller catches, warns, and falls back to the HF re-tokenized ids.
         """
         assert images is not None
         image_sizes = [(image.height, image.width) for image in images]
@@ -1250,8 +1248,6 @@ class BaseMultimodalProcessor(ABC):
         processor's re-tokenization is discarded, so non-media tokens cannot
         drift.
 
-        Raises ``ValueError`` when expansion cannot be aligned; the caller
-        catches it, warns, and falls back to the HF re-tokenized ids.
         """
         if image_token_id is None:
             raise ValueError("image_token_id is not set for this processor")
@@ -1348,10 +1344,7 @@ class BaseMultimodalProcessor(ABC):
                     )
                 except Exception as e:
                     logger.warning(
-                        "Token-id multimodal prompt could not be aligned with the "
-                        "processor expansion (%s); falling back to decode+retokenize, "
-                        "which may change prompt length (token drift).",
-                        e,
+                        f"Due to {e}, falling back to decode+retokenize, which may change prompt length (token drift)."
                     )
         else:
             ret = None
