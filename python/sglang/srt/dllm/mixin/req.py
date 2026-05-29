@@ -46,7 +46,7 @@ class ReqDllmMixin:
             # still incoming stage
             return
 
-        input_block = self.get_fill_ids()[prefix_length:min_required_length]
+        input_block = self.full_untruncated_fill_ids[prefix_length:min_required_length]
         is_prefill_phase = self.dllm_config.mask_id not in input_block
 
         if is_prefill_phase:
