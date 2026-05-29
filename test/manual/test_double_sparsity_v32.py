@@ -18,8 +18,8 @@ tradeoff (and a prompt longer than the DS KV pool is unservable). Those points
 (4K / 16K / 64K) are **CHARACTERIZED** — recorded with the recall-vs-length
 curve and any admission limit — **not** pass/failed against DSA, which DS is
 not expected to match beyond its budget. (Testing recall beyond the selection
-budget tested DS outside its design envelope; this DS-fair scope was adopted in
-loop5 Round 14 — see ``runs/<date>_dsv32_mvp/ac12_analysis.md``.)
+budget tests DS outside its design envelope; this DS-fair scope and its rationale
+are documented in ``runs/<date>_dsv32_mvp/ac12_analysis.md``.)
 
 Skips cleanly when env vars are unset so CI imports do not error.
 
@@ -715,7 +715,7 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
     # budget equal to the model's DSA index_topk. Needle recall is a fair DS
     # quality measure only WITHIN that budget (DS selects densely); beyond it,
     # recall degrades as an inherent top_k sparsity tradeoff and is
-    # CHARACTERIZED, not pass/failed against DSA (Round-14 re-scope).
+    # CHARACTERIZED, not pass/failed against the dense baseline.
     INDEX_TOPK = _env_int("AC12_INDEX_TOPK", 2048)
     # Within-budget NIAH word counts — chosen so the tokenized prompt stays
     # <= INDEX_TOPK (DS selects densely). The hard recall gate runs here.
