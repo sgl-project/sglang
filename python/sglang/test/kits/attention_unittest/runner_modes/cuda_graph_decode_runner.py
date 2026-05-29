@@ -291,36 +291,36 @@ def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
         max_bs=capture_batch_size,
         max_num_tokens=batch.input_ids.numel(),
     )
-    backend.init_forward_metadata_capture_cuda_graph(
-        bs=capture_batch_size,
-        num_tokens=batch.input_ids.numel(),
-        req_pool_indices=batch.req_pool_indices,
-        seq_lens=batch.seq_lens,
-        encoder_lens=batch.encoder_lens,
-        forward_mode=batch.forward_mode,
-        spec_info=batch.spec_info,
-    )
+    # Mirror the production capture path: the new init_forward_data API
+    # reads all required fields off the ForwardBatch (or fb_view); the
+    # caller signals capture via in_capture=True.
+    backend.init_forward_data_out_graph(batch, in_capture=True)
 
 
 def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
-    # Some backends (e.g., `DeepseekV4AttnBackend`) read out-of-band attributes
-    # off the backend during replay metadata init — production wires this in
-    # `sglang/srt/model_executor/cuda_graph_runner.py:1234`. Mirror that
-    # contract so backends that don't use it just store-and-clear the field.
-    backend._replay_forward_batch = batch
-    try:
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=capture_batch_size,
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            seq_lens_sum=batch.seq_lens_sum,
-            encoder_lens=batch.encoder_lens,
-            forward_mode=batch.forward_mode,
-            spec_info=batch.spec_info,
-            seq_lens_cpu=batch.seq_lens_cpu,
-        )
-    finally:
-        backend._replay_forward_batch = None
+    # Production replay path: the graph runner builds an fb_view with
+    # actual_forward_mode + out_cache_loc (see build_replay_fb_view) and
+    # dispatches via init_forward_data_out_graph(fb_view). For the unit
+    # test we just hand the batch object directly — it already carries
+    # the runtime forward_mode (mapped to actual_forward_mode below) plus
+    # out_cache_loc.
+    from types import SimpleNamespace
+
+    fb_view = SimpleNamespace(
+        batch_size=capture_batch_size,
+        forward_mode=batch.forward_mode,
+        actual_forward_mode=batch.forward_mode,
+        input_ids=batch.input_ids,
+        positions=getattr(batch, "positions", None),
+        req_pool_indices=batch.req_pool_indices,
+        seq_lens=batch.seq_lens,
+        seq_lens_sum=batch.seq_lens_sum,
+        seq_lens_cpu=batch.seq_lens_cpu,
+        encoder_lens=batch.encoder_lens,
+        out_cache_loc=getattr(batch, "out_cache_loc", None),
+        spec_info=batch.spec_info,
+    )
+    backend.init_forward_data_out_graph(fb_view)
     # Best-effort metadata-shape sanity check — catches negative kv_lens and
     # non-monotonic indptr that would otherwise leave real-row output correct
     # but corrupt padded-row scratch state. See `metadata_invariants.py`.
