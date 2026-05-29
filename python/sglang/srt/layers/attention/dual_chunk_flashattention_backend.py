@@ -172,6 +172,38 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         end_head = start_head + self.num_heads
         return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
 
+    def init_forward_data(self, forward_batch: ForwardBatch):
+        # Delegate to legacy method while Phase E hasn't moved the body yet.
+        self.init_forward_metadata(forward_batch)
+
+    def init_forward_data_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        if in_capture:
+            self.init_forward_metadata_capture_cuda_graph(
+                bs=bs,
+                num_tokens=forward_batch.input_ids.shape[0],
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+            )
+        else:
+            self.init_forward_metadata_replay_cuda_graph(
+                bs=bs,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
 
