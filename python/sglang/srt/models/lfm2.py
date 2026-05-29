@@ -25,17 +25,22 @@ from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_update,
 )
 from sglang.srt.utils import is_npu
+
 if is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu,
         causal_conv1d_update_v2,
     )
+
     # prefill: _npu expects standard layout (..., dim, state_len),
     #          but NPU native is (..., state_len, dim) → transpose conv_states.
     def causal_conv1d_fn(x, weight, bias=None, conv_states=None, **kwargs):
         if conv_states is not None:
             conv_states = conv_states.transpose(-1, -2)
-        return causal_conv1d_fn_npu(x, weight, bias=bias, conv_states=conv_states, **kwargs)
+        return causal_conv1d_fn_npu(
+            x, weight, bias=bias, conv_states=conv_states, **kwargs
+            )
+
     # decode: v2 expects NPU-native conv_state (..., state_len, dim) — no transpose.
     #         v2 expects weight (width, dim); model stores (dim, width) → weight.T.
     def causal_conv1d_update(x, conv_state, weight, bias=None, **kwargs):
