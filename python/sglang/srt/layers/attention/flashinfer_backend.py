@@ -1650,22 +1650,11 @@ class FlashInferMultiStepDraftBackend:
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        from types import SimpleNamespace
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
         def call_fn(i, fb):
-            inner_fb = SimpleNamespace(
-                batch_size=fb.batch_size,
-                forward_mode=ForwardMode.DECODE,
-                actual_forward_mode=fb.forward_mode,
-                input_ids=getattr(fb, "input_ids", None),
-                positions=getattr(fb, "positions", None),
-                req_pool_indices=fb.req_pool_indices,
-                seq_lens=fb.seq_lens,
-                seq_lens_sum=getattr(fb, "seq_lens_sum", None) or -1,
-                seq_lens_cpu=getattr(fb, "seq_lens_cpu", None),
-                encoder_lens=None,
-                out_cache_loc=getattr(fb, "out_cache_loc", None),
-                spec_info=fb.spec_info,
+            inner_fb = build_inner_fb_view(
+                fb, bs=fb.batch_size, forward_mode=ForwardMode.DECODE
             )
             self.attn_backends[i].init_forward_data_out_graph(
                 inner_fb, in_capture=True
@@ -1676,22 +1665,11 @@ class FlashInferMultiStepDraftBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        from types import SimpleNamespace
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
         def call_fn(i, fb):
-            inner_fb = SimpleNamespace(
-                batch_size=bs,
-                forward_mode=ForwardMode.DECODE,
-                actual_forward_mode=fb.forward_mode,
-                input_ids=getattr(fb, "input_ids", None),
-                positions=getattr(fb, "positions", None),
-                req_pool_indices=fb.req_pool_indices,
-                seq_lens=fb.seq_lens,
-                seq_lens_sum=-1,
-                seq_lens_cpu=fb.seq_lens_cpu,
-                encoder_lens=None,
-                out_cache_loc=getattr(fb, "out_cache_loc", None),
-                spec_info=fb.spec_info,
+            inner_fb = build_inner_fb_view(
+                fb, bs=bs, forward_mode=ForwardMode.DECODE
             )
             self.attn_backends[i].init_forward_data_out_graph(inner_fb)
 
