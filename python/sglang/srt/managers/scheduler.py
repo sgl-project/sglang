@@ -1147,8 +1147,15 @@ class Scheduler(
             self.future_map = None
             return
 
+        # Workers not on BaseSpecWorker (e.g. FrozenKVMTPWorker) lack the
+        # override; fall back to target-only so the helper still produces a
+        # safe decision (no accidental opt-out for unaudited shapes).
         if self.draft_worker is not None:
-            attn_backends = self.draft_worker.spec_v2_attn_backends
+            attn_backends = getattr(
+                self.draft_worker,
+                "spec_v2_attn_backends",
+                (self.tp_worker.model_runner.attn_backend,),
+            )
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
