@@ -75,11 +75,12 @@ def _invert(out_row, inv_cpu):
         (8, 512),       # trivial (seq == k)
         (8, 4096),      # register
         (200, 16384),   # streaming (batch > 128 => non-cluster)
-        (4, 16384),     # streaming (seq < 64K => non-cluster, small batch)
-        (4, 65536),     # cluster (seq >= 64K, batch <= 128)
-        (100, 65536),   # cluster
-        (256, 65536),   # batch > 128 => streaming even at 64K
-        (2, 131072),    # cluster, long
+        (4, 16384),     # streaming (seq < floor => non-cluster, small batch)
+        (100, 65536),   # streaming (seq == floor)
+        (256, 131072),  # batch > 128 => streaming even at long ctx
+        (2, 131072),    # persistent cluster, pool >= N
+        (40, 262144),   # persistent cluster round-robin (N > pool of 30)
+        (64, 262144),   # persistent cluster round-robin (N > pool of 30)
     ],
 )
 @pytest.mark.parametrize("k", [512, 1024])

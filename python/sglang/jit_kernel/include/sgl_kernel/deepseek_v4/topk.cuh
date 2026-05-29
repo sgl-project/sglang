@@ -130,15 +130,26 @@ struct TopKProblem {
   uint32_t seq_len;
   uint32_t page_bits;
 
+  // Write the raw selected index. The page-table transform is applied afterwards
+  // by transform_output() in a separate, pipelined pass -- keeping the per-element
+  // page_table gather out of the hot scatter/tie loops (which are serialized by
+  // shared-memory atomics).
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
-    out[pos] = page_to_indices(page_table, raw_idx, page_bits);
-    if (raw_out != nullptr) raw_out[pos] = static_cast<int32_t>(raw_idx);
+    out[pos] = static_cast<int32_t>(raw_idx);
   }
   SGL_DEVICE void emit_invalid(uint32_t pos) const {
     out[pos] = -1;
-    if (raw_out != nullptr) raw_out[pos] = -1;
   }
 };
+
+/// In-place page-table transform of one output slot, plus the optional raw side
+/// output. `out[t]` holds a raw index (or -1) on entry. Caller must have a block-
+/// (or cluster-) wide barrier after all emit()s and before calling this.
+SGL_DEVICE void transform_output(const TopKProblem& p, uint32_t t) {
+  const auto raw = p.out[t];
+  if (p.raw_out != nullptr) p.raw_out[t] = raw;
+  if (raw >= 0) p.out[t] = page_to_indices(p.page_table, static_cast<uint32_t>(raw), p.page_bits);
+}
 
 // ---------------------------------------------------------------------------
 // Shared configuration + tie handling (exact radix select on the threshold bin)
@@ -335,7 +346,6 @@ struct TopKTrivial : TopKConfig {
         }
       }
     }
-    device::PDLTriggerSecondary<kUsePDL>();
   }
 };
 
@@ -516,7 +526,6 @@ struct TopKRegister : TopKRadixBase<12> {
 
     // Phase 4: Handle ties. Layout driven by the collect counts for consistency
     // with the fp32 classification.
-    device::PDLTriggerSecondary<kUsePDL>();
     __syncthreads();
     const auto above_count = smem->count_gt;
     const auto equal_count = smem->count_eq;
@@ -586,7 +595,6 @@ struct TopKStreaming : TopKRegister {
       }
     });
 
-    device::PDLTriggerSecondary<kUsePDL>();
     // Phase 4: Handle ties. Drive the output layout from the *collect* counts so it
     // is self-consistent with the fp32 classification above (rather than the fp16
     // histogram counts), even if rounding moves a boundary element between the
@@ -727,7 +735,6 @@ struct TopKCluster : TopKRadixBase<10> {
     }
 
     cluster.sync();
-    device::PDLTriggerSecondary<kUsePDL>();
     if (!is_primary) {
 #pragma unroll
       for (uint32_t i = 0; i < kTopKItems; ++i) {
