@@ -267,11 +267,7 @@ def create_dcp_kv_indices(
     for i in range(num_loop):
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offset < prefix_len
-        data = (
-            prefix_start
-            + (offset % dcp_world_size) * (extend_prefix_lens_sum // dcp_world_size)
-            + (offset // dcp_world_size % local_prefix_len)
-        )
+        data = prefix_start + offset
         tl.store(kv_indices_ptr + kv_ind_start + offset, data, mask=mask)
     extend_len = tl.load(extend_lens_ptr + pid)
     extend_start = tl.load(extend_cu_lens_ptr + pid)
