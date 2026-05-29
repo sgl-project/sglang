@@ -651,9 +651,7 @@ class TestSpecialCaseBasic(ScriptedRuntimeTestCase):
                 break
             yield
         assert r.finished
-        assert (
-            saw_chunking
-        ), "req should have occupied the chunked_req slot mid-chunk"
+        assert saw_chunking, "req should have occupied the chunked_req slot mid-chunk"
         # After finish the chunked slot must be cleared back to None.
         assert (
             s.chunked_req is None

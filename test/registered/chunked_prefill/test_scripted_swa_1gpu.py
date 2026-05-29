@@ -83,9 +83,7 @@ class TestScriptedSwaChunkedReqScheduledLastIter(ScriptedRuntimeTestCase):
             and len(s.waiting_queue) == 0
             and s.running_batch.is_empty(),
         )
-        locked = {
-            nid: lr for nid, lr in t.get_all_node_lock_refs().items() if lr != 0
-        }
+        locked = {nid: lr for nid, lr in t.get_all_node_lock_refs().items() if lr != 0}
         assert not locked, (
             f"radix nodes left locked after drain {locked} — stash gate let "
             "an un-scheduled chunked req commit partial KV"
