@@ -385,31 +385,100 @@ class TestExtendAttention(CustomTestCase):
                     if is_mla and is_cross_attn:
                         continue
                     self._test_extend_attention_once(
-                        1, 123, 1, 1, 128, 96, None, False, is_mla, is_cross_attn, kvcache_dtype
+                        1,
+                        123,
+                        1,
+                        1,
+                        128,
+                        96,
+                        None,
+                        False,
+                        is_mla,
+                        is_cross_attn,
+                        kvcache_dtype,
                     )
                     self._test_extend_attention_once(
-                        1, 123, 16, 1, 128, 96, None, False, is_mla, is_cross_attn, kvcache_dtype
+                        1,
+                        123,
+                        16,
+                        1,
+                        128,
+                        96,
+                        None,
+                        False,
+                        is_mla,
+                        is_cross_attn,
+                        kvcache_dtype,
                     )
                     self._test_extend_attention_once(
-                        4, 1230, 16, 4, 128, 96, None, False, is_mla, is_cross_attn, kvcache_dtype
+                        4,
+                        1230,
+                        16,
+                        4,
+                        128,
+                        96,
+                        None,
+                        False,
+                        is_mla,
+                        is_cross_attn,
+                        kvcache_dtype,
                     )
                     self._test_extend_attention_once(
-                        1, 9000, 16, 1, 32, 32, None, False, is_mla, is_cross_attn, kvcache_dtype
+                        1,
+                        9000,
+                        16,
+                        1,
+                        32,
+                        32,
+                        None,
+                        False,
+                        is_mla,
+                        is_cross_attn,
+                        kvcache_dtype,
                     )
             for has_sink in [True, False]:
                 for sliding_window in [None, 10, 128]:
                     if not has_sink and sliding_window is not None:
                         continue
                     self._test_extend_attention_once(
-                        1, 123, 16, 4, 64, 64, sliding_window, has_sink, False, False, kvcache_dtype
+                        1,
+                        123,
+                        16,
+                        4,
+                        64,
+                        64,
+                        sliding_window,
+                        has_sink,
+                        False,
+                        False,
+                        kvcache_dtype,
                     )
                     self._test_extend_attention_once(
-                        1, 20, 16, 1, 64, 64, sliding_window, has_sink, False, False, kvcache_dtype
+                        1,
+                        20,
+                        16,
+                        1,
+                        64,
+                        64,
+                        sliding_window,
+                        has_sink,
+                        False,
+                        False,
+                        kvcache_dtype,
                     )
                     self._test_extend_attention_once(
-                        1, 20, 1, 1, 64, 64, sliding_window, has_sink, False, False, kvcache_dtype
+                        1,
+                        20,
+                        1,
+                        1,
+                        64,
+                        64,
+                        sliding_window,
+                        has_sink,
+                        False,
+                        False,
+                        kvcache_dtype,
                     )
-            
 
     def test_extend_attention_large_seq_causal_mask(self):
         self._test_extend_attention_once(

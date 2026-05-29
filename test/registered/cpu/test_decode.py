@@ -156,7 +156,18 @@ class TestDecodeAttention(CustomTestCase):
         return output
 
     def _test_grouped_decode_attention_once(
-        self, B, H_Q, H_KV, D, D_V, sliding_window, sink, is_cross_attn, dtype, kvcache_dtype, device
+        self,
+        B,
+        H_Q,
+        H_KV,
+        D,
+        D_V,
+        sliding_window,
+        sink,
+        is_cross_attn,
+        dtype,
+        kvcache_dtype,
+        device,
     ):
         # This represents the number of tokens already in the sequence
         seq_len = 1024
@@ -337,7 +348,17 @@ class TestDecodeAttention(CustomTestCase):
                                 device=device,
                             )
                     self._test_grouped_decode_attention_once(
-                        B, H_Q, H_KV, D, D_V, None, False, True, dtype=dtype, kvcache_dtype=kvcache_dtype, device=device
+                        B,
+                        H_Q,
+                        H_KV,
+                        D,
+                        D_V,
+                        None,
+                        False,
+                        True,
+                        dtype=dtype,
+                        kvcache_dtype=kvcache_dtype,
+                        device=device,
                     )
 
     def test_grouped_decode_attention(self):

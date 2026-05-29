@@ -516,7 +516,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor? k_buf_scale, Tensor? v_buf_scale, Tensor req_to_token, Tensor req_pool_indices, Tensor "
       "seq_lens, Tensor extend_seq_lens, Tensor "
-      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? "
+      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
+      "sliding_window_size, Tensor? "
       "encoder_lens, Tensor? sinks) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
