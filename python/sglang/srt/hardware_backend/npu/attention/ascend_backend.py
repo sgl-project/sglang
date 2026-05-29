@@ -2417,6 +2417,23 @@ class AscendAttnMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
 
+    def init_forward_data(self, forward_batch: ForwardBatch):
+        # Delegate to legacy method while Phase E hasn't moved the body yet.
+        self.init_forward_metadata(forward_batch)
+
+    def init_forward_data_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        # MultiStep uses custom signatures (fb-only / fb+bs).
+        if in_capture:
+            self.init_forward_metadata_capture_cuda_graph(forward_batch)
+        else:
+            self.init_forward_metadata_replay_cuda_graph(
+                forward_batch, forward_batch.batch_size
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
             assert forward_batch.spec_info is not None
