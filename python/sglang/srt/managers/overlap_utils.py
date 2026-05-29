@@ -32,9 +32,8 @@ def decide_needs_cpu_seq_lens(
     if not server_args.disable_piecewise_cuda_graph:
         # FIXME: support PCG without seq lens cpu value
         return True
-    # Skip None entries (e.g. `draft_extend_attn_backend` is unset on some spec
-    # configs) and treat missing capability as True so a new backend that has
-    # not declared the flag stays on the legacy seq_lens_cpu path (fail-safe).
+    # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
+    # missing flag -> True so undeclared backends stay on the legacy path.
     return any(
         getattr(b, "needs_cpu_seq_lens", True) for b in attn_backends if b is not None
     )
