@@ -18,49 +18,46 @@ register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 _SWA_MODEL = "openai/gpt-oss-20b"
 
 # ---------------------------------------------------------------------------
-# Sizing so the SWA budget — not the full pool — is what starves the chunked
-# req, i.e. the genuine hybrid-SWA early-return path. The arithmetic below
-# assumes page_size == 1 (set explicitly) so token accounting is exact.
+# Why the chunked req early-returns (page_size == 1 so token accounting is
+# exact; the engine kwargs pin it).
 #
-# Pools (pool_configurator.py): with max_total_tokens = M and
-# swa_full_tokens_ratio = R,
-#     full pool  F = M                 = 512 slots
-#     swa  pool  S = floor(R * M)      = floor(0.25 * 512) = 128 slots
+# Pools (pool_configurator.py) with max_total_tokens = M, swa_full_tokens_ratio
+# = R:
+#     full pool  F = M            = 8192 slots   (full-attention layers)
+#     swa  pool  S = floor(R*M)   = 819 slots    (sliding-window layers)
 #
-# gpt-oss-20b sliding window W = sliding_window(128) - 1 = 127
-# (models/gpt_oss.py:get_attention_sliding_window_size). Every prompt here is
-# <= W, so NO token is ever beyond the window => SWA keeps all of them =>
-# a req's SWA footprint == its committed length, identical to its full-pool
-# footprint. Two facts follow:
-#   * The full pool F=512 holds ~5 reqs of 96 -> rem_total_tokens never hits 0.
-#   * The SWA pool S=128 is the smaller budget for the same footprint -> it is
-#     the binding constraint. This is the whole reason swa_full_tokens_ratio
-#     must be set: it pins S small enough to starve before F.
+# gpt-oss-20b sliding window W = sliding_window(128) - 1 = 127. The two layer
+# families consume their pools very differently for a req of committed length
+# L:
+#     full-attention layers keep ALL tokens  -> full footprint  = L
+#     sliding-window layers keep only last W -> swa  footprint  = min(L, W) ~ 127
+# So a single req only ever ties up ~127 SWA slots: S=819 is never the binding
+# budget here. The FULL pool is. (Set swa_full_tokens_ratio low anyway so S is
+# explicit and we can show it stays slack rather than relying on the 0.8
+# default.) add_chunked_req early-returns the moment EITHER budget is exhausted
+# under hybrid SWA, so starving the full pool is enough.
 #
-# Timeline (rem_swa = swa_available + swa_evictable; resident reqs are not
-# evictable):
-#   1. Competitor (prompt 96) prefills then stays resident decoding, holding
-#      96 SWA slots -> rem_swa = 128 - 96 = 32.
-#   2. Chunked r (prompt 96, chunk 32) resumes. add_chunked_req computes
-#         _rem = min(rem_chunk_tokens=32, rem_total_tokens(~400),
-#                    rem_swa_tokens - page_size)
-#      First resume: rem_swa 32 -> 32-1 = 31 -> admits 31 (truncated chunk);
-#      rem_swa -> 1. Next resume: rem_swa 1 -> 1-1 = 0 <= 0 -> is_hybrid_swa
-#      -> `return req`: the early-return. r stays parked as scheduler.chunked_req
+# Timeline:
+#   1. Competitor (prompt 6144) prefills then stays resident decoding. Its
+#      full-pool footprint is the whole 6144 (full layers keep everything),
+#      plus a small decode reserve -> free_full ~ 8192 - 6144 - ~64 ~ 1984.
+#   2. Chunked r (prompt 4096, chunk 512) resumes. add_chunked_req computes
+#         _rem = min(rem_chunk_tokens=512, rem_total_tokens, rem_swa - page)
+#      rem_total_tokens walks 1984 -> 1472 -> 960 -> 448 as r commits 512-token
+#      chunks; the 4th chunk truncates to 448 and drives free_full to 0, so the
+#      next resume sees rem_total_tokens <= 0 -> _rem <= 0 -> is_hybrid_swa ->
+#      `return req`: the early-return. r (4096) far exceeds the ~1984 free, so
+#      this is guaranteed, not marginal. r stays parked as scheduler.chunked_req
 #      without entering the forward batch.
-#   3. Competitor finishes its 32 decode tokens and frees its 96 slots ->
-#      rem_swa jumps back above a chunk -> r drains to completion (96 <= F, S).
+#   3. Competitor finishes its decode tokens and frees 6144 slots -> r resumes
+#      and drains (4096 <= F=8192, swa footprint ~127 <= S=819).
 # ---------------------------------------------------------------------------
-_MAX_TOTAL_TOKENS = 512
-_SWA_FULL_TOKENS_RATIO = 0.25  # -> SWA pool = 128 slots, the binding budget
-_CHUNK_SIZE = 32
-_SWA_WINDOW = 127  # gpt-oss-20b: sliding_window(128) - 1
-_RESIDENT_PROMPT = 96  # <= _SWA_WINDOW so SWA footprint == length
-_RESIDENT_DECODE = 32
-_CHUNKED_PROMPT = 96  # <= _SWA_WINDOW; > _CHUNK_SIZE so it actually chunks
-
-assert _RESIDENT_PROMPT <= _SWA_WINDOW and _CHUNKED_PROMPT <= _SWA_WINDOW
-assert _CHUNKED_PROMPT > _CHUNK_SIZE
+_MAX_TOTAL_TOKENS = 8192
+_SWA_FULL_TOKENS_RATIO = 0.1  # SWA pool = 819 slots; stays slack (window-capped)
+_CHUNK_SIZE = 512
+_RESIDENT_PROMPT = 6144  # competitor: pins ~6144 of the 8192 full pool
+_RESIDENT_DECODE = 64  # keep it resident while r overflows and early-returns
+_CHUNKED_PROMPT = 4096  # >> the ~1984 free full slots -> guaranteed overflow
 
 
 class TestScriptedSwaChunkedReqEarlyReturn(ScriptedRuntimeTestCase):
@@ -75,20 +72,20 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedRuntimeTestCase):
     )
 
     def test_swa_chunked_req_early_return_no_double_free(self):
-        """SWA-budget starvation makes add_chunked_req early-return; the stash gate keeps the un-scheduled chunked req's partial KV out of the tree."""
+        """KV-cache starvation makes add_chunked_req early-return; the stash gate keeps the un-scheduled chunked req's partial KV out of the tree."""
         self.runtime.run(self._script_swa_chunked_req_early_return_no_double_free)
 
-    # A resident competitor occupies most of the tiny SWA pool, so the chunked
-    # req hits the add_chunked_req SWA early-return: it stays parked as
-    # scheduler.chunked_req without running, and the stash gate must keep its
-    # partial KV out of the tree so no radix node is left locked after drain.
+    # A resident competitor pins most of the KV pool, so the chunked req hits
+    # the add_chunked_req early-return: it stays parked as scheduler.chunked_req
+    # without running, and the stash gate must keep its partial KV out of the
+    # tree so no radix node is left locked after drain.
     @staticmethod
     def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedRuntime):
         s = t._scheduler
 
         # Bring the competitor up first and let it finish its own chunked
-        # prefill, so it is resident (decoding) and holding ~_RESIDENT_PROMPT
-        # SWA slots before the chunked req under test starts. Only one req may
+        # prefill, so it is resident (decoding) and pinning ~_RESIDENT_PROMPT
+        # KV slots before the chunked req under test starts. Only one req may
         # be chunking at a time, so starting them together would just serialize
         # them with no pressure.
         competitor = t.start_req(
@@ -127,7 +124,7 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedRuntimeTestCase):
         assert observed_early_return, (
             "test must exercise the add_chunked_req early-return branch: no iter "
             "observed r parked as scheduler.chunked_req while absent from the "
-            "forward batch — the SWA budget was never tight enough"
+            "forward batch — the KV pool was never tight enough"
         )
 
         # Gate held: drain to a fully idle engine, then assert no radix node
