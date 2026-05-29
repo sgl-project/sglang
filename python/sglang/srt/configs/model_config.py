@@ -452,6 +452,12 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
+        ):
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["Step3p5MTP"]
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -1557,6 +1563,7 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
+    "Step3p7ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
 
@@ -1671,6 +1678,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
+        "Step3p7ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
         "LagunaForCausalLM",
@@ -1709,7 +1717,10 @@ def get_hybrid_layer_ids(
     elif "MiMoV2MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
-    elif "Step3p5ForCausalLM" in model_architectures:
+    elif (
+        "Step3p5ForCausalLM" in model_architectures
+        or "Step3p7ForConditionalGeneration" in model_architectures
+    ):
         layer_types = hf_text_config.layer_types
         swa_attention_layer_ids = [
             i
