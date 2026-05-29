@@ -30,8 +30,6 @@ from typing import (
     Union,
 )
 
-import requests
-
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
@@ -427,6 +425,10 @@ class ScriptedRuntime:
         tokenizers; any valid token works since the harness does not validate
         decode quality.
         """
+        # Local import keeps ``requests`` off the production scheduler load
+        # path (this module is imported unconditionally by run_scheduler_process).
+        import requests
+
         url = self._generate_url
         payload = {
             "input_ids": [1] * prompt_len,
