@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -578,8 +580,9 @@ class Gemma3TextModel(PreTrainedModel):
 
         global_config = copy.deepcopy(config)
         global_config.rope_parameters = {
-            "rope_type": "default",
             "rope_theta": global_theta,
+            "factor": config.rope_parameters["full_attention"]["factor"],
+            "rope_type": "linear",
         }
         self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)
         self.gradient_checkpointing = False

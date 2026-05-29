@@ -21,6 +21,7 @@ import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_world_group,
@@ -46,7 +47,9 @@ from sglang.multimodal_gen.runtime.models.dits.mova_video_dit import (
 # Create aliases for backward compatibility
 video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
 audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -186,6 +189,10 @@ class MOVADenoisingStage(PipelineStage):
         return uses
 
     @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
+
+    @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:
             return StageParallelismType.CFG_PARALLEL
@@ -237,6 +244,13 @@ class MOVADenoisingStage(PipelineStage):
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
         if not server_args.enable_torch_compile or not isinstance(module, nn.Module):
+            return
+        if current_platform.is_hip():
+            logger.warning(
+                "Skipping torch.compile for %s on ROCm because the current "
+                "HIPRTC/Inductor path can emit invalid bf16 kernels.",
+                module.__class__.__name__,
+            )
             return
         compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
 
@@ -951,6 +965,10 @@ class MOVADecodingStage(PipelineStage):
             ComponentUse(stage_name, "video_vae", target_dtype=vae_dtype),
             ComponentUse(stage_name, "audio_vae"),
         ]
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DECODER
 
     @property
     def parallelism_type(self) -> StageParallelismType:

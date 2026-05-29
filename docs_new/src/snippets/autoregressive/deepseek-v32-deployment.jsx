@@ -196,8 +196,8 @@ export const DeepSeekV32Deployment = () => {
     // Hardware platform specific parameters
     if (isAMD) {
       cmd += ' \\\n  --trust-remote-code';
-      cmd += ' \\\n  --nsa-prefill-backend tilelang';
-      cmd += ' \\\n  --nsa-decode-backend tilelang';
+      cmd += ' \\\n  --dsa-prefill-backend tilelang';
+      cmd += ' \\\n  --dsa-decode-backend tilelang';
       cmd += ' \\\n  --cuda-graph-max-bs 64';
     }
 

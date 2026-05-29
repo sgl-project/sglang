@@ -9,6 +9,22 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
 @dataclass
+class MoELoRABatchInfo:
+    # Per-request segment indptrs used by MoE LoRA routing, shape (bs + 1,).
+    seg_indptr: torch.Tensor
+
+    # Per-request adapter index used by MoE LoRA routing, shape (bs,).
+    req_to_lora: torch.Tensor
+
+    # A mask indicating if lora adapter is enabled. Shape (num_loras,)
+    adapter_enabled: torch.Tensor
+
+    # A mapping of which lora adapter is used for each token. Shape (num_tokens,)
+    # If a token has no lora adapter, the value is -1.
+    token_lora_mapping: torch.Tensor
+
+
+@dataclass
 class LoRABatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool
@@ -57,6 +73,9 @@ class LoRABatchInfo:
 
     # Per-request adapter index, shape (bs,).
     req_weight_indices: Optional[torch.Tensor] = None
+
+    # MoE LoRA batch info
+    moe_lora_info: Optional[MoELoRABatchInfo] = None
 
 
 class LoRAType(Enum):
@@ -133,6 +152,18 @@ def get_hidden_dim(
             return (
                 config.hidden_size,
                 q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+            )
+        elif module_name == "q_b_proj":
+            return (
+                config.q_lora_rank,
+                config.num_attention_heads
+                * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+            )
+        elif module_name == "kv_b_proj":
+            return (
+                config.kv_lora_rank,
+                config.num_attention_heads
+                * (config.qk_nope_head_dim + config.v_head_dim),
             )
         elif module_name == "gate_up_proj_moe":
             moe_inter = (
@@ -274,6 +305,8 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "embed_tokens",
         "lm_head",
         "fused_qkv_a_proj_with_mqa",
+        "q_b_proj",
+        "kv_b_proj",
     }
 )
 

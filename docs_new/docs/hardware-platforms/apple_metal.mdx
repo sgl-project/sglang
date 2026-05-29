@@ -60,6 +60,30 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 2. `--disable-cuda-graph` - Disables usage of CUDA graph, which is not relevant for Apple Metal.
 3. `--disable-overlap-schedule` - Disables overlap scheduling (enabled/not present by default) achieved using MLX's `async_eval()`
 
+## Quantization
+
+The MLX backend supports two quantization paths on Apple Silicon:
+
+1. **Pre-quantized HF repos.** Any `mlx-community/<model>-4bit` (or `-8bit`) repo loads directly through `mlx_lm.load(...)` — no extra flag needed.
+   ```bash
+   SGLANG_USE_MLX=1 python -m sglang.launch_server \
+     --model-path mlx-community/Qwen3-0.6B-4bit \
+     --disable-cuda-graph
+   ```
+2. **On-the-fly quantization.** For any fp16 model, pass `--quantization mlx_q4` or `--quantization mlx_q8` to have sglang quantize the weights at load time via `mlx_lm.utils.quantize_model` (group size 64, the mlx-community default). The quantized weights stay in process memory; the on-disk model is untouched.
+   ```bash
+   SGLANG_USE_MLX=1 python -m sglang.launch_server \
+     --model-path Qwen/Qwen3-0.6B \
+     --quantization mlx_q4 \
+     --disable-cuda-graph
+   ```
+   Expected log line:
+   ```
+   Quantizing MLX model on-the-fly: bits=4 group_size=64 (preset=mlx_q4)
+   Quantization complete in 0.13s — active mem: 1.11 GB -> 0.31 GB (71.9% reduction)
+   ```
+   The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
+
 
 ## Benchmarking with Requests
 
