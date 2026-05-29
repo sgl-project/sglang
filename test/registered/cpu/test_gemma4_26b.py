@@ -47,6 +47,7 @@ class TestGemma4_26BCPU(unittest.TestCase):
                 output_lens=(1024,),
                 enable_profile=False,
             ),
+            share_server=True,
         )
         self.assertTrue(result["all_passed"], f"Test failed: {result}")
 
