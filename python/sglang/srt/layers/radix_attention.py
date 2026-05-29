@@ -112,6 +112,14 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        # IDLE is a dispatch sentinel — for DP attention a worker may be
+        # allocated no sequences, and we early-return an empty tensor of
+        # the shape the model expects. Doing this here (rather than in the
+        # AttentionBackend.forward dispatch) means backend.forward bodies
+        # do not have to handle IDLE input.
+        if forward_batch.forward_mode.is_idle():
+            return q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None

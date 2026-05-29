@@ -136,17 +136,16 @@ class AttentionBackend(ABC):
 
         Dispatches on the shape class of ``forward_batch.forward_mode``:
 
-        * ``IDLE`` — short-circuits to an empty tensor. This branch will
-          be removed once :py:class:`RadixAttention.forward` takes over
-          the IDLE short-circuit (see attention refactor step 09.d).
         * ``SINGLE_TOKEN`` (== ``DECODE``) — :py:meth:`forward_single_token`.
         * ``UNIFORM_LEN`` (NPU only, dispatched via the legacy
           ``is_mixed()`` predicate today) — :py:meth:`forward_uniform_len`.
         * everything else — :py:meth:`forward_var_len`.
+
+        IDLE is *not* dispatched here: :py:class:`RadixAttention.forward`
+        short-circuits IDLE upstream so that backend bodies do not have
+        to handle empty input.
         """
-        if forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif forward_batch.forward_mode.is_single_token():
+        if forward_batch.forward_mode.is_single_token():
             return self.forward_single_token(
                 q,
                 k,
