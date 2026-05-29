@@ -248,7 +248,9 @@ class ScriptedRuntime:
         independent of what earlier scripts on the shared engine left
         behind.
         """
-        assert self._is_driver, "reset_radix_cache is only callable from the driver rank"
+        assert (
+            self._is_driver
+        ), "reset_radix_cache is only callable from the driver rank"
         self._scheduler.tree_cache.reset()
 
     def get_all_node_hit_counts(self) -> int:
