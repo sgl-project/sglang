@@ -610,8 +610,15 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
         else:
+            # gpu_only path leaves extend_prefix_lens_cpu unset; over-allocate
+            # via a static ub since _fill_kv_indptr_and_indices writes ragged
+            # using the GPU extend_prefix_lens tensor (extra tail unused).
+            if forward_batch.extend_prefix_lens_cpu is not None:
+                kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
+            else:
+                kv_indices_len = bs * self.max_context_len
             kv_indices = torch.empty(
-                sum(forward_batch.extend_prefix_lens_cpu),
+                kv_indices_len,
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -646,7 +653,13 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+            # Caller typically sets extend_seq_lens_cpu (eagle_info gpu_only path
+            # supplies the host-constant mirror); fall back to a GPU max only if
+            # some caller leaves it unset.
+            if forward_batch.extend_seq_lens_cpu is not None:
+                max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+            else:
+                max_extend_len = int(forward_batch.extend_seq_lens.max())
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(
