@@ -204,7 +204,11 @@ class FutureMap:
         if fi is None:
             return
         if self.publish_ready is not None:
-            self.publish_ready.wait()
+            if _is_hip:
+                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                self.publish_ready.synchronize()
+            else:
+                self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
