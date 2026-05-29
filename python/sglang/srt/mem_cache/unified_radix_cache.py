@@ -910,6 +910,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_len = node.key.match(key, page_size=self.page_size)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
+                if (
+                    self.supports_swa()
+                    and self._swa_valid_from_for_event(node) is not None
+                ):
+                    self._record_store_event(node, medium=StorageMedium.GPU)
 
             if node.evicted:
                 old_parent = node.parent

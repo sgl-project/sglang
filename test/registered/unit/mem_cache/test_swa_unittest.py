@@ -226,6 +226,20 @@ class TestSWA(unittest.TestCase):
         swa_update_stores = [e for e in swa_update_events if isinstance(e, BlockStored)]
         self.assertEqual({e.swa_valid_from for e in swa_update_stores}, {4})
 
+        partial_value = _swa_alloc(allocator, 4)
+        self.assertIsNotNone(partial_value)
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])),
+                value=partial_value,
+                swa_evicted_seqlen=2,
+            )
+        )
+        partial_restore_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual({e.swa_valid_from for e in partial_restore_events}, {2, None})
+
         _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
         swa_restore_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)

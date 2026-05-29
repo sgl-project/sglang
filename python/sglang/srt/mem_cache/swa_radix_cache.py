@@ -1147,6 +1147,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
+                if node.swa_tombstone:
+                    self._record_store_event(node)
 
             # if tombstone after update_kv_after_len, update node.value to be the input value.
             # This is needed because it is possible that the last sliding window size tokens
@@ -1178,7 +1180,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         self.token_to_kv_pool_allocator.free(
                             node.value[start_update_idx:prefix_len]
                         )
-                        self._split_node(node.key, node, start_update_idx)
+                        parent = self._split_node(node.key, node, start_update_idx)
+                        self._record_store_event(parent)
                         # Here node is the new node after split, so we can overwrite the value to the new node.
                         # The old node is still swa tombstone and the full token is not freed.
                         node.value = value[start_update_idx:prefix_len].clone()
