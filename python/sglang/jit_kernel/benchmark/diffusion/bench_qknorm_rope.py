@@ -46,17 +46,9 @@ BENCH_CASES = (
     CaseSpec("hunyuanvideo_medium", 1, 24576, 24, 128, 128, False),
 )
 CASE_BY_NAME = {case.name: case for case in BENCH_CASES}
-
-# `hunyuanvideo_medium` (1×24576×24×128 → ~75M elements, ~150 MB Q/K
-# tensors each, ~1 GB working set per case across split + fused providers)
-# is ~3x the per-case wall time of the existing cases. Excluded from the
-# default CI range to keep `register_cuda_ci(est_time=13, ...)` honest;
-# still runs via `--cases hunyuanvideo_medium` or `--cases <full-list>`
-# for standalone perf verification.
-_CI_EXCLUDE = frozenset({"hunyuanvideo_medium"})
 CASE_NAMES = get_benchmark_range(
     full_range=[case.name for case in BENCH_CASES],
-    ci_range=[case.name for case in BENCH_CASES if case.name not in _CI_EXCLUDE],
+    ci_range=[case.name for case in BENCH_CASES],
 )
 LINE_VALS = ["split", "fused"]
 LINE_NAMES = ["JIT QKNorm + FlashInfer RoPE", "SGL JIT Fused QKNorm+RoPE"]
