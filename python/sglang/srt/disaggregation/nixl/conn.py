@@ -172,9 +172,6 @@ def expand_page_indices_for_slice(
 
     Dlist layout: num_ptr_pairs blocks of (num_slots * page_size * num_groups),
     with [slot, token, group] interleaving. head_group_idx selects one group (0 for dst).
-
-    E.g. page_indices=[1], page_size=2, num_slots=4, num_groups=2, head_group_idx=1:
-      → [1*(2*2)+0*2+1, 1*(2*2)+1*2+1] = [5, 7]
     """
     token_offsets = np.arange(page_size, dtype=np.int32)
     pair_stride = num_slots * page_size * num_groups
@@ -188,15 +185,15 @@ def expand_page_indices_for_slice(
 
 
 def repeat_indices_over_layers(
-    indices: npt.NDArray[np.int32], layer_lengths: List[int]
+    indices: npt.NDArray[np.int32], num_layers: int, layer_length: int
 ) -> npt.NDArray[np.int32]:
     """Map per-slot token indices to flat indices in a pre-built descriptor list.
 
-    Given indices [1, 3] and layer_lengths [M, M] (two layers with M slots each),
-    returns [1, 3, M+1, M+3] — the flat dlist positions across all layers concatenated.
-    Works uniformly for both MLA (one ptr/layer) and MHA (K+V ptrs, 2×N entries).
+    Each of ``num_layers`` blocks has ``layer_length`` slots; block i is offset by
+    ``i * layer_length``. Works uniformly for both MLA (one ptr/layer) and MHA
+    (K+V ptrs, 2×N entries).
     """
-    offsets = np.cumsum([0] + layer_lengths[:-1])
+    offsets = np.arange(num_layers, dtype=np.int32) * layer_length
     return (offsets[:, None] + indices[None, :]).ravel().astype(np.int32)
 
 
@@ -298,18 +295,13 @@ class NixlKVManager(CommonKVManager):
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
             None  # (handle, num_groups, num_ptr_pairs, num_slots)
         )
-        self.prep_handles_slice_dst: Dict[str, Tuple[Any, int]] = (
-            {}
-        )  # peer_name -> (handle, num_slots)
-        self.peer_head_group: Dict[str, int] = {}  # peer_name -> head_group_idx
+        self.prep_handles_slice_dst: Dict[str, Tuple[Any, int, int]] = {}
+        # peer_name -> (handle, num_slots, head_group_idx)
         self._num_slots_src: int = 0
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._num_slots_src = (
                 self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
-            )
-            self._init_equal_tp_prep_handle(
-                "", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id
             )
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
@@ -550,7 +542,7 @@ class NixlKVManager(CommonKVManager):
             self.prep_handles[peer_name] is not None
         ), f"prep_xfer_dlist returned None for peer '{peer_name}'"
 
-    def _init_hetero_tp_slice_prep_handle(
+    def _init_hetero_tp_prep_handle(
         self, peer_name: str, decode_kv_args: KVArgsRegisterInfo
     ):
         """Pre-build NIXL dlists for TP-heterogeneous slice transfers.
@@ -560,14 +552,10 @@ class NixlKVManager(CommonKVManager):
         prefill_tp > decode_tp: num_groups=1. Dst dlist is per-peer.
         """
         decode_tp_size = decode_kv_args.decode_tp_size
-        decode_tp_rank = decode_kv_args.decode_tp_rank
         dst_kv_item_len = decode_kv_args.dst_kv_item_len
-        dst_gpu_id = decode_kv_args.gpu_id
         prefill_tp_size = self.attn_tp_size
 
-        src_kv_item_len = self.kv_args.kv_item_lens[0]
         page_size = self.kv_args.page_size
-        num_slots = self.kv_args.kv_data_lens[0] // src_kv_item_len
 
         total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
@@ -591,7 +579,7 @@ class NixlKVManager(CommonKVManager):
         else:
             # One prefill rank feeds multiple decode ranks: interleave num_groups
             # head-groups in the src dlist so each decode rank picks its slice.
-            dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
+            dst_tp_rank_in_group = decode_kv_args.decode_tp_rank % decode_tp_size
             num_groups = decode_tp_size // prefill_tp_size
             num_heads_to_send = dst_heads_per_rank
             src_head_start = (
@@ -600,6 +588,7 @@ class NixlKVManager(CommonKVManager):
             head_group_idx = src_head_start // dst_heads_per_rank
             dst_head_offset = 0
 
+        src_kv_item_len = self.kv_args.kv_item_lens[0]
         bytes_per_token_to_send = num_heads_to_send * bytes_per_head_slice
         bytes_per_token_src = src_kv_item_len // page_size
         bytes_per_token_dst = dst_kv_item_len // page_size
@@ -613,11 +602,12 @@ class NixlKVManager(CommonKVManager):
         dst_ptrs = list(dst_k_ptrs[:layers_pp]) + list(dst_v_ptrs[:layers_pp])
         num_ptr_pairs = len(src_ptrs)
 
+        num_slots = self.kv_args.kv_data_lens[0] // src_kv_item_len
         slots = np.arange(num_slots, dtype=np.int64)
         tokens = np.arange(page_size, dtype=np.int64)  # reused in dst dlist below
         groups = np.arange(num_groups, dtype=np.int64)
 
-        # Src dlist built once and shared. For heterogeneous decode TP, key by (decode_tp_size, layers_pp).
+        # Src dlist built once and shared.
         if self.prep_handle_slice_src is None:
             # (ptr, slot, token, group) → ravel; groups interleaved per token.
             src_ptrs_arr = np.array(src_ptrs, dtype=np.int64)
@@ -664,21 +654,30 @@ class NixlKVManager(CommonKVManager):
             [
                 addrs,
                 np.full(len(addrs), bytes_per_token_to_send, dtype=np.int64),
-                np.full(len(addrs), dst_gpu_id, dtype=np.int64),
+                np.full(len(addrs), decode_kv_args.gpu_id, dtype=np.int64),
             ]
         )
         dst_handle = self.agent.prep_xfer_dlist(peer_name, dst_array, "VRAM")
         assert (
             dst_handle is not None
         ), f"prep_xfer_dlist returned None for slice dst for peer '{peer_name}'"
-        self.prep_handles_slice_dst[peer_name] = (dst_handle, num_slots_dst)
-        self.peer_head_group[peer_name] = head_group_idx
+        self.prep_handles_slice_dst[peer_name] = (
+            dst_handle,
+            num_slots_dst,
+            head_group_idx,
+        )
 
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
             # Safe to use prefill's kv_item_lens for the dst dlist stride:
             # equal_tp guarantees identical heads-per-rank (same item_len);
             # MLA latent shape is TP-invariant.
+            # Build the shared src dlist on the first equal-TP/MLA peer; later
+            # peers reuse it. Skipped entirely on heterogeneous-TP-only setups.
+            if "" not in self.prep_handles:
+                self._init_equal_tp_prep_handle(
+                    "", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id
+                )
             self._init_equal_tp_prep_handle(
                 peer_info.agent_name,
                 peer_info.dst_kv_ptrs,
@@ -686,7 +685,7 @@ class NixlKVManager(CommonKVManager):
                 num_slots=peer_info.dst_num_slots,
             )
         else:
-            self._init_hetero_tp_slice_prep_handle(peer_info.agent_name, peer_info)
+            self._init_hetero_tp_prep_handle(peer_info.agent_name, peer_info)
 
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
@@ -805,14 +804,8 @@ class NixlKVManager(CommonKVManager):
                                 kv_xfer_handle = self.send_kvcache_slice(
                                     req.agent_name,
                                     kv_chunk.prefill_kv_indices,
-                                    dst_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
-                                    dst_info.gpu_id,
                                     notif,
-                                    prefill_tp_size=self.attn_tp_size,
-                                    decode_tp_size=decode_tp_size,
-                                    decode_tp_rank=dst_info.decode_tp_rank,
-                                    dst_kv_item_len=dst_info.dst_kv_item_len,
                                 )
 
                         handles.append(kv_xfer_handle)
@@ -972,13 +965,12 @@ class NixlKVManager(CommonKVManager):
                 if info.dst_num_slots is not None
                 else self._num_slots_src
             )
-            src_layer_lengths = [self._num_slots_src] * len(item_lens)
-            dst_layer_lengths = [num_slots_dst] * len(item_lens)
+            num_layers = len(item_lens)
             src_indices = repeat_indices_over_layers(
-                prefill_data_indices, src_layer_lengths
+                prefill_data_indices, num_layers, self._num_slots_src
             )
             dst_indices = repeat_indices_over_layers(
-                dst_data_indices, dst_layer_lengths
+                dst_data_indices, num_layers, num_slots_dst
             )
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE",
@@ -1125,26 +1117,18 @@ class NixlKVManager(CommonKVManager):
         self,
         peer_name: str,
         prefill_kv_indices: npt.NDArray[np.int32],
-        dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
-        dst_gpu_id: int,
         notif: str,
-        prefill_tp_size: int,
-        decode_tp_size: int,
-        decode_tp_rank: int,
-        dst_kv_item_len: int,
     ):
-        del dst_kv_ptrs, dst_gpu_id, prefill_tp_size, decode_tp_size
-        del decode_tp_rank, dst_kv_item_len
-
         # Prepped path: src dlist is shared per decode_tp_size; dst is per peer.
         assert self.prep_handle_slice_src is not None
         assert peer_name in self.prep_handles_slice_dst
         src_handle, num_groups, num_ptr_pairs, num_slots_src = (
             self.prep_handle_slice_src
         )
-        dst_handle, num_slots_dst = self.prep_handles_slice_dst[peer_name]
-        head_group_idx = self.peer_head_group[peer_name]
+        dst_handle, num_slots_dst, head_group_idx = self.prep_handles_slice_dst[
+            peer_name
+        ]
         page_size = self.kv_args.page_size
         src_indices = expand_page_indices_for_slice(
             np.asarray(prefill_kv_indices, dtype=np.int32),
