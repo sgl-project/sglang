@@ -1465,6 +1465,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         K_padded = round_up_to_multiple(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
+
+        # Snapshot the raw (pre-swizzle) scale BEFORE alias_or_bind_derived_param
+        # overwrites layer.weight_scale.data in-place via .copy_() on the broadcast
+        # path. Without this, the swiglu side-channel below would read the swizzled
+        # bytes when it later re-reads layer.weight_scale.
+        raw_scale_snapshot = (
+            (scales.squeeze(0) if scale_ndim == 2 else scales).detach().clone()
+        )
+
         batches, rows, cols = padded_scales.shape
         assert rows % 128 == 0
         assert cols % 4 == 0
@@ -1480,22 +1489,72 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer, "weight_scale", "weight_scale_interleaved", padded_scales
         )
 
+        # When the caller opts in via `interleave_for_swiglu_fusion=True`, also
+        # produce the [Up, Gate] 64-row-interleaved weight + scale that the
+        # nvfp4_gemm_swiglu_nvfp4_quant CUTE-DSL kernel consumes for FC1.
+        if getattr(layer, "interleave_for_swiglu_fusion", False):
+            from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+                interleave_linear_and_gate,
+                swizzle_blockscale_2d,
+            )
+
+            w = layer.weight.data
+            # Reshuffle paths below assume the loaded shapes match what the
+            # kernel will see. K-padding would create a weight/scale K mismatch
+            # (swizzled scale uses the raw, unpadded K); N-padding would shift
+            # the gate/up halves apart. Eligibility is gated upstream in
+            # DeepseekV2MoE.__init__ so a failure here is a setup bug.
+            assert weights_padding_cols == 0, (
+                "interleave_for_swiglu_fusion does not support K-padded weights; "
+                f"got weights_padding_cols={weights_padding_cols}."
+            )
+            assert raw_scale_snapshot.shape[0] == w.shape[0], (
+                "interleave_for_swiglu_fusion requires no N-padding; "
+                f"raw_scale rows={raw_scale_snapshot.shape[0]} vs weight rows={w.shape[0]}."
+            )
+            assert w.shape[0] % 128 == 0, (
+                "interleave_for_swiglu_fusion requires N % 128 == 0 (group_size=64 "
+                f"with gate+up halves); got N={w.shape[0]}."
+            )
+
+            gate_w, up_w = w.chunk(2, dim=0)
+            w_swiglu = interleave_linear_and_gate(
+                torch.cat((up_w, gate_w), dim=0), group_size=64, dim=0
+            )
+
+            gate_s, up_s = raw_scale_snapshot.chunk(2, dim=0)
+            w_scale_swiglu = swizzle_blockscale_2d(
+                interleave_linear_and_gate(
+                    torch.cat((up_s, gate_s), dim=0), group_size=64, dim=0
+                )
+            )
+
+            layer.weight_swiglu_interleaved = w_swiglu
+            layer.weight_scale_swiglu_interleaved = w_scale_swiglu
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        output_dtype = x.dtype
-        x_m, _ = x.shape
+        # Pre-quantized (fp4, scale) input — an upstream fused op (e.g.
+        # nvfp4_gemm_swiglu_nvfp4_quant) already produced the FP4 + swizzled
+        # scale and the layer was set up to consume it directly. The flag is
+        # required so an accidental tuple from unrelated code can't silently
+        # bypass quantization.
+        if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(x, tuple):
+            x_fp4, x_scale_interleaved = x
+            x_m = x_fp4.shape[0]
+            output_dtype = getattr(layer, "prequantized_output_dtype", torch.bfloat16)
+        else:
+            x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+            x_m, _ = x.shape
+            output_dtype = x.dtype
 
-        # Get original output size (before padding) and padded weight size
         output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
-
-        # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight.dtype == torch.uint8
