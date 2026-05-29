@@ -2,6 +2,7 @@
 
 import gc
 import platform as _platform
+from functools import cached_property
 from typing import Optional
 
 import psutil
@@ -23,6 +24,16 @@ class CpuDeviceMixin(DeviceMixin):
     device_name: str = "cpu"
     device_type: str = "cpu"
 
+    @cached_property
+    def cpu_arch(self) -> CpuArchEnum:
+        """Host CPU architecture (X86 / ARM / UNSPECIFIED), resolved once.
+
+        First-class identity attribute parallel to ``_enum`` — callers branch
+        on CPU arch through this instead of recomputing ``platform.machine()``.
+        ``get_cpu_architecture()`` is process-stable, so caching is safe.
+        """
+        return self.get_cpu_architecture()
+
     def get_device_total_memory(self, device_id: int = 0) -> int:
         return int(psutil.virtual_memory().total)
 
@@ -32,20 +43,32 @@ class CpuDeviceMixin(DeviceMixin):
         return float(psutil.Process().memory_info().rss)
 
     def get_device(self, local_rank: int) -> "torch.device":
+        # ``local_rank`` is intentionally ignored. PyTorch's CPU device is
+        # unindexed — ``torch.device("cpu", n)`` parses but the index is a
+        # semantic no-op, unlike CUDA where it selects a physical GPU. CPU
+        # tensor parallelism does have per-rank meaning (one rank per
+        # sub-NUMA cluster), but that isolation is applied out-of-band via
+        # OpenMP thread binding + numactl pinning (see
+        # ModelRunner.init_threads_binding), not through the device object.
         return torch.device("cpu")
 
     def set_device(self, device: "torch.device") -> None:
-        # True no-op. Do NOT call ``torch.set_default_device("cpu")`` — that
-        # would flip the process-wide default and break code that constructs
-        # ``torch.empty(..., device="cuda")`` elsewhere.
+        # No-op by design. On CUDA, set_device moves the current thread's
+        # active-device cursor (so subsequent allocations land on that GPU).
+        # CPU has a single unindexed logical device — there is no cursor to
+        # move, and per-rank isolation is handled via OpenMP/numactl binding
+        # (see get_device), not here.
+        #
+        # We also deliberately avoid ``torch.set_default_device("cpu")``: that
+        # flips the *process-wide* default tensor device, which would break
+        # code paths that explicitly build tensors on another device.
         pass
 
     def get_device_name(self, device_id: int = 0) -> str:
-        arch = self.get_cpu_architecture()
         proc = _platform.processor() or _platform.machine() or "unknown"
-        if arch == CpuArchEnum.ARM:
+        if self.cpu_arch == CpuArchEnum.ARM:
             return f"cpu (aarch64: {proc})"
-        if arch == CpuArchEnum.X86:
+        if self.cpu_arch == CpuArchEnum.X86:
             return f"cpu (x86_64: {proc})"
         return f"cpu ({proc})"
 
@@ -56,10 +79,17 @@ class CpuDeviceMixin(DeviceMixin):
         return None
 
     def empty_cache(self) -> None:
-        # Trigger a GC pass. ``empty_cache`` is called at well-defined teardown
-        # points (Scheduler.flush_cache, weight reload, etc.) where a brief
-        # collection pause is acceptable. Beats the base ``pass`` no-op for
-        # actual CPU memory pressure.
+        # CPU has no device-side allocator cache to drop, and PyTorch exposes
+        # no ``torch.cpu.empty_cache()`` (nor any arch-specific equivalent on
+        # the x86/ARM CPUs we support). The honest portable action is a GC
+        # pass to reclaim Python-level cycles at the teardown points where this
+        # is called (Scheduler.flush_cache, periodic idle sleep, weight reload).
+        #
+        # This intentionally does NOT force freed arenas back to the OS. glibc
+        # ``malloc_trim`` could, but it is (a) a no-op under the tcmalloc / TBB
+        # malloc allocators the CPU deployment guide preloads via LD_PRELOAD,
+        # and (b) on a periodic path. Real RSS reclaim, if needed, belongs in a
+        # separate benchmarked change gated on the active allocator.
         gc.collect()
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:

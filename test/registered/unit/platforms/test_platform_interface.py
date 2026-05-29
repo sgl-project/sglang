@@ -391,6 +391,15 @@ class TestCpuDeviceMixin(CustomTestCase):
         self.assertEqual(base.get_torch_distributed_backend_str(), "gloo")
 
     @patch("platform.machine", return_value="aarch64")
+    def test_cpu_arch_property_resolves_and_caches(self, mock_machine):
+        base = CpuSRTPlatform()
+        self.assertEqual(base.cpu_arch, CpuArchEnum.ARM)
+        # cached_property: second access must not re-query platform.machine
+        call_count = mock_machine.call_count
+        self.assertEqual(base.cpu_arch, CpuArchEnum.ARM)
+        self.assertEqual(mock_machine.call_count, call_count)
+
+    @patch("platform.machine", return_value="aarch64")
     def test_get_device_name_arm_branch(self, _mock_machine):
         base = CpuSRTPlatform()
         name = base.get_device_name()
