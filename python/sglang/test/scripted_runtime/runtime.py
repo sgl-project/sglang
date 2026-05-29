@@ -338,35 +338,6 @@ class ScriptedRuntime:
         s = self._scheduler
         return s.chunked_req is not None and s.chunked_req.rid == rid
 
-    def _lookup_chunked_req_scheduled_last_iter(self, rid: str) -> Optional[bool]:
-        """Per-req snapshot of the scheduler's chunked-iter flag.
-
-        Returns the scheduler's ``_chunked_req_scheduled_last_iter`` if
-        this rid is the current ``chunked_req``; otherwise ``None``.
-        """
-        s = self._scheduler
-        if s.chunked_req is not None and s.chunked_req.rid == rid:
-            return s._chunked_req_scheduled_last_iter
-        return None
-
-    def _lookup_swa_chunked_early_return_count(self, rid: str) -> int:
-        """Per-req count of SWA early-returns from ``add_chunked_req``.
-
-        Reads ``Req.swa_chunked_early_return_count`` (always initialised).
-        Returns 0 if the req is no longer held by the scheduler.
-        """
-        req = self._find_req_by_rid(rid)
-        return req.swa_chunked_early_return_count if req is not None else 0
-
-    def _lookup_swa_stash_double_free_count(self, rid: str) -> int:
-        """Per-req count of stash-gate invariant violations.
-
-        Reads ``Req.swa_stash_double_free_count`` (always initialised).
-        Returns 0 if the req is no longer held by the scheduler.
-        """
-        req = self._find_req_by_rid(rid)
-        return req.swa_stash_double_free_count if req is not None else 0
-
     # ============================================================
     # Internal: invoked by SchedulerRequestReceiver at every iter.
     # ============================================================
@@ -898,16 +869,6 @@ class ScriptedRuntime:
             "scripted_runtime: last_scheduler_path is wishlist — see "
             "2026-05-26-round-5-de-skip-and-api-wishlist.md"
         )
-
-    def last_chunked_req_scheduled_iter_flag(self) -> Optional[bool]:
-        """Snapshot of ``_chunked_req_scheduled_last_iter``.
-
-        Tracks whether the previous iter scheduled a chunk for the
-        current chunked_req. Critical for the exclude-set source logic.
-
-        Consumed by: test_chunked_req_scheduled_last_iter_flag (special_case).
-        """
-        return self._scheduler._chunked_req_scheduled_last_iter
 
     def last_chunked_exclude_set_source(self) -> Optional[str]:
         """Return where the chunked_req_to_exclude set came from on the last iter.

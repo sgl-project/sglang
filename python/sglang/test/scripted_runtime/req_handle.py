@@ -180,18 +180,6 @@ class ReqHandle:
         raise _wishlist("inflight_middle_chunks")
 
     @property
-    def chunked_req_scheduled_last_iter(self) -> Optional[bool]:
-        """Per-req snapshot of ``_chunked_req_scheduled_last_iter``.
-
-        Returns the scheduler flag if this req is the current chunked_req;
-        ``None`` otherwise (req is not in the chunked slot this iter).
-
-        Consumed by: test_chunked_req_scheduled_last_iter_flag (special_case),
-                     test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
-        """
-        return self.runtime._lookup_chunked_req_scheduled_last_iter(self.rid)
-
-    @property
     def extend_input_len(self) -> int:
         """Current ``extend_input_len`` (chunk size for the next extend).
 
@@ -492,32 +480,6 @@ class ReqHandle:
         raise _wishlist("spec_accept_rate")
 
     # === SWA ===
-
-    @property
-    def swa_stash_double_free_count(self) -> int:
-        """Count of stash-gate invariant violations for this req.
-
-        Increments when ``stash_chunked_request`` is called on this req
-        with ``Scheduler._chunked_req_scheduled_last_iter == False`` —
-        the exact regression the flag was added to prevent. Invariant
-        is "stays at 0".
-
-        Consumed by: test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
-        """
-        return self.runtime._lookup_swa_stash_double_free_count(self.rid)
-
-    @property
-    def swa_chunked_early_return_count(self) -> int:
-        """Count of SWA early-returns from ``add_chunked_req`` for this req.
-
-        Incremented when hybrid-SWA budget pressure forces
-        ``schedule_policy.add_chunked_req`` to early-return without admitting
-        the chunked_req to ``can_run_list``. Used by regression tests to
-        verify the SWA early-return code path was actually exercised.
-
-        Consumed by: test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
-        """
-        return self.runtime._lookup_swa_chunked_early_return_count(self.rid)
 
     @property
     def swa_budget_overflow_count(self) -> int:
