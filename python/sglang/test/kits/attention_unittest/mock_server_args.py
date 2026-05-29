@@ -52,6 +52,7 @@ def make_mock_server_args(**overrides) -> ServerArgs:
             setattr(sa, f.name, f.default)
         elif f.default_factory is not dataclasses.MISSING:
             setattr(sa, f.name, f.default_factory())
+    legacy_cuda_graph_bs = overrides.pop("cuda_graph_bs", None)
     for k, v in overrides.items():
         cls_attr = getattr(type(sa), k, None)
         if isinstance(cls_attr, property):
@@ -60,9 +61,10 @@ def make_mock_server_args(**overrides) -> ServerArgs:
             setattr(sa, k, v)
     if sa.cuda_graph_config is None:
         sa.cuda_graph_config = default_cuda_graph_config()
-        sa.cuda_graph_config[Phase.DECODE]["bs"] = [1, 2, 4, 8]
-        sa.cuda_graph_config[Phase.DECODE]["max_bs"] = 8
-        sa.cuda_graph_config[Phase.PREFILL]["max_bs"] = 8
+        bs = legacy_cuda_graph_bs if legacy_cuda_graph_bs is not None else [4]
+        sa.cuda_graph_config[Phase.DECODE]["bs"] = list(bs)
+        sa.cuda_graph_config[Phase.DECODE]["max_bs"] = max(bs)
+        sa.cuda_graph_config[Phase.PREFILL]["max_bs"] = max(bs)
     if not hasattr(sa, "_cuda_graph_config_locked"):
         sa._cuda_graph_config_locked = set()
     return sa
