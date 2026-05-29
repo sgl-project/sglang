@@ -284,7 +284,7 @@ class FlashAttentionBackend(AttentionBackend):
         if in_capture:
             self.init_forward_metadata_capture_cuda_graph(
                 bs=bs,
-                num_tokens=forward_batch.input_ids.shape[0],
+                num_tokens=forward_batch.positions.numel(),
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
                 encoder_lens=forward_batch.encoder_lens,
