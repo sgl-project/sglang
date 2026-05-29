@@ -1,4 +1,4 @@
-"""LoRA overlap loading × chunked: naive ScriptedRuntime smoke.
+"""LoRA overlap loading × chunked: naive ScriptedContext smoke.
 
 Adapter H2D copy runs concurrently with the chunked prefill loop. We
 want the chunked-resume path to make progress even while LoRA H2D is
@@ -17,8 +17,8 @@ In addition to the baseline smoke, this file pins:
 
 import unittest
 
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -36,7 +36,7 @@ _LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
 _LORA_ADAPTER_B = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test-b"
 
 
-class TestLoRAOverlapSingleAdapter(ScriptedRuntimeTestCase):
+class TestLoRAOverlapSingleAdapter(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=_LORA_BASE_MODEL,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -46,11 +46,11 @@ class TestLoRAOverlapSingleAdapter(ScriptedRuntimeTestCase):
     )
 
     def test_naive_lora_overlap_chunked(self):
-        """LoRA overlap loading × chunked: naive ScriptedRuntime smoke."""
-        self.runtime.run(self._script_naive_lora_overlap_chunked)
+        """LoRA overlap loading × chunked: naive ScriptedContext smoke."""
+        self.server.execute_script(self._script_naive_lora_overlap_chunked)
 
     @staticmethod
-    def _script_naive_lora_overlap_chunked(t: ScriptedRuntime):
+    def _script_naive_lora_overlap_chunked(t: ScriptedContext):
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=4,
@@ -61,7 +61,7 @@ class TestLoRAOverlapSingleAdapter(ScriptedRuntimeTestCase):
         assert r.chunks_done >= 2
 
 
-class TestLoRAOverlapH2dDuringChunk(ScriptedRuntimeTestCase):
+class TestLoRAOverlapH2dDuringChunk(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=_LORA_BASE_MODEL,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -74,7 +74,7 @@ class TestLoRAOverlapH2dDuringChunk(ScriptedRuntimeTestCase):
 
     def test_lora_overlap_h2d_during_chunk_admit(self):
         """LoRA H2D copy in flight when chunked admission for a different adapter fires."""
-        self.runtime.run(self._script_lora_overlap_h2d_during_chunk_admit)
+        self.server.execute_script(self._script_lora_overlap_h2d_during_chunk_admit)
 
     # H2D copy of adapter B is overlapping the scheduler
     # loop when r_b's first chunk wants to admit. Pre-fix, the chunked
@@ -82,7 +82,7 @@ class TestLoRAOverlapH2dDuringChunk(ScriptedRuntimeTestCase):
     # admission must wait for H2D to settle. r_a continues chunking on
     # adapter A meanwhile and both reqs finish on their pinned adapter.
     @staticmethod
-    def _script_lora_overlap_h2d_during_chunk_admit(t: ScriptedRuntime):
+    def _script_lora_overlap_h2d_during_chunk_admit(t: ScriptedContext):
         r_a = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
@@ -107,7 +107,7 @@ class TestLoRAOverlapH2dDuringChunk(ScriptedRuntimeTestCase):
         assert r_b.lora_path == _LORA_ADAPTER_B
 
 
-class TestLoRAOverlapAdapterRotation(ScriptedRuntimeTestCase):
+class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=_LORA_BASE_MODEL,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -120,7 +120,7 @@ class TestLoRAOverlapAdapterRotation(ScriptedRuntimeTestCase):
 
     def test_lora_overlap_abort_during_h2d(self):
         """Abort hitting the LoRA H2D + chunked sync window cancels cleanly without double-fire."""
-        self.runtime.run(self._script_lora_overlap_abort_during_h2d)
+        self.server.execute_script(self._script_lora_overlap_abort_during_h2d)
 
     # r_a chunks on adapter A. r_b on adapter
     # B is submitted, forcing an overlapped H2D of adapter B and a
@@ -128,7 +128,7 @@ class TestLoRAOverlapAdapterRotation(ScriptedRuntimeTestCase):
     # cleanly: no double-fire on the completion event, no orphaned
     # adapter ref, no KV leak. r_a's adapter pin must survive.
     @staticmethod
-    def _script_lora_overlap_abort_during_h2d(t: ScriptedRuntime):
+    def _script_lora_overlap_abort_during_h2d(t: ScriptedContext):
         r_a = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
@@ -159,7 +159,9 @@ class TestLoRAOverlapAdapterRotation(ScriptedRuntimeTestCase):
 
     def test_lora_overlap_back_to_back_adapters_chunked(self):
         """Back-to-back distinct adapter loads with chunked reqs all finish on their own adapter."""
-        self.runtime.run(self._script_lora_overlap_back_to_back_adapters_chunked)
+        self.server.execute_script(
+            self._script_lora_overlap_back_to_back_adapters_chunked
+        )
 
     # Several chunked reqs submitted back-to-back, each on
     # a distinct adapter, with overlap loading on and only one adapter
@@ -167,7 +169,7 @@ class TestLoRAOverlapAdapterRotation(ScriptedRuntimeTestCase):
     # before its req's first chunk runs, and every req finishes on its
     # pinned adapter without cross-contamination.
     @staticmethod
-    def _script_lora_overlap_back_to_back_adapters_chunked(t: ScriptedRuntime):
+    def _script_lora_overlap_back_to_back_adapters_chunked(t: ScriptedContext):
         adapters = [_LORA_ADAPTER, _LORA_ADAPTER_B, _LORA_ADAPTER, _LORA_ADAPTER_B]
         reqs = [
             t.start_req(

@@ -1,14 +1,14 @@
 """Long-lived script that pulls sub-scripts from an IPC socket and runs them.
 
-Installed as the ScriptedRuntime ``script_fn`` by
-:class:`ScriptedRuntimeSession`. Owns no test logic of its own — it is a
+Installed as the scripted-runtime ``script_fn`` by
+:class:`ScriptedHttpServer`. Owns no test logic of its own — it is a
 pure router that ``yield from``s each caller-requested sub-script and
 forwards success / failure back over a unix-socket connection.
 
 Crucially, when a sub-script raises (including ``AssertionError``), the
 router *captures* the traceback into a socket message and *keeps
 running* — it does not re-raise. Re-raising would tear the engine down
-(the runtime ``sys.exit``s the scheduler subprocess), voiding every
+(the hook ``sys.exit``s the scheduler subprocess), voiding every
 remaining test in the class.
 """
 
@@ -19,10 +19,11 @@ import traceback
 from multiprocessing.connection import Client
 from typing import Generator
 
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime, _resolve_fn
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.utils import resolve_fn
 
 
-def router_script(t: ScriptedRuntime) -> Generator:
+def router_script(t: ScriptedContext) -> Generator:
     """Receive ``run`` / ``shutdown`` commands; ``yield from`` each sub-script.
 
     Runs forever on the scheduler driver rank until the caller sends a
@@ -39,7 +40,7 @@ def router_script(t: ScriptedRuntime) -> Generator:
             if kind == "shutdown":
                 return
             if kind == "run":
-                fn = _resolve_fn(msg["fn_path"])
+                fn = resolve_fn(msg["fn_path"])
                 # Start every sub-script from a clean engine: flush so radix /
                 # pool state from the previous sub-script can't leak across
                 # runs. Visible on the next yield (same as start_req), hence the

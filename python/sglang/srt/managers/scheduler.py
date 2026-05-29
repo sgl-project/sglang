@@ -538,7 +538,7 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.init_grammar_manager()
 
-        self.init_scripted_runtime()
+        self.maybe_init_scripted_scheduler_hook()
 
         self.init_request_receiver()
 
@@ -1541,17 +1541,19 @@ class Scheduler(
     def init_grammar_manager(self) -> None:
         self.grammar_manager = GrammarManager(self)
 
-    def init_scripted_runtime(self) -> None:
+    def maybe_init_scripted_scheduler_hook(self) -> None:
         if self.server_args.scripted_runtime_fn_path is not None:
-            from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+            from sglang.test.scripted_runtime.scheduler_hook import (
+                ScriptedSchedulerHook,
+            )
 
-            self.scripted_runtime = ScriptedRuntime(
+            self.scripted_scheduler_hook = ScriptedSchedulerHook(
                 scheduler=self,
                 script_fn_path=self.server_args.scripted_runtime_fn_path,
                 tokenizer_recv_proxy=self.ipc_channels.recv_from_tokenizer,
             )
         else:
-            self.scripted_runtime = None
+            self.scripted_scheduler_hook = None
 
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
@@ -1575,7 +1577,7 @@ class Scheduler(
             get_last_forward_mode=lambda: (
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
-            scripted_runtime=self.scripted_runtime,
+            scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
 
     def init_dp_attn_adapter(self) -> None:

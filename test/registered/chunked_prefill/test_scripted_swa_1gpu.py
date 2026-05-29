@@ -1,8 +1,8 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     base_engine_kwargs,
     run_until,
@@ -60,7 +60,7 @@ _RESIDENT_DECODE = 64  # keep it resident while r overflows and early-returns
 _CHUNKED_PROMPT = 4096  # >> the ~1984 free full slots -> guaranteed overflow
 
 
-class TestScriptedSwaChunkedReqEarlyReturn(ScriptedRuntimeTestCase):
+class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=_SWA_MODEL,
         chunked_prefill_size=_CHUNK_SIZE,
@@ -73,14 +73,16 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedRuntimeTestCase):
 
     def test_swa_chunked_req_early_return_no_double_free(self):
         """KV-cache starvation makes add_chunked_req early-return; the stash gate keeps the un-scheduled chunked req's partial KV out of the tree."""
-        self.runtime.run(self._script_swa_chunked_req_early_return_no_double_free)
+        self.server.execute_script(
+            self._script_swa_chunked_req_early_return_no_double_free
+        )
 
     # A resident competitor pins most of the KV pool, so the chunked req hits
     # the add_chunked_req early-return: it stays parked as scheduler.chunked_req
     # without running, and the stash gate must keep its partial KV out of the
     # tree so no radix node is left locked after drain.
     @staticmethod
-    def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedRuntime):
+    def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedContext):
         s = t._scheduler
 
         # Bring the competitor up first and let it finish its own chunked

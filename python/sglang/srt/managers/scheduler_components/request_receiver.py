@@ -34,12 +34,14 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.server_args import ServerArgs
-    from sglang.test.scripted_runtime.tokenizer_recv_proxy import TokenizerRecvProxy
+    from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
+        ScriptedTokenizerRecvProxy,
+    )
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[zmq.Socket, "TokenizerRecvProxy"]
+    recv_from_tokenizer: Union[zmq.Socket, "ScriptedTokenizerRecvProxy"]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
@@ -57,7 +59,7 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
-    scripted_runtime: Optional[Any] = None
+    scripted_scheduler_hook: Optional[Any] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -69,9 +71,9 @@ class SchedulerRequestReceiver:
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
-        if self.scripted_runtime is not None:
+        if self.scripted_scheduler_hook is not None:
             # All ranks must call this so the cross-rank broadcast stays balanced.
-            self.scripted_runtime._yield_to_script()
+            self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_forward_mode()):

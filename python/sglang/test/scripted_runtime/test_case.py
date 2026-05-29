@@ -1,9 +1,9 @@
-"""unittest base class wrapping :class:`ScriptedRuntimeSession`.
+"""unittest base class wrapping :class:`ScriptedHttpServer`.
 
 Subclass and set ``ENGINE_KWARGS`` as a class attribute. The base owns
-the Engine lifecycle — one engine per concrete class, shared across
+the HTTP-server lifecycle — one server per concrete class, shared across
 every ``test_*`` method. Tests dispatch ``_script_*`` sub-scripts via
-``self.runtime.run(...)``.
+``self.server.execute_script(...)``.
 
 Convention (no enforcement until the wishlist abort / list_active_reqs
 APIs land): each ``_script_*`` must drive every request it starts to
@@ -16,16 +16,16 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Dict
 
-from sglang.test.scripted_runtime.session import ScriptedRuntimeSession
+from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
 from sglang.test.test_utils import CustomTestCase
 
 
-class ScriptedRuntimeTestCase(CustomTestCase):
-    """Base TestCase that owns a class-scoped :class:`ScriptedRuntimeSession`."""
+class ScriptedTestCase(CustomTestCase):
+    """Base TestCase that owns a class-scoped :class:`ScriptedHttpServer`."""
 
     ENGINE_KWARGS: ClassVar[Dict[str, Any]] = {}
 
-    runtime: ClassVar[ScriptedRuntimeSession]
+    server: ClassVar[ScriptedHttpServer]
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -34,11 +34,11 @@ class ScriptedRuntimeTestCase(CustomTestCase):
             raise AssertionError(
                 f"{cls.__name__} must set ENGINE_KWARGS to a non-empty dict"
             )
-        cls.runtime = ScriptedRuntimeSession.start(**cls.ENGINE_KWARGS)
+        cls.server = ScriptedHttpServer.start(**cls.ENGINE_KWARGS)
 
     @classmethod
     def tearDownClass(cls) -> None:
         try:
-            cls.runtime.shutdown()
+            cls.server.shutdown()
         finally:
             super().tearDownClass()

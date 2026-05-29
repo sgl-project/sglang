@@ -19,9 +19,9 @@ already finished, and idempotent on repeated calls.
 import unittest
 
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.test.scripted_runtime.req_handle import ReqHandle
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -32,18 +32,18 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
-class TestAbortBasic(ScriptedRuntimeTestCase):
+class TestAbortBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_abort_waiting_chunked_resume(self):
         """Abort a chunked-resume req parked in waiting_queue: full resource release."""
-        self.runtime.run(self._script_abort_waiting_chunked_resume)
+        self.server.execute_script(self._script_abort_waiting_chunked_resume)
 
     # abort a chunked-resume req while it's still in waiting_queue
     # (chunked-resume parked between chunks). Resources must release
     # across the dual-queue path.
     @staticmethod
-    def _script_abort_waiting_chunked_resume(t: ScriptedRuntime):
+    def _script_abort_waiting_chunked_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         # Push it into chunked-resume parked-in-waiting state.
         yield from run_until(r, lambda h: h.is_chunking)
@@ -71,11 +71,11 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_at_chunk_0(self):
         """Abort during chunk_0 (first chunk not yet flushed)."""
-        self.runtime.run(self._script_abort_at_chunk_0)
+        self.server.execute_script(self._script_abort_at_chunk_0)
 
     # abort during chunk_0 (first chunk not yet flushed).
     @staticmethod
-    def _script_abort_at_chunk_0(t: ScriptedRuntime):
+    def _script_abort_at_chunk_0(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield  # request observed by scheduler; first chunk starts
         yield from run_until(r, lambda h: h.is_chunking)
@@ -88,11 +88,11 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_at_chunk_mid(self):
         """Abort at chunk_mid (some chunks done, some pending)."""
-        self.runtime.run(self._script_abort_at_chunk_mid)
+        self.server.execute_script(self._script_abort_at_chunk_mid)
 
     # abort at chunk_mid (some chunks done, some pending).
     @staticmethod
-    def _script_abort_at_chunk_mid(t: ScriptedRuntime):
+    def _script_abort_at_chunk_mid(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
 
@@ -103,13 +103,13 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_at_last_chunk(self):
         """Aborting at last chunk zeros pending_middle_outputs to prevent revival."""
-        self.runtime.run(self._script_abort_at_last_chunk)
+        self.server.execute_script(self._script_abort_at_last_chunk)
 
     # abort at last_chunk (pending_middle_outputs has been ++ for
     # the last admission; abort must zero it so Stage A doesn't revive
     # the released row). Tied to scheduler.py:3567-3569 defensive cleanup.
     @staticmethod
-    def _script_abort_at_last_chunk(t: ScriptedRuntime):
+    def _script_abort_at_last_chunk(t: ScriptedContext):
         # Use a prompt that's exactly 2 chunks so the second chunk is the
         # last one.
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
@@ -130,11 +130,11 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_one_does_not_disturb_other(self):
         """Abort one chunked req does not disturb another in flight."""
-        self.runtime.run(self._script_abort_one_does_not_disturb_other)
+        self.server.execute_script(self._script_abort_one_does_not_disturb_other)
 
     # abort one chunked req does not disturb another in flight.
     @staticmethod
-    def _script_abort_one_does_not_disturb_other(t: ScriptedRuntime):
+    def _script_abort_one_does_not_disturb_other(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
@@ -149,10 +149,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_with_zero_yield(self):
         """Submit + abort same step (zero yields between)."""
-        self.runtime.run(self._script_abort_with_zero_yield)
+        self.server.execute_script(self._script_abort_with_zero_yield)
 
     @staticmethod
-    def _script_abort_with_zero_yield(t: ScriptedRuntime):
+    def _script_abort_with_zero_yield(t: ScriptedContext):
         # Submit + abort same step (zero yields between).
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         t.abort(r)
@@ -163,10 +163,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_at_admission_step(self):
         """Submit, yield once (admission), abort."""
-        self.runtime.run(self._script_abort_at_admission_step)
+        self.server.execute_script(self._script_abort_at_admission_step)
 
     @staticmethod
-    def _script_abort_at_admission_step(t: ScriptedRuntime):
+    def _script_abort_at_admission_step(t: ScriptedContext):
         # Submit, yield once (admission), abort.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield  # scheduler observes req
@@ -177,10 +177,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_then_start_same_step_new_rid(self):
         """Abort one req; in the same yield step, submit a different rid."""
-        self.runtime.run(self._script_abort_then_start_same_step_new_rid)
+        self.server.execute_script(self._script_abort_then_start_same_step_new_rid)
 
     @staticmethod
-    def _script_abort_then_start_same_step_new_rid(t: ScriptedRuntime):
+    def _script_abort_then_start_same_step_new_rid(t: ScriptedContext):
         # Abort one req; in the same yield step, submit a different rid.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
@@ -192,10 +192,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_then_start_same_step_same_rid(self):
         """Abort r1; resubmit with the same rid — must work as a fresh req."""
-        self.runtime.run(self._script_abort_then_start_same_step_same_rid)
+        self.server.execute_script(self._script_abort_then_start_same_step_same_rid)
 
     @staticmethod
-    def _script_abort_then_start_same_step_same_rid(t: ScriptedRuntime):
+    def _script_abort_then_start_same_step_same_rid(t: ScriptedContext):
         # Abort r1; resubmit with the same rid — must work as a fresh req.
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, rid="abort-reuse"
@@ -209,10 +209,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_five_chunked_in_a_row(self):
         """5 chunked reqs submitted; abort all 5 sequentially."""
-        self.runtime.run(self._script_abort_five_chunked_in_a_row)
+        self.server.execute_script(self._script_abort_five_chunked_in_a_row)
 
     @staticmethod
-    def _script_abort_five_chunked_in_a_row(t: ScriptedRuntime):
+    def _script_abort_five_chunked_in_a_row(t: ScriptedContext):
         # 5 chunked reqs submitted; abort all 5 sequentially.
         reqs = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -228,15 +228,17 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_unknown_rid_noop(self):
         """Abort an unknown rid is a no-op: the engine stays idle and a subsequent valid req still completes."""
-        self.runtime.run(self._script_abort_unknown_rid_noop)
+        self.server.execute_script(self._script_abort_unknown_rid_noop)
 
     @staticmethod
-    def _script_abort_unknown_rid_noop(t: ScriptedRuntime):
+    def _script_abort_unknown_rid_noop(t: ScriptedContext):
         # Abort an rid that was never submitted: no exception, no state
         # change. Positive invariant: a real req submitted after the
         # bogus abort must admit and complete normally — the bogus
         # abort cannot have poisoned scheduler state.
-        bogus = ReqHandle(rid="never-submitted-rid", runtime=t)
+        bogus = ScriptedReqHandle(
+            rid="never-submitted-rid", scheduler_hook=t._scheduler_hook
+        )
         t.abort(bogus)  # must not raise
         yield
         r = t.start_req(prompt_len=16, max_new_tokens=2)
@@ -247,10 +249,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_after_finish_noop(self):
         """Aborting an already-finished req is a no-op: KV stays released."""
-        self.runtime.run(self._script_abort_after_finish_noop)
+        self.server.execute_script(self._script_abort_after_finish_noop)
 
     @staticmethod
-    def _script_abort_after_finish_noop(t: ScriptedRuntime):
+    def _script_abort_after_finish_noop(t: ScriptedContext):
         # Submit r, wait for finish, then abort. The abort must not
         # trigger a second resource release on the corpse.
         r = t.start_req(prompt_len=16, max_new_tokens=2)
@@ -274,10 +276,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_during_waiting_timeout(self):
         """Chunked-resume in waiting_queue survives the timeout-cleanup sweep."""
-        self.runtime.run(self._script_abort_during_waiting_timeout)
+        self.server.execute_script(self._script_abort_during_waiting_timeout)
 
     @staticmethod
-    def _script_abort_during_waiting_timeout(t: ScriptedRuntime):
+    def _script_abort_during_waiting_timeout(t: ScriptedContext):
         # Chunked-resume in waiting_queue + abort timeout cleanup hits.
         # The cleanup must skip chunked-resume reqs (359e5ed7bd).
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -298,10 +300,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_chunk_first(self):
         """Abort during the very first chunk releases KV, lock_refs, and finalize-event count is bounded."""
-        self.runtime.run(self._script_abort_chunk_first)
+        self.server.execute_script(self._script_abort_chunk_first)
 
     @staticmethod
-    def _script_abort_chunk_first(t: ScriptedRuntime):
+    def _script_abort_chunk_first(t: ScriptedContext):
         # Abort while the very first chunk is still in progress. Even
         # before any chunk has committed, the abort path must release
         # row + KV + lock_refs cleanly and emit at most one finalize.
@@ -316,10 +318,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_chunk_last(self):
         """Abort while the last chunk is in progress."""
-        self.runtime.run(self._script_abort_chunk_last)
+        self.server.execute_script(self._script_abort_chunk_last)
 
     @staticmethod
-    def _script_abort_chunk_last(t: ScriptedRuntime):
+    def _script_abort_chunk_last(t: ScriptedContext):
         # Abort while the last chunk is in progress.
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
@@ -330,10 +332,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_penultimate_chunk(self):
         """Abort 1 chunk before the final one."""
-        self.runtime.run(self._script_abort_penultimate_chunk)
+        self.server.execute_script(self._script_abort_penultimate_chunk)
 
     @staticmethod
-    def _script_abort_penultimate_chunk(t: ScriptedRuntime):
+    def _script_abort_penultimate_chunk(t: ScriptedContext):
         # Abort 1 chunk before the final one.
         r = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
@@ -343,10 +345,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_double_abort_idempotent(self):
         """Call abort twice on the same handle: second call is a no-op."""
-        self.runtime.run(self._script_double_abort_idempotent)
+        self.server.execute_script(self._script_double_abort_idempotent)
 
     @staticmethod
-    def _script_double_abort_idempotent(t: ScriptedRuntime):
+    def _script_double_abort_idempotent(t: ScriptedContext):
         # Call abort twice on the same handle: second call is a no-op.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
@@ -361,10 +363,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_during_decode(self):
         """Abort mid-decode releases KV + lock_refs cleanly without double-finalize."""
-        self.runtime.run(self._script_abort_during_decode)
+        self.server.execute_script(self._script_abort_during_decode)
 
     @staticmethod
-    def _script_abort_during_decode(t: ScriptedRuntime):
+    def _script_abort_during_decode(t: ScriptedContext):
         # r has finished prefill, is in decode; abort mid-decode. The
         # abort path must run all the way through release + finalize
         # exactly once.
@@ -379,10 +381,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_one_of_three_others_finish(self):
         """Three reqs in batch, abort middle one, other two finish."""
-        self.runtime.run(self._script_abort_one_of_three_others_finish)
+        self.server.execute_script(self._script_abort_one_of_three_others_finish)
 
     @staticmethod
-    def _script_abort_one_of_three_others_finish(t: ScriptedRuntime):
+    def _script_abort_one_of_three_others_finish(t: ScriptedContext):
         # Three reqs in batch, abort middle one, other two finish.
         r1 = t.start_req(prompt_len=16, max_new_tokens=4)
         r2 = t.start_req(prompt_len=16, max_new_tokens=4)
@@ -394,10 +396,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_in_separate_yields(self):
         """Submit 3 chunked, abort in 3 separate yield steps."""
-        self.runtime.run(self._script_abort_in_separate_yields)
+        self.server.execute_script(self._script_abort_in_separate_yields)
 
     @staticmethod
-    def _script_abort_in_separate_yields(t: ScriptedRuntime):
+    def _script_abort_in_separate_yields(t: ScriptedContext):
         # Submit 3 chunked, abort in 3 separate yield steps.
         reqs = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -412,10 +414,10 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_finish_event_count_at_most_one(self):
         """Aborted req should not emit a normal finish event."""
-        self.runtime.run(self._script_abort_finish_event_count_at_most_one)
+        self.server.execute_script(self._script_abort_finish_event_count_at_most_one)
 
     @staticmethod
-    def _script_abort_finish_event_count_at_most_one(t: ScriptedRuntime):
+    def _script_abort_finish_event_count_at_most_one(t: ScriptedContext):
         # Aborted req should not emit a normal finish event.
         # NEW API NEEDED: r.finish_event_count — count of completion events.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -428,14 +430,14 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_at_chunk_boundary_race(self):
         """Abort fires the same step a chunk boundary advances chunks_done."""
-        self.runtime.run(self._script_abort_at_chunk_boundary_race)
+        self.server.execute_script(self._script_abort_at_chunk_boundary_race)
 
     # abort raced with chunks_done increment at a chunk
     # boundary. Drive the req to a known mid-chunk state, then abort on
     # the same yield step the scheduler is about to commit the next
     # chunk. No double-finalize; pending_middle_outputs must zero.
     @staticmethod
-    def _script_abort_at_chunk_boundary_race(t: ScriptedRuntime):
+    def _script_abort_at_chunk_boundary_race(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         # First, observe the chunked req in flight.
         yield from run_until(r, lambda h: h.is_chunking)
@@ -459,14 +461,14 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_then_resubmit_same_rid_same_step(self):
         """Abort r1 then immediately submit a new req reusing the same rid in one step."""
-        self.runtime.run(self._script_abort_then_resubmit_same_rid_same_step)
+        self.server.execute_script(self._script_abort_then_resubmit_same_rid_same_step)
 
     # abort + same-step resubmit with the
     # identical rid. The new req must complete independently — the
     # scheduler must not confuse the resubmit with the dying corpse of
     # the aborted r1.
     @staticmethod
-    def _script_abort_then_resubmit_same_rid_same_step(t: ScriptedRuntime):
+    def _script_abort_then_resubmit_same_rid_same_step(t: ScriptedContext):
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
@@ -489,14 +491,16 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_during_gap_pending_middle_outputs_positive(self):
         """Abort during the gap where pending_middle_outputs > 0 but is_chunking == False."""
-        self.runtime.run(self._script_abort_during_gap_pending_middle_outputs_positive)
+        self.server.execute_script(
+            self._script_abort_during_gap_pending_middle_outputs_positive
+        )
 
     # the gap between "last chunk submitted to forward" and
     # "Stage A drains pending_middle_outputs". In that window
     # pending_middle_outputs > 0 yet the req is not currently chunking.
     # Aborting here must not revive the freed row via Stage A.
     @staticmethod
-    def _script_abort_during_gap_pending_middle_outputs_positive(t: ScriptedRuntime):
+    def _script_abort_during_gap_pending_middle_outputs_positive(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         # Wait for the gap window: pending_middle_outputs has been ++'d
         # for the last admission but is_chunking is no longer True
@@ -520,13 +524,13 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_when_chunked_only_then_idle(self):
         """Aborting the only chunked req in flight leaves the engine idle."""
-        self.runtime.run(self._script_abort_when_chunked_only_then_idle)
+        self.server.execute_script(self._script_abort_when_chunked_only_then_idle)
 
     # when the only chunked req is aborted, the engine must
     # transition all the way back to idle — chunked_req is None,
     # chunked_in_flight_count is 0, and t.is_idle.
     @staticmethod
-    def _script_abort_when_chunked_only_then_idle(t: ScriptedRuntime):
+    def _script_abort_when_chunked_only_then_idle(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         assert t.chunked_in_flight_count() == 1
@@ -542,7 +546,7 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_chunked_req_then_abort_then_new_short_in_one_yield(self):
         """Mid-chunk R1: abort R1 and start a short R2 in the same yield; R2 admits fresh and chunked slot is no longer R1."""
-        self.runtime.run(
+        self.server.execute_script(
             self._script_chunked_req_then_abort_then_new_short_in_one_yield
         )
 
@@ -552,7 +556,7 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
     # longer reference R1 (either None or R2's rid if R2 also chunked,
     # though R2 is short so should be None).
     @staticmethod
-    def _script_chunked_req_then_abort_then_new_short_in_one_yield(t: ScriptedRuntime):
+    def _script_chunked_req_then_abort_then_new_short_in_one_yield(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
         assert t.get_chunked_req_rid() == r1.rid, (
@@ -576,14 +580,14 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_force_retract_then_abort_same_yield(self):
         """Force_retract + abort on the same handle in the same yield: clean state, no double-free, finish_event_count <= 1."""
-        self.runtime.run(self._script_force_retract_then_abort_same_yield)
+        self.server.execute_script(self._script_force_retract_then_abort_same_yield)
 
     # same-yield combo of force_retract + abort. Both operations
     # tear resources down; doing them in the same yield step must not
     # double-free and must not emit two finish events. All resources
     # released and the finalize counter capped at 1.
     @staticmethod
-    def _script_force_retract_then_abort_same_yield(t: ScriptedRuntime):
+    def _script_force_retract_then_abort_same_yield(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
         assert r1.kv_pages > 0
@@ -612,13 +616,13 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
 
     def test_abort_chunked_with_baton_handoff(self):
         """Abort the in-flight chunked req while a waiting chunked req takes the baton."""
-        self.runtime.run(self._script_abort_chunked_with_baton_handoff)
+        self.server.execute_script(self._script_abort_chunked_with_baton_handoff)
 
     # r1 holds the chunked_req slot; r2 is waiting. Abort
     # r1: r2 must successfully claim the chunked_req baton on the next
     # admission step.
     @staticmethod
-    def _script_abort_chunked_with_baton_handoff(t: ScriptedRuntime):
+    def _script_abort_chunked_with_baton_handoff(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         # r1 takes the chunked slot first (FCFS).
@@ -638,7 +642,7 @@ class TestAbortBasic(ScriptedRuntimeTestCase):
         assert r2.lock_refs == 0
 
 
-class TestAbortDualQueueInvariant(ScriptedRuntimeTestCase):
+class TestAbortDualQueueInvariant(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_dual_queue_abort_no_double_release_invariant(self):
@@ -647,7 +651,9 @@ class TestAbortDualQueueInvariant(ScriptedRuntimeTestCase):
         Direct access to ``_scheduler`` internals is intentional; this is an
         invariant-tier test (see direct-internals-access plan).
         """
-        self.runtime.run(self._script_dual_queue_abort_no_double_release_invariant)
+        self.server.execute_script(
+            self._script_dual_queue_abort_no_double_release_invariant
+        )
 
     # W3 — abort_request dual-queue dedup gate. Manually inject a
     # chunked req into both ``waiting_queue`` and ``running_batch.reqs``
@@ -660,7 +666,7 @@ class TestAbortDualQueueInvariant(ScriptedRuntimeTestCase):
     # ``to_finish`` set, causing duplicate ``send_output`` (and in
     # disagg-DECODE mode, duplicate ``release_kv_cache``).
     @staticmethod
-    def _script_dual_queue_abort_no_double_release_invariant(t: ScriptedRuntime):
+    def _script_dual_queue_abort_no_double_release_invariant(t: ScriptedContext):
         s = t._scheduler
         allocator = s.token_to_kv_pool_allocator
 
@@ -736,7 +742,7 @@ class TestAbortDualQueueInvariant(ScriptedRuntimeTestCase):
         yield
 
 
-class TestAbortPP(ScriptedRuntimeTestCase):
+class TestAbortPP(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         pp_size=2,
@@ -744,13 +750,13 @@ class TestAbortPP(ScriptedRuntimeTestCase):
 
     def test_abort_at_last_chunk_in_flight_pp(self):
         """PP=2 abort at last_chunk_in_flight finalizes exactly once."""
-        self.runtime.run(self._script_abort_at_last_chunk_in_flight_pp)
+        self.server.execute_script(self._script_abort_at_last_chunk_in_flight_pp)
 
     # abort at last_chunk_in_flight under PP (forward still in
     # flight when the abort hits). Verifies the PP cross-microbatch
     # dedup (b823c16e60) and double-finalize guard (02b1785f0a).
     @staticmethod
-    def _script_abort_at_last_chunk_in_flight_pp(t: ScriptedRuntime):
+    def _script_abort_at_last_chunk_in_flight_pp(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
         # Drive to last_chunk_in_flight via batch_composition introspection
         # — when ``mb='b'`` has the chunked extend and ``mb='a'`` has the

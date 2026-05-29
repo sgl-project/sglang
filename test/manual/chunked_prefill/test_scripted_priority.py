@@ -1,4 +1,4 @@
-"""Priority scheduling × chunked: naive ScriptedRuntime smoke plus retract/preempt edge cases.
+"""Priority scheduling × chunked: naive ScriptedContext smoke plus retract/preempt edge cases.
 
 Submit a low-priority long-prompt request that must be chunked, then
 a high-priority short request. With priority preemption enabled the
@@ -21,8 +21,8 @@ import time
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
@@ -34,18 +34,18 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
-class TestPriorityBasic(ScriptedRuntimeTestCase):
+class TestPriorityBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_retract_mid_chunk_releases_kv(self):
         """KV pressure mid-chunk causes the chunked-resume req to be retracted."""
-        self.runtime.run(self._script_retract_mid_chunk_releases_kv)
+        self.server.execute_script(self._script_retract_mid_chunk_releases_kv)
 
     # KV pressure mid-chunk causes the chunked-resume req to be
     # retracted. All resources must release immediately (96d4749094 +
     # f38e69f87d).
     @staticmethod
-    def _script_retract_mid_chunk_releases_kv(t: ScriptedRuntime):
+    def _script_retract_mid_chunk_releases_kv(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
@@ -68,12 +68,12 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_retract_and_resume(self):
         """Retract chunked mid-stream, release pressure, then complete normally."""
-        self.runtime.run(self._script_retract_and_resume)
+        self.server.execute_script(self._script_retract_and_resume)
 
     # retract-and-resume. Retract chunked mid-stream, then release
     # pressure so it can be re-admitted; must complete normally.
     @staticmethod
-    def _script_retract_and_resume(t: ScriptedRuntime):
+    def _script_retract_and_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
@@ -91,10 +91,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_force_retract_at_chunk_0(self):
         """Force retract before first chunk completes."""
-        self.runtime.run(self._script_force_retract_at_chunk_0)
+        self.server.execute_script(self._script_force_retract_at_chunk_0)
 
     @staticmethod
-    def _script_force_retract_at_chunk_0(t: ScriptedRuntime):
+    def _script_force_retract_at_chunk_0(t: ScriptedContext):
         # Force retract before first chunk completes.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield  # admission
@@ -105,10 +105,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_force_retract_at_chunk_mid(self):
         """Force retract in the middle of chunked extend."""
-        self.runtime.run(self._script_force_retract_at_chunk_mid)
+        self.server.execute_script(self._script_force_retract_at_chunk_mid)
 
     @staticmethod
-    def _script_force_retract_at_chunk_mid(t: ScriptedRuntime):
+    def _script_force_retract_at_chunk_mid(t: ScriptedContext):
         # Force retract in the middle of chunked extend.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
@@ -118,10 +118,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_force_retract_at_last_chunk(self):
         """Force retract during the last chunk's admit."""
-        self.runtime.run(self._script_force_retract_at_last_chunk)
+        self.server.execute_script(self._script_force_retract_at_last_chunk)
 
     @staticmethod
-    def _script_force_retract_at_last_chunk(t: ScriptedRuntime):
+    def _script_force_retract_at_last_chunk(t: ScriptedContext):
         # Force retract during the last chunk's admit.
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
@@ -132,10 +132,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_force_retract_then_readmit(self):
         """Force retract then req re-admits and finishes cleanly."""
-        self.runtime.run(self._script_force_retract_then_readmit)
+        self.server.execute_script(self._script_force_retract_then_readmit)
 
     @staticmethod
-    def _script_force_retract_then_readmit(t: ScriptedRuntime):
+    def _script_force_retract_then_readmit(t: ScriptedContext):
         # Force retract; the chunked-resume parked in waiting_queue
         # must not be aborted by the watchdog (commit 359e5ed7bd) —
         # observable as the req successfully re-admitting and finishing.
@@ -152,10 +152,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_retract_one_admit_one(self):
         """Retract r1 while admitting r2: r2 finishes first, r1 re-admits and finishes, neither leaks resources."""
-        self.runtime.run(self._script_retract_one_admit_one)
+        self.server.execute_script(self._script_retract_one_admit_one)
 
     @staticmethod
-    def _script_retract_one_admit_one(t: ScriptedRuntime):
+    def _script_retract_one_admit_one(t: ScriptedContext):
         # Force retract r1 + simultaneously admit r2. r2 must complete
         # quickly; r1 must re-admit and complete cleanly. KV / lock_refs
         # must release for both.
@@ -173,10 +173,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_retract_during_decode(self):
         """Retract during pure decode (no chunked) cleanly releases resources and the req still finishes."""
-        self.runtime.run(self._script_retract_during_decode)
+        self.server.execute_script(self._script_retract_during_decode)
 
     @staticmethod
-    def _script_retract_during_decode(t: ScriptedRuntime):
+    def _script_retract_during_decode(t: ScriptedContext):
         # Retract during pure decode (no chunked path involved at all).
         # The retract must release KV immediately; the scheduler must
         # re-admit and the req must finish with no leaked resources.
@@ -193,10 +193,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_retract_then_abort_idempotent(self):
         """Retract + abort same step; final state stable."""
-        self.runtime.run(self._script_retract_then_abort_idempotent)
+        self.server.execute_script(self._script_retract_then_abort_idempotent)
 
     @staticmethod
-    def _script_retract_then_abort_idempotent(t: ScriptedRuntime):
+    def _script_retract_then_abort_idempotent(t: ScriptedContext):
         # Retract + abort same step; final state stable.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
@@ -207,10 +207,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_disagg_retract_resets_send_state_extra(self):
         """Disagg path: retract must reset send-side state (414efd4a27)."""
-        self.runtime.run(self._script_disagg_retract_resets_send_state_extra)
+        self.server.execute_script(self._script_disagg_retract_resets_send_state_extra)
 
     @staticmethod
-    def _script_disagg_retract_resets_send_state_extra(t: ScriptedRuntime):
+    def _script_disagg_retract_resets_send_state_extra(t: ScriptedContext):
         # disagg path: retract must reset send-side state (414efd4a27).
         # Even in non-disagg engine config, the send-side field must be
         # absent/idle after retract — retract still touches the same
@@ -227,10 +227,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_retract_chunked_resume_in_waiting(self):
         """Chunked-resume sitting in waiting → force retract releases row + KV cleanly."""
-        self.runtime.run(self._script_retract_chunked_resume_in_waiting)
+        self.server.execute_script(self._script_retract_chunked_resume_in_waiting)
 
     @staticmethod
-    def _script_retract_chunked_resume_in_waiting(t: ScriptedRuntime):
+    def _script_retract_chunked_resume_in_waiting(t: ScriptedContext):
         # Chunked-resume already parked in waiting — this is the exact
         # state the commit 359e5ed7bd fix protects: watchdog must not
         # abort a chunked-resume here. Observable as the req being
@@ -248,10 +248,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_two_retracts_same_yield(self):
         """Two reqs retracted in the same yield release KV simultaneously and both still finish."""
-        self.runtime.run(self._script_two_retracts_same_yield)
+        self.server.execute_script(self._script_two_retracts_same_yield)
 
     @staticmethod
-    def _script_two_retracts_same_yield(t: ScriptedRuntime):
+    def _script_two_retracts_same_yield(t: ScriptedContext):
         # Two reqs force_retracted in the same yield step — both must
         # release KV in lockstep, both must re-admit and finish (the
         # observable witness that the watchdog did not spuriously abort
@@ -271,10 +271,10 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
 
     def test_retract_then_re_chunk(self):
         """Retract mid-chunk then resume: re-chunk continues, KV/lock release at finish."""
-        self.runtime.run(self._script_retract_then_re_chunk)
+        self.server.execute_script(self._script_retract_then_re_chunk)
 
     @staticmethod
-    def _script_retract_then_re_chunk(t: ScriptedRuntime):
+    def _script_retract_then_re_chunk(t: ScriptedContext):
         # Retract a mid-chunk req; subsequent re-chunk must complete
         # without prefix_indices residue. The req successfully finishing
         # is the observable witness that the watchdog did not abort the
@@ -297,7 +297,7 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         Direct access to ``_scheduler`` internals is intentional; this is an
         invariant-tier test (see direct-internals-access plan).
         """
-        self.runtime.run(self._script_watchdog_skips_chunked_resume_invariant)
+        self.server.execute_script(self._script_watchdog_skips_chunked_resume_invariant)
 
     # W2 — drive a chunked req mid-prefill, simulate the v2 "chunked-resume
     # parked in waiting_queue" condition by manually inserting it into
@@ -309,7 +309,7 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
     # See commit 359e5ed7bd ("Skip chunked-resume reqs in
     # _abort_on_waiting_timeout") for the original bug.
     @staticmethod
-    def _script_watchdog_skips_chunked_resume_invariant(t: ScriptedRuntime):
+    def _script_watchdog_skips_chunked_resume_invariant(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         # Drive until the scheduler is mid-chunk on this req — the
         # chunked_req slot is occupied and inflight_middle_chunks > 0,
@@ -384,18 +384,18 @@ class TestPriorityBasic(ScriptedRuntimeTestCase):
         assert r.finished
 
 
-class TestPriorityPriority(ScriptedRuntimeTestCase):
+class TestPriorityPriority(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         enable_priority_scheduling=True,
     )
 
     def test_naive_priority_chunked(self):
-        """Priority scheduling × chunked: naive ScriptedRuntime smoke plus retract/preempt edge cases."""
-        self.runtime.run(self._script_naive_priority_chunked)
+        """Priority scheduling × chunked: naive ScriptedContext smoke plus retract/preempt edge cases."""
+        self.server.execute_script(self._script_naive_priority_chunked)
 
     @staticmethod
-    def _script_naive_priority_chunked(t: ScriptedRuntime):
+    def _script_naive_priority_chunked(t: ScriptedContext):
         low = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority="low"
         )
@@ -408,14 +408,14 @@ class TestPriorityPriority(ScriptedRuntimeTestCase):
 
     def test_priority_preempt_chunked(self):
         """Priority preemption — a high-priority req shows up while a low-priority chunked-resume holds resources."""
-        self.runtime.run(self._script_priority_preempt_chunked)
+        self.server.execute_script(self._script_priority_preempt_chunked)
 
     # priority preemption — a high-priority req shows up while a
     # low-priority chunked-resume holds resources. The victim chunked req
     # must go through retract (not abort) and the high-priority req takes
     # its slot.
     @staticmethod
-    def _script_priority_preempt_chunked(t: ScriptedRuntime):
+    def _script_priority_preempt_chunked(t: ScriptedContext):
         low = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
         )
@@ -436,10 +436,10 @@ class TestPriorityPriority(ScriptedRuntimeTestCase):
 
     def test_priority_preempt_chunked_victim(self):
         """Submit chunked low-priority, then high-priority new req."""
-        self.runtime.run(self._script_priority_preempt_chunked_victim)
+        self.server.execute_script(self._script_priority_preempt_chunked_victim)
 
     @staticmethod
-    def _script_priority_preempt_chunked_victim(t: ScriptedRuntime):
+    def _script_priority_preempt_chunked_victim(t: ScriptedContext):
         # Submit chunked low-priority, then high-priority new req.
         # Victim chunked must be moved from active to waiting.
         r_low = t.start_req(
@@ -459,10 +459,10 @@ class TestPriorityPriority(ScriptedRuntimeTestCase):
 
     def test_preempt_five_victims(self):
         """5 chunked reqs preempted simultaneously."""
-        self.runtime.run(self._script_preempt_five_victims)
+        self.server.execute_script(self._script_preempt_five_victims)
 
     @staticmethod
-    def _script_preempt_five_victims(t: ScriptedRuntime):
+    def _script_preempt_five_victims(t: ScriptedContext):
         # 5 chunked reqs preempted simultaneously.
         victims = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -483,10 +483,10 @@ class TestPriorityPriority(ScriptedRuntimeTestCase):
 
     def test_priority_preempt_release_invariant(self):
         """Each preemption releases the victim's kv_pages strictly to 0."""
-        self.runtime.run(self._script_priority_preempt_release_invariant)
+        self.server.execute_script(self._script_priority_preempt_release_invariant)
 
     @staticmethod
-    def _script_priority_preempt_release_invariant(t: ScriptedRuntime):
+    def _script_priority_preempt_release_invariant(t: ScriptedContext):
         # Each preemption releases the victim's kv_pages strictly to 0.
         r_low = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
@@ -504,7 +504,7 @@ class TestPriorityPriority(ScriptedRuntimeTestCase):
 
     def test_priority_preempt_with_chunked_admission_same_yield(self):
         """Same yield: high-priority R1 + new long chunked R2 land while low-priority R3 runs; R3 preempted, R2 chunks_done starts; both finish."""
-        self.runtime.run(
+        self.server.execute_script(
             self._script_priority_preempt_with_chunked_admission_same_yield
         )
 
@@ -515,7 +515,7 @@ class TestPriorityPriority(ScriptedRuntimeTestCase):
     # advancing), and ultimately every req completes.
     @staticmethod
     def _script_priority_preempt_with_chunked_admission_same_yield(
-        t: ScriptedRuntime,
+        t: ScriptedContext,
     ):
         # Low-priority running req to be preempted.
         r3 = t.start_req(
@@ -554,7 +554,7 @@ class TestPriorityPriority(ScriptedRuntimeTestCase):
         assert r1.finished and r2.finished and r3.finished
 
 
-class TestPriorityDisagg(ScriptedRuntimeTestCase):
+class TestPriorityDisagg(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disaggregation_mode="prefill",
@@ -562,12 +562,12 @@ class TestPriorityDisagg(ScriptedRuntimeTestCase):
 
     def test_disagg_retract_resets_send_state(self):
         """Disagg mode retract — disaggregation send-side state must reset on chunked-resume retract (414efd4a27)."""
-        self.runtime.run(self._script_disagg_retract_resets_send_state)
+        self.server.execute_script(self._script_disagg_retract_resets_send_state)
 
     # disagg mode retract — disaggregation send-side state must
     # reset on chunked-resume retract (414efd4a27).
     @staticmethod
-    def _script_disagg_retract_resets_send_state(t: ScriptedRuntime):
+    def _script_disagg_retract_resets_send_state(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 

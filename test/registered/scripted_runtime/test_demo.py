@@ -1,7 +1,7 @@
-"""ScriptedRuntime end-to-end demo.
+"""Scripted runtime end-to-end demo.
 
 This file is a *teaching demo*: a single script that exercises every
-public piece of the ScriptedRuntime API with inline commentary, so a
+public piece of the ScriptedContext API with inline commentary, so a
 new user can read it top-to-bottom and learn the full surface.
 
 For focused tests of individual behaviors (assertion surfacing,
@@ -10,29 +10,29 @@ non-generator script rejection, lambda-as-script rejection, etc.) see
 launch?" smoke see ``test_scripted_runtime_smoke.py``.
 
 What the demo covers:
-1. Engine launch via :class:`ScriptedRuntimeTestCase` (one ENGINE_KWARGS dict).
-2. Submitting requests with :meth:`ScriptedRuntime.start_req`.
-3. Observing request status via :class:`ReqHandle`.
+1. Engine launch via :class:`ScriptedTestCase` (one ENGINE_KWARGS dict).
+2. Submitting requests with :meth:`ScriptedContext.start_req`.
+3. Observing request status via :class:`ScriptedReqHandle`.
 4. The bare-``yield`` primitive as the single "step the scheduler"
    action.
 5. The ``while not <condition>: yield`` idiom for waiting on a state.
 6. Multiple concurrent requests.
-7. Constructing a :class:`ReqHandle` directly for an arbitrary rid.
+7. Constructing a :class:`ScriptedReqHandle` directly for an arbitrary rid.
 8. Clean shutdown via generator return.
 """
 
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scripted_runtime.req_handle import ReqHandle
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestDemo(ScriptedRuntimeTestCase):
+class TestDemo(ScriptedTestCase):
     """Single test that walks through every feature for didactic value."""
 
     ENGINE_KWARGS = dict(
@@ -45,17 +45,17 @@ class TestDemo(ScriptedRuntimeTestCase):
     )
 
     def test_demo(self):
-        """Didactic walk-through of every ScriptedRuntime API in one script."""
-        self.runtime.run(self._demo_script)
+        """Didactic walk-through of every ScriptedContext API in one script."""
+        self.server.execute_script(self._demo_script)
 
     @staticmethod
-    def _demo_script(t: ScriptedRuntime):
-        """Walk through every ScriptedRuntime feature in one script.
+    def _demo_script(t: ScriptedContext):
+        """Walk through every ScriptedContext feature in one script.
 
         Read top-to-bottom to learn the API. The script generator is the
         unit of test: ``yield`` returns control to the scheduler for one
         event-loop iteration; everything between yields is pure Python
-        that can read scheduler state via :class:`ReqHandle` properties.
+        that can read scheduler state via :class:`ScriptedReqHandle` properties.
         """
 
         # ----------------------------------------------------------------
@@ -65,16 +65,16 @@ class TestDemo(ScriptedRuntimeTestCase):
         # token ids of length ``prompt_len`` and injects it directly into
         # the scheduler's input queue (bypassing HTTP server and tokenizer
         # manager — fine-grained tests don't care about those layers). It
-        # returns a :class:`ReqHandle` we use later to ask questions about
+        # returns a :class:`ScriptedReqHandle` we use later to ask questions about
         # the request.
         # ----------------------------------------------------------------
         r1 = t.start_req(prompt_len=12, max_new_tokens=4)
-        assert isinstance(r1, ReqHandle)
+        assert isinstance(r1, ScriptedReqHandle)
         assert r1.rid == "scripted-0"  # rids auto-assigned in submission order
 
         # Before any ``yield``, the scheduler has not run another event-loop
         # iteration, so it has not pulled r1 from the in-process queue yet.
-        # ``ReqHandle.status`` reports ``"unknown"`` — "the scheduler does
+        # ``ScriptedReqHandle.status`` reports ``"unknown"`` — "the scheduler does
         # not currently see this rid in any of its structures".
         assert r1.status == "unknown"
 
@@ -85,7 +85,7 @@ class TestDemo(ScriptedRuntimeTestCase):
         # from this generator to the scheduler, which executes exactly one
         # event-loop iteration (one ``recv_requests`` call plus whatever
         # else fits in that iteration). On the next iteration the
-        # ``_yield_to_script`` hook re-enters this generator at the
+        # ``step`` hook re-enters this generator at the
         # statement after the yield. Test logic between yields is plain
         # Python and runs synchronously inside the scheduler subprocess on
         # the driver rank (pp_rank == 0 and tp_rank == 0 and
@@ -124,7 +124,7 @@ class TestDemo(ScriptedRuntimeTestCase):
         # ----------------------------------------------------------------
         # Part 4 — The ``while not <cond>: yield`` idiom.
         #
-        # ScriptedRuntime intentionally does not expose a ``run_until``
+        # ScriptedContext intentionally does not expose a ``run_until``
         # helper; idiomatic scripts use plain Python loops with ``yield``
         # in the body. This makes step semantics explicit at the call
         # site and avoids hiding the iteration count.
@@ -143,16 +143,18 @@ class TestDemo(ScriptedRuntimeTestCase):
             )
 
         # ----------------------------------------------------------------
-        # Part 5 — Construct a :class:`ReqHandle` for an arbitrary rid.
+        # Part 5 — Construct a :class:`ScriptedReqHandle` for an arbitrary rid.
         #
-        # ReqHandle is a public frozen dataclass; you can build one for
+        # ScriptedReqHandle is a public frozen dataclass; you can build one for
         # any rid (e.g. to assert "the scheduler must not know about
         # this"). Status lookup is just a query against the scheduler's
         # waiting/running structures, no side effects. Normal tests just
         # hold the handles returned by ``start_req``; this path is for
         # advanced scenarios.
         # ----------------------------------------------------------------
-        bogus = ReqHandle(rid="never-submitted-rid", runtime=t)
+        bogus = ScriptedReqHandle(
+            rid="never-submitted-rid", scheduler_hook=t._scheduler_hook
+        )
         assert bogus.status == "unknown"
 
         # ----------------------------------------------------------------
@@ -160,14 +162,14 @@ class TestDemo(ScriptedRuntimeTestCase):
         #
         # When this generator returns (here implicitly), the router
         # captures completion and reports "ok" back to the caller; the
-        # next ``self.runtime.run(...)`` call dispatches another
+        # next ``self.server.execute_script(...)`` call dispatches another
         # sub-script on the same engine. The engine itself is torn down
-        # by :meth:`ScriptedRuntimeTestCase.tearDownClass` after every
+        # by :meth:`ScriptedTestCase.tearDownClass` after every
         # ``test_*`` in this class has run.
         #
         # If you raise from this generator (e.g. an ``assert`` fails),
         # the router catches the traceback and sends it back over the
-        # socket; ``self.runtime.run`` re-raises an ``AssertionError`` on
+        # socket; ``self.server.run`` re-raises an ``AssertionError`` on
         # the caller side carrying that text.
         # ----------------------------------------------------------------
 

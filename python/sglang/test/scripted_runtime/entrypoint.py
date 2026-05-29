@@ -1,9 +1,9 @@
-"""Subprocess entry point for ScriptedRuntime tests.
+"""Subprocess entry point for scripted-runtime tests.
 
-:func:`execute_scripted_runtime` runs inside a dedicated ``mp.Process``
-(spawned by :class:`ScriptedRuntimeSession`). It resolves the script
+:func:`execute_scripted_http_server` runs inside a dedicated ``mp.Process``
+(spawned by :class:`ScriptedHttpServer`). It resolves the script
 generator to a qualified name, builds ``ServerArgs`` with the
-ScriptedRuntime fields set, and launches a **real** HTTP server via
+scripted-runtime fields set, and launches a **real** HTTP server via
 :func:`launch_server`. The HTTP server stays up for the whole test class;
 ``launch_server`` blocks in uvicorn until the scheduler subprocess exits
 (which it does once the router script returns on shutdown), at which point
@@ -28,10 +28,10 @@ from typing import Any, Callable, Dict, Literal, Optional
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.test.scripted_runtime.runtime import _resolve_fn
+from sglang.test.scripted_runtime.utils import resolve_fn
 
 
-def execute_scripted_runtime(
+def execute_scripted_http_server(
     script_fn: Callable,
     *,
     model_path: str,
@@ -46,10 +46,10 @@ def execute_scripted_runtime(
     disagg_router_args: Optional[Dict[str, Any]] = None,
     **engine_overrides: Any,
 ) -> None:
-    """Run ``script_fn`` as a ScriptedRuntime generator behind a real HTTP server.
+    """Run ``script_fn`` as a scripted-runtime generator behind a real HTTP server.
 
     ``script_fn`` must be a top-level generator function with signature
-    ``def script_fn(t: ScriptedRuntime) -> Generator``. It is resolved by
+    ``def script_fn(t: ScriptedContext) -> Generator``. It is resolved by
     qualified name in the scheduler subprocess, so it must be importable.
 
     Blocks in ``launch_server`` until the scheduler subprocess(es) terminate
@@ -59,7 +59,7 @@ def execute_scripted_runtime(
 
     Disagg sidecar mode (``disagg_role != "none"``) is wishlist — see
     ``2026-05-26-round-5-de-skip-and-api-wishlist.md`` §4.2. In that mode this
-    entry point will fork the ScriptedRuntime-controlled engine, the
+    entry point will fork the scripted-runtime-controlled engine, the
     opposite-side engine, and the router; today any non-default disagg kwarg
     raises ``NotImplementedError``.
 
@@ -76,7 +76,7 @@ def execute_scripted_runtime(
     )
 
     script_fn_path = f"{script_fn.__module__}:{script_fn.__qualname__}"
-    resolved = _resolve_fn(script_fn_path)
+    resolved = resolve_fn(script_fn_path)
     if resolved is not script_fn:
         raise ValueError(
             f"script_fn must be a top-level function importable by "

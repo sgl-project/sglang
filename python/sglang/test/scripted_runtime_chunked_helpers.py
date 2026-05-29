@@ -1,4 +1,4 @@
-"""Shared constants and helpers for chunked-prefill ScriptedRuntime tests.
+"""Shared constants and helpers for chunked-prefill scripted-runtime tests.
 
 Every test file in this directory imports from here. Constants and
 helpers stay deliberately small — most of the value is in keeping the
@@ -6,12 +6,12 @@ scripts uniform, not in factoring shared logic.
 
 API surface used by these tests:
 
-* :func:`sglang.test.scripted_runtime.execute_scripted_runtime`
-* :class:`sglang.test.scripted_runtime.ScriptedRuntime`
-* :class:`sglang.test.scripted_runtime.ReqHandle`
+* :func:`sglang.test.scripted_runtime.execute_scripted_http_server`
+* :class:`sglang.test.scripted_runtime.ScriptedContext`
+* :class:`sglang.test.scripted_runtime.ScriptedReqHandle`
 
 Many scripts also reference attributes that are not yet on
-:class:`ReqHandle` / :class:`ScriptedRuntime`. The full wishlist lives
+:class:`ScriptedReqHandle` / :class:`ScriptedContext`. The full wishlist lives
 in ``agent-context/projects/sglang/2026-05-25-chunked-prefill-rewrite/
 agent-drafts/2026-05-26-chunked-test-suite-initial-plan.md`` §4. When
 the harness gains those attributes, the corresponding tests start
@@ -57,7 +57,7 @@ def base_engine_kwargs(
     chunked_prefill_size: int = DEFAULT_CHUNK_SIZE,
     **overrides: Any,
 ) -> Dict[str, Any]:
-    """Common engine kwargs for a single-GPU ScriptedRuntime chunked test.
+    """Common engine kwargs for a single-GPU scripted-runtime chunked test.
 
     ``disable_overlap_schedule`` and ``disable_cuda_graph`` are off to
     keep the scheduler event loop deterministic — chunked-state tests

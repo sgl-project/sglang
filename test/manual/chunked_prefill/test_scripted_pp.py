@@ -1,4 +1,4 @@
-"""PP × chunked: naive ScriptedRuntime smoke.
+"""PP × chunked: naive ScriptedContext smoke.
 
 Submit one long-prompt request that must be chunked across at least
 two scheduler iterations, with ``pp_size=2`` so the chunked req crosses
@@ -8,15 +8,15 @@ Asserts the request reaches ``finished`` and went through >= 2 chunks.
 Does not attempt to reproduce the 309b6dc last-chunk-in-flight race —
 that lives in ``test_scripted_regression_309b6dc.py``.
 
-Requires 2 GPUs. ScriptedRuntime must support ``pp_size > 1`` (see
+Requires 2 GPUs. ScriptedContext must support ``pp_size > 1`` (see
 wishlist §4 P2 (12)).
 """
 
 import unittest
 from typing import Any, Dict
 
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -36,17 +36,17 @@ def _pp_engine_kwargs(*, pp_size: int = 2, **overrides: Any) -> Dict[str, Any]:
     )
 
 
-class TestPPBasic(ScriptedRuntimeTestCase):
+class TestPPBasic(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs()
 
     def test_pp_chunked_no_double_finalize(self):
         """PP=2 chunked req must finalize exactly once across microbatches."""
-        self.runtime.run(self._script_pp_chunked_no_double_finalize)
+        self.server.execute_script(self._script_pp_chunked_no_double_finalize)
 
     # PP cross-mb _handle_finished_req must not double-finalize:
     # a chunked req visible in mb_a + mb_other was finalized twice pre-fix.
     @staticmethod
-    def _script_pp_chunked_no_double_finalize(t: ScriptedRuntime):
+    def _script_pp_chunked_no_double_finalize(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until_finished(r)
         assert r.finished
@@ -57,12 +57,12 @@ class TestPPBasic(ScriptedRuntimeTestCase):
 
     def test_pp_abort_during_inflight_chunk(self):
         """PP=2 abort on chunked req in both mb_other and waiting_queue dedups cleanly."""
-        self.runtime.run(self._script_pp_abort_during_inflight_chunk)
+        self.server.execute_script(self._script_pp_abort_during_inflight_chunk)
 
     # PP abort_request must dedup across batch_rids:
     # a single req can sit in mb_other.reqs and waiting_queue, abort once.
     @staticmethod
-    def _script_pp_abort_during_inflight_chunk(t: ScriptedRuntime):
+    def _script_pp_abort_during_inflight_chunk(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.abort(r)
@@ -73,13 +73,13 @@ class TestPPBasic(ScriptedRuntimeTestCase):
 
     def test_pp_last_chunk_cross_mb_kv_correctness(self):
         """PP=2 last-chunk-in-flight across microbatches must not corrupt decode KV."""
-        self.runtime.run(self._script_pp_last_chunk_cross_mb_kv_correctness)
+        self.server.execute_script(self._script_pp_last_chunk_cross_mb_kv_correctness)
 
     # PP last-chunk cross-mb KV correctness:
     # gsm8k 70B accuracy 0.66 -> 0.77 after fix; decode KV positions must
     # be written correctly when the last chunk lands in the alternate mb.
     @staticmethod
-    def _script_pp_last_chunk_cross_mb_kv_correctness(t: ScriptedRuntime):
+    def _script_pp_last_chunk_cross_mb_kv_correctness(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8)
         yield from run_until_finished(r)
         assert r.finished
@@ -93,13 +93,15 @@ class TestPPBasic(ScriptedRuntimeTestCase):
 
     def test_pp_multi_microbatch_chunks_done_aggregation(self):
         """PP=2 single chunked req across 4+ chunks aggregates chunks_done correctly."""
-        self.runtime.run(self._script_pp_multi_microbatch_chunks_done_aggregation)
+        self.server.execute_script(
+            self._script_pp_multi_microbatch_chunks_done_aggregation
+        )
 
     # PP=2 chunks_done aggregation across mbs — single chunked req
-    # spans 4+ chunks; chunks_done increments observed by ReqHandle must
+    # spans 4+ chunks; chunks_done increments observed by ScriptedReqHandle must
     # reflect the union of per-mb progress.
     @staticmethod
-    def _script_pp_multi_microbatch_chunks_done_aggregation(t: ScriptedRuntime):
+    def _script_pp_multi_microbatch_chunks_done_aggregation(t: ScriptedContext):
         # 4 * DEFAULT_CHUNK_SIZE forces >=4 chunks distributed across mbs.
         r = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
@@ -112,13 +114,13 @@ class TestPPBasic(ScriptedRuntimeTestCase):
 
     def test_pp_two_chunked_one_per_mb_simultaneous(self):
         """PP=2 with one chunked req per microbatch — both complete; per-mb in-flight bounded."""
-        self.runtime.run(self._script_pp_two_chunked_one_per_mb_simultaneous)
+        self.server.execute_script(self._script_pp_two_chunked_one_per_mb_simultaneous)
 
     # PP=2, one chunked per mb — chunked_in_flight_count must stay
     # <=1 per mb but the global count may reach 2. Both reqs must
     # complete cleanly across mbs.
     @staticmethod
-    def _script_pp_two_chunked_one_per_mb_simultaneous(t: ScriptedRuntime):
+    def _script_pp_two_chunked_one_per_mb_simultaneous(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         # Observe in-flight count while both chunking.
@@ -143,14 +145,14 @@ class TestPPBasic(ScriptedRuntimeTestCase):
 
     def test_pp_retract_chunked_in_middle_mb(self):
         """PP=2 retract of chunked req mid-mb cleans cross-mb exclude set."""
-        self.runtime.run(self._script_pp_retract_chunked_in_middle_mb)
+        self.server.execute_script(self._script_pp_retract_chunked_in_middle_mb)
 
     # PP=2 mid-mb chunked retract — exclude set must drop the
     # cross-mb chunked_req reference so it does not re-enter the batch.
     # The req successfully resuming + finishing is the observable
     # witness that the exclude-on-merge gate held.
     @staticmethod
-    def _script_pp_retract_chunked_in_middle_mb(t: ScriptedRuntime):
+    def _script_pp_retract_chunked_in_middle_mb(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.force_retract(r)
@@ -161,7 +163,7 @@ class TestPPBasic(ScriptedRuntimeTestCase):
 
     def test_pp_chunked_req_to_exclude_pp_context(self):
         """PP last_batch.chunked_req stale pointer is excluded — fresh req admits and finishes cleanly after abort."""
-        self.runtime.run(self._script_pp_chunked_req_to_exclude_pp_context)
+        self.server.execute_script(self._script_pp_chunked_req_to_exclude_pp_context)
 
     # PP-path exclude set — last_batch.chunked_req can be stale
     # under PP; must not re-enter the batch on the next admission.
@@ -169,7 +171,7 @@ class TestPPBasic(ScriptedRuntimeTestCase):
     # witness that the scheduler dropped the stale pointer before
     # merging (scheduler.py:2370-2373).
     @staticmethod
-    def _script_pp_chunked_req_to_exclude_pp_context(t: ScriptedRuntime):
+    def _script_pp_chunked_req_to_exclude_pp_context(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         # After abort the chunked_req pointer goes stale across mbs.
@@ -183,17 +185,19 @@ class TestPPBasic(ScriptedRuntimeTestCase):
         assert r2.lock_refs == 0
 
 
-class TestPPPdmux(ScriptedRuntimeTestCase):
+class TestPPPdmux(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs(enable_pdmux=True)
 
     def test_pp_split_prefill_chunked_no_merge_assert(self):
         """PP=2 + pdmux split-prefill + chunked must not trip merge_batch assert."""
-        self.runtime.run(self._script_pp_split_prefill_chunked_no_merge_assert)
+        self.server.execute_script(
+            self._script_pp_split_prefill_chunked_no_merge_assert
+        )
 
     # pdmux + chunked — split-prefill filter must
     # exclude chunked reqs so merge_batch assert does not fire.
     @staticmethod
-    def _script_pp_split_prefill_chunked_no_merge_assert(t: ScriptedRuntime):
+    def _script_pp_split_prefill_chunked_no_merge_assert(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
         # Concrete observable signal that pdmux + chunked actually exercised
@@ -218,15 +222,15 @@ class TestPPPdmux(ScriptedRuntimeTestCase):
             )
 
 
-class TestPPDynamic(ScriptedRuntimeTestCase):
+class TestPPDynamic(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs(enable_dynamic_chunking=True)
 
     def test_naive_pp_chunked(self):
-        """PP × chunked: naive ScriptedRuntime smoke."""
-        self.runtime.run(self._script_naive_pp_chunked)
+        """PP × chunked: naive ScriptedContext smoke."""
+        self.server.execute_script(self._script_naive_pp_chunked)
 
     @staticmethod
-    def _script_naive_pp_chunked(t: ScriptedRuntime):
+    def _script_naive_pp_chunked(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until_finished(r)
         assert r.finished
@@ -238,12 +242,12 @@ class TestPPDynamic(ScriptedRuntimeTestCase):
 
     def test_pp_dynamic_chunking_predictor(self):
         """PP=2 + dynamic chunking — last_chunked_prefill_size set per iter by predictor."""
-        self.runtime.run(self._script_pp_dynamic_chunking_predictor)
+        self.server.execute_script(self._script_pp_dynamic_chunking_predictor)
 
     # dynamic chunking under PP — predictor must populate
     # last_chunked_prefill_size every iter the chunked req is in flight.
     @staticmethod
-    def _script_pp_dynamic_chunking_predictor(t: ScriptedRuntime):
+    def _script_pp_dynamic_chunking_predictor(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         observed_non_none = False
         for _ in range(400):
@@ -265,17 +269,17 @@ class TestPPDynamic(ScriptedRuntimeTestCase):
         ), "dynamic chunking predictor never produced a non-None size"
 
 
-class TestPPSize4(ScriptedRuntimeTestCase):
+class TestPPSize4(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs(pp_size=4)
 
     def test_pp_size_4_chunked_completes(self):
         """PP=4 long chunked req completes with no microbatch residue."""
-        self.runtime.run(self._script_pp_size_4_chunked_completes)
+        self.server.execute_script(self._script_pp_size_4_chunked_completes)
 
     # PP=4 chunked completion — verifies the cross-mb bookkeeping
     # scales beyond pp_size=2; long chunked req must not leak.
     @staticmethod
-    def _script_pp_size_4_chunked_completes(t: ScriptedRuntime):
+    def _script_pp_size_4_chunked_completes(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished

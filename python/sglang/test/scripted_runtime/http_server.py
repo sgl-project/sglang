@@ -1,13 +1,13 @@
 """Caller-side resource: long-lived HTTP server + per-test script dispatch.
 
-Owned by :class:`ScriptedRuntimeTestCase`. Spawns a dedicated subprocess
-that runs :func:`execute_scripted_runtime`, which launches a real sglang
+Owned by :class:`ScriptedTestCase`. Spawns a dedicated subprocess
+that runs :func:`execute_scripted_http_server`, which launches a real sglang
 HTTP server; the caller communicates with the scheduler-side
 ``router_script`` over a unix-socket :class:`multiprocessing.connection.Listener`.
 
-One :class:`ScriptedRuntimeSession` instance per test class — every
+One :class:`ScriptedHttpServer` instance per test class — every
 ``test_*`` method shares the same HTTP server / engine and submits a fresh
-``_script_*`` over the socket via :meth:`ScriptedRuntimeSession.run`.
+``_script_*`` over the socket via :meth:`ScriptedHttpServer.run`.
 
 The HTTP server runs in its own process (not a background thread of the
 test process) so uvicorn can install its signal handlers in that process's
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
 from sglang.srt.utils.network import get_free_port
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_http_server
 from sglang.test.scripted_runtime.router_script import router_script
 
 DEFAULT_RUN_TIMEOUT_S: float = 120.0
@@ -35,7 +35,7 @@ LISTENER_ACCEPT_TIMEOUT_S: float = 300.0
 SERVER_HOST: str = "127.0.0.1"
 
 
-class ScriptedRuntimeSession:
+class ScriptedHttpServer:
     """Long-lived HTTP-server process wrapper. One instance per test class."""
 
     def __init__(
@@ -56,7 +56,7 @@ class ScriptedRuntimeSession:
         self._dirty: Optional[str] = None
 
     @classmethod
-    def start(cls, **engine_kwargs: Any) -> "ScriptedRuntimeSession":
+    def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
         """Spawn the HTTP-server process and accept the router connection.
 
         The listener is bound *before* the server process starts so the
@@ -66,7 +66,7 @@ class ScriptedRuntimeSession:
         hanging the test process indefinitely.
 
         ``engine_kwargs`` (notably ``model_path`` plus any ServerArgs
-        overrides) are forwarded to :func:`execute_scripted_runtime`.
+        overrides) are forwarded to :func:`execute_scripted_http_server`.
         """
         socket_dir = Path(tempfile.mkdtemp(prefix="sglang_scripted_ipc_"))
         addr = str(socket_dir / "ipc.sock")
@@ -92,7 +92,7 @@ class ScriptedRuntimeSession:
 
         ctx = mp.get_context("spawn")
         server_process = ctx.Process(
-            target=execute_scripted_runtime,
+            target=execute_scripted_http_server,
             args=(router_script,),
             kwargs=dict(
                 host=host,
@@ -111,7 +111,7 @@ class ScriptedRuntimeSession:
             listener.close()
             cls._terminate_process(server_process)
             raise TimeoutError(
-                f"ScriptedRuntimeSession: HTTP server did not connect within "
+                f"ScriptedHttpServer: HTTP server did not connect within "
                 f"{LISTENER_ACCEPT_TIMEOUT_S}s"
             ) from exc
 
@@ -123,7 +123,7 @@ class ScriptedRuntimeSession:
             traceback_path=traceback_path,
         )
 
-    def run(
+    def execute_script(
         self,
         script_fn: Callable,
         *,
@@ -133,7 +133,7 @@ class ScriptedRuntimeSession:
         """Dispatch ``script_fn`` to the router and block on its result.
 
         ``args`` are forwarded positionally to the script after the
-        ``ScriptedRuntime`` handle (``script_fn(t, *args)``), letting one
+        ``ScriptedContext`` handle (``script_fn(t, *args)``), letting one
         parameterized script back many ``subTest`` combos. They cross the
         IPC pipe, so every element must be picklable.
 
@@ -144,7 +144,7 @@ class ScriptedRuntimeSession:
         responding.
         """
         if self._dirty:
-            raise RuntimeError(f"ScriptedRuntimeSession is dirty: {self._dirty}")
+            raise RuntimeError(f"ScriptedHttpServer is dirty: {self._dirty}")
 
         fn_path = f"{script_fn.__module__}:{script_fn.__qualname__}"
         self._conn.send({"kind": "run", "fn_path": fn_path, "args": args})
@@ -158,7 +158,7 @@ class ScriptedRuntimeSession:
 
         result = self._conn.recv()
         if result["kind"] == "error":
-            raise AssertionError(f"ScriptedRuntime script failed:\n{result['tb']}")
+            raise AssertionError(f"scripted-runtime script failed:\n{result['tb']}")
         if result["kind"] != "ok":
             raise RuntimeError(
                 f"router replied with unexpected kind {result['kind']!r}"
@@ -194,9 +194,9 @@ class ScriptedRuntimeSession:
             self._shutdown_done = True
 
         if fatal_tb:
-            raise AssertionError(f"ScriptedRuntime server failed:\n{fatal_tb}")
+            raise AssertionError(f"scripted-runtime server failed:\n{fatal_tb}")
 
-    def __enter__(self) -> "ScriptedRuntimeSession":
+    def __enter__(self) -> "ScriptedHttpServer":
         return self
 
     def __exit__(self, *exc: Any) -> None:

@@ -20,8 +20,8 @@ is still in effect.
 
 import unittest
 
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
@@ -36,7 +36,7 @@ _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 _LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
 
 
-class TestRegressionLora(ScriptedRuntimeTestCase):
+class TestRegressionLora(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=_LORA_BASE_MODEL,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -46,7 +46,7 @@ class TestRegressionLora(ScriptedRuntimeTestCase):
 
     def test_lora_drainer_chunked_resume(self):
         """5ed4faf0ab "Bypass LoRA scheduling gate for chunked-resume reqs"."""
-        self.runtime.run(self._script_lora_drainer_chunked_resume)
+        self.server.execute_script(self._script_lora_drainer_chunked_resume)
 
     # 5ed4faf0ab "Bypass LoRA scheduling gate for chunked-resume reqs".
     # Bug: LoRA drainer would reject chunked-resume reqs, leaving them
@@ -55,7 +55,7 @@ class TestRegressionLora(ScriptedRuntimeTestCase):
     # when adapter draining is forced via the wishlist
     # ``t.force_lora_drainer_reject`` helper.
     @staticmethod
-    def _script_lora_drainer_chunked_resume(t: ScriptedRuntime):
+    def _script_lora_drainer_chunked_resume(t: ScriptedContext):
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
@@ -82,17 +82,17 @@ class TestRegressionLora(ScriptedRuntimeTestCase):
         assert len(r.output_tokens) == 2
 
 
-class TestRegressionBasic(ScriptedRuntimeTestCase):
+class TestRegressionBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_abort_waiting_releases_all(self):
         """96d4749094 "Release row + KV + lock_ref when aborting a chunked-resume req from waiting_queue"."""
-        self.runtime.run(self._script_abort_waiting_releases_all)
+        self.server.execute_script(self._script_abort_waiting_releases_all)
 
     # 96d4749094 "Release row + KV + lock_ref when aborting a
     # chunked-resume req from waiting_queue".
     @staticmethod
-    def _script_abort_waiting_releases_all(t: ScriptedRuntime):
+    def _script_abort_waiting_releases_all(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         yield from run_until(r, lambda h: h.status == "waiting")
@@ -110,13 +110,13 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_pause_covers_waiting_chunked(self):
         """F38e69f87d "Extend pause(retract) to waiting chunked-resume reqs"."""
-        self.runtime.run(self._script_pause_covers_waiting_chunked)
+        self.server.execute_script(self._script_pause_covers_waiting_chunked)
 
     # f38e69f87d "Extend pause(retract) to waiting chunked-resume reqs".
     # Bug: pause path didn't iterate waiting_queue chunked-resume entries,
     # so paused chunked reqs leaked.
     @staticmethod
-    def _script_pause_covers_waiting_chunked(t: ScriptedRuntime):
+    def _script_pause_covers_waiting_chunked(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         yield from run_until(r, lambda h: h.status == "waiting")
@@ -136,7 +136,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_pending_middle_outputs_invariant(self):
         """B3a7b9f2a1 "Bump pending_middle_outputs for last-chunk admits + decrement-first output proc"."""
-        self.runtime.run(self._script_pending_middle_outputs_invariant)
+        self.server.execute_script(self._script_pending_middle_outputs_invariant)
 
     # b3a7b9f2a1 "Bump pending_middle_outputs for last-chunk admits +
     # decrement-first output proc".
@@ -144,7 +144,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # pending_middle_outputs > 0; once the output is processed it returns
     # to 0.
     @staticmethod
-    def _script_pending_middle_outputs_invariant(t: ScriptedRuntime):
+    def _script_pending_middle_outputs_invariant(t: ScriptedContext):
         r = t.start_req(
             prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, ignore_eos=True
         )
@@ -176,20 +176,20 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     )
     def test_mamba_chunked_resume_no_token(self):
         """Dbdcdde245 mamba_pool_idx cleanup-skip — requires a mamba model fixture."""
-        self.runtime.run(self._script_mamba_chunked_resume_no_token)
+        self.server.execute_script(self._script_mamba_chunked_resume_no_token)
 
     @staticmethod
-    def _script_mamba_chunked_resume_no_token(t: ScriptedRuntime):
+    def _script_mamba_chunked_resume_no_token(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
 
     def test_revert_bump_pending_middle_outputs(self):
         """E875cd36e4: revert of pending_middle_outputs bump."""
-        self.runtime.run(self._script_revert_bump_pending_middle_outputs)
+        self.server.execute_script(self._script_revert_bump_pending_middle_outputs)
 
     @staticmethod
-    def _script_revert_bump_pending_middle_outputs(t: ScriptedRuntime):
+    def _script_revert_bump_pending_middle_outputs(t: ScriptedContext):
         # Revert of pending_middle_outputs bump.
         # Bug shape: a transient fix wrongly bumped pending_middle_outputs
         # a second time when crossing the last-chunk admit boundary, so
@@ -229,10 +229,10 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_filter_batch_exclude_in_flight_other_mb(self):
         """5c523049db / 45347ca3a3: exclude in-flight other-mb reqs in filter_batch."""
-        self.runtime.run(self._script_filter_batch_exclude_in_flight_other_mb)
+        self.server.execute_script(self._script_filter_batch_exclude_in_flight_other_mb)
 
     @staticmethod
-    def _script_filter_batch_exclude_in_flight_other_mb(t: ScriptedRuntime):
+    def _script_filter_batch_exclude_in_flight_other_mb(t: ScriptedContext):
         # Exclude in-flight other-mb reqs
         # in filter_batch.
         # Bug shape: filter_batch's keep-set logic did not consult the
@@ -287,10 +287,10 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_stage_a_chunk_stash_iter_boundary(self):
         """678bba26f0: Stage A chunk-stash runs at iter boundary, not mid-iter."""
-        self.runtime.run(self._script_stage_a_chunk_stash_iter_boundary)
+        self.server.execute_script(self._script_stage_a_chunk_stash_iter_boundary)
 
     @staticmethod
-    def _script_stage_a_chunk_stash_iter_boundary(t: ScriptedRuntime):
+    def _script_stage_a_chunk_stash_iter_boundary(t: ScriptedContext):
         # Stage A chunk-stash runs at iter boundary,
         # BEFORE adder.build on the next iter (not mid-iter, not after
         # adder.build).
@@ -382,10 +382,10 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_merge_batch_assert_widened(self):
         """36ec1d7269: widen merge_batch assert: a chunked + short req pair completes with no extend-idx regression."""
-        self.runtime.run(self._script_merge_batch_assert_widened)
+        self.server.execute_script(self._script_merge_batch_assert_widened)
 
     @staticmethod
-    def _script_merge_batch_assert_widened(t: ScriptedRuntime):
+    def _script_merge_batch_assert_widened(t: ScriptedContext):
         # 36ec1d7269: widen merge_batch assert to match filter_batch
         # predicate. Pre-fix the merge_batch assertion would fire on the
         # legitimate chunked+short combo. Verification: both reqs finish
@@ -402,10 +402,12 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_filter_batch_explicit_exclude_chunked_flag(self):
         """Fd3dcca22f: explicit exclude_chunked_req flag — chunked + short pair completes, R1/B6 clean."""
-        self.runtime.run(self._script_filter_batch_explicit_exclude_chunked_flag)
+        self.server.execute_script(
+            self._script_filter_batch_explicit_exclude_chunked_flag
+        )
 
     @staticmethod
-    def _script_filter_batch_explicit_exclude_chunked_flag(t: ScriptedRuntime):
+    def _script_filter_batch_explicit_exclude_chunked_flag(t: ScriptedContext):
         # fd3dcca22f: refactor filter_batch to explicit
         # exclude_chunked_req flag. The refactor must keep the same
         # observable behavior — chunked reqs continue to be excluded
@@ -424,10 +426,12 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_waiting_queue_pending_tokens_subtract_prefix(self):
         """C79a73bec4: subtract prefix_indices from waiting_queue pending tokens sum."""
-        self.runtime.run(self._script_waiting_queue_pending_tokens_subtract_prefix)
+        self.server.execute_script(
+            self._script_waiting_queue_pending_tokens_subtract_prefix
+        )
 
     @staticmethod
-    def _script_waiting_queue_pending_tokens_subtract_prefix(t: ScriptedRuntime):
+    def _script_waiting_queue_pending_tokens_subtract_prefix(t: ScriptedContext):
         # Subtract prefix_indices from waiting_queue
         # pending tokens sum.
         # Bug shape: load_inquirer (the admission-budget probe used by
@@ -459,7 +463,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
         yield from run_until(r1, lambda h: h.status == "waiting")
 
         # NEW API NEEDED: r.prefix_indices_len exposing the stashed
-        # radix prefix length (already in the v2 ReqHandle wishlist).
+        # radix prefix length (already in the v2 ScriptedReqHandle wishlist).
         r1_prefix = r1.prefix_indices_len
         r1_committed = r1.kv_committed_len
         assert r1_committed > 0, "R1 must hold committed KV in waiting_queue"
@@ -472,7 +476,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
         # NEW API NEEDED: t.load_inquirer_num_pending_tokens() — the
         # admission-budget probe's pending-tokens count over the
         # current waiting_queue. Implemented inside Scheduler's
-        # load_inquirer subsystem; exposed via ScriptedRuntime.
+        # load_inquirer subsystem; exposed via ScriptedContext.
         observed_pending = t.load_inquirer_num_pending_tokens()
 
         r1_total = r1.total_tokens
@@ -497,10 +501,10 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_abort_dedup_dual_queue_holding(self):
         """De3859646b: abort_request dedup for chunked-resume dual-queue holding."""
-        self.runtime.run(self._script_abort_dedup_dual_queue_holding)
+        self.server.execute_script(self._script_abort_dedup_dual_queue_holding)
 
     @staticmethod
-    def _script_abort_dedup_dual_queue_holding(t: ScriptedRuntime):
+    def _script_abort_dedup_dual_queue_holding(t: ScriptedContext):
         # de3859646b: abort_request dedup for chunked-resume dual-queue holding.
         # The double-abort here is intentionally same-tick: both calls happen
         # before the next yield so the scheduler must dedup them in a single
@@ -525,7 +529,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_chunked_admission_reuse_branch_balanced(self):
         """add_one_req reuse branch keeps lock_ref balanced across a multi-chunk lifecycle."""
-        self.runtime.run(self._script_chunked_admission_reuse_branch_balanced)
+        self.server.execute_script(self._script_chunked_admission_reuse_branch_balanced)
 
     # Unify chunked admission via add_one_req reuse branch.
     # Bug: the previous dedicated add_chunked_req method re-incremented
@@ -537,7 +541,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # first chunk, one release on completion). Pre-fix this would walk
     # up by one per chunk.
     @staticmethod
-    def _script_chunked_admission_reuse_branch_balanced(t: ScriptedRuntime):
+    def _script_chunked_admission_reuse_branch_balanced(t: ScriptedContext):
         baseline_refs = t.lock_refs_snapshot()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
@@ -563,7 +567,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_chunked_resume_lives_in_waiting_queue(self):
         """Mid-chunk req sits in waiting_queue between chunks; queue empties after last chunk."""
-        self.runtime.run(self._script_chunked_resume_lives_in_waiting_queue)
+        self.server.execute_script(self._script_chunked_resume_lives_in_waiting_queue)
 
     # Switch chunked-resume to waiting_queue holding;
     # delete chunked_req fields.
@@ -576,7 +580,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # running. Pre-fix the req would have been in running_batch the
     # whole time with status "running".
     @staticmethod
-    def _script_chunked_resume_lives_in_waiting_queue(t: ScriptedRuntime):
+    def _script_chunked_resume_lives_in_waiting_queue(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE + 32, max_new_tokens=2)
 
         # Observe between chunk 1 and chunk 2: req must be in
@@ -604,7 +608,9 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_chunked_retract_no_double_init_load_back(self):
         """Retract -> re-admit chunk 2 must not run init_load_back twice (host_hit_length reset is unconditional)."""
-        self.runtime.run(self._script_chunked_retract_no_double_init_load_back)
+        self.server.execute_script(
+            self._script_chunked_retract_no_double_init_load_back
+        )
 
     # Reset host_hit_length unconditionally in
     # prepare_for_extend.
@@ -622,7 +628,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # re-admit, observe init_load_back fired exactly ONCE across the
     # second lifecycle and lock_refs balanced.
     @staticmethod
-    def _script_chunked_retract_no_double_init_load_back(t: ScriptedRuntime):
+    def _script_chunked_retract_no_double_init_load_back(t: ScriptedContext):
         baseline_refs = t.lock_refs_snapshot()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
@@ -648,7 +654,9 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_streaming_session_multiturn_no_reuse_branch(self):
         """Streaming-session turn N>1 must NOT take the reuse branch even though kv_committed_len > 0."""
-        self.runtime.run(self._script_streaming_session_multiturn_no_reuse_branch)
+        self.server.execute_script(
+            self._script_streaming_session_multiturn_no_reuse_branch
+        )
 
     # Tighten add_one_req reuse gate to
     # has_pending_chunk.
@@ -664,7 +672,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # zero. Pre-fix the dec would not match (no inc happened) and
     # baseline would be off by one.
     @staticmethod
-    def _script_streaming_session_multiturn_no_reuse_branch(t: ScriptedRuntime):
+    def _script_streaming_session_multiturn_no_reuse_branch(t: ScriptedContext):
         baseline_refs = t.lock_refs_snapshot()
         # Turn 1: short prompt, completes normally, leaves
         # kv_committed_len > 0 on the session slot.
@@ -697,7 +705,9 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_abort_chunked_resume_releases_all_resources(self):
         """Aborting a chunked-resume req that lives ONLY in waiting_queue must release row + KV + lock_ref together."""
-        self.runtime.run(self._script_abort_chunked_resume_releases_all_resources)
+        self.server.execute_script(
+            self._script_abort_chunked_resume_releases_all_resources
+        )
 
     # Release row + KV + lock_ref when aborting a
     # chunked-resume req from waiting_queue.
@@ -714,7 +724,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # idea but does not snapshot all three resources simultaneously;
     # this one pins the full triple plus the global lock_refs baseline.
     @staticmethod
-    def _script_abort_chunked_resume_releases_all_resources(t: ScriptedRuntime):
+    def _script_abort_chunked_resume_releases_all_resources(t: ScriptedContext):
         baseline_refs = t.lock_refs_snapshot()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
@@ -748,7 +758,9 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_abort_chunked_resume_dual_queue_no_double_release(self):
         """Abort of a chunked-resume req held in BOTH waiting_queue and batch.reqs must dedup and release exactly once."""
-        self.runtime.run(self._script_abort_chunked_resume_dual_queue_no_double_release)
+        self.server.execute_script(
+            self._script_abort_chunked_resume_dual_queue_no_double_release
+        )
 
     # abort_request dedup for chunked-resume dual-queue
     # holding.
@@ -764,7 +776,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # finish_event_count must be exactly 1 and resources must release
     # cleanly without underflow.
     @staticmethod
-    def _script_abort_chunked_resume_dual_queue_no_double_release(t: ScriptedRuntime):
+    def _script_abort_chunked_resume_dual_queue_no_double_release(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
         # Spin until we observe the dual-queue moment: rid in both
@@ -804,7 +816,9 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_pause_retract_releases_waiting_chunked_resume(self):
         """Pause_generation(retract) must release waiting_queue chunked-resume row+KV+lock_ref (not only running_batch)."""
-        self.runtime.run(self._script_pause_retract_releases_waiting_chunked_resume)
+        self.server.execute_script(
+            self._script_pause_retract_releases_waiting_chunked_resume
+        )
 
     # Extend pause(retract) to waiting chunked-resume
     # reqs.
@@ -821,7 +835,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # (retract). The waiting chunked-resume's row+KV+lock_ref must be
     # released and the engine must report is_fully_idle.
     @staticmethod
-    def _script_pause_retract_releases_waiting_chunked_resume(t: ScriptedRuntime):
+    def _script_pause_retract_releases_waiting_chunked_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         yield from run_until(r, lambda h: h.status == "waiting")
@@ -849,7 +863,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
 
     def test_retract_all_clears_batch_with_chunked(self):
         """Retract_all triggered mid-chunk must clear the batch (keep_indices=[] semantics), not pass List[Req] as keep_indices."""
-        self.runtime.run(self._script_retract_all_clears_batch_with_chunked)
+        self.server.execute_script(self._script_retract_all_clears_batch_with_chunked)
 
     # retract_all was passing List[Req] to filter_batch
     # as keep_indices.
@@ -864,7 +878,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
     # "kept"), all reqs must be in waiting_queue with reset chunked
     # state, and subsequent resume must finish all of them.
     @staticmethod
-    def _script_retract_all_clears_batch_with_chunked(t: ScriptedRuntime):
+    def _script_retract_all_clears_batch_with_chunked(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
@@ -896,7 +910,7 @@ class TestRegressionBasic(ScriptedRuntimeTestCase):
         yield from run_until_all_finished([r1, r2])
 
 
-class TestRegressionPp(ScriptedRuntimeTestCase):
+class TestRegressionPp(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         tp_size=2,
@@ -905,7 +919,7 @@ class TestRegressionPp(ScriptedRuntimeTestCase):
 
     def test_pp_abort_dedup(self):
         """B823c16e60 "Include PP microbatch reqs in abort_request batch_rids dedup"."""
-        self.runtime.run(self._script_pp_abort_dedup)
+        self.server.execute_script(self._script_pp_abort_dedup)
 
     # Include PP microbatch reqs in abort_request
     # batch_rids dedup.
@@ -923,7 +937,7 @@ class TestRegressionPp(ScriptedRuntimeTestCase):
     # set t.batch_rids() (computed across the union of locations) must
     # contain exactly 1 entry for r, not 3.
     @staticmethod
-    def _script_pp_abort_dedup(t: ScriptedRuntime):
+    def _script_pp_abort_dedup(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
 
         # Drive r into the dual-mb + waiting_queue state. With PP=2 and
@@ -958,7 +972,7 @@ class TestRegressionPp(ScriptedRuntimeTestCase):
 
     def test_pp_other_mb_chunked_exclude(self):
         """69ef71edc4 "Conditionally exclude in-flight other-mb chunked-resume reqs (PP, max_new_tokens > 1)"."""
-        self.runtime.run(self._script_pp_other_mb_chunked_exclude)
+        self.server.execute_script(self._script_pp_other_mb_chunked_exclude)
 
     # Conditionally exclude in-flight other-mb
     # chunked-resume reqs (PP, max_new_tokens > 1).
@@ -977,7 +991,7 @@ class TestRegressionPp(ScriptedRuntimeTestCase):
     # the exclude path engaged. For the max_new_tokens == 1 control,
     # the exclude must NOT engage (the req can co-occur in running).
     @staticmethod
-    def _script_pp_other_mb_chunked_exclude(t: ScriptedRuntime):
+    def _script_pp_other_mb_chunked_exclude(t: ScriptedContext):
         r_long = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r_ctrl = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1)
 
@@ -1032,7 +1046,7 @@ class TestRegressionPp(ScriptedRuntimeTestCase):
         )
 
 
-class TestRegressionDisagg(ScriptedRuntimeTestCase):
+class TestRegressionDisagg(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disaggregation_mode="prefill",
@@ -1040,7 +1054,7 @@ class TestRegressionDisagg(ScriptedRuntimeTestCase):
 
     def test_disagg_retract_resets_send(self):
         """414efd4a27 "Reset disagg send-side state on chunked-resume retract"."""
-        self.runtime.run(self._script_disagg_retract_resets_send)
+        self.server.execute_script(self._script_disagg_retract_resets_send)
 
     # 414efd4a27 "Reset disagg send-side state on chunked-resume retract".
     # Bug shape: retracting a chunked-resume req that was mid-flight on
@@ -1049,7 +1063,7 @@ class TestRegressionDisagg(ScriptedRuntimeTestCase):
     # The fix resets send-side state on retract. D3 counter fires +1
     # whenever a retract path leaves the disagg send state non-reset.
     @staticmethod
-    def _script_disagg_retract_resets_send(t: ScriptedRuntime):
+    def _script_disagg_retract_resets_send(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
@@ -1062,7 +1076,7 @@ class TestRegressionDisagg(ScriptedRuntimeTestCase):
         )
 
 
-class TestRegressionPriority(ScriptedRuntimeTestCase):
+class TestRegressionPriority(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         enable_priority_scheduling=True,
@@ -1070,7 +1084,7 @@ class TestRegressionPriority(ScriptedRuntimeTestCase):
 
     def test_priority_skips_chunked_in_prefix_match(self):
         """Aaf3752d2b "Skip chunked-resume reqs in calc_priority prefix matching"."""
-        self.runtime.run(self._script_priority_skips_chunked_in_prefix_match)
+        self.server.execute_script(self._script_priority_skips_chunked_in_prefix_match)
 
     # aaf3752d2b "Skip chunked-resume reqs in calc_priority prefix
     # matching".
@@ -1079,7 +1093,7 @@ class TestRegressionPriority(ScriptedRuntimeTestCase):
     # enable priority + radix; r1 chunks, r2 arrives; priority calc must
     # not include r1 in its prefix match.
     @staticmethod
-    def _script_priority_skips_chunked_in_prefix_match(t: ScriptedRuntime):
+    def _script_priority_skips_chunked_in_prefix_match(t: ScriptedContext):
         # Snapshot r1's stashed state at the mid-chunk boundary; if the
         # priority calc tried to prefix-match r1, that state would be
         # corrupted (the same bug shape as the LPM regression).
@@ -1120,7 +1134,7 @@ class TestRegressionPriority(ScriptedRuntimeTestCase):
         assert len(r1.output_tokens) == 2 and len(r2.output_tokens) == 2
 
 
-class TestRegressionLpm(ScriptedRuntimeTestCase):
+class TestRegressionLpm(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         schedule_policy="lpm",
@@ -1128,7 +1142,7 @@ class TestRegressionLpm(ScriptedRuntimeTestCase):
 
     def test_chunked_resume_priority_in_sort(self):
         """Bf5b4e9a10 "Give chunked-resume reqs priority in LPM and DFS_WEIGHT sorts"."""
-        self.runtime.run(self._script_chunked_resume_priority_in_sort)
+        self.server.execute_script(self._script_chunked_resume_priority_in_sort)
 
     # bf5b4e9a10 "Give chunked-resume reqs priority in LPM and
     # DFS_WEIGHT sorts".
@@ -1137,7 +1151,7 @@ class TestRegressionLpm(ScriptedRuntimeTestCase):
     # Test: a chunked req in flight + many short reqs; chunked must
     # advance, not starve.
     @staticmethod
-    def _script_chunked_resume_priority_in_sort(t: ScriptedRuntime):
+    def _script_chunked_resume_priority_in_sort(t: ScriptedContext):
         r_long = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r_long, lambda h: h.is_chunking)
 
@@ -1162,7 +1176,7 @@ class TestRegressionLpm(ScriptedRuntimeTestCase):
 
     def test_lpm_skips_chunked_resume_prefix_match(self):
         """Calc_priority prefix matching must skip chunked-resume reqs to preserve their stashed last_node/prefix_indices."""
-        self.runtime.run(self._script_lpm_skips_chunked_resume_prefix_match)
+        self.server.execute_script(self._script_lpm_skips_chunked_resume_prefix_match)
 
     # Skip chunked-resume reqs in calc_priority prefix
     # matching.
@@ -1180,7 +1194,7 @@ class TestRegressionLpm(ScriptedRuntimeTestCase):
     # pass, R1's last_node, prefix_indices_len, and host_hit_length
     # must all be unchanged.
     @staticmethod
-    def _script_lpm_skips_chunked_resume_prefix_match(t: ScriptedRuntime):
+    def _script_lpm_skips_chunked_resume_prefix_match(t: ScriptedContext):
         # Warm the radix with a common prefix so R2 will have a match
         # candidate that calc_priority will try to use.
         t.warmup_radix(prompt_tokens=[1] * (2 * DEFAULT_CHUNK_SIZE))
@@ -1215,7 +1229,7 @@ class TestRegressionLpm(ScriptedRuntimeTestCase):
 
     def test_chunked_resume_priority_under_lpm(self):
         """Chunked-resume gets priority in LPM sort even when its prefix_indices length is short vs fresh long-prefix waiters."""
-        self.runtime.run(self._script_chunked_resume_priority_under_lpm)
+        self.server.execute_script(self._script_chunked_resume_priority_under_lpm)
 
     # Give chunked-resume reqs priority in LPM and
     # DFS_WEIGHT sorts.
@@ -1232,7 +1246,7 @@ class TestRegressionLpm(ScriptedRuntimeTestCase):
     # forward progress (chunks_done increases) within a small step
     # budget. Pre-fix R1 would be stuck.
     @staticmethod
-    def _script_chunked_resume_priority_under_lpm(t: ScriptedRuntime):
+    def _script_chunked_resume_priority_under_lpm(t: ScriptedContext):
         long_prefix_tokens = [1] * (3 * DEFAULT_CHUNK_SIZE)
         t.warmup_radix(prompt_tokens=long_prefix_tokens)
 
@@ -1262,7 +1276,7 @@ class TestRegressionLpm(ScriptedRuntimeTestCase):
         yield from run_until_all_finished([r1, *competitors])
 
 
-class TestRegressionGptOss(ScriptedRuntimeTestCase):
+class TestRegressionGptOss(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         model_path="openai/gpt-oss-20b",
@@ -1272,7 +1286,9 @@ class TestRegressionGptOss(ScriptedRuntimeTestCase):
 
     def test_chunked_stash_bounded_by_kv_committed_len(self):
         """Cache_unfinished_req reads only up to kv_committed_len; SWA early-return must not leak garbage prefix."""
-        self.runtime.run(self._script_chunked_stash_bounded_by_kv_committed_len)
+        self.server.execute_script(
+            self._script_chunked_stash_bounded_by_kv_committed_len
+        )
 
     # Bound cache_unfinished_req row read by
     # kv_committed_len.
@@ -1288,7 +1304,7 @@ class TestRegressionGptOss(ScriptedRuntimeTestCase):
     # kv_committed_len (NOT len(fill_ids)). Pre-fix prefix_indices
     # would be longer and point into garbage cells.
     @staticmethod
-    def _script_chunked_stash_bounded_by_kv_committed_len(t: ScriptedRuntime):
+    def _script_chunked_stash_bounded_by_kv_committed_len(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
@@ -1311,7 +1327,7 @@ class TestRegressionGptOss(ScriptedRuntimeTestCase):
         yield from run_until_finished(r)
 
 
-class TestRegressionWaitingTimeout(ScriptedRuntimeTestCase):
+class TestRegressionWaitingTimeout(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         env={"SGLANG_REQ_WAITING_TIMEOUT": "1"},
@@ -1319,7 +1335,9 @@ class TestRegressionWaitingTimeout(ScriptedRuntimeTestCase):
 
     def test_chunked_resume_immune_to_waiting_timeout(self):
         """_abort_on_waiting_timeout must skip chunked-resume reqs even when SGLANG_REQ_WAITING_TIMEOUT triggers."""
-        self.runtime.run(self._script_chunked_resume_immune_to_waiting_timeout)
+        self.server.execute_script(
+            self._script_chunked_resume_immune_to_waiting_timeout
+        )
 
     # Skip chunked-resume reqs in
     # _abort_on_waiting_timeout.
@@ -1334,7 +1352,7 @@ class TestRegressionWaitingTimeout(ScriptedRuntimeTestCase):
     # The chunked-resume req must NOT be aborted; it must continue to
     # completion.
     @staticmethod
-    def _script_chunked_resume_immune_to_waiting_timeout(t: ScriptedRuntime):
+    def _script_chunked_resume_immune_to_waiting_timeout(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         assert r.has_pending_chunk

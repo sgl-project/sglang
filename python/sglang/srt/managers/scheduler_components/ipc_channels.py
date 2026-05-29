@@ -8,12 +8,14 @@ from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import get_zmq_socket
 
 if TYPE_CHECKING:
-    from sglang.test.scripted_runtime.tokenizer_recv_proxy import TokenizerRecvProxy
+    from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
+        ScriptedTokenizerRecvProxy,
+    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SchedulerIpcChannels:
-    recv_from_tokenizer: Union[zmq.Socket, "TokenizerRecvProxy"]
+    recv_from_tokenizer: Union[zmq.Socket, "ScriptedTokenizerRecvProxy"]
     recv_from_rpc: Optional[zmq.Socket]
     send_to_tokenizer: SenderWrapper
     send_to_detokenizer: SenderWrapper
@@ -37,10 +39,12 @@ class SchedulerIpcChannels:
             )
             if enable_scripted_runtime:
                 from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
-                    TokenizerRecvProxy,
+                    ScriptedTokenizerRecvProxy,
                 )
 
-                recv_from_tokenizer = TokenizerRecvProxy(underlying=recv_from_tokenizer)
+                recv_from_tokenizer = ScriptedTokenizerRecvProxy(
+                    underlying=recv_from_tokenizer
+                )
             recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )

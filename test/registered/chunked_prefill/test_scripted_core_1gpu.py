@@ -1,8 +1,8 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     LIFECYCLE_STAGES,
     advance_to_lifecycle_stage,
@@ -39,15 +39,15 @@ def _advance_to_stage(r, stage: str):
     )
 
 
-class TestScriptedCore(ScriptedRuntimeTestCase):
+class TestScriptedCore(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
 
     def test_chunked_prefill_smoke(self):
         """Engine boots with small chunk_size and a multi-chunk req finishes cleanly."""
-        self.runtime.run(self._script_chunked_prefill_smoke)
+        self.server.execute_script(self._script_chunked_prefill_smoke)
 
     @staticmethod
-    def _script_chunked_prefill_smoke(t: ScriptedRuntime):
+    def _script_chunked_prefill_smoke(t: ScriptedContext):
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=3)
         yield from run_until_finished(r)
         assert r.finished, "req did not finish"
@@ -57,13 +57,13 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         for offset in (-2, -1, 1, 2):
             prompt_len = 2 * _CHUNK_SIZE + offset
             with self.subTest(offset=offset, prompt_len=prompt_len):
-                self.runtime.run(
+                self.server.execute_script(
                     self._script_chunked_prefill_smoke_at_offset,
                     args=(prompt_len,),
                 )
 
     @staticmethod
-    def _script_chunked_prefill_smoke_at_offset(t: ScriptedRuntime, prompt_len: int):
+    def _script_chunked_prefill_smoke_at_offset(t: ScriptedContext, prompt_len: int):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=3)
         yield from run_until_finished(r)
         assert r.finished, f"req with prompt_len={prompt_len} did not finish"
@@ -72,13 +72,13 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         """Pause(retract) at each lifecycle stage, sit paused, continue, and the req still finishes."""
         for stage in LIFECYCLE_STAGES:
             with self.subTest(stage=stage):
-                self.runtime.run(
+                self.server.execute_script(
                     self._script_pause_retract_at_stage,
                     args=(stage,),
                 )
 
     @staticmethod
-    def _script_pause_retract_at_stage(t: ScriptedRuntime, stage: str):
+    def _script_pause_retract_at_stage(t: ScriptedContext, stage: str):
         r = t.start_req(
             prompt_len=_PROMPT_LEN, max_new_tokens=_LIFECYCLE_MAX_NEW_TOKENS
         )
@@ -123,10 +123,12 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
         """abort_all() at each lifecycle stage terminates the req within a few yields."""
         for stage in LIFECYCLE_STAGES:
             with self.subTest(stage=stage):
-                self.runtime.run(self._script_abort_all_at_stage, args=(stage,))
+                self.server.execute_script(
+                    self._script_abort_all_at_stage, args=(stage,)
+                )
 
     @staticmethod
-    def _script_abort_all_at_stage(t: ScriptedRuntime, stage: str):
+    def _script_abort_all_at_stage(t: ScriptedContext, stage: str):
         r = t.start_req(
             prompt_len=_PROMPT_LEN, max_new_tokens=_LIFECYCLE_MAX_NEW_TOKENS
         )
@@ -144,20 +146,22 @@ class TestScriptedCore(ScriptedRuntimeTestCase):
 
     def test_chunked_req_single_decode_finishes(self):
         """A chunked-prefill req with max_new_tokens=1 finishes cleanly after its single decode step."""
-        self.runtime.run(self._script_chunked_req_single_decode_finishes)
+        self.server.execute_script(self._script_chunked_req_single_decode_finishes)
 
     @staticmethod
-    def _script_chunked_req_single_decode_finishes(t: ScriptedRuntime):
+    def _script_chunked_req_single_decode_finishes(t: ScriptedContext):
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=1)
         yield from run_until_finished(r)
         assert r.finished, "single-decode chunked req did not finish"
 
     def test_chunked_prefill_does_not_inflate_radix_hit_count(self):
         """Chunked inserts skip hit_count, so every radix node is bumped exactly once (==1), never per-chunk inflated."""
-        self.runtime.run(self._script_chunked_prefill_does_not_inflate_radix_hit_count)
+        self.server.execute_script(
+            self._script_chunked_prefill_does_not_inflate_radix_hit_count
+        )
 
     @staticmethod
-    def _script_chunked_prefill_does_not_inflate_radix_hit_count(t: ScriptedRuntime):
+    def _script_chunked_prefill_does_not_inflate_radix_hit_count(t: ScriptedContext):
         # runtime.run starts every script from a flushed cache (t.flush_cache),
         # so the radix tree holds only this request's nodes.
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)

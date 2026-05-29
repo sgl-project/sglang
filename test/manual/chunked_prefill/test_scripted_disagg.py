@@ -1,10 +1,10 @@
-"""Disagg × chunked: naive ScriptedRuntime smoke.
+"""Disagg × chunked: naive ScriptedContext smoke.
 
 Submit a long-prompt request to a prefill-engine running with
 ``--chunked-prefill-size 256``. The prefill engine must chunk the
 request and hand off KV to the decode engine cleanly.
 
-The current ScriptedRuntime only spins up a single Engine; the
+The current ScriptedContext only spins up a single Engine; the
 disagg topology requires running two Engines and routing through the
 PD router (wishlist §4 P3 (16)). This test encodes the *intent* —
 when disagg support lands the script body stays unchanged.
@@ -14,8 +14,8 @@ Requires 2-4 GPUs in PD configuration.
 
 import unittest
 
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
@@ -27,8 +27,8 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
-class TestDisaggBasic(ScriptedRuntimeTestCase):
-    # When ScriptedRuntime grows disagg topology support, the
+class TestDisaggBasic(ScriptedTestCase):
+    # When ScriptedContext grows disagg topology support, the
     # decode-side engine kwargs go through ``decode_engine_kwargs=``
     # (or similar) — see wishlist §4 P3 (16).
     ENGINE_KWARGS = base_engine_kwargs(
@@ -39,10 +39,10 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
 
     def test_naive_disagg_chunked(self):
         """Disagg x chunked: prefill engine chunks long prompt and hands off to decode."""
-        self.runtime.run(self._script_naive_disagg_chunked)
+        self.server.execute_script(self._script_naive_disagg_chunked)
 
     @staticmethod
-    def _script_naive_disagg_chunked(t: ScriptedRuntime):
+    def _script_naive_disagg_chunked(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until_finished(r)
         assert r.finished
@@ -55,12 +55,12 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
 
     def test_disagg_prefill_per_chunk_kv_send(self):
         """Disagg-prefill multi-chunk: each middle chunk sends KV with last_chunk=False."""
-        self.runtime.run(self._script_disagg_prefill_per_chunk_kv_send)
+        self.server.execute_script(self._script_disagg_prefill_per_chunk_kv_send)
 
     # Disagg-prefill per-chunk KV send — each middle chunk must call
     # send_kv_chunk(last_chunk=False); only the final chunk uses last_chunk=True.
     @staticmethod
-    def _script_disagg_prefill_per_chunk_kv_send(t: ScriptedRuntime):
+    def _script_disagg_prefill_per_chunk_kv_send(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
@@ -78,12 +78,12 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
 
     def test_disagg_retract_resets_send_state(self):
         """Disagg-prefill chunked retract resets start_send_idx and tmp_end_idx."""
-        self.runtime.run(self._script_disagg_retract_resets_send_state)
+        self.server.execute_script(self._script_disagg_retract_resets_send_state)
 
     # Disagg chunked retract — start_send_idx must reset to 0
     # and tmp_end_idx to -1 so the resumed prefill restarts the KV stream.
     @staticmethod
-    def _script_disagg_retract_resets_send_state(t: ScriptedRuntime):
+    def _script_disagg_retract_resets_send_state(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.force_retract(r)
@@ -103,7 +103,9 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
         Direct access to ``_scheduler`` internals is intentional; this is an
         invariant-tier test (see direct-internals-access plan).
         """
-        self.runtime.run(self._script_disagg_send_state_reset_on_retract_invariant)
+        self.server.execute_script(
+            self._script_disagg_send_state_reset_on_retract_invariant
+        )
 
     # D3 — drive a disagg-prefill chunked req partway so its send-side
     # state has been advanced by ``send_kv_chunk`` (``start_send_idx >
@@ -116,7 +118,7 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
     # See commit 414efd4a27 ("Reset disagg send-side state on
     # chunked-resume retract") for the original bug.
     @staticmethod
-    def _script_disagg_send_state_reset_on_retract_invariant(t: ScriptedRuntime):
+    def _script_disagg_send_state_reset_on_retract_invariant(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         # Drive past at least one chunk completion so the disagg
         # prefill side has executed a ``send_kv_chunk`` and advanced
@@ -157,7 +159,7 @@ class TestDisaggBasic(ScriptedRuntimeTestCase):
         )
 
 
-class TestDisaggOverlap(ScriptedRuntimeTestCase):
+class TestDisaggOverlap(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=DEFAULT_MODEL_NAME_FOR_TEST,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -167,13 +169,13 @@ class TestDisaggOverlap(ScriptedRuntimeTestCase):
 
     def test_disagg_overlap_mid_chunk_tmp_end_idx(self):
         """Disagg overlap mode: tmp_end_idx updates per chunk per the documented formula."""
-        self.runtime.run(self._script_disagg_overlap_mid_chunk_tmp_end_idx)
+        self.server.execute_script(self._script_disagg_overlap_mid_chunk_tmp_end_idx)
 
     # Disagg overlap + middle chunk — tmp_end_idx must advance
     # by exactly chunk_size each iter; send_kv_chunk uses tmp_end_idx as the
     # right end of the slice for the in-flight middle chunk.
     @staticmethod
-    def _script_disagg_overlap_mid_chunk_tmp_end_idx(t: ScriptedRuntime):
+    def _script_disagg_overlap_mid_chunk_tmp_end_idx(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         first_tmp = r.tmp_end_idx

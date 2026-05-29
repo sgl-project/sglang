@@ -1,4 +1,4 @@
-"""ReqHandle: handle for a request submitted via ScriptedRuntime.
+"""ScriptedReqHandle: handle for a request submitted via ScriptedContext.
 
 Convenience handle exposing a stable, named subset of req state for
 the common test patterns. Test scripts are also explicitly allowed to
@@ -16,14 +16,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+    from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
 
 
-ReqStatus = Literal["waiting", "running", "finished", "unknown"]
+ScriptedReqStatus = Literal["waiting", "running", "finished", "unknown"]
 
 
 def _wishlist(name: str) -> NotImplementedError:
-    """Build the standardised wishlist NotImplementedError for ReqHandle props."""
+    """Build the standardised wishlist NotImplementedError for ScriptedReqHandle props."""
     return NotImplementedError(
         f"scripted_runtime: {name} is wishlist — see "
         "2026-05-26-round-5-de-skip-and-api-wishlist.md"
@@ -31,13 +31,13 @@ def _wishlist(name: str) -> NotImplementedError:
 
 
 @dataclass(frozen=True, slots=True)
-class ReqHandle:
+class ScriptedReqHandle:
     rid: str
-    runtime: "ScriptedRuntime"
+    scheduler_hook: "ScriptedSchedulerHook"
 
     @property
-    def status(self) -> ReqStatus:
-        return self.runtime._lookup_req_status(self.rid)
+    def status(self) -> ScriptedReqStatus:
+        return self.scheduler_hook._lookup_req_status(self.rid)
 
     @property
     def req(self) -> Optional["Req"]:
@@ -49,14 +49,14 @@ class ReqHandle:
         access. Re-fetched on every access since the req moves between
         scheduler structures.
         """
-        return self.runtime._find_req_by_rid(self.rid)
+        return self.scheduler_hook._find_req_by_rid(self.rid)
 
     # ============================================================
     # Wishlist properties (NotImplementedError stubs).
     # See 2026-05-26-round-5-de-skip-and-api-wishlist.md §5.3.
-    # Each stub raises directly without going through runtime to
-    # keep the runtime.py surface clean — real implementations will
-    # delegate to runtime._lookup_req_* helpers.
+    # Each stub raises directly without going through the scheduler_hook
+    # to keep the ScriptedSchedulerHook surface clean — real implementations
+    # will delegate to scheduler_hook._lookup_* helpers.
     # ============================================================
 
     # === Lifecycle ===
@@ -70,7 +70,7 @@ class ReqHandle:
                      test_chunked_prefill_finishes_with_correct_output_len (regression),
                      test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
         """
-        return self.runtime._lookup_finished(self.rid)
+        return self.scheduler_hook._lookup_finished(self.rid)
 
     @property
     def aborted(self) -> bool:
@@ -160,7 +160,7 @@ class ReqHandle:
                      test_chunked_req_slot_ownership (special_case),
                      test_swa_chunked_req_early_return_no_double_free (hybrid_swa).
         """
-        return self.runtime._lookup_is_chunking(self.rid)
+        return self.scheduler_hook._lookup_is_chunking(self.rid)
 
     @property
     def has_pending_chunk(self) -> bool:

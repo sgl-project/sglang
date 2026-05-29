@@ -15,8 +15,8 @@ batch sizes and mixed-shape concurrency.
 
 import unittest
 
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
@@ -28,17 +28,17 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
-class TestMultiReqBasic(ScriptedRuntimeTestCase):
+class TestMultiReqBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_at_most_one_chunked_in_flight(self):
         """Two long requests submitted back-to-back; main-upstream invariant says at most one is chunked-in-flight at any moment."""
-        self.runtime.run(self._script_at_most_one_chunked_in_flight)
+        self.server.execute_script(self._script_at_most_one_chunked_in_flight)
 
     # two long requests submitted back-to-back; main-upstream
     # invariant says at most one is chunked-in-flight at any moment.
     @staticmethod
-    def _script_at_most_one_chunked_in_flight(t: ScriptedRuntime):
+    def _script_at_most_one_chunked_in_flight(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
@@ -57,12 +57,12 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_second_chunked_waits(self):
         """R1 chunked mid-stream + r2 submitted long."""
-        self.runtime.run(self._script_second_chunked_waits)
+        self.server.execute_script(self._script_second_chunked_waits)
 
     # r1 chunked mid-stream + r2 submitted long. r2 must wait for
     # r1's chunk loop to clear before starting its own chunking.
     @staticmethod
-    def _script_second_chunked_waits(t: ScriptedRuntime):
+    def _script_second_chunked_waits(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
         # r1 is mid-chunk-loop. Submit a second long req.
@@ -79,12 +79,12 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_chunked_plus_decode_in_batch(self):
         """R1 chunked mid-stream + r2 short decode-only."""
-        self.runtime.run(self._script_chunked_plus_decode_in_batch)
+        self.server.execute_script(self._script_chunked_plus_decode_in_batch)
 
     # r1 chunked mid-stream + r2 short decode-only. r2 should be
     # admittable into the running batch alongside r1's chunked extend.
     @staticmethod
-    def _script_chunked_plus_decode_in_batch(t: ScriptedRuntime):
+    def _script_chunked_plus_decode_in_batch(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
 
@@ -111,10 +111,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_hundred_short_reqs(self):
         """100 short reqs back-to-back: all complete, no leak, no S2 violation."""
-        self.runtime.run(self._script_hundred_short_reqs)
+        self.server.execute_script(self._script_hundred_short_reqs)
 
     @staticmethod
-    def _script_hundred_short_reqs(t: ScriptedRuntime):
+    def _script_hundred_short_reqs(t: ScriptedContext):
         # 100 short reqs back-to-back. Beyond r.finished, confirm KV
         # pool returns to baseline (no leak).
         baseline = t.engine_stats()
@@ -129,10 +129,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_five_hundred_short_reqs(self):
         """500 short reqs: sustained pressure, KV returns to baseline."""
-        self.runtime.run(self._script_five_hundred_short_reqs)
+        self.server.execute_script(self._script_five_hundred_short_reqs)
 
     @staticmethod
-    def _script_five_hundred_short_reqs(t: ScriptedRuntime):
+    def _script_five_hundred_short_reqs(t: ScriptedContext):
         # 500 short reqs. Beyond r.finished, confirm KV pool returns
         # to baseline.
         # max_steps bumped to 20000 for the same reason as the 200-req case.
@@ -146,10 +146,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_mixed_ten_chunked_ten_short(self):
         """10 chunked + 10 short, all submitted back-to-back."""
-        self.runtime.run(self._script_mixed_ten_chunked_ten_short)
+        self.server.execute_script(self._script_mixed_ten_chunked_ten_short)
 
     @staticmethod
-    def _script_mixed_ten_chunked_ten_short(t: ScriptedRuntime):
+    def _script_mixed_ten_chunked_ten_short(t: ScriptedContext):
         # 10 chunked + 10 short, all submitted back-to-back. Single
         # chunked-in-flight invariant preserved at every step.
         chunked = [
@@ -167,10 +167,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_submit_during_chunk_mid(self):
         """R1 in mid-chunk; r2 submitted after 1 yield; r3 after another."""
-        self.runtime.run(self._script_submit_during_chunk_mid)
+        self.server.execute_script(self._script_submit_during_chunk_mid)
 
     @staticmethod
-    def _script_submit_during_chunk_mid(t: ScriptedRuntime):
+    def _script_submit_during_chunk_mid(t: ScriptedContext):
         # r1 in mid-chunk; r2 submitted after 1 yield; r3 after another.
         # All three complete.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -183,10 +183,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_five_identical_prompts(self):
         """5 identical prompts: r1 chunks; r2..r5 hit radix."""
-        self.runtime.run(self._script_five_identical_prompts)
+        self.server.execute_script(self._script_five_identical_prompts)
 
     @staticmethod
-    def _script_five_identical_prompts(t: ScriptedRuntime):
+    def _script_five_identical_prompts(t: ScriptedContext):
         # 5 identical prompts: r1 chunks; r2..r5 hit radix.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r1)
@@ -204,10 +204,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_sibling_shared_prefix(self):
         """Two reqs share the first N tokens: each runs to completion."""
-        self.runtime.run(self._script_sibling_shared_prefix)
+        self.server.execute_script(self._script_sibling_shared_prefix)
 
     @staticmethod
-    def _script_sibling_shared_prefix(t: ScriptedRuntime):
+    def _script_sibling_shared_prefix(t: ScriptedContext):
         # Two reqs share the first N tokens: each runs to completion.
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r1)
@@ -217,10 +217,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_trickle_per_yield_50(self):
         """Submit one new req per yield for 50 yields."""
-        self.runtime.run(self._script_trickle_per_yield_50)
+        self.server.execute_script(self._script_trickle_per_yield_50)
 
     @staticmethod
-    def _script_trickle_per_yield_50(t: ScriptedRuntime):
+    def _script_trickle_per_yield_50(t: ScriptedContext):
         # Submit one new req per yield for 50 yields. All complete and
         # KV pool returns to baseline.
         baseline = t.engine_stats()
@@ -236,10 +236,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_submit_then_immediate_abort(self):
         """Start_req then abort in same yield step: clean state, no double-release."""
-        self.runtime.run(self._script_submit_then_immediate_abort)
+        self.server.execute_script(self._script_submit_then_immediate_abort)
 
     @staticmethod
-    def _script_submit_then_immediate_abort(t: ScriptedRuntime):
+    def _script_submit_then_immediate_abort(t: ScriptedContext):
         # start_req then abort in same yield step: clean state.
         # Note: same-step abort vs admission ordering is impl-defined;
         # assertion holds either way (whether or not the req was admitted
@@ -255,10 +255,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_rid_reuse_after_finish(self):
         """Submit r1, wait for finish, then submit r2 with same rid."""
-        self.runtime.run(self._script_rid_reuse_after_finish)
+        self.server.execute_script(self._script_rid_reuse_after_finish)
 
     @staticmethod
-    def _script_rid_reuse_after_finish(t: ScriptedRuntime):
+    def _script_rid_reuse_after_finish(t: ScriptedContext):
         # Submit r1, wait for finish, then submit r2 with same rid.
         # NEW API NEEDED: start_req(..., rid="...") — explicit rid control.
         baseline = t.engine_stats()
@@ -273,10 +273,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_three_long_back_to_back(self):
         """Three long chunked reqs submitted back-to-back."""
-        self.runtime.run(self._script_three_long_back_to_back)
+        self.server.execute_script(self._script_three_long_back_to_back)
 
     @staticmethod
-    def _script_three_long_back_to_back(t: ScriptedRuntime):
+    def _script_three_long_back_to_back(t: ScriptedContext):
         # Three long chunked reqs submitted back-to-back.
         # Beyond r.finished, assert chunked_in_flight stays <= 1.
         reqs = [
@@ -293,10 +293,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_submit_pause_n_resubmit_same_rid(self):
         """Submit and complete r1, then 200 yields, then resubmit with same rid."""
-        self.runtime.run(self._script_submit_pause_n_resubmit_same_rid)
+        self.server.execute_script(self._script_submit_pause_n_resubmit_same_rid)
 
     @staticmethod
-    def _script_submit_pause_n_resubmit_same_rid(t: ScriptedRuntime):
+    def _script_submit_pause_n_resubmit_same_rid(t: ScriptedContext):
         # Submit and complete r1, then 200 yields, then resubmit with
         # same rid. The idle yield-gap must not leave any state behind.
         baseline = t.engine_stats()
@@ -315,10 +315,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_submit_during_decode_of_other(self):
         """R1 in decode phase; submit r2 (chunked)."""
-        self.runtime.run(self._script_submit_during_decode_of_other)
+        self.server.execute_script(self._script_submit_during_decode_of_other)
 
     @staticmethod
-    def _script_submit_during_decode_of_other(t: ScriptedRuntime):
+    def _script_submit_during_decode_of_other(t: ScriptedContext):
         # r1 in decode phase; submit r2 (chunked). Both complete.
         r1 = t.start_req(prompt_len=16, max_new_tokens=16)
         yield from run_until(r1, lambda h: h.status == "running")
@@ -332,10 +332,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_unique_rids_distinct(self):
         """Many reqs with unique explicit rids."""
-        self.runtime.run(self._script_unique_rids_distinct)
+        self.server.execute_script(self._script_unique_rids_distinct)
 
     @staticmethod
-    def _script_unique_rids_distinct(t: ScriptedRuntime):
+    def _script_unique_rids_distinct(t: ScriptedContext):
         # Many reqs with unique explicit rids. KV pool must return to
         # baseline.
         baseline = t.engine_stats()
@@ -351,10 +351,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_two_small_parallel(self):
         """Two short parallel reqs both finish; no chunked admission triggered."""
-        self.runtime.run(self._script_two_small_parallel)
+        self.server.execute_script(self._script_two_small_parallel)
 
     @staticmethod
-    def _script_two_small_parallel(t: ScriptedRuntime):
+    def _script_two_small_parallel(t: ScriptedContext):
         # Two short reqs. Negative control for chunked admission —
         # the scheduler's chunked slot must never be populated.
         r1 = t.start_req(prompt_len=16, max_new_tokens=4)
@@ -368,10 +368,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_one_chunked_plus_many_short(self):
         """1 long chunked + 5 short, all parallel."""
-        self.runtime.run(self._script_one_chunked_plus_many_short)
+        self.server.execute_script(self._script_one_chunked_plus_many_short)
 
     @staticmethod
-    def _script_one_chunked_plus_many_short(t: ScriptedRuntime):
+    def _script_one_chunked_plus_many_short(t: ScriptedContext):
         # 1 long chunked + 5 short, all parallel.
         chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         shorts = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(5)]
@@ -387,10 +387,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_multiple_chunked_staggered(self):
         """Submit chunked reqs every few yields, serial chunking."""
-        self.runtime.run(self._script_multiple_chunked_staggered)
+        self.server.execute_script(self._script_multiple_chunked_staggered)
 
     @staticmethod
-    def _script_multiple_chunked_staggered(t: ScriptedRuntime):
+    def _script_multiple_chunked_staggered(t: ScriptedContext):
         # Submit chunked reqs every few yields, serial chunking.
         reqs = []
         for _ in range(4):
@@ -408,10 +408,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_eight_concurrent_chunked(self):
         """8 chunked reqs submitted together."""
-        self.runtime.run(self._script_eight_concurrent_chunked)
+        self.server.execute_script(self._script_eight_concurrent_chunked)
 
     @staticmethod
-    def _script_eight_concurrent_chunked(t: ScriptedRuntime):
+    def _script_eight_concurrent_chunked(t: ScriptedContext):
         # 8 chunked reqs submitted together. Single-in-flight invariant
         # holds across the whole run.
         reqs = [
@@ -427,10 +427,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_decode_only_batch(self):
         """10 short reqs — pure decode batch, chunked slot must remain None."""
-        self.runtime.run(self._script_decode_only_batch)
+        self.server.execute_script(self._script_decode_only_batch)
 
     @staticmethod
-    def _script_decode_only_batch(t: ScriptedRuntime):
+    def _script_decode_only_batch(t: ScriptedContext):
         # 10 short reqs — pure decode batch. Negative control for the
         # chunked admission path: the scheduler's chunked_req slot must
         # remain None across the whole lifecycle.
@@ -447,10 +447,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_mixed_prefill_lengths(self):
         """Variable prompt lengths in same batch."""
-        self.runtime.run(self._script_mixed_prefill_lengths)
+        self.server.execute_script(self._script_mixed_prefill_lengths)
 
     @staticmethod
-    def _script_mixed_prefill_lengths(t: ScriptedRuntime):
+    def _script_mixed_prefill_lengths(t: ScriptedContext):
         # Variable prompt lengths in same batch. Some will chunk
         # (the longer ones), others won't.
         lens = [8, 16, 32, 64, 128, 256, 512, 1024]
@@ -469,10 +469,12 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
         Direct access to ``_scheduler`` internals is intentional; this is an
         invariant-tier test (see direct-internals-access plan).
         """
-        self.runtime.run(self._script_chunked_req_exclusive_of_batch_invariant)
+        self.server.execute_script(
+            self._script_chunked_req_exclusive_of_batch_invariant
+        )
 
     @staticmethod
-    def _script_chunked_req_exclusive_of_batch_invariant(t: ScriptedRuntime):
+    def _script_chunked_req_exclusive_of_batch_invariant(t: ScriptedContext):
         # Drive 2 long chunked reqs through admission. At every iter
         # boundary, verify the scheduler's chunked_req slot (if any) is
         # never simultaneously a member of running_batch.reqs.
@@ -494,10 +496,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_two_chunked_one_decode(self):
         """2 chunked + 1 decode-only."""
-        self.runtime.run(self._script_two_chunked_one_decode)
+        self.server.execute_script(self._script_two_chunked_one_decode)
 
     @staticmethod
-    def _script_two_chunked_one_decode(t: ScriptedRuntime):
+    def _script_two_chunked_one_decode(t: ScriptedContext):
         # 2 chunked + 1 decode-only. Verify in-flight invariant across
         # the whole run.
         chunked1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -512,10 +514,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_batch_with_finish_event_count(self):
         """Each req emits exactly 1 finish event."""
-        self.runtime.run(self._script_batch_with_finish_event_count)
+        self.server.execute_script(self._script_batch_with_finish_event_count)
 
     @staticmethod
-    def _script_batch_with_finish_event_count(t: ScriptedRuntime):
+    def _script_batch_with_finish_event_count(t: ScriptedContext):
         # Each req emits exactly 1 finish event.
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(6)]
         yield from run_until_all_finished(reqs)
@@ -524,10 +526,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_batch_state_query_during_run(self):
         """Query batch_composition every step while batch is active."""
-        self.runtime.run(self._script_batch_state_query_during_run)
+        self.server.execute_script(self._script_batch_state_query_during_run)
 
     @staticmethod
-    def _script_batch_state_query_during_run(t: ScriptedRuntime):
+    def _script_batch_state_query_during_run(t: ScriptedContext):
         # Query batch_composition every step while batch is active.
         # Beyond the type check, verify that prefill / decode / chunked
         # subsets remain disjoint at every step.
@@ -548,10 +550,10 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
 
     def test_mixed_lengths_then_more_arrivals(self):
         """First batch starts; midway, more reqs arrive."""
-        self.runtime.run(self._script_mixed_lengths_then_more_arrivals)
+        self.server.execute_script(self._script_mixed_lengths_then_more_arrivals)
 
     @staticmethod
-    def _script_mixed_lengths_then_more_arrivals(t: ScriptedRuntime):
+    def _script_mixed_lengths_then_more_arrivals(t: ScriptedContext):
         # First batch starts; midway, more reqs arrive. All reqs reach
         # finished state across the admission of the second batch.
         initial = [t.start_req(prompt_len=16, max_new_tokens=4) for _ in range(3)]
@@ -563,7 +565,7 @@ class TestMultiReqBasic(ScriptedRuntimeTestCase):
             assert r.finished
 
 
-class TestMultiReqPriority(ScriptedRuntimeTestCase):
+class TestMultiReqPriority(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         enable_priority_scheduling=True,
@@ -571,10 +573,10 @@ class TestMultiReqPriority(ScriptedRuntimeTestCase):
 
     def test_parallel_with_priority(self):
         """3 normal + 2 high-priority reqs all complete; S2 stays clean."""
-        self.runtime.run(self._script_parallel_with_priority)
+        self.server.execute_script(self._script_parallel_with_priority)
 
     @staticmethod
-    def _script_parallel_with_priority(t: ScriptedRuntime):
+    def _script_parallel_with_priority(t: ScriptedContext):
         # 3 normal + 2 high-priority reqs. All complete and the KV pool
         # returns to baseline under priority scheduling.
         baseline = t.engine_stats()

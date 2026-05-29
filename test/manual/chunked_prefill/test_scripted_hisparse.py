@@ -1,4 +1,4 @@
-"""HiSparse × chunked: naive ScriptedRuntime smoke.
+"""HiSparse × chunked: naive ScriptedContext smoke.
 
 HiSparse staging DMA can race with chunked admission (audit doc
 § "HiSparse"). A naive smoke just verifies "engine starts with both
@@ -11,8 +11,8 @@ Uses the same GLM-5-FP8 model and 8×H200 layout as
 
 import unittest
 
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -24,7 +24,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 _HISPARSE_MODEL = "zai-org/GLM-5-FP8"
 
 
-class TestHiSparseBasic(ScriptedRuntimeTestCase):
+class TestHiSparseBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=_HISPARSE_MODEL,
         tp_size=8,
@@ -36,10 +36,10 @@ class TestHiSparseBasic(ScriptedRuntimeTestCase):
 
     def test_naive_hisparse_chunked(self):
         """Long enough to trigger both chunked prefill and a hisparse staging transfer mid-chunk."""
-        self.runtime.run(self._script_naive_hisparse_chunked)
+        self.server.execute_script(self._script_naive_hisparse_chunked)
 
     @staticmethod
-    def _script_naive_hisparse_chunked(t: ScriptedRuntime):
+    def _script_naive_hisparse_chunked(t: ScriptedContext):
         # Long enough to trigger both chunked prefill and a hisparse
         # staging transfer mid-chunk.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN * 4, max_new_tokens=4)
@@ -58,13 +58,13 @@ class TestHiSparseBasic(ScriptedRuntimeTestCase):
 
     def test_hisparse_staging_dma_during_chunk_admit(self):
         """HiSparse staging DMA in flight + chunk admission must not deadlock."""
-        self.runtime.run(self._script_hisparse_staging_dma_during_chunk_admit)
+        self.server.execute_script(self._script_hisparse_staging_dma_during_chunk_admit)
 
     # HiSparse staging DMA + chunk admission race — when a
     # DMA transfer is in flight at admission time the scheduler must not
     # deadlock; the chunked req must still progress and finish.
     @staticmethod
-    def _script_hisparse_staging_dma_during_chunk_admit(t: ScriptedRuntime):
+    def _script_hisparse_staging_dma_during_chunk_admit(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN * 4, max_new_tokens=2)
         # Wait until a staging DMA is in flight before admitting more work.
         yield from run_until(r, lambda h: h.hisparse_dma_in_flight)
@@ -92,12 +92,12 @@ class TestHiSparseBasic(ScriptedRuntimeTestCase):
 
     def test_hisparse_abort_during_chunk_with_dma(self):
         """HiSparse DMA + chunk + abort three-way race must cancel cleanly."""
-        self.runtime.run(self._script_hisparse_abort_during_chunk_with_dma)
+        self.server.execute_script(self._script_hisparse_abort_during_chunk_with_dma)
 
     # HiSparse DMA + mid-chunk + abort — cancellation must
     # complete cleanly with no orphaned staging buffers or stuck DMA.
     @staticmethod
-    def _script_hisparse_abort_during_chunk_with_dma(t: ScriptedRuntime):
+    def _script_hisparse_abort_during_chunk_with_dma(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN * 4, max_new_tokens=4)
         yield from run_until(
             r,

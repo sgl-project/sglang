@@ -1,6 +1,6 @@
 """Proxy that wraps the scheduler's real ``recv_from_tokenizer`` socket.
 
-Installed in place of the raw zmq PULL socket only when ScriptedRuntime
+Installed in place of the raw zmq PULL socket only when the scripted runtime
 is active (see ``SchedulerIpcChannels.create``). Unlike a from-scratch
 injector, this proxy *wraps* the real PULL socket: requests still travel
 the production path (HTTP server -> tokenizer manager -> ZMQ PUSH), and
@@ -8,7 +8,7 @@ the proxy buffers whatever it drains off the underlying socket so a
 script can control the exact step at which each request becomes visible
 to the scheduler.
 
-``ScriptedRuntime.start_req`` fires a real ``/generate`` HTTP request and
+``ScriptedContext.start_req`` fires a real ``/generate`` HTTP request and
 then calls :meth:`wait_until_rid_arrived` to drain the request into the
 buffer without yet handing it to the scheduler; the next ``recv_requests``
 iteration pops it. Control-class messages (e.g. ``flush_cache``) may still
@@ -24,11 +24,11 @@ from typing import Any, Optional
 import zmq
 
 
-class RidNotArrivedError(TimeoutError):
+class ScriptedRidNotArrivedError(TimeoutError):
     """Raised when a rid does not arrive on the socket within the timeout."""
 
 
-class TokenizerRecvProxy:
+class ScriptedTokenizerRecvProxy:
     """Quacks like a ``zmq.Socket``. NOBLOCK semantics mirror a real PULL
     socket: an empty buffer (after draining the underlying socket) raises
     ``zmq.ZMQError`` with ``EAGAIN``.
@@ -54,7 +54,7 @@ class TokenizerRecvProxy:
         if flags & zmq.NOBLOCK:
             raise zmq.ZMQError(zmq.EAGAIN, "Resource temporarily unavailable")
         raise RuntimeError(
-            "TokenizerRecvProxy.recv_pyobj: blocking recv is not supported"
+            "ScriptedTokenizerRecvProxy.recv_pyobj: blocking recv is not supported"
         )
 
     def wait_until_rid_arrived(self, rid: str, *, timeout_s: float) -> None:
@@ -64,7 +64,7 @@ class TokenizerRecvProxy:
         polls) until a buffered request exposes ``rid``. Every request read
         in the meantime stays buffered, so the arrival ordering the
         scheduler later observes is preserved. Raises
-        :class:`RidNotArrivedError` if the rid does not arrive in time.
+        :class:`ScriptedRidNotArrivedError` if the rid does not arrive in time.
         """
         deadline = time.monotonic() + timeout_s
 
@@ -73,8 +73,8 @@ class TokenizerRecvProxy:
             if any(self._req_rid(req) == rid for req in self._buffer):
                 return
             if time.monotonic() >= deadline:
-                raise RidNotArrivedError(
-                    f"TokenizerRecvProxy: rid {rid!r} did not arrive on the "
+                raise ScriptedRidNotArrivedError(
+                    f"ScriptedTokenizerRecvProxy: rid {rid!r} did not arrive on the "
                     f"recv_from_tokenizer socket within {timeout_s}s"
                 )
             time.sleep(0.005)

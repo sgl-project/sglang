@@ -1,8 +1,8 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     SMALL_MODEL,
@@ -19,7 +19,7 @@ register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-h100")
 _CHUNK_SIZE = 64
 
 
-class TestScriptedPpChunkSweep(ScriptedRuntimeTestCase):
+class TestScriptedPpChunkSweep(ScriptedTestCase):
     # pp_async_batch_depth=2 makes pp_loop_size = pp_size + depth = 6,
     # so the loop size strictly exceeds pp_size — the regime where the
     # PP queue depth is larger than the GPU count.
@@ -43,13 +43,13 @@ class TestScriptedPpChunkSweep(ScriptedRuntimeTestCase):
         for num_chunks in self._NUM_CHUNKS_VALUES:
             for num_conc_reqs in self._NUM_CONC_REQS_VALUES:
                 with self.subTest(num_chunks=num_chunks, num_conc_reqs=num_conc_reqs):
-                    self.runtime.run(
+                    self.server.execute_script(
                         self._script_pp_one_combo,
                         args=(num_chunks, num_conc_reqs),
                     )
 
     @staticmethod
-    def _script_pp_one_combo(t: ScriptedRuntime, num_chunks: int, num_conc_reqs: int):
+    def _script_pp_one_combo(t: ScriptedContext, num_chunks: int, num_conc_reqs: int):
         # A few tokens short of a clean chunk multiple so the last chunk is
         # partial — exercises the off-by-one path under PP.
         prompt_len = num_chunks * _CHUNK_SIZE - 3

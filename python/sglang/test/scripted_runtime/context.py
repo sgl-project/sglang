@@ -1,34 +1,19 @@
-"""ScriptedRuntime: generator-driven scheduler harness.
+"""ScriptedContext: the object a test script drives.
 
-Lives inside each scheduler subprocess. The driver rank
-(``pp_rank == tp_rank == attn_cp_rank == 0``) advances a caller-provided
-generator one step per scheduler event-loop iteration (one
-``recv_requests`` call). Non-driver ranks join the cross-rank cpu
-broadcast that carries the script's done / error state so every rank
-exits together when the script finishes.
+Passed to the caller-provided script generator as its single argument
+(``def my_script(t: ScriptedContext)``). Exposes the script-facing verbs
+— submit requests, inject pressure, query scheduler state — and reaches
+the live ``Scheduler`` through its :class:`ScriptedSchedulerHook`. The
+hook owns the generator stepping and the scheduler-side lookups; this
+object owns everything the script itself calls.
 """
 
 from __future__ import annotations
 
-import importlib
 import logging
-import sys
 import threading
-import traceback
 import uuid
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    Generator,
-    List,
-    Literal,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Union
 
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -36,91 +21,39 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     PauseGenerationReqInput,
 )
-from sglang.srt.utils.common import broadcast_pyobj
-from sglang.test.scripted_runtime.req_handle import ReqHandle, ReqStatus
-from sglang.test.scripted_runtime.tokenizer_recv_proxy import TokenizerRecvProxy
+from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
+    from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
+        ScriptedTokenizerRecvProxy,
+    )
 
 logger = logging.getLogger(__name__)
 
 START_REQ_ARRIVAL_TIMEOUT_S: float = 60.0
 
 
-def _ensure_script_importable(sys_path_entry: Optional[str]) -> None:
-    """Forward the script module's directory onto ``sys.path``.
+class ScriptedContext:
+    """Script-facing control surface, created by :class:`ScriptedSchedulerHook`.
 
-    Spawn-mode mp subprocesses don't inherit the parent's ``sys.path``, so
-    the script can't be imported by qualified name without this. No-op when
-    the entry is unset or already present.
-    """
-    if sys_path_entry and sys_path_entry not in sys.path:
-        sys.path.insert(0, sys_path_entry)
-
-
-def _resolve_fn(qualified: str) -> Callable:
-    """Resolve ``"module.path:qualname"`` to the function object.
-
-    The leaf must be importable across processes — no lambdas / closures.
-    """
-    module_name, sep, fn_name = qualified.partition(":")
-    if not sep or not module_name or not fn_name:
-        raise ValueError(
-            f"scripted_runtime_fn_path must be 'module.path:function_name', "
-            f"got {qualified!r}"
-        )
-    obj = importlib.import_module(module_name)
-    for part in fn_name.split("."):
-        obj = getattr(obj, part)
-    if not callable(obj):
-        raise TypeError(f"resolved object is not callable: {qualified!r} -> {obj!r}")
-    return obj
-
-
-class ScriptedRuntime:
-    """Generator-driven harness installed in every scheduler subprocess.
-
-    Constructed by ``Scheduler.__init__`` when ``scripted_runtime_fn_path``
-    is set. On the driver rank, instantiates the script generator and
-    advances it one step per ``_yield_to_script`` call (invoked by
-    ``SchedulerRequestReceiver.recv_requests`` every event-loop iter).
-    When the generator finishes, every rank ``sys.exit``s so all
-    subprocesses tear down together.
+    Holds a back-reference to the hook (and through it the live
+    ``Scheduler``) plus the script-side request bookkeeping. Every method
+    here is called from the test script on the driver rank.
     """
 
     def __init__(
         self,
         *,
-        scheduler: "Scheduler",
-        script_fn_path: str,
-        tokenizer_recv_proxy: Optional[TokenizerRecvProxy],
+        scheduler_hook: "ScriptedSchedulerHook",
+        tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
     ) -> None:
-        self._scheduler = scheduler
+        self._scheduler_hook = scheduler_hook
+        self._scheduler = scheduler_hook._scheduler
+        self._is_driver = scheduler_hook._is_driver
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
-        self._is_driver = (
-            scheduler.ps.pp_rank == 0
-            and scheduler.ps.tp_rank == 0
-            and scheduler.ps.attn_cp_rank == 0
-        )
-        self._script_fn_path = script_fn_path
 
-        if self._is_driver:
-            _ensure_script_importable(
-                scheduler.server_args.scripted_runtime_sys_path_entry
-            )
-            script_fn = _resolve_fn(script_fn_path)
-            generator = script_fn(self)
-            if not hasattr(generator, "__next__"):
-                raise TypeError(
-                    f"scripted_runtime function {script_fn_path!r} must be a "
-                    f"generator (use 'yield' inside it); got {type(generator).__name__}"
-                )
-            self._generator: Optional[Generator] = generator
-        else:
-            self._generator = None
-
-        self._req_handles: dict[str, ReqHandle] = {}
+        self._req_handles: dict[str, ScriptedReqHandle] = {}
         self._req_counter = 0
         self._http_threads: List[threading.Thread] = []
 
@@ -133,7 +66,6 @@ class ScriptedRuntime:
     # ============================================================
     # Public API: called from test scripts on the driver rank.
     # ============================================================
-
     def start_req(
         self,
         *,
@@ -163,7 +95,7 @@ class ScriptedRuntime:
         return_hidden_states: bool = False,
         grammar: Optional[str] = None,
         stream: bool = False,
-    ) -> ReqHandle:
+    ) -> ScriptedReqHandle:
         """Submit a synthetic request via a real ``/generate`` HTTP call.
 
         Fires the request asynchronously (a background thread streams and
@@ -217,7 +149,7 @@ class ScriptedRuntime:
             rid, timeout_s=START_REQ_ARRIVAL_TIMEOUT_S
         )
 
-        handle = ReqHandle(rid=rid, runtime=self)
+        handle = ScriptedReqHandle(rid=rid, scheduler_hook=self._scheduler_hook)
         self._req_handles[rid] = handle
         return handle
 
@@ -293,121 +225,6 @@ class ScriptedRuntime:
         return lock_refs
 
     # ============================================================
-    # Lookups used by ReqHandle (driver-rank-local view).
-    # ============================================================
-
-    def _lookup_req_status(self, rid: str) -> ReqStatus:
-        # TODO(reimplement): the previous implementation was wrong. It never
-        # reported "finished", ignored the chunked_req slot, and under PP only
-        # inspected the current microbatch's running_batch — so a req running
-        # in another microbatch read as "unknown". A correct version must fold
-        # in finished / chunked / cross-microbatch state before callers can
-        # trust it; until then use the narrower observables (is_chunking,
-        # finished, _find_req_by_rid + waiting_queue) instead.
-        raise NotImplementedError(
-            "scripted_runtime: _lookup_req_status needs reimplementation — see "
-            "the chunked / PP / finished caveats in the comment above"
-        )
-
-    def _find_req_by_rid(self, rid: str) -> Optional[Any]:
-        """Locate the raw ``Req`` by rid across scheduler queues / batches.
-
-        Returns ``None`` if the rid is not currently held by the scheduler.
-        Used by ReqHandle properties that read per-req scheduler-side state.
-        """
-        s = self._scheduler
-        chunked = s.chunked_req
-        if chunked is not None and chunked.rid == rid:
-            return chunked
-        for r in s.waiting_queue:
-            if r.rid == rid:
-                return r
-        if s.running_batch is not None:
-            for r in s.running_batch.reqs:
-                if r.rid == rid:
-                    return r
-        last_batch = getattr(s, "last_batch", None)
-        if last_batch is not None:
-            for r in last_batch.reqs:
-                if r.rid == rid:
-                    return r
-        return None
-
-    def _lookup_finished(self, rid: str) -> bool:
-        """True iff the req has reached a finished state (or already gone).
-
-        Once a req is filtered out of all scheduler structures, the lookup
-        returns ``True`` — by that point the req can only have left because
-        it finished.
-        """
-        req = self._find_req_by_rid(rid)
-        if req is None:
-            # Req has left every scheduler structure → it finished (or was
-            # aborted, which is also a finish). True is the only sensible
-            # answer for a req that's no longer tracked.
-            return rid in self._req_handles
-        return req.finished()
-
-    def _lookup_is_chunking(self, rid: str) -> bool:
-        """True iff this rid is the scheduler's current chunked_req."""
-        s = self._scheduler
-        return s.chunked_req is not None and s.chunked_req.rid == rid
-
-    # ============================================================
-    # Internal: invoked by SchedulerRequestReceiver at every iter.
-    # ============================================================
-
-    def _yield_to_script(self) -> None:
-        """Advance the generator one step (driver only) and broadcast
-        completion state. When the script finishes or raises, every rank
-        ``sys.exit``s so all scheduler subprocesses tear down together.
-
-        ``sys.exit`` raises ``SystemExit`` (a ``BaseException``), so it sails
-        past ``run_scheduler_process``'s ``except Exception`` SIGQUIT path and
-        exits the subprocess cleanly with code 0 (ok) / 1 (script failed) —
-        no scripted-runtime hook in the production bootstrap.
-        """
-        if self._is_driver:
-            payload: List = list(self._advance_generator())
-        else:
-            # ``broadcast_pyobj`` ignores the value on non-source ranks.
-            payload = []
-
-        payload = broadcast_pyobj(
-            data=payload,
-            rank=self._scheduler.world_group.rank,
-            dist_group=self._scheduler.world_group.cpu_group,
-            src=0,
-        )
-        done, exc_tb = payload[0], payload[1]
-        if not done:
-            return
-
-        if exc_tb is not None and self._is_driver:
-            self._write_traceback(exc_tb)
-        sys.exit(0 if exc_tb is None else 1)
-
-    def _write_traceback(self, exc_tb: str) -> None:
-        """Persist a failed script's traceback for the caller to surface."""
-        path = self._scheduler.server_args.scripted_runtime_traceback_path
-        if not path:
-            return
-        try:
-            with open(path, "w") as f:
-                f.write(exc_tb or "<no traceback>")
-        except OSError:
-            logger.exception("Failed to write scripted_runtime traceback to %s", path)
-
-    def _advance_generator(self) -> Tuple[bool, Optional[str]]:
-        try:
-            next(self._generator)
-            return (False, None)
-        except StopIteration:
-            return (True, None)
-        except BaseException:  # noqa: BLE001 — capture every kind of failure
-            return (True, traceback.format_exc())
-
-    # ============================================================
     # Helpers
     # ============================================================
 
@@ -462,7 +279,7 @@ class ScriptedRuntime:
 
     # === Req lifecycle control ===
 
-    def abort(self, r: ReqHandle) -> None:
+    def abort(self, r: ScriptedReqHandle) -> None:
         """Abort a single in-flight request immediately.
 
         Drives the engine's abort code path on a deterministic target
@@ -479,7 +296,7 @@ class ScriptedRuntime:
             "2026-05-26-round-5-de-skip-and-api-wishlist.md"
         )
 
-    def force_retract(self, r: ReqHandle) -> None:
+    def force_retract(self, r: ScriptedReqHandle) -> None:
         """Force a single req to retract immediately, releasing its KV and rolling chunks_done back to 0.
 
         Independent of KV pressure — this is a deterministic test hook used to drive the retract code
@@ -523,7 +340,7 @@ class ScriptedRuntime:
             "2026-05-26-round-5-de-skip-and-api-wishlist.md"
         )
 
-    def force_preempt(self, *, req: ReqHandle, by: ReqHandle) -> None:
+    def force_preempt(self, *, req: ScriptedReqHandle, by: ScriptedReqHandle) -> None:
         """Manually trigger priority preemption of ``req`` by ``by``.
 
         Bypasses the priority comparator so tests can drive the preempt
@@ -668,7 +485,7 @@ class ScriptedRuntime:
         """Send an engine shutdown signal from inside the script.
 
         Lets a lifecycle test verify clean shutdown from the scripted
-        side without relying on the outer ``execute_scripted_runtime``
+        side without relying on the outer ``execute_scripted_http_server``
         teardown.
 
         Consumed by: test_engine_shutdown_from_script (lifecycle).

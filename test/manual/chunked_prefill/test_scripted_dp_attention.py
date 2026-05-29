@@ -1,17 +1,17 @@
-"""DP attention × chunked: naive ScriptedRuntime smoke.
+"""DP attention × chunked: naive ScriptedContext smoke.
 
 DP attention shards attention across DP ranks; the chunked path runs
 independently on each DP rank. The naive smoke just verifies a
 chunked request completes when DP attention is on.
 
-Requires 2 GPUs and ScriptedRuntime multi-rank support (wishlist §4
+Requires 2 GPUs and ScriptedContext multi-rank support (wishlist §4
 P2 (12)).
 """
 
 import unittest
 
-from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-from sglang.test.scripted_runtime.test_case import ScriptedRuntimeTestCase
+from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
@@ -21,7 +21,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
-class TestDPAttnBasic(ScriptedRuntimeTestCase):
+class TestDPAttnBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         tp_size=2,
         dp_size=2,
@@ -30,11 +30,11 @@ class TestDPAttnBasic(ScriptedRuntimeTestCase):
     )
 
     def test_naive_dp_attention_chunked(self):
-        """DP attention × chunked: naive ScriptedRuntime smoke."""
-        self.runtime.run(self._script_naive_dp_attention_chunked)
+        """DP attention × chunked: naive ScriptedContext smoke."""
+        self.server.execute_script(self._script_naive_dp_attention_chunked)
 
     @staticmethod
-    def _script_naive_dp_attention_chunked(t: ScriptedRuntime):
+    def _script_naive_dp_attention_chunked(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until_finished(r)
         assert r.finished
@@ -42,13 +42,13 @@ class TestDPAttnBasic(ScriptedRuntimeTestCase):
 
     def test_dp_chunked_on_one_rank_other_idle(self):
         """DP rank 0 chunked, rank 1 fully idle — rank 1 must not block rank 0."""
-        self.runtime.run(self._script_dp_chunked_on_one_rank_other_idle)
+        self.server.execute_script(self._script_dp_chunked_on_one_rank_other_idle)
 
     # DP rank imbalance — rank 0 has a long chunked req while
     # rank 1 stays idle; rank 1 must not block the chunked progress on
     # rank 0 via the cross-rank barrier.
     @staticmethod
-    def _script_dp_chunked_on_one_rank_other_idle(t: ScriptedRuntime):
+    def _script_dp_chunked_on_one_rank_other_idle(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, dp_rank=0)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
@@ -61,12 +61,12 @@ class TestDPAttnBasic(ScriptedRuntimeTestCase):
 
     def test_dp_two_chunked_one_per_rank(self):
         """DP one chunked req per rank with different chunk sizes — chunks_done tracked per rank."""
-        self.runtime.run(self._script_dp_two_chunked_one_per_rank)
+        self.server.execute_script(self._script_dp_two_chunked_one_per_rank)
 
     # Per-rank chunked reqs with different sizes — each rank
     # tracks its own chunks_done; ranks must not cross-contaminate.
     @staticmethod
-    def _script_dp_two_chunked_one_per_rank(t: ScriptedRuntime):
+    def _script_dp_two_chunked_one_per_rank(t: ScriptedContext):
         r0 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, dp_rank=0)
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN * 2, max_new_tokens=2, dp_rank=1
@@ -81,13 +81,13 @@ class TestDPAttnBasic(ScriptedRuntimeTestCase):
 
     def test_dp_chunked_completion_skew(self):
         """DP rank 0 finishes while rank 1 still chunking — broadcast stays consistent."""
-        self.runtime.run(self._script_dp_chunked_completion_skew)
+        self.server.execute_script(self._script_dp_chunked_completion_skew)
 
     # DP completion skew — rank 0 finishes early; rank 1 keeps
     # chunking. The cross-rank broadcast must stay consistent and rank 0
     # must report idle once done.
     @staticmethod
-    def _script_dp_chunked_completion_skew(t: ScriptedRuntime):
+    def _script_dp_chunked_completion_skew(t: ScriptedContext):
         r0 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=2, dp_rank=0)
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN * 2, max_new_tokens=2, dp_rank=1
