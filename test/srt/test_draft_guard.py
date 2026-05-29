@@ -104,15 +104,37 @@ class GuardFailureTest(unittest.TestCase):
     def test_moe_entry_pending_optout_fails(self):
         """An inventory entry that's MoE-bearing but `opted_out=False`
         (the plumbing isn't done yet) must fail closed even if the
-        current `TopK` flags happen to look correct."""
-        cls = _make_class("BailingMoeForCausalLMNextN")  # opted_out=False in inventory
+        current `TopK` flags happen to look correct.
+
+        After round 2 every MoE-bearing family in the inventory has
+        `opted_out=True`, so to exercise this guard branch we inject a
+        synthetic pending entry via mock instead of relying on a real
+        pending family."""
+        from unittest.mock import patch
+
+        from sglang.srt.state_capturer.draft_inventory import DraftInventoryEntry
+
+        pending_entry = DraftInventoryEntry(
+            source_architectures=("FakeBaseForCausalLM",),
+            draft_architecture="FakePendingForCausalLMMTP",
+            moe_bearing=True,
+            draft_signal="is_mtp",
+            opt_out_injection_point="python/sglang/srt/models/fake_pending.py:FakePendingMoE",
+            rationale="synthetic pending entry for guard test",
+            opted_out=False,
+        )
+        cls = _make_class("FakePendingForCausalLMMTP")
         model = cls(_make_topk(False))
-        with self.assertRaisesRegex(RuntimeError, "opted_out=False"):
-            check_draft_capture_optout(
-                model,
-                _make_hf_config("BailingMoeForCausalLMNextN"),
-                routed_experts_capture_enabled=True,
-            )
+        with patch(
+            "sglang.srt.state_capturer.draft_guard.lookup_draft_arch",
+            return_value=pending_entry,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "opted_out=False"):
+                check_draft_capture_optout(
+                    model,
+                    _make_hf_config("FakePendingForCausalLMMTP"),
+                    routed_experts_capture_enabled=True,
+                )
 
     def test_moe_entry_with_true_flag_fails(self):
         """A properly registered, opted-out MoE family must still fail

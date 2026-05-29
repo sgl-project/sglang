@@ -158,14 +158,13 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         source_architectures=("Step3p5ForCausalLM",),
         draft_architecture="Step3p5MTP",
         moe_bearing=True,
-        draft_signal="is_nextn",
-        opt_out_injection_point="python/sglang/srt/models/step3p5.py:Step3p5MoE",
+        draft_signal="is_mtp",
+        opt_out_injection_point="python/sglang/srt/models/step3p5.py:Step3p5MoEMLP",
         rationale=(
-            "step3p5_mtp.py constructs Step3p5DecoderLayer at layer_id=45; "
-            "Step3p5MoE constructs a TopK at line 144. Opt-out is keyed on "
-            "is_nextn plumbed through the decoder layer constructor chain."
+            "step3p5_mtp.py:83 constructs Step3p5DecoderLayer(..., "
+            "capture_routed_experts=False); the kwarg threads to Step3p5MoEMLP "
+            "and lands as `capture_routed_experts=False` on the MoE TopK."
         ),
-        opted_out=False,
     ),
     DraftInventoryEntry(
         source_architectures=("BailingMoeForCausalLM",),
@@ -174,11 +173,10 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         draft_signal="is_nextn",
         opt_out_injection_point="python/sglang/srt/models/bailing_moe.py:BailingMoESparseMoeBlock",
         rationale=(
-            "bailing_moe_nextn.py instantiates BailingMoEBlock; the existing "
-            "block does not thread is_nextn to BailingMoESparseMoeBlock. "
-            "Opt-out requires adding the kwarg through both layers."
+            "bailing_moe_nextn.py:107 passes is_nextn=True to BailingMoEBlock; "
+            "the block threads is_nextn to BailingMoESparseMoeBlock which sets "
+            "capture_routed_experts=not is_nextn on its TopK."
         ),
-        opted_out=False,
     ),
     DraftInventoryEntry(
         source_architectures=("Ernie4_5_MoeForCausalLM",),
@@ -221,12 +219,11 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         draft_signal="is_mtp",
         opt_out_injection_point="python/sglang/srt/models/exaone_moe.py:ExaoneMoESparseMoEBlock",
         rationale=(
-            "exaone_moe_mtp.py subclasses ExaoneMoEForCausalLM. Opt-out "
-            "requires adding a keyword-only `capture_routed_experts` argument "
-            "through ExaoneMoEModel / ExaoneMoEDecoderLayer / "
-            "ExaoneMoESparseMoEBlock."
+            "exaone_moe_mtp.py constructs ExaoneMoEModel(..., "
+            "capture_routed_experts=False); the kwarg threads through "
+            "ExaoneMoEModel / ExaoneMoEDecoderLayer / ExaoneMoESparseMoEBlock "
+            "and lands as `capture_routed_experts=False` on the MoE TopK."
         ),
-        opted_out=False,
     ),
     DraftInventoryEntry(
         source_architectures=("NemotronHForCausalLM",),
@@ -235,12 +232,11 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         draft_signal="is_mtp",
         opt_out_injection_point="python/sglang/srt/models/nemotron_h.py:NemotronHMoE",
         rationale=(
-            "nemotron_h_mtp.py:115 defines NemotronHMTPMoEDecoderLayer "
-            "extending NemotronHMoEDecoderLayer; opt-out requires adding "
-            "the capture-routing kwarg through NemotronHMTPMoEDecoderLayer "
-            "to NemotronHMoE."
+            "nemotron_h_mtp.py:115 NemotronHMTPMoEDecoderLayer calls "
+            "super().__init__(..., capture_routed_experts=False); the kwarg "
+            "threads through NemotronHMoEDecoderLayer to NemotronHMoE and "
+            "lands as `capture_routed_experts=False` on the MoE TopK."
         ),
-        opted_out=False,
     ),
     DraftInventoryEntry(
         source_architectures=("HYV3ForCausalLM",),
@@ -249,11 +245,10 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         draft_signal="is_nextn",
         opt_out_injection_point="python/sglang/srt/models/hunyuan_v3.py:HYV3MoEFused",
         rationale=(
-            "hunyuan_v3_nextn.py constructs HYV3DecoderLayer; opt-out "
-            "requires a keyword-only `capture_routed_experts` arg threaded "
-            "into HYV3MoEFused, set to False at the nextn wrapper."
+            "hunyuan_v3_nextn.py:67 constructs HYV3DecoderLayer(..., "
+            "capture_routed_experts=False); the kwarg threads to HYV3MoEFused "
+            "and lands as `capture_routed_experts=False` on the MoE TopK."
         ),
-        opted_out=False,
     ),
     # ---- Independent EAGLE-style draft architectures ----
     DraftInventoryEntry(
@@ -288,11 +283,11 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         opt_out_injection_point="python/sglang/srt/models/mistral_large_3_eagle.py:MistralLarge3EagleModel",
         rationale=(
             "mistral_large_3_eagle.py:48 constructs DeepseekV2DecoderLayer "
-            "without is_nextn=True. The whole class is always a draft, so the "
-            "opt-out must be hardcoded (e.g. pass is_nextn=True or set "
-            "capture_routed_experts=False at construction)."
+            "with explicit capture_routed_experts=False. DeepseekV2MoE was "
+            "extended in round 2 to accept this Optional[bool] keyword and "
+            "use it when not None (otherwise falling back to `not is_nextn` "
+            "for the target path)."
         ),
-        opted_out=False,
     ),
     DraftInventoryEntry(
         source_architectures=(),
@@ -311,6 +306,21 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         rationale=(
             "kimi_k25_eagle3.py defines Eagle3MLADecoderLayer with self.mlp = "
             "DeepseekV2MLP (line 126); no MoE TopK is constructed."
+        ),
+    ),
+    DraftInventoryEntry(
+        source_architectures=(),
+        draft_architecture="Gemma4AssistantForCausalLM",
+        moe_bearing=True,
+        draft_signal="always_draft",
+        opt_out_injection_point="python/sglang/srt/models/gemma4_causal.py:Gemma4MoE",
+        rationale=(
+            "gemma4_mtp.py:95 constructs Gemma4TextModel(..., "
+            "capture_routed_experts=False); the kwarg threads through "
+            "Gemma4DecoderLayer / Gemma4MoE and lands as "
+            "`capture_routed_experts=False` on the MoE TopK. This is the "
+            "only assistant arch that auto-promotes to FROZEN_KV_MTP in "
+            "server_args._resolve_speculative_algorithm_alias."
         ),
     ),
 )

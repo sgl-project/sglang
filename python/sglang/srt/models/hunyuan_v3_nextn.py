@@ -70,6 +70,7 @@ class HYV3ModelNextN(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.decoder",
             alt_stream=self.alt_stream,
+            capture_routed_experts=False,
         )
         config.first_k_dense_replace = orig_first_k
 
