@@ -211,6 +211,10 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    # When False, RoutedExpertsCapturer.capture() is skipped at this layer's
+    # MoE topk site. Default True keeps target-model behavior; draft-side MoE
+    # blocks (NextN / MTP / EAGLE-MoE) set this to False at construction.
+    capture_routed_experts: bool = True
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -330,6 +334,7 @@ class TopK(MultiPlatformOp):
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
+        capture_routed_experts: bool = True,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -375,6 +380,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            capture_routed_experts=capture_routed_experts,
         )
 
     def _apply_deepep_waterfill(
@@ -1274,7 +1280,9 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    if (cap := get_global_experts_capturer()) is not None:
+    if topk_config.capture_routed_experts and (
+        cap := get_global_experts_capturer()
+    ) is not None:
         cap.capture(
             layer_id=layer_id,
             topk_indices=topk_ids,
