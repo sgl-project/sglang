@@ -5482,14 +5482,16 @@ class TestR5Coverage(unittest.TestCase):
 
 
 class TestDSv32SmokeHelpers(unittest.TestCase):
-    """Registered helper-level regressions for the AC-8 quality smoke
-    file under ``test/manual/test_dsv32_quality_smoke.py``.
+    """Registered helper-level regressions for the AC-Q quality smoke.
 
-    The manual file itself skips without env vars (so the four full
-    gates only run on real H200), but its pure-Python helpers
-    (``_first_n_tokens_match``, ``_rouge_l_f``, the prefix-match gate
-    condition) are testable in CI. Round 21 introduced two gate bugs;
-    Round 22 fixes them and locks the corrected behavior here.
+    The pure-Python helpers now live in
+    ``test/manual/_dsv32_quality_smoke_lib.py`` (shared by the manual
+    unittest, the single-node sequential capture/compare CLI, and the
+    sequential CPU regression). The manual run still only does the four
+    full gates on real H200, but ``first_n_tokens_match`` / ``rouge_l_f``
+    / the prefix-match condition are testable in CI. Round 21 introduced
+    two gate bugs; Round 22 fixed them and this locks the corrected
+    behavior.
     """
 
     @classmethod
@@ -5497,16 +5499,18 @@ class TestDSv32SmokeHelpers(unittest.TestCase):
         import importlib.util
         import pathlib
         path = pathlib.Path(__file__).resolve()
-        # Walk up to the repo root, then load test/manual/test_dsv32_quality_smoke.py.
+        # The pure-Python helpers moved to the shared smoke library so the
+        # sequential capture/compare CLI, the manual unittest, and these
+        # regressions all use one implementation. Load that library.
         for parent in path.parents:
-            cand = parent / "test" / "manual" / "test_dsv32_quality_smoke.py"
+            cand = parent / "test" / "manual" / "_dsv32_quality_smoke_lib.py"
             if cand.exists():
                 spec = importlib.util.spec_from_file_location("_dsv32_smoke", cand)
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
                 cls._smoke = mod
                 return
-        raise RuntimeError("could not locate test/manual/test_dsv32_quality_smoke.py")
+        raise RuntimeError("could not locate test/manual/_dsv32_quality_smoke_lib.py")
 
     def test_prefix_match_accepts_short_exact_outputs(self):
         """Round 21 gate bug: ``len(dsa) >= 32`` guard rejected short
@@ -5528,7 +5532,7 @@ class TestDSv32SmokeHelpers(unittest.TestCase):
         """Round 21 gate bug: documented "any overlap" but only checked
         same-position equality. Now uses set intersection."""
         self.assertTrue(
-            self._smoke._first_n_tokens_match(
+            self._smoke.first_n_tokens_match(
                 "alpha beta gamma", "beta gamma alpha", n=3,
             ),
             "shifted overlap in first-n window must register as overlap",
@@ -5537,7 +5541,7 @@ class TestDSv32SmokeHelpers(unittest.TestCase):
     def test_first_n_tokens_match_no_overlap_is_false(self):
         """Negative: truly disjoint first-n windows must return False."""
         self.assertFalse(
-            self._smoke._first_n_tokens_match("a b c", "x y z", n=3),
+            self._smoke.first_n_tokens_match("a b c", "x y z", n=3),
             "disjoint first-n windows must not register as overlap",
         )
 
