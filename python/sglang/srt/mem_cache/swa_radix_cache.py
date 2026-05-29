@@ -488,14 +488,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, : req.fill_len
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]

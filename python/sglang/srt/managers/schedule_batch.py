@@ -698,8 +698,11 @@ class Req(ReqDllmMixin):
         )  # Before image padding
         # Each decode stage's output ids
         self.output_ids = array("q")
-        # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        self.fill_ids = array("q")
+        # Full untruncated sequence: origin + output (+ DLLM mask block).
+        # Rebuilt at the top of each init_next_round_input; admission only
+        # updates fill_len, never mutates this array's length.
+        self.full_untruncated_fill_ids = array("q")
+        self.fill_len: int = 0
 
         self.session = session
         self.input_embeds = input_embeds
@@ -950,8 +953,8 @@ class Req(ReqDllmMixin):
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
-        # kv_send(req.input_ids[req.start_send_idx:len(req.fill_ids)])
-        # start_send_idx = len(req.fill_ids)
+        # kv_send(req.input_ids[req.start_send_idx:req.fill_len])
+        # start_send_idx = req.fill_len
         self.start_send_idx: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
@@ -1042,6 +1045,9 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def get_fill_ids(self) -> array:
+        return self.full_untruncated_fill_ids[: self.fill_len]
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1051,9 +1057,10 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self.fill_ids = self.origin_input_ids + self.output_ids
+            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+            self.fill_len = len(self.full_untruncated_fill_ids)
 
-        input_len = len(self.fill_ids)
+        input_len = self.fill_len
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1071,7 +1078,9 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        token_ids_to_match = self.fill_ids[: self._compute_max_prefix_len(input_len)]
+        token_ids_to_match = self.full_untruncated_fill_ids[
+            : self._compute_max_prefix_len(input_len)
+        ]
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
@@ -1130,7 +1139,7 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+        self.set_extend_input_len(self.fill_len - len(self.prefix_indices))
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -1337,6 +1346,8 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        self.full_untruncated_fill_ids = array("q")
+        self.fill_len = 0
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1395,7 +1406,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.fill_ids)
+            logprob_start_len = self.fill_len
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
@@ -1844,10 +1855,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = [len(r.fill_ids) for r in reqs]
-        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        seq_lens = [r.fill_len for r in reqs]
+        orig_seq_lens = [max(r.fill_len, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
@@ -1921,7 +1932,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
-                # fill_ids/extend_input_len on chunk overflow but not input_embeds.
+                # fill_len/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]
                 )
@@ -1995,16 +2006,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # to compute input logprobs. E.g., (chunk size 2)
                 #
                 # input_logprobs = [1, 2, 3, 4]
-                # fill_ids = [1, 2]
+                # get_fill_ids() = [1, 2]
                 # extend_input_logprob_token_id = [2, 3]
                 #
                 # Note that it can also overflow. In this case, we pad it with 0.
                 # input_logprobs = [1, 2, 3, 4]
-                # fill_ids = [3, 4]
+                # get_fill_ids() = [3, 4]
                 # extend_input_logprob_token_id = [4, 0]
                 global_start_idx, global_end_idx = (
                     len(req.prefix_indices),
-                    len(req.fill_ids),
+                    req.fill_len,
                 )
                 if req.logprob_start_len == -1:
                     logprob_start_len = len(req.origin_input_ids)
@@ -2244,7 +2255,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+            req.fill_len = len(req.full_untruncated_fill_ids)
             req.set_extend_input_len(1)
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
