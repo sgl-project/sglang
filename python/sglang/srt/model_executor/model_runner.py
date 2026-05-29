@@ -2297,69 +2297,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self._flashinfer_autotune()
 
         if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and self.pp_size > 1
             and not self.spec_algorithm.is_speculative()
         ):
-            self._pp_parallel_deep_gemm_warmup()
+            from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
+                pp_parallel_deep_gemm_warmup,
+            )
 
-    def _pp_parallel_deep_gemm_warmup(self):
-        """Per-PP-rank local dummy forward so DeepGEMM JIT compiles in
-        parallel across PP stages instead of serially via the warmup
-        ``/generate`` request flowing through the pipeline.
-        """
-        # n_splits ~= n_sms // ceil(bs/64); pick bs to cover 5 brackets.
-        n_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
-        block_m = 64
-        cp = max(self.attn_cp_size, 1)
-        batch_sizes = sorted(
-            {
-                ceil_align(bs, cp)
-                for bs in (
-                    1,
-                    2 * block_m,
-                    max(n_sms // 8, 2) * block_m,
-                    max(n_sms // 4, 4) * block_m,
-                    n_sms * block_m,
-                )
-            }
-        )
-
-        # Skip DECODE on prefill nodes (indexer would OOM) and EXTEND on decode nodes.
-        disagg_mode = self.server_args.disaggregation_mode
-        run_decode = self.is_generation and disagg_mode != "prefill"
-        run_extend = disagg_mode != "decode"
-
-        logger.info(
-            "PP-parallel DeepGEMM warmup start "
-            "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, "
-            "disagg=%s, run_decode=%s, run_extend=%s).",
-            self.pp_rank,
-            self.tp_rank,
-            batch_sizes,
-            disagg_mode,
-            run_decode,
-            run_extend,
-        )
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            for bs in batch_sizes:
-                if run_decode:
-                    self._dummy_run(
-                        batch_size=bs,
-                        forward_mode_override=ForwardMode.DECODE,
-                    )
-                if run_extend:
-                    self._dummy_run(
-                        batch_size=bs,
-                        forward_mode_override=ForwardMode.EXTEND,
-                    )
-
-        logger.info(
-            "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
-            time.perf_counter() - t0,
-            self.pp_rank,
-        )
+            pp_parallel_deep_gemm_warmup(self)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
@@ -2580,13 +2527,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extend_start_loc = None
 
         if self.server_args.pp_size > 1:
-            # DSA prefill CP: PP0 already cp-split hidden_states before send.
+            # PP0 already cp-split hidden_states before send.
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
                 and self.pp_rank != 0
                 and self.attn_cp_size > 1
-                and is_dsa_enable_prefill_cp()
             ):
                 pp_hidden_tokens = num_tokens // self.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
