@@ -436,16 +436,12 @@ def _capture_frozen_kv_mtp_graph_runner(
 ) -> FrozenKVMTPCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.decode_runner.graph_capture",
+            "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.decode_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner.get_tensor_model_parallel_rank",
             lambda: 0,
-        ),
-        patch(
-            "sglang.srt.model_executor.cuda_graph_runner.decode_runner.get_available_gpu_memory",
-            lambda *args, **kwargs: 0.0,
         ),
         patch(
             "sglang.srt.model_executor.cuda_graph_runner.base_runner.get_attention_cp_size",

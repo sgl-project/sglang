@@ -5,8 +5,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
+import tqdm
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -16,8 +19,8 @@ from sglang.srt.model_executor.cuda_graph_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.model_executor.cuda_graph_runner import (
-    DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
+    freeze_gc,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
@@ -193,7 +196,18 @@ class FrozenKVMTPCudaGraphRunner:
         self.graphs[self.bs].replay()
 
     def capture(self):
-        DecodeCudaGraphRunner.capture(self)
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            with graph_capture() as graph_capture_context:
+                self.stream = graph_capture_context.stream
+                capture_range = (
+                    tqdm.tqdm(list(reversed(self.capture_bs)))
+                    if get_tensor_model_parallel_rank() == 0
+                    else reversed(self.capture_bs)
+                )
+                for bs in capture_range:
+                    graph, output_buffers = self.capture_one_batch_size(bs, None)
+                    self.graphs[bs] = graph
+                    self.output_buffers[bs] = output_buffers
 
     def capture_one_batch_size(
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
