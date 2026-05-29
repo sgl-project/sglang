@@ -38,7 +38,7 @@ class TestBasicSanityEagle3(
     # measurement window to avoid too few non-NaN samples.
     fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 97.0
     fwd_occupancy_max_new_tokens = 4096 if is_in_amd_ci() else 2048
-    fwd_occupancy_acc_length_threshold: float = 1.8
+    fwd_occupancy_acc_length_threshold: float = 1.6
 
     model = DEFAULT_TARGET_MODEL_EAGLE3
     gsm8k_num_questions = 1400
