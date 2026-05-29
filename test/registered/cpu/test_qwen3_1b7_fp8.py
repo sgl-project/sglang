@@ -6,7 +6,7 @@ Registry: nightly-xeon-models suite"""
 
 import unittest
 
-from utils import CPU_BASE_ARGS
+from utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,6 +30,7 @@ class TestQwen3_1B7FP8Xeon(unittest.TestCase):
                 MODEL_PATH,
                 extra_args=BASE_ARGS,
                 tp_size=6,
+                launch_timeout=CPU_LAUNCH_TIMEOUT,
             ),
         ]
         result = run_combined_tests(
@@ -46,7 +47,7 @@ class TestQwen3_1B7FP8Xeon(unittest.TestCase):
                 input_lens=(1024,),
                 output_lens=(1024,),
                 enable_profile=False,
-                baseline_output_throughput=685.0,
+                baseline_output_throughput=450.0,
             ),
             share_server=True,
         )

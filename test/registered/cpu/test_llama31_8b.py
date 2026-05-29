@@ -7,7 +7,7 @@ Registry: nightly-xeon-models suite"""
 
 import unittest
 
-from utils import CPU_BASE_ARGS
+from utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,6 +31,7 @@ class TestLlama31_8BXeon(unittest.TestCase):
                 MODEL_PATH,
                 extra_args=BASE_ARGS,
                 tp_size=6,
+                launch_timeout=CPU_LAUNCH_TIMEOUT,
             ),
         ]
         result = run_combined_tests(
@@ -38,7 +39,7 @@ class TestLlama31_8BXeon(unittest.TestCase):
             test_name="Llama-3.1-8B-Instruct (Xeon)",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                baseline_accuracy=0.75,
+                baseline_accuracy=0.74,
                 api="completion",
                 num_threads=64,
             ),

@@ -683,4 +683,12 @@ CPU_BASE_ARGS = [
     "0.8",
     "--max-total-tokens",
     "65536",
+    "--enable-torch-compile",
+    "--torch-compile-max-bs",
+    "1",
 ]
+
+# Server launch timeout for CPU nightly tests.
+# --enable-torch-compile triggers batch-capture on startup (~38s/batch × 24 batches).
+# Allow 40 minutes to cover compile + model load for the largest models.
+CPU_LAUNCH_TIMEOUT = 2400

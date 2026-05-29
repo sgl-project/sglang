@@ -6,7 +6,7 @@ Registry: nightly-xeon-models suite"""
 
 import unittest
 
-from utils import CPU_BASE_ARGS
+from utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -18,7 +18,13 @@ register_cpu_ci(est_time=3600, suite="nightly-xeon-models", nightly=True)
 
 MODEL_PATH = "google/gemma-4-26B-A4B"
 
-BASE_ARGS = CPU_BASE_ARGS + ["--skip-server-warmup"]
+BASE_ARGS = CPU_BASE_ARGS + [
+    "--context-length",
+    "4096",
+    "--skip-server-warmup",
+    "--torch-compile-max-bs",
+    "8",
+]
 
 
 class TestGemma4_26BCPU(unittest.TestCase):
@@ -30,6 +36,7 @@ class TestGemma4_26BCPU(unittest.TestCase):
                 MODEL_PATH,
                 extra_args=BASE_ARGS,
                 tp_size=6,
+                launch_timeout=CPU_LAUNCH_TIMEOUT,
             ),
         ]
         result = run_combined_tests(
