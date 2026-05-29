@@ -604,6 +604,8 @@ class Scheduler(
                 self.ps.attn_tp_rank == 0
                 or self.server_args.enable_metrics_for_all_schedulers
             ),
+            scripted_runtime_active=self.server_args.scripted_runtime_fn_path
+            is not None,
         )
 
     def init_idle_sleeper(self) -> None:
@@ -1541,35 +1543,24 @@ class Scheduler(
 
     def init_scripted_runtime(self) -> None:
         # Test-only wiring; see ``sglang.test.scripted_runtime``. When
-        # ``scripted_runtime_fn_path`` is set, a ``ScriptedRuntime`` instance
-        # drives the scheduler from inside its event loop and a
-        # ``TokenizerRecvProxy`` replaces the real tokenizer recv socket so
-        # the script can inject synthetic requests.
+        # ``scripted_runtime_fn_path`` is set, ``init_ipc_channels`` has
+        # already swapped ``recv_from_tokenizer`` for a ``TokenizerRecvProxy``;
+        # the ``ScriptedRuntime`` drives the scheduler from inside its event
+        # loop and injects synthetic requests through that proxy.
         if self.server_args.scripted_runtime_fn_path is not None:
             from sglang.test.scripted_runtime.runtime import ScriptedRuntime
-            from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
-                TokenizerRecvProxy,
-            )
 
-            tokenizer_recv_proxy = TokenizerRecvProxy(
-                underlying=self.ipc_channels.recv_from_tokenizer,
-                test_mode=True,
-            )
             self.scripted_runtime = ScriptedRuntime(
                 scheduler=self,
                 script_fn_path=self.server_args.scripted_runtime_fn_path,
-                tokenizer_recv_proxy=tokenizer_recv_proxy,
+                tokenizer_recv_proxy=self.ipc_channels.recv_from_tokenizer,
             )
-            self._recv_from_tokenizer_for_receiver = tokenizer_recv_proxy
         else:
             self.scripted_runtime = None
-            self._recv_from_tokenizer_for_receiver = (
-                self.ipc_channels.recv_from_tokenizer
-            )
 
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
-            recv_from_tokenizer=self._recv_from_tokenizer_for_receiver,
+            recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,

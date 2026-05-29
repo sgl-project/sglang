@@ -96,7 +96,7 @@ class ScriptedRuntime:
         *,
         scheduler: "Scheduler",
         script_fn_path: str,
-        tokenizer_recv_proxy: TokenizerRecvProxy,
+        tokenizer_recv_proxy: Optional[TokenizerRecvProxy],
     ) -> None:
         self._scheduler = scheduler
         self._tokenizer_recv_proxy = tokenizer_recv_proxy

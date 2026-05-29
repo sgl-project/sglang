@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import zmq
 
@@ -10,7 +10,9 @@ from sglang.srt.utils.network import get_zmq_socket
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SchedulerIpcChannels:
-    recv_from_tokenizer: Optional[zmq.Socket]
+    # Production: ``zmq.Socket``. ScriptedRuntime test mode: a
+    # ``TokenizerRecvProxy`` quacking the same ``recv_pyobj(flags)``.
+    recv_from_tokenizer: Any
     recv_from_rpc: Optional[zmq.Socket]
     send_to_tokenizer: SenderWrapper
     send_to_detokenizer: SenderWrapper
@@ -24,6 +26,7 @@ class SchedulerIpcChannels:
         is_rank_zero: bool,
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
+        scripted_runtime_active: bool = False,
     ) -> "SchedulerIpcChannels":
         context = zmq.Context(2)
 
@@ -31,6 +34,19 @@ class SchedulerIpcChannels:
             recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            if scripted_runtime_active:
+                # Test-only: wrap the real tokenizer recv socket so a
+                # ScriptedRuntime script injects requests through an in-process
+                # queue instead of the HTTP server / tokenizer manager (see
+                # ``sglang.test.scripted_runtime``). Lazy import keeps the
+                # test module off the production load path.
+                from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
+                    TokenizerRecvProxy,
+                )
+
+                recv_from_tokenizer = TokenizerRecvProxy(
+                    underlying=recv_from_tokenizer
+                )
             recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
