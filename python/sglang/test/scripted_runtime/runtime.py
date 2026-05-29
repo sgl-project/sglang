@@ -13,8 +13,9 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
+import threading
 import traceback
-from array import array
+import uuid
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -29,14 +30,14 @@ from typing import (
     Union,
 )
 
+import requests
+
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
     FlushCacheReqInput,
     PauseGenerationReqInput,
-    TokenizedGenerateReqInput,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.common import broadcast_pyobj
 from sglang.test.scripted_runtime.req_handle import ReqHandle, ReqStatus
 from sglang.test.scripted_runtime.tokenizer_recv_proxy import TokenizerRecvProxy
@@ -45,6 +46,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+START_REQ_ARRIVAL_TIMEOUT_S: float = 60.0
 
 
 class ScriptedRuntimeFinished(Exception):
@@ -136,6 +139,13 @@ class ScriptedRuntime:
 
         self._req_handles: dict[str, ReqHandle] = {}
         self._req_counter = 0
+        self._http_threads: List[threading.Thread] = []
+
+    @property
+    def _generate_url(self) -> str:
+        host = self._scheduler.server_args.host
+        port = self._scheduler.server_args.port
+        return f"http://{host}:{port}/generate"
 
     # ============================================================
     # Public API: called from test scripts on the driver rank.
@@ -171,10 +181,15 @@ class ScriptedRuntime:
         grammar: Optional[str] = None,
         stream: bool = False,
     ) -> ReqHandle:
-        """Inject a synthetic request into the scheduler's input queue.
+        """Submit a synthetic request via a real ``/generate`` HTTP call.
 
-        Visible to the scheduler on the next ``yield`` (next
-        ``recv_requests`` iteration).
+        Fires the request asynchronously (a background thread streams and
+        discards the response, so the scheduler never blocks on it), then
+        drains the wrapped ``recv_from_tokenizer`` socket until the request
+        carrying this ``rid`` has been buffered by the proxy. The request
+        has arrived but is not yet handed to the scheduler — it is popped on
+        the next ``yield`` (next ``recv_requests`` iteration), keeping each
+        step deterministic.
 
         The first three parameters (``prompt_len``, ``max_new_tokens``,
         ``rid``) are fully implemented. All other keyword-only parameters
@@ -209,14 +224,14 @@ class ScriptedRuntime:
             stream=stream,
         )
         if rid is None:
-            rid = f"scripted-{self._req_counter}"
+            rid = f"scripted-{self._req_counter}-{uuid.uuid4().hex}"
             self._req_counter += 1
-        req = self._build_tokenized_req(
-            rid=rid,
-            prompt_len=prompt_len,
-            max_new_tokens=max_new_tokens,
+
+        self._post_generate_async(rid=rid, prompt_len=prompt_len, max_new_tokens=max_new_tokens)
+        self._tokenizer_recv_proxy.wait_until_rid_arrived(
+            rid, timeout_s=START_REQ_ARRIVAL_TIMEOUT_S
         )
-        self._tokenizer_recv_proxy.inject(req)
+
         handle = ReqHandle(rid=rid, runtime=self)
         self._req_handles[rid] = handle
         return handle
@@ -394,29 +409,43 @@ class ScriptedRuntime:
     # Helpers
     # ============================================================
 
-    @staticmethod
-    def _build_tokenized_req(
+    def _post_generate_async(
+        self,
         *,
         rid: str,
         prompt_len: int,
         max_new_tokens: int,
-    ) -> TokenizedGenerateReqInput:
-        # Token id 1 is BOS for most tokenizers; any valid token works
-        # since the harness does not validate decode quality.
-        input_ids = array("i", [1] * prompt_len)
-        sampling_params = SamplingParams(max_new_tokens=max_new_tokens)
-        return TokenizedGenerateReqInput(
-            rid=rid,
-            input_text="",
-            input_ids=input_ids,
-            mm_inputs=None,
-            sampling_params=sampling_params,
-            return_logprob=False,
-            logprob_start_len=0,
-            top_logprobs_num=0,
-            token_ids_logprob=[],
-            stream=False,
+    ) -> None:
+        """Fire a ``/generate`` request in a fire-and-forget background thread.
+
+        The scheduler must never block waiting for the HTTP response, so the
+        POST runs on its own daemon thread with ``stream=True`` and the body
+        discarded. The request carries the caller-supplied ``rid`` so the
+        proxy can match it on the socket. Token id 1 is BOS for most
+        tokenizers; any valid token works since the harness does not validate
+        decode quality.
+        """
+        url = self._generate_url
+        payload = {
+            "input_ids": [1] * prompt_len,
+            "sampling_params": {"max_new_tokens": max_new_tokens},
+            "rid": rid,
+            "stream": True,
+        }
+
+        def _run() -> None:
+            try:
+                with requests.post(url, json=payload, stream=True, timeout=600) as resp:
+                    for _ in resp.iter_content(chunk_size=8192):
+                        pass
+            except Exception:  # noqa: BLE001 — fire-and-forget background thread
+                logger.exception("scripted_runtime: /generate request rid=%s failed", rid)
+
+        thread = threading.Thread(
+            target=_run, name=f"scripted-generate-{rid}", daemon=True
         )
+        self._http_threads.append(thread)
+        thread.start()
 
     # ============================================================
     # Wishlist API (NotImplementedError stubs).
