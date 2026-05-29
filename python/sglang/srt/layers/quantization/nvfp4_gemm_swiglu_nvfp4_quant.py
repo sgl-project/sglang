@@ -1818,10 +1818,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tRS_sC[(None, None, None, c_buffer)],
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
+                    cute.arch.fence_view_async_shared()
                     self.epilog_sync_barrier.arrive_and_wait()
 
                     #
