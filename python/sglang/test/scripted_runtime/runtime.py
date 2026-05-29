@@ -227,7 +227,9 @@ class ScriptedRuntime:
             rid = f"scripted-{self._req_counter}-{uuid.uuid4().hex}"
             self._req_counter += 1
 
-        self._post_generate_async(rid=rid, prompt_len=prompt_len, max_new_tokens=max_new_tokens)
+        self._post_generate_async(
+            rid=rid, prompt_len=prompt_len, max_new_tokens=max_new_tokens
+        )
         self._tokenizer_recv_proxy.wait_until_rid_arrived(
             rid, timeout_s=START_REQ_ARRIVAL_TIMEOUT_S
         )
@@ -439,7 +441,9 @@ class ScriptedRuntime:
                     for _ in resp.iter_content(chunk_size=8192):
                         pass
             except Exception:  # noqa: BLE001 — fire-and-forget background thread
-                logger.exception("scripted_runtime: /generate request rid=%s failed", rid)
+                logger.exception(
+                    "scripted_runtime: /generate request rid=%s failed", rid
+                )
 
         thread = threading.Thread(
             target=_run, name=f"scripted-generate-{rid}", daemon=True
