@@ -61,7 +61,7 @@ def apply_eagle_prefill_input_rotation(
         return
     assert len(next_token_ids) == len(batch.seq_lens)
     extend_lens = torch.tensor(
-        batch.extend_lens, dtype=torch.int64, device=batch.input_ids.device
+        batch.extend_lens, dtype=torch.int64, device=batch.device
     )
     seg_ends = extend_lens.cumsum(0) - 1
     rotated = torch.empty_like(batch.input_ids)
