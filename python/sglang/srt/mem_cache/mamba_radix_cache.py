@@ -431,6 +431,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.disable = params.disable
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
@@ -558,7 +559,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
             if self.enable_mamba_extra_buffer:
-                if self.req_to_token_pool.enable_mamba_extra_buffer_lazy:
+                if self.enable_mamba_extra_buffer_lazy:
                     mamba_ping_pong_track_buffer_to_keep = req.mamba_next_track_idx
                 else:
                     mamba_ping_pong_track_buffer_to_keep = (

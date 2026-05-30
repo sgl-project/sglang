@@ -856,7 +856,7 @@ class SchedulerBatchResultProcessor:
             return
 
         mamba_track_interval = get_global_server_args().mamba_track_interval
-        lazy = batch.req_to_token_pool.enable_mamba_extra_buffer_lazy
+        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         at_boundary = False
 
@@ -886,9 +886,9 @@ class SchedulerBatchResultProcessor:
                 )
             req.mamba_last_track_seqlen = track_seqlen
             if lazy:
-                self._mamba_lazy_post_decode_at_boundary(req, batch)
+                self.mamba_lazy_post_decode_at_boundary(req, batch)
 
-    def _mamba_lazy_post_decode_at_boundary(
+    def mamba_lazy_post_decode_at_boundary(
         self, req: Req, batch: ScheduleBatch
     ):
         """Post-decode cleanup at a lazy-mode track boundary.
