@@ -1455,10 +1455,14 @@ class Indexer(MultiPlatformOp):
                     forward_batch.attn_cp_metadata is not None
                     and is_dsa_prefill_cp_in_seq_split()
                 ):
-                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev
-                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next
-                    actual_seq_q_prev = forward_batch.attn_cp_metadata.actual_seq_q_prev
-                    actual_seq_q_next = forward_batch.attn_cp_metadata.actual_seq_q_next
+                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev_list[0]
+                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next_list[0]
+                    actual_seq_q_prev = (
+                        forward_batch.attn_cp_metadata.actual_seq_q_prev_list[0]
+                    )
+                    actual_seq_q_next = (
+                        forward_batch.attn_cp_metadata.actual_seq_q_next_list[0]
+                    )
 
                     # TODO support mutil-batch
                     # cp_batch_seq_index_prev = forward_batch.attn_cp_metadata["cp_batch_seq_index_prev"]
