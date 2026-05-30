@@ -253,12 +253,12 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     server_args = get_global_server_args()
     use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
 
-    # The wrapper pre-allocates (and enforces) its buffers only when
-    # use_cuda_graph is True, which also guarantees server_args is not None.
-    # Size them to the largest number of tokens a single forward can route
-    # through this layer; the value is irrelevant otherwise.
+    # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
+    # single forward can route through this layer. They are only allocated and
+    # enforced under CUDA graph (which also implies server_args is not None).
     dispatcher = getattr(layer, "dispatcher", None)
     if not use_cuda_graph:
+        # No CUDA-graph buffers are allocated, so max_num_tokens is unused.
         max_num_tokens = 1
     elif hasattr(dispatcher, "max_num_tokens"):
         # A2A path: bounded by the dispatcher's own workspace limit.

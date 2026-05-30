@@ -3483,9 +3483,6 @@ class ServerArgs:
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
-            # CuteDSL dispatcher-workspace budget is validated in
-            # _validate_cutedsl_a2a_token_budget(), called after speculative
-            # decoding resolves num_tokens_per_bs.
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
