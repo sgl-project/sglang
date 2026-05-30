@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
     ConditionEvent,
     ConditionEventQueue,
     ConditionSamplingParams,
+    ControlSignal,
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
@@ -85,6 +86,49 @@ def test_condition_event_queue_samples_chunk_and_repeats_last_item():
     )
 
     assert chunk == [["w"], ["d"], ["d"], ["d"]]
+
+
+def test_condition_event_contains_multiple_same_kind_control_signals():
+    event = ConditionEvent(
+        kind="camera_actions",
+        payload=[
+            ControlSignal(kind="camera_actions", payload=["w"]),
+            ControlSignal(kind="camera_actions", payload=["d"]),
+        ],
+    )
+    signals = list(event.iter_signals())
+
+    assert [signal.kind for signal in signals] == [
+        "camera_actions",
+        "camera_actions",
+    ]
+    assert [signal.payload for signal in signals] == [["w"], ["d"]]
+
+
+def test_condition_event_queue_samples_control_signal_payloads():
+    queue = ConditionEventQueue()
+    queue.push(
+        ConditionEvent(
+            kind="camera_actions",
+            payload=[
+                ControlSignal(kind="camera_actions", payload=["w"]),
+                ControlSignal(kind="camera_actions", payload=["a"]),
+                ControlSignal(kind="camera_actions", payload=["s"]),
+            ],
+        )
+    )
+
+    first = queue.sample_chunk(
+        "camera_actions",
+        ConditionSamplingParams(chunk_size=2, default_item=[]),
+    )
+    second = queue.sample_chunk(
+        "camera_actions",
+        ConditionSamplingParams(chunk_size=2, default_item=[]),
+    )
+
+    assert first == [["w"], ["a"]]
+    assert second == [["s"], ["s"]]
 
 
 def test_condition_event_queue_preserves_event_remainder_across_chunks():

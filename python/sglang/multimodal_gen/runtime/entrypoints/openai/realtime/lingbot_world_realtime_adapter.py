@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
     ConditionEvent,
     ConditionEventQueue,
     ConditionSamplingParams,
+    ControlSignal,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
@@ -47,11 +48,19 @@ class LingBotWorldRealtimeState:
         self.events.clear()
 
     def append_prompt(self, prompt: str) -> None:
-        self.events.push(ConditionEvent(kind="prompt", payload=prompt))
+        self.events.push(
+            ConditionEvent(
+                kind="prompt",
+                payload=ControlSignal(kind="prompt", payload=prompt),
+            )
+        )
 
     def append_camera_actions(self, camera_actions: list[list[str]]) -> None:
-        normalized = [list(actions) for actions in camera_actions]
-        self.events.push(ConditionEvent(kind="camera_actions", payload=normalized))
+        signals = [
+            ControlSignal(kind="camera_actions", payload=list(actions))
+            for actions in camera_actions
+        ]
+        self.events.push(ConditionEvent(kind="camera_actions", payload=signals))
 
     def sample_prompt(self) -> str:
         prompt = self.events.pop_latest("prompt")
@@ -60,13 +69,13 @@ class LingBotWorldRealtimeState:
         return prompt
 
     def sample_camera_actions(self, chunk_size: int) -> list[list[str]] | None:
-        chunk = self.events.sample_chunk(
+        signal_payloads = self.events.sample_chunk(
             "camera_actions",
             ConditionSamplingParams(chunk_size=chunk_size, default_item=[]),
         )
-        if chunk is None:
+        if signal_payloads is None:
             return None
-        return [list(actions) for actions in chunk]
+        return [list(actions) for actions in signal_payloads]
 
     def has_prompt(self) -> bool:
         return self.events.has_events("prompt")

@@ -11,9 +11,44 @@ _MISSING = object()
 
 
 @dataclass(frozen=True)
-class ConditionEvent:
+class ControlSignal:
     kind: str
     payload: Any
+    timestamp_ms: int | None = None
+    seq_id: int | None = None
+
+
+@dataclass(frozen=True)
+class ConditionEvent:
+    """transport envelope for one or more same-kind control signals"""
+
+    kind: str
+    payload: Any
+
+    def iter_signals(self, expand_payload: bool = True):
+        items = (
+            self.payload
+            if self._should_expand_payload(self.payload, expand_payload)
+            else (self.payload,)
+        )
+        for item in items:
+            if isinstance(item, ControlSignal):
+                if item.kind != self.kind:
+                    raise ValueError(
+                        "control signal kind "
+                        f"{item.kind!r} does not match event kind {self.kind!r}"
+                    )
+                yield item
+            else:
+                yield ControlSignal(kind=self.kind, payload=item)
+
+    @staticmethod
+    def _should_expand_payload(payload: Any, expand_payload: bool) -> bool:
+        return (
+            expand_payload
+            and isinstance(payload, Sequence)
+            and not isinstance(payload, (str, bytes, bytearray))
+        )
 
 
 @dataclass(frozen=True)
@@ -33,8 +68,8 @@ class ConditionEventQueue:
     ) -> None:
         self._max_events = max_events
         self._events: dict[str, deque[ConditionEvent]] = {}
-        self._pending_items: dict[str, deque[Any]] = {}
-        self._last_items: dict[str, Any] = {}
+        self._pending_signals: dict[str, deque[ControlSignal]] = {}
+        self._last_payloads: dict[str, Any] = {}
         self._seen_kinds: set[str] = set()
 
     def push(self, event: ConditionEvent) -> None:
@@ -46,14 +81,16 @@ class ConditionEventQueue:
         queue = self._events.get(kind)
         if not queue:
             return None
-        latest = queue.pop().payload
+        signals = list(queue.pop().iter_signals())
         queue.clear()
         self._seen_kinds.add(kind)
-        return latest
+        if not signals:
+            return None
+        return signals[-1].payload
 
     def has_events(self, kind: str) -> bool:
         queue = self._events.get(kind)
-        pending = self._pending_items.get(kind)
+        pending = self._pending_signals.get(kind)
         return bool(queue) or bool(pending)
 
     def sample_chunk(
@@ -65,16 +102,16 @@ class ConditionEventQueue:
             return None
 
         chunk: list[Any] = []
-        pending = self._pending_items.get(kind)
-        self._drain_items(kind, pending, chunk, params.chunk_size)
+        pending = self._pending_signals.get(kind)
+        self._drain_signals(kind, pending, chunk, params.chunk_size)
 
         queue = self._events.get(kind)
         while len(chunk) < params.chunk_size and queue:
             event = queue.popleft()
-            items = deque(self._iter_event_items(event.payload, params.expand_payload))
-            self._drain_items(kind, items, chunk, params.chunk_size)
-            if items:
-                self._pending_items[kind] = items
+            signals = deque(event.iter_signals(params.expand_payload))
+            self._drain_signals(kind, signals, chunk, params.chunk_size)
+            if signals:
+                self._pending_signals[kind] = signals
 
         if len(chunk) == 0 and kind not in self._seen_kinds:
             if params.default_item is _MISSING:
@@ -84,7 +121,7 @@ class ConditionEventQueue:
         if not params.repeat_last:
             return chunk
 
-        pad_item = self._last_items.get(kind, params.default_item)
+        pad_item = self._last_payloads.get(kind, params.default_item)
         if pad_item is _MISSING:
             return chunk
         while len(chunk) < params.chunk_size:
@@ -93,8 +130,8 @@ class ConditionEventQueue:
 
     def clear(self) -> None:
         self._events.clear()
-        self._pending_items.clear()
-        self._last_items.clear()
+        self._pending_signals.clear()
+        self._last_payloads.clear()
         self._seen_kinds.clear()
 
     def _queue_for(self, kind: str) -> deque[ConditionEvent]:
@@ -108,25 +145,14 @@ class ConditionEventQueue:
             self._events[kind] = queue
         return queue
 
-    @staticmethod
-    def _iter_event_items(payload: Any, expand_payload: bool):
-        if (
-            expand_payload
-            and isinstance(payload, Sequence)
-            and not isinstance(payload, (str, bytes, bytearray))
-        ):
-            yield from payload
-        else:
-            yield payload
-
-    def _drain_items(
+    def _drain_signals(
         self,
         kind: str,
-        items: deque[Any] | None,
+        signals: deque[ControlSignal] | None,
         chunk: list[Any],
         chunk_size: int,
     ) -> None:
-        while items and len(chunk) < chunk_size:
-            item = items.popleft()
-            chunk.append(item)
-            self._last_items[kind] = item
+        while signals and len(chunk) < chunk_size:
+            signal = signals.popleft()
+            chunk.append(signal.payload)
+            self._last_payloads[kind] = signal.payload
