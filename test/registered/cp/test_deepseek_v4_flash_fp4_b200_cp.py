@@ -81,7 +81,7 @@ class TestDSV4FlashFP4B200Balanced_CP(
             kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashFP4B200Balanced_CP_FusedMoe(
+class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -115,6 +115,8 @@ class TestDSV4FlashFP4B200Balanced_CP_FusedMoe(
                 "--enable-dsa-prefill-context-parallel",
                 "--dsa-prefill-cp-mode",
                 "round-robin-split",
+                "--moe-runner-backend",  # for fp4 checkpoint
+                "marlin",
             ],
         )
 
