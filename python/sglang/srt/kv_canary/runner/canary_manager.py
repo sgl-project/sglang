@@ -16,6 +16,7 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
+from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.single_forward_manager.manager import (
     SingleForwardManager,
@@ -24,6 +25,7 @@ from sglang.srt.kv_canary.single_forward_manager.manager import (
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -80,6 +82,14 @@ class CanaryManager:
             config=config,
             device_state=self._device_state,
             d2h_stream=self._d2h_stream,
+            outer_step_counter_getter=self._get_outer_step_counter,
+        )
+        self._sweep_orchestrator = SweepOrchestrator(
+            config=config,
+            device_state=self._device_state,
+            buffer_groups=self._buffer_groups,
+            endpoints=self._endpoints,
+            swa_window_size=self._swa_window_size,
             outer_step_counter_getter=self._get_outer_step_counter,
         )
         self._single_forward_managers: tuple[SingleForwardManager, ...] = (
@@ -174,6 +184,7 @@ class CanaryManager:
     ) -> None:
         for idx in single_forward_indices:
             self._single_forward_managers[idx].post_ops_outside_graph()
+        self._sweep_orchestrator.maybe_run_sweep()
         self._outer_step_counter += 1
         self._violation_manager.step()
 
@@ -181,6 +192,9 @@ class CanaryManager:
         for single_forward_manager in self._single_forward_managers:
             single_forward_manager.phase_checker.enable_assert()
         self._device_state.enable_chain_position_assert.fill_(1)
+
+    def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
+        self._sweep_orchestrator.attach_radix_cache(radix_cache)
 
     def _get_outer_step_counter(self) -> int:
         return self._outer_step_counter

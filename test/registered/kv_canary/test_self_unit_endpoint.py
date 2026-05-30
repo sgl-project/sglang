@@ -63,6 +63,28 @@ class TestSelfUnitEndpoint(CustomTestCase):
     def setUp(self):
         self.device = DEFAULT_DEVICE
 
+    def test_launch_sweep_only_calls_verify(self):
+        """Verify sweep launch invokes only the verify kernel."""
+        calls: list[str] = []
+        with patch.object(
+            endpoint_module,
+            "launch_canary_verify_kernel",
+            lambda **kwargs: calls.append("verify"),
+        ), patch.object(
+            endpoint_module,
+            "launch_canary_write_kernel",
+            lambda **kwargs: calls.append("write"),
+        ):
+            ep = _make_endpoint(
+                device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_K_FULL
+            )
+            args = _make_kernel_args(self.device)
+            ep.launch_sweep(
+                verify_plan=args.verify_plan,
+                violation_log=args.violation_log,
+            )
+        self.assertEqual(calls, ["verify"])
+
     def test_launch_per_forward_passes_kernel_kind(self):
         """Verify per-forward launch passes the endpoint kernel kind."""
         captured: list[tuple[str, CanaryLaunchTag]] = []
@@ -109,33 +131,19 @@ class TestSelfUnitEndpoint(CustomTestCase):
         ):
             shared_log = ViolationLog.allocate(ring_capacity=2, device=self.device)
             ep_a = _make_endpoint(
-                device=self.device, kernel_kind=CanaryLaunchTag.HEAD_K_FULL
+                device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_K_FULL
             )
             ep_b = _make_endpoint(
-                device=self.device, kernel_kind=CanaryLaunchTag.HEAD_V_FULL
+                device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_V_FULL
             )
 
-            args = _make_kernel_args(self.device)
-            ep_a.launch_per_forward(
-                verify_plan=args.verify_plan,
-                write_plan=args.write_plan,
-                input_ids=args.input_ids,
-                positions=args.positions,
-                out_cache_loc=args.out_cache_loc,
-                enable_write_input_assert=args.enable_write_input_assert,
-                enable_verify_token_assert=args.enable_verify_token_assert,
-                expected_inputs=args.expected_inputs,
+            plan = VerifyPlan.allocate(verify_capacity=1, device=self.device)
+            ep_a.launch_sweep(
+                verify_plan=plan,
                 violation_log=shared_log,
             )
-            ep_b.launch_per_forward(
-                verify_plan=args.verify_plan,
-                write_plan=args.write_plan,
-                input_ids=args.input_ids,
-                positions=args.positions,
-                out_cache_loc=args.out_cache_loc,
-                enable_write_input_assert=args.enable_write_input_assert,
-                enable_verify_token_assert=args.enable_verify_token_assert,
-                expected_inputs=args.expected_inputs,
+            ep_b.launch_sweep(
+                verify_plan=plan,
                 violation_log=shared_log,
             )
         self.assertEqual(captured_rings[0], captured_rings[1])

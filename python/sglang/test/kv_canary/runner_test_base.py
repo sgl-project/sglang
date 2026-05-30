@@ -24,10 +24,12 @@ def make_config(
     *,
     mode: CanaryMode = CanaryMode.RAISE,
     ring_capacity: int = 1024,
+    sweep_interval: int = 0,
 ) -> CanaryConfig:
     return CanaryConfig(
         mode=mode,
         ring_capacity=ring_capacity,
+        sweep_interval=sweep_interval,
     )
 
 

@@ -45,6 +45,11 @@ class CanaryEndpoint:
         expected_inputs: ExpectedInputs,
         violation_log: ViolationLog,
     ) -> None:
+        if _is_sweep_tag(self.kernel_kind):
+            raise NotImplementedError(
+                f"kv-canary: launch_per_forward not supported on sweep endpoint {self.kernel_kind.name}"
+            )
+
         context = self._make_verify_or_write_context(
             violation_log=violation_log,
         )
@@ -77,6 +82,25 @@ class CanaryEndpoint:
             expected_input_positions=expected_input_positions,
         )
 
+    def launch_sweep(
+        self,
+        *,
+        verify_plan: VerifyPlan,
+        violation_log: ViolationLog,
+    ) -> None:
+        if not _is_sweep_tag(self.kernel_kind):
+            raise NotImplementedError(
+                f"kv-canary: launch_sweep not supported on non-sweep endpoint {self.kernel_kind.name}"
+            )
+
+        launch_canary_verify_kernel(
+            context=self._make_verify_or_write_context(
+                violation_log=violation_log,
+            ),
+            plan=verify_plan,
+            check_verify_expected_token=False,
+        )
+
     def _make_verify_or_write_context(
         self,
         *,
@@ -91,6 +115,15 @@ class CanaryEndpoint:
             kernel_run_counter=self.kernel_run_counter_view,
             enable_chain_position_assert=self.enable_chain_position_assert,
         )
+
+
+def _is_sweep_tag(tag: CanaryLaunchTag) -> bool:
+    return tag in (
+        CanaryLaunchTag.SWEEP_K_FULL,
+        CanaryLaunchTag.SWEEP_V_FULL,
+        CanaryLaunchTag.SWEEP_K_SWA,
+        CanaryLaunchTag.SWEEP_V_SWA,
+    )
 
 
 def _resolve_canary_buf(
@@ -113,6 +146,8 @@ _FULL_LAYOUT: tuple[tuple[CanaryLaunchTag, str, str], ...] = (
     (CanaryLaunchTag.HEAD_V_FULL, "HEAD", "V"),
     (CanaryLaunchTag.TAIL_K_FULL, "TAIL", "K"),
     (CanaryLaunchTag.TAIL_V_FULL, "TAIL", "V"),
+    (CanaryLaunchTag.SWEEP_K_FULL, "SWEEP", "K"),
+    (CanaryLaunchTag.SWEEP_V_FULL, "SWEEP", "V"),
 )
 
 
@@ -121,6 +156,8 @@ _SWA_LAYOUT: tuple[tuple[CanaryLaunchTag, str, str], ...] = (
     (CanaryLaunchTag.HEAD_V_SWA, "HEAD", "V"),
     (CanaryLaunchTag.TAIL_K_SWA, "TAIL", "K"),
     (CanaryLaunchTag.TAIL_V_SWA, "TAIL", "V"),
+    (CanaryLaunchTag.SWEEP_K_SWA, "SWEEP", "K"),
+    (CanaryLaunchTag.SWEEP_V_SWA, "SWEEP", "V"),
 )
 
 
@@ -138,7 +175,8 @@ def build_endpoints_from_group(
         if half == "V" and not group.has_v_half:
             continue
 
-        canary_buf = _resolve_canary_buf(slot=slot, half=half, group=group)
+        buf_slot = "TAIL" if slot == "SWEEP" else slot
+        canary_buf = _resolve_canary_buf(slot=buf_slot, half=half, group=group)
         lut = group.swa_index_lut if pool_kind is PoolKind.SWA else None
         slot_view = device_state.slot_run_counters[tag.value : tag.value + 1]
         kernel_view = device_state.kernel_run_counters[tag.value : tag.value + 1]

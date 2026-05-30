@@ -635,7 +635,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
 
 
 @pytest.mark.parametrize(
-    "kernel_kind", [CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.TAIL_V_SWA]
+    "kernel_kind", [CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.SWEEP_V_SWA]
 )
 def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
     """Different CanaryLaunchTag values: violation ring's kernel_kind field matches on both sides."""

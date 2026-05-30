@@ -11,7 +11,7 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 
 class _BaselineBase(CanaryE2EBase):
-    """No perturb, kv-canary=log. Server should run clean with no canary
+    """No perturb, kv-canary=log, sweep off. Server should run clean with no canary
     violations and every request must come back 200."""
 
     kv_canary_mode = CanaryMode.LOG

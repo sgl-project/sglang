@@ -30,10 +30,14 @@ class CanaryConfig:
             violations propagate to host as RuntimeError after the next D2H pump.
         ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously;
             overflow only drops detail beyond row N, the monotonic counter still grows.
+        sweep_interval: 0 disables sweep entirely; positive N means every N-th forward step the runner
+            additionally walks all radix-tree-held slots (overlap with per-forward HEAD/TAIL is harmless
+            redundancy) and verifies them.
     """
 
     mode: CanaryMode
     ring_capacity: int
+    sweep_interval: int
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
@@ -46,4 +50,5 @@ class CanaryConfig:
         return cls(
             mode=CanaryMode(mode_raw),
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
+            sweep_interval=server_args.kv_canary_sweep_interval,
         )
