@@ -257,6 +257,7 @@ class GenerateReqInput(BaseReq):
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    mm_data_mooncake: Optional[List] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -800,6 +801,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    mm_data_mooncake: Optional[List] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -1771,6 +1773,7 @@ class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     log_requests_format: Optional[str] = None
+    log_level: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None

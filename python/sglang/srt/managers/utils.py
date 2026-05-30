@@ -240,7 +240,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
 
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.speculative_num_draft_tokens
+    spec_tokens = server_args.max_speculative_num_draft_tokens
     page_size = server_args.page_size
 
     if page_size == 1 or spec_topk == 1:
