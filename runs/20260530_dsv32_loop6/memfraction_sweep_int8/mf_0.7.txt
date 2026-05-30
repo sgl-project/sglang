@@ -13,7 +13,7 @@ max_total_num_tokens=396096, chunked_prefill_size=8192, max_prefill_tokens=16384
 [2026-05-30 08:44:10 TP4] Load weight begin. avail mem=137.97 GB
 -- generation-time OOM check:
 -- NVML per-GPU used (MiB):
-0, 125116 MiB 1, 125210 MiB 2, 125210 MiB 3, 125210 MiB 4, 125210 MiB 5, 125210 MiB 6, 125210 MiB 7, 124730 MiB 
+0, 125116 MiB 1, 125210 MiB 2, 125210 MiB 3, 125210 MiB 4, 125210 MiB 5, 125210 MiB 6, 125210 MiB 7, 124730 MiB
 -- NVML total used (MiB):
 1001106
 -- NVML min free (MiB):

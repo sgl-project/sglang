@@ -1,0 +1,16 @@
+# DS-int8 mem_fraction_static=0.7 server-log excerpt during the sustained stress (reboot_0.7.log)
+## Decode/prefill scheduler activity (sampled) — proves sustained traffic was served:
+[2026-05-30 09:13:40 TP0] Prefill batch, #new-seq: 2, #new-token: 8192, #cached-token: 0, token usage: 0.30, #running-req: 24, #queue-req: 6, #pending-token: 28055, cuda graph: False, input throughput (token/s): 20456.23
+[2026-05-30 09:13:41 TP0] Prefill batch, #new-seq: 3, #new-token: 8192, #cached-token: 0, token usage: 0.32, #running-req: 25, #queue-req: 4, #pending-token: 19893, cuda graph: False, input throughput (token/s): 21036.16
+[2026-05-30 09:13:41 TP0] Prefill batch, #new-seq: 3, #new-token: 8192, #cached-token: 0, token usage: 0.34, #running-req: 27, #queue-req: 2, #pending-token: 11731, cuda graph: False, input throughput (token/s): 20949.21
+[2026-05-30 09:13:41 TP0] Prefill batch, #new-seq: 3, #new-token: 8192, #cached-token: 0, token usage: 0.36, #running-req: 29, #queue-req: 0, #pending-token: 3569, cuda graph: False, input throughput (token/s): 20824.23
+[2026-05-30 09:13:42 TP0] Prefill batch, #new-seq: 1, #new-token: 3584, #cached-token: 0, token usage: 0.37, #running-req: 31, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 15186.78
+[2026-05-30 09:13:42 TP0] Decode batch, #running-req: 32, #token: 147456, token usage: 0.37, cuda graph: True, gen throughput (token/s): 121.25, #queue-req: 0
+[2026-05-30 09:13:45 TP0] Decode batch, #running-req: 32, #token: 149504, token usage: 0.38, cuda graph: True, gen throughput (token/s): 385.27, #queue-req: 0
+[2026-05-30 09:13:48 TP0] Decode batch, #running-req: 32, #token: 151552, token usage: 0.38, cuda graph: True, gen throughput (token/s): 383.19, #queue-req: 0
+[2026-05-30 09:13:52 TP0] Decode batch, #running-req: 32, #token: 151552, token usage: 0.38, cuda graph: True, gen throughput (token/s): 382.66, #queue-req: 0
+[2026-05-30 09:13:55 TP0] Decode batch, #running-req: 32, #token: 153600, token usage: 0.39, cuda graph: True, gen throughput (token/s): 381.30, #queue-req: 0
+[2026-05-30 09:13:59 TP0] Decode batch, #running-req: 32, #token: 153600, token usage: 0.39, cuda graph: True, gen throughput (token/s): 380.84, #queue-req: 0
+[2026-05-30 09:14:02 TP0] Decode batch, #running-req: 32, #token: 155648, token usage: 0.39, cuda graph: True, gen throughput (token/s): 380.66, #queue-req: 0
+## generation-time OOM lines (expect none):
+  count = 0

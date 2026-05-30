@@ -1,0 +1,4 @@
+round 0 done @ 35.6s
+round 1 done @ 64.2s
+round 2 done @ 92.7s
+SUMMARY: 97/97 ok, 0 failed, elapsed 92.7s

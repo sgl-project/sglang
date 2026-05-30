@@ -12,7 +12,7 @@ max_total_num_tokens=53056, chunked_prefill_size=8192, max_prefill_tokens=16384,
 -- load weight begin avail:
 [2026-05-30 08:40:02 TP4] Load weight begin. avail mem=137.97 GB
 -- NVML (nvidia-smi used per GPU, MiB):
-0, 103842 MiB 1, 103936 MiB 2, 103936 MiB 3, 103938 MiB 4, 103936 MiB 5, 103936 MiB 6, 103936 MiB 7, 103456 MiB 
+0, 103842 MiB 1, 103936 MiB 2, 103936 MiB 3, 103938 MiB 4, 103936 MiB 5, 103936 MiB 6, 103936 MiB 7, 103456 MiB
 -- NVML total used MiB:
 830916
 -- /get_server_info (torch mem if present):
