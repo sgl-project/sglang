@@ -100,11 +100,28 @@ def _post_json(
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _as_int_or_none(value: Any) -> Optional[int]:
+    """Coerce a server-reported token count to int, or None if absent/invalid."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _generate(
     base_url: str, prompt: str, *, max_new_tokens: int = 64,
     use_chat: bool = False,
-) -> str:
-    """Issue a generation request and return the completion text.
+) -> Tuple[str, Optional[int]]:
+    """Issue a generation request and return ``(completion_text, prompt_tokens)``.
+
+    ``prompt_tokens`` is the server-measured *tokenized* input length, read
+    from the OpenAI ``usage.prompt_tokens`` (chat) or ``meta_info.prompt_tokens``
+    (raw ``/generate``) field, or ``None`` if the server omitted it. The
+    within-budget gate uses this real token count (not a word-count proxy) to
+    decide whether a prompt fits the DS selection budget, and fails closed when
+    it is absent.
 
     Two transports, chosen per task because the checkpoint is
     instruction-tuned:
@@ -138,10 +155,13 @@ def _generate(
             f"{_openai_base_url(base_url)}/chat/completions",
             body, timeout=600.0,
         )
+        prompt_tokens = (out.get("usage") or {}).get("prompt_tokens")
         choices = out.get("choices") or []
         if choices:
-            return (choices[0].get("message") or {}).get("content") or ""
-        return ""
+            text = (choices[0].get("message") or {}).get("content") or ""
+        else:
+            text = ""
+        return text, _as_int_or_none(prompt_tokens)
     body = {
         "text": prompt,
         "sampling_params": {
@@ -153,7 +173,8 @@ def _generate(
     text = out.get("text")
     if text is None and "choices" in out:
         text = out["choices"][0].get("text", "")
-    return text or ""
+    prompt_tokens = (out.get("meta_info") or {}).get("prompt_tokens")
+    return (text or ""), _as_int_or_none(prompt_tokens)
 
 
 # ----- NIAH prompt generator --------------------------------------------
@@ -175,30 +196,30 @@ _FILLER_WORDS: List[str] = (
 
 
 def _make_niah_prompt(
-    length_tokens: int, *, seed: int, needle: str,
+    length_words: int, *, seed: int, needle: str,
 ) -> str:
     """Build a deterministic NIAH prompt.
 
-    Whitespace-tokenizes to approximately ``length_tokens`` words and
+    Whitespace-tokenizes to approximately ``length_words`` words and
     plants ``needle`` exactly once at a deterministic depth in
     [0.35, 0.65] of the prompt. The needle is the exact string the
     model must echo to count as a recall hit. The prompt ends with an
     explicit question.
 
-    Determinism: same (length_tokens, seed, needle) → same string.
+    Determinism: same (length_words, seed, needle) → same string.
     """
-    if length_tokens < 64:
-        length_tokens = 64
+    if length_words < 64:
+        length_words = 64
     rng = random.Random(seed)
     pool_size = len(_FILLER_WORDS)
-    # We need length_tokens whitespace-separated words. Subtract a
+    # We need length_words whitespace-separated words. Subtract a
     # constant for the question suffix and the needle phrase.
     suffix_words = (
         "Question: What is the hidden value? Output only the value."
     ).split()
     needle_phrase = f"The hidden value is {needle}."
     needle_word_count = len(needle_phrase.split())
-    filler_count = max(0, length_tokens - len(suffix_words) - needle_word_count)
+    filler_count = max(0, length_words - len(suffix_words) - needle_word_count)
 
     # Pick a depth in [0.35, 0.65].
     depth_frac = 0.35 + (rng.random() * 0.30)
@@ -213,10 +234,10 @@ def _make_niah_prompt(
     return " ".join(parts)
 
 
-def _niah_needle(length_tokens: int, prompt_idx: int) -> str:
+def _niah_needle(length_words: int, prompt_idx: int) -> str:
     """Stable per-(length, idx) needle in the form NEEDLE-####."""
     # Use a 4-digit zero-padded suffix that's unique per (L, idx).
-    return f"NEEDLE-{length_tokens:05d}-{prompt_idx:03d}"
+    return f"NEEDLE-{length_words:05d}-{prompt_idx:03d}"
 
 
 def _niah_recall_hits(
@@ -580,6 +601,7 @@ class _GenAttempt:
     http_status: Optional[int] = None
     error: Optional[str] = None
     body: Optional[str] = None
+    prompt_tokens: Optional[int] = None  # server-measured tokenized input length
 
 
 def _generate_attempt(
@@ -594,10 +616,10 @@ def _generate_attempt(
     an uncaught exception that skips the per-length artifact.
     """
     try:
-        text = _generate(
+        text, prompt_tokens = _generate(
             base_url, prompt, max_new_tokens=max_new_tokens, use_chat=use_chat,
         )
-        return _GenAttempt(text=text, ok=True)
+        return _GenAttempt(text=text, ok=True, prompt_tokens=prompt_tokens)
     except urllib.error.HTTPError as exc:
         try:
             body = exc.read().decode("utf-8", "replace")
@@ -616,7 +638,7 @@ def _generate_attempt(
 
 @dataclass
 class _NIAHRunResult:
-    length_tokens: int
+    length_words: int
     num_prompts: int
     dsa_hits: int
     ds_hits: int
@@ -627,6 +649,13 @@ class _NIAHRunResult:
     ds_served: int = 0    # prompts the DS server actually answered
     dsa_error: Optional[str] = None  # first DSA rejection (status/reason/body), if any
     ds_error: Optional[str] = None   # first DS rejection (status/reason/body), if any
+    # Real tokenized input length (max usage.prompt_tokens over served prompts),
+    # per server; None if no served prompt reported usage. *_usage_missing is
+    # True when a SERVED prompt omitted usage.prompt_tokens (fail-closed signal).
+    ds_input_tokens: Optional[int] = None
+    dsa_input_tokens: Optional[int] = None
+    ds_usage_missing: bool = False
+    dsa_usage_missing: bool = False
 
 
 def _summarize_attempts(
@@ -643,11 +672,29 @@ def _summarize_attempts(
     return served, msg
 
 
+def _summarize_prompt_tokens(
+    attempts: List[_GenAttempt],
+) -> Tuple[Optional[int], bool]:
+    """Return ``(input_tokens, usage_missing)`` over the SERVED attempts.
+
+    ``input_tokens`` is the max server-measured ``usage.prompt_tokens`` across
+    served prompts (the within-budget check must hold for the longest one), or
+    ``None`` if no served prompt reported usage. ``usage_missing`` is True when
+    any *served* prompt omitted ``prompt_tokens`` — a fail-closed signal: the
+    real tokenized length is then unknown and the within-budget premise cannot
+    be asserted from the word-count proxy.
+    """
+    served = [a for a in attempts if a.ok]
+    toks = [a.prompt_tokens for a in served if a.prompt_tokens is not None]
+    usage_missing = any(a.prompt_tokens is None for a in served)
+    return (max(toks) if toks else None), usage_missing
+
+
 def _run_niah(
     ds_url: str, dsa_url: str, *,
-    length_tokens: int, num_prompts: int, max_new_tokens: int,
+    length_words: int, num_prompts: int, max_new_tokens: int,
 ) -> _NIAHRunResult:
-    """Generate ``num_prompts`` NIAH prompts at ``length_tokens``, query both
+    """Generate ``num_prompts`` NIAH prompts at ``length_words``, query both
     servers, and compute paired recall + delta.
 
     The prompts are instruction-style ("... output only the value"), so they
@@ -658,10 +705,10 @@ def _run_niah(
     served count and error and counts as a recall miss, rather than aborting
     the gate before the artifact is written.
     """
-    needles = [_niah_needle(length_tokens, i) for i in range(num_prompts)]
+    needles = [_niah_needle(length_words, i) for i in range(num_prompts)]
     prompts = [
         _make_niah_prompt(
-            length_tokens, seed=(length_tokens * 10_000 + i), needle=needles[i],
+            length_words, seed=(length_words * 10_000 + i), needle=needles[i],
         )
         for i in range(num_prompts)
     ]
@@ -677,13 +724,15 @@ def _run_niah(
     ]
     dsa_served, dsa_error = _summarize_attempts(dsa_attempts)
     ds_served, ds_error = _summarize_attempts(ds_attempts)
+    ds_input_tokens, ds_usage_missing = _summarize_prompt_tokens(ds_attempts)
+    dsa_input_tokens, dsa_usage_missing = _summarize_prompt_tokens(dsa_attempts)
     # Recall is over num_prompts: an unservable prompt is a miss (text="").
     dsa_hits = _niah_recall_hits(needles, [a.text for a in dsa_attempts])
     ds_hits = _niah_recall_hits(needles, [a.text for a in ds_attempts])
     dsa_recall = (dsa_hits / num_prompts) * 100.0
     ds_recall = (ds_hits / num_prompts) * 100.0
     return _NIAHRunResult(
-        length_tokens=length_tokens,
+        length_words=length_words,
         num_prompts=num_prompts,
         dsa_hits=dsa_hits,
         ds_hits=ds_hits,
@@ -694,6 +743,10 @@ def _run_niah(
         ds_served=ds_served,
         dsa_error=dsa_error,
         ds_error=ds_error,
+        ds_input_tokens=ds_input_tokens,
+        dsa_input_tokens=dsa_input_tokens,
+        ds_usage_missing=ds_usage_missing,
+        dsa_usage_missing=dsa_usage_missing,
     )
 
 
@@ -731,9 +784,9 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         cls.max_new_tokens = _env_int("AC12_NIAH_MAX_NEW_TOKENS", 64)
 
     def _niah_record(
-        self, length_tokens: int, *, gate_class: str,
+        self, length_words: int, *, gate_class: str,
     ) -> Tuple[_NIAHRunResult, bool, str]:
-        """Run NIAH at ``length_tokens``, ALWAYS record the per-length
+        """Run NIAH at ``length_words``, ALWAYS record the per-length
         artifact (even on a server rejection — see _run_niah), and return
         ``(result, passed, message)``. ``passed`` is the DS-within-5pp-of-DSA
         recall result; the caller asserts it for the within-budget HARD gate
@@ -741,17 +794,34 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         """
         r = _run_niah(
             self.ds_url, self.dsa_url,
-            length_tokens=length_tokens,
+            length_words=length_words,
             num_prompts=self.num_prompts,
             max_new_tokens=self.max_new_tokens,
         )
         server_error = (r.ds_error is not None) or (r.dsa_error is not None)
         passed = (not server_error) and (r.delta_pct <= self.NIAH_TOLERANCE_PP)
+        # Within-budget is decided by the REAL tokenized input length
+        # (usage.prompt_tokens from the DS server), NOT the word-count knob.
+        # Fail closed: if a served prompt omitted usage, the real length is
+        # unknown, so within_budget is None and the within-budget gate's premise
+        # assertion (below) fails rather than silently trusting the proxy.
+        input_tokens = r.ds_input_tokens
+        usage_missing = r.ds_usage_missing
+        if usage_missing or input_tokens is None:
+            within_budget: Optional[bool] = None
+        else:
+            within_budget = input_tokens <= self.INDEX_TOPK
+        within_budget_wordcount_proxy = length_words <= self.INDEX_TOPK
         _record_artifact(
             {
-                "length_tokens": r.length_tokens,
+                "length_words": r.length_words,
+                "input_tokens": input_tokens,
+                "input_tokens_source": "usage.prompt_tokens (max over served prompts)",
+                "dsa_input_tokens": r.dsa_input_tokens,
+                "usage_missing": usage_missing,
                 "index_topk": self.INDEX_TOPK,
-                "within_budget": length_tokens <= self.INDEX_TOPK,
+                "within_budget": within_budget,
+                "within_budget_wordcount_proxy": within_budget_wordcount_proxy,
                 "gate_class": gate_class,
                 "num_prompts": r.num_prompts,
                 "dsa_served": r.dsa_served,
@@ -766,24 +836,24 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
                 "ds_error": r.ds_error,
                 "verdict": "PASS" if passed else "FAIL",
             },
-            suffix=f"niah_{length_tokens}",
+            suffix=f"niah_{length_words}",
         )
         if r.ds_error is not None:
             msg = (
-                f"NIAH @ {length_tokens}: DS could not serve the prompt "
+                f"NIAH @ {length_words}: DS could not serve the prompt "
                 f"(served {r.ds_served}/{r.num_prompts}); DS error: {r.ds_error}. "
                 f"DSA served {r.dsa_served}/{r.num_prompts}, "
                 f"recall {r.dsa_recall_pct:.1f}%."
             )
         elif r.dsa_error is not None:
             msg = (
-                f"NIAH @ {length_tokens}: DSA reference could not serve the "
+                f"NIAH @ {length_words}: DSA reference could not serve the "
                 f"prompt (served {r.dsa_served}/{r.num_prompts}); "
                 f"DSA error: {r.dsa_error}."
             )
         else:
             msg = (
-                f"NIAH @ {length_tokens}: DS recall {r.ds_recall_pct:.1f}% vs "
+                f"NIAH @ {length_words}: DS recall {r.ds_recall_pct:.1f}% vs "
                 f"DSA recall {r.dsa_recall_pct:.1f}% (delta {r.delta_pct:.1f} pp, "
                 f"threshold {self.NIAH_TOLERANCE_PP} pp)."
             )
@@ -794,10 +864,32 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         (tokenized length <= INDEX_TOPK, so DS selects effectively densely),
         DS needle recall must be within 5 pp of DSA. This measures DS recall
         quality inside its design envelope (dense-prefill / sparse-decode)."""
-        for length_tokens in self.NIAH_WITHIN_BUDGET_LENGTHS:
-            with self.subTest(length_tokens=length_tokens):
-                _, passed, msg = self._niah_record(
-                    length_tokens, gate_class="within_budget_hard",
+        for length_words in self.NIAH_WITHIN_BUDGET_LENGTHS:
+            with self.subTest(length_words=length_words):
+                r, passed, msg = self._niah_record(
+                    length_words, gate_class="within_budget_hard",
+                )
+                # Assert the within-budget PREMISE from the REAL tokenized
+                # length (usage.prompt_tokens), failing closed if the DS server
+                # omitted usage — never silently trust the word-count proxy.
+                self.assertFalse(
+                    r.ds_usage_missing,
+                    f"NIAH @ {length_words} words: a served DS prompt omitted "
+                    f"usage.prompt_tokens; cannot confirm within_budget from real "
+                    f"tokens (fail-closed).",
+                )
+                self.assertIsNotNone(
+                    r.ds_input_tokens,
+                    f"NIAH @ {length_words} words: no usage.prompt_tokens from any "
+                    f"served DS prompt (fail-closed).",
+                )
+                self.assertLessEqual(
+                    r.ds_input_tokens, self.INDEX_TOPK,
+                    f"NIAH @ {length_words} words: real input_tokens "
+                    f"{r.ds_input_tokens} exceeds INDEX_TOPK {self.INDEX_TOPK} — "
+                    f"this length is not within the DS selection budget by token "
+                    f"count (the word-count proxy was unsafe); move it to the "
+                    f"characterization set rather than the hard gate.",
                 )
                 self.assertTrue(passed, msg)
 
@@ -810,13 +902,13 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         servable points (catches an anomalous regression) — never DSA parity,
         which DS is not expected to meet beyond its budget."""
         servable: List[Tuple[int, float]] = []
-        for length_tokens in self.NIAH_CHARACTERIZATION_LENGTHS:
-            with self.subTest(length_tokens=length_tokens):
+        for length_words in self.NIAH_CHARACTERIZATION_LENGTHS:
+            with self.subTest(length_words=length_words):
                 r, _, _ = self._niah_record(
-                    length_tokens, gate_class="beyond_budget_characterization",
+                    length_words, gate_class="beyond_budget_characterization",
                 )
                 if r.ds_error is None:
-                    servable.append((length_tokens, r.ds_recall_pct))
+                    servable.append((length_words, r.ds_recall_pct))
         for (l0, r0), (l1, r1) in zip(servable, servable[1:]):
             self.assertLessEqual(
                 r1, r0 + 1e-9,
@@ -911,7 +1003,7 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
             per_subject: Dict[str, Dict[str, int]] = {}
             for ex in examples:
                 prompt = _make_mmlu_5shot_prompt(ex["dev"], ex["subject"], ex["row"])
-                resp = _generate(url, prompt, max_new_tokens=4)
+                resp, _ = _generate(url, prompt, max_new_tokens=4)
                 pred = _parse_mmlu_letter(resp.strip())
                 gold = str(ex["row"][5]).strip().upper()
                 hit = (pred == gold)
@@ -966,13 +1058,13 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         corrupt_url = _env("DS_CORRUPT_MASK_URL")
         r = _run_niah(
             corrupt_url, self.dsa_url,
-            length_tokens=65536,
+            length_words=65536,
             num_prompts=self.num_prompts,
             max_new_tokens=self.max_new_tokens,
         )
         _record_artifact(
             {
-                "length_tokens": r.length_tokens,
+                "length_words": r.length_words,
                 "num_prompts": r.num_prompts,
                 "dsa_hits": r.dsa_hits,
                 "ds_corrupt_hits": r.ds_hits,
@@ -1001,13 +1093,13 @@ class TestDoubleSparsityV32Quality(unittest.TestCase):
         zero_url = _env("DS_ZERO_SIG_URL")
         r = _run_niah(
             zero_url, self.dsa_url,
-            length_tokens=16384,
+            length_words=16384,
             num_prompts=self.num_prompts,
             max_new_tokens=self.max_new_tokens,
         )
         _record_artifact(
             {
-                "length_tokens": r.length_tokens,
+                "length_words": r.length_words,
                 "num_prompts": r.num_prompts,
                 "dsa_hits": r.dsa_hits,
                 "ds_zero_hits": r.ds_hits,
