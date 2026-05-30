@@ -351,6 +351,154 @@ class CausalDMDDenoisingStage(DenoisingStage):
             autocast_enabled=autocast_enabled,
         )
 
+    def _warm_up_causal_context_cache(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        context_input: torch.Tensor,
+        prompt_embeds,
+        kv_cache,
+        crossattn_cache,
+        current_start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+    ) -> None:
+        self._update_causal_context_cache(
+            batch,
+            server_args,
+            context_input=context_input,
+            prompt_embeds=prompt_embeds,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start_tokens=current_start_frame * self.frame_seq_length,
+            start_frame=current_start_frame,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            attn_metadata=None,
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+        )
+
+    def _denoise_and_update_causal_block(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        chunk_latents: torch.Tensor,
+        scheduler,
+        timesteps: torch.Tensor,
+        prompt_embeds,
+        kv_cache,
+        crossattn_cache,
+        current_start_tokens: int,
+        start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+        device: torch.device,
+        attn_raw_latent_shape: tuple[int, int, int],
+        prepare_model_input: Callable[[torch.Tensor], torch.Tensor],
+        prepare_context_input: Callable[[torch.Tensor], torch.Tensor],
+        progress_bar=None,
+    ) -> torch.Tensor:
+        current_latents, attn_metadata = self._denoise_causal_dmd_chunk(
+            batch,
+            server_args,
+            chunk_latents=chunk_latents,
+            scheduler=scheduler,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start_tokens=current_start_tokens,
+            start_frame=start_frame,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+            device=device,
+            attn_raw_latent_shape=attn_raw_latent_shape,
+            prepare_model_input=prepare_model_input,
+            progress_bar=progress_bar,
+        )
+        self._update_causal_context_cache(
+            batch,
+            server_args,
+            context_input=prepare_context_input(current_latents),
+            prompt_embeds=prompt_embeds,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start_tokens=current_start_tokens,
+            start_frame=start_frame,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            attn_metadata=attn_metadata,
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+        )
+        return current_latents
+
+    def _get_max_text_len(self, server_args: ServerArgs) -> int:
+        return server_args.pipeline_config.text_encoder_configs[0].arch_config.text_len
+
+    def _initialize_causal_caches(
+        self,
+        *,
+        batch_size: int,
+        max_text_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        kv_cache_kwargs: dict | None = None,
+    ) -> tuple[list, list]:
+        self._initialize_kv_cache(
+            batch_size=batch_size,
+            dtype=dtype,
+            device=device,
+            **(kv_cache_kwargs or {}),
+        )
+        self._initialize_crossattn_cache(
+            batch_size=batch_size,
+            max_text_len=max_text_len,
+            dtype=dtype,
+            device=device,
+        )
+        assert self.kv_cache1 is not None
+        assert self.crossattn_cache is not None
+        return self.kv_cache1, self.crossattn_cache
+
+    def _reset_causal_caches(
+        self,
+        *,
+        kv_cache,
+        crossattn_cache,
+        device: torch.device,
+    ) -> None:
+        self._reset_crossattn_cache(crossattn_cache)
+        self._reset_kv_cache(kv_cache, device)
+
+    def _reset_crossattn_cache(self, crossattn_cache) -> None:
+        for block_index in range(self.num_transformer_blocks):
+            crossattn_cache[block_index]["is_init"] = False
+
+    @staticmethod
+    def _reset_kv_cache(kv_cache, device: torch.device) -> None:
+        for block_index in range(len(kv_cache)):
+            kv_cache[block_index]["global_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            kv_cache[block_index]["local_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            if "global_end_index_int" in kv_cache[block_index]:
+                kv_cache[block_index]["global_end_index_int"] = 0
+            if "local_end_index_int" in kv_cache[block_index]:
+                kv_cache[block_index]["local_end_index_int"] = 0
+
+    @torch.no_grad()
     def forward(
         self,
         batch: Req,
@@ -403,34 +551,19 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
         # Initialize or reset caches
         if self.kv_cache1 is None:
-            self._initialize_kv_cache(
-                batch_size=latents.shape[0], dtype=target_dtype, device=latents.device
-            )
-            self._initialize_crossattn_cache(
+            self._initialize_causal_caches(
                 batch_size=latents.shape[0],
-                max_text_len=server_args.pipeline_config.text_encoder_configs[
-                    0
-                ].arch_config.text_len,
+                max_text_len=self._get_max_text_len(server_args),
                 dtype=target_dtype,
                 device=latents.device,
             )
         else:
             assert self.crossattn_cache is not None
-            # reset cross-attention cache
-            for block_index in range(self.num_transformer_blocks):
-                self.crossattn_cache[block_index]["is_init"] = False  # type: ignore
-            # reset kv cache pointers
-            for block_index in range(len(self.kv_cache1)):
-                self.kv_cache1[block_index]["global_end_index"] = (
-                    torch.tensor(  # type: ignore
-                        [0], dtype=torch.long, device=latents.device
-                    )
-                )
-                self.kv_cache1[block_index]["local_end_index"] = (
-                    torch.tensor(  # type: ignore
-                        [0], dtype=torch.long, device=latents.device
-                    )
-                )
+            self._reset_causal_caches(
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                device=latents.device,
+            )
 
         # Optional: cache context features from provided image latents prior to generation
         current_start_frame = 0
@@ -438,30 +571,21 @@ class CausalDMDDenoisingStage(DenoisingStage):
             image_latent = batch.image_latent
             assert image_latent is not None
             input_frames = image_latent.shape[2]
-            # timestep zero (or configured context noise) for cache warm-up
-            t_zero = torch.zeros(
-                [latents.shape[0]], device=latents.device, dtype=torch.long
-            )
             if independent_first_frame and input_frames >= 1:
                 # warm-up with the very first frame independently
-                image_first_btchw = (
-                    image_latent[:, :, :1, :, :].to(target_dtype).permute(0, 2, 1, 3, 4)
+                self._warm_up_causal_context_cache(
+                    batch,
+                    server_args,
+                    context_input=image_latent[:, :, :1, :, :],
+                    prompt_embeds=prompt_embeds,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start_frame=current_start_frame,
+                    image_kwargs=image_kwargs,
+                    pos_cond_kwargs=pos_cond_kwargs,
+                    target_dtype=target_dtype,
+                    autocast_enabled=autocast_enabled,
                 )
-                with torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=target_dtype,
-                    enabled=autocast_enabled,
-                ):
-                    _ = self.transformer(
-                        image_first_btchw,
-                        prompt_embeds,
-                        t_zero,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                        **image_kwargs,
-                        **pos_cond_kwargs,
-                    )
                 current_start_frame += 1
                 remaining_frames = input_frames - 1
             else:
@@ -470,28 +594,21 @@ class CausalDMDDenoisingStage(DenoisingStage):
             # process remaining input frames in blocks of num_frame_per_block
             while remaining_frames > 0:
                 block = min(self.num_frames_per_block, remaining_frames)
-                ref_btchw = (
-                    image_latent[
+                self._warm_up_causal_context_cache(
+                    batch,
+                    server_args,
+                    context_input=image_latent[
                         :, :, current_start_frame : current_start_frame + block, :, :
-                    ]
-                    .to(target_dtype)
-                    .permute(0, 2, 1, 3, 4)
+                    ],
+                    prompt_embeds=prompt_embeds,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start_frame=current_start_frame,
+                    image_kwargs=image_kwargs,
+                    pos_cond_kwargs=pos_cond_kwargs,
+                    target_dtype=target_dtype,
+                    autocast_enabled=autocast_enabled,
                 )
-                with torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=target_dtype,
-                    enabled=autocast_enabled,
-                ):
-                    _ = self.transformer(
-                        ref_btchw,
-                        prompt_embeds,
-                        t_zero,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                        **image_kwargs,
-                        **pos_cond_kwargs,
-                    )
                 current_start_frame += block
                 remaining_frames -= block
 
@@ -518,12 +635,16 @@ class CausalDMDDenoisingStage(DenoisingStage):
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
             start_index = 0
 
+        def prepare_context_input(current_latents):
+            return current_latents
+
         # DMD loop in causal blocks
         with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
             for current_num_frames in block_sizes:
                 current_latents = latents[
                     :, :, start_index : start_index + current_num_frames, :, :
                 ]
+
                 def prepare_model_input(current_latents):
                     latent_model_input = current_latents
                     if (
@@ -537,7 +658,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         )
                     return latent_model_input
 
-                current_latents, attn_metadata = self._denoise_causal_dmd_chunk(
+                current_start_tokens = (
+                    pos_start_base + start_index
+                ) * self.frame_seq_length
+                current_latents = self._denoise_and_update_causal_block(
                     batch,
                     server_args,
                     chunk_latents=current_latents,
@@ -546,8 +670,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     prompt_embeds=prompt_embeds,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start_tokens=(pos_start_base + start_index)
-                    * self.frame_seq_length,
+                    current_start_tokens=current_start_tokens,
                     start_frame=start_index,
                     image_kwargs=image_kwargs,
                     pos_cond_kwargs=pos_cond_kwargs,
@@ -556,6 +679,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     device=device,
                     attn_raw_latent_shape=(current_num_frames, h, w),
                     prepare_model_input=prepare_model_input,
+                    prepare_context_input=prepare_context_input,
                     progress_bar=progress_bar,
                 )
 
@@ -564,22 +688,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     current_latents
                 )
 
-                self._update_causal_context_cache(
-                    batch,
-                    server_args,
-                    context_input=current_latents,
-                    prompt_embeds=prompt_embeds,
-                    kv_cache=self.kv_cache1,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start_tokens=(pos_start_base + start_index)
-                    * self.frame_seq_length,
-                    start_frame=start_index,
-                    image_kwargs=image_kwargs,
-                    pos_cond_kwargs=pos_cond_kwargs,
-                    attn_metadata=attn_metadata,
-                    target_dtype=target_dtype,
-                    autocast_enabled=autocast_enabled,
-                )
                 start_index += current_num_frames
 
         batch.latents = latents
