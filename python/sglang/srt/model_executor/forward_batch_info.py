@@ -511,22 +511,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
-        # When --enable-mis is on, every request in the batch is expected to
-        # carry delimiter indices (the score endpoint always produces MIS-structured
-        # requests). Consumers index this list without None-checking.
-        if get_global_server_args().enable_mis and any(
-            r.multi_item_delimiter_indices is not None for r in batch.reqs
-        ):
-            assert all(
-                r.multi_item_delimiter_indices is not None for r in batch.reqs
-            ), "MIS batch must have delimiter indices on every request"
-            multi_item_delimiter_indices = [
-                torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
-                for r in batch.reqs
-            ]
-        else:
-            multi_item_delimiter_indices = None
-
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -560,20 +544,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
-            dimensions=(
-                [
-                    r.dimensions if r.dimensions else batch.model_config.hidden_size
-                    for r in batch.reqs
-                ]
-                if batch.model_config.is_matryoshka
-                and any(r.dimensions is not None for r in batch.reqs)
-                else None
-            ),
-            # OR across the batch so a single fused forward matches; requests that
-            # did not ask for PHS still skip attaching it in the output processor.
-            return_pooled_hidden_states=any(
-                r.return_pooled_hidden_states for r in batch.reqs
-            ),
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
@@ -582,13 +552,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
-            multi_item_delimiter_indices=multi_item_delimiter_indices,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
         )
+
+        ret._compute_pooling_fields(batch)
 
         device = model_runner.device
 
@@ -706,6 +677,44 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def _compute_pooling_fields(self, batch: ScheduleBatch):
+        """Populate the pooling-family per-request fields from ``batch.reqs``.
+
+        These are only meaningful for embedding / reward / scoring (pooling)
+        forwards. They are recomputed fresh at every ForwardBatch construction
+        rather than stored on the cross-iter-reused ScheduleBatch.
+        """
+        # Matryoshka output dims, one per request (fall back to hidden_size for
+        # requests that did not ask for a custom dimension).
+        if batch.model_config.is_matryoshka and any(
+            r.dimensions is not None for r in batch.reqs
+        ):
+            self.dimensions = [
+                r.dimensions if r.dimensions else batch.model_config.hidden_size
+                for r in batch.reqs
+            ]
+
+        # OR across the batch so a single fused forward matches; requests that
+        # did not ask for PHS still skip attaching it in the output processor.
+        self.return_pooled_hidden_states = any(
+            r.return_pooled_hidden_states for r in batch.reqs
+        )
+
+        # When --enable-mis is on, every request in the batch is expected to
+        # carry delimiter indices (the score endpoint always produces
+        # MIS-structured requests). Consumers index this list without
+        # None-checking.
+        if get_global_server_args().enable_mis and any(
+            r.multi_item_delimiter_indices is not None for r in batch.reqs
+        ):
+            assert all(
+                r.multi_item_delimiter_indices is not None for r in batch.reqs
+            ), "MIS batch must have delimiter indices on every request"
+            self.multi_item_delimiter_indices = [
+                torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
+                for r in batch.reqs
+            ]
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
