@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -46,7 +46,7 @@ _is_npu = is_npu()
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
-_DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
+_DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -79,23 +79,24 @@ def _gather_spec_extras(
 
 
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
-    """Materialize input_ids at forward entry. Prefill H2D from pinned CPU
-    staging; decode gather from future_map.output_tokens_buf. Spec_v2 sets
-    input_ids inside the worker (draft tokens); only extras are gathered here.
+    """Materialize input_ids at forward entry. Two sources:
+
+    - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
+    - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
     if batch.prefill_input_ids_cpu is not None:
-        prefill_dev = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
-            decode_dev = future_map.output_tokens_buf[batch.mix_running_indices]
+            decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(
-                    decode_dev,
+                    decode_gpu,
                     future_map.output_tokens_buf,
                     batch.mix_running_indices,
                 )
-            batch.input_ids = torch.cat([prefill_dev, decode_dev])
+            batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
         else:
-            batch.input_ids = prefill_dev
+            batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
     elif batch.input_ids is None and future_map.spec_algo.is_none():
