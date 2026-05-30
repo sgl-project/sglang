@@ -3,7 +3,7 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#include <sgl_kernel/deepseek_v4/topk.cuh>
+#include <sgl_kernel/deepseek_v4/topk_impl.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>

@@ -1,4 +1,4 @@
-/// \file topk.cuh
+/// \file topk_impl.cuh
 /// \brief DeepSeek-V4 (DSA indexer) top-k implementation classes.
 ///
 /// This header holds ONLY the device-side implementation classes + helpers; the
