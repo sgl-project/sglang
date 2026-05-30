@@ -3344,7 +3344,7 @@ class ServerArgs:
             num_tokens_per_bs = self.speculative_num_draft_tokens or 1
         else:
             num_tokens_per_bs = 1
-        prefill_tokens = self.max_prefill_tokens or 0
+        prefill_tokens = self.max_prefill_tokens
         if not self.disable_piecewise_cuda_graph:
             prefill_tokens = max(
                 prefill_tokens, self.piecewise_cuda_graph_max_tokens or 0
@@ -3359,7 +3359,6 @@ class ServerArgs:
         if not (
             self.moe_a2a_backend == "flashinfer"
             and self.moe_runner_backend == "flashinfer_cutedsl"
-            and self.max_prefill_tokens is not None
             and self.max_prefill_tokens > 0
             and self.disaggregation_mode != "decode"
         ):
