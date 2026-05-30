@@ -2,7 +2,7 @@
 
 import unittest
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 from unittest import mock
 
@@ -89,6 +89,7 @@ class CacheConfig:
     head_num: int = 2
     head_dim: int = 64
     dtype: torch.dtype = torch.bfloat16
+    eviction_policy: str = "lru"
 
     @property
     def has_mamba(self) -> bool:
@@ -233,6 +234,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
+        eviction_policy=cfg.eviction_policy,
     )
     tree = UnifiedRadixCache(params=cache_init_params)
     tree.cache_init_params = cache_init_params
@@ -443,11 +445,11 @@ class UnifiedRadixCacheSuite:
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
 
-    def _insert(self, tree, allocator, req_to_token_pool, tokens):
+    def _insert(self, tree, allocator, req_to_token_pool, tokens, priority=0):
         """Insert tokens, attaching mamba data when the config has mamba."""
         key = RadixKey(array("q", tokens))
         value = self._alloc(allocator, len(tokens))
-        params = InsertParams(key=key, value=value[: len(key)])
+        params = InsertParams(key=key, value=value[: len(key)], priority=priority)
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
@@ -1280,6 +1282,27 @@ class UnifiedRadixCacheSuite:
         m_new = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_new))))
         self.assertEqual(len(m_old.device_indices), 0)
         self.assertEqual(len(m_new.device_indices), len(seq_new))
+        tree.sanity_check()
+
+    def test_evict_respects_priority_policy(self):
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("priority policy ordering is covered on Full-only configs")
+        priority_cfg = replace(self.cfg, eviction_policy="priority")
+        tree, allocator, req_to_token_pool = build_fixture(priority_cfg)
+        seq_high = self._make_seq(1, 2)
+        seq_low = self._make_seq(500, 2)
+
+        self._insert(tree, allocator, req_to_token_pool, seq_high, priority=10)
+        self._insert(tree, allocator, req_to_token_pool, seq_low, priority=0)
+
+        tree.evict(EvictParams(num_tokens=len(seq_low)))
+
+        m_high = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_high)))
+        )
+        m_low = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_low))))
+        self.assertEqual(len(m_high.device_indices), len(seq_high))
+        self.assertEqual(len(m_low.device_indices), 0)
         tree.sanity_check()
 
     def test_evict_multiple_independent_leaves(self):
