@@ -721,6 +721,59 @@ class CausalDMDDenoisingStage(DenoisingStage):
             if "local_end_index_int" in cache_block:
                 cache_block["local_end_index_int"] = 0
 
+    def _get_causal_kv_cache_size(self) -> int:
+        if self.local_attn_size != -1:
+            return self.local_attn_size * self.frame_seq_length
+        return self.frame_seq_length * self.sliding_window_num_frames
+
+    def _allocate_causal_kv_cache(
+        self,
+        *,
+        batch_size: int,
+        kv_cache_size: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        dtype: torch.dtype,
+        device,
+        use_int_indices: bool = False,
+    ) -> list[CausalSelfAttentionKVCache]:
+        causal_kv_cache = []
+        int_index = 0 if use_int_indices else None
+        for _ in range(self.num_transformer_blocks):
+            causal_kv_cache.append(
+                CausalSelfAttentionKVCache(
+                    k=torch.zeros(
+                        [
+                            batch_size,
+                            kv_cache_size,
+                            num_attention_heads,
+                            attention_head_dim,
+                        ],
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    v=torch.zeros(
+                        [
+                            batch_size,
+                            kv_cache_size,
+                            num_attention_heads,
+                            attention_head_dim,
+                        ],
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    global_end_index=torch.zeros(
+                        1, dtype=torch.long, device=device
+                    ),
+                    local_end_index=torch.zeros(
+                        1, dtype=torch.long, device=device
+                    ),
+                    global_end_index_int=int_index,
+                    local_end_index_int=int_index,
+                )
+            )
+        return causal_kv_cache
+
     @torch.no_grad()
     def forward(
         self,
@@ -890,47 +943,16 @@ class CausalDMDDenoisingStage(DenoisingStage):
         """
             Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
         """
-        causal_kv_cache = []
         num_attention_heads = self.transformer.num_attention_heads
         attention_head_dim = self.transformer.attention_head_dim
-        if self.local_attn_size != -1:
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
-        else:
-            kv_cache_size = self.frame_seq_length * self.sliding_window_num_frames
-
-        for _ in range(self.num_transformer_blocks):
-            causal_kv_cache.append(
-                CausalSelfAttentionKVCache(
-                    k=torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    v=torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    global_end_index=torch.zeros(
-                        1, dtype=torch.long, device=device
-                    ),
-                    local_end_index=torch.zeros(
-                        1, dtype=torch.long, device=device
-                    ),
-                )
-            )
-
-        self.causal_kv_cache = causal_kv_cache
+        self.causal_kv_cache = self._allocate_causal_kv_cache(
+            batch_size=batch_size,
+            kv_cache_size=self._get_causal_kv_cache_size(),
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            dtype=dtype,
+            device=device,
+        )
 
     def _initialize_crossattn_cache(
         self, batch_size, max_text_len, dtype, device
