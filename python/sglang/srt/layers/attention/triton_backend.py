@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import triton
@@ -292,10 +292,30 @@ class TritonAttnBackend(AttentionBackend):
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        kv_indices: torch.Tensor,
-    ) -> torch.Tensor:
+        kv_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build ``kv_indptr`` from cumsum(seq_lens) and fill ``kv_indices``.
+
+        If ``kv_indices`` is ``None`` (the eager path with no pre-allocated
+        buffer), allocate it sized to ``int(kv_indptr[-1])`` — the exact
+        total derived from this call's cumsum. Do **not** rely on
+        ``forward_batch.seq_lens_sum`` to size the buffer here: that cached
+        value can be stale relative to the GPU ``seq_lens`` (e.g. when a
+        spec-decode worker bumps ``seq_lens`` for the verify batch and the
+        cached sum was set on the pre-bump value, or when ``needs_cpu_seq_lens
+        = False`` leaves the sum unset). A stale sum produces an undersized
+        ``kv_indices`` and ``create_flashinfer_kv_indices_triton`` writes
+        OOB, corrupting whatever lives next to the allocation; later the
+        Triton extend kernel reads garbage indices and faults with
+        ``WARP_OUT_OF_RANGE_ADDRESS`` — that's the failure reported by
+        ``test_spec_ngram_extra.py`` on main post-#26665.
+        """
         kv_indptr = self.kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        if kv_indices is None:
+            kv_indices = torch.empty(
+                int(kv_indptr[-1]), dtype=torch.int64, device=self.device
+            )
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
@@ -305,7 +325,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices,
             self.req_to_token.stride(0),
         )
-        return kv_indptr
+        return kv_indptr, kv_indices
 
     def _update_decode_kv_buffers(
         self,
@@ -320,7 +340,7 @@ class TritonAttnBackend(AttentionBackend):
         """
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        kv_indptr = self._fill_kv_indptr_and_indices(
+        kv_indptr, _ = self._fill_kv_indptr_and_indices(
             bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
         window_kv_indptr = self.window_kv_indptr
@@ -359,7 +379,7 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        kv_indptr = self._fill_kv_indptr_and_indices(
+        kv_indptr, _ = self._fill_kv_indptr_and_indices(
             bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
         window_kv_indptr = self.window_kv_indptr
@@ -451,7 +471,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # DRAFT_EXTEND_V1: seq_lens = prefix only.
             kv_lens = seq_lens
-        kv_indptr = self._fill_kv_indptr_and_indices(
+        kv_indptr, _ = self._fill_kv_indptr_and_indices(
             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
         return qo_indptr, kv_indptr, num_tokens_per_bs
@@ -469,14 +489,17 @@ class TritonAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
-                kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
-                )
-                kv_indptr = self._fill_kv_indptr_and_indices(
+                # Eager path: let `_fill_kv_indptr_and_indices` size
+                # `kv_indices` from the actual cumsum total (`int(kv_indptr[-1])`).
+                # Sizing here off `forward_batch.seq_lens_sum` is unsafe — it
+                # can be stale or None (e.g. when Triton's
+                # `needs_cpu_seq_lens=False` skips computing it) and that
+                # leads to OOB writes from `create_flashinfer_kv_indices_triton`.
+                kv_indptr, kv_indices = self._fill_kv_indptr_and_indices(
                     bs,
                     forward_batch.seq_lens,
                     forward_batch.req_pool_indices,
-                    kv_indices,
+                    None,
                 )
                 # Sliding window
                 if (
@@ -537,15 +560,15 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # Different with flashinfer kv_indptr and kv_indices construction
-            kv_indices = torch.empty(
-                forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
-            )
-            kv_indptr = self._fill_kv_indptr_and_indices(
+            # Different with flashinfer kv_indptr and kv_indices construction.
+            # Size `kv_indices` from the actual cumsum total — see the
+            # decode_or_idle branch above for why `forward_batch.seq_lens_sum`
+            # is unsafe to use here (stale / None under various spec workflows).
+            kv_indptr, kv_indices = self._fill_kv_indptr_and_indices(
                 bs,
                 forward_batch.seq_lens,
                 forward_batch.req_pool_indices,
-                kv_indices,
+                None,
             )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
@@ -605,16 +628,16 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
         else:
-            kv_indices = torch.empty(
-                sum(forward_batch.extend_prefix_lens_cpu),
-                dtype=torch.int64,
-                device=self.device,
-            )
-            kv_indptr = self._fill_kv_indptr_and_indices(
+            # Size `kv_indices` from the actual cumsum total (the helper
+            # allocates it internally) — `sum(extend_prefix_lens_cpu)` can
+            # be stale relative to the GPU `extend_prefix_lens` tensor and
+            # would mis-size the buffer the same way the spec_v2 sum issue
+            # bit decode/target_verify (see _fill_kv_indptr_and_indices).
+            kv_indptr, kv_indices = self._fill_kv_indptr_and_indices(
                 bs,
                 forward_batch.extend_prefix_lens,
                 forward_batch.req_pool_indices,
-                kv_indices,
+                None,
             )
             # Sliding window
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
