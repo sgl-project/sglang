@@ -4711,7 +4711,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, 'priority' evicts lower-priority requests first, 'fifo' stands for First-In First-Out, 'mru' stands for Most Recently Used, and 'filo' stands for First-In Last-Out",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, 'priority' evicts lower-priority requests first, 'fifo' stands for First-In First-Out, 'mru' stands for Most Recently Used, and 'filo' stands for First-In Last-Out.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",
