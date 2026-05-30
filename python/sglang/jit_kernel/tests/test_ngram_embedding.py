@@ -9,7 +9,7 @@ from sglang.jit_kernel.ngram_embedding import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 17, 128, 1024])
