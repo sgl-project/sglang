@@ -109,7 +109,7 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
                 audio_inputs.append(result["audio_input"])
                 input_ids.extend(result["input_ids"])
 
-        ids = torch.tensor(input_ids)
+        ids = torch.as_tensor(input_ids)
         position_ids = torch.arange(ids.shape[0]).expand(3, -1)
         rope_deltas = torch.zeros((1, 1), dtype=torch.int32)
         return ids, audio_inputs, position_ids, rope_deltas
@@ -195,7 +195,9 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
     ):
         if audio_data is None:
             audio_data = getattr(request_obj, "audio_data", [])
-        if audio_data and not self.AUDIO_REGEX.search(input_text):
+        if not audio_data:
+            return None
+        if not self.AUDIO_REGEX.search(input_text):
             input_text = f"{self.mm_tokens.audio_token}{input_text}"
 
         base_output = await self.load_mm_data(
@@ -259,9 +261,8 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
             raise ValueError(f"Multimodal data is corrupted or cannot be decoded: {e}")
 
         input_ids_flat = input_ids.flatten()
-        mm_items: List[MultimodalDataItem] = []
         if audio_inputs:
-            mm_items.append(
+            mm_items = [
                 MultimodalDataItem(
                     modality=Modality.AUDIO,
                     feature=audio_inputs,
@@ -270,7 +271,9 @@ class MiMoV2ASRProcessor(BaseMultimodalProcessor):
                         mm_token_id=self.audio_token_id,
                     ),
                 )
-            )
+            ]
+        else:
+            mm_items = []
 
         return MultimodalProcessorOutput(
             mm_items=mm_items,
