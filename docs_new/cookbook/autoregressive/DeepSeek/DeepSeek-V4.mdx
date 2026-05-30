@@ -106,7 +106,7 @@ For installation instructions across all hardware platforms, refer to the [offic
 docker pull lmsysorg/sglang:latest
 ```
 
-For how to actually launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the [command generator](#deploy) above produces):
+For how to actually launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the [command generator](#deployment) above produces):
 
 ```bash Command
 docker run --gpus all \
@@ -255,7 +255,7 @@ curl http://localhost:30000/v1/chat/completions \
 
 #### 4.2.1 Reasoning Parser
 
-Enable the `deepseek-v4` reasoning parser (check the box in the [command panel above](#deploy)) to separate thinking from the final answer into `reasoning_content` vs `content`.
+Enable the `deepseek-v4` reasoning parser (check the box in the [command panel above](#deployment)) to separate thinking from the final answer into `reasoning_content` vs `content`.
 
 <Accordion title="Streaming with Thinking Process (Python)">
 
@@ -329,7 +329,7 @@ Multiply the decimal form by 240:
 
 #### 4.2.2 Tool Calling
 
-Enable the `deepseekv4` tool-call parser (check the box in the [command panel above](#deploy)) to surface structured tool calls via `message.tool_calls`.
+Enable the `deepseekv4` tool-call parser (check the box in the [command panel above](#deployment)) to surface structured tool calls via `message.tool_calls`.
 
 <Accordion title="Python Example with Thinking Process">
 

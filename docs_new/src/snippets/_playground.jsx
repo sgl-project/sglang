@@ -516,11 +516,14 @@ export const Playground = ({ config }) => {
         const labelFor = (knob) => (c) => {
           if (c.label !== undefined) return c.label;
           if (knob.id === "dpAttn") {
-            const labelMap = knob.labels || { "auto": "auto", "false": "off" };
+            // Keys ("auto" / "false") are lookup keys into the label map,
+            // NOT display strings — they stay lowercase. The VALUES are
+            // what the user sees, so they're Title-cased.
+            const labelMap = knob.labels || { "auto": "Auto", "false": "Off" };
             const k = c.value === null ? "auto" : String(c.value);
             return labelMap[k] || k;
           }
-          return c.value === null ? "auto" : String(c.value);
+          return c.value === null ? "Auto" : String(c.value);
         };
         // Display rule: explicit user pick (non-null) > derived-from-base >
         // null sentinel. When derive produced a real value, hide the
@@ -803,25 +806,34 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect, derived }) => {
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, derived }) => {
         const opts = fc.options || [];
         if (!opts.length) return null;
+        // Single-select chip group (same visual language as the Parsers
+        // axis). Exactly one chip is "checked" — the effective preset.
         // Display rule: explicit pick (!= "current") wins; otherwise show
-        // whatever deriveFromBase matched. Hide the "current" sentinel from
-        // the dropdown when derive resolved to a real preset (or "off") —
-        // keep it only when nothing matched, so "Inherited from base" is
-        // still pickable as the no-match fallback.
+        // whatever deriveFromBase matched.
         const display = (value !== "current") ? value
                        : (derived ? derived : "current");
-        const hideValues = (derived && derived !== "current") ? ["current"] : [];
+        // Hide the "current" ("Inherited from base") chip when derive
+        // resolved to a real preset (or "off") — keep it only as the
+        // no-match fallback, mirroring the old dropdown's hideValues.
+        const hideCurrent = !!(derived && derived !== "current");
+        const visible = opts
+          .map((opt) => h.evaluateChip(opt, base))
+          .filter((c) => !c.hidden && !(hideCurrent && c.value === "current"));
+        if (visible.length === 0) return null;
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
               <span style={s.axisTitle}>Speculative</span>
-              <span style={s.field}>
-                {renderSelect(display, opts, setValue, base, undefined,
-                  { hideValues })}
-              </span>
+              {visible.map((c) => (
+                <span key={c.value} style={s.field}>
+                  {renderChip(c.label, display, c.value,
+                    () => setValue(c.value),
+                    { disabled: c.disabled, disabledReason: c.disableReason })}
+                </span>
+              ))}
             </div>
           </div>
         );
@@ -1460,10 +1472,11 @@ export const Playground = ({ config }) => {
       color: isDark ? "#e5e7eb" : "inherit",
       textAlign: "center",
     },
+    // Selected-chip color matches the §3.1 Deployment panel's selected
+    // button (`checked` in _deployment.jsx: #D45D44 terracotta, no dark-
+    // mode branch) so the two widgets read as one visual system.
     chipChecked: {
-      background: isDark ? "#FDBA74" : "#FB923C",
-      color: isDark ? "#7C2D12" : "white",
-      borderColor: isDark ? "#FDBA74" : "#FB923C",
+      background: "#D45D44", color: "white", borderColor: "#D45D44",
     },
     chipDisabled: { cursor: "not-allowed", opacity: 0.4 },
     commandWrap: {
@@ -1975,7 +1988,7 @@ export const Playground = ({ config }) => {
   //
   // `labelFor(c)` is an optional custom label resolver — receives the
   // evaluated chip and returns a string. Falls back to c.label, then to
-  // "auto" for null, then to String(c.value).
+  // "Auto" for null, then to String(c.value).
   //
   // `opts.hideValues` (optional) — array of chip values to suppress from
   // the dropdown entirely. Used when an axis derives a real default from
@@ -1991,7 +2004,7 @@ export const Playground = ({ config }) => {
       const lbl = labelFor
         ? labelFor(c)
         : (c.label !== undefined ? c.label
-          : c.value === null ? "auto" : String(c.value));
+          : c.value === null ? "Auto" : String(c.value));
       items.push({ ...c, label: lbl });
     }
     let idx = items.findIndex((c) => c.value === current);
@@ -2027,15 +2040,17 @@ export const Playground = ({ config }) => {
       <div style={s.baseStrip}>
         <span style={{ fontWeight: 600 }}>Inherited base from §3.1:</span>
         <code style={{ fontFamily: "Menlo, monospace" }}>{baseSummary}</code>
-        {/* Scroll back to §3.1 (the Interactive Command Generator). Use
-            scrollIntoView so the URL hash — which carries the base cell
-            selection — isn't overwritten. The target id is the auto-
-            generated Mintlify slug for "## Deploy". */}
+        {/* Scroll back to the Deploy panel. Use scrollIntoView so the URL
+            hash — which carries the base cell selection — isn't overwritten.
+            The target is the auto-generated Mintlify slug for the Deploy
+            heading; cookbooks title it either "## Deployment" (→ id
+            "deployment") or "## Deploy" (→ id "deploy"), so try both. */}
         <button
           type="button"
           style={s.switchBaseBtn}
           onClick={() => {
-            const el = document.getElementById("deploy");
+            const el = document.getElementById("deployment")
+              || document.getElementById("deploy");
             if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
           }}
         >

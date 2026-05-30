@@ -165,7 +165,7 @@ export const config = {
             { value: 16, disable: { nodes: ["single"] },
               disableReason: "DP-Attention=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
           ],
-          labels: { "auto": "auto", "false": "off" } },
+          labels: { "auto": "Auto", "false": "Off" } },
       ],
     },
 
@@ -236,7 +236,7 @@ export const config = {
           disable: { dpAttnOn: [true] },
           disableReason: "NGRAM is incompatible with DP-Attention. Turn DP-Attention off in the Attention card above to use NGRAM." },
         { id: "dflash",     label: "DFlash", disabled: true,
-          disabledReason: "Coming soon — pending DFlash kernel integration." },
+          disableReason: "Coming soon — pending DFlash kernel integration." },
       ],
     },
 
@@ -267,9 +267,11 @@ export const config = {
         { id: "nixl",     label: "NiXL" },
       ],
       // IB device defaults differ per Blackwell variant: B200 typically uses
-      // mlx5_7, H200 uses mlx5_0, GB300 uses NVLink (no IB). `auto` (default)
-      // emits no --disaggregation-ib-device flag.
-      ibDevices: ["auto", "mlx5_0", "mlx5_7"],
+      // mlx5_7, H200 uses mlx5_0, GB300 uses NVLink (no IB). The `auto`
+      // sentinel (default) emits no --disaggregation-ib-device flag; it's an
+      // {id,label} object so it displays "Auto" while the engine's
+      // `value.ibDevice !== "auto"` checks still see the lowercase id.
+      ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
     },
 
     // ----- Card 6: "Hierarchical KV Cache" — Enable + Storage + Write Policy -----
@@ -277,14 +279,28 @@ export const config = {
     // host RAM only. `auto` for writePolicy resolves to "write_through" in
     // the engine.
     hicache: {
+      // `id` is the literal `--hicache-storage-backend` value SGLang's CLI
+      // expects (lowercase); `label` is the formal display name from
+      // docs/advanced_features/hicache_design.mdx (Mooncake / HF3FS / NIXL).
+      // We use "NiXL" here to match the PD-Disagg Transfer Backend label
+      // above (the docs write "NIXL"; the cookbook standardizes on "NiXL").
       backends: [
-        { id: null,        label: "auto" },
-        { id: "file",      label: "file" },
-        { id: "mooncake",  label: "mooncake" },
-        { id: "hf3fs",     label: "hf3fs" },
-        { id: "nixl",      label: "nixl" },
+        { id: null,        label: "Auto" },
+        { id: "file",      label: "File" },
+        { id: "mooncake",  label: "Mooncake" },
+        { id: "hf3fs",     label: "HF3FS" },
+        { id: "nixl",      label: "NiXL" },
       ],
-      writePolicies: ["auto", "write_through", "write_back", "write_through_selective"],
+      // `id` is the literal `--hicache-write-policy` value; `label` is the
+      // hyphenated prose form from the HiCache design doc's "Data Write-back"
+      // section. "auto" is the inherit sentinel (engine resolves it to
+      // write_through), not a CLI value.
+      writePolicies: [
+        { id: "auto",                    label: "Auto" },
+        { id: "write_through",           label: "Write-through" },
+        { id: "write_back",              label: "Write-back" },
+        { id: "write_through_selective", label: "Write-through (selective)" },
+      ],
     },
 
     // ----- Card 7: "HiSparse" — decode-only hierarchical sparse attention -----
