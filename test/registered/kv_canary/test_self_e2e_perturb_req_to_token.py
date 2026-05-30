@@ -34,6 +34,7 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         for _ in range(self.workload_n_batches):
             self.send_parallel_requests()
         self.assert_per_forward_violation_reported(fail_reason="verify_chain_hash")
+        self.maybe_assert_swa_divergence_observed()
 
 
 class TestPerturbReqToTokenMha(_PerturbReqToTokenBase):
