@@ -225,6 +225,7 @@ def trtllm_fp8_block_scale_routed_moe_lora(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type=None,
     activation_type: Optional[int] = None,
+    lora_ready_event: int = 0,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     from flashinfer.fused_moe.core import ActivationType, Fp8QuantizationType
     from flashinfer.utils import device_support_pdl
@@ -278,6 +279,7 @@ def trtllm_fp8_block_scale_routed_moe_lora(
         None,
         gate_up_lora_delta,
         activation_lora_input,
+        lora_ready_event,
     )
 
     return output if do_finalize else result

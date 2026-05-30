@@ -17,6 +17,12 @@ from sglang.srt.lora.trtllm_moe import (
     is_two_stream_active,
 )
 
+# GEMM1-LoRA overlap: keep LoRA-ready events recorded during cuda-graph capture alive so the
+# captured cross-stream wait (resolved inside the trtllm op before activation) isn't torn down
+# before graph instantiation. Only appended while capturing; eager runs rely on CUDA's
+# deferred cudaEventDestroy.
+_LORA_OVERLAP_EVENTS: list = []
+
 
 def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     dispatch_output,
@@ -116,12 +122,18 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
             local_num_experts=quant_info.local_num_experts,
         )
 
-    # O1 fork — gate_up shrink/expand on side stream concurrent with the
-    # main-stream per-token-group FP8 quant below. gate_up needs only
-    # hidden_states + token_lora_mapping, so no conflict with quant.
+    # GEMM1-LoRA overlap: fire the gate_up LoRA on the side stream + record an event; the
+    # trtllm op waits on it right before activation (the only consumer of gate_up_delta), so
+    # permute+GEMM1 overlap the side-stream LoRA shrink/expand instead of joining before the
+    # whole op.
+    lora_event = torch.cuda.Event()
+
+    # O1 fork — gate_up shrink/expand on side stream concurrent with the main-stream
+    # per-token-group FP8 quant + the trtllm op's permute+GEMM1 below.
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         _run_gate_up_lora()
+        lora_event.record()
 
     # Fuse the per-token scale transpose into the quant kernel: column-major scales make
     # the `.t()` a free view, dropping the standalone ~2us transpose+copy. The trtllm MoE
@@ -151,8 +163,12 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
             device=hidden_states.device,
         )
 
-    # O1 join — trtllm's activation step consumes gate_up_delta produced on side.
-    torch.cuda.current_stream().wait_stream(side_stream)
+    # No pre-op join: the trtllm op waits on lora_event right before its activation kernel,
+    # so permute+GEMM1 run concurrent with the side-stream LoRA. Keep the event alive through
+    # cuda-graph capture so the captured cross-stream wait isn't torn down before instantiation.
+    if torch.cuda.is_current_stream_capturing():
+        _LORA_OVERLAP_EVENTS.append(lora_event)
+    lora_ready_handle = lora_event.cuda_event
 
     moe_result = trtllm_fp8_block_scale_routed_moe_lora(
         topk_ids=packed_topk_ids,
@@ -165,6 +181,7 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
         gemm2_weights_scale=quant_info.w2_weight_scale_inv,
         gate_up_lora_delta=gate_up_delta,
         activation_lora_input=activation_lora_input,
+        lora_ready_event=lora_ready_handle,
         num_experts=quant_info.global_num_experts,
         top_k=runner_config.top_k,
         n_group=None,

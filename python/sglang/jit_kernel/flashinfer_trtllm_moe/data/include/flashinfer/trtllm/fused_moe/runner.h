@@ -345,6 +345,12 @@ struct MoERunnerArgs {
   void* gate_up_lora_delta = nullptr;
   void* activation_lora_input = nullptr;
 
+  // Optional CUDA event (cudaEvent_t) recorded on the LoRA side stream. When set, the
+  // runner waits on it right before the activation kernel (which consumes
+  // gate_up_lora_delta), so permute+GEMM1 overlap the side-stream LoRA shrink/expand
+  // instead of joining before the whole MoE op. nullptr = no wait (serial behavior).
+  void* lora_ready_event = nullptr;
+
   // Output:
   void* output = nullptr;
   float* output_scale = nullptr;

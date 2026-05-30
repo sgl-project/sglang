@@ -751,6 +751,12 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   void* gemm2_input_scale = workspace.gemm1_output_scale;
   // We do activation only for DeepSeek FP8, as cubins do not have fused activation.
   if (args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8) {
+    // GEMM1-LoRA overlap: activation consumes gate_up_lora_delta, so wait on the LoRA
+    // side-stream event HERE (not before the op) -- permute+GEMM1 above overlapped the
+    // side-stream LoRA shrink/expand. nullptr event = no wait (serial / non-overlap path).
+    if (args.lora_ready_event != nullptr) {
+      cudaStreamWaitEvent(stream, static_cast<cudaEvent_t>(args.lora_ready_event), 0);
+    }
     // Run activation
     moe::dev::activation::run(activationData, stream);
     gemm2_input = workspace.activation_output;
