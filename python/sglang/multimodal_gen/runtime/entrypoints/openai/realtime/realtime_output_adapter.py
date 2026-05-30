@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, TypedDict
 
 from fastapi import WebSocket
 from msgpack import packb
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timing import (
+    RealtimeStageTimer,
+)
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CHANNELS,
     RAW_RGB_CONTENT_TYPE,
@@ -154,23 +156,18 @@ class RawRGBRealtimeOutputAdapter:
             }
             header.update(metadata)
 
-            stage_start = time.perf_counter()
+            timer = RealtimeStageTimer()
             header_payload = packb(header, use_bin_type=True)
-            stats["header_pack_ms"] += (time.perf_counter() - stage_start) * 1000.0
+            stats["header_pack_ms"] += timer.mark_ms()
 
-            stage_start = time.perf_counter()
             await ws.send_bytes(header_payload)
-            stats["header_write_ms"] += (time.perf_counter() - stage_start) * 1000.0
+            stats["header_write_ms"] += timer.mark_ms()
 
-            stage_start = time.perf_counter()
             raw_payload = b"".join(frames)
-            stats["raw_payload_build_ms"] += (
-                time.perf_counter() - stage_start
-            ) * 1000.0
+            stats["raw_payload_build_ms"] += timer.mark_ms()
 
-            stage_start = time.perf_counter()
             await ws.send_bytes(raw_payload)
-            stats["raw_write_ms"] += (time.perf_counter() - stage_start) * 1000.0
+            stats["raw_write_ms"] += timer.mark_ms()
 
             stats["raw_bytes"] += frame_bytes
             stats["ws_payload_bytes"] += len(header_payload) + len(raw_payload)
