@@ -5,9 +5,21 @@ writes the page-table transform of the selected raw indices into the output. We
 validate against ``torch.topk`` with a small tolerance for boundary ties (the
 fp16 coarse histogram can swap elements of equal score).
 
-Covers every dispatch path: trivial (seq<=k), register (seq<=8192), streaming
-(seq>8192 non-cluster), and cluster (seq>=64K with batch<=128), plus identity &
-permutation page tables and ragged lengths.
+Coverage is organized around the kernel's dispatch so every template and its
+boundaries are exercised:
+
+  template      per-row seq            reached when
+  --------      ----------             ------------
+  trivial       seq <= k
+  Register2     k < seq <= 8192        max_seq <= 8192          (level 0)
+  Register4     8192 < seq <= 16384    max_seq <= 16384         (level 1)
+  Streaming     16384 < seq <= floor   max_seq > 16384, non-cluster (level 2)
+  Cluster       seq > floor(=65536)    max_seq > floor and batch <= 128
+
+and two cluster dispatch shapes: the fused small-batch kernel (batch <= 30) and
+the persistent-pool + main kernel (30 < batch <= 128). Boundary seq lengths
+(8192/8193, 16384/16385, 65535/65536/65537) and batch sizes (30/31, 128/129) are
+included explicitly, across k in {512,1024,2048} and identity/perm page tables.
 """
 
 from __future__ import annotations
@@ -20,126 +32,174 @@ import torch
 from sglang.jit_kernel.dsv4.topk import plan_topk_v2, topk_transform_512_v2
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=90, suite="base-b-kernel-unit-1-gpu-large")
 
 PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
 PAGE_MASK = PAGE_SIZE - 1
 MAX_PERMIT_ERROR = 5
+FLOOR = 65536  # kClusterFloor
+
+# (batch, seq) chosen to land on each template and each dispatch boundary.
+FIXED_CONFIGS = [
+    # --- trivial (seq <= k) ---
+    (8, 256),  # trivial for every k
+    (16, 1024),  # trivial for k>=1024
+    # --- Register2 (level 0: max_seq <= 8192) ---
+    (8, 4096),
+    (8, 8192),  # reg2 upper boundary
+    (128, 8192),
+    (300, 8192),  # batch > 128, still level 0
+    # --- Register4 (level 1: 8192 < max_seq <= 16384) ---
+    (8, 8193),  # just over reg2
+    (64, 16384),  # reg4 upper boundary
+    (256, 16384),  # batch > 128
+    # --- Streaming (level 2: max_seq > 16384, non-cluster) ---
+    (8, 16385),  # just over reg4 (small batch, seq < floor => non-cluster)
+    (4, 32768),
+    (16, 65535),  # just under floor
+    (4, 65536),  # at floor (seq == floor => non-cluster)
+    (100, 65536),
+    # --- Cluster, fused small-batch kernel (batch <= 30, max_seq > floor) ---
+    (1, 65537),  # single row just over floor
+    (2, 131072),
+    (8, 98304),
+    (30, 131072),  # batch == pool boundary
+    # --- Cluster, persistent pool + main kernel (30 < batch <= 128) ---
+    (31, 131072),  # just over small-batch
+    (40, 262144),  # N > pool of 30 => round-robin
+    (64, 196608),
+    (128, 131072),  # cluster batch upper boundary
+    # --- batch > 128 => non-cluster streaming even at long ctx ---
+    (129, 131072),
+    (200, 262144),
+]
 
 
-def _assert_topk_close(scores, ref_raw, our_raw, bs, seq_lens, k):
+def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
     """Set-compare our top-k raw indices vs torch's, tolerating equal-score ties."""
     bad = 0
     for i in range(bs):
         L = int(seq_lens[i])
-        ref = set(ref_raw[i])
-        our = set(our_raw[i])
+        ref, our = set(ref_raw[i]), set(our_raw[i])
         more, less = our - ref, ref - our
         if more or less:
-            mv = sorted(scores[i, list(more)].tolist())
-            lv = sorted(scores[i, list(less)].tolist())
+            mv = sorted(scores_cpu[i, list(more)].tolist())
+            lv = sorted(scores_cpu[i, list(less)].tolist())
             if mv != lv:  # not merely a tie swap -> genuine error
                 bad += len(more)
                 print(f"b={i} L={L} k={k}: more={list(more)[:4]} less={list(less)[:4]} mv={mv[:3]} lv={lv[:3]}")
-        # exactly min(k, L) valid (non -1) selections expected
-        assert len(our) == min(k, L), f"b={i}: {len(our)} valid != {min(k, L)}"
+        assert len(our) == min(k, L), f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
     assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
 
 
-def _make_page_table(batch, num_pages, mode, device):
+def _make_page_table(batch, num_pages, mode, device, per_row=False):
     if mode == "identity":
         pt = torch.arange(num_pages, dtype=torch.int32, device=device)
-        inv = pt
-    else:  # permutation
-        pt = torch.randperm(num_pages, device=device).to(torch.int32)
-        inv = torch.empty_like(pt)
-        inv[pt.long()] = torch.arange(num_pages, dtype=torch.int32, device=device)
-    return pt.unsqueeze(0).expand(batch, -1).contiguous(), inv.cpu()
+        full = pt.unsqueeze(0).expand(batch, -1).contiguous()
+        inv = pt.unsqueeze(0).expand(batch, -1).cpu()
+        return full, inv
+    # permutation (optionally a distinct permutation per row)
+    rows = batch if per_row else 1
+    full = torch.stack([torch.randperm(num_pages, device=device) for _ in range(rows)]).to(torch.int32)
+    inv = torch.empty_like(full)
+    ar = torch.arange(num_pages, dtype=torch.int32, device=device)
+    for r in range(rows):
+        inv[r, full[r].long()] = ar
+    if not per_row:
+        full = full.expand(batch, -1).contiguous()
+        inv = inv.expand(batch, -1)
+    return full, inv.cpu()
 
 
-def _invert(out_row, inv_cpu):
-    """Undo page_to_indices for a list of page indices (drop -1 padding)."""
-    raw = []
-    for v in out_row:
-        if v == -1:
-            continue
-        raw.append((int(inv_cpu[v >> PAGE_BITS]) << PAGE_BITS) | (v & PAGE_MASK))
-    return raw
+def _invert(out_row, inv_row):
+    """Undo page_to_indices for one row's page indices (drop -1 padding)."""
+    return [
+        (int(inv_row[v >> PAGE_BITS]) << PAGE_BITS) | (v & PAGE_MASK)
+        for v in out_row
+        if v != -1
+    ]
 
 
-@pytest.mark.parametrize("page_mode", ["identity", "perm"])
-@pytest.mark.parametrize(
-    "batch,seq",
-    [
-        (8, 512),       # trivial (seq == k)
-        (8, 4096),      # register
-        (200, 16384),   # streaming (batch > 128 => non-cluster)
-        (4, 16384),     # streaming (seq < floor => non-cluster, small batch)
-        (100, 65536),   # streaming (seq == floor)
-        (256, 131072),  # batch > 128 => streaming even at long ctx
-        (2, 131072),    # persistent cluster, pool >= N
-        (40, 262144),   # persistent cluster round-robin (N > pool of 30)
-        (64, 262144),   # persistent cluster round-robin (N > pool of 30)
-    ],
-)
-@pytest.mark.parametrize("k", [512, 1024])
-@torch.inference_mode()
-def test_topk_v2(batch: int, seq: int, k: int, page_mode: str) -> None:
-    if k > seq:
-        pytest.skip("k cannot exceed seq")
-    torch.manual_seed(batch * 1000 + seq + k)
-    device = "cuda"
-    scores = torch.randn(batch, seq, dtype=torch.float32, device=device)
-    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
-    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
-    page_table, inv_cpu = _make_page_table(batch, num_pages, page_mode, device)
-    out = torch.full((batch, k), -1, dtype=torch.int32, device=device)
+def _reference(scores, seq_lens, k):
+    """torch.topk reference indices per row (trivial rows -> all positions)."""
+    ref = []
+    for i in range(scores.shape[0]):
+        L = int(seq_lens[i])
+        if L <= k:
+            ref.append(list(range(L)))
+        else:
+            ref.append(torch.topk(scores[i, :L], k, sorted=False).indices.cpu().tolist())
+    return ref
 
+
+def _run(scores, seq_lens, page_table, inv_cpu, k):
+    batch = scores.shape[0]
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
     metadata = plan_topk_v2(seq_lens)
     topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata)
     torch.cuda.synchronize()
-
     out_cpu = out.cpu().tolist()
-    our_raw = [_invert(out_cpu[i], inv_cpu) for i in range(batch)]
-    ref_raw = [
-        torch.topk(scores[i, :seq], k, sorted=False).indices.cpu().tolist()
-        for i in range(batch)
-    ]
+    return [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
+
+
+@pytest.mark.parametrize("page_mode", ["identity", "perm"])
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("batch,seq", FIXED_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2(batch: int, seq: int, k: int, page_mode: str) -> None:
+    torch.manual_seed(batch * 100003 + seq * 7 + k)
+    device = "cuda"
+    # Pad the row stride to a multiple of 4 (16-byte vectorized load) while keeping
+    # the exact seq_len -- this also exercises the scalar-tail path for odd seq.
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, page_mode, device)
+
+    our_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
+    ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
 @pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "batch,shape",
+    [
+        (20, "small_batch"),  # fused small-batch kernel (<= pool of 30)
+        (64, "persistent"),  # persistent pool + main kernel
+        (128, "persistent"),  # cluster batch boundary
+    ],
+)
+@pytest.mark.parametrize("per_row_pt", [False, True])
 @torch.inference_mode()
-def test_topk_v2_ragged(k: int) -> None:
-    """Ragged per-batch lengths spanning trivial..cluster paths in one launch."""
-    torch.manual_seed(2024 + k)
+def test_topk_v2_ragged(batch: int, shape: str, k: int, per_row_pt: bool) -> None:
+    """Ragged lengths spanning trivial..cluster in one launch, both dispatch shapes.
+
+    ``per_row_pt`` gives each row a distinct page-table permutation, exercising
+    the per-batch page_table indexing (batch_id stride) rather than a shared one.
+    """
+    torch.manual_seed(7777 + batch + k + int(per_row_pt))
     device = "cuda"
-    batch, seq = 64, 131072
+    seq = 262144
     scores = torch.randn(batch, seq, dtype=torch.float32, device=device)
-    # mix of short (trivial/register), medium and long (cluster) rows
-    lengths = torch.randint(k, seq + 1, (batch,), dtype=torch.int32, device=device)
-    lengths[0] = max(1, k // 2)  # force a trivial row (seq < k)
+    # span every path; guarantee at least one > floor row so cluster dispatch fires
+    buckets = [max(1, k // 2), k, 4096, 12000, 40000, 65536, 98304, 262144]
+    g = torch.Generator(device="cpu").manual_seed(batch + k)
+    lengths = torch.tensor(
+        [buckets[int(torch.randint(0, len(buckets), (1,), generator=g))] for _ in range(batch)],
+        dtype=torch.int32,
+        device=device,
+    )
+    lengths[0] = max(1, k // 2)  # a trivial row
+    lengths[1] = 262144  # a long (cluster) row
     num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
-    page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device)
-    out = torch.full((batch, k), -1, dtype=torch.int32, device=device)
+    page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device, per_row=per_row_pt)
 
-    metadata = plan_topk_v2(lengths)
-    topk_transform_512_v2(scores, lengths, page_table, out, PAGE_SIZE, metadata)
-    torch.cuda.synchronize()
-
-    out_cpu = out.cpu().tolist()
-    sl = lengths.cpu()
-    scores_cpu = scores.cpu()
-    our_raw, ref_raw = [], []
-    for i in range(batch):
-        L = int(sl[i])
-        our_raw.append(_invert(out_cpu[i], inv_cpu))
-        if L <= k:
-            ref_raw.append(list(range(L)))  # trivial: all positions
-        else:
-            ref_raw.append(torch.topk(scores_cpu[i, :L], k, sorted=False).indices.tolist())
-    _assert_topk_close(scores_cpu, ref_raw, our_raw, batch, sl, k)
+    our_raw = _run(scores, lengths, page_table, inv_cpu, k)
+    ref_raw = _reference(scores, lengths, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, lengths.cpu(), k)
 
 
 if __name__ == "__main__":

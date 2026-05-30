@@ -1,25 +1,3 @@
-/// \file topk_v2.cuh
-/// \brief DeepSeek-V4 (DSA indexer) top-k transform: __global__ kernels + host
-///        dispatcher. The implementation classes live in the single header
-///        <sgl_kernel/deepseek_v4/topk.cuh>.
-///
-/// Universal, runtime-`topk` (<= 2048) top-k + page-table transform with ragged
-/// per-batch seq_lens. Dynamic (plan-routed) dispatch:
-///   - `plan` (single block) decides a `cluster_threshold` from the seq_len
-///     distribution + batch size and writes it to a relocatable metadata tensor.
-///   - `topk_cluster_kernel` (one cluster of 8 blocks per element, occupancy 2 =>
-///     ~30 concurrent on B200) processes the "long" items (seq > threshold) and
-///     skips the rest.
-///   - `topk_kernel` (one block per element) processes the "short" items
-///     (trivial/register/streaming) and skips the long ones.
-///
-/// Why non-persistent clusters: a persistent pool (fixed 30 clusters looping over
-/// items) was measured ~20% slower for long contexts -- the serial per-cluster
-/// item loop with cluster.sync barriers loses the inter-wave pipelining that a
-/// plain non-persistent launch gets for free at occupancy 2. The plan's
-/// `cluster_threshold` is what keeps medium-context items on the cheaper
-/// streaming path (fixing the mid-batch regressions).
-
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -39,7 +17,6 @@ namespace {
 namespace impl = device::topk;
 using impl::TopKProblem;
 
-using Trivial = impl::TopKTrivial;
 using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
 using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
 using Streaming = impl::TopKStreaming;
@@ -50,21 +27,14 @@ constexpr uint32_t kOccupancy = impl::TopKConfig::kOccupancy;
 constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
 constexpr uint32_t kClusterSize = Cluster::kClusterSize;
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
-constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384 (max_register_vecs=4)
+constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
-// Below this context length the 8-way cluster split is too fine to beat plain
-// streaming, so never cluster (also the smallest plan candidate threshold).
+#define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
+#define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
+
 constexpr uint32_t kClusterFloor = 65536;
-// Above this batch, one-block-per-element streaming already fills the GPU at
-// occupancy 2, so the cluster path cannot help -- don't launch it.
-constexpr uint32_t kClusterMaxBatch = 128;
-// Persistent cluster pool size (clusters of 8 blocks). ~15 = one co-scheduled
-// wave on B200's 8 GPCs; 30 = two waves (occupancy 2). The pool loops to fetch
-// work from the plan list, so the all-short case wastes only this many clusters
-// (not batch_size). Tunable.
-constexpr uint32_t kNumPersistentClusters = 30;
-
-constexpr bool kUsePDL = true;
+constexpr uint32_t kClusterMaxBatch = 512;
+constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -88,12 +58,20 @@ struct TopKLaunchParams {
   int64_t page_table_stride;
   uint32_t topk;
   uint32_t page_bits;
+  uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
 
   SGL_DEVICE const GlobalMetadata& global() const {
     return *reinterpret_cast<const GlobalMetadata*>(metadata);
   }
-  SGL_DEVICE uint32_t cluster_threshold() const { return global().cluster_threshold; }
-  SGL_DEVICE const PlanItem& item(uint32_t i) const { return metadata[1 + i]; }
+  SGL_DEVICE uint32_t cluster_threshold() const {
+    return global().cluster_threshold;
+  }
+  SGL_DEVICE const PlanItem& item(uint32_t i) const {
+    return metadata[1 + i];
+  }
+  SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
+    return page_indices + batch_id * static_cast<int64_t>(topk);
+  }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
     return TopKProblem{
@@ -107,71 +85,144 @@ struct TopKLaunchParams {
     };
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
-    return problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
+    return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
   }
 };
 
-// One block per batch element (no cluster). Specialized on the host-known
-// max_seq_len bucket `kLevel` so a small-max_seq_len launch only compiles the
-// paths it needs (leaner kernel, less register/smem-spill reservation):
-//   kLevel 0: max_seq_len <= 8192   -> trivial + register<2>
-//   kLevel 1: max_seq_len <= 16384  -> + register<4>
-//   kLevel 2: max_seq_len  > 16384  -> + streaming  (the "main" kernel)
-// When kSkipLong, items routed to the cluster path are skipped (full
-// one-block-per-element parallelism for the short items, no cluster cap).
-template <bool kPDL, bool kSkipLong, int kLevel>
-__global__ __launch_bounds__(kBlockSize, kOccupancy) void topk_kernel(
-    const __grid_constant__ TopKLaunchParams params) {
-  impl::enable_smem_spilling();
-  const auto problem = params.problem(blockIdx.x);
-  if constexpr (kSkipLong) {
-    if (problem.seq_len > params.cluster_threshold()) return;  // cluster path handles it
-  }
-  alignas(alignof(Streaming::Smem)) __shared__ uint8_t smem[sizeof(Streaming::Smem)];
-  if (problem.seq_len <= problem.topk) {
-    Trivial::forward<kPDL>(problem);
-  } else if (problem.seq_len <= kReg2MaxSeqLen) {
-    Register2::forward<kPDL>(problem, &smem);
-  } else if constexpr (kLevel == 1) {
-    Register4::forward<kPDL>(problem, &smem);  // max_seq_len <= 16384 guarantees seq <= 16384
-  } else if constexpr (kLevel >= 2) {
-    if (problem.seq_len <= kReg4MaxSeqLen) {
-      Register4::forward<kPDL>(problem, &smem);
-    } else {
-      Streaming::forward<kPDL>(problem, &smem);
-    }
-  }
-  // Pipelined page-table transform pass (gathers kept out of the hot scatter loop),
-  // then trigger the dependent kernel only after the full output is written.
-  __syncthreads();
-  for (uint32_t t = threadIdx.x; t < problem.topk; t += kBlockSize) impl::transform_output(problem, t);
-  device::PDLTriggerSecondary<kPDL>();
-}
-
-// Persistent cluster pool: a FIXED gridDim.x (<= kNumPersistentClusters) clusters
-// of 8 blocks loop to fetch the compacted long items from the plan list (stride
-// gridDim.x). Bounded launch -- the all-short case wastes only the pool's clusters
-// in the first wave (not batch_size*8), PDL overlaps it, and all-long small-batch
-// finishes in the first wave. Long items always have seq_len > cluster_threshold
-// >= kClusterFloor > kMaxTopK, so they take the radix (never trivial) path.
+/**
+ * \brief Persistent cluster kernel for the long items. It will handle long inputs.
+ * The short items are handled by the separate topk_kernel.
+ */
 template <bool kPDL>
-__global__ __launch_bounds__(kBlockSize, kOccupancy) __cluster_dims__(1, kClusterSize, 1) void topk_persistent_cluster_kernel(
-    const __grid_constant__ TopKLaunchParams params) {
+CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
   impl::enable_smem_spilling();
-  alignas(alignof(Cluster::Smem)) __shared__ uint8_t smem[sizeof(Cluster::Smem)];
-  const uint32_t n = params.global().num_cluster_items;
+  __shared__ impl::MaxSmem<Cluster::Smem> smem;
+  const uint32_t num_cluster_items = params.global().num_cluster_items;
   device::PDLWaitPrimary<kPDL>();
-  for (uint32_t w = blockIdx.x; w < n; w += gridDim.x) {
+  device::PDLTriggerSecondary<kPDL>();
+  for (uint32_t w = blockIdx.x; w < num_cluster_items; w += kNumPersistentClusters) {
     const auto it = params.item(w);
     const auto problem = params.problem(it.batch_id, it.seq_len);
-    Cluster::forward(problem, &smem);  // writes raw indices to out
-    // Barrier: all ranks' raw writes are visible before the transform pass; the
-    // 8 ranks then split the topk slots for the page-table transform.
-    cooperative_groups::this_cluster().sync();
-    for (uint32_t t = blockIdx.y * kBlockSize + threadIdx.x; t < problem.topk; t += kClusterSize * kBlockSize)
-      impl::transform_output(problem, t);
+    // forward()'s cross-rank DSMEM phases (histogram all-reduce, tie gather) are
+    // each bounded by its own internal cluster.sync(); after them it only touches
+    // its OWN block's smem. So the lone unguarded hazard before this cluster reuses
+    // `smem` for its next item is WITHIN a block: a fast thread re-initializing the
+    // radix smem (which unions with tie_handle_smem) while a slow thread is still in
+    // the previous item's handle_tie. A block barrier covers that -- no cluster-wide
+    // barrier needed. The LAST item needs none: kernel completion flushes its global
+    // writes before main_kernel<kLevel=3>'s PDL-gated epilogue reads them.
+    Cluster::forward<false>(problem, &smem);
+    if (w + kNumPersistentClusters < num_cluster_items) __syncthreads();
   }
+}
+
+template <typename F>
+SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
+  constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
+#pragma unroll
+  for (uint32_t i = 0; i < kNumElems; ++i) {
+    if (const auto tx = i * kBlockSize + threadIdx.x; tx < topk) {
+      __builtin_assume(tx < kMaxTopK);
+      f(tx, i);
+    }
+  }
+}
+
+template <bool kPDL>
+SGL_DEVICE void trivial_transform(const TopKProblem& problem) {
+  device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
+    problem.transform_output(tx, tx < problem.seq_len ? static_cast<int32_t>(tx) : -1);
+  });
+}
+
+SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
+  static_assert(kMaxTopK % kBlockSize == 0);
+  constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
+  int32_t source_index[kNumElems];
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { source_index[i] = problem.out[tx]; });
+  problem.out = output_ptr;
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { problem.transform_output(tx, source_index[i]); });
+}
+
+/**
+ * \brief Main kernel for the short items and epilogue of long items.
+ * \tparam kPDL whether to use PDL to synchronize with the cluster kernel (if any)
+ * \tparam kLevel:
+ * - Level 0: max_seq_len <= 8192           -> trivial + register<2>
+ * - Level 1: max_seq_len <= 16384          -> trivial + register<4>
+ * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4> + streaming
+ * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
+ */
+template <bool kPDL, int kLevel>
+TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
+  impl::enable_smem_spilling();
+  auto problem = params.problem(blockIdx.x);
+  constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  __shared__ int32_t topk_indices[kMaxTopK];
+  problem.out = topk_indices;
+
+  constexpr bool kHandleCluster = (kLevel == 3);
+  // non-trivial path: dispatch based on level and seq_len
+  const auto cluster_threshold = kHandleCluster ? params.cluster_threshold() : kU32Max;
+  if constexpr (kLevel == 0) {
+    __builtin_assume(problem.seq_len <= kReg2MaxSeqLen);
+    Register2::forward<kPDL>(problem, &smem);
+  } else if constexpr (kLevel == 1) {
+    __builtin_assume(problem.seq_len <= kReg4MaxSeqLen);
+    Register4::forward<kPDL>(problem, &smem);  // max_seq_len <= 16384 guarantees seq <= 16384
+  } else {
+    static_assert(kLevel == 2 || kLevel == 3, "we only support level = 0,1,2,3 now");
+    // if using cluster, we can delay the PDL wait
+    constexpr bool kPDLEarly = kPDL && !kHandleCluster;
+    constexpr bool kPDLFinal = kPDL && kHandleCluster;
+    if (problem.seq_len <= kReg4MaxSeqLen) {
+      Register4::forward<kPDLEarly>(problem, &smem);
+    } else if (problem.seq_len <= cluster_threshold) {
+      Streaming::forward<kPDLEarly>(problem, &smem);
+    } else {  // cluster path do nothing here
+      problem.out = params.get_output_ptr(blockIdx.x);
+    }
+    device::PDLWaitPrimary<kPDLFinal>();
+  }
+
+  // page-table transform pass (gathers kept out of the hot scatter loop),
+  // then trigger the dependent kernel only after the full output is written.
+  device::PDLTriggerSecondary<kPDL>();
+  __syncthreads();
+  problem_transform(problem, params.get_output_ptr(blockIdx.x));
+}
+
+template <bool kPDL>
+CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
+  impl::enable_smem_spilling();
+  auto problem = params.problem(blockIdx.x);
+  __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
+  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  __shared__ int32_t topk_indices[kMaxTopK];
+  problem.out = topk_indices;
+
+  // randomly elect one worker rank to avoid workload imbalance
+  const auto worker_rank = blockIdx.x % kClusterSize;
+
+  // for small batch, we will fuse in the cluster case
+  if (problem.seq_len <= kReg4MaxSeqLen) {
+    if (blockIdx.y == worker_rank) Register4::forward<kPDL>(problem, &smem);
+  } else if (problem.seq_len <= params.cluster_floor) {
+    if (blockIdx.y == worker_rank) Streaming::forward<kPDL>(problem, &smem);
+  } else {
+    auto cluster = cooperative_groups::this_cluster();
+    problem.out = cluster.map_shared_rank(topk_indices, worker_rank);
+    Cluster::forward<kPDL>(problem, &smem);  // write to peer's output shared memory
+    cluster.sync();
+  }
+
+  device::PDLWaitPrimary<kPDL>();
+  __syncthreads();
+  if (blockIdx.y == worker_rank) problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
@@ -180,22 +231,25 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
     PlanItem* __restrict__ metadata,  // [0]=GlobalMetadata, [1+i]=PlanItem
     const uint32_t batch_size,
     const uint32_t static_cluster_threshold) {
-  // Candidate thresholds (strictly increasing). Route items with seq_len > T to
-  // the cluster pool only while the routed count stays <= max_batch_size, chosen
-  // as the pool size: up to a full one-wave pool of long items is worth
-  // clustering (measured faster than streaming for small batch on B200), but
-  // beyond that the pool would serial-loop and one-block-per-element streaming
-  // wins. (Plan is tunable; this aligns the routing cap with the pool.)
+  // Candidate (threshold T_j, cap_j) pairs, T strictly increasing. The plan lowers
+  // cluster_threshold to T_j while #(items with seq_len > T_j) <= cap_j, so cap_j
+  // bounds how many long items go to the persistent pool. The pool runs N items in
+  // ceil(N / kNumPersistentClusters) waves; the longer the seq the more waves pay
+  // off (streaming a single block over a long item is very slow), so cap_j is the
+  // measured cluster-vs-streaming crossover (B200, occ2) and GROWS with T -- a flat
+  // cap = pool size only fits the shortest (~98K, one-wave) bucket. (Plan is tunable.)
   struct Pair {
     uint32_t threshold;
     uint32_t max_batch_size;
   };
   constexpr Pair kCandidates[] = {
-      {65536, kNumPersistentClusters},
-      {98304, kNumPersistentClusters},
-      {131072, kNumPersistentClusters},
-      {196608, kNumPersistentClusters},
-      {262144, kNumPersistentClusters},
+      {65536, 30},    // (65536,98304]:    ~1 pool wave, streams beyond 30
+      {98304, 48},    // (98304,131072]
+      {131072, 60},   // (131072,196608]
+      {196608, 80},   // (196608,262144]
+      {262144, 112},  // (262144,393216]
+      {393216, 128},  // (393216,inf):     longest -- worth many pool waves; a top
+                      // threshold here lets overloaded ~280-393K batches still stream
   };
   constexpr uint32_t kNumCandidates = std::size(kCandidates);
   static_assert(kCandidates[0].threshold == kClusterFloor);
@@ -316,6 +370,12 @@ struct CombinedTopKKernel {
     const auto max_seq_len = static_cast<uint32_t>(L.unwrap());
     const auto device = device_.unwrap();
 
+    // For batch <= kSmallBatchLowFloor the fused kernel is latency-bound (one 8-block
+    // cluster per element), so the 8-way split beats streaming from a lower seq:
+    // measured crossover ~32K for batch<=8 vs ~56K for batch 16-30 (at occ2). Larger
+    // batch keeps the 64K floor. The floor is chosen on the host per launch.
+    constexpr uint32_t kClusterFloorSmall = 32768;
+    constexpr uint32_t kSmallBatchLowFloor = 8;
     const auto params = TopKLaunchParams{
         .scores = static_cast<const float*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -326,28 +386,33 @@ struct CombinedTopKKernel {
         .page_table_stride = P.unwrap(),
         .topk = topk,
         .page_bits = page_bits,
+        .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
     };
 
-    const bool use_cluster = (max_seq_len > kClusterFloor) && (batch_size <= kClusterMaxBatch);
+    const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
+    constexpr bool kUsePDL = true;
     if (use_cluster) {
-      // Persistent cluster pool (bounded grid) handles the long items via the plan
-      // work list; the per-element kernel handles the short ones (skips long).
-      // Short items can be up to kClusterFloor, so the per-element kernel is level 2.
-      const uint32_t pool = batch_size < kNumPersistentClusters ? batch_size : kNumPersistentClusters;
-      LaunchKernel(dim3{pool, kClusterSize}, kBlockSize, device)
-          .enable_cluster(dim3{1, kClusterSize})
-          .enable_pdl(kUsePDL)(topk_persistent_cluster_kernel<kUsePDL>, params);
-      LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/true, /*kLevel=*/2>, params);
+      if (batch_size <= kNumPersistentClusters) {
+        LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+            .enable_cluster(dim3{1, kClusterSize})
+            .enable_pdl(kUsePDL)(topk_small_batch_kernel<kUsePDL>, params);
+      } else {
+        const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
+        LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
+            .enable_cluster(dim3{1, kClusterSize})
+            .enable_pdl(kUsePDL)(topk_persistent_cluster_kernel<kUsePDL>, params);
+        LaunchKernel(batch_size, kBlockSize, device)  //
+            .enable_pdl(kUsePDL)(topk_main_kernel<kUsePDL, /*kLevel=*/3>, params);
+      }
     } else if (max_seq_len <= kReg2MaxSeqLen) {
       LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/false, /*kLevel=*/0>, params);
+          .enable_pdl(kUsePDL)(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);
     } else if (max_seq_len <= kReg4MaxSeqLen) {
       LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/false, /*kLevel=*/1>, params);
+          .enable_pdl(kUsePDL)(topk_main_kernel<kUsePDL, /*kLevel=*/1>, params);
     } else {
       LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_kernel<kUsePDL, /*kSkipLong=*/false, /*kLevel=*/2>, params);
+          .enable_pdl(kUsePDL)(topk_main_kernel<kUsePDL, /*kLevel=*/2>, params);
     }
   }
 };

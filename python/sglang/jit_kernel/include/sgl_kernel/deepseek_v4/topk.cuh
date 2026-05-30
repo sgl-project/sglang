@@ -25,9 +25,8 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <cooperative_groups.h>
-
 #include <cfloat>
+#include <cooperative_groups.h>
 #include <cstdint>
 #include <limits>
 
@@ -35,8 +34,8 @@ namespace device::topk {
 
 namespace cg = cooperative_groups;
 
-/// Upstream uses `device::kWarpSize`; sgl_kernel calls it `kWarpThreads`.
-inline constexpr uint32_t kWarpSize = ::device::kWarpThreads;
+/// Upstream uses `kWarpSize`; sgl_kernel calls it `kWarpThreads`.
+inline constexpr uint32_t kWarpSize = kWarpThreads;
 
 /// PTX pragma that lets the compiler spill registers into otherwise-unused
 /// shared memory instead of local memory. The radix kernels run at occupancy 2
@@ -46,6 +45,36 @@ SGL_DEVICE void enable_smem_spilling() {
   asm(".pragma \"enable_smem_spilling\";");
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// Shared-memory storage sized/aligned for several impl `Smem` types
+// ---------------------------------------------------------------------------
+
+/// Compile-time max over a non-empty pack (avoids an <algorithm> dependency).
+template <typename T>
+constexpr T ct_max(T a) {
+  return a;
+}
+template <typename T, typename... Ts>
+constexpr T ct_max(T a, Ts... rest) {
+  const T m = ct_max(rest...);
+  return a > m ? a : m;
+}
+
+/// Static shared-memory buffer sized + aligned to hold any one of the given
+/// impl `Smem` types. A kernel that dispatches across several paths (e.g. the
+/// fused small-batch kernel runs either Streaming or Cluster; the main kernel
+/// runs any of Register2/Register4/Streaming) declares one
+/// `__shared__ MaxSmem<...> smem` and hands `&smem` to whichever forward() it
+/// calls -- instead of hand-picking "the largest" type and relying on it
+/// staying the largest. `&smem` converts to the `void*` the forwards expect;
+/// the buffer is aligned to the strictest member, so the cast is well-aligned.
+template <typename... Smems>
+struct MaxSmem {
+  static constexpr size_t kSize = ct_max(sizeof(Smems)...);
+  static constexpr size_t kAlign = ct_max(alignof(Smems)...);
+  alignas(kAlign) uint8_t storage[kSize];
+};
 
 // ---------------------------------------------------------------------------
 // Order-preserving float -> integer key extraction
@@ -59,7 +88,7 @@ SGL_DEVICE uint32_t extract_exact_bin(float x) {
 template <uint32_t kBits>
 SGL_DEVICE uint32_t extract_coarse_bin(float x) {
   static_assert(0 < kBits && kBits < 15);
-  const auto hx = device::cast<fp16_t>(x);
+  const auto hx = cast<fp16_t>(x);
   const uint16_t bits = *reinterpret_cast<const uint16_t*>(&hx);
   const uint16_t key = (bits & 0x8000) ? ~bits : bits | 0x8000;
   return key >> (16 - kBits);
@@ -81,7 +110,7 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   const auto to_val = [](uint32_t okey) -> float {
     const uint16_t ob = static_cast<uint16_t>(okey);
     const uint16_t hb = (ob & 0x8000) ? static_cast<uint16_t>(ob ^ 0x8000) : static_cast<uint16_t>(~ob);
-    return device::cast<float>(*reinterpret_cast<const fp16_t*>(&hb));
+    return cast<float>(*reinterpret_cast<const fp16_t*>(&hb));
   };
   // fp16 rounds to nearest, so the fp32 boundary is the midpoint between the fp16
   // value at this key and the next-lower fp16 value (ordered key - 1).
@@ -123,8 +152,8 @@ SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint3
 /// for `out` and (optionally) recording the raw index in `raw_out`.
 struct TopKProblem {
   const float* __restrict__ in;
-  int32_t* __restrict__ out;          // page_indices  [topk]
-  int32_t* __restrict__ raw_out;      // optional raw indices [topk]; nullptr if unused
+  int32_t* __restrict__ out;      // page_indices  [topk]
+  int32_t* __restrict__ raw_out;  // optional raw indices [topk]; nullptr if unused
   const int32_t* __restrict__ page_table;
   uint32_t topk;
   uint32_t seq_len;
@@ -140,16 +169,11 @@ struct TopKProblem {
   SGL_DEVICE void emit_invalid(uint32_t pos) const {
     out[pos] = -1;
   }
+  SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
+    if (raw_out != nullptr) raw_out[t] = raw;
+    out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
+  }
 };
-
-/// In-place page-table transform of one output slot + the optional raw side
-/// output. out[t] holds a raw index (or -1) on entry. The caller must barrier
-/// after all emit()s and before calling this.
-SGL_DEVICE void transform_output(const TopKProblem& p, uint32_t t) {
-  const auto raw = p.out[t];
-  if (p.raw_out != nullptr) p.raw_out[t] = raw;
-  if (raw >= 0) p.out[t] = page_to_indices(p.page_table, static_cast<uint32_t>(raw), p.page_bits);
-}
 
 // ---------------------------------------------------------------------------
 // Shared configuration + tie handling (exact radix select on the threshold bin)
@@ -327,29 +351,6 @@ struct TopKConfig {
 };
 
 // ---------------------------------------------------------------------------
-// Trivial path: seq_len <= topk -- output all indices, pad the rest with -1
-// ---------------------------------------------------------------------------
-
-struct TopKTrivial : TopKConfig {
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem problem) {
-    const auto tx = threadIdx.x;
-    device::PDLWaitPrimary<kUsePDL>();
-#pragma unroll
-    for (uint32_t i = 0; i < kTopKItems; ++i) {
-      const auto t = tx + i * kBlockSize;
-      if (t < problem.topk) {
-        if (t < problem.seq_len) {
-          problem.emit(t, t);
-        } else {
-          problem.emit_invalid(t);
-        }
-      }
-    }
-  }
-};
-
-// ---------------------------------------------------------------------------
 // Radix base: histogram storage + input iteration + threshold-bin search
 // ---------------------------------------------------------------------------
 
@@ -358,10 +359,10 @@ struct TopKRadixBase : TopKConfig {
   static constexpr uint32_t kVecSize = 4;
   static constexpr uint32_t kHistBits = kHistBits_;
   static constexpr uint32_t kHistSize = 1 << kHistBits;
-  using vec_t = device::AlignedVector<float, kVecSize>;
+  using vec_t = AlignedVector<float, kVecSize>;
 
   struct Smem {
-    using kHistVec = device::AlignedVector<uint32_t, kHistSize / kBlockSize>;
+    using kHistVec = AlignedVector<uint32_t, kHistSize / kBlockSize>;
     alignas(128) uint32_t count_eq;
     alignas(128) uint32_t count_gt;
     uint32_t threshold_bin;
@@ -469,7 +470,7 @@ struct TopKRegister : TopKRadixBase<12> {
     }
 
     __syncthreads();
-    device::PDLWaitPrimary<kUsePDL>();
+    PDLWaitPrimary<kUsePDL>();
 
     // A vector `vi` is fully in bounds iff vi < num_full; only full vectors are
     // vector-loaded (16B aligned, never straddling seq_len). The <kVecSize tail is
@@ -513,10 +514,12 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto collect = [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
-        if (pos < topk) [[likely]] problem.emit(pos, idx);
+        if (pos < topk) [[likely]]
+          problem.emit(pos, idx);
       } else if (val >= v_lo) {
         const auto count_eq = atomicAdd(&smem->count_eq, 1);
-        if (count_eq < kMaxNumTie) [[likely]] smem->tie_values[count_eq] = {val, idx};
+        if (count_eq < kMaxNumTie) [[likely]]
+          smem->tie_values[count_eq] = {val, idx};
       }
     };
 #pragma unroll
@@ -525,7 +528,8 @@ struct TopKRegister : TopKRadixBase<12> {
       const auto base = vi * kVecSize;
       if (vi >= num_full) break;
 #pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j) collect(local_vecs[i][j], base + j);
+      for (uint32_t j = 0; j < kVecSize; ++j)
+        collect(local_vecs[i][j], base + j);
     }
     if (tx >= kBlockSize - tail) {
       const uint32_t idx = tail_start + tx - (kBlockSize - tail);
@@ -565,7 +569,7 @@ struct TopKStreaming : TopKRegister<2> {
       smem->count_gt = 0;
     }
     __syncthreads();
-    device::PDLWaitPrimary<kUsePDL>();
+    PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
@@ -635,6 +639,7 @@ struct TopKCluster : TopKRadixBase<10> {
   // the persistent kernel does PDLWaitPrimary once before its item loop and a
   // cluster.sync() after each forward(). Writes raw indices to out; the kernel's
   // transform pass applies the page-table transform.
+  template <bool kUsePDL>
   SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -643,7 +648,7 @@ struct TopKCluster : TopKRadixBase<10> {
     const bool is_primary = (this_rank == 0);
 
     constexpr uint32_t kAlignElems = kWarpSize * kVecSize;
-    const uint32_t chunk_size = device::div_ceil(problem.seq_len, kClusterSize * kAlignElems) * kAlignElems;
+    const uint32_t chunk_size = div_ceil(problem.seq_len, kClusterSize * kAlignElems) * kAlignElems;
     const uint32_t chunk_start = min(this_rank * chunk_size, problem.seq_len);
     const uint32_t chunk_finish = min(chunk_start + chunk_size, problem.seq_len);
     const uint32_t local_seq_len = chunk_finish - chunk_start;
@@ -659,6 +664,7 @@ struct TopKCluster : TopKRadixBase<10> {
       smem->count_gt = 0;
     }
     __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram over this rank's contiguous chunk.
     for_each_input(problem.in, local_seq_len, [&](float val, uint32_t) {
@@ -749,15 +755,15 @@ struct TopKCluster : TopKRadixBase<10> {
           problem.emit(start_write + t, smem->tmp_out[t]);
         }
       }
-      return;
+    } else {
+      // Phase 4: Handle ties.
+      __syncthreads();
+      const auto above_count = smem->count_gt;
+      const auto equal_count = smem->count_eq;
+      const auto remain_topk = above_count < topk ? topk - above_count : 0;
+      const auto tie_count = min(equal_count, kMaxNumTie);
+      handle_tie(smem->tie_values, problem, above_count, tie_count, remain_topk, &smem->tie_handle_smem);
     }
-    // Phase 4: Handle ties.
-    __syncthreads();
-    const auto above_count = smem->count_gt;
-    const auto equal_count = smem->count_eq;
-    const auto remain_topk = above_count < topk ? topk - above_count : 0;
-    const auto tie_count = min(equal_count, kMaxNumTie);
-    handle_tie(smem->tie_values, problem, above_count, tie_count, remain_topk, &smem->tie_handle_smem);
   }
 };
 
