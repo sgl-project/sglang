@@ -33,7 +33,7 @@ export const DeepSeekV4Deployment = () => {
         { id: "gb300", label: "GB300", default: false },
         { id: "h200",  label: "H200",  default: false },
         { id: "h100",  label: "H100",  default: false },
-        { id: "h20",   label: "H20",   default: false, subtitle: "alias of H100" },
+        { id: "h20",   label: "H20",   default: false },
       ],
     },
     modelSize: {
