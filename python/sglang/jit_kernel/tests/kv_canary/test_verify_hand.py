@@ -966,7 +966,7 @@ class TestViolationRing:
         buf_pair = _buf_pair()
         _stamp_head(buf_pair, slot_idx=1, token=1)
 
-        for tag in (CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.TAIL_V_SWA):
+        for tag in (CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.SWEEP_V_SWA):
             plan_pair = _plan_pair_single(slot_idx=1, position=99)
             cuda_log, _ = run_verify_diff(
                 buf_pair=buf_pair, plan_pair=plan_pair, kernel_kind=tag
