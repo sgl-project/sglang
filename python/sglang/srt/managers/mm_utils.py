@@ -31,6 +31,38 @@ from sglang.utils import logger
 
 _is_npu = is_npu()
 
+
+class MultimodalEmbeddingError(RuntimeError):
+    """A multimodal item failed to embed (vision/audio tower raised).
+
+    Raised by the embedding layer when a per-batch encoder call raises a
+    RuntimeError so the scheduler can catch and translate to per-request
+    aborts instead of letting the exception kill the scheduler subprocess
+    (and with it every unrelated in-flight request in the batch).
+
+    Attributes:
+        modality:        The modality whose embedder failed (e.g. IMAGE).
+        num_items:       Number of mm items in the failing batch (across all
+                         requests sharing this forward).
+        original_error:  The original RuntimeError raised by the encoder.
+    """
+
+    def __init__(
+        self,
+        modality: "Modality",
+        num_items: int,
+        original_error: BaseException,
+    ):
+        self.modality = modality
+        self.num_items = num_items
+        self.original_error = original_error
+        super().__init__(
+            f"Multimodal {modality.name.lower()} embedding failed "
+            f"({num_items} item(s) in batch): "
+            f"{type(original_error).__name__}: {original_error}"
+        )
+
+
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
@@ -851,16 +883,43 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
-            embedding, mask, input_ids = get_embedding_and_mask(
-                data_embedding_func=embedder,
-                embedding_items=items,
-                placeholder_tensor=placeholder_tensor,
-                input_ids=input_ids,
-                items_size=items_size,
-                prefix_length=extend_prefix_lens,
-                extend_length=extend_seq_lens,
-                items_offset_list=items_offsets,
-            )
+            try:
+                embedding, mask, input_ids = get_embedding_and_mask(
+                    data_embedding_func=embedder,
+                    embedding_items=items,
+                    placeholder_tensor=placeholder_tensor,
+                    input_ids=input_ids,
+                    items_size=items_size,
+                    prefix_length=extend_prefix_lens,
+                    extend_length=extend_seq_lens,
+                    items_offset_list=items_offsets,
+                )
+            except MultimodalEmbeddingError:
+                # Already typed (e.g. raised by a nested mm encoder); propagate.
+                raise
+            except RuntimeError as e:
+                # A single malformed multimodal item (e.g. a non-RGB image
+                # that survives the loader, an oversize/short video frame,
+                # a bad audio sample rate, ...) would otherwise propagate up
+                # through forward_batch_generation -> run_batch -> the
+                # scheduler event loop, where the unhandled exception
+                # SIGQUITs the scheduler subprocess and takes every other
+                # in-flight request in the batch down with it. Re-raise as
+                # a typed error so the scheduler can catch it, abort the
+                # offending batch with an attributable finished_reason,
+                # and keep serving the next batch instead of restarting
+                # the pod.
+                logger.exception(
+                    "Multimodal %s embedding raised; "
+                    "translating to MultimodalEmbeddingError so the "
+                    "scheduler can isolate the failing batch.",
+                    modality.name.lower(),
+                )
+                raise MultimodalEmbeddingError(
+                    modality=modality,
+                    num_items=len(items),
+                    original_error=e,
+                ) from e
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
