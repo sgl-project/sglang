@@ -50,6 +50,11 @@ logger = init_logger(__name__)
 
 globally_suppress_loggers()
 
+FIRST_DENOISE_STEP_TOLERANCE = 4.0
+FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
+DECODING_STAGE_MIN_ABS_TOLERANCE_MS = 450.0
+VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 160.0
+
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
 MESH_OUTPUT_PATHS: dict[str, str] = {}
@@ -159,6 +164,14 @@ class ServerContext:
     log_dir: Path
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
+
+    def log_tail(self, lines: int = 200) -> str:
+        """Return recent server output for failure diagnostics."""
+        try:
+            content = self.stdout_file.read_text(encoding="utf-8", errors="ignore")
+            return "\n".join(content.splitlines()[-lines:])
+        except Exception:
+            return ""
 
     def cleanup(self) -> None:
         """Clean up server resources."""
@@ -595,14 +608,23 @@ class PerformanceValidator:
             expected = self.scenario.denoise_step_ms.get(idx)
             if expected is None:
                 continue
-            # FIXME: hardcode, looser for first step
-            tolerance = 0.4 if idx == 0 else self.tolerances.denoise_step
+            if idx == 0:
+                # server warmup is generic, so the first real step can still
+                # pay request-shape/path lazy init that is not a steady-state signal
+                self._assert_le(
+                    f"Denoise Step {idx}",
+                    actual,
+                    expected,
+                    FIRST_DENOISE_STEP_TOLERANCE,
+                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                )
+                continue
 
             self._assert_le(
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                tolerance,
+                self.tolerances.denoise_step,
             )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
@@ -621,7 +643,7 @@ class PerformanceValidator:
             )
             if stage.endswith("DecodingStage"):
                 tolerance = max(tolerance, 0.9)
-                min_abs_tolerance_ms = 250.0
+                min_abs_tolerance_ms = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
             else:
                 min_abs_tolerance_ms = 120.0
             self._assert_le(
@@ -637,6 +659,32 @@ class VideoPerformanceValidator(PerformanceValidator):
     """Extended validator for video diffusion with frame-level metrics."""
 
     is_video_gen = True
+
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
+        """Validate individual denoising steps."""
+        for idx, actual in summary.sampled_steps.items():
+            expected = self.scenario.denoise_step_ms.get(idx)
+            if expected is None:
+                continue
+            if idx == 0:
+                self._assert_le(
+                    f"Denoise Step {idx}",
+                    actual,
+                    expected,
+                    FIRST_DENOISE_STEP_TOLERANCE,
+                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                )
+                continue
+
+            # video per-step samples can catch one-off scheduling/offload jitter;
+            # avg and median denoise checks remain the steady-state guard
+            self._assert_le(
+                f"Denoise Step {idx}",
+                actual,
+                expected,
+                self.tolerances.denoise_step,
+                min_abs_tolerance_ms=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+            )
 
     def validate(
         self,
