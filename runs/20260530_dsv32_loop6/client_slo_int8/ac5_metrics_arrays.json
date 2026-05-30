@@ -2,11 +2,12 @@
  "_description": "Exact per-request AC-5 metrics extracted from the gitignored benchmark JSONLs so the client-SLO percentiles recompute from committed files.",
  "percentile_method": "numpy.percentile(arr, q) (linear interpolation); reproduces sglang bench_serving stored summary fields exactly.",
  "tpot_formula_ms": "1000 * sum(itls[i]) / (output_lens[i] - 1)  (sglang formula; reproduces stored median_tpot_ms exactly)",
+ "itl_source": "ac5_itl_flat_ms.json (flattened per-token ITL in ms, sorted ascending; reproduces stored median/p95/p99 itl exactly)",
  "ttft_units": "seconds",
  "tpot_units": "ms",
  "itl_units": "ms",
  "build_command": "python3 ac5_metrics_tool.py --build",
- "verify_command": "python3 ac5_metrics_tool.py --verify  (recomputes from this file alone, no JSONL)",
+ "verify_command": "python3 ac5_metrics_tool.py --verify  (recomputes TTFT/TPOT/TPS/ITL from committed files; exits 1 on any mismatch)",
  "source_jsonls": {
   "c16": {
    "path": "../../../development/results/double_sparsity_gsp_isl4096_osl512_c16_t1.jsonl",
@@ -29,7 +30,6 @@
    "completed": 320,
    "achieved_concurrency": 16,
    "duration_s": 829.5528535982594,
-   "seed": null,
    "errors_nonempty_count": 0,
    "errors_all_empty": true,
    "ttfts_s": [
@@ -1320,13 +1320,7 @@
     512,
     512
    ],
-   "itl_all_tokens": {
-    "count": 163323,
-    "recompute": "flatten itls from the checksummed source JSONL; summary below matches np.percentile of that flat array",
-    "median_ms": 56.57258443534374,
-    "p95_ms": 58.385821990668774,
-    "p99_ms": 58.694540951400995
-   },
+   "itl_flat_count": 163323,
    "stored_summary_ms": {
     "median_ttft_ms": 12465.5099385418,
     "p99_ttft_ms": 12788.82867012173,
@@ -1341,7 +1335,6 @@
    "completed": 320,
    "achieved_concurrency": 32,
    "duration_s": 692.664030758664,
-   "seed": null,
    "errors_nonempty_count": 0,
    "errors_all_empty": true,
    "ttfts_s": [
@@ -2632,13 +2625,7 @@
     512,
     512
    ],
-   "itl_all_tokens": {
-    "count": 163334,
-    "recompute": "flatten itls from the checksummed source JSONL; summary below matches np.percentile of that flat array",
-    "median_ms": 87.0051784440875,
-    "p95_ms": 87.60043568909168,
-    "p99_ms": 87.94353095814586
-   },
+   "itl_flat_count": 163334,
    "stored_summary_ms": {
     "median_ttft_ms": 24712.342906277627,
     "p99_ttft_ms": 25497.41500427015,
@@ -2653,7 +2640,6 @@
    "completed": 320,
    "achieved_concurrency": 64,
    "duration_s": 713.1484881537035,
-   "seed": null,
    "errors_nonempty_count": 0,
    "errors_all_empty": true,
    "ttfts_s": [
@@ -3944,13 +3930,7 @@
     512,
     512
    ],
-   "itl_all_tokens": {
-    "count": 163304,
-    "recompute": "flatten itls from the checksummed source JSONL; summary below matches np.percentile of that flat array",
-    "median_ms": 103.14017487689853,
-    "p95_ms": 103.80089967511594,
-    "p99_ms": 105.26790376752616
-   },
+   "itl_flat_count": 163304,
    "stored_summary_ms": {
     "median_ttft_ms": 92194.141051732,
     "p99_ttft_ms": 111159.63970512152,

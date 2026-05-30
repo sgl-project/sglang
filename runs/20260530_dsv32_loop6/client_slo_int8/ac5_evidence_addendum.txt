@@ -1,8 +1,9 @@
 # AC-5 evidence addendum — human-readable per-conc distributions/percentiles.
-# EXACT recomputation source: ac5_metrics_arrays.json (exact per-request arrays + source JSONL SHA256).
-#   Run `python3 ac5_metrics_tool.py --verify` to recompute every TTFT/TPOT/TPS percentile from the
-#   committed JSON alone (asserts recomputed == stored; PASS at all conc). This file is the readable view;
-#   raw *.jsonl are gitignored, and the numbers below verify without the 4 MB JSONLs.
+# EXACT recomputation sources: ac5_metrics_arrays.json (per-request ttfts/tpots/input_lens/output_lens +
+#   source JSONL SHA256) and ac5_itl_flat_ms.json (flattened per-token ITL, ms).
+#   Run `python3 ac5_metrics_tool.py --verify` to recompute TTFT, TPOT/TPS, AND ITL percentiles from the
+#   committed files alone + sanity checks; it is FAIL-CLOSED (exit 1 on any mismatch; exit 0 + PASS at all
+#   conc here). This file is the readable view; raw *.jsonl are gitignored and not needed to verify the numbers.
 # Run: DS int8 @ mem_fraction_static=0.7, radix-on; gsp 4096 ISL/512 OSL; 1 trial WARMUP=0/WINDOW=60.
 # Source JSONL (gitignored): development/results/double_sparsity_gsp_isl4096_osl512_c{16,32,64}_t1.jsonl
 # Sidecar (tracked): client_slo_int8/double_sparsity_gsp_isl4096_osl512_c{16,32,64}_t1.jsonl.meta.json
