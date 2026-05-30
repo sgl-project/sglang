@@ -1335,6 +1335,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
+        # Defend against the silent-NaN failure mode reported in
+        # sgl-project/sglang#26745: a VLM checkpoint missing the
+        # visual encoder weights leaves those parameters at the
+        # ``torch.empty()`` allocation, which the warmup pass then
+        # propagates as NaN through the prefix-cached KV pool — every
+        # subsequent chat request returns garbage, with no error in
+        # the logs. Fail fast here, *before* downstream consumers
+        # (FP8 KV-cache scale loading, sliding-window probing,
+        # draft-model setup, runtime quant post-processing) can
+        # surface their own opaque error against an already-poisoned
+        # model. Disable only when knowingly serving a partial
+        # checkpoint via ``SGLANG_SKIP_WEIGHT_VALIDATION`` (e.g. RL
+        # warm-up where weights stream in later).
+        if not envs.SGLANG_SKIP_WEIGHT_VALIDATION.get():
+            sample, total = _validate_loaded_weights(self.model)
+            if total > 0:
+                raise RuntimeError(
+                    f"Weight loading validation failed: at least "
+                    f"{total} parameter(s) appear to hold uninitialized "
+                    f"memory (NaN / Inf / |x| > "
+                    f"{_UNINITIALIZED_MAGNITUDE_THRESHOLD:.0e}). This "
+                    f"usually means the checkpoint at "
+                    f"{self.model_config.model_path!r} is missing "
+                    f"weights for one or more submodules. Affected "
+                    f"sample (showing up to {len(sample)} of {total}): "
+                    f"{sample}. Set SGLANG_SKIP_WEIGHT_VALIDATION=1 "
+                    f"to bypass if this is intentional."
+                )
+
         if not self.is_draft_worker:
             get_offloader().post_init()
 
@@ -1398,6 +1427,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+
         if self.server_args.debug_tensor_dump_output_folder is not None:
             dump_folder = self.server_args.debug_tensor_dump_output_folder
             if self.spec_algorithm.is_eagle():
@@ -3535,6 +3565,184 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
         return output
+
+
+# Magnitude threshold above which a float element is treated as a
+# torch.empty() byte-pattern artifact rather than a legitimate
+# post-load weight value. Centralized so tests, error messages, and
+# the heuristic itself reference one source of truth.
+_UNINITIALIZED_MAGNITUDE_THRESHOLD: float = 1e30
+
+# Per-tensor element budget for the bounded-sampling heuristic. The
+# detector inspects up to this many elements per parameter (taken as a
+# 1D view); set high enough that uninitialized-memory artifacts (which
+# are dense in practice — ~50% of decoded float bytes are NaN/Inf) are
+# caught with overwhelming probability, low enough that the total scan
+# is bounded regardless of model size.
+_UNINITIALIZED_SAMPLE_BUDGET: int = 256
+
+
+def _bytes_look_uninitialized(sample: torch.Tensor) -> torch.Tensor:
+    """Boolean tensor predicate: ``True`` where bytes look uninitialized.
+
+    Combines the three signatures of a ``torch.empty()`` byte pattern
+    decoded as a float — ``NaN``, ``Inf``, or magnitude above
+    :data:`_UNINITIALIZED_MAGNITUDE_THRESHOLD` — into a single
+    elementwise predicate evaluated on-device. Returns the predicate
+    tensor; the caller decides when to ``any().item()`` so that several
+    samples can be reduced together in one host-device sync.
+
+    ``~torch.isfinite(x)`` covers NaN and Inf in one op; the magnitude
+    check then catches the (rare) finite-but-absurd values.
+    """
+    return ~torch.isfinite(sample) | (sample.abs() > _UNINITIALIZED_MAGNITUDE_THRESHOLD)
+
+
+def _has_uninitialized_signature(tensor: torch.Tensor) -> bool:
+    """Heuristic detector for ``torch.empty()``-style uninitialized memory.
+
+    Parameter slots that the checkpoint failed to fill keep whatever bit
+    pattern ``torch.empty()`` allocated. On floating dtypes those random
+    bytes are decoded as one of: ``NaN``, ``Inf``, or values whose
+    magnitude is far outside any sane post-load weight range. The trio
+    is the cheapest signature available without tracking which keys
+    came from ``load_weights()``.
+
+    Bounded sampling. Only the first :data:`_UNINITIALIZED_SAMPLE_BUDGET`
+    elements of the flattened tensor are inspected — uninitialized
+    memory artifacts are dense (NaN/Inf typically occupy ~50% of the
+    decoded float bytes), so a few hundred samples catch the failure
+    mode with overwhelming probability, and the per-tensor cost stays
+    bounded on hundred-billion-parameter models.
+
+    Single host-device sync. The three predicates (NaN, Inf, magnitude)
+    are fused into one elementwise op via :func:`_bytes_look_uninitialized`,
+    so the call costs exactly one ``.any().item()`` synchronization.
+
+    Args:
+        tensor: A floating-point tensor (the caller is expected to filter).
+
+    Returns:
+        ``True`` iff the sampled prefix contains ``NaN``/``Inf`` or any
+        element with absolute magnitude above
+        :data:`_UNINITIALIZED_MAGNITUDE_THRESHOLD` (the heuristic
+        suggested in sgl-project/sglang#26745).
+    """
+    if tensor.numel() == 0:
+        return False
+    with torch.no_grad():
+        flat = tensor.detach().reshape(-1)
+        sample = flat[:_UNINITIALIZED_SAMPLE_BUDGET]
+        return bool(_bytes_look_uninitialized(sample).any().item())
+
+
+def _validate_loaded_weights(
+    model: torch.nn.Module, max_report: int = 10
+) -> Tuple[List[str], int]:
+    """Heuristic detector for parameters left uninitialized by the checkpoint.
+
+    Walks ``model.named_modules()`` and inspects every floating-point
+    parameter that each module owns directly (via
+    ``named_parameters(recurse=False)``); ``recurse=False`` ensures
+    each parameter is sampled exactly once even though
+    ``named_modules()`` visits non-leaf containers as well — non-leaf
+    modules that hold their own ``torch.empty`` parameters (e.g. some
+    decoder layers that mix child sub-modules with directly owned
+    expert weights) are still inspected, while their children's
+    params are not re-inspected at the parent level. ``meta`` tensors
+    and non-floating dtypes (quantized int4/int8 weights) are skipped
+    because they don't carry the ``torch.empty()`` NaN-bit signature
+    reliably.
+
+    Two-pass batched check. Pass 1 collects a bounded prefix sample of
+    every candidate parameter, groups samples by ``(device, dtype)``,
+    concatenates each group, and runs the predicate once per group.
+    The 99.9% common case (no uninitialized params) costs a single
+    host-device sync per ``(device, dtype)`` tuple — typically one or
+    two — regardless of how many parameters the model has. Pass 2 only
+    runs when a group flips: it falls back to per-parameter inspection
+    inside that group to identify the exact culprits, so the slow path
+    still produces precise error messages.
+
+    Per parameter, the inspection is :func:`_has_uninitialized_signature`
+    over a bounded prefix (see that function's docstring), so per-tensor
+    cost is bounded by :data:`_UNINITIALIZED_SAMPLE_BUDGET` regardless
+    of parameter shape — sub-second even on hundred-billion parameter
+    VLMs.
+
+    The detector is intentionally a heuristic; it deliberately trades
+    precision for speed. Its job is to fail-fast on the obvious
+    "checkpoint missing a whole submodule" case (the silent NaN
+    corruption pattern reported in sgl-project/sglang#26745), not to
+    validate weight correctness. A precise contract via
+    ``load_weights() -> set[str]`` is RFC #24703; this heuristic
+    remains useful as defense-in-depth even after that lands.
+
+    Args:
+        model: The fully loaded ``torch.nn.Module``.
+        max_report: Cap on the number of offending parameter names
+            returned (the running total is reported separately so the
+            caller can say "at least N" rather than truncating
+            silently).
+
+    Returns:
+        ``(sample, total)`` where ``sample`` is a list of dotted
+        parameter names that look uninitialized, truncated at
+        ``max_report``, and ``total`` is the running count of all
+        offenders the walk found.
+    """
+    # Pass 1 — collect prefix samples in walk order; the order also
+    # determines which culprits land in ``sample`` first when the
+    # cap is hit, which mirrors how reviewers typically read the
+    # report (top-of-tree errors are usually the actionable ones).
+    candidates: List[Tuple[str, torch.Tensor]] = []
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if not param.dtype.is_floating_point:
+                continue
+            if param.is_meta:
+                continue
+            if param.numel() == 0:
+                continue
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            with torch.no_grad():
+                flat = param.detach().reshape(-1)
+                candidates.append((full_name, flat[:_UNINITIALIZED_SAMPLE_BUDGET]))
+
+    if not candidates:
+        return [], 0
+
+    # Pass 2 — group by (device, dtype) so concatenation is a free
+    # buffer-copy with no implicit cast or H2D transfer. Each group
+    # gets one ``.any().item()`` sync; in the clean case the whole
+    # model collapses to one or two syncs total.
+    groups: (
+        "defaultdict[Tuple[torch.device, torch.dtype], List[Tuple[str, torch.Tensor]]]"
+    ) = defaultdict(list)
+    for name, prefix in candidates:
+        groups[(prefix.device, prefix.dtype)].append((name, prefix))
+
+    sample_names: List[str] = []
+    total = 0
+    for entries in groups.values():
+        prefixes = [p for _, p in entries]
+        with torch.no_grad():
+            combined = torch.cat(prefixes)
+            if not bool(_bytes_look_uninitialized(combined).any().item()):
+                continue
+            # Slow path: this group has at least one offender. Walk
+            # entries individually to pin the exact culprits. The
+            # per-entry call is the single-sync version of
+            # ``_bytes_look_uninitialized`` and only runs in failure
+            # cases, so the typical clean-startup cost is unaffected.
+            for name, prefix in entries:
+                if not bool(_bytes_look_uninitialized(prefix).any().item()):
+                    continue
+                total += 1
+                if len(sample_names) < max_report:
+                    sample_names.append(name)
+    return sample_names, total
+    return sample, total
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

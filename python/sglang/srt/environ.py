@@ -199,6 +199,14 @@ class Envs:
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    # Skip the post-load NaN/Inf scan that detects parameters left
+    # uninitialized by the checkpoint (i.e. still holding the
+    # ``torch.empty()`` allocation). Set to ``True`` only when knowingly
+    # serving a partial checkpoint where uninitialized weights are
+    # expected to be filled in later (e.g. RL training warm-up). The
+    # validator is sample-based (one floating param per leaf module) so
+    # the cost is O(number of modules), not O(parameter count).
+    SGLANG_SKIP_WEIGHT_VALIDATION = EnvBool(False)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
