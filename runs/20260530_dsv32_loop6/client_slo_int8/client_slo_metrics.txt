@@ -1,0 +1,12 @@
+# AC-5 client-SLO metrics (DS int8 @ mem_fraction_static=0.7, radix-on; gsp 4096 ISL/512 OSL; 1 trial, WARMUP=0/WINDOW=60; completed=320/conc)
+# SLO: P99 TTFT < 22.0 s AND >= 30 TPS/req. Loop-5 baseline TTFT 57.7/132.9/292.0 s; TPS 34.0/33.9/33.9.
+ conc  achieved completed  med_ISL  P99_TTFT_s  med_TTFT_s  min_TTFT_s  med_TPOT_ms  perReq_TPS out_tok_tput  radix_on
+   16      16.0       320     4295        12.8        12.5         1.3         56.8        17.6        197.5      True
+   32      32.0       320     4276        25.5        24.7         0.7         87.1        11.5        236.5      True
+   64      60.1       320     4274       111.2        92.3         1.4        108.1         9.3        229.7      True
+
+# Attribution (ReqTimeStats, all-conc aggregate, N=959, excl HEALTH_CHECK):
+#   queue_duration (admission-wait): median 10.5s, p99 98.5s, max 100.2s
+#   forward_duration (prefill+decode): median 55.4s, p99 82.5s, max 83.2s
+#   prefill-only floor (min TTFT/conc): ~1.3 / 0.7 / 1.4 s  => residual TTFT is queue/throughput-bound, not KV-pool-admission (64x4608=295K < 396K pool).
+# Steady decode (server Decode-batch log @ conc64): #running-req 19-20, gen ~277 tok/s => ~14 tok/s/req (decode-batch growth from restored admission lowers per-req TPS).
