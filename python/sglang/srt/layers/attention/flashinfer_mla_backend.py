@@ -204,6 +204,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_chunk_kv = (
             not skip_prefill
             and get_global_server_args().disaggregation_mode != "decode"
@@ -380,7 +384,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+        seq_lens_sum = seq_lens.sum().item()
+        seq_lens_cpu = seq_lens.cpu()
+
         if forward_mode.is_decode_or_idle():
+            # Decode: create wrapper, run the initial full begin_forward (False),
+            # then install the fast plan.  After that, call replay so the
+            # data-update path (update(True)) is also exercised during capture.
             decode_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
                 use_cuda_graph=True,
@@ -390,8 +400,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_len_arr=self.cuda_graph_kv_lens[:num_tokens],
                 backend="auto",
             )
-
-            seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
                 req_pool_indices,
                 seq_lens,
@@ -402,9 +410,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrapper
             self.forward_metadata = DecodeMetadata(decode_wrapper)
+            # fast_mla_decode_plan requires _cached_module set by the initial
+            # begin_forward above; install it only after that call completes.
             decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
-        elif forward_mode.is_target_verify():
-            verify_wrapper = BatchMLAPagedAttentionWrapper(
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            # Prefill: create wrapper and store — replay handles the update call.
+            prefill_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
                 use_cuda_graph=True,
                 qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
@@ -413,42 +424,21 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_len_arr=self.cuda_graph_kv_lens[:bs],
                 backend="auto",
             )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=verify_wrapper,
-                use_ragged=False,
-                spec_info=spec_info,
-            )
-            self.prefill_cuda_graph_metadata[bs] = verify_wrapper
-            self.forward_metadata = PrefillMetadata(verify_wrapper, False)
-        elif forward_mode.is_draft_extend():
-            draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                use_cuda_graph=True,
-                qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
-                kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                kv_len_arr=self.cuda_graph_kv_lens[:bs],
-                backend="auto",
-            )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=draft_extend_wrapper,
-                use_ragged=False,
-                spec_info=spec_info,
-            )
-            self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
-            self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrapper
+            self.forward_metadata = PrefillMetadata(prefill_wrapper, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
+
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -484,17 +474,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 **self.fast_decode_kwargs,
             )
-        elif forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
-                spec_info=spec_info,
-            )
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -544,11 +524,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, cache_loc, k, k_rope
-                    )
+                    self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -572,9 +550,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
+            k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -611,14 +587,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
                         k_rope,
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -636,9 +612,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-            q.dtype
-        )
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
 
         o = q_nope.new_empty(q_nope.shape)
         # Direct call to run without the wrapper
@@ -944,6 +918,7 @@ class FlashInferMLAMultiStepDraftBackend:
         self.max_context_len = self.attn_backends[0].max_context_len
 
         # Cached variables for generate_draft_decode_kv_indices
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
 
@@ -961,7 +936,7 @@ class FlashInferMLAMultiStepDraftBackend:
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
-            forward_batch.req_to_token_pool.req_to_token,
+            self.req_to_token_pool.req_to_token,
             forward_batch.seq_lens,
             kv_indices_buffer,
             self.kv_indptr,

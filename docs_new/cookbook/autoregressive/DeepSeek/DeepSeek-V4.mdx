@@ -35,7 +35,7 @@ tag: NEW
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.6T</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>high-capacity: B200 8 GPU / GB200 8 GPU (2 nodes) / GB300 4 GPU / H200 8 GPU(fp4)/16 GPU(fp8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>high-capacity: B200 8 GPU / GB200 8 GPU (2 nodes) / GB300 4 GPU / H200 8 GPU (FP4) or 16 GPU (SGLang FP8)</td>
     </tr>
   </tbody>
 </table>
@@ -120,7 +120,7 @@ The generator currently picks values on the **conservative** side (mirroring an 
 **Hopper (H200) note**
 
 We provide two different options for running DeepSeek-V4 models on Hopper devices (H200)
-- Original FP4 checkpoints: To run original FP4 checkpoints, we provide two different options for w4a16 MoE kernels: Marlin (`--moe-runner-backend marlin`) and Flashinfer (`--moe-runner-backend flashinfer_mxfp4). For this variant we only support Tensor Parallelism. Complete Pro model can be run on a single H200 node with this option.
+- Original FP4 checkpoints: To run original FP4 checkpoints, we provide two different options for w4a16 MoE kernels: Marlin (`--moe-runner-backend marlin`) and Flashinfer (`--moe-runner-backend flashinfer_mxfp4`). For this variant we only support Tensor Parallelism. Complete Pro model can be run on a single H200 node with this option.
 - Converted FP8 checkpoints: We also provide pre-converted FP8 checkpoints (`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`), which support more parallelism and features.
 
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
@@ -145,8 +145,8 @@ Two variants are exposed:
   (~89.5 GPQA on Pro).
 
 Notes:
-- MegaMoE is **not** supported on Hopper (H100 / H200) nor on the `low-latency` / `cp` settings. When running MegaMoE, don't set `--moe-runner-backend` manually.
-- Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space. (recommended: 4096 for balanced, 8320 for max-throughput).
+- MegaMoE is **not** supported on Hopper (H100 / H200) nor on the `low-latency` / `balanced` / `cp` settings — it is only wired into the `max-throughput` recipe on Blackwell. When running MegaMoE, don't set `--moe-runner-backend` manually.
+- Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space. (recommended: 8320 for max-throughput).
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
@@ -182,7 +182,7 @@ curl http://localhost:30000/v1/chat/completions \
 
 Enable the `deepseek-v4` reasoning parser (check the box in the [command panel above](#3-model-deployment)) to separate thinking from the final answer into `reasoning_content` vs `content`.
 
-**Streaming with Thinking Process:**
+<Accordion title="Streaming with Thinking Process (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -227,17 +227,36 @@ for chunk in response:
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
-Pending update — replace with real server output after deployment.
+We are asked: "What is 15% of 240?" This is a simple percentage problem. I need to provide a step-by-step solution. The user wants the solution explained step by step. I'll calculate 15% of 240: 0.15 * 240 = 36. I'll break it down into steps: understand what percent means, convert percentage to decimal or fraction, then multiply. I'll present the answer clearly.</think>To find 15% of 240, follow these steps:
+
+**Step 1: Understand the meaning of percent**
+"Percent" means "per hundred," so 15% means 15 out of every100, or \( \frac{15}{100} \).
+
+**Step2: Convert the percentage to a decimal or fraction**
+\( 15\% = \frac{15}{100} = 0.15 \)
+
+**Step3: Multiply by the given number**
+Multiply the decimal form by 240:
+\( 0.15 \times 240 \)
+
+**Step4: Perform the multiplication**
+\( 0.15 \times 240 = 36 \)
+
+**Answer:** 15% of 240 is **36**.
 ```
+
+</Accordion>
 
 #### 4.2.2 Tool Calling
 
 Enable the `deepseekv4` tool-call parser (check the box in the [command panel above](#3-model-deployment)) to surface structured tool calls via `message.tool_calls`.
 
-**Python Example (with Thinking Process):**
+<Accordion title="Python Example with Thinking Process">
 
 ```python Example
 from openai import OpenAI
@@ -313,11 +332,21 @@ for index, tool_call in sorted(tool_calls_accumulator.items()):
 print()
 ```
 
-**Output Example:**
+</Accordion>
+
+<Accordion title="Example Output">
 
 ```text Output
-Pending update — replace with real server output after deployment.
+The user wants to know the weather in Beijing. I'll use the get_weather function with Beijing as the location. I don't need to specify a unit, so I'll just use the default.</think>
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_weather">
+<｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>
 ```
+
+</Accordion>
 
 #### 4.2.3 HiCache (Hierarchical KV Caching)
 
@@ -332,68 +361,13 @@ For more details, see the [HiCache documentation](../../../docs/advanced_feature
 
 ## 5. Benchmark
 
-### 5.1 Speed Benchmark on Blackwell
+### 5.1 Accuracy Benchmark
 
-**Test Environment:**
+For accuracy benchmarking on DeepSeek-V4 models, please make sure that:
+- `SGLANG_DEFAULT_THINKING=1 SGLANG_REASONING_EFFORT=max` are set when launching model.
+- For GPQA and AIME25 benchmarks, run at least 16 turns to reduce randomness.
 
-- Hardware: NVIDIA B200 GPU (4x)
-- Model: DeepSeek-V4-Flash (FP4)
-- Tensor Parallelism: 4
-- sglang version: Pending update
-
-We use SGLang's built-in benchmarking tool to conduct performance evaluation on the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset. This dataset contains real conversation data and can better reflect performance in actual use scenarios. To simulate real-world usage patterns, we configure each request with 1024 input tokens and 1024 output tokens, representing typical medium-length conversations with detailed responses.
-
-#### 5.1.1 Latency-Sensitive Benchmark
-
-- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
-
-- Benchmark Command:
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 \
-  --port 30000 \
-  --model deepseek-ai/DeepSeek-V4-Flash \
-  --random-input-len 1024 \
-  --random-output-len 1024 \
-  --num-prompts 10 \
-  --max-concurrency 1
-```
-
-- **Test Results:**
-
-```text Output
-Pending update — replace with real bench_serving output after the latency run.
-```
-
-#### 5.1.2 Throughput-Sensitive Benchmark
-
-- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
-
-- Benchmark Command:
-
-```shell Command
-python3 -m sglang.bench_serving \
-  --backend sglang \
-  --host 127.0.0.1 \
-  --port 30000 \
-  --model deepseek-ai/DeepSeek-V4-Flash \
-  --random-input-len 1024 \
-  --random-output-len 1024 \
-  --num-prompts 1000 \
-  --max-concurrency 100
-```
-
-- **Test Results:**
-
-```text Output
-Pending update — replace with real bench_serving output after the throughput run.
-```
-
-### 5.2 Accuracy Benchmark
-
-#### 5.2.1 GSM8K Benchmark
+#### 5.1.1 GSM8K Benchmark
 
 - **Benchmark Command:**
 
@@ -402,47 +376,63 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
 ```
 
 - **Test Results:**
-  - DeepSeek-V4-Flash (FP4, Blackwell)
+  - DeepSeek-V4-Pro (FP4, B300, low-latency)
     ```
-    Pending update
+    Accuracy: 0.965
+    Invalid: 0.000
     ```
-  - DeepSeek-V4-Flash (FP8, Hopper)
+  - DeepSeek-V4-Pro (FP4, H200, low-latency)
     ```
-    Pending update
+    Accuracy: 0.975
+    Invalid: 0.000
     ```
 
-#### 5.2.2 MMLU Benchmark
+#### 5.1.2 GPQA Diamond Benchmark
 
-- **Benchmark Command:**
+For GPQA Diamond benchmark, we recommend applying [sgl-eval](https://github.com/sgl-project/sgl-eval) as the benchmark tool.
 
 ```shell Command
-cd sglang
-bash benchmark/mmlu/download_data.sh
-python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 30000
+# Install
+pip install git+https://github.com/sgl-project/sgl-eval
+
+# For Flash model, reference accuracy: 88.1%
+sgl-eval run gpqa --model deepseek-ai/DeepSeek-V4-Flash --api-key <api-key> --n-repeats 16 --max-tokens 200000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
+
+# For Pro model, reference accuracy: 90.1%
+sgl-eval run gpqa --model deepseek-ai/DeepSeek-V4-Pro --api-key <api-key> --n-repeats 16 --max-tokens 400000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
 ```
 
-- **Test Results:**
-  - DeepSeek-V4-Flash (FP4, Blackwell)
-    ```
-    Pending update
-    ```
-  - DeepSeek-V4-Flash (FP8, Hopper)
-    ```
-    Pending update
-    ```
+#### 5.1.3 AIME25 Benchmark
 
-### 5.3 Speed Benchmark on Hopper
+For AIME25 benchmark, we recommend applying [sgl-eval](https://github.com/sgl-project/sgl-eval) as the benchmark tool.
+
+```shell Command
+# Install
+pip install git+https://github.com/sgl-project/sgl-eval
+
+# For Flash model, reference accuracy: ~95%
+sgl-eval run aime25 --model deepseek-ai/DeepSeek-V4-Flash --api-key <api-key> --n-repeats 16 --max-tokens 200000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
+
+# For Pro model, reference accuracy: ~97.5%
+sgl-eval run aime25 --model deepseek-ai/DeepSeek-V4-Pro --api-key <api-key> --n-repeats 16 --max-tokens 400000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
+```
+
+### 5.2 Speed Benchmark
+
+We use SGLang's built-in benchmarking tool with its `random` dataset — real prompts sampled from [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) and then truncated/padded to a controlled length. This dataset contains real conversation data and can better reflect performance in actual use scenarios. To simulate real-world usage patterns, we configure each request with 1024 input tokens and 1024 output tokens, representing typical medium-length conversations with detailed responses.
+
+#### 5.2.1 Hopper
 
 **Test Environment:**
 
 - Hardware: NVIDIA H200 GPU (4x)
-- Model: DeepSeek-V4-Flash (FP8)
+- Model: DeepSeek-V4-Flash (FP4)
 - Tensor Parallelism: 4
-- sglang version: Pending update
+- sglang version: 0.5.12
 
-#### 5.3.1 Latency-Sensitive Benchmark
+##### Latency-Sensitive Benchmark
 
-- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- **Model Deployment Command:** H200 · DeepSeek-V4-Flash · FP4 · Low-Latency. See the [command panel above](#3-model-deployment).
 
 - Benchmark Command:
 
@@ -452,6 +442,7 @@ python3 -m sglang.bench_serving \
   --host 127.0.0.1 \
   --port 30000 \
   --model deepseek-ai/DeepSeek-V4-Flash \
+  --dataset-name random \
   --random-input-len 1024 \
   --random-output-len 1024 \
   --num-prompts 10 \
@@ -461,12 +452,49 @@ python3 -m sglang.bench_serving \
 - **Test Results:**
 
 ```text Output
-Pending update — replace with real bench_serving output after the latency run.
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  15.98
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4220
+Request throughput (req/s):              0.63
+Input token throughput (tok/s):          381.86
+Output token throughput (tok/s):         264.13
+Peak output token throughput (tok/s):    324.00
+Peak concurrent requests:                3
+Total token throughput (tok/s):          645.98
+Concurrency:                             1.00
+Accept length:                           2.96
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1596.65
+Median E2E Latency (ms):                 1274.48
+P90 E2E Latency (ms):                    2950.70
+P99 E2E Latency (ms):                    3333.18
+---------------Time to First Token----------------
+Mean TTFT (ms):                          147.26
+Median TTFT (ms):                        132.22
+P99 TTFT (ms):                           181.37
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          3.50
+Median TPOT (ms):                        3.48
+P99 TPOT (ms):                           4.18
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           3.44
+Median ITL (ms):                         3.36
+P95 ITL (ms):                            5.06
+P99 ITL (ms):                            5.15
+Max ITL (ms):                            35.31
+==================================================
 ```
 
-#### 5.3.2 Throughput-Sensitive Benchmark
+##### Throughput-Sensitive Benchmark
 
-- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- **Model Deployment Command:** H200 · DeepSeek-V4-Flash · FP4 · Max-Throughput. See the [command panel above](#3-model-deployment).
 
 - Benchmark Command:
 
@@ -476,6 +504,7 @@ python3 -m sglang.bench_serving \
   --host 127.0.0.1 \
   --port 30000 \
   --model deepseek-ai/DeepSeek-V4-Flash \
+  --dataset-name random \
   --random-input-len 1024 \
   --random-output-len 1024 \
   --num-prompts 1000 \
@@ -485,5 +514,173 @@ python3 -m sglang.bench_serving \
 - **Test Results:**
 
 ```text Output
-Pending update — replace with real bench_serving output after the throughput run.
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  198.42
+Total input tokens:                      512842
+Total input text tokens:                 512842
+Total generated tokens:                  510855
+Total generated tokens (retokenized):    510765
+Request throughput (req/s):              5.04
+Input token throughput (tok/s):          2584.65
+Output token throughput (tok/s):         2574.64
+Peak output token throughput (tok/s):    4400.00
+Peak concurrent requests:                110
+Total token throughput (tok/s):          5159.28
+Concurrency:                             96.21
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   19090.29
+Median E2E Latency (ms):                 18328.71
+P90 E2E Latency (ms):                    35698.68
+P99 E2E Latency (ms):                    39161.43
+---------------Time to First Token----------------
+Mean TTFT (ms):                          302.41
+Median TTFT (ms):                        131.35
+P99 TTFT (ms):                           2172.03
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          37.46
+Median TPOT (ms):                        37.72
+P99 TPOT (ms):                           55.72
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           36.85
+Median ITL (ms):                         21.75
+P95 ITL (ms):                            107.64
+P99 ITL (ms):                            134.58
+Max ITL (ms):                            1930.74
+==================================================
+```
+
+#### 5.2.2 Blackwell
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU (4x)
+- Model: DeepSeek-V4-Flash (FP4)
+- Tensor Parallelism: 4
+- sglang version: 0.5.12
+
+##### Latency-Sensitive Benchmark
+
+- **Model Deployment Command:** B200 · DeepSeek-V4-Flash · FP4 · Low-Latency. See the [command panel above](#3-model-deployment).
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model deepseek-ai/DeepSeek-V4-Flash \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  15.25
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4220
+Request throughput (req/s):              0.66
+Input token throughput (tok/s):          400.06
+Output token throughput (tok/s):         276.72
+Peak output token throughput (tok/s):    308.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          676.78
+Concurrency:                             1.00
+Accept length:                           2.73
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1523.83
+Median E2E Latency (ms):                 1173.50
+P90 E2E Latency (ms):                    2770.33
+P99 E2E Latency (ms):                    3233.82
+---------------Time to First Token----------------
+Mean TTFT (ms):                          102.72
+Median TTFT (ms):                        85.94
+P99 TTFT (ms):                           134.79
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          3.40
+Median TPOT (ms):                        3.42
+P99 TPOT (ms):                           4.00
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           3.38
+Median ITL (ms):                         3.06
+P95 ITL (ms):                            4.60
+P99 ITL (ms):                            4.95
+Max ITL (ms):                            34.64
+==================================================
+```
+
+##### Throughput-Sensitive Benchmark
+
+- **Model Deployment Command:** B200 · DeepSeek-V4-Flash · FP4 · Max-Throughput (MegaMoE W4A4). See the [command panel above](#3-model-deployment) — flip the **MegaMoE** toggle to **W4A4** to reproduce these numbers; the default Max-Throughput recipe uses `--moe-a2a-backend deepep` and runs slower.
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model deepseek-ai/DeepSeek-V4-Flash \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  105.10
+Total input tokens:                      512842
+Total input text tokens:                 512842
+Total generated tokens:                  510855
+Total generated tokens (retokenized):    510682
+Request throughput (req/s):              9.51
+Input token throughput (tok/s):          4879.44
+Output token throughput (tok/s):         4860.54
+Peak output token throughput (tok/s):    6600.00
+Peak concurrent requests:                117
+Total token throughput (tok/s):          9739.98
+Concurrency:                             94.34
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   9915.50
+Median E2E Latency (ms):                 9521.19
+P90 E2E Latency (ms):                    17726.66
+P99 E2E Latency (ms):                    24910.72
+---------------Time to First Token----------------
+Mean TTFT (ms):                          349.95
+Median TTFT (ms):                        68.23
+P99 TTFT (ms):                           4581.26
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          19.86
+Median TPOT (ms):                        17.96
+P99 TPOT (ms):                           61.58
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           18.76
+Median ITL (ms):                         13.23
+P95 ITL (ms):                            44.79
+P99 ITL (ms):                            88.25
+Max ITL (ms):                            2499.49
+==================================================
 ```
