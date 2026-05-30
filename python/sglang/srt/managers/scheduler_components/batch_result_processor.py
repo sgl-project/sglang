@@ -831,7 +831,7 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                is_insert = req.mamba_lazy_is_insert if self.server_args.enable_mamba_extra_buffer_lazy() else True
+                is_insert = req.mamba_lazy_is_insert if get_global_server_args().enable_mamba_extra_buffer_lazy() else True
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
@@ -884,20 +884,17 @@ class SchedulerBatchResultProcessor:
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen). In lazy mode the boundary is
-        detected one step early (interval-1) so the prealloc in
-        prepare_for_decode can allocate the second slot before the forward.
-        For spec decode, the boundary is detected by comparing the accepted
-        seq_len range against interval boundaries.
+        Returns (at_boundary, track_seqlen). Both lazy and non-lazy use the
+        same boundary condition (seq_len % interval == 0). For spec decode,
+        the boundary is detected by comparing the accepted seq_len range
+        against interval boundaries.
         """
         interval = get_global_server_args().mamba_track_interval
-        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
 
         if batch.spec_algorithm.is_none():
             seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-            check = (interval - 1) if lazy else 0
-            if seq_len % interval == check:
-                return True, (seq_len + 1) if lazy else seq_len
+            if seq_len % interval == 0:
+                return True, seq_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
             prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
@@ -913,16 +910,17 @@ class SchedulerBatchResultProcessor:
 
         For running reqs: free the old ping-pong slot so we go back to
         holding only 1 slot until the next boundary.
-        For finished reqs: if the prealloc failed (other slot is -1),
-        mark is_insert=False so cache_finished_req skips the insert.
+        For finished reqs: if prealloc failed (other slot is -1), the
+        forward overwrote the only slot with corrupted state — mark
+        is_insert=False so cache_finished_req skips the insert.
         """
-        pool = batch.req_to_token_pool
         other_idx = 1 - req.mamba_next_track_idx
         if req.finished():
             if req.mamba_ping_pong_track_buffer[other_idx].item() == -1:
                 req.mamba_lazy_is_insert = False
-        else:
-            old_val = req.mamba_ping_pong_track_buffer[other_idx]
-            if old_val.item() != -1:
-                pool.mamba_pool.free(old_val.unsqueeze(0))
-            pool.set_mamba_ping_pong_slot(req, other_idx, -1)
+            return
+        pool = batch.req_to_token_pool
+        old_val = req.mamba_ping_pong_track_buffer[other_idx]
+        if old_val.item() != -1:
+            pool.mamba_pool.free(old_val.unsqueeze(0))
+        pool.set_mamba_ping_pong_slot(req, other_idx, -1)

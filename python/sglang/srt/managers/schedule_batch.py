@@ -768,7 +768,8 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
         self.mamba_needs_clear: bool = False
-        # Lazy extra buffer: whether to insert into radix cache on finish
+        # Lazy extra buffer: skip radix cache insert when prealloc failed at
+        # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
 
         # Check finish
@@ -2436,7 +2437,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
             other_idx = 1 - req.mamba_next_track_idx
-            assert buf[other_idx].item() == -1
+            assert buf[other_idx].item() == -1, (
+                f"Lazy ping-pong slot leak: buf={buf.tolist()}, "
+                f"next_track_idx={req.mamba_next_track_idx}, "
+                f"seq_len={self.seq_lens_cpu[i].item()}, "
+                f"forward_mode={self.forward_mode}, "
+                f"rid={req.rid}"
+            )
             new_slot = pool.mamba_pool.alloc(1)
             if new_slot is None:
                 self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))

@@ -668,12 +668,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             "Not enough space for mamba ping pong idx, "
             "try to increase --mamba-full-memory-ratio."
         )
-        if self.enable_mamba_extra_buffer_lazy:
-            req.mamba_ping_pong_track_buffer = torch.tensor(
-                [slots[0].item(), -1], dtype=slots.dtype, device=slots.device,
-            )
-        else:
-            req.mamba_ping_pong_track_buffer = slots
+        buf = torch.full(
+            (self.mamba_ping_pong_track_buffer_size,), -1,
+            dtype=slots.dtype, device=slots.device,
+        )
+        buf[:n] = slots
+        req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
 
     def set_mamba_ping_pong_slot(self, req: "Req", idx: int, value):
