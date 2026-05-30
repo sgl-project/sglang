@@ -16,7 +16,6 @@
 
 import logging
 import os
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -26,7 +25,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
