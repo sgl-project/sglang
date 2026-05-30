@@ -73,6 +73,11 @@ class ShutdownReq:
 
 
 @dataclass
+class ReleaseRealtimeSessionReq:
+    session_id: str
+
+
+@dataclass
 class GetDisaggStatsReq:
     """Request to get disagg pipeline metrics from the scheduler."""
 
@@ -186,6 +191,7 @@ def _copy_req_for_output(
     output_req = copy(req)
     output_req.sampling_params = copy(req.sampling_params)
     output_req.extra = dict(req.extra)
+    output_req.condition_inputs = dict(req.condition_inputs)
     output_req.trace_ctx = _copy_trace_ctx_for_output(req, request_id, output_index)
     return output_req
 
