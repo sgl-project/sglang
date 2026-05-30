@@ -24,8 +24,8 @@ from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSessionCache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.utils.lingbot_world_camera import (
-    actions_to_c2ws,
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    _actions_to_c2ws,
 )
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
@@ -190,12 +190,12 @@ def test_sampling_params_apply_condition_inputs_to_req():
 
 
 def test_lingbot_camera_actions_have_deterministic_pose_precision():
-    poses = actions_to_c2ws([["w"], ["d"]])
+    poses = _actions_to_c2ws([["w"], ["d"]])
 
     np.testing.assert_allclose(poses[1][:3, 3], [0.0, 0.0, 0.05], atol=1e-6)
     np.testing.assert_allclose(poses[2][:3, 3], [0.05, 0.0, 0.05], atol=1e-6)
 
-    yaw_pose = actions_to_c2ws([["l"]])[1]
+    yaw_pose = _actions_to_c2ws([["l"]])[1]
     expected_yaw = np.array(
         [
             [np.cos(np.deg2rad(6.0)), 0.0, np.sin(np.deg2rad(6.0))],
