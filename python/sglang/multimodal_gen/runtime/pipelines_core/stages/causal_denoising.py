@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch  # type: ignore
 
@@ -48,6 +48,56 @@ class CausalDMDForwardContext:
     width: int
 
 
+@dataclass(slots=True)
+class CausalSelfAttentionKVCache:
+    """one transformer block's causal self-attn K/V cache and write cursors"""
+
+    k: torch.Tensor
+    v: torch.Tensor
+    global_end_index: torch.Tensor
+    local_end_index: torch.Tensor
+    global_end_index_int: int | None = None
+    local_end_index_int: int | None = None
+
+    _FIELD_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "k",
+            "v",
+            "global_end_index",
+            "local_end_index",
+            "global_end_index_int",
+            "local_end_index_int",
+        }
+    )
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._FIELD_NAMES:
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key not in self._FIELD_NAMES:
+            raise KeyError(key)
+        setattr(self, key, value)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._FIELD_NAMES and getattr(self, key) is not None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key not in self._FIELD_NAMES:
+            return default
+        value = getattr(self, key)
+        return default if value is None else value
+
+    def reset_indices(self) -> None:
+        self.global_end_index.zero_()
+        self.local_end_index.zero_()
+        if self.global_end_index_int is not None:
+            self.global_end_index_int = 0
+        if self.local_end_index_int is not None:
+            self.local_end_index_int = 0
+
+
 class CausalDMDDenoisingStage(DenoisingStage):
     """
     Denoising stage for causal diffusion.
@@ -56,7 +106,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
     def __init__(self, transformer, scheduler) -> None:
         super().__init__(transformer, scheduler)
         # KV and cross-attention cache state (initialized on first forward)
-        self.kv_cache1: list | None = None
+        self.causal_kv_cache: list | None = None
         self.crossattn_cache: list | None = None
         # Model-dependent constants (aligned with causal_inference.py assumptions)
         self.num_transformer_blocks = self.transformer.config.arch_config.num_layers
@@ -461,6 +511,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         target_dtype: torch.dtype,
         autocast_enabled: bool,
     ) -> None:
+        """fill the self-attn KV cache by performing a one-time forward on DiT"""
         context_noise = getattr(server_args.pipeline_config, "context_noise", 0)
         timestep = torch.full(
             (context_input.shape[0], 1),
@@ -600,9 +651,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             dtype=dtype,
             device=device,
         )
-        assert self.kv_cache1 is not None
+        assert self.causal_kv_cache is not None
         assert self.crossattn_cache is not None
-        return self.kv_cache1, self.crossattn_cache
+        return self.causal_kv_cache, self.crossattn_cache
 
     def _reset_causal_caches(
         self,
@@ -621,16 +672,16 @@ class CausalDMDDenoisingStage(DenoisingStage):
     @staticmethod
     def _reset_kv_cache(kv_cache, device: torch.device) -> None:
         for block_index in range(len(kv_cache)):
-            kv_cache[block_index]["global_end_index"] = torch.tensor(
-                [0], dtype=torch.long, device=device
-            )
-            kv_cache[block_index]["local_end_index"] = torch.tensor(
-                [0], dtype=torch.long, device=device
-            )
-            if "global_end_index_int" in kv_cache[block_index]:
-                kv_cache[block_index]["global_end_index_int"] = 0
-            if "local_end_index_int" in kv_cache[block_index]:
-                kv_cache[block_index]["local_end_index_int"] = 0
+            cache_block = kv_cache[block_index]
+            if isinstance(cache_block, CausalSelfAttentionKVCache):
+                cache_block.reset_indices()
+                continue
+            cache_block["global_end_index"].zero_()
+            cache_block["local_end_index"].zero_()
+            if "global_end_index_int" in cache_block:
+                cache_block["global_end_index_int"] = 0
+            if "local_end_index_int" in cache_block:
+                cache_block["local_end_index_int"] = 0
 
     @torch.no_grad()
     def forward(
@@ -654,7 +705,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         independent_first_frame = self.transformer.independent_first_frame
 
         # Initialize or reset caches
-        if self.kv_cache1 is None:
+        if self.causal_kv_cache is None:
             self._initialize_causal_caches(
                 batch_size=latents.shape[0],
                 max_text_len=self._get_max_text_len(server_args),
@@ -664,7 +715,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         else:
             assert self.crossattn_cache is not None
             self._reset_causal_caches(
-                kv_cache=self.kv_cache1,
+                kv_cache=self.causal_kv_cache,
                 crossattn_cache=self.crossattn_cache,
                 device=latents.device,
             )
@@ -682,7 +733,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     server_args,
                     context_input=image_latent[:, :, :1, :, :],
                     prompt_embeds=prompt_embeds,
-                    kv_cache=self.kv_cache1,
+                    kv_cache=self.causal_kv_cache,
                     crossattn_cache=self.crossattn_cache,
                     current_start_frame=current_start_frame,
                     image_kwargs=image_kwargs,
@@ -705,7 +756,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         :, :, current_start_frame : current_start_frame + block, :, :
                     ],
                     prompt_embeds=prompt_embeds,
-                    kv_cache=self.kv_cache1,
+                    kv_cache=self.causal_kv_cache,
                     crossattn_cache=self.crossattn_cache,
                     current_start_frame=current_start_frame,
                     image_kwargs=image_kwargs,
@@ -772,7 +823,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     scheduler=scheduler,
                     timesteps=timesteps,
                     prompt_embeds=prompt_embeds,
-                    kv_cache=self.kv_cache1,
+                    kv_cache=self.causal_kv_cache,
                     crossattn_cache=self.crossattn_cache,
                     current_start_tokens=current_start_tokens,
                     start_frame=start_index,
@@ -799,9 +850,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
     def _initialize_kv_cache(self, batch_size, dtype, device) -> None:
         """
-        Initialize a Per-GPU KV cache aligned with the Wan model assumptions.
+        Initialize a Per-GPU KV cache aligned with the model assumptions.
         """
-        kv_cache1 = []
+        causal_kv_cache = []
         num_attention_heads = self.transformer.num_attention_heads
         attention_head_dim = self.transformer.attention_head_dim
         if self.local_attn_size != -1:
@@ -810,9 +861,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             kv_cache_size = self.frame_seq_length * self.sliding_window_num_frames
 
         for _ in range(self.num_transformer_blocks):
-            kv_cache1.append(
-                {
-                    "k": torch.zeros(
+            causal_kv_cache.append(
+                CausalSelfAttentionKVCache(
+                    k=torch.zeros(
                         [
                             batch_size,
                             kv_cache_size,
@@ -822,7 +873,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         dtype=dtype,
                         device=device,
                     ),
-                    "v": torch.zeros(
+                    v=torch.zeros(
                         [
                             batch_size,
                             kv_cache_size,
@@ -832,16 +883,16 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         dtype=dtype,
                         device=device,
                     ),
-                    "global_end_index": torch.tensor(
-                        [0], dtype=torch.long, device=device
+                    global_end_index=torch.zeros(
+                        1, dtype=torch.long, device=device
                     ),
-                    "local_end_index": torch.tensor(
-                        [0], dtype=torch.long, device=device
+                    local_end_index=torch.zeros(
+                        1, dtype=torch.long, device=device
                     ),
-                }
+                )
             )
 
-        self.kv_cache1 = kv_cache1
+        self.causal_kv_cache = causal_kv_cache
 
     def _initialize_crossattn_cache(
         self, batch_size, max_text_len, dtype, device

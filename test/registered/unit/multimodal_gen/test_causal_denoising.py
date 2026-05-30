@@ -6,6 +6,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
+    CausalSelfAttentionKVCache,
 )
 
 
@@ -272,7 +273,7 @@ def test_causal_cache_helpers_reset_and_forward_model_specific_kwargs():
 
     def fake_initialize_kv_cache(self, batch_size, dtype, device, **kwargs):
         calls.append(("kv", batch_size, dtype, device, kwargs))
-        self.kv_cache1 = ["kv-cache"]
+        self.causal_kv_cache = ["kv-cache"]
 
     def fake_initialize_crossattn_cache(self, batch_size, max_text_len, dtype, device):
         calls.append(("cross", batch_size, max_text_len, dtype, device))
@@ -303,3 +304,34 @@ def test_causal_cache_helpers_reset_and_forward_model_specific_kwargs():
         ),
         ("cross", 2, 128, torch.bfloat16, torch.device("cpu")),
     ]
+
+
+def test_causal_kv_cache_block_supports_dict_access_and_in_place_reset():
+    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
+    k = torch.ones(1, 4, 2, 3)
+    v = torch.ones(1, 4, 2, 3)
+    global_end_index = torch.tensor([7])
+    local_end_index = torch.tensor([4])
+    cache = CausalSelfAttentionKVCache(
+        k=k,
+        v=v,
+        global_end_index=global_end_index,
+        local_end_index=local_end_index,
+        global_end_index_int=7,
+        local_end_index_int=4,
+    )
+
+    assert cache["k"] is k
+    assert cache.get("global_end_index_int") == 7
+    detached_k = k.detach()
+    cache["k"] = detached_k
+    assert cache.k is detached_k
+
+    stage._reset_kv_cache([cache], torch.device("cpu"))
+
+    assert cache.global_end_index is global_end_index
+    assert cache.local_end_index is local_end_index
+    assert int(cache.global_end_index.item()) == 0
+    assert int(cache.local_end_index.item()) == 0
+    assert cache.global_end_index_int == 0
+    assert cache.local_end_index_int == 0

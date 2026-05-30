@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
+    CausalSelfAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.realtime_states import (
     RealtimeCausalDiTState,
@@ -70,7 +71,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         *,
         sequence_shard_enabled: bool = False,
     ) -> None:
-        kv_cache1 = []
+        causal_kv_cache = []
         num_attention_heads = self.transformer.num_attention_heads
         if sequence_shard_enabled:
             ulysses_world_size = get_ulysses_parallel_world_size()
@@ -110,9 +111,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         )
 
         for _ in range(self.num_transformer_blocks):
-            kv_cache1.append(
-                {
-                    "k": torch.zeros(
+            causal_kv_cache.append(
+                CausalSelfAttentionKVCache(
+                    k=torch.zeros(
                         [
                             batch_size,
                             kv_cache_size,
@@ -122,7 +123,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                         dtype=dtype,
                         device=device,
                     ),
-                    "v": torch.zeros(
+                    v=torch.zeros(
                         [
                             batch_size,
                             kv_cache_size,
@@ -132,18 +133,18 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                         dtype=dtype,
                         device=device,
                     ),
-                    "global_end_index": torch.tensor(
-                        [0], dtype=torch.long, device=device
+                    global_end_index=torch.zeros(
+                        1, dtype=torch.long, device=device
                     ),
-                    "local_end_index": torch.tensor(
-                        [0], dtype=torch.long, device=device
+                    local_end_index=torch.zeros(
+                        1, dtype=torch.long, device=device
                     ),
-                    "global_end_index_int": 0,
-                    "local_end_index_int": 0,
-                }
+                    global_end_index_int=0,
+                    local_end_index_int=0,
+                )
             )
 
-        self.kv_cache1 = kv_cache1
+        self.causal_kv_cache = causal_kv_cache
 
     def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
         latents = batch.latents
@@ -229,7 +230,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         # --- KV cache from session state ---
         cache_state, persist_cache_state = self._get_cache_state(batch)
-        kv_cache1 = cache_state.kv_cache
+        causal_kv_cache = cache_state.kv_cache
         crossattn_cache = cache_state.crossattn_cache
         sequence_shard_enabled = bool(
             getattr(batch, "enable_sequence_shard", False)
@@ -245,15 +246,15 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         should_reset_cache = (
             batch.block_idx == 0
-            or kv_cache1 is None
+            or causal_kv_cache is None
             or crossattn_cache is None
-            or len(kv_cache1) != self.num_transformer_blocks
+            or len(causal_kv_cache) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
-            or kv_cache1[0]["k"].shape[2] != expected_cache_heads
+            or causal_kv_cache[0]["k"].shape[2] != expected_cache_heads
         )
 
         if should_reset_cache:
-            kv_cache1, crossattn_cache = self._initialize_causal_caches(
+            causal_kv_cache, crossattn_cache = self._initialize_causal_caches(
                 batch_size=b,
                 max_text_len=self._get_max_text_len(server_args),
                 dtype=target_dtype,
@@ -262,7 +263,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                     "sequence_shard_enabled": sequence_shard_enabled,
                 },
             )
-            cache_state.kv_cache = kv_cache1
+            cache_state.kv_cache = causal_kv_cache
             cache_state.crossattn_cache = crossattn_cache
             # Reset frame position on cache reset
             cache_state.current_chunk_start_frame = 0
@@ -295,7 +296,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 scheduler=scheduler,
                 timesteps=timesteps,
                 prompt_embeds=prompt_embeds,
-                kv_cache=kv_cache1,
+                kv_cache=causal_kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start_tokens=current_start_frame * self.frame_seq_length,
                 start_frame=current_start_frame,
