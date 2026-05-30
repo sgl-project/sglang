@@ -1,0 +1,18 @@
+{
+  "length_tokens": 16384,
+  "index_topk": 2048,
+  "within_budget": false,
+  "gate_class": "beyond_budget_characterization",
+  "num_prompts": 20,
+  "dsa_served": 20,
+  "ds_served": 20,
+  "dsa_hits": 20,
+  "ds_hits": 1,
+  "dsa_recall_pct": 100.0,
+  "ds_recall_pct": 5.0,
+  "delta_pct": 95.0,
+  "threshold_pp": 5.0,
+  "dsa_error": null,
+  "ds_error": null,
+  "verdict": "FAIL"
+}

@@ -1,0 +1,4 @@
+# DS-int8 server boot proof (node 0, server_double_sparsity_20260530-080928.log)
+[2026-05-30 08:10:46 TP1] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+"signature_dtype": "int8"
+[2026-05-30 08:12:24 TP0] max_total_num_tokens=53056, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=2048, context_len=163840, available_gpu_mem=38.43 GB
