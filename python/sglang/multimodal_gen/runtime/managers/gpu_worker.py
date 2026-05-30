@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    materialize_output_sample,
     post_process_sample,
     save_outputs,
 )
@@ -379,37 +380,7 @@ class GPUWorker:
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
-            # Realtime raw-frame responses avoid serializing generated tensors between
-            # scheduler_client and gpu_worker.
-            if req.return_raw_frames and self.rank == 0:
-                if output_batch.output is not None:
-                    output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
-                    (
-                        output_batch.raw_frame_batches,
-                        output_batch.raw_frame_metadata,
-                    ) = build_raw_rgb_frame_batches(
-                        output_batch.output,
-                        req,
-                        output_batch,
-                        post_process_sample,
-                    )
-                    output_batch.output = None
-                output_batch.audio = None
-                output_batch.audio_sample_rate = None
-
-            # file-path-only responses avoid serializing generated tensors between
-            # scheduler_client and gpu_worker.
-            if req.save_output and req.return_file_paths_only:
-                save_output_paths(output_batch)
-                output_batch.output = None
-                output_batch.audio = None
-                output_batch.audio_sample_rate = None
-
-                if torch.cuda.is_initialized():
-                    torch.cuda.empty_cache()
-
-            # Keep return_frames payloads off the scheduler's tensor ZMQ path.
-            self._materialize_frame_outputs_for_return(output_batch, req)
+            self._materialize_output_transport(output_batch, req, save_output_paths)
 
             if (
                 torch.cuda.is_initialized()
@@ -449,6 +420,50 @@ class GPUWorker:
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
         return output_batch
+
+    def _materialize_output_transport(
+        self,
+        output_batch: OutputBatch,
+        req: Req,
+        save_output_paths: Callable[[OutputBatch], None],
+    ) -> None:
+        if req.return_raw_frames:
+            self._materialize_raw_frame_transport(output_batch, req)
+        elif req.save_output and req.return_file_paths_only:
+            self._materialize_file_path_transport(output_batch, save_output_paths)
+        elif req.return_frames:
+            self._materialize_frame_outputs_for_return(output_batch, req)
+
+    def _materialize_raw_frame_transport(
+        self, output_batch: OutputBatch, req: Req
+    ) -> None:
+        if self.rank != 0:
+            return
+        if output_batch.output is not None:
+            output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
+            (
+                output_batch.raw_frame_batches,
+                output_batch.raw_frame_metadata,
+            ) = build_raw_rgb_frame_batches(
+                output_batch.output,
+                req,
+                output_batch,
+                post_process_sample,
+            )
+            output_batch.output = None
+        output_batch.audio = None
+        output_batch.audio_sample_rate = None
+
+    def _materialize_file_path_transport(
+        self,
+        output_batch: OutputBatch,
+        save_output_paths: Callable[[OutputBatch], None],
+    ) -> None:
+        if self.rank == 0:
+            save_output_paths(output_batch)
+        output_batch.output = None
+        output_batch.audio = None
+        output_batch.audio_sample_rate = None
 
     def _materialize_frame_outputs_for_return(
         self, output_batch: OutputBatch, req: Req
@@ -499,13 +514,10 @@ class GPUWorker:
         ):
             return output
 
-        frames = post_process_sample(
+        materialized = materialize_output_sample(
             output,
             req.data_type,
             req.fps,
-            save_output=False,
-            audio_sample_rate=output_batch.audio_sample_rate,
-            output_compression=req.output_compression,
             enable_frame_interpolation=req.enable_frame_interpolation,
             frame_interpolation_exp=req.frame_interpolation_exp,
             frame_interpolation_scale=req.frame_interpolation_scale,
@@ -514,7 +526,7 @@ class GPUWorker:
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
         )
-        return np.asarray(frames)
+        return np.asarray(materialized.frames)
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if self.rank != 0 or current_platform.is_cpu():
