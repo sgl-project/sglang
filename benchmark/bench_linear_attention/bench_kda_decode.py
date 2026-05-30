@@ -19,10 +19,6 @@ Usage:
 """
 
 import argparse
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 import torch
 
@@ -217,10 +213,11 @@ def bench_shape(B, H, HV, K, V, pool_size, device, dtype):
             use_qk_l2norm_in_kernel=True,
         )
 
-    # Wall-clock CUDA event timing. Decode is per-token-per-step in practice
-    # (no fusion across steps), so the CPU dispatch overhead that ``packed``
-    # eliminates is a real cost — ``triton.testing.do_bench`` amortizes that
-    # away and would under-report the win.
+    # Intentionally wall-clock CUDA-event timing, not the shared do_bench /
+    # do_bench_cudagraph util: ~2/3 of the packed win is eager CPU dispatch
+    # (split + 3x unflatten + extra launch), which graph capture / L2-flush
+    # harnesses amortize away. Decode runs these ops eagerly every step, so
+    # wall-clock is the production-relevant metric (~1.7x vs ~1.3x kernel-only).
     warmup, iters = 50, 200
     for _ in range(warmup):
         fn_baseline()
@@ -395,4 +392,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

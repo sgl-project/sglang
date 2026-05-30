@@ -387,6 +387,66 @@ class TestKDAPackedDecode(unittest.TestCase):
             o_packed.float(), o_baseline.float(), atol=2e-2, rtol=1e-2
         )
 
+    def test_production_shapes_through_dispatcher(self):
+        """Go through ``TritonKDAKernel.packed_decode`` with the exact tensor
+        shapes the KimiDeltaAttention model produces at decode time, so the
+        a/b/A_log/dt_bias reshape-normalization is unit-tested (not only E2E).
+
+        Production decode shapes (see kimi_linear.py forward + __init__):
+          - a (forget_gate): [B, HV*K]   (2D, not unflattened in decode)
+          - b (beta):        [1, B, HV]  (unsqueeze(0), pre-sigmoid)
+          - A_log:           [1, 1, HV, 1]
+          - dt_bias:         [HV*K]
+        """
+        from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+            TritonKDAKernel,
+        )
+
+        device = get_device()
+        dtype = torch.bfloat16
+        B, H, HV, K, V = 4, 16, 16, 128, 128
+        pool_size = B + 4
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices = self._make_inputs(
+            B, H, HV, K, V, pool_size, dtype, device
+        )
+
+        # Reshape the flat reference tensors into the production layouts.
+        b_prod = b.unsqueeze(0)  # [B, HV] -> [1, B, HV]
+        A_log_prod = A_log.view(1, 1, HV, 1)  # [HV] -> [1, 1, HV, 1]
+
+        kernel = TritonKDAKernel()
+        self.assertTrue(kernel.supports_packed_decode)
+
+        s_packed = ssm_states.clone()
+        out = kernel.packed_decode(
+            mixed_qkv,
+            a,
+            b_prod,
+            A_log=A_log_prod,
+            dt_bias=dt_bias,
+            scale=K**-0.5,
+            ssm_states=s_packed,
+            cache_indices=cache_indices,
+            num_v_heads=HV,
+            head_v_dim=V,
+        )
+
+        s_baseline = ssm_states.clone()
+        o_baseline = self._run_baseline(
+            mixed_qkv, a, b, A_log, dt_bias, s_baseline, cache_indices, H, HV, K, V
+        )
+
+        # Dispatcher returns [1, B, HV, V], same layout as the baseline.
+        torch.testing.assert_close(
+            out.float(), o_baseline.float(), atol=2e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            s_packed[cache_indices].float(),
+            s_baseline[cache_indices].float(),
+            atol=2e-2,
+            rtol=1e-2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -198,7 +198,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         # Skip split + reshape by consuming the packed mixed_qkv directly in a
         # single fused Triton kernel (KDA per-K gate variant of GDN PR #20627).
+        #
+        # The packed kernel hard-assumes one token per sequence (T=1): it has no
+        # query_start_loc / per-sequence loop. forward_decode is only entered in
+        # decode mode (see HybridLinearAttnBackend.forward dispatch), where each
+        # request contributes exactly one token, so #tokens == #requests. Multi-
+        # token-per-seq speculative paths (target_verify / draft_extend) go
+        # through forward_extend instead. Assert the invariant so a future
+        # routing change fails loudly rather than silently corrupting state.
         if self.kernel_dispatcher.supports_packed_decode:
+            assert qkv.shape[0] == cache_indices.shape[0], (
+                "KDA packed decode requires one token per sequence (T=1): "
+                f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
+            )
             return self.kernel_dispatcher.packed_decode(
                 mixed_qkv=qkv,
                 a=a,
