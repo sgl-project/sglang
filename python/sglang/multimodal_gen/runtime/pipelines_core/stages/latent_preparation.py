@@ -320,3 +320,48 @@ class LatentPreparationStage(PipelineStage):
         # result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         result.add_check("raw_latent_shape", batch.raw_latent_shape, V.is_tuple)
         return result
+
+
+class RealtimeChunkLatentPreparationStage(LatentPreparationStage):
+    """Prepare one realtime causal DiT chunk from the encoded condition shape."""
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        if batch.latents is not None:
+            batch.latents = batch.latents.to(get_local_torch_device())
+            batch.raw_latent_shape = batch.latents.shape
+            return batch
+
+        condition_latent = batch.image_latent
+        assert condition_latent is not None, (
+            "Realtime chunk latent preparation requires image_latent. "
+            "Ensure the condition VAE encoding stage runs before this stage."
+        )
+
+        batch_size = condition_latent.shape[0]
+        height = condition_latent.shape[3]
+        width = condition_latent.shape[4]
+        num_channels_latents = self.transformer.config.arch_config.out_channels
+        num_frames = self.transformer.config.arch_config.num_frames_per_block
+
+        latents = randn_tensor(
+            (batch_size, num_channels_latents, num_frames, height, width),
+            generator=batch.generator,
+            device=get_local_torch_device(),
+            dtype=condition_latent.dtype,
+        )
+        batch.latents = latents
+        batch.raw_latent_shape = latents.shape
+        return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check(
+            "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
+        )
+        result.add_check("generator", batch.generator, V.generator_or_list_generators)
+        result.add_check("latents", batch.latents, V.none_or_tensor)
+        return result

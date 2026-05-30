@@ -23,6 +23,9 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.realtime.session import (
+    RealtimeSession,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
@@ -141,6 +144,7 @@ class Req:
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None
+    c2ws_plucker_emb: torch.Tensor | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -178,6 +182,7 @@ class Req:
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
 
     is_warmup: bool = False
 
@@ -202,6 +207,13 @@ class Req:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+
+    # realtime
+    realtime_session_id: str | None = None
+    session: RealtimeSession | None = None
+    block_idx: int = 0
+    realtime_chunk_size: int | None = None
+    return_encoded_frames: bool = False
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
@@ -387,6 +399,9 @@ class OutputBatch:
     """
 
     output: Any | None = None
+    encoded_frame_batches: list[list[bytes]] | None = None
+    encoded_frame_content_type: str = "image/jpeg"
+    encoded_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None

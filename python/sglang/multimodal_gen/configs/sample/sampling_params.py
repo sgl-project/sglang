@@ -227,6 +227,8 @@ class SamplingParams:
     use_resolution_template: bool | None = None
     use_system_prompt: bool | None = None
     use_guardrails: bool | None = None
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
+    realtime_chunk_size: int | None = None
 
     # Prompt enhancement (ErnieImage)
     use_pe: bool | None = None
@@ -309,6 +311,10 @@ class SamplingParams:
     def apply_request_extra(self, req: Any) -> None:
         """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
         req.extra.update(self.build_request_extra())
+        if self.condition_inputs:
+            req.condition_inputs.update(self.condition_inputs)
+        if self.realtime_chunk_size is not None:
+            req.realtime_chunk_size = self.realtime_chunk_size
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""

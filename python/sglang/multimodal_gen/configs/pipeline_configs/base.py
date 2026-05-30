@@ -311,6 +311,9 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        return False
+
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
 
@@ -685,6 +688,9 @@ class PipelineConfig:
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
+
+    def prepare_world_condition(self, batch, device, dtype):
+        return None
 
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
