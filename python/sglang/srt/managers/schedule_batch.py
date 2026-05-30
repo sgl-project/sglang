@@ -2391,8 +2391,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Snapshot routed experts BEFORE we release the KV cache. After
         # ``release_kv_cache`` the per-token mapping in ``req_to_token_pool``
         # is no longer guaranteed to point at this request's expert ids in
-        # the host cache, so the snapshot must happen here.
-        if req.return_routed_experts:
+        # the host cache, so the snapshot must happen here. Skip when
+        # ``input_embeds`` is set: retract discards decoded output_ids in
+        # that case, so the associated experts should be discarded too.
+        if req.return_routed_experts and req.input_embeds is None:
             self._snapshot_routed_experts_for_retract(req)
 
         # TODO (csy): for preempted requests, we may want to insert into the tree
