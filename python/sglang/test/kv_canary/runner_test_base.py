@@ -10,6 +10,7 @@ from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.runner import kernel_launcher as kernel_launcher_module
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
 from sglang.test.kv_canary.fixtures import (
@@ -44,10 +45,20 @@ class RecordingEndpoint:
         self.calls.append(kwargs)
 
 
+def make_perturb_config() -> PerturbConfig:
+    """Build a PerturbConfig with every probability pinned to 0 so the
+    perturb hooks do nothing during unit tests."""
+    return PerturbConfig(
+        target_group_kind=None,
+        warmup_steps=0,
+    )
+
+
 def make_manager(
     *,
     device: torch.device,
     config: CanaryConfig | None = None,
+    perturb_config: PerturbConfig | None = None,
     group: CanaryBufferGroup | None = None,
     req_pool: SimpleNamespace | None = None,
     per_forward_verify_capacity: int = 16,
@@ -55,12 +66,15 @@ def make_manager(
 ) -> CanaryManager:
     if config is None:
         config = make_config()
+    if perturb_config is None:
+        perturb_config = make_perturb_config()
     if group is None:
         group = make_buffer_group(device=device)
     if req_pool is None:
         req_pool = make_req_to_token_pool(device=device, max_reqs=4, max_seq_len=8)
     return CanaryManager(
         config=config,
+        perturb_config=perturb_config,
         buffer_groups=(group,),
         device=device,
         req_to_token_pool=req_pool,
