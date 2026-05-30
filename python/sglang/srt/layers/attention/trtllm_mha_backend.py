@@ -378,7 +378,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bs,
             )
             self.target_verify_metadata[bs] = metadata
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = num_tokens // bs
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
@@ -422,7 +422,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             spec_info=spec_info,
             seq_lens_cpu=seq_lens_cpu,
         )
-        if forward_mode.is_draft_extend():
+        if forward_mode.is_draft_extend(include_v2=True):
             # CUDA graph bakes max_seq_len_q as a constant.  replay() sets it to
             # max(num_accept_tokens_cpu) which is None/empty at capture time,
             # falling back to 1.  Restore the correct upper bound so the kernel
@@ -502,7 +502,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
@@ -511,15 +511,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            extend_lens = spec_info.num_accept_tokens[:bs]
-            if spec_info.num_accept_tokens_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
-            else:
-                metadata.max_seq_len_q = 1
 
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
-            )
+            if forward_mode.is_draft_extend_v2():
+                # V2: fixed shape per request, use num_tokens // bs
+                num_tokens_per_bs = metadata.max_seq_len_q  # set during capture
+                metadata.cu_seqlens_q[: bs + 1].copy_(
+                    torch.arange(
+                        0,
+                        bs * num_tokens_per_bs + 1,
+                        step=num_tokens_per_bs,
+                        dtype=torch.int32,
+                        device=seq_lens.device,
+                    )
+                )
+            else:
+                # V1: variable accept lengths per request
+                extend_lens = spec_info.num_accept_tokens[:bs]
+                if spec_info.num_accept_tokens_cpu:
+                    metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
+                else:
+                    metadata.max_seq_len_q = 1
+                metadata.cu_seqlens_q[1:].copy_(
+                    torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
+                )
 
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
