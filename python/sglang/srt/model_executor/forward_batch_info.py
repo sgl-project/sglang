@@ -559,7 +559,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        ret._compute_pooling_fields(batch)
+        ret._compute_derived_fields(batch)
 
         device = model_runner.device
 
@@ -678,8 +678,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         return ret
 
-    def _compute_pooling_fields(self, batch: ScheduleBatch):
-        """Populate per-request fields for embedding / reward / scoring forwards."""
+    def _compute_derived_fields(self, batch: ScheduleBatch):
+        """Derive per-request fields from ``batch.reqs`` (embedding / reward / scoring forwards)."""
         if batch.model_config.is_matryoshka and any(
             r.dimensions is not None for r in batch.reqs
         ):
