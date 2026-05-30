@@ -254,6 +254,9 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
+    # Load snapshot backend
+    SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
+
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
@@ -376,6 +379,7 @@ class Envs:
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
+    SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
@@ -638,6 +642,7 @@ class Envs:
     SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
@@ -817,7 +822,7 @@ _warn_deprecated_env_to_cli_flag(
 # Import cuda_coredump to trigger auto-injection of CUDA env vars
 # when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
 # set CUDA_* env vars in the shell before launching Python.
-import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402
+import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402  # isort: skip
 
 
 def example_with_exit_stack():
