@@ -1,0 +1,22 @@
+### mem_fraction_static=0.8 (int8)
+-- token_label_table:
+[2026-05-30 08:51:11 TP3] token_label_table: 12.10 GB/rank  L=61 T=739264 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+-- KV cache:
+[2026-05-30 08:51:11 TP3] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 739200, KV size: 33.09 GB
+-- memory pool end:
+[2026-05-30 08:51:11 TP3] Memory pool end. avail mem=22.68 GB
+-- cuda graph end:
+-- max_total_num_tokens:
+-- load weight begin avail:
+[2026-05-30 08:50:11 TP4] Load weight begin. avail mem=137.97 GB
+-- generation-time OOM check:
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 146.00 MiB. GPU 3 has a total capacity of 139.80 GiB of which 132.12 MiB is free. Including non-PyTorch memory, this process has 139.66 GiB memory in use. Of the allocated memory 134.41 GiB is allocated by PyTorch, with 610.00 MiB allocated in private pools (e.g., CUDA Graphs), and 313.68 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+Exception: Capture cuda graph failed: CUDA out of memory. Tried to allocate 146.00 MiB. GPU 3 has a total capacity of 139.80 GiB of which 132.12 MiB is free. Including non-PyTorch memory, this process has 139.66 GiB memory in use. Of the allocated memory 134.41 GiB is allocated by PyTorch, with 610.00 MiB allocated in private pools (e.g., CUDA Graphs), and 313.68 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+-- NVML per-GPU used (MiB):
+0, 0 MiB 1, 0 MiB 2, 0 MiB 3, 0 MiB 4, 0 MiB 5, 0 MiB 6, 0 MiB 7, 0 MiB 
+-- NVML total used (MiB):
+0
+-- NVML min free (MiB):
+143157
+-- /get_server_info:
+(empty/non-json)

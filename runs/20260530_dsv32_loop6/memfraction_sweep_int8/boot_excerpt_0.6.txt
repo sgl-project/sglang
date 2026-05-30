@@ -1,0 +1,41 @@
+[2026-05-30 08:40:02 TP4] Load weight begin. avail mem=137.97 GB
+[2026-05-30 08:40:02 TP6] Load weight begin. avail mem=137.97 GB
+[2026-05-30 08:40:02 TP7] Load weight begin. avail mem=138.20 GB
+[2026-05-30 08:40:02 TP5] Load weight begin. avail mem=137.97 GB
+[2026-05-30 08:40:02 TP0] Load weight begin. avail mem=138.02 GB
+[2026-05-30 08:40:02 TP2] Load weight begin. avail mem=137.97 GB
+[2026-05-30 08:40:02 TP3] Load weight begin. avail mem=137.97 GB
+[2026-05-30 08:40:02 TP1] Load weight begin. avail mem=137.97 GB
+[2026-05-30 08:40:57 TP7] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 53056, KV size: 2.38 GB
+[2026-05-30 08:40:57 TP7] Memory pool end. avail mem=53.72 GB
+[2026-05-30 08:40:57 TP4] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 53056, KV size: 2.38 GB
+[2026-05-30 08:40:57 TP4] Memory pool end. avail mem=53.49 GB
+[2026-05-30 08:40:57 TP6] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 53056, KV size: 2.38 GB
+[2026-05-30 08:40:57 TP7] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 08:40:57 TP6] Memory pool end. avail mem=53.49 GB
+[2026-05-30 08:40:57 TP0] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 53056, KV size: 2.38 GB
+[2026-05-30 08:40:57 TP0] Memory pool end. avail mem=53.54 GB
+[2026-05-30 08:40:57 TP3] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 53056, KV size: 2.38 GB
+[2026-05-30 08:40:57 TP3] Memory pool end. avail mem=53.49 GB
+[2026-05-30 08:40:57 TP4] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 08:40:57 TP0] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 08:40:57 TP6] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 08:40:57 TP1] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 53056, KV size: 2.38 GB
+[2026-05-30 08:40:57 TP1] Memory pool end. avail mem=53.49 GB
+[2026-05-30 08:40:57 TP3] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 08:40:57 TP5] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 53056, KV size: 2.38 GB
+[2026-05-30 08:40:57 TP5] Memory pool end. avail mem=53.49 GB
+[2026-05-30 08:40:57 TP2] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 53056, KV size: 2.38 GB
+[2026-05-30 08:40:57 TP2] Memory pool end. avail mem=53.49 GB
+[2026-05-30 08:40:57 TP1] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 08:40:57 TP5] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 08:40:57 TP2] token_label_table: 0.87 GB/rank  L=61 T=53120 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 08:42:35 TP6] Capture cuda graph end. Time elapsed: 96.55 s. mem usage=11.61 GB. avail mem=38.34 GB.
+[2026-05-30 08:42:35 TP3] Capture cuda graph end. Time elapsed: 96.55 s. mem usage=11.61 GB. avail mem=38.33 GB.
+[2026-05-30 08:42:35 TP4] Capture cuda graph end. Time elapsed: 96.56 s. mem usage=11.61 GB. avail mem=38.34 GB.
+[2026-05-30 08:42:35 TP2] Capture cuda graph end. Time elapsed: 96.56 s. mem usage=11.61 GB. avail mem=38.34 GB.
+[2026-05-30 08:42:35 TP7] Capture cuda graph end. Time elapsed: 96.56 s. mem usage=11.61 GB. avail mem=38.80 GB.
+[2026-05-30 08:42:35 TP1] Capture cuda graph end. Time elapsed: 96.56 s. mem usage=11.61 GB. avail mem=38.34 GB.
+[2026-05-30 08:42:35 TP5] Capture cuda graph end. Time elapsed: 96.56 s. mem usage=11.61 GB. avail mem=38.34 GB.
+[2026-05-30 08:42:35 TP0] Capture cuda graph end. Time elapsed: 96.56 s. mem usage=11.61 GB. avail mem=38.43 GB.
+[2026-05-30 08:42:35 TP0] max_total_num_tokens=53056, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=2048, context_len=163840, available_gpu_mem=38.43 GB

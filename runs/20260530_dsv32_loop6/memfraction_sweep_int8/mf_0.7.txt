@@ -1,0 +1,22 @@
+### mem_fraction_static=0.7 (int8)
+-- token_label_table:
+[2026-05-30 08:45:00 TP2] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+-- KV cache:
+[2026-05-30 08:45:00 TP2] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 396096, KV size: 17.73 GB
+-- memory pool end:
+[2026-05-30 08:45:00 TP2] Memory pool end. avail mem=38.33 GB
+-- cuda graph end:
+[2026-05-30 08:46:36 TP6] Capture cuda graph end. Time elapsed: 95.12 s. mem usage=11.59 GB. avail mem=17.56 GB.
+-- max_total_num_tokens:
+max_total_num_tokens=396096, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=2048, context_len=163840, available_gpu_mem=17.65 GB
+-- load weight begin avail:
+[2026-05-30 08:44:10 TP4] Load weight begin. avail mem=137.97 GB
+-- generation-time OOM check:
+-- NVML per-GPU used (MiB):
+0, 125116 MiB 1, 125210 MiB 2, 125210 MiB 3, 125210 MiB 4, 125210 MiB 5, 125210 MiB 6, 125210 MiB 7, 124730 MiB 
+-- NVML total used (MiB):
+1001106
+-- NVML min free (MiB):
+17947
+-- /get_server_info:
+{"tokenizer_path": "/cluster-storage/models/deepseek-ai/DeepSeek-V3.2", "tokenizer_mode": "auto", "tokenizer_backend": "huggingface", "tokenizer_worker_num": 1, "detokenizer_worker_num": 1, "skip_tokenizer_init": false, "mem_fraction_static": 0.7, "max_total_tokens": null, "max_prefill_tokens": 16384, "swa_full_tokens_ratio": 0.8, "disable_hybrid_swa_memory": false, "prefill_delayer_token_usage_low_watermark": null, "tokenizer_metrics_custom_labels_header": "x-custom-labels", "tokenizer_metrics_allowed_custom_labels": null, "bucket_time_to_first_token": null, "bucket_inter_token_latency": null, "prompt_tokens_buckets": null, "generation_tokens_buckets": null, "speculative_num_draft_tokens": null, "speculative_token_map": null, "speculative_ngram_external_corpus_max_tokens": 10000000, "mamba_full_memory_ratio": 0.9, "hicache_mem_layout": "layer_first", "kt_max_deferred_experts_per_token": null, "enable_symm_mem": false, "enable_tokenizer_batch_encode": false, "disable_tokenizer_batch_decode": false, "enable_torch_symm_mem": false, "tbo_token_distribution_threshold": 0.48, "piecewise_cuda_graph_max_tokens": 2048, "piecewise_cuda_graph_tokens": [4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048], "enable_memory_saver": false, "enable_dynamic_batch_tokenizer": false, "dynamic_batch_tokenizer_batch_size": 32, "dynamic_batch_tokenizer_batch_timeout": 0.002, "num_reserved_decode_tokens": 512, "max_total_num_tokens": 396096}
