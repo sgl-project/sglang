@@ -147,6 +147,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         self.kv_cache1 = kv_cache1
 
+    @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         target_dtype = self._target_dtype()
         autocast_enabled = self._autocast_enabled(target_dtype, server_args)
@@ -229,22 +230,17 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         )
 
         if should_reset_cache:
-            self._initialize_kv_cache(
+            kv_cache1, crossattn_cache = self._initialize_causal_caches(
                 batch_size=b,
+                max_text_len=self._get_max_text_len(server_args),
                 dtype=target_dtype,
                 device=device,
-                sequence_shard_enabled=sequence_shard_enabled,
+                kv_cache_kwargs={
+                    "sequence_shard_enabled": sequence_shard_enabled,
+                },
             )
-            self._initialize_crossattn_cache(
-                batch_size=b,
-                max_text_len=server_args.pipeline_config.text_encoder_configs[
-                    0
-                ].arch_config.text_len,
-                dtype=target_dtype,
-                device=device,
-            )
-            kv_cache1 = cache_state.kv_cache = self.kv_cache1
-            crossattn_cache = cache_state.crossattn_cache = self.crossattn_cache
+            cache_state.kv_cache = kv_cache1
+            cache_state.crossattn_cache = crossattn_cache
             # Reset frame position on cache reset
             cache_state.current_chunk_start_frame = 0
             cache_state.chunk_idx = 0
@@ -265,8 +261,11 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         def prepare_model_input(current_latents):
             return torch.cat([current_latents, condition], dim=1)
 
+        def prepare_context_input(current_latents):
+            return torch.cat([current_latents, condition], dim=1)
+
         with self.progress_bar(total=len(timesteps)) as progress_bar:
-            current_latents, attn_metadata = self._denoise_causal_dmd_chunk(
+            current_latents = self._denoise_and_update_causal_block(
                 batch,
                 server_args,
                 chunk_latents=current_latents,
@@ -284,26 +283,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 device=device,
                 attn_raw_latent_shape=(t, h, w),
                 prepare_model_input=prepare_model_input,
+                prepare_context_input=prepare_context_input,
                 progress_bar=progress_bar,
             )
-
-        # --- KV cache update: forward with clean x0 + condition ---
-        context_input = torch.cat([current_latents, condition], dim=1)
-        self._update_causal_context_cache(
-            batch,
-            server_args,
-            context_input=context_input,
-            prompt_embeds=prompt_embeds,
-            kv_cache=kv_cache1,
-            crossattn_cache=crossattn_cache,
-            current_start_tokens=current_start_frame * self.frame_seq_length,
-            start_frame=current_start_frame,
-            image_kwargs=image_kwargs,
-            pos_cond_kwargs=pos_cond_kwargs,
-            attn_metadata=attn_metadata,
-            target_dtype=target_dtype,
-            autocast_enabled=autocast_enabled,
-        )
 
         # Advance cumulative frame position
         cache_state.current_chunk_start_frame += t
