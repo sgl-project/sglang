@@ -1,4 +1,9 @@
+import os
+import shutil
+import tempfile
 import unittest
+
+from test_unified_radix_cache_kl_hicache_nightly import AccuracyTwoPassMixin
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -12,22 +17,61 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
 )
 
-MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+register_cuda_ci(est_time=768, stage="base-c", runner_config="4-gpu-h100")
+
+MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64
 MAMBA_TRACK_INTERVAL = 128
 
-DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
-DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=768, stage="base-c", runner_config="8-gpu-h200")
+class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
+    """Mamba hybrid + UnifiedRadixCache."""
+
+    kl_threshold = 0.003
+    prefill_cache_assert = staticmethod(
+        make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
+    )
+    decode_cache_assert = staticmethod(
+        make_mamba_decode_assert(track_interval=MAMBA_TRACK_INTERVAL)
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = MAMBA_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size",
+                "4",
+                "--chunked-prefill-size",
+                "2048",
+                "--mem-fraction-static",
+                "0.85",
+                "--mamba-scheduler-strategy",
+                "extra_buffer",
+                "--mamba-track-interval",
+                str(MAMBA_TRACK_INTERVAL),
+            ],
+            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+        )
+        cls.input_ids = get_input_ids(cls.model, num_samples=18)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
+# ─── Mamba + HiCache L2 ──────────────────────────────────────────────────────
 
 
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """Mamba hybrid + HiCache + UnifiedRadixCache."""
+    """Mamba hybrid + HiCache L2 + UnifiedRadixCache."""
 
     kl_threshold = 0.005
     prefill_cache_assert = staticmethod(
@@ -82,87 +126,60 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
-    expected = history_len + output_len
-    actual = result["meta_info"]["cached_tokens"]
-    lower = max(0, expected - 256)
-    assert actual >= lower, f"{label}: expected cached_tokens>={lower}, got {actual}"
+# ─── Mamba + HiCache L3 (file backend) ───────────────────────────────────────
 
 
-class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
-
-    hicache_io_backend = "direct"
-    hicache_mem_layout = "page_first_direct"
-    max_running_requests = 4
-    kl_threshold = 0.005
-    sampling_temperature = 0
-    decode_hit_request_batch_size = 3
-    decode_hit_inter_batch_delay_s = 0.5
-    decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
-    gsm8k_threshold = 0.90
-    num_gsm8k_questions = 100
-
-    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-    def test_multiturn_logprobs_match(self):
-        pass
+class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
+    """Mamba hybrid + HiCache L3 (file backend) + UnifiedRadixCache."""
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DSV4_FLASH_MODEL
+        cls.model = MAMBA_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.hicache_dir = tempfile.mkdtemp(prefix="hicache_l3_mamba_")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--trust-remote-code",
                 "--tp-size",
                 "4",
-                "--attention-backend",
-                "compressed",
-                "--page-size",
-                "256",
                 "--chunked-prefill-size",
-                "8192",
+                "2048",
                 "--mem-fraction-static",
-                "0.9",
-                "--disable-shared-experts-fusion",
+                "0.85",
+                "--mamba-scheduler-strategy",
+                "extra_buffer",
+                "--mamba-track-interval",
+                str(MAMBA_TRACK_INTERVAL),
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
-                "4",
+                "2",
                 "--hicache-write-policy",
                 "write_through",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
                 "--hicache-io-backend",
-                cls.hicache_io_backend,
+                "direct",
                 "--hicache-mem-layout",
-                cls.hicache_mem_layout,
-                "--swa-full-tokens-ratio",
-                "0.25",
-                "--max-total-tokens",
-                "20000",
-                "--max-running-requests",
-                str(cls.max_running_requests),
+                "page_first_direct",
+                "--hicache-storage-backend",
+                "file",
+                "--max-mamba-cache-size",
+                "500",
+                "--weight-loader-prefetch-checkpoints",
             ],
             env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )
-        cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-
-class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
-    TestUnifiedDeepSeekV4FlashHiCache
-):
-    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
-
-    hicache_io_backend = "kernel"
-    hicache_mem_layout = "layer_first"
+        if os.path.isdir(cls.hicache_dir):
+            shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

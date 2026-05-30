@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal, Optional
 
 import torch
 
@@ -9,6 +9,24 @@ from .cuda_graph_decode_runner import (
     _init_cuda_graph_capture_metadata,
     _init_cuda_graph_replay_metadata,
 )
+
+# How padded rows of a CG replay batch are filled.
+#
+# "small_real" (default, legacy): padded rows look like miniature real
+# requests — `seq_lens[padded] = capture_prefix_len + num_tokens_per_req`,
+# `extend_seq_lens[padded] = num_tokens_per_req`. Easy for the reference
+# module to compute an expected attention output for, but doesn't match
+# production's padding shape.
+#
+# "prod_fill": mirrors `eagle_draft_extend_cuda_graph_runner.py:466-474`
+# (and similar in `multi_layer_eagle_draft_extend_cuda_graph_runner.py`):
+# padded rows are pure scratch — `seq_lens[padded] = seq_len_fill_value`,
+# `extend_seq_lens[padded] = num_tokens_per_bs`, `req_pool_indices[padded] = 0`,
+# `out_cache_loc[padded] = 0`, `positions[padded] = 0`. seq_lens and
+# extend_seq_lens are intentionally inconsistent for padded rows (their
+# subtraction goes negative), so backends must defend against that — the
+# attention output for padded rows is never used in production.
+PadStyle = Literal["small_real", "prod_fill"]
 
 
 @dataclass(frozen=True)
@@ -32,6 +50,72 @@ class SpeculativeCudaGraphAdapter:
     compare_replay_to_graph_eager: bool = True
     atol: float = 0.0
     rtol: float = 0.0
+    # Padding behavior for replay batches when raw_bs < capture_batch_size.
+    # See PadStyle docstring above for semantics.
+    pad_style: PadStyle = "small_real"
+    # Required when pad_style == "prod_fill": draft tokens per request,
+    # used to fill the padded slots of extend_seq_lens / spec_info.
+    pad_num_tokens_per_bs: Optional[int] = None
+
+
+def _apply_prod_fill_padding(
+    batch,
+    *,
+    real_bs: int,
+    capture_bs: int,
+    seq_len_fill_value: int,
+    num_tokens_per_bs: int,
+) -> None:
+    """Overwrite padded slots of `batch` to match the production CG runner.
+
+    Production sets padded rows to: seq_lens = fill, extend_seq_lens = N,
+    req_pool_indices = 0, out_cache_loc = 0, positions = 0. The subtraction
+    `seq_lens - extend_seq_lens` then goes negative for padded rows — a
+    well-behaved backend must clamp or otherwise handle this.
+    """
+    if real_bs >= capture_bs:
+        return
+
+    pad_lo, pad_hi = real_bs, capture_bs
+
+    # Per-request length tensors.
+    batch.seq_lens[pad_lo:pad_hi] = seq_len_fill_value
+    if batch.seq_lens_cpu is not None:
+        batch.seq_lens_cpu[pad_lo:pad_hi] = seq_len_fill_value
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+    if getattr(batch, "extend_seq_lens", None) is not None:
+        batch.extend_seq_lens[pad_lo:pad_hi] = num_tokens_per_bs
+    if getattr(batch, "extend_seq_lens_cpu", None) is not None:
+        ext = list(batch.extend_seq_lens_cpu)
+        for i in range(pad_lo, min(pad_hi, len(ext))):
+            ext[i] = num_tokens_per_bs
+        batch.extend_seq_lens_cpu = ext
+
+    # Per-request slot tensors.
+    batch.req_pool_indices[pad_lo:pad_hi] = 0
+
+    # Per-token tensors: padded rows occupy slots
+    # [real_bs * num_tokens_per_bs, capture_bs * num_tokens_per_bs).
+    tok_lo = pad_lo * num_tokens_per_bs
+    tok_hi = pad_hi * num_tokens_per_bs
+    for field in ("out_cache_loc", "positions", "input_ids"):
+        t = getattr(batch, field, None)
+        if t is not None and t.numel() >= tok_hi:
+            t[tok_lo:tok_hi] = 0
+
+    # Mirror spec_info's per-request length tensor if present (set by the
+    # V2 production runner at replay: `spec_info.extend_seq_lens_tensor =
+    # buffers.extend_seq_lens[:bs]`).
+    spec_info = getattr(batch, "spec_info", None)
+    if spec_info is not None:
+        eslt = getattr(spec_info, "extend_seq_lens_tensor", None)
+        if isinstance(eslt, torch.Tensor) and eslt.numel() >= pad_hi:
+            eslt[pad_lo:pad_hi] = num_tokens_per_bs
+        eslc = getattr(spec_info, "extend_seq_lens_cpu", None)
+        if isinstance(eslc, list):
+            for i in range(pad_lo, min(pad_hi, len(eslc))):
+                eslc[i] = num_tokens_per_bs
 
 
 def _check_speculative_cuda_graph_case(
@@ -201,6 +285,30 @@ def run_speculative_cuda_graph_case(
         graph_initial_state,
     )
 
+    # Optionally overwrite padded rows to match the production CG runner's
+    # fill pattern. Done after prepare_batch + expected_output so that the
+    # reference is computed against the "small_real" layout (where padded
+    # rows have an interpretable attention output); the assertion below
+    # then compares only the real-row slice.
+    real_bs = case.batch_size
+    if (
+        adapter.pad_style == "prod_fill"
+        and adapter.allow_padding
+        and real_bs < capture_batch_size
+    ):
+        if adapter.pad_num_tokens_per_bs is None:
+            raise ValueError(
+                "SpeculativeCudaGraphAdapter.pad_num_tokens_per_bs must be set "
+                "when pad_style='prod_fill'."
+            )
+        _apply_prod_fill_padding(
+            replay_batch,
+            real_bs=real_bs,
+            capture_bs=capture_batch_size,
+            seq_len_fill_value=capture_prefix_len,
+            num_tokens_per_bs=adapter.pad_num_tokens_per_bs,
+        )
+
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
         _init_cuda_graph_replay_metadata(backend, capture_batch_size, replay_batch)
         replay_actual = adapter.run_forward(
@@ -209,12 +317,23 @@ def run_speculative_cuda_graph_case(
             replay_inputs,
         )
 
-    torch.testing.assert_close(
-        replay_actual,
-        replay_expected,
-        atol=adapter.atol,
-        rtol=adapter.rtol,
-    )
+    if adapter.pad_style == "prod_fill":
+        # Padded rows have undefined output (their state is scratch in
+        # production; the runner discards their result). Assert only on the
+        # real-row slice.
+        torch.testing.assert_close(
+            replay_actual[: case.num_input_tokens],
+            replay_expected[: case.num_input_tokens],
+            atol=adapter.atol,
+            rtol=adapter.rtol,
+        )
+    else:
+        torch.testing.assert_close(
+            replay_actual,
+            replay_expected,
+            atol=adapter.atol,
+            rtol=adapter.rtol,
+        )
     if adapter.compare_replay_to_graph_eager:
         torch.testing.assert_close(
             replay_actual[: case.num_input_tokens],

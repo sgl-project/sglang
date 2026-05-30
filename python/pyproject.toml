@@ -82,7 +82,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.2.1",
   "smg-grpc-servicer>=0.5.0",
-  "kernels",
+  "kernels<0.15",
 ]
 
 [[tool.uv.index]]

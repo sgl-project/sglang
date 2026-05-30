@@ -1069,12 +1069,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
             )
         )
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.block_sparse_moe(
-            hidden_states, state.forward_batch
-        )
-
     def op_comm_postprocess_layer(self, state):
         """Communication postprocess for layer - TBO operation"""
         hidden_states, residual = self.layer_communicator.postprocess_layer(
