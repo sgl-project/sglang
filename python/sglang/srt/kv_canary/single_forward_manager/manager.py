@@ -13,6 +13,9 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.plan_input import PlanInput
+from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
+    populate_req_to_expected_token_ids,
+)
 from sglang.srt.kv_canary.runner.enable_warner import CanaryEnableWarner
 from sglang.srt.kv_canary.runner.kernel_launcher import (
     invoke_plan,
@@ -130,6 +133,12 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
+        if self._config.enable_verify_token_assert:
+            populate_req_to_expected_token_ids(
+                forward_batch=maybe_inaccurate_forward_batch,
+                req_to_verify_expected_tokens=self._device_state.req_to_verify_expected_tokens,
+            )
+
     def pre_ops_maybe_inside_graph(
         self, forward_batch: "ForwardBatch"
     ) -> "_PreOpsMaybeInsideGraphOutput":
@@ -203,7 +212,7 @@ class SingleForwardManager:
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 enable_write_input_assert=enable_write_input_assert,
-                enable_verify_token_assert=False,
+                enable_verify_token_assert=self._config.enable_verify_token_assert,
             )
 
         return _PreOpsMaybeInsideGraphOutput(
@@ -241,7 +250,7 @@ class SingleForwardManager:
                 violation_log=violation_log,
                 real_kv_hash_mode=self._config.real_kv_hash_mode,
                 enable_write_input_assert=enable_write_input_assert,
-                enable_verify_token_assert=False,
+                enable_verify_token_assert=self._config.enable_verify_token_assert,
             )
 
         verify_plan_enable_combined = _torch_reduce_minimum(
