@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.elementwise import fused_sigmoid_mul
 
 # Layers - Others
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -970,15 +971,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if _is_hip:
-                from sglang.jit_kernel.triton.sigmoid_gate_mul import (
-                    sigmoid_gate_mul,
-                )
-
-                attn_output = sigmoid_gate_mul(attn_output, gate)
-            else:
-                gate = torch.sigmoid(gate)
-                attn_output = attn_output * gate
+            attn_output = fused_sigmoid_mul(attn_output, gate)
 
         output, _ = self.o_proj(attn_output)
         return output

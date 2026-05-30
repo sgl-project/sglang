@@ -531,6 +531,44 @@ def silu_and_mul_triton(
 
 
 @triton.jit
+def _fused_sigmoid_mul_kernel(
+    output_ptr,
+    attn_output_ptr,
+    gate_ptr,
+    n_ele,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fuse sigmoid(gate) * attn_output into a single kernel."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_ele
+
+    attn = tl.load(attn_output_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    result = attn * tl.sigmoid(g)
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+
+def fused_sigmoid_mul(
+    attn_output: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Fused sigmoid-mul for attention output gating.
+
+    Equivalent to: attn_output * sigmoid(gate)
+    """
+    out = torch.empty_like(attn_output)
+    n_elements = out.numel()
+    grid = (triton.cdiv(n_elements, 1024),)
+    _fused_sigmoid_mul_kernel[grid](
+        out, attn_output, gate, n_elements, BLOCK_SIZE=1024, num_warps=8
+    )
+    return out
+
+
+@triton.jit
 def _fused_gate_sigmoid_mul_add_kernel(
     hidden_states_ptr,  # [num_tokens, hidden_dim]
     gate_weight_ptr,  # [hidden_dim]
