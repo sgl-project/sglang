@@ -98,7 +98,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -193,6 +192,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -200,6 +200,7 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.extra_key = extra_key
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -216,6 +217,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ):
         self.request_id = request_id
 
@@ -223,7 +225,13 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            prefix_keys=prefix_keys,
+            extra_key=extra_key,
+        )
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -241,7 +249,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -852,12 +859,18 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            extra_key,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -987,7 +1000,9 @@ class HiCacheController:
             batch_hashes = []
             for i in range(0, len(batch_tokens), self.page_size):
                 last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
+                    batch_tokens[i : i + self.page_size],
+                    last_hash,
+                    extra_key=operation.extra_key,
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)

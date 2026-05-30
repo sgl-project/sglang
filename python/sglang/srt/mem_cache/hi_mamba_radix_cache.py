@@ -1757,6 +1757,7 @@ class HiMambaRadixCache(MambaRadixCache):
             new_input_tokens,
             last_hash,
             prefix_keys,
+            extra_key=last_host_node.key.extra_key if last_host_node.key else None,
             extra_pools=extra_pools,
         )
         self.ongoing_prefetch[req_id] = (

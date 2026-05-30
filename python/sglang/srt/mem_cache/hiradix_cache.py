@@ -1308,6 +1308,7 @@ class HiRadixCache(RadixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            extra_key=prefetch_key.extra_key,
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
