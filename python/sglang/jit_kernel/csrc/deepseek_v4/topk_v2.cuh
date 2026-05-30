@@ -402,12 +402,13 @@ struct TopKKernel {
     const auto max_seq_len = static_cast<uint32_t>(L.unwrap());
     const auto device = device_.unwrap();
 
-    // For batch <= kSmallBatchLowFloor the fused kernel is latency-bound (one 8-block
-    // cluster per element), so the 8-way split beats streaming from a lower seq:
-    // measured crossover ~32K for batch<=8 vs ~56K for batch 16-30 (at occ2). Larger
-    // batch keeps the 64K floor. The floor is chosen on the host per launch.
+    // The fused kernel runs one 8-block cluster per batch element, and B200 fits one
+    // wave of exactly 15 such clusters (occ2). For batch <= 15 it stays latency-bound,
+    // so the 8-way split beats streaming from a much lower seq (measured crossover
+    // ~36-40K); batch 16 spills into a 2nd wave (+25%) and keeps the 64K floor.
+    // The floor is chosen on the host per launch.
     constexpr uint32_t kClusterFloorSmall = 32768;
-    constexpr uint32_t kSmallBatchLowFloor = 8;
+    constexpr uint32_t kSmallBatchLowFloor = 15;
     const auto params = TopKLaunchParams{
         .scores = static_cast<const float*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
