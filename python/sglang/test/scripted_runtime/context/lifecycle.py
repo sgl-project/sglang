@@ -1,14 +1,14 @@
-"""Free functions for request- and engine-lifecycle control verbs.
+"""Free functions for engine-wide control verbs.
 
-These drive pause / continue / abort / retract / preempt and engine-wide
-actions (flush cache, shutdown). Each takes the facade ``ctx`` first.
+These drive ``pause_generation`` / ``continue_generation`` / ``abort_all`` /
+``flush_cache``. Each takes the facade ``ctx`` first.
 
-Verbs that have an HTTP API and must apply across all ranks (flush_cache,
-abort_all, pause_generation, continue_generation) go through the real
-server like ``start_req``: fire an HTTP POST on the hook's shared async
-loop, then wait until the resulting control object reaches the wrapped
-``recv_from_tokenizer`` socket (so the scheduler broadcasts it to every
-rank on the next ``yield``). They never touch a scheduler object directly.
+All of them have an HTTP API and must apply across all ranks, so they go
+through the real server like ``start_req``: fire an HTTP POST on the hook's
+shared async loop, then wait until the resulting control object reaches the
+wrapped ``recv_from_tokenizer`` socket (so the scheduler broadcasts it to
+every rank on the next ``yield``). They never touch a scheduler object
+directly.
 """
 
 from __future__ import annotations
