@@ -1,0 +1,23 @@
+{
+  "length_words": 1024,
+  "input_tokens": 1128,
+  "input_tokens_source": "usage.prompt_tokens (max over served prompts)",
+  "dsa_input_tokens": 1128,
+  "usage_missing": false,
+  "index_topk": 2048,
+  "within_budget": true,
+  "within_budget_wordcount_proxy": true,
+  "gate_class": "within_budget_hard",
+  "num_prompts": 20,
+  "dsa_served": 20,
+  "ds_served": 20,
+  "dsa_hits": 20,
+  "ds_hits": 20,
+  "dsa_recall_pct": 100.0,
+  "ds_recall_pct": 100.0,
+  "delta_pct": 0.0,
+  "threshold_pp": 5.0,
+  "dsa_error": null,
+  "ds_error": null,
+  "verdict": "PASS"
+}
