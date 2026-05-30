@@ -14,10 +14,6 @@ class BaseSWAKVPool(KVCache):
     handle SWA state separately from the full KV state.
     """
 
-    # By default, PD prefill assumes the SWA pool stores KV for every prompt
-    # token. Pools that use SWA only for window state should override this.
-    pd_prefill_swa_pool_holds_full_prompt: bool = True
-
     swa_kv_pool: KVCache
 
     def invalidate_loc_cache(self) -> None:

@@ -354,7 +354,6 @@ class DeepSeekV4LayerItem(NamedTuple):
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
-    pd_prefill_swa_pool_holds_full_prompt = False
 
     def __init__(
         self,
