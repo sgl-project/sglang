@@ -54,6 +54,10 @@ def make_perturb_config() -> PerturbConfig:
     """Build a PerturbConfig with every probability pinned to 0 so the
     perturb hooks do nothing during unit tests."""
     return PerturbConfig(
+        req_to_token_prob=0.0,
+        real_kv_used_prob=0.0,
+        real_kv_unused_cache_prob=0.0,
+        real_kv_post_forward_prob=0.0,
         target_group_kind=None,
         warmup_steps=0,
     )
