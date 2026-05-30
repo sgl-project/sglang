@@ -189,6 +189,55 @@ def test_sampling_params_apply_condition_inputs_to_req():
     assert req.realtime_chunk_size == 3
 
 
+def test_realtime_chunk_latent_preparation_uses_chunk_spec():
+    import torch
+    from unittest.mock import patch
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+        RealtimeChunkLatentPreparationStage,
+    )
+
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(out_channels=16, num_frames_per_block=3)
+        )
+    )
+    stage = RealtimeChunkLatentPreparationStage(
+        scheduler=SimpleNamespace(init_noise_sigma=10.0),
+        transformer=transformer,
+    )
+    batch = SimpleNamespace(
+        batch_size=1,
+        generator=None,
+        height=None,
+        width=None,
+        image_latent=torch.zeros(2, 20, 6, 4, 5, dtype=torch.float32),
+        latents=None,
+        realtime_chunk_size=2,
+    )
+
+    def fake_randn_tensor(shape, generator, device, dtype):
+        del generator
+        return torch.ones(shape, device=device, dtype=dtype)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation.randn_tensor",
+            side_effect=fake_randn_tensor,
+        ),
+    ):
+        result = stage.forward(batch, SimpleNamespace())
+
+    assert tuple(result.latents.shape) == (2, 16, 2, 4, 5)
+    assert result.latents.dtype == torch.float32
+    assert torch.all(result.latents == 1)
+    assert result.raw_latent_shape == result.latents.shape
+
+
 def test_lingbot_camera_actions_have_deterministic_pose_precision():
     poses = _actions_to_c2ws([["w"], ["d"]])
 
