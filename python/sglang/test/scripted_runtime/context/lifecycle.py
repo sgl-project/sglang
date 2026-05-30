@@ -35,9 +35,7 @@ def pause_generation(
     ctx._scheduler.pause_generation(PauseGenerationReqInput(mode=mode))
 
 
-def continue_generation(
-    ctx: "ScriptedContext", *, torch_empty_cache: bool = False
-) -> None:
+def continue_generation(ctx: "ScriptedContext", *, torch_empty_cache: bool) -> None:
     """Scripted-only entry point: bypasses HTTP server / tokenizer manager.
 
     Resume after :meth:`pause_generation`. Defaults to skipping the
