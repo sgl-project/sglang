@@ -46,6 +46,10 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.causal_attention_cache import (
+    CausalSelfAttentionKVCache,
+    CrossAttentionKVCache,
+)
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanT2VCrossAttention,
     WanTimeTextImageEmbedding,
@@ -105,7 +109,7 @@ class CausalWanSelfAttention(nn.Module):
         v: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         block_mask: BlockMask,
-        kv_cache: dict | None = None,
+        kv_cache: CausalSelfAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
     ):
@@ -170,83 +174,20 @@ class CausalWanSelfAttention(nn.Module):
             )[:, :, :-padded_length].transpose(2, 1)
         else:
             frame_seqlen = q.shape[1]
-            current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
-            # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-            kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
-            if (
-                self.local_attn_size != -1
-                and (current_end > kv_cache["global_end_index"].item())
-                and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size
-                )
-            ):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                # Clone the source slice to avoid overlapping memory error
-                num_evicted_tokens = (
-                    num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                )
-                num_rolled_tokens = (
-                    kv_cache["local_end_index"].item()
-                    - num_evicted_tokens
-                    - sink_tokens
-                )
-                kv_cache["k"][
-                    :, sink_tokens : sink_tokens + num_rolled_tokens
-                ] = kv_cache["k"][
-                    :,
-                    sink_tokens
-                    + num_evicted_tokens : sink_tokens
-                    + num_evicted_tokens
-                    + num_rolled_tokens,
-                ].clone()
-                kv_cache["v"][
-                    :, sink_tokens : sink_tokens + num_rolled_tokens
-                ] = kv_cache["v"][
-                    :,
-                    sink_tokens
-                    + num_evicted_tokens : sink_tokens
-                    + num_evicted_tokens
-                    + num_rolled_tokens,
-                ].clone()
-                # Insert the new keys/values at the end
-                local_end_index = (
-                    kv_cache["local_end_index"].item()
-                    + current_end
-                    - kv_cache["global_end_index"].item()
-                    - num_evicted_tokens
-                )
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
-            else:
-                # Assign new keys/values directly up to current_end
-                local_end_index = (
-                    kv_cache["local_end_index"].item()
-                    + current_end
-                    - kv_cache["global_end_index"].item()
-                )
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"] = kv_cache["k"].detach()
-                kv_cache["v"] = kv_cache["v"].detach()
-                # logger.info("kv_cache['k'] is in comp graph: %s", kv_cache["k"].requires_grad or kv_cache["k"].grad_fn is not None)
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+            cache_view = kv_cache.update_and_get_attention_kv(
+                key=roped_key,
+                value=v,
+                current_start=current_start,
+                sink_tokens=sink_tokens,
+                attention_window_size=self.max_attention_size,
+                debug_name="CausalWan KV cache",
+            )
             x = self.attn(
                 roped_query,
-                kv_cache["k"][
-                    :,
-                    max(0, local_end_index - self.max_attention_size) : local_end_index,
-                ],
-                kv_cache["v"][
-                    :,
-                    max(0, local_end_index - self.max_attention_size) : local_end_index,
-                ],
+                cache_view.k,
+                cache_view.v,
             )
-            kv_cache["global_end_index"].fill_(current_end)
-            kv_cache["local_end_index"].fill_(local_end_index)
 
         return x
 
@@ -335,8 +276,8 @@ class CausalWanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         block_mask: BlockMask,
-        kv_cache: dict | None = None,
-        crossattn_cache: dict | None = None,
+        kv_cache: CausalSelfAttentionKVCache | None = None,
+        crossattn_cache: CrossAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
     ) -> torch.Tensor:
@@ -600,8 +541,8 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.LongTensor,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
-        kv_cache: dict = None,
-        crossattn_cache: dict = None,
+        kv_cache: list[CausalSelfAttentionKVCache] | None = None,
+        crossattn_cache: list[CrossAttentionKVCache] | None = None,
         current_start: int = 0,
         cache_start: int = 0,
         start_frame: int = 0,

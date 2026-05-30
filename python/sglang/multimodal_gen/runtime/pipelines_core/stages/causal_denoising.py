@@ -2,12 +2,16 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any
 
 import torch  # type: ignore
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits.causal_attention_cache import (
+    CausalSelfAttentionKVCache,
+    CrossAttentionKVCache,
+)
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
@@ -46,90 +50,6 @@ class CausalDMDForwardContext:
     num_frames: int
     height: int
     width: int
-
-
-@dataclass(slots=True)
-class CausalSelfAttentionKVCache:
-    """one transformer block's causal self-attn K/V cache and write cursors"""
-
-    k: torch.Tensor
-    v: torch.Tensor
-    # the position within global token sequence
-    global_end_index: torch.Tensor
-    # the position within current chunk
-    local_end_index: torch.Tensor
-    global_end_index_int: int | None = None
-    local_end_index_int: int | None = None
-
-    _FIELD_NAMES: ClassVar[frozenset[str]] = frozenset(
-        {
-            "k",
-            "v",
-            "global_end_index",
-            "local_end_index",
-            "global_end_index_int",
-            "local_end_index_int",
-        }
-    )
-
-    def __getitem__(self, key: str) -> Any:
-        if key not in self._FIELD_NAMES:
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key not in self._FIELD_NAMES:
-            raise KeyError(key)
-        setattr(self, key, value)
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._FIELD_NAMES and getattr(self, key) is not None
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if key not in self._FIELD_NAMES:
-            return default
-        value = getattr(self, key)
-        return default if value is None else value
-
-    def reset_indices(self) -> None:
-        self.global_end_index.zero_()
-        self.local_end_index.zero_()
-        if self.global_end_index_int is not None:
-            self.global_end_index_int = 0
-        if self.local_end_index_int is not None:
-            self.local_end_index_int = 0
-
-
-@dataclass(slots=True)
-class CrossAttentionKVCache:
-    """one transformer block's cross-attn condition K/V cache"""
-
-    k: torch.Tensor
-    v: torch.Tensor
-    is_init: bool = False
-
-    _FIELD_NAMES: ClassVar[frozenset[str]] = frozenset({"k", "v", "is_init"})
-
-    def __getitem__(self, key: str) -> Any:
-        if key not in self._FIELD_NAMES:
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key not in self._FIELD_NAMES:
-            raise KeyError(key)
-        setattr(self, key, value)
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._FIELD_NAMES
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if key not in self._FIELD_NAMES:
-            return default
-        return getattr(self, key)
-
-    def reset(self) -> None:
-        self.is_init = False
 
 
 class CausalDMDDenoisingStage(DenoisingStage):
@@ -694,32 +614,18 @@ class CausalDMDDenoisingStage(DenoisingStage):
         *,
         kv_cache,
         crossattn_cache,
-        device: torch.device,
     ) -> None:
         self._reset_crossattn_cache(crossattn_cache)
-        self._reset_kv_cache(kv_cache, device)
+        self._reset_kv_cache(kv_cache)
 
     def _reset_crossattn_cache(self, crossattn_cache) -> None:
-        for block_index in range(self.num_transformer_blocks):
-            cache_block = crossattn_cache[block_index]
-            if isinstance(cache_block, CrossAttentionKVCache):
-                cache_block.reset()
-            else:
-                cache_block["is_init"] = False
+        for cache_block in crossattn_cache:
+            cache_block.reset()
 
     @staticmethod
-    def _reset_kv_cache(kv_cache, device: torch.device) -> None:
-        for block_index in range(len(kv_cache)):
-            cache_block = kv_cache[block_index]
-            if isinstance(cache_block, CausalSelfAttentionKVCache):
-                cache_block.reset_indices()
-                continue
-            cache_block["global_end_index"].zero_()
-            cache_block["local_end_index"].zero_()
-            if "global_end_index_int" in cache_block:
-                cache_block["global_end_index_int"] = 0
-            if "local_end_index_int" in cache_block:
-                cache_block["local_end_index_int"] = 0
+    def _reset_kv_cache(kv_cache) -> None:
+        for cache_block in kv_cache:
+            cache_block.reset_indices()
 
     def _get_causal_kv_cache_size(self) -> int:
         if self.local_attn_size != -1:
@@ -808,7 +714,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
             self._reset_causal_caches(
                 kv_cache=self.causal_kv_cache,
                 crossattn_cache=self.crossattn_cache,
-                device=latents.device,
             )
 
         # Optional: cache context features from provided image latents prior to generation
