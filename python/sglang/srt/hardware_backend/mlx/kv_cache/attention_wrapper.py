@@ -9,6 +9,11 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from sglang.srt.hardware_backend.mlx.aot import (
+    MlxAOTKernelContext,
+    MlxAOTKernelSet,
+    MlxAOTRoPEContext,
+)
 from sglang.srt.hardware_backend.mlx.kv_cache.contiguous_cache import ContiguousKVCache
 
 _thread_local = threading.local()
@@ -23,6 +28,11 @@ class BatchedDecodeContext:
     seq_lens: list[int]  # per-request token count before the new token
     # layer_caches[layer_idx][req_idx] = ContiguousKVCache
     layer_caches: list[list[ContiguousKVCache]]
+
+    # Optional AOT kernel state. Keep kernel-specific fields out of the regular
+    # MLX decode path so future AOT kernels can be added without growing this
+    # context one field at a time.
+    aot: MlxAOTKernelContext = field(default_factory=MlxAOTKernelContext)
 
     # Derived tensors/metadata, shared across all layers in one forward pass.
     offsets: mx.array = field(init=False)
@@ -41,6 +51,38 @@ class BatchedDecodeContext:
         self.needs_padding = min(seq_lens) < max_seq_len
         self.pad_sizes = [max_seq_len - s for s in seq_lens]
         self.positions = mx.arange(self.max_len) if self.needs_padding else None
+
+    @classmethod
+    def from_decode(
+        cls,
+        *,
+        caches: list[list[ContiguousKVCache]],
+        num_layers: int,
+        req_ids: list[str],
+        aot_kernels: MlxAOTKernelSet,
+        kv_pool: Any | None,
+        req_pool_idx: dict[str, int],
+        req_to_token_pool: Any | None,
+    ) -> "BatchedDecodeContext":
+        batch_size = len(req_ids)
+        seq_lens = [caches[i][0].offset for i in range(batch_size)]
+        layer_caches = [
+            [caches[i][layer_idx] for i in range(batch_size)]
+            for layer_idx in range(num_layers)
+        ]
+        return cls(
+            batch_size=batch_size,
+            seq_lens=seq_lens,
+            layer_caches=layer_caches,
+            aot=MlxAOTKernelContext.from_decode(
+                aot_kernels=aot_kernels,
+                kv_pool=kv_pool,
+                req_ids=req_ids,
+                req_pool_idx=req_pool_idx,
+                req_to_token_pool=req_to_token_pool,
+                layer_caches=layer_caches,
+            ),
+        )
 
 
 def set_context(ctx: Optional[BatchedDecodeContext]) -> None:
@@ -96,13 +138,26 @@ class MLXAttentionWrapper(nn.Module):
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
-        # Vectorized RoPE with per-batch offsets
+        # Vectorized RoPE with per-batch offsets (cached on the context).
         offsets = ctx.offsets
-        queries = inner.rope(queries, offset=offsets)
-        keys = inner.rope(keys, offset=offsets)
+
+        if ctx.aot.rope is not None:
+            # AOT path: real .metallib RoPE + fused KV pool scatter.
+            queries, keys = self._rope_custom_aot(
+                queries,
+                keys,
+                values,
+                offsets,
+                layer_idx,
+                ctx.aot.rope,
+            )
+        else:
+            # Fallback: MLX's built-in mx.fast.rope (used when the AOT kernel
+            # isn't built or the model uses an unsupported RoPE variant).
+            queries = inner.rope(queries, offset=offsets)
+            keys = inner.rope(keys, offset=offsets)
 
         layer_caches = ctx.layer_caches[layer_idx]
-        max_len = ctx.max_len
         pad_sizes = ctx.pad_sizes
 
         # TODO: replace per-request loop with native batched/ragged
@@ -148,3 +203,56 @@ class MLXAttentionWrapper(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, 1, -1)
         return inner.o_proj(output)
+
+    @staticmethod
+    def _rope_custom_aot(
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        positions: mx.array,
+        layer_idx: int,
+        rope_ctx: MlxAOTRoPEContext,
+    ) -> tuple[mx.array, mx.array]:
+        """AOT path: rotate Q/K and scatter K/V into the shared pool.
+
+        The kernel call does RoPE on Q/K and scatters
+        rotated K + (untouched) V into ``kv_pool`` at ``new_token_slots``
+        for ``layer_idx``.
+
+        If ``new_token_slots`` is None, slot=-1 sentinel is used (no pool
+        write, RoPE-only mode). Returns rotated (queries, keys) in the
+        original 4-D attention layout. ``values`` is unchanged by RoPE.
+        """
+        # (B, n_heads, 1, head_dim) -> (B, n_heads, head_dim) for kernel
+        q_flat = queries[:, :, 0, :]
+        k_flat = keys[:, :, 0, :]
+        v_flat = values[:, :, 0, :]
+        B = q_flat.shape[0]
+
+        if rope_ctx.new_token_slots is None:
+            slots = mx.full((B,), -1, dtype=mx.int32)
+        else:
+            slots = rope_ctx.new_token_slots.astype(mx.int32)
+
+        k_pool = rope_ctx.kv_pool.k_buffer[layer_idx]
+        v_pool = rope_ctx.kv_pool.v_buffer[layer_idx]
+
+        q_rot, k_rot, k_pool_new, v_pool_new = rope_ctx.kernel.rope_pool_fused(
+            q_flat,
+            k_flat,
+            v_flat,
+            positions,
+            slots,
+            k_pool,
+            v_pool,
+            head_dim=rope_ctx.kernel.config["head_dim"],
+            num_qo_heads=rope_ctx.kernel.config["num_qo_heads"],
+            num_kv_heads=rope_ctx.kernel.config["num_kv_heads"],
+            rope_base=rope_ctx.kernel.base,
+        )
+        # Rebind pool buffers (zero-copy donation result).
+        rope_ctx.kv_pool.k_buffer[layer_idx] = k_pool_new
+        rope_ctx.kv_pool.v_buffer[layer_idx] = v_pool_new
+
+        # (B, n_heads, head_dim) -> (B, n_heads, 1, head_dim) for SDPA path
+        return q_rot[:, :, None, :], k_rot[:, :, None, :]
