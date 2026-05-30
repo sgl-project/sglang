@@ -134,3 +134,90 @@ def _dequantize_k_cache_paged_kernel(
     bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
     rope_data = tl.load(buf_bf16_ptr + bf16_off)
     tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
+
+
+def dequantize_k_cache_paged_ref(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """Pure-torch reference for :func:`dequantize_k_cache_paged`.
+
+    Decodes the same v4 paged layout with vectorized torch indexing instead of
+    a Triton kernel. Used to validate the kernel (see the ``__main__`` block
+    below); not on any hot path.
+    """
+    assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+    u8 = quant_k_cache.view(torch.uint8)
+    bytes_per_page = u8.shape[-1]
+    s_offset_bytes = page_size * NOPE_ROPE_BYTES
+
+    flat_u8 = u8.reshape(-1)
+    flat_fp8 = u8.view(fp8_dtype).reshape(-1)
+    flat_bf16 = u8.view(torch.bfloat16).reshape(-1)
+
+    loc = page_table_1_flattened.to(torch.int64)
+    page_idx = loc // page_size
+    in_page = loc % page_size
+    page_byte_base = page_idx * bytes_per_page
+    token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
+    token_scale_base = (
+        page_byte_base + s_offset_bytes + in_page * PADDED_SCALE_PER_TOKEN
+    )
+
+    device = quant_k_cache.device
+    nope_byte = (
+        token_data_base[:, None] + torch.arange(DIM_NOPE, device=device)[None, :]
+    )
+    nope_fp8 = flat_fp8[nope_byte].to(torch.float32)
+    scale_byte = (
+        token_scale_base[:, None]
+        + torch.arange(NUM_SCALE_TILES, device=device)[None, :]
+    )
+    scale_u8 = flat_u8[scale_byte].to(torch.int32)
+    scale_pow2 = torch.exp2((scale_u8 - 127).to(torch.float32))
+    scale_full = scale_pow2.repeat_interleave(TILE_SIZE, dim=1)
+    nope = nope_fp8 * scale_full
+
+    rope_bf16_base = (token_data_base + DIM_NOPE) // 2
+    rope_idx = rope_bf16_base[:, None] + torch.arange(DIM_ROPE, device=device)[None, :]
+    rope = flat_bf16[rope_idx]
+
+    out = torch.empty(
+        (loc.shape[0], 1, DIM_NOPE + DIM_ROPE),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    out[:, 0, :DIM_NOPE] = nope.to(torch.bfloat16)
+    out[:, 0, DIM_NOPE:] = rope
+    return out
+
+
+if __name__ == "__main__":
+    assert torch.cuda.is_available(), "this self-test needs a CUDA device"
+    torch.manual_seed(0)
+    device = "cuda"
+
+    page_size = 64
+    num_pages = 8
+    num_tokens = 333
+    raw_bytes = page_size * (NOPE_ROPE_BYTES + PADDED_SCALE_PER_TOKEN)
+    bytes_per_page = (
+        (raw_bytes + NOPE_ROPE_BYTES - 1) // NOPE_ROPE_BYTES
+    ) * NOPE_ROPE_BYTES
+
+    quant_k_cache = torch.randint(
+        0, 256, (num_pages, bytes_per_page), dtype=torch.uint8, device=device
+    )
+    page_table = torch.randint(
+        0, num_pages * page_size, (num_tokens,), dtype=torch.int32, device=device
+    )
+
+    out_kernel = dequantize_k_cache_paged(quant_k_cache, page_table, page_size)
+    out_ref = dequantize_k_cache_paged_ref(quant_k_cache, page_table, page_size)
+
+    torch.testing.assert_close(out_kernel, out_ref, atol=0, rtol=0, equal_nan=True)
+    print(
+        f"OK: kernel matches torch ref for {num_tokens} tokens "
+        f"(page_size={page_size}, bytes_per_page={bytes_per_page})"
+    )

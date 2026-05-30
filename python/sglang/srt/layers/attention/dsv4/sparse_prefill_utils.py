@@ -1,7 +1,10 @@
 """Per-query sparse-index combiner for the FlashMLA sparse prefill path.
 
-Adapts vllm's ``combine_topk_swa_indices`` (vllm/v1/attention/ops/
-deepseek_v4_ops/cache_utils.py) to sglang's flat-workspace layout. For each
+Adapts vllm's ``combine_topk_swa_indices`` to sglang's flat-workspace layout.
+Reference:
+https://github.com/vllm-project/vllm/blob/124fac10cb0ea83aee2ffeabac0b413d6b759b26/vllm/models/deepseek_v4/common/ops/cache_utils.py#L476
+
+For each
 query token in a prefill chunk, emits one row of combined indices into the
 chunk's bf16 KV workspace:
 
@@ -239,7 +242,7 @@ def _build_swa_token_ids_kernel(
 
     first_pos = tl.load(swa_first_pos_ptr + batch_idx)
     gather_len = tl.load(swa_gather_lens_ptr + batch_idx)
-    out_off = tl.load(swa_offsets_ptr + batch_idx)
+    out_off = tl.load(swa_offsets_ptr + batch_idx).to(tl.int64)
     req_pool_idx = tl.load(req_pool_indices_ptr + batch_idx).to(tl.int64)
 
     for i in range(worker_id, gather_len, num_workers):
@@ -297,14 +300,17 @@ def _combine_topk_swa_indices_kernel(
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
+        combined_row = token_idx * combined_indices_stride.to(tl.int64)
+        topk_row = token_idx * topk_indices_stride.to(tl.int64)
+
         offset = tl.arange(0, PADDED_TOP_K)
         mask = offset < topk_len
         topk_vals = tl.load(
-            topk_indices_ptr + token_idx * topk_indices_stride + offset,
+            topk_indices_ptr + topk_row + offset,
             mask=mask,
         )
         tl.store(
-            combined_indices_ptr + token_idx * combined_indices_stride + offset,
+            combined_indices_ptr + combined_row + offset,
             topk_vals + compressed_base,
             mask=mask,
         )
@@ -314,10 +320,7 @@ def _combine_topk_swa_indices_kernel(
         # For positions [pos - swa_len + 1, pos], the buffer offsets are
         # [pos - swa_len + 1 - gather_start, pos - gather_start].
         tl.store(
-            combined_indices_ptr
-            + token_idx * combined_indices_stride
-            + topk_len
-            + offset,
+            combined_indices_ptr + combined_row + topk_len + offset,
             swa_base + offset + pos - swa_len + 1 - gather_start,
             mask=offset < swa_len,
         )
