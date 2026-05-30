@@ -181,9 +181,7 @@ class _ThreadedDetokenizer(DetokenizerManager):
     by the multi-detokenizer change.
     """
 
-    def init_ipc_channels(
-        self, port_args: PortArgs, server_args: ServerArgs
-    ) -> None:
+    def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs) -> None:
         self.recv_from_scheduler = None
         self.send_to_tokenizer = None
 
@@ -361,9 +359,7 @@ class ThreadedEngine(Engine):
 
         # ---- wait for scheduler to come up ----
         if not scheduler_ready.wait(timeout=600):
-            raise RuntimeError(
-                "Scheduler rank-0 thread did not initialize within 600s"
-            )
+            raise RuntimeError("Scheduler rank-0 thread did not initialize within 600s")
         if scheduler_error_box[0] is not None:
             raise RuntimeError(
                 f"Scheduler rank-0 thread failed:\n{scheduler_error_box[0]}"
@@ -378,9 +374,7 @@ class ThreadedEngine(Engine):
             TokenizerManagerClass=_ThreadedTokenizerManager,
         )
         tokenizer_manager.send_to_scheduler = hub.tokenizer_to_scheduler.sender
-        tokenizer_manager.recv_from_detokenizer = (
-            hub.detokenizer_to_tokenizer.receiver
-        )
+        tokenizer_manager.recv_from_detokenizer = hub.detokenizer_to_tokenizer.receiver
 
         # FanOutCommunicators were constructed with send_to_scheduler=None;
         # patch their private sender field. Assert the field exists so a

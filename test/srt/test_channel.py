@@ -7,10 +7,7 @@ run on any 3.12+ interpreter, free-threaded or not.
 from __future__ import annotations
 
 import asyncio
-import gc
 import queue
-import threading
-import time
 import unittest
 
 import zmq
@@ -200,15 +197,9 @@ class TestChannelHub(unittest.TestCase):
             self.assertIsInstance(hub.detokenizer_to_tokenizer, AsyncChannelPair)
             self.assertIsInstance(hub.rpc_dealer, QueueDealer)
 
-            self.assertIsNot(
-                hub.tokenizer_to_scheduler, hub.scheduler_to_detokenizer
-            )
-            self.assertIsNot(
-                hub.tokenizer_to_scheduler, hub.detokenizer_to_tokenizer
-            )
-            self.assertIsNot(
-                hub.scheduler_to_detokenizer, hub.detokenizer_to_tokenizer
-            )
+            self.assertIsNot(hub.tokenizer_to_scheduler, hub.scheduler_to_detokenizer)
+            self.assertIsNot(hub.tokenizer_to_scheduler, hub.detokenizer_to_tokenizer)
+            self.assertIsNot(hub.scheduler_to_detokenizer, hub.detokenizer_to_tokenizer)
         finally:
             hub.close()
 
