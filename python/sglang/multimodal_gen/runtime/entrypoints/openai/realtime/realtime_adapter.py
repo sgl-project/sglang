@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from fastapi import WebSocket
@@ -17,11 +18,19 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
         GenerateSession,
+        RealtimeChunkContext,
     )
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
         OutputBatch,
         Req,
     )
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+@dataclass(slots=True)
+class RealtimeChunkInputs:
+    prompt: str
+    condition_inputs: dict[str, Any] = field(default_factory=dict)
 
 
 class RealtimeModelAdapter(Protocol):
@@ -41,9 +50,12 @@ class RealtimeModelAdapter(Protocol):
         event: RealtimeEvent,
     ) -> str: ...
 
-    def build_sampling_params(self, session: GenerateSession): ...
-
-    def prepare_request(self, session: GenerateSession, batch: Req) -> Req: ...
+    def prepare_next_request(
+        self,
+        session: GenerateSession,
+        server_args: ServerArgs,
+        chunk: RealtimeChunkContext,
+    ) -> Req: ...
 
     async def send_output(
         self,

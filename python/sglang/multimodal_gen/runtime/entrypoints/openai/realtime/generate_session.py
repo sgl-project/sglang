@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -18,13 +19,20 @@ if TYPE_CHECKING:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RealtimeChunkContext:
+    session_id: str
+    index: int
+    request_id: str
+
+
 class GenerateSession:
     def __init__(self):
         self.id = uuid4().hex
-        self.request_id = None
         self.request: RealtimeVideoGenerationsRequest | None = None
         self.input_temp_dir: str | None = None
         self.generate_chunk_cnt = 0
+        self.current_chunk: RealtimeChunkContext | None = None
         self.realtime_session = RealtimeSession()
         self.adapter: RealtimeModelAdapter | None = None
         self.adapter_state: Any = None
@@ -40,20 +48,24 @@ class GenerateSession:
         if self.adapter is not None:
             self.adapter.dispose(self)
         self.request = None
-        self.request_id = None
         self.input_temp_dir = None
         self.generate_chunk_cnt = 0
+        self.current_chunk = None
         self.adapter = None
         self.adapter_state = None
         self.realtime_session.dispose()
 
-    def new_request(self):
-        self.request_id = f"{self.id}_{uuid4().hex}"
+    def new_chunk(self) -> RealtimeChunkContext:
+        if self.current_chunk is not None:
+            raise RuntimeError("previous realtime chunk is still active")
+        chunk = RealtimeChunkContext(
+            session_id=self.id,
+            index=self.generate_chunk_cnt,
+            request_id=f"{self.id}_{uuid4().hex}",
+        )
+        self.current_chunk = chunk
+        return chunk
 
     def generate_chunk_completed(self):
         self.generate_chunk_cnt += 1
-
-    def build_sampling_params(self):
-        if self.adapter is None:
-            raise ValueError("realtime adapter is not initialized")
-        return self.adapter.build_sampling_params(self)
+        self.current_chunk = None

@@ -137,12 +137,16 @@ class RealtimeTextEncodingStage(TextEncodingStage):
         state = batch.session.get_or_create_state(RealtimeTextState)
         assert isinstance(state, RealtimeTextState)
 
+        # cache the encoder results into BaseRealtimeState, restore when encoder inputs hits the cache
         cache_key = self._make_cache_key(batch)
         if state.cache_key == cache_key and state.prompt_embeds is not None:
             return self._restore_cached_outputs(batch, state)
 
         state.clear_text_cache()
+
+        # perform regular text encoding
         batch = super().forward(batch, server_args)
+
         state.cache_key = cache_key
         self._store_outputs(batch, state)
         return batch

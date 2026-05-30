@@ -123,7 +123,7 @@ class RawRGBRealtimeOutputAdapter:
             result.raw_frame_batches,
             content_type=content_type,
             chunk_index_start=batch.block_idx,
-            request_id=session.request_id,
+            request_id=batch.request_id,
             frame_metadata=frame_metadata,
         )
         stats["frame_shape"] = _frame_shape_from_metadata(frame_metadata)

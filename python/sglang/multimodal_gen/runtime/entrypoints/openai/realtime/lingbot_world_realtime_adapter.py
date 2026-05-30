@@ -12,6 +12,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
     RealtimeVideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
+    RealtimeChunkInputs,
+    RealtimeModelAdapter,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
     RealtimeFrameSendStats,
@@ -19,6 +23,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    prepare_request as prepare_backend_request,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
     ConditionEvent,
@@ -31,11 +38,13 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
         GenerateSession,
+        RealtimeChunkContext,
     )
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
         OutputBatch,
         Req,
     )
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class LingBotWorldRealtimeState:
@@ -47,7 +56,7 @@ class LingBotWorldRealtimeState:
     def clear(self) -> None:
         self.events.clear()
 
-    def append_prompt(self, prompt: str) -> None:
+    def receive_prompt(self, prompt: str) -> None:
         self.events.push(
             ConditionEvent(
                 kind="prompt",
@@ -55,7 +64,7 @@ class LingBotWorldRealtimeState:
             )
         )
 
-    def append_camera_actions(self, camera_actions: list[list[str]]) -> None:
+    def receive_camera_actions(self, camera_actions: list[list[str]]) -> None:
         signals = [
             ControlSignal(kind="camera_actions", payload=list(actions))
             for actions in camera_actions
@@ -69,7 +78,7 @@ class LingBotWorldRealtimeState:
         return prompt
 
     def sample_camera_actions(self, chunk_size: int) -> list[list[str]] | None:
-        """samples a sequence action for the chunk with chunk_size frames
+        """samples a sequence of camera actions for the chunk with chunk_size frames
 
             Args:
                 chunk_size: number of frames
@@ -86,7 +95,7 @@ class LingBotWorldRealtimeState:
         return self.events.has_events("prompt")
 
 
-class LingBotWorldRealtimeAdapter:
+class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
     name = "lingbot_world"
 
     def __init__(self):
@@ -141,22 +150,27 @@ class LingBotWorldRealtimeAdapter:
         state = self._state(session)
         if event.kind == "camera_actions":
             camera_actions = self._validate_camera_actions(event.payload)
-            state.append_camera_actions(camera_actions)
+            state.receive_camera_actions(camera_actions)
             return f"kind=camera_actions, frames={len(camera_actions)}"
-        if event.kind == "prompt":
+        elif event.kind == "prompt":
             if not isinstance(event.payload, str) or not event.payload:
                 raise ValueError("prompt event payload must be a non-empty string")
-            state.append_prompt(event.payload)
+            state.receive_prompt(event.payload)
             return f"kind=prompt, prompt_len={len(event.payload)}"
         raise ValueError(f"unsupported event kind: {event.kind}")
 
-    def build_sampling_params(self, session: GenerateSession):
+    def _sample_chunk_inputs(
+        self,
+        session: GenerateSession,
+        chunk: RealtimeChunkContext,
+        chunk_size: int,
+    ) -> RealtimeChunkInputs:
         state = self._state(session)
         request = session.request
         if request is None:
             raise ValueError("realtime request is not initialized")
 
-        if session.generate_chunk_cnt == 0:
+        if chunk.index == 0:
             prompt = request.prompt
         elif state.has_prompt():
             prompt = state.sample_prompt()
@@ -164,14 +178,31 @@ class LingBotWorldRealtimeAdapter:
         else:
             prompt = request.prompt
 
+        condition_inputs = {}
+        camera_actions = state.sample_camera_actions(chunk_size)
+        if camera_actions is not None:
+            condition_inputs["camera_actions"] = camera_actions
+        return RealtimeChunkInputs(prompt=prompt, condition_inputs=condition_inputs)
+
+    def _build_sampling_params(
+        self,
+        session: GenerateSession,
+        chunk: RealtimeChunkContext,
+        chunk_inputs: RealtimeChunkInputs,
+        chunk_size: int,
+    ):
+        request = session.request
+        if request is None:
+            raise ValueError("realtime request is not initialized")
+
         return build_sampling_params(
-            session.request_id,
-            prompt=prompt,
+            chunk.request_id,
+            prompt=chunk_inputs.prompt,
             size=request.size,
             num_frames=request.num_frames,
             fps=request.fps,
             image_path=request.first_frame,
-            output_file_name=session.request_id,
+            output_file_name=chunk.request_id,
             save_output=False,
             seed=request.seed,
             generator_device=request.generator_device,
@@ -195,20 +226,33 @@ class LingBotWorldRealtimeAdapter:
             output_path=request.output_path,
             output_compression=request.output_compression,
             output_quality=request.output_quality,
+            condition_inputs=chunk_inputs.condition_inputs,
+            realtime_chunk_size=chunk_size,
         )
 
-    def prepare_request(self, session: GenerateSession, batch: Req) -> Req:
-        state = self._state(session)
+    def prepare_next_request(
+        self,
+        session: GenerateSession,
+        server_args: ServerArgs,
+        chunk: RealtimeChunkContext,
+    ) -> Req:
+        pipeline_config = server_args.pipeline_config
+        chunk_size = int(pipeline_config.dit_config.arch_config.num_frames_per_block)
+        chunk_inputs = self._sample_chunk_inputs(session, chunk, chunk_size)
+        sampling_params = self._build_sampling_params(
+            session,
+            chunk,
+            chunk_inputs,
+            chunk_size,
+        )
+        batch = prepare_backend_request(
+            server_args=server_args,
+            sampling_params=sampling_params,
+        )
         batch.session = session.realtime_session
         batch.realtime_session_id = session.id
         batch.return_raw_frames = True
-        batch.block_idx = session.generate_chunk_cnt
-        pipeline_config = get_global_server_args().pipeline_config
-        chunk_size = int(pipeline_config.dit_config.arch_config.num_frames_per_block)
-        batch.realtime_chunk_size = chunk_size
-        camera_actions = state.sample_camera_actions(chunk_size)
-        if camera_actions is not None:
-            batch.condition_inputs["camera_actions"] = camera_actions
+        batch.block_idx = chunk.index
         return batch
 
     async def send_output(
