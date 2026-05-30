@@ -653,18 +653,29 @@ class SchedulerBatchResultProcessor:
             # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
+            # Spec V2 + grammar advances output_ids, the grammar FSM, reasoning,
+            # and finish state token-by-token inside the helper (stopping at
+            # grammar completion), so the shared reasoning/finish/grammar calls
+            # below are skipped for that path.
+            is_spec_v2_grammar = batch.is_spec_v2 and req.grammar is not None
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+            elif is_spec_v2_grammar:
+                next_token_id = self._accept_spec_v2_grammar_tokens(req, next_token_id)
+                next_token_ids[i] = next_token_id
+                new_accepted_len = len(next_token_id)
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
-            self._maybe_update_reasoning_tokens(req, next_token_id)
+            if not is_spec_v2_grammar:
+                self._maybe_update_reasoning_tokens(req, next_token_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
-            req.update_finish_state(new_accepted_len)
+            if not is_spec_v2_grammar:
+                req.update_finish_state(new_accepted_len)
 
             self._handle_finished_req(req, i, logits_output)
 
@@ -684,9 +695,13 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.grammar is not None:
-                self._apply_decode_grammar(
-                    req=req, next_token_id=next_token_id, batch=batch
-                )
+                if is_spec_v2_grammar:
+                    # Already advanced token-by-token above; just sync terminal flag.
+                    req.grammar.finished = req.finished()
+                else:
+                    self._apply_decode_grammar(
+                        req=req, next_token_id=next_token_id, batch=batch
+                    )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -776,6 +791,49 @@ class SchedulerBatchResultProcessor:
                 req.logprob.output_token_ids_logprobs_idx.append(
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
+
+    def _accept_spec_v2_grammar_tokens(
+        self, req: Req, proposed: List[int]
+    ) -> List[int]:
+        """Accept Spec V2 proposed tokens one at a time, stopping at grammar
+        completion, and return the retained prefix.
+
+        Spec V2 verify proposes several tokens at once; the grammar may
+        terminate partway through that list, and the bonus token after the
+        terminating one would otherwise be committed to output_ids and the
+        grammar FSM (see review thread). Tokens proposed after termination are
+        dropped so output_ids, the grammar FSM, reasoning state, and (via the
+        returned prefix) logprob bookkeeping don't advance past completion.
+        Mutates req (output_ids, reasoning, grammar, finish state).
+        """
+        accept_tokens = []
+        try:
+            for token_id in proposed:
+                req.output_ids.append(token_id)
+                accept_tokens.append(token_id)
+                self._maybe_update_reasoning_tokens(req, token_id)
+                req.grammar.accept_token(token_id)
+                req.update_finish_state()
+                if req.finished():
+                    break
+        except ValueError as e:
+            # accept_token raises ValueError if the token is not in the grammar
+            # (misconfigured grammar or invalid token); abort the request.
+            logger.error(
+                f"Grammar accept_token failed for req {req.rid} with token {proposed}: {e}"
+            )
+            self.abort_request(AbortReq(rid=req.rid))
+
+        # _resolve_spec_overlap_tokens already added (len(proposed) - 1) to
+        # req.kv_committed_len based on the full spec-accepted count. If grammar
+        # terminated mid-list, the slots for the dropped tokens are committed
+        # but unused; roll them back so the KV pool free-list stays balanced
+        # when the request is released (SchedulerInvariantChecker._report_leak
+        # catches the imbalance otherwise).
+        dropped = len(proposed) - len(accept_tokens)
+        if dropped > 0:
+            req.kv_committed_len -= dropped
+        return accept_tokens
 
     def _apply_decode_grammar(
         self,
