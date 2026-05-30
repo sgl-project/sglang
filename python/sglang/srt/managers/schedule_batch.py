@@ -254,8 +254,6 @@ class MultimodalDataItem:
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
-    # CPU reference kept during GPU encoding, used to skip GPU->CPU copy on offload
-    _cpu_feature: Optional[torch.Tensor] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
@@ -1509,19 +1507,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
 
-    # For logits and logprob post processing (ForwardBatch keeps its own copies)
-    temp_scaled_logprobs: bool = False
-    top_p_normalized_logprobs: bool = False
-
     # CPU mirror of req_pool_indices; schedule-path only (used in overlap_utils,
     # not read by ForwardBatch), stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
     # Forward-pass metrics
     fpm_start_time: float = 0.0
-
-    # Stream
-    has_stream: bool = False
 
     # Whether to return captured experts
     return_routed_experts: bool = False
@@ -1673,7 +1664,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
-            has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
@@ -2562,7 +2552,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices_device]
-        self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
@@ -2570,6 +2559,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.input_ids is not None:
             self.input_ids = self.input_ids[keep_indices_device]
+        # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
 
         self.mamba_track_indices = None
         self.mamba_track_mask = None
@@ -2585,7 +2577,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
 
-        self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
@@ -2617,13 +2608,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
         if self.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
+        # Optional under no-verify-sync; drop the mirror if either side absent.
+        if self.seq_lens_cpu is None or other.seq_lens_cpu is None:
+            self.seq_lens_cpu = None
+        else:
+            self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
@@ -2641,7 +2636,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
-        self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
