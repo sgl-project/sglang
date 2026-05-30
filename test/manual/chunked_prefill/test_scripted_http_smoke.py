@@ -4,7 +4,7 @@ Exercises only the implemented ScriptedContext surface (``start_req``,
 ``ScriptedReqHandle.finished``, ``ScriptedReqHandle.is_chunking``, ``ScriptedReqHandle.req``) so it
 can run end-to-end on the small CI model. The point is to verify the new
 real-HTTP-server launch path and the ``start_req`` -> ``/generate`` ->
-``wait_until_rid_arrived`` round-trip, not any wishlist observability.
+``wait_until_arrived`` round-trip, not any wishlist observability.
 """
 
 import unittest

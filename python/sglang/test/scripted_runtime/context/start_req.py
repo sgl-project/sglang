@@ -102,8 +102,10 @@ def start_req(
     _post_generate_async(
         ctx, rid=rid, prompt_len=prompt_len, max_new_tokens=max_new_tokens
     )
-    ctx._tokenizer_recv_proxy.wait_until_rid_arrived(
-        rid, timeout_s=START_REQ_ARRIVAL_TIMEOUT_S
+    ctx._tokenizer_recv_proxy.wait_until_arrived(
+        lambda obj: getattr(obj, "rid", None) == rid,
+        timeout_s=START_REQ_ARRIVAL_TIMEOUT_S,
+        description=f"request with rid {rid!r}",
     )
 
     handle = ScriptedReqHandle(rid=rid, scheduler_hook=ctx._scheduler_hook)

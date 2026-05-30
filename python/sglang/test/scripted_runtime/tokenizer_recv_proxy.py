@@ -8,26 +8,21 @@ the proxy buffers whatever it drains off the underlying socket so a
 script can control the exact step at which each request becomes visible
 to the scheduler.
 
-``ScriptedContext.start_req`` fires a real ``/generate`` HTTP request and
-then calls :meth:`wait_until_rid_arrived` to drain the request into the
-buffer without yet handing it to the scheduler; the next ``recv_requests``
-iteration pops it. Control verbs (flush_cache / abort_all / pause / continue)
-fire their own real HTTP POST and then call :meth:`wait_until_arrived` to
-confirm the resulting control object reached the socket before the next
-``yield``.
+``ScriptedContext.start_req`` and the control verbs (flush_cache / abort_all
+/ pause / continue) all fire a real HTTP POST and then call
+:meth:`wait_until_arrived` with a predicate (matching the rid for start_req,
+the message type for the control verbs) to drain the resulting object into
+the buffer without yet handing it to the scheduler; the next ``recv_requests``
+iteration pops it.
 """
 
 from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import zmq
-
-
-class ScriptedRidNotArrivedError(TimeoutError):
-    """Raised when a rid does not arrive on the socket within the timeout."""
 
 
 class ScriptedTokenizerRecvProxy:
@@ -67,40 +62,23 @@ class ScriptedTokenizerRecvProxy:
             "ScriptedTokenizerRecvProxy.recv_pyobj: blocking recv is not supported"
         )
 
-    def wait_until_rid_arrived(self, rid: str, *, timeout_s: float) -> None:
-        """Block until a request carrying ``rid`` has been buffered.
-
-        Repeatedly drains the underlying socket (with a small sleep between
-        polls) until a buffered request exposes ``rid``. Every request read
-        in the meantime stays buffered, so the arrival ordering the
-        scheduler later observes is preserved. Raises
-        :class:`ScriptedRidNotArrivedError` if the rid does not arrive in time.
-        """
-        deadline = time.monotonic() + timeout_s
-
-        while True:
-            self._drain_underlying()
-            if any(self._req_rid(req) == rid for req in self._buffer):
-                return
-            if time.monotonic() >= deadline:
-                raise ScriptedRidNotArrivedError(
-                    f"ScriptedTokenizerRecvProxy: rid {rid!r} did not arrive on the "
-                    f"recv_from_tokenizer socket within {timeout_s}s"
-                )
-            time.sleep(0.005)
-
     def wait_until_arrived(
-        self, predicate: Callable[[Any], bool], *, timeout_s: float
+        self,
+        predicate: Callable[[Any], bool],
+        *,
+        timeout_s: float,
+        description: str = "matching object",
     ) -> None:
         """Block until a *newly*-drained object satisfies ``predicate``.
 
-        Used by control verbs (flush_cache / abort_all / pause / continue),
-        which fire a real HTTP POST and then wait for the resulting control
-        object to reach the wrapped socket. Only objects drained at or after
-        this call starts are eligible, so a stale buffered object of the same
-        type from an earlier verb is not mistaken for this one. Every drained
-        object stays buffered, so the scheduler still observes it on the next
-        ``recv_requests``.
+        Used by every script verb that injects through the real HTTP path
+        (start_req matches the rid; flush_cache / abort_all / pause / continue
+        match the message type). Only objects drained at or after this call
+        starts are eligible, so a stale buffered object of the same kind from
+        an earlier verb is not mistaken for this one. Every drained object
+        stays buffered, so the scheduler still observes it on the next
+        ``recv_requests``. ``description`` names the awaited object in the
+        timeout error.
         """
         start_seq = self._total_drained
         deadline = time.monotonic() + timeout_s
@@ -111,8 +89,8 @@ class ScriptedTokenizerRecvProxy:
                     return
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    "ScriptedTokenizerRecvProxy: no object matching predicate "
-                    f"arrived on the recv_from_tokenizer socket within {timeout_s}s"
+                    f"ScriptedTokenizerRecvProxy: no {description} arrived on the "
+                    f"recv_from_tokenizer socket within {timeout_s}s"
                 )
             time.sleep(0.005)
 
@@ -124,7 +102,3 @@ class ScriptedTokenizerRecvProxy:
                 break
             self._buffer.append(req)
             self._total_drained += 1
-
-    @staticmethod
-    def _req_rid(req: Any) -> Optional[str]:
-        return getattr(req, "rid", None)

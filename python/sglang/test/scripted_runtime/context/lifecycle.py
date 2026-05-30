@@ -62,7 +62,9 @@ def _post_and_await_control(
 
     ctx._http_poster.submit_coro(_post())
     ctx._tokenizer_recv_proxy.wait_until_arrived(
-        lambda obj: isinstance(obj, expect_type), timeout_s=timeout_s
+        lambda obj: isinstance(obj, expect_type),
+        timeout_s=timeout_s,
+        description=expect_type.__name__,
     )
 
 
