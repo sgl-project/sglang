@@ -29,6 +29,9 @@ class CausalSelfAttentionKVCache:
     local_end_index: torch.Tensor
     global_end_index_int: int | None = None
     local_end_index_int: int | None = None
+    cache_size: int = 0
+    sink_tokens: int = 0
+    attention_window_size: int = 0
 
     _FIELD_NAMES: ClassVar[frozenset[str]] = frozenset(
         {
@@ -38,8 +41,17 @@ class CausalSelfAttentionKVCache:
             "local_end_index",
             "global_end_index_int",
             "local_end_index_int",
+            "cache_size",
+            "sink_tokens",
+            "attention_window_size",
         }
     )
+
+    def __post_init__(self) -> None:
+        if self.cache_size == 0:
+            self.cache_size = self.k.shape[1]
+        if self.attention_window_size == 0:
+            self.attention_window_size = self.cache_size
 
     def __getitem__(self, key: str) -> Any:
         if key not in self._FIELD_NAMES:
@@ -94,8 +106,6 @@ class CausalSelfAttentionKVCache:
         key: torch.Tensor,
         value: torch.Tensor,
         current_chunk_start: int,
-        sink_tokens: int,
-        attention_window_size: int | None,
         debug_name: str = "causal KV cache",
     ) -> CausalAttentionKVView:
         """write kv into the cache, returns the part visible to the current chunk
@@ -106,7 +116,8 @@ class CausalSelfAttentionKVCache:
         """
         num_new_tokens = key.shape[1]
         current_chunk_end = current_chunk_start + num_new_tokens
-        kv_cache_size = self.k.shape[1]
+        kv_cache_size = self.cache_size
+        sink_tokens = self.sink_tokens
         global_end_index, local_end_index_prev = self._read_indices()
 
         # local_end_index: the local position of the end of current chunk
@@ -195,10 +206,7 @@ class CausalSelfAttentionKVCache:
         self.k[:, local_start_index:local_end_index] = key
         self.v[:, local_start_index:local_end_index] = value
 
-        if attention_window_size is None:
-            attn_start_index = 0
-        else:
-            attn_start_index = max(0, updated_local_end - attention_window_size)
+        attn_start_index = max(0, updated_local_end - self.attention_window_size)
         self._write_indices(
             global_end_index=updated_global_end,
             local_end_index=updated_local_end,

@@ -369,6 +369,8 @@ def test_causal_kv_cache_allocation_sets_shapes_and_optional_int_indices():
         dtype=torch.float16,
         device=torch.device("cpu"),
         use_int_indices=True,
+        sink_tokens=13,
+        attention_window_size=3,
     )
 
     assert len(cache) == 2
@@ -378,6 +380,9 @@ def test_causal_kv_cache_allocation_sets_shapes_and_optional_int_indices():
     assert cache[0].local_end_index.shape == (1,)
     assert cache[0].global_end_index_int == 0
     assert cache[0].local_end_index_int == 0
+    assert cache[0].cache_size == 5
+    assert cache[0].sink_tokens == 13
+    assert cache[0].attention_window_size == 3
 
 
 def test_causal_kv_cache_update_handles_append_roll_and_recompute():
@@ -394,8 +399,6 @@ def test_causal_kv_cache_update_handles_append_roll_and_recompute():
         key=torch.tensor([[[[1.0]], [[2.0]], [[3.0]]]]),
         value=torch.tensor([[[[10.0]], [[20.0]], [[30.0]]]]),
         current_chunk_start=0,
-        sink_tokens=0,
-        attention_window_size=None,
     )
 
     assert first_view.visible_global_end == 3
@@ -408,20 +411,17 @@ def test_causal_kv_cache_update_handles_append_roll_and_recompute():
         key=torch.tensor([[[[4.0]], [[5.0]], [[6.0]]]]),
         value=torch.tensor([[[[40.0]], [[50.0]], [[60.0]]]]),
         current_chunk_start=3,
-        sink_tokens=0,
-        attention_window_size=None,
     )
 
     assert rolled_view.visible_global_end == 6
     assert rolled_view.visible_local_end == 4
     assert cache.k.flatten().tolist() == [3.0, 4.0, 5.0, 6.0]
 
+    cache.attention_window_size = 2
     recompute_view = cache.update_and_get_attention_kv(
         key=torch.tensor([[[[50.0]]]]),
         value=torch.tensor([[[[500.0]]]]),
         current_chunk_start=4,
-        sink_tokens=0,
-        attention_window_size=2,
     )
 
     assert recompute_view.local_start_index == 2
