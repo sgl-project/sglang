@@ -760,7 +760,10 @@ def _register_configs():
     register_configs(
         sampling_param_cls=LingBotWorldSamplingParams,
         pipeline_config_cls=LingBotWorldCausalDMDConfig,
-        hf_model_paths=["IPostYellow/lingbot-world-fast-diffusers"],
+        hf_model_paths=[
+            "IPostYellow/lingbot-world-fast-diffusers",
+            "robbyant/lingbot-world-fast-diffusers",
+        ],
     )
     register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
