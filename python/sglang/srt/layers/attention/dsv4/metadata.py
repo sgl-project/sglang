@@ -104,7 +104,10 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+        ):
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -114,7 +117,7 @@ class PagedIndexerMetadata:
                 or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
             )
             if use_jit_indexer:
-                from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
+                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
@@ -129,7 +132,7 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
+        from sglang.jit_kernel.dsv4 import plan_topk_v2
 
         if envs.SGLANG_OPT_USE_TOPK_V2.get():
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
@@ -153,14 +156,17 @@ class PagedIndexerMetadata:
     def copy_(self, other: "PagedIndexerMetadata"):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
+            assign_fields = ["deep_gemm_metadata"]
         else:
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+            assign_fields = []
         copy_fields += ["topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=["page_size"],
             copy_fields=copy_fields,
+            assign_fields=assign_fields,
         )
 
 

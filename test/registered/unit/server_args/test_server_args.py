@@ -12,6 +12,7 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-b-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -615,6 +616,47 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     def test_rejects_fp4_kv_cache(self):
         with self.assertRaisesRegex(ValueError, "fp4_e2m1"):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
+
+
+class TestCutedslMoeMaxNumTokens(unittest.TestCase):
+    """The shared CuteDSL MoE per-forward token bound. Fields are set directly
+    to exercise the math independently of __post_init__ resolution."""
+
+    def _args(self, **overrides):
+        server_args = ServerArgs(model_path="dummy")
+        fields = dict(
+            speculative_algorithm=None,
+            speculative_num_draft_tokens=None,
+            max_prefill_tokens=16384,
+            disable_piecewise_cuda_graph=False,
+            piecewise_cuda_graph_max_tokens=2048,
+            cuda_graph_max_bs=512,
+        )
+        fields.update(overrides)
+        for key, value in fields.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_prefill_dominates_in_default_config(self):
+        self.assertEqual(self._args().cutedsl_moe_max_num_tokens(), 16384)
+
+    def test_speculative_decoding_scales_decode_bound(self):
+        # decode bound 512 * 8 dominates the small prefill/piecewise bounds
+        args = self._args(
+            max_prefill_tokens=512,
+            piecewise_cuda_graph_max_tokens=512,
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=8,
+        )
+        self.assertEqual(args.cutedsl_moe_max_num_tokens(), 4096)
+
+    def test_piecewise_bound_excluded_when_disabled(self):
+        args = self._args(
+            max_prefill_tokens=512,
+            disable_piecewise_cuda_graph=True,
+            cuda_graph_max_bs=64,
+        )
+        self.assertEqual(args.cutedsl_moe_max_num_tokens(), 512)
 
 
 if __name__ == "__main__":
