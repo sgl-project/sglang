@@ -246,7 +246,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
-            current_start=current_start,
+            current_chunk_start=current_start,
             sink_tokens=sink_tokens,
             attention_window_size=(
                 None if self.local_attn_size == -1 else self.max_attention_size

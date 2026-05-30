@@ -22,9 +22,10 @@ class CausalSelfAttentionKVCache:
 
     k: torch.Tensor
     v: torch.Tensor
-    # the position within global token sequence
+    # the right bound of the valid global token range
+    # e.g., 12000 means [0, 12000) has been generated and cached
     global_end_index: torch.Tensor
-    # the position within current cache buffer
+    # the right bound of the valid local token range within the buffer (when cache is unfilled)
     local_end_index: torch.Tensor
     global_end_index_int: int | None = None
     local_end_index_int: int | None = None
@@ -78,42 +79,72 @@ class CausalSelfAttentionKVCache:
         return global_end_index, local_end_index
 
     def _write_indices(
-        self, *, visible_global_end: int, visible_local_end: int
+        self, *, global_end_index: int, local_end_index: int
     ) -> None:
         if self.global_end_index_int is not None:
-            self.global_end_index_int = visible_global_end
+            self.global_end_index_int = global_end_index
         if self.local_end_index_int is not None:
-            self.local_end_index_int = visible_local_end
-        self.global_end_index.fill_(visible_global_end)
-        self.local_end_index.fill_(visible_local_end)
+            self.local_end_index_int = local_end_index
+        self.global_end_index.fill_(global_end_index)
+        self.local_end_index.fill_(local_end_index)
 
     def update_and_get_attention_kv(
         self,
         *,
         key: torch.Tensor,
         value: torch.Tensor,
-        current_start: int,
+        current_chunk_start: int,
         sink_tokens: int,
         attention_window_size: int | None,
         debug_name: str = "causal KV cache",
     ) -> CausalAttentionKVView:
+        """write kv into the cache, returns the part visible to the current chunk
+
+        Args:
+            current_chunk_start: the global position of the start of the chunk
+
+        """
         num_new_tokens = key.shape[1]
-        current_end = current_start + num_new_tokens
+        current_chunk_end = current_chunk_start + num_new_tokens
         kv_cache_size = self.k.shape[1]
         global_end_index, local_end_index_prev = self._read_indices()
+
+        # local_end_index: the local position of the end of current chunk
+        # updated_local_end: the updated local end
+        # updated_global_end: the updated global end
+
+        # the global position of the start of the buffer
         window_start = global_end_index - local_end_index_prev
 
-        if current_end <= global_end_index:
-            local_start_index = current_start - window_start
+        if current_chunk_end <= global_end_index:
+            # the window stays as previous
+            # cache layout:
+            # [sink tokens, recent window tokens, current chunk tokens, uninitialized tokens (optional)]
+            local_start_index = current_chunk_start - window_start
             local_end_index = local_start_index + num_new_tokens
-            visible_local_end = local_end_index_prev
-            visible_global_end = global_end_index
+
+            # the local end and global end remains unchanged (since the chunk hasn't proceed)
+            updated_local_end = local_end_index_prev
+            updated_global_end = global_end_index
         else:
-            appended_tokens = current_end - global_end_index
+            # the chunk window has proceed, append new tokens, and evict earliest (if have to)
+            appended_tokens = current_chunk_end - global_end_index
             if local_end_index_prev + appended_tokens > kv_cache_size:
+                # the new tokens can't fit in the remaining space (after local_end_index_prev), start evicting:
+                # before:
+                # [sink tokens, evicted tokens, rolled tokens, remaining space]
+                #                                            ^ end of previous chunk
+                # after:
+                # [sink tokens, rolled tokens,           remaining space      ]
+
+
+                # 1. keep sink tokens ([0: sink_tokens]) untouched
+                # 2. evict obsolete tokens in: [sink_tokens:sink_tokens + num_evicted_tokens]
                 num_evicted_tokens = (
                     local_end_index_prev + appended_tokens - kv_cache_size
                 )
+
+                # number of tokens to move
                 num_rolled_tokens = max(
                     0,
                     local_end_index_prev - num_evicted_tokens - sink_tokens,
@@ -133,14 +164,16 @@ class CausalSelfAttentionKVCache:
                         + num_evicted_tokens
                         + num_rolled_tokens,
                     ].clone()
-                local_end_index = (
-                    local_end_index_prev + appended_tokens - num_evicted_tokens
-                )
+
+                # if we move the minimum number of tokens, the right bound of the append token would be aligned with end of the buffer
+                local_end_index = kv_cache_size
             else:
+                # enough space, directly append new tokens after end of previous chunk
                 local_end_index = local_end_index_prev + appended_tokens
             local_start_index = local_end_index - num_new_tokens
-            visible_local_end = local_end_index
-            visible_global_end = current_end
+            updated_local_end = local_end_index
+            # after filling in the proceeded new chunk, the global end aligns with the global end of the current chunk
+            updated_global_end = current_chunk_end
 
         if (
             local_start_index < 0
@@ -154,7 +187,7 @@ class CausalSelfAttentionKVCache:
                 f"prev_local_end={local_end_index_prev}, "
                 f"kv_cache_size={kv_cache_size}, "
                 f"num_new_tokens={num_new_tokens}, "
-                f"current_start={current_start}, current_end={current_end}"
+                f"current_start={current_chunk_start}, current_end={current_chunk_end}"
             )
 
         self.k = self.k.detach()
@@ -165,18 +198,18 @@ class CausalSelfAttentionKVCache:
         if attention_window_size is None:
             attn_start_index = 0
         else:
-            attn_start_index = max(0, visible_local_end - attention_window_size)
+            attn_start_index = max(0, updated_local_end - attention_window_size)
         self._write_indices(
-            visible_global_end=visible_global_end,
-            visible_local_end=visible_local_end,
+            global_end_index=updated_global_end,
+            local_end_index=updated_local_end,
         )
         return CausalAttentionKVView(
-            k=self.k[:, attn_start_index:visible_local_end],
-            v=self.v[:, attn_start_index:visible_local_end],
+            k=self.k[:, attn_start_index:updated_local_end],
+            v=self.v[:, attn_start_index:updated_local_end],
             local_start_index=local_start_index,
             local_end_index=local_end_index,
-            visible_local_end=visible_local_end,
-            visible_global_end=visible_global_end,
+            visible_local_end=updated_local_end,
+            visible_global_end=updated_global_end,
         )
 
 

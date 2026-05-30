@@ -178,7 +178,7 @@ class CausalWanSelfAttention(nn.Module):
             cache_view = kv_cache.update_and_get_attention_kv(
                 key=roped_key,
                 value=v,
-                current_start=current_start,
+                current_chunk_start=current_start,
                 sink_tokens=sink_tokens,
                 attention_window_size=self.max_attention_size,
                 debug_name="CausalWan KV cache",
