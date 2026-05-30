@@ -169,8 +169,12 @@ class DecodeStagingHandler:
 
         ok = self._scatter_region(staging_offset, page_start, num_pages, decode_req)
         if ok:
-            event = torch.cuda.Event()
+            k_buffers = self.kv_buffer_info["k_buffers"]
+            device = k_buffers[0].device
+            device_module = torch.get_device_module(device)
+            event = device_module.Event()
             event.record(self.staging_allocator._scatter_stream)
+
             if not hasattr(decode_req, "_chunk_events"):
                 decode_req._chunk_events = []
             decode_req._chunk_events.append((event, alloc_id))
@@ -238,7 +242,10 @@ class DecodeStagingHandler:
             return False
         alloc_id = self._submit_last_scatter(decode_req)
         if alloc_id >= 0:
-            event = torch.cuda.Event()
+            k_buffers = self.kv_buffer_info["k_buffers"]
+            device = k_buffers[0].device
+            device_module = torch.get_device_module(device)
+            event = device_module.Event()
             event.record(self.staging_allocator._scatter_stream)
             decode_req._scatter_event = event
             decode_req._scatter_alloc_id = alloc_id
@@ -310,10 +317,11 @@ class DecodeStagingHandler:
         dst_tp_rank = self.kv_manager.kv_args.engine_rank % self.decode_tp
 
         device = k_buffers[0].device
-        torch.cuda.set_device(device)
+        device_module = torch.get_device_module(device)
+        device_module.set_device(device)
 
         if not hasattr(self.staging_allocator, "_scatter_stream"):
-            self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
+            self.staging_allocator._scatter_stream = device_module.Stream(device=device)
 
         scatter_stream = self.staging_allocator._scatter_stream
 
@@ -324,7 +332,7 @@ class DecodeStagingHandler:
         token_end = token_start + num_pages * page_size
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
 
-        with torch.cuda.stream(scatter_stream):
+        with device_module.stream(scatter_stream):
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
                 req_pool_idx, token_start:token_end
             ]

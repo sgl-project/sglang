@@ -130,17 +130,29 @@ class StagingBuffer:
         custom_mem_pool=None,
     ):
         self.size_bytes = size_bytes
+        if isinstance(device, str):
+            device = torch.device(device)
         self.device = device
         self.gpu_id = gpu_id
-
-        torch.cuda.set_device(gpu_id)
-        if custom_mem_pool is not None:
-            with torch.cuda.use_mem_pool(custom_mem_pool):
+        if device.type == "cuda":
+            torch.cuda.set_device(gpu_id)
+            if custom_mem_pool is not None:
+                with torch.cuda.use_mem_pool(custom_mem_pool):
+                    self.buffer = torch.empty(
+                        size_bytes, dtype=torch.uint8, device=device
+                    )
+                alloc_method = "custom_mem_pool (cuMemCreate)"
+            else:
                 self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "custom_mem_pool (cuMemCreate)"
-        else:
+                alloc_method = "cudaMalloc (NVLink incompatible!)"
+        elif device.type == "xpu":
+            torch.xpu.set_device(gpu_id)
+            # No custom memory pools for XPU, use default allocator
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "cudaMalloc"
+            alloc_method = "default allocator"
+        else:
+            raise RuntimeError(f"Unsupported device type: {device.type}")
+
         self.data_ptr = self.buffer.data_ptr()
 
         logger.info(
@@ -338,8 +350,11 @@ def _gather_all_layers_torch(
     num_tokens = len(page_indices_np) * page_size
     per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
 
-    device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    device = k_buffers[0].device
+    device_module = torch.get_device_module(device)
+
+    if hasattr(device_module, "set_device") and device.index is not None:
+        device_module.set_device(device.index)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
     if page_size == 1:
@@ -351,15 +366,13 @@ def _gather_all_layers_torch(
     gather_idx = token_indices.view(-1, 1, 1).expand(num_tokens, num_heads, head_dim)
 
     if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
+        staging_buffer._gather_stream = device_module.Stream(device=device)
 
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    staging_buffer._gather_stream.wait_stream(device_module.default_stream(device))
 
     staging_view = staging_buffer.buffer
     offset = 0
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with device_module.stream(staging_buffer._gather_stream):
         for layer_id in range(num_layers):
             dst = (
                 staging_view[offset : offset + per_layer_bytes]
@@ -416,8 +429,11 @@ def _gather_all_layers_triton(
     per_layer_bytes = per_layer_elems * dtype_size
     total_bytes = per_layer_bytes * num_layers * 2
 
-    device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    device = k_buffers[0].device
+    device_module = torch.get_device_module(device)
+
+    if hasattr(device_module, "set_device") and device.index is not None:
+        device_module.set_device(device.index)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
     layer_ptrs = torch.tensor(
@@ -431,16 +447,16 @@ def _gather_all_layers_triton(
     staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
 
     if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
+        staging_buffer._gather_stream = device_module.Stream(device=device)
 
     staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
+        device_module.default_stream(torch.device(device))
     )
 
     BLOCK_SIZE = 1024
     grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
 
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with device_module.stream(staging_buffer._gather_stream):
         _fused_gather_to_staging_kernel[grid](
             layer_ptrs,
             page_idx_tensor,
