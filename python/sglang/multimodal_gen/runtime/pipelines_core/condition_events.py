@@ -84,12 +84,16 @@ class ConditionEventQueue:
         queue = self._events.get(kind)
         if not queue:
             return None
-        signals = list(queue.pop().iter_signals())
+        latest_payload = None
+        has_signal = False
+        for signal in queue.pop().iter_signals():
+            latest_payload = signal.payload
+            has_signal = True
         queue.clear()
         self._seen_kinds.add(kind)
-        if not signals:
+        if not has_signal:
             return None
-        return signals[-1].payload
+        return latest_payload
 
     def has_events(self, kind: str) -> bool:
         queue = self._events.get(kind)
