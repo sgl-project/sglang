@@ -2,7 +2,7 @@
 
 import asyncio
 import shutil
-import time
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from msgpack import packb, unpackb
@@ -13,12 +13,16 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
     GenerateSession,
+    RealtimeChunkContext,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
-    empty_frame_send_stats,
+    RealtimeFrameSendStats,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timing import (
+    RealtimeStageTimer,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
@@ -30,24 +34,62 @@ from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_clien
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 _ACTIVE_SESSION_IDS: set[str] = set()
 
 
+def _log_realtime_chunk_timing(
+    session: GenerateSession,
+    chunk: RealtimeChunkContext,
+    batch: "Req",
+    request_prepare_ms: float,
+    scheduler_forward_ms: float,
+    chunk_total_ms: float,
+    send_stats: RealtimeFrameSendStats,
+) -> None:
+    logger.info(
+        "realtime chunk timing: session_id=%s request_id=%s "
+        "chunk_idx=%s request_prepare=%.2fms scheduler_forward=%.2fms "
+        "header_pack=%.2fms "
+        "header_write=%.2fms raw_payload_build=%.2fms raw_write=%.2fms "
+        "ws_write=%.2fms chunk_total=%.2fms batches=%d frames=%d "
+        "frame_shape=%s raw_bytes=%d ws_payload_bytes=%d content_type=%s",
+        session.id,
+        chunk.request_id,
+        batch.block_idx,
+        request_prepare_ms,
+        scheduler_forward_ms,
+        send_stats["header_pack_ms"],
+        send_stats["header_write_ms"],
+        send_stats["raw_payload_build_ms"],
+        send_stats["raw_write_ms"],
+        send_stats["ws_write_ms"],
+        chunk_total_ms,
+        send_stats["num_batches"],
+        send_stats["num_frames"],
+        send_stats["frame_shape"],
+        send_stats["raw_bytes"],
+        send_stats["ws_payload_bytes"],
+        send_stats["content_type"],
+    )
+
+
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
     while True:
         try:
-            start = time.perf_counter()
-            timings: dict[str, float] = {}
+            timer = RealtimeStageTimer()
 
             # send to scheduler and generate video chunk
-            stage_start = time.perf_counter()
             server_args = get_global_server_args()
-            if session.adapter is None:
+            adapter = session.adapter
+            if adapter is None:
                 raise ValueError("realtime adapter is not initialized")
             chunk = session.new_chunk()
-            batch = session.adapter.prepare_next_request(
+            batch = adapter.prepare_next_request(
                 session,
                 server_args,
                 chunk,
@@ -59,55 +101,29 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                     batch.block_idx,
                     sorted(batch.condition_inputs),
                 )
-            timings["prepare_ms"] = (time.perf_counter() - stage_start) * 1000.0
-            stage_start = time.perf_counter()
-            _, result = await process_generation_batch(async_scheduler_client, batch)
-            timings["scheduler_forward_ms"] = (
-                time.perf_counter() - stage_start
-            ) * 1000.0
+            request_prepare_ms = timer.mark_ms()
 
-            send_stats = empty_frame_send_stats(result.raw_frame_content_type)
-            if session.adapter is not None:
-                send_stats = await session.adapter.send_output(
-                    ws,
-                    session,
-                    result,
-                    batch,
-                )
-            timings["header_pack_ms"] = float(send_stats["header_pack_ms"])
-            timings["header_write_ms"] = float(send_stats["header_write_ms"])
-            timings["raw_payload_build_ms"] = float(send_stats["raw_payload_build_ms"])
-            timings["raw_write_ms"] = float(send_stats["raw_write_ms"])
-            timings["ws_write_ms"] = float(send_stats["ws_write_ms"])
-            timings["total_ms"] = (time.perf_counter() - start) * 1000.0
+            _, result = await process_generation_batch(async_scheduler_client, batch)
+            scheduler_forward_ms = timer.mark_ms()
+
+            send_stats = await adapter.send_output(
+                ws,
+                session,
+                result,
+                batch,
+            )
+            chunk_total_ms = timer.total_ms()
 
             # finish
-            session.adapter.on_chunk_complete(session, result)
-
-            logger.info(
-                "realtime chunk timing: session_id=%s request_id=%s "
-                "chunk_idx=%s request_prepare=%.2fms scheduler_forward=%.2fms "
-                "header_pack=%.2fms "
-                "header_write=%.2fms raw_payload_build=%.2fms raw_write=%.2fms "
-                "ws_write=%.2fms chunk_total=%.2fms batches=%d frames=%d "
-                "frame_shape=%s raw_bytes=%d ws_payload_bytes=%d content_type=%s",
-                session.id,
-                chunk.request_id,
-                batch.block_idx,
-                timings["prepare_ms"],
-                timings["scheduler_forward_ms"],
-                timings["header_pack_ms"],
-                timings["header_write_ms"],
-                timings["raw_payload_build_ms"],
-                timings["raw_write_ms"],
-                timings["ws_write_ms"],
-                timings["total_ms"],
-                send_stats["num_batches"],
-                send_stats["num_frames"],
-                send_stats["frame_shape"],
-                send_stats["raw_bytes"],
-                send_stats["ws_payload_bytes"],
-                send_stats["content_type"],
+            adapter.on_chunk_complete(session, result)
+            _log_realtime_chunk_timing(
+                session,
+                chunk,
+                batch,
+                request_prepare_ms,
+                scheduler_forward_ms,
+                chunk_total_ms,
+                send_stats,
             )
 
         except asyncio.CancelledError:
