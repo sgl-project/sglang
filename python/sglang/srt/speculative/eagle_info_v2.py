@@ -355,16 +355,16 @@ class EagleVerifyInputV2Mixin:
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
         """
+        device = batch.device
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.int32, device=batch.device)
-            num_correct_drafts = torch.empty(0, dtype=torch.int32, device=batch.device)
-            accept_index = torch.empty(0, dtype=torch.int32, device=batch.device)
+            predict = torch.empty(0, dtype=torch.int32, device=device)
+            num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
+            accept_index = torch.empty(0, dtype=torch.int32, device=device)
             return predict, num_correct_drafts, accept_index
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
-        device = batch.device
 
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.
