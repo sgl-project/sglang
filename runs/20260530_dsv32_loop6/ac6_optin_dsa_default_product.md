@@ -58,7 +58,7 @@ on any gitignored file.)
   ~29.5 is marginally below 30 in the DSA baseline itself** — a pre-existing DSA
   characteristic at the threshold (decode batch of 64), **not** introduced by the DS
   opt-in code (DSA-default does not run DS code).
-- **Fresh corroboration (R11, cross-node, same num_prompts=64 methodology — `dsa_default_slo_np64.txt`):** reproduces the baseline — conc 16/32/64 P99 TTFT **0.89 / 1.49 / 2.18 s** (all < 22 ✅), TPS **46.1 / 37.0 / 29.4** (conc-64 ~29.4 marginal, matching the baseline's 29.5). completed 832/1344/2048, errors 0, achieved == nominal.
+- **Fresh corroboration (R11, cross-node `bench_serving --host node1`, same num_prompts=64 methodology):** reproduces the baseline — conc 16/32/64 P99 TTFT **0.89 / 1.49 / 2.18 s** (all < 22 ✅), TPS **46.1 / 37.0 / 29.4** (conc-64 ~29.4 marginal, matching the baseline's 29.5). completed 832/1344/2048, errors 0, achieved == nominal. **Recomputable:** `dsa_slo_arrays.json` holds the exact per-request `ttfts`/`tpots`/`input_lens`/`output_lens` + source JSONL SHA256; `python3 dsa_slo_metrics_tool.py --verify` recomputes P99 TTFT + per-req TPS from the committed JSON alone and is **fail-closed** (exit 1 on mismatch).
 
 ### Methodology note (why a fresh `NUM_PROMPTS=320` run does NOT reflect steady state)
 A `NUM_PROMPTS=320` run (one epoch ≈ 558 s at conc-16 with request_rate=inf) has an
@@ -70,7 +70,21 @@ which is the methodology behind the 0.97/1.39/2.02 s numbers above. (Recorded as
 BitLesson; the 320-prompt run is kept only as the cold-ramp datapoint in
 `dsa_default_slo.txt`.)
 
+## AC-6 verdict (per user decision, R12)
+AC-6 is graded as a **non-regression / opt-in product test** (user decision, R12): the
+DSA-default product is **byte-identical to the pre-DS Loop-5 baseline** and **reproduces
+it** (fresh R11 run: 0.89/1.49/2.18 s, 46.1/37.0/29.4 — matching 0.97/1.39/2.02 s,
+46.7/37.6/29.5), so enabling the DS opt-in code leaves DSA-default **unchanged**; and the
+DS opt-in flag toggles the compact int8 path at the locked radix-on point. **AC-6 = MET.**
+
+The one gap — DSA-default conc-64 per-req TPS **~29.4 (< 30)** — is **pre-existing** (29.5
+in the Loop-5 baseline, a DSA + H200 decode-batch-64 limit) and **not introduced by DS**.
+Per the user decision it does **not** block AC-6 (a non-regression test); it is recorded as
+a separate **client-SLO-vs-DSA tension** (the strict `≥30 TPS/req` is marginally unmet by
+DSA-default itself at conc-64, independent of Double Sparsity).
+
 ## Artifacts
+- `ac6_product_proof/dsa_slo_metrics_tool.py` + `dsa_slo_arrays.json` — recomputable DSA-default SLO (exact per-request arrays + SHA256 + fail-closed `--verify`).
 - `ac6_product_proof/get_server_info_keys.json` — DS vs DSA key fields (both radix-on; the toggle).
 - `ac6_product_proof/ds_opt_in_get_server_info.json`, `dsa_default_get_server_info.json` — full server info.
 - `ac6_product_proof/ds_table_boot_excerpt.txt` — DS int8 `token_label_table` (8 ranks) + radix-fixture PASSED.
