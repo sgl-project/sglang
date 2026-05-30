@@ -1,28 +1,41 @@
 """ScriptedSchedulerHook: the scheduler-side half of the scripted runtime.
 
-Constructed by ``Scheduler.__init__`` when ``scripted_runtime_fn_path`` is
+Constructed by ``Scheduler.__init__`` when ``enable_scripted_runtime`` is
 set and held as a scheduler field. ``SchedulerRequestReceiver.recv_requests``
 calls :meth:`step` once per event-loop iteration. On the driver rank
-(``pp_rank == tp_rank == attn_cp_rank == 0``) the hook owns the script
+(``pp_rank == tp_rank == attn_cp_rank == 0``) the hook owns the dispatch-loop
 generator and the :class:`ScriptedContext` handed to it, advancing the
 generator one step per call; non-driver ranks join the cross-rank cpu
 broadcast that carries the script's done / error state so every rank
 ``sys.exit``s together when the script finishes.
 
-This object owns everything the *scheduler* touches (generator stepping,
-cross-rank broadcast, per-req lookups for :class:`ScriptedReqHandle`); the
-script-facing verbs live on :class:`ScriptedContext`.
+This object owns everything the *scheduler* touches: the ZMQ control plane
+(the dispatch loop that pulls and runs each caller-requested sub-script),
+generator stepping, cross-rank broadcast, and per-req lookups for
+:class:`ScriptedReqHandle`. The script-facing verbs live on
+:class:`ScriptedContext`.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import traceback
 from typing import TYPE_CHECKING, Any, Generator, List, Optional, Tuple
 
+import zmq
+
 from sglang.srt.utils.common import broadcast_pyobj
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.io_struct import (
+    HookReady,
+    RunScript,
+    ScriptFailed,
+    ScriptSucceeded,
+    Shutdown,
+)
 from sglang.test.scripted_runtime.utils import ensure_script_importable, resolve_fn
 
 if TYPE_CHECKING:
@@ -38,17 +51,16 @@ logger = logging.getLogger(__name__)
 class ScriptedSchedulerHook:
     """Generator-driven scheduler-side hook installed in every scheduler subprocess.
 
-    On the driver rank it builds the :class:`ScriptedContext`, instantiates
-    the script generator over it, and advances it one step per :meth:`step`
-    call. When the generator finishes, every rank ``sys.exit``s so all
-    scheduler subprocesses tear down together.
+    On the driver rank it builds the :class:`ScriptedContext`, opens the ZMQ
+    dispatch loop over it, and advances that loop one step per :meth:`step`
+    call. When the loop finishes (the caller sent :class:`Shutdown`), every
+    rank ``sys.exit``s so all scheduler subprocesses tear down together.
     """
 
     def __init__(
         self,
         *,
         scheduler: "Scheduler",
-        script_fn_path: str,
         tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
     ) -> None:
         self._scheduler = scheduler
@@ -57,27 +69,70 @@ class ScriptedSchedulerHook:
             and scheduler.ps.tp_rank == 0
             and scheduler.ps.attn_cp_rank == 0
         )
-        self._script_fn_path = script_fn_path
 
         if self._is_driver:
             ensure_script_importable(
                 scheduler.server_args.scripted_runtime_sys_path_entry
             )
-            script_fn = resolve_fn(script_fn_path)
             self._context: Optional[ScriptedContext] = ScriptedContext(
                 scheduler_hook=self,
                 tokenizer_recv_proxy=tokenizer_recv_proxy,
             )
-            generator = script_fn(self._context)
-            if not hasattr(generator, "__next__"):
-                raise TypeError(
-                    f"scripted_runtime function {script_fn_path!r} must be a "
-                    f"generator (use 'yield' inside it); got {type(generator).__name__}"
-                )
-            self._generator: Optional[Generator] = generator
+            self._script_fn_generator: Optional[Generator] = self._run_dispatch_loop()
         else:
             self._context = None
-            self._generator = None
+            self._script_fn_generator = None
+
+    def _run_dispatch_loop(self) -> Generator:
+        """Receive :class:`RunScript` / :class:`Shutdown`; ``yield from`` each sub-script.
+
+        Runs forever on the scheduler driver rank until the caller sends a
+        :class:`Shutdown`, at which point the generator returns normally and
+        the scheduler tears down.
+
+        Crucially, when a sub-script raises (including ``AssertionError``), the
+        loop *captures* the traceback into a socket message and *keeps
+        running* — it does not re-raise. Re-raising would tear the engine down
+        (the hook ``sys.exit``s the scheduler subprocess), voiding every
+        remaining test in the class.
+        """
+        endpoint = os.environ["SGLANG_SCRIPTED_RUNTIME_IPC_ADDR"]
+        ctx_zmq = zmq.Context()
+        socket = get_zmq_socket(ctx_zmq, zmq.PAIR, endpoint, bind=False)
+        try:
+            # Announce readiness so the server-startup handshake confirms the
+            # scheduler subprocess came up.
+            socket.send_pyobj(HookReady())
+            while True:
+                msg = socket.recv_pyobj()
+                match msg:
+                    case Shutdown():
+                        return
+                    case RunScript(fn_path=fn_path, args=args):
+                        fn = resolve_fn(fn_path)
+                        ctx = self._context
+                        # Start every sub-script from a clean engine: flush so
+                        # radix / pool state from the previous sub-script can't
+                        # leak across runs. Visible on the next yield (same as
+                        # start_req), hence the explicit yield before the
+                        # sub-script observes any state.
+                        ctx.flush_cache()
+                        yield
+                        sub_gen = fn(ctx, *args)
+                        try:
+                            yield from sub_gen
+                        except BaseException:
+                            socket.send_pyobj(
+                                ScriptFailed(traceback=traceback.format_exc())
+                            )
+                        else:
+                            socket.send_pyobj(ScriptSucceeded())
+                    case _:
+                        raise ValueError(f"dispatch loop: unknown command {msg!r}")
+        finally:
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.close()
+            ctx_zmq.term()
 
     # ============================================================
     # Lookups used by ScriptedReqHandle (driver-rank-local view).
@@ -186,7 +241,7 @@ class ScriptedSchedulerHook:
 
     def _advance_generator(self) -> Tuple[bool, Optional[str]]:
         try:
-            next(self._generator)
+            next(self._script_fn_generator)
             return (False, None)
         except StopIteration:
             return (True, None)

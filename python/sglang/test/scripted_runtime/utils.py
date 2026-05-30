@@ -31,7 +31,7 @@ def resolve_fn(qualified: str) -> Callable:
     module_name, sep, fn_name = qualified.partition(":")
     if not sep or not module_name or not fn_name:
         raise ValueError(
-            f"scripted_runtime_fn_path must be 'module.path:function_name', "
+            f"scripted-runtime fn path must be 'module.path:function_name', "
             f"got {qualified!r}"
         )
     obj = importlib.import_module(module_name)

@@ -1,9 +1,10 @@
 """Caller-side resource: long-lived HTTP server + per-test script dispatch.
 
 Owned by :class:`ScriptedTestCase`. Spawns a dedicated subprocess
-that runs :func:`execute_scripted_http_server`, which launches a real sglang
-HTTP server; the caller communicates with the scheduler-side
-``router_script`` over a ZMQ ``PAIR`` socket bound to an ``ipc://`` endpoint.
+that runs :func:`launch_scripted_http_server`, which launches a real sglang
+HTTP server; the caller communicates with the scheduler-side dispatch loop
+(owned by :class:`ScriptedSchedulerHook`) over a ZMQ ``PAIR`` socket bound
+to an ``ipc://`` endpoint.
 
 One :class:`ScriptedHttpServer` instance per test class — every
 ``test_*`` method shares the same HTTP server / engine and submits a fresh
@@ -25,7 +26,9 @@ from typing import Any, Callable, Optional, Tuple
 import zmq
 
 from sglang.srt.utils.network import get_free_port, get_zmq_socket
-from sglang.test.scripted_runtime.entrypoint import execute_scripted_http_server
+from sglang.test.scripted_runtime.http_server_subprocess import (
+    launch_scripted_http_server,
+)
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
     RunScript,
@@ -33,7 +36,6 @@ from sglang.test.scripted_runtime.io_struct import (
     ScriptSucceeded,
     Shutdown,
 )
-from sglang.test.scripted_runtime.router_script import router_script
 
 DEFAULT_RUN_TIMEOUT_S: float = 120.0
 SHUTDOWN_JOIN_TIMEOUT_S: float = 60.0
@@ -63,22 +65,22 @@ class ScriptedHttpServer:
 
     @classmethod
     def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
-        """Spawn the HTTP-server process and await the router's handshake.
+        """Spawn the HTTP-server process and await the dispatch loop's handshake.
 
         The PAIR socket is bound to an ``ipc://`` endpoint *before* the
-        server process starts so the router's connect call never races. If
-        the server fails to start (slow load, model error, CUDA failure) the
-        first-message poll times out after :data:`LISTENER_ACCEPT_TIMEOUT_S`
-        instead of hanging the test process indefinitely. The router sends a
-        :class:`HookReady` as its first message once it connects, which the
-        startup handshake confirms.
+        server process starts so the dispatch loop's connect call never
+        races. If the server fails to start (slow load, model error, CUDA
+        failure) the first-message poll times out after
+        :data:`LISTENER_ACCEPT_TIMEOUT_S` instead of hanging the test process
+        indefinitely. The dispatch loop sends a :class:`HookReady` as its
+        first message once it connects, which the startup handshake confirms.
 
         The ipc socket lives in a private 0700 temp dir, so we rely on
         filesystem permissions instead of an authkey — matching sglang's
         no-auth ZMQ posture.
 
         ``engine_kwargs`` (notably ``model_path`` plus any ServerArgs
-        overrides) are forwarded to :func:`execute_scripted_http_server`.
+        overrides) are forwarded to :func:`launch_scripted_http_server`.
         """
         socket_dir = Path(tempfile.mkdtemp(prefix="sglang_scripted_ipc_"))
         endpoint = f"ipc://{socket_dir}/ipc.sock"
@@ -91,7 +93,7 @@ class ScriptedHttpServer:
         socket = get_zmq_socket(ctx, zmq.PAIR, endpoint, bind=True)
 
         # Spawn-mode children snapshot os.environ at start(); set the IPC
-        # coordinates before launching so the router can connect.
+        # coordinates before launching so the dispatch loop can connect.
         os.environ["SGLANG_SCRIPTED_RUNTIME_IPC_ADDR"] = endpoint
 
         host = SERVER_HOST
@@ -99,8 +101,8 @@ class ScriptedHttpServer:
 
         mp_ctx = mp.get_context("spawn")
         server_process = mp_ctx.Process(
-            target=execute_scripted_http_server,
-            args=(router_script,),
+            target=launch_scripted_http_server,
+            args=(),
             kwargs=dict(
                 host=host,
                 port=port,
@@ -112,8 +114,9 @@ class ScriptedHttpServer:
         )
         server_process.start()
 
-        # Poll for the router's HookReady; a stuck server startup surfaces as
-        # TimeoutError instead of blocking forever (poll takes milliseconds).
+        # Poll for the dispatch loop's HookReady; a stuck server startup
+        # surfaces as TimeoutError instead of blocking forever (poll takes
+        # milliseconds).
         if not socket.poll(int(LISTENER_ACCEPT_TIMEOUT_S * 1000)):
             socket.setsockopt(zmq.LINGER, 0)
             socket.close()
@@ -144,7 +147,7 @@ class ScriptedHttpServer:
         args: Tuple[Any, ...] = (),
         timeout_s: float = DEFAULT_RUN_TIMEOUT_S,
     ) -> None:
-        """Dispatch ``script_fn`` to the router and block on its result.
+        """Dispatch ``script_fn`` to the scheduler hook and block on its result.
 
         ``args`` are forwarded positionally to the script after the
         ``ScriptedContext`` handle (``script_fn(t, *args)``), letting one
@@ -178,10 +181,12 @@ class ScriptedHttpServer:
             case ScriptSucceeded():
                 return
             case _:
-                raise RuntimeError(f"router replied with unexpected message {reply!r}")
+                raise RuntimeError(
+                    f"scheduler hook replied with unexpected message {reply!r}"
+                )
 
     def shutdown(self) -> None:
-        """Tell the router to return, join the server process, and clean up.
+        """Tell the dispatch loop to return, join the server process, and clean up.
 
         Idempotent — calling twice is safe. Surfaces a fatal scheduler-side
         traceback (written to the traceback file) as an ``AssertionError``.

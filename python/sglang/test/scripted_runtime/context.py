@@ -485,7 +485,7 @@ class ScriptedContext:
         """Send an engine shutdown signal from inside the script.
 
         Lets a lifecycle test verify clean shutdown from the scripted
-        side without relying on the outer ``execute_scripted_http_server``
+        side without relying on the outer ``launch_scripted_http_server``
         teardown.
 
         Consumed by: test_engine_shutdown_from_script (lifecycle).

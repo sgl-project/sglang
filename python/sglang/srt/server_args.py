@@ -844,7 +844,7 @@ class ServerArgs:
     msprobe_dump_config: Optional[str] = None
 
     # Scripted runtime (testing only; set programmatically, not via CLI).
-    scripted_runtime_fn_path: Optional[str] = None
+    enable_scripted_runtime: bool = False
     scripted_runtime_traceback_path: Optional[str] = None
     scripted_runtime_sys_path_entry: Optional[str] = None
 

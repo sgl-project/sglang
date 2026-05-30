@@ -604,8 +604,7 @@ class Scheduler(
                 self.ps.attn_tp_rank == 0
                 or self.server_args.enable_metrics_for_all_schedulers
             ),
-            enable_scripted_runtime=self.server_args.scripted_runtime_fn_path
-            is not None,
+            enable_scripted_runtime=self.server_args.enable_scripted_runtime,
         )
 
     def init_idle_sleeper(self) -> None:
@@ -1542,14 +1541,13 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
     def maybe_init_scripted_scheduler_hook(self) -> None:
-        if self.server_args.scripted_runtime_fn_path is not None:
+        if self.server_args.enable_scripted_runtime:
             from sglang.test.scripted_runtime.scheduler_hook import (
                 ScriptedSchedulerHook,
             )
 
             self.scripted_scheduler_hook = ScriptedSchedulerHook(
                 scheduler=self,
-                script_fn_path=self.server_args.scripted_runtime_fn_path,
                 tokenizer_recv_proxy=self.ipc_channels.recv_from_tokenizer,
             )
         else:

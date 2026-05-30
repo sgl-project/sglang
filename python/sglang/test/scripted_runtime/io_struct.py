@@ -2,7 +2,8 @@
 
 These dataclasses are the wire format of the ZMQ ``PAIR`` socket that
 connects the test process (:class:`ScriptedHttpServer`) to the
-scheduler-subprocess :func:`router_script`. They are exchanged via
+scheduler-subprocess dispatch loop owned by
+:class:`ScriptedSchedulerHook`. They are exchanged via
 ``send_pyobj`` / ``recv_pyobj`` (pickle), replacing the raw dicts that the
 old ``multiprocessing.connection`` transport used.
 
@@ -34,12 +35,12 @@ class RunScript:
 
 @dataclass(frozen=True, slots=True)
 class Shutdown:
-    """Tell the router to return so the scheduler can tear down."""
+    """Tell the dispatch loop to return so the scheduler can tear down."""
 
 
 @dataclass(frozen=True, slots=True)
 class HookReady:
-    """Sent once when the router connects, confirming the scheduler came up."""
+    """Sent once when the dispatch loop connects, confirming the scheduler came up."""
 
 
 @dataclass(frozen=True, slots=True)
