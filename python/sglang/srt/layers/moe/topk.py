@@ -701,7 +701,10 @@ def fused_topk(
             assert num_fused_shared_experts <= 1
             if routed_scaling_factor is None:
                 routed_scaling_factor = 1.0
-            if routed_scaling_factor != 1.0 and not apply_routed_scaling_factor_on_output:
+            if (
+                routed_scaling_factor != 1.0
+                and not apply_routed_scaling_factor_on_output
+            ):
                 raise ValueError(
                     "apply_routed_scaling_factor_on_output must be True when scoring_func is sigmoid"
                 )

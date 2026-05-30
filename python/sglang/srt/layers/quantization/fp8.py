@@ -623,8 +623,10 @@ class Fp8LinearMethod(LinearMethodBase):
             n, k = layer.weight.shape
             scale_u8 = layer.weight_scale_inv.data  # uint8 [N, K//32]
             scale_fp32 = (
-                scale_u8.contiguous().view(-1).to(torch.int32) << 23
-            ).view(torch.float32).view(n, k // 32)
+                (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
+                .view(torch.float32)
+                .view(n, k // 32)
+            )
             if DEEPGEMM_SCALE_UE8M0:
                 # Blackwell: pre-pack to int32 MN-major TMA-aligned.
                 # Use with disable_ue8m0_cast=True to skip internal transform.
@@ -1547,8 +1549,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if DEEPGEMM_SCALE_UE8M0:
                 import deep_gemm.utils.layout
 
-                return deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-                    scale_fp32
+                return (
+                    deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                        scale_fp32
+                    )
                 )
             return scale_fp32
 

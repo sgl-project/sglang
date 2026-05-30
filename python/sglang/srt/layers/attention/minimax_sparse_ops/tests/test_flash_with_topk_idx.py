@@ -16,29 +16,56 @@ ATOL_VS_REF = 5e-3
 # Reference & helpers
 # ---------------------------------------------------------------------------
 
-def pytorch_reference(q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_ids,
-                      block_size, topk, init_blocks, local_blocks, sm_scale=None,
-                      score_type="max"):
+
+def pytorch_reference(
+    q,
+    sink,
+    k_cache,
+    v_cache,
+    req_to_token,
+    seq_lens,
+    slot_ids,
+    block_size,
+    topk,
+    init_blocks,
+    local_blocks,
+    sm_scale=None,
+    score_type="max",
+):
     batch_size, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     gqa_group_size = num_q_heads // num_kv_heads
     if sm_scale is None:
-        sm_scale = head_dim ** -0.5
+        sm_scale = head_dim**-0.5
     max_sl = seq_lens.max().item()
 
     # Gather K/V for all batches: [BS, max_sl, kv_heads, hd] -> [BS, q_heads, max_sl, hd]
     all_slots = req_to_token[:, :max_sl].long()
-    k = k_cache[all_slots].float().permute(0, 2, 1, 3).repeat_interleave(gqa_group_size, dim=1)
-    v = v_cache[all_slots].float().permute(0, 2, 1, 3).repeat_interleave(gqa_group_size, dim=1)
+    k = (
+        k_cache[all_slots]
+        .float()
+        .permute(0, 2, 1, 3)
+        .repeat_interleave(gqa_group_size, dim=1)
+    )
+    v = (
+        v_cache[all_slots]
+        .float()
+        .permute(0, 2, 1, 3)
+        .repeat_interleave(gqa_group_size, dim=1)
+    )
 
     # Batched QK: [BS, q_heads, max_sl]
     qk = (q.float().unsqueeze(2) @ k.transpose(-1, -2)).squeeze(2) * sm_scale
-    seq_mask = torch.arange(max_sl, device=q.device).unsqueeze(0) < seq_lens.unsqueeze(1)
+    seq_mask = torch.arange(max_sl, device=q.device).unsqueeze(0) < seq_lens.unsqueeze(
+        1
+    )
     qk = qk.masked_fill(~seq_mask.unsqueeze(1), float("-inf"))
 
     # Attention output (full attention on all tokens)
     if sink is not None:
-        sink_score = (q.float() * sink.float().unsqueeze(0)).sum(dim=-1, keepdim=True) * sm_scale
+        sink_score = (q.float() * sink.float().unsqueeze(0)).sum(
+            dim=-1, keepdim=True
+        ) * sm_scale
         attn = torch.softmax(torch.cat([sink_score, qk], dim=-1), dim=-1)
         o = (attn[:, :, 1:].unsqueeze(2) @ v).squeeze(2)
     else:
@@ -46,12 +73,18 @@ def pytorch_reference(q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_id
         o = (attn.unsqueeze(2) @ v).squeeze(2)
 
     # Block scores + topk
-    topk_idx = torch.full((num_q_heads, batch_size, topk), -1, dtype=torch.int32, device=q.device)
+    topk_idx = torch.full(
+        (num_q_heads, batch_size, topk), -1, dtype=torch.int32, device=q.device
+    )
     max_num_blocks = (max_sl + block_size - 1) // block_size
     padded_len = max_num_blocks * block_size
-    qk_padded = torch.full((batch_size, num_q_heads, padded_len), float("-inf"), device=q.device)
+    qk_padded = torch.full(
+        (batch_size, num_q_heads, padded_len), float("-inf"), device=q.device
+    )
     qk_padded[:, :, :max_sl] = qk
-    block_scores = qk_padded.reshape(batch_size, num_q_heads, max_num_blocks, block_size)
+    block_scores = qk_padded.reshape(
+        batch_size, num_q_heads, max_num_blocks, block_size
+    )
     if score_type == "max":
         block_scores = block_scores.max(dim=-1).values
     else:
@@ -77,8 +110,16 @@ def pytorch_reference(q, sink, k_cache, v_cache, req_to_token, seq_lens, slot_id
     return o, topk_idx
 
 
-def build_inputs(batch_size, num_q_heads, num_kv_heads, head_dim, seq_lens_list,
-                 max_kv_len=None, with_sink=False, dtype=torch.bfloat16):
+def build_inputs(
+    batch_size,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+    seq_lens_list,
+    max_kv_len=None,
+    with_sink=False,
+    dtype=torch.bfloat16,
+):
     if max_kv_len is None:
         max_kv_len = max(seq_lens_list)
     max_slots = batch_size * max_kv_len
@@ -91,8 +132,14 @@ def build_inputs(batch_size, num_q_heads, num_kv_heads, head_dim, seq_lens_list,
     for i in range(batch_size):
         base = i * max_kv_len
         slot_ids[i] = i
-        req_to_token[i, :max_kv_len] = torch.arange(base, base + max_kv_len, device=DEVICE)
-    sink = torch.randn(num_q_heads, head_dim, dtype=dtype, device=DEVICE) if with_sink else None
+        req_to_token[i, :max_kv_len] = torch.arange(
+            base, base + max_kv_len, device=DEVICE
+        )
+    sink = (
+        torch.randn(num_q_heads, head_dim, dtype=dtype, device=DEVICE)
+        if with_sink
+        else None
+    )
     return q, sink, k_cache, v_cache, req_to_token, seq_lens, max_kv_len, slot_ids
 
 
@@ -116,6 +163,7 @@ def make_seq_lens(pattern, batch_size, block_size):
 # ---------------------------------------------------------------------------
 # Test cases: compact set covering all code paths + long sequence.
 # ---------------------------------------------------------------------------
+
 
 def _case(bs, nqh, nkh, hd, blk, sink, seq_pat, ib, lb, tk):
     tag = (
@@ -151,33 +199,63 @@ CASES = [
 # Tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("score_type", ["max", "lse"])
 @pytest.mark.parametrize(
     "bs,nqh,nkh,hd,blk,with_sink,seq_pat,ib,lb,tk",
     CASES,
 )
-def test_flash_decode_with_topk_idx(bs, nqh, nkh, hd, blk, with_sink, seq_pat, ib, lb, tk, score_type):
+def test_flash_decode_with_topk_idx(
+    bs, nqh, nkh, hd, blk, with_sink, seq_pat, ib, lb, tk, score_type
+):
     torch.manual_seed(42)
     seq_lens, mkl = make_seq_lens(seq_pat, bs, blk)
 
     q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids = build_inputs(
-        bs, nqh, nkh, hd, seq_lens, max_kv_len=mkl, with_sink=with_sink,
+        bs,
+        nqh,
+        nkh,
+        hd,
+        seq_lens,
+        max_kv_len=mkl,
+        with_sink=with_sink,
     )
 
     o_new, topk_new = flash_decode_with_topk_idx(
-        q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids,
-        blk, tk, ib, lb, score_type=score_type,
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens_t,
+        mkl,
+        slot_ids,
+        blk,
+        tk,
+        ib,
+        lb,
+        score_type=score_type,
     )
     o_ref, topk_ref = pytorch_reference(
-        q, sink, k_cache, v_cache, req_to_token, seq_lens_t, slot_ids,
-        blk, tk, ib, lb, score_type=score_type,
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens_t,
+        slot_ids,
+        blk,
+        tk,
+        ib,
+        lb,
+        score_type=score_type,
     )
     o_ref = o_ref.to(o_new.dtype)
 
     # --- attention output vs reference ---
-    assert torch.allclose(o_new.float(), o_ref.float(), rtol=RTOL_VS_REF, atol=ATOL_VS_REF), (
-        f"vs ref max abs diff {(o_new.float() - o_ref.float()).abs().max().item():.4e}"
-    )
+    assert torch.allclose(
+        o_new.float(), o_ref.float(), rtol=RTOL_VS_REF, atol=ATOL_VS_REF
+    ), f"vs ref max abs diff {(o_new.float() - o_ref.float()).abs().max().item():.4e}"
 
     # --- topk set match vs reference ---
     for h in range(nqh):
@@ -187,7 +265,9 @@ def test_flash_decode_with_topk_idx(bs, nqh, nkh, hd, blk, with_sink, seq_pat, i
             actual_k = min(tk, num_blocks)
             set_new = set(topk_new[h, b, :actual_k].tolist())
             set_ref = set(topk_ref[h, b, :actual_k].tolist())
-            assert set_new == set_ref, f"topk mismatch at h={h} b={b}: kernel={set_new} ref={set_ref}"
+            assert (
+                set_new == set_ref
+            ), f"topk mismatch at h={h} b={b}: kernel={set_new} ref={set_ref}"
 
     # --- topk sentinel: invalid positions must be -1 ---
     for b in range(bs):
@@ -196,9 +276,9 @@ def test_flash_decode_with_topk_idx(bs, nqh, nkh, hd, blk, with_sink, seq_pat, i
         actual_k = min(tk, num_blocks)
         if actual_k < tk:
             invalid = topk_new[:, b, actual_k:]
-            assert (invalid == -1).all(), (
-                f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
-            )
+            assert (
+                invalid == -1
+            ).all(), f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
 
 
 @pytest.mark.parametrize("score_type", ["max", "lse"])
@@ -206,21 +286,51 @@ def test_flash_decode_with_topk_idx(bs, nqh, nkh, hd, blk, with_sink, seq_pat, i
     "bs,nqh,nkh,hd,blk,with_sink,seq_pat,ib,lb,tk",
     CASES,
 )
-def test_flash_decode_score_only(bs, nqh, nkh, hd, blk, with_sink, seq_pat, ib, lb, tk, score_type):
+def test_flash_decode_score_only(
+    bs, nqh, nkh, hd, blk, with_sink, seq_pat, ib, lb, tk, score_type
+):
     torch.manual_seed(42)
     seq_lens, mkl = make_seq_lens(seq_pat, bs, blk)
 
     q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids = build_inputs(
-        bs, nqh, nkh, hd, seq_lens, max_kv_len=mkl, with_sink=with_sink,
+        bs,
+        nqh,
+        nkh,
+        hd,
+        seq_lens,
+        max_kv_len=mkl,
+        with_sink=with_sink,
     )
 
     o_new, topk_new = flash_decode_with_topk_idx(
-        q, sink, k_cache, v_cache, req_to_token, seq_lens_t, mkl, slot_ids,
-        blk, tk, ib, lb, disable_index_value=True, score_type=score_type,
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens_t,
+        mkl,
+        slot_ids,
+        blk,
+        tk,
+        ib,
+        lb,
+        disable_index_value=True,
+        score_type=score_type,
     )
     _, topk_ref = pytorch_reference(
-        q, sink, k_cache, v_cache, req_to_token, seq_lens_t, slot_ids,
-        blk, tk, ib, lb, score_type=score_type,
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens_t,
+        slot_ids,
+        blk,
+        tk,
+        ib,
+        lb,
+        score_type=score_type,
     )
 
     assert o_new is None, "expected None output when disable_index_value=True"
@@ -232,7 +342,9 @@ def test_flash_decode_score_only(bs, nqh, nkh, hd, blk, with_sink, seq_pat, ib, 
             actual_k = min(tk, num_blocks)
             set_new = set(topk_new[h, b, :actual_k].tolist())
             set_ref = set(topk_ref[h, b, :actual_k].tolist())
-            assert set_new == set_ref, f"topk mismatch at h={h} b={b}: kernel={set_new} ref={set_ref}"
+            assert (
+                set_new == set_ref
+            ), f"topk mismatch at h={h} b={b}: kernel={set_new} ref={set_ref}"
 
     for b in range(bs):
         sl = seq_lens[b]
@@ -240,9 +352,9 @@ def test_flash_decode_score_only(bs, nqh, nkh, hd, blk, with_sink, seq_pat, ib, 
         actual_k = min(tk, num_blocks)
         if actual_k < tk:
             invalid = topk_new[:, b, actual_k:]
-            assert (invalid == -1).all(), (
-                f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
-            )
+            assert (
+                invalid == -1
+            ).all(), f"sentinel fail at b={b}: expected -1, got {invalid[invalid != -1].tolist()}"
 
 
 if __name__ == "__main__":

@@ -64,6 +64,7 @@ class MiniMaxVLBaseConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
+
 class MiniMaxM3VLConfig(MiniMaxVLBaseConfig):
     """MiniMax M3 VL: vision tower + M3 (mixed sparse/dense MoE) text backbone."""
 

@@ -91,9 +91,7 @@ def _decode_score_kernel(
     chunk_end = tl.minimum(chunk_end_block * block_size, seq_len)
     if chunk_start_block >= chunk_end_block:
         return
-    sid = (
-        tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
-    ) % max_slots
+    sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
     # init qkv pointer
     q_ptrs = tl.make_block_ptr(
         base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
@@ -125,7 +123,9 @@ def _decode_score_kernel(
     prefetch_pos = chunk_start + off_n
     prefetch_mask = prefetch_pos < seq_len
     prefetched_slots = tl.load(
-        r2t_base + prefetch_pos, mask=prefetch_mask, other=0,
+        r2t_base + prefetch_pos,
+        mask=prefetch_mask,
+        other=0,
     ).to(tl.int64)
     # score-only: compute block scores without loading V
     for i in range(chunk_start, chunk_end, BLOCK_SIZE_N):
@@ -137,7 +137,9 @@ def _decode_score_kernel(
             next_pos = next_i + off_n
             prefetch_mask = next_pos < seq_len
             prefetched_slots = tl.load(
-                r2t_base + next_pos, mask=prefetch_mask, other=0,
+                r2t_base + next_pos,
+                mask=prefetch_mask,
+                other=0,
             ).to(tl.int64)
         slots = (slots + max_slots) % max_slots
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
@@ -586,17 +588,25 @@ def _bitonic_merge(
 )
 @triton.jit
 def _topk_index_partial_kernel(
-    s_ptr,            # Score: [num_q_heads, BS, max_seqblock]
-    ts_partial_ptr,   # Partial scores out: [NUM_TOPK_CHUNKS, num_q_heads, BS, BLOCK_SIZE_T]
-    ti_partial_ptr,   # Partial idx out (1-indexed global, 0=invalid): same shape
+    s_ptr,  # Score: [num_q_heads, BS, max_seqblock]
+    ts_partial_ptr,  # Partial scores out: [NUM_TOPK_CHUNKS, num_q_heads, BS, BLOCK_SIZE_T]
+    ti_partial_ptr,  # Partial idx out (1-indexed global, 0=invalid): same shape
     seq_lens,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     chunk_blocks: tl.constexpr,  # how many score-blocks each chunk owns
     # strides
-    stride_s_h, stride_s_b, stride_s_k,
-    stride_ts_c, stride_ts_h, stride_ts_b, stride_ts_t,
-    stride_ti_c, stride_ti_h, stride_ti_b, stride_ti_t,
+    stride_s_h,
+    stride_s_b,
+    stride_s_k,
+    stride_ts_c,
+    stride_ts_h,
+    stride_ts_b,
+    stride_ts_t,
+    stride_ti_c,
+    stride_ti_h,
+    stride_ti_b,
+    stride_ti_t,
     # META
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
@@ -709,14 +719,22 @@ def _topk_index_partial_kernel(
 def _topk_index_merge_kernel(
     ts_partial_ptr,  # Partial scores: [NUM_TOPK_CHUNKS, num_q_heads, BS, BLOCK_SIZE_T]
     ti_partial_ptr,  # Partial idx (1-indexed global, 0=invalid): same shape
-    ti_final_ptr,    # Final idx (0-indexed global, -1=invalid): [num_q_heads, BS, topk]
+    ti_final_ptr,  # Final idx (0-indexed global, -1=invalid): [num_q_heads, BS, topk]
     seq_lens,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     # strides
-    stride_ts_c, stride_ts_h, stride_ts_b, stride_ts_t,
-    stride_ti_c, stride_ti_h, stride_ti_b, stride_ti_t,
-    stride_tif_h, stride_tif_b, stride_tif_t,
+    stride_ts_c,
+    stride_ts_h,
+    stride_ts_b,
+    stride_ts_t,
+    stride_ti_c,
+    stride_ti_h,
+    stride_ti_b,
+    stride_ti_t,
+    stride_tif_h,
+    stride_tif_b,
+    stride_tif_t,
     # META
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -799,9 +817,10 @@ def flash_decode_with_topk_idx(
     score_type: str = "max",
     disable_index_value: bool = False,
 ) -> torch.Tensor:
-    assert score_type in ("max", "lse"), (
-        f"score_type must be 'max' or 'lse', got {score_type!r}"
-    )
+    assert score_type in (
+        "max",
+        "lse",
+    ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
     # dtype check
     assert (
@@ -953,12 +972,20 @@ def flash_decode_with_topk_idx(
     max_seqblock = score.shape[2]
     chunk_blocks = (max_seqblock + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
     topk_score_partial = torch.empty(
-        NUM_TOPK_CHUNKS, num_q_heads, batch_size, BLOCK_SIZE_T,
-        dtype=torch.float32, device=score.device,
+        NUM_TOPK_CHUNKS,
+        num_q_heads,
+        batch_size,
+        BLOCK_SIZE_T,
+        dtype=torch.float32,
+        device=score.device,
     )
     topk_idx_partial = torch.empty(
-        NUM_TOPK_CHUNKS, num_q_heads, batch_size, BLOCK_SIZE_T,
-        dtype=torch.int32, device=score.device,
+        NUM_TOPK_CHUNKS,
+        num_q_heads,
+        batch_size,
+        BLOCK_SIZE_T,
+        dtype=torch.int32,
+        device=score.device,
     )
     # topk index and attn output merge on parallel streams
     if disable_index_value:

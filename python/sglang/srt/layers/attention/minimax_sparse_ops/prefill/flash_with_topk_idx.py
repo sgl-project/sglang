@@ -489,9 +489,10 @@ def flash_prefill_with_topk_index(
     score_type: str = "max",
     disable_index_value: bool = False,
 ):
-    assert score_type in ("max", "lse"), (
-        f"score_type must be 'max' or 'lse', got {score_type!r}"
-    )
+    assert score_type in (
+        "max",
+        "lse",
+    ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
     # dtype check
     assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
@@ -524,9 +525,7 @@ def flash_prefill_with_topk_index(
     if disable_index_value:
         o = None
     else:
-        o = torch.empty(
-            total_q, num_heads, v_head_dim, dtype=q.dtype, device=q.device
-        )
+        o = torch.empty(total_q, num_heads, v_head_dim, dtype=q.dtype, device=q.device)
     score = torch.full(
         (num_heads, total_q, max_seqblock_k),
         float("-inf"),

@@ -1249,7 +1249,8 @@ def moe_ep_deepgemm_preprocess(
 
     if use_mxfp8:
         hidden_states, scale = per_token_group_quant_fp8(
-            hidden_states, block_k,
+            hidden_states,
+            block_k,
             column_major_scales=True,
             scale_tma_aligned=True,
             scale_ue8m0=True,
@@ -1280,7 +1281,9 @@ def moe_ep_deepgemm_preprocess(
 
     # MXFP8: v2 outputs packed int32 UE8M0 scales, fix to MN-major layout after scatter
     if use_mxfp8:
-        gateup_input_scale = gateup_input_scale.transpose(1, 2).contiguous().transpose(1, 2)
+        gateup_input_scale = (
+            gateup_input_scale.transpose(1, 2).contiguous().transpose(1, 2)
+        )
 
     return (
         masked_m,

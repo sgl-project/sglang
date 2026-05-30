@@ -189,9 +189,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
         else:
-            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(
-                layer.layer_id
-            )
+            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
         cu_seqlens = torch.cat(
             [
@@ -254,16 +252,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Pad output back to original size for DP communication
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
-            o = torch.cat(
-                [o, o.new_zeros(pad_len, *o.shape[1:])], dim=0
-            )
+            o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
             if idx_o is not None:
                 idx_o = torch.cat(
                     [idx_o, idx_o.new_zeros(pad_len, *idx_o.shape[1:])], dim=0
                 )
 
         return (
-            None if idx_o is None else idx_o.reshape(original_num_tokens, -1).contiguous(),
+            (
+                None
+                if idx_o is None
+                else idx_o.reshape(original_num_tokens, -1).contiguous()
+            ),
             o.reshape(original_num_tokens, -1).contiguous(),
         )
 
@@ -305,9 +305,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
         else:
-            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(
-                layer.layer_id
-            )
+            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
         idx_o, o = minimax_sparse_decode(
             q,

@@ -2471,9 +2471,7 @@ class MiniMaxSparseKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.main_pool.get_kv_buffer(layer_id)
 
-    def get_index_kv_buffer(
-        self, layer_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_index_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         mapped_id = self.index_kv_layer_id_mapping.get(layer_id)
         if mapped_id is None:
             raise ValueError(
@@ -2508,7 +2506,12 @@ class MiniMaxSparseKVPool(KVCache):
     ) -> None:
         """Write main K/V at `loc`. Works for any layer (dense or sparse)."""
         self.main_pool.set_kv_buffer(
-            layer, loc, cache_k, cache_v, k_scale, v_scale,
+            layer,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
         )
 
     def set_index_kv_buffer(
@@ -2528,7 +2531,12 @@ class MiniMaxSparseKVPool(KVCache):
                 f"index_kv layers: {list(self.index_kv_layer_id_mapping.keys())}"
             )
         self.index_kv_pool.set_kv_buffer(
-            layer, loc, cache_idx_k, cache_idx_v, k_scale, v_scale,
+            layer,
+            loc,
+            cache_idx_k,
+            cache_idx_v,
+            k_scale,
+            v_scale,
             layer_id_override=mapped_id,
         )
 

@@ -21,8 +21,8 @@ from typing import (
 
 from typing_extensions import Self
 
-from .data_type import NULL_STRINGS, FunctionCallParameterDataType
 from .base import Parser, ParserOutput, PatternMismatched
+from .data_type import NULL_STRINGS, FunctionCallParameterDataType
 from .decoder import CountConsumedTokensFn
 
 OutputKey = Union[str, Callable[[Any], Dict]]

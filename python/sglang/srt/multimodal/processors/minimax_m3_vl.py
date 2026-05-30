@@ -8,49 +8,20 @@ MiniMaxM2VLVideoProcessor) live in sglang.srt.configs.minimax_vl_processor to
 avoid circular imports with model classes.
 """
 
-import re
-from typing import Dict, List, Optional
-
-import pybase64
-import torch
-from torchvision.io import decode_image
-
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
-from sglang.srt.models.minimax_m3_vl import (
-    MiniMaxM3SparseForConditionalGeneration
-)
-from sglang.srt.multimodal.processors.base_processor import (
-    BaseMultimodalProcessor,
-    BaseMultiModalProcessorOutput,
-    MultimodalSpecialTokens,
-)
-from sglang.srt.utils import ImageData
-
-
 import math
 import re
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torchvision
 from torchvision.transforms import InterpolationMode
-from transformers import BatchFeature
-from transformers.image_processing_utils_fast import (
-    BaseImageProcessorFast,
-    group_images_by_shape,
-    reorder_images,
+
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
 )
-from transformers.image_utils import PILImageResampling, SizeDict
-from transformers.processing_utils import (
-    ImagesKwargs,
-    ProcessingKwargs,
-    ProcessorMixin,
-    Unpack,
-    VideosKwargs,
-)
-from transformers.utils import TensorType
-from transformers.video_processing_utils import BaseVideoProcessor
-from transformers.video_utils import group_videos_by_shape, reorder_videos
 
 
 def get_hw_multiple_of(
@@ -142,6 +113,7 @@ def vllm_resize(
     """
     new_w, new_h = get_hw_multiple_of((width, height), factor, max_size)
     return new_h, new_w
+
 
 def _compute_sampled_frame_indices(
     total_frames: int,
@@ -274,7 +246,6 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
     # Whether to use padding when tokenizing text in process_mm_data.
     # M3's tokenizer does not have a pad_token, so disable padding.
     tokenizer_padding = False
-
 
     IMAGE_TOKEN = "]<]image[>["
     VIDEO_TOKEN = "]<]video[>["

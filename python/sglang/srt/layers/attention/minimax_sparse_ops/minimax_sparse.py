@@ -18,7 +18,9 @@ def minimax_sparse_prefill(
     sink: Optional[torch.Tensor],  # [num_q_heads, qk_head_dim]
     idx_q: torch.Tensor,  # [total_extend_tokens, num_idx_heads, idx_head_dim]
     idx_k_cache: torch.Tensor,  # [max_slots, 1, idx_head_dim] (paged index)
-    idx_v_cache: Optional[torch.Tensor],  # [max_slots, 1, idx_head_dim] (paged index); None when disable_index_value
+    idx_v_cache: Optional[
+        torch.Tensor
+    ],  # [max_slots, 1, idx_head_dim] (paged index); None when disable_index_value
     idx_sink: Optional[torch.Tensor],  # [num_idx_heads, idx_head_dim]
     req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
     slot_ids: torch.Tensor,  # [batch_size, ]
@@ -96,7 +98,9 @@ def minimax_sparse_decode(
     idx_q: torch.Tensor,  # [batch_size, num_idx_heads, idx_head_dim], num_idx_heads >= num_kv_heads
     idx_sink: Optional[torch.Tensor],  # [num_idx_heads, idx_head_dim]
     idx_k_cache: torch.Tensor,  # [max_slots, 1, idx_head_dim] (paged)
-    idx_v_cache: Optional[torch.Tensor],  # [max_slots, 1, idx_head_dim] (paged); None when disable_index_value
+    idx_v_cache: Optional[
+        torch.Tensor
+    ],  # [max_slots, 1, idx_head_dim] (paged); None when disable_index_value
     req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
     slot_ids: torch.Tensor,  # [batch_size, ]
     seq_lens: torch.Tensor,  # [batch_size, ]

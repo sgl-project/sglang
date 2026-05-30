@@ -128,9 +128,7 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
 
 
 @warmup("prefill_shapes")
-async def prefill_shapes(
-    disaggregation_mode: str, tokenizer_manager: TokenizerManager
-):
+async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
     """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
 
     Uses power-of-2 sizes plus intermediate points to cover the shape space

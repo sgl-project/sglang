@@ -164,9 +164,10 @@ def get_minimax_sparse_disable_value_layer_ids(sparse_cfg: dict) -> list[int]:
 
 def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
     score_type = sparse_cfg.get("sparse_score_type", "max")
-    assert score_type in ("max", "lse"), (
-        f"sparse_score_type must be 'max' or 'lse', got {score_type!r}"
-    )
+    assert score_type in (
+        "max",
+        "lse",
+    ), f"sparse_score_type must be 'max' or 'lse', got {score_type!r}"
     return score_type
 
 

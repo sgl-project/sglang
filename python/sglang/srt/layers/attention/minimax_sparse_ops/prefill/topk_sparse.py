@@ -289,7 +289,7 @@ def flash_prefill_with_gqa_share_sparse(
     # launch kernel
     num_q_loop = (
         max_seqblock_q // 131072 + 1
-    )  # calculate multiple querys in one kernel if seqlence length is too long
+    )  # calculate multiple queries in one kernel if seqlence length is too long
     BLOCK_SIZE_Q = triton.next_power_of_2(block_size_q)
     BLOCK_SIZE_K = triton.next_power_of_2(block_size_k)
     grid = (

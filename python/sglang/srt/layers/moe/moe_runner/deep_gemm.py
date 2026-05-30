@@ -123,12 +123,13 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
 
     def __post_init__(self):
         if self.use_mxfp8:
-            assert self.block_shape == [1, 32], (
-                f"MXFP8 requires block_shape [1, 32], got {self.block_shape}"
-            )
-            assert deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0, (
-                "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
-            )
+            assert self.block_shape == [
+                1,
+                32,
+            ], f"MXFP8 requires block_shape [1, 32], got {self.block_shape}"
+            assert (
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            ), "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -864,9 +865,9 @@ def _varlen_deep_gemm_silu_mul_quant(
     )
 
     if _MASKED_GEMM_FAST_ACT:
-        assert gemm1_alpha is None, (
-            "gemm1_alpha is not supported with SGLANG_MASKED_GEMM_FAST_ACT"
-        )
+        assert (
+            gemm1_alpha is None
+        ), "gemm1_alpha is not supported with SGLANG_MASKED_GEMM_FAST_ACT"
         assert not swizzle, (
             "SGLANG_OPT_FIX_MEGA_MOE_MEMORY is incompatible with "
             "SGLANG_MASKED_GEMM_FAST_ACT (swizzled layout only supported by JIT act)"
@@ -927,9 +928,9 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
     else:
         if gemm1_alpha is not None:
-            assert swiglu_limit is None, (
-                "swiglu_limit and gemm1_alpha are mutually exclusive"
-            )
+            assert (
+                swiglu_limit is None
+            ), "swiglu_limit and gemm1_alpha are mutually exclusive"
             assert not swizzle, "swizzle is not supported with gemm1_alpha"
         else:
             assert (

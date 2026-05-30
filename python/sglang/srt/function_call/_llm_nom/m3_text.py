@@ -4,8 +4,8 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Union
 
 from typing_extensions import Self
 
-from .data_type import AtomDataType, FunctionCallParameterDataType
 from .base import FunctionCallDict
+from .data_type import AtomDataType, FunctionCallParameterDataType
 from .generator import (
     GeneratorParser,
     default_tool_call_output_key,
