@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 
@@ -29,29 +29,6 @@ def start_req(
     prompt_len: int,
     max_new_tokens: int,
     rid: Optional[str],
-    # === Wishlist kwargs (additive, see 2026-05-26-round-5-de-skip-and-api-wishlist.md §5.2) ===
-    prompt_tokens: Optional[List[int]],
-    temperature: Optional[float],
-    top_p: Optional[float],
-    top_k: Optional[int],
-    seed: Optional[int],
-    ignore_eos: bool,
-    min_new_tokens: Optional[int],
-    stop: Optional[Union[str, List[str]]],
-    stop_token_ids: Optional[List[int]],
-    repetition_penalty: Optional[float],
-    frequency_penalty: Optional[float],
-    presence_penalty: Optional[float],
-    return_logprob: bool,
-    top_logprobs_num: Optional[int],
-    logprob_start_len: Optional[int],
-    priority: Optional[int],
-    lora_path: Optional[str],
-    session_id: Optional[str],
-    dp_rank: Optional[int],
-    return_hidden_states: bool,
-    grammar: Optional[str],
-    stream: bool,
 ) -> ScriptedReqHandle:
     """Submit a synthetic request via a real ``/generate`` HTTP call.
 
@@ -62,39 +39,8 @@ def start_req(
     has arrived but is not yet handed to the scheduler — it is popped on
     the next ``yield`` (next ``recv_requests`` iteration), keeping each
     step deterministic.
-
-    The first three parameters (``prompt_len``, ``max_new_tokens``,
-    ``rid``) are fully implemented. All other keyword-only parameters
-    are wishlist additions described in
-    ``2026-05-26-round-5-de-skip-and-api-wishlist.md`` §5.2 — passing
-    any of them to a non-default value raises ``NotImplementedError``
-    until the engine-side wiring lands.
     """
     assert ctx._is_driver, "start_req is only callable from the driver rank"
-    _check_start_req_wishlist_kwargs(
-        prompt_tokens=prompt_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        seed=seed,
-        ignore_eos=ignore_eos,
-        min_new_tokens=min_new_tokens,
-        stop=stop,
-        stop_token_ids=stop_token_ids,
-        repetition_penalty=repetition_penalty,
-        frequency_penalty=frequency_penalty,
-        presence_penalty=presence_penalty,
-        return_logprob=return_logprob,
-        top_logprobs_num=top_logprobs_num,
-        logprob_start_len=logprob_start_len,
-        priority=priority,
-        lora_path=lora_path,
-        session_id=session_id,
-        dp_rank=dp_rank,
-        return_hidden_states=return_hidden_states,
-        grammar=grammar,
-        stream=stream,
-    )
     if rid is None:
         rid = f"scripted-{ctx._req_counter}-{uuid.uuid4().hex}"
         ctx._req_counter += 1
@@ -150,71 +96,3 @@ def _post_generate_async(
             logger.exception("scripted_runtime: /generate request rid=%s failed", rid)
 
     ctx._http_poster.submit_coro(_post())
-
-
-def _check_start_req_wishlist_kwargs(
-    *,
-    prompt_tokens: Optional[List[int]],
-    temperature: Optional[float],
-    top_p: Optional[float],
-    top_k: Optional[int],
-    seed: Optional[int],
-    ignore_eos: bool,
-    min_new_tokens: Optional[int],
-    stop: Optional[Union[str, List[str]]],
-    stop_token_ids: Optional[List[int]],
-    repetition_penalty: Optional[float],
-    frequency_penalty: Optional[float],
-    presence_penalty: Optional[float],
-    return_logprob: bool,
-    top_logprobs_num: Optional[int],
-    logprob_start_len: Optional[int],
-    priority: Optional[int],
-    lora_path: Optional[str],
-    session_id: Optional[str],
-    dp_rank: Optional[int],
-    return_hidden_states: bool,
-    grammar: Optional[str],
-    stream: bool,
-) -> None:
-    """Raise NotImplementedError for any non-default wishlist kwarg.
-
-    Centralised so each wishlist kwarg surfaces with a specific name in
-    the error message, making the unimplemented-call site easy to find.
-    """
-    non_default_optionals: Dict[str, Any] = {
-        "prompt_tokens": prompt_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "seed": seed,
-        "min_new_tokens": min_new_tokens,
-        "stop": stop,
-        "stop_token_ids": stop_token_ids,
-        "repetition_penalty": repetition_penalty,
-        "frequency_penalty": frequency_penalty,
-        "presence_penalty": presence_penalty,
-        "top_logprobs_num": top_logprobs_num,
-        "logprob_start_len": logprob_start_len,
-        "priority": priority,
-        "lora_path": lora_path,
-        "session_id": session_id,
-        "dp_rank": dp_rank,
-        "grammar": grammar,
-    }
-    for name, value in non_default_optionals.items():
-        if value is not None:
-            raise NotImplementedError(
-                f"scripted_runtime: start_req kwarg '{name}' is wishlist"
-            )
-    non_default_flags: Dict[str, bool] = {
-        "ignore_eos": ignore_eos,
-        "return_logprob": return_logprob,
-        "return_hidden_states": return_hidden_states,
-        "stream": stream,
-    }
-    for name, flag in non_default_flags.items():
-        if flag:
-            raise NotImplementedError(
-                f"scripted_runtime: start_req kwarg '{name}' is wishlist"
-            )

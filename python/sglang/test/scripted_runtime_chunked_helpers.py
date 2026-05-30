@@ -9,36 +9,18 @@ API surface used by these tests:
 * :func:`sglang.test.scripted_runtime.http_server_subprocess.launch_scripted_http_server`
 * :class:`sglang.test.scripted_runtime.ScriptedContext`
 * :class:`sglang.test.scripted_runtime.ScriptedReqHandle`
-
-Many scripts also reference attributes that are not yet on
-:class:`ScriptedReqHandle` / :class:`ScriptedContext`. The full wishlist lives
-in ``agent-context/projects/sglang/2026-05-25-chunked-prefill-rewrite/
-agent-drafts/2026-05-26-chunked-test-suite-initial-plan.md`` §4. When
-the harness gains those attributes, the corresponding tests start
-exercising them with no further wiring needed.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-)
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # Chosen to force every meaningful prompt into 4+ chunks. The
 # accuracy-flavored suite under test/manual/chunked_prefill/ uses the
 # same value; keeping them aligned makes side-by-side comparisons easy.
 DEFAULT_CHUNK_SIZE: int = 256
-
-# "Long" = comfortably > DEFAULT_CHUNK_SIZE so every test that calls
-# ``start_req(prompt_len=LONG_PROMPT_LEN)`` triggers chunking.
-LONG_PROMPT_LEN: int = 1024
-
-# A prompt length that crosses many chunk boundaries — used to give the
-# scheduler several iterations to observe / abort / retract in flight.
-VERY_LONG_PROMPT_LEN: int = 4096
 
 # Bound the bare-yield idiom so a stuck scheduler doesn't hang the test
 # process forever. Picked generously — real scripts almost never need
@@ -48,7 +30,6 @@ DEFAULT_MAX_STEPS: int = 400
 # Default model — single-GPU tests use the small model; the multi-GPU
 # feature tests override per-fixture.
 SMALL_MODEL: str = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-DEFAULT_MODEL: str = DEFAULT_MODEL_NAME_FOR_TEST
 
 
 def base_engine_kwargs(
@@ -146,9 +127,8 @@ def advance_to_decode_step(
 ):
     """Generator helper: ``yield`` until the req has produced ``target_output_len`` decode tokens.
 
-    Reads ``Req.output_ids`` directly (the output-length handle property is
-    still wishlist) and assumes the req runs to ``max_new_tokens`` by length —
-    the synthetic decode does not stop early.
+    Reads ``Req.output_ids`` directly and assumes the req runs to
+    ``max_new_tokens`` by length — the synthetic decode does not stop early.
     """
     for _ in range(max_steps):
         assert (

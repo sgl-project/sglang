@@ -5,11 +5,10 @@ the HTTP-server lifecycle — one server per concrete class, shared across
 every ``test_*`` method. Tests dispatch ``_script_*`` sub-scripts via
 ``self.server.execute_script(...)``.
 
-Convention (no enforcement until the wishlist abort / list_active_reqs
-APIs land): each ``_script_*`` must drive every request it starts to
-``finished`` (or, eventually, abort) before returning. The base does
-not perform an automatic state reset between tests, so leaked
-in-flight reqs will pollute the next test in the same class.
+Convention (not enforced): each ``_script_*`` must drive every request
+it starts to ``finished`` before returning. The base does not perform an
+automatic state reset between tests, so leaked in-flight reqs will
+pollute the next test in the same class.
 """
 
 from __future__ import annotations

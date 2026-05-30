@@ -41,7 +41,6 @@ from sglang.test.scripted_runtime.utils import ensure_script_importable, resolve
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.test.scripted_runtime.req_handle import ScriptedReqStatus
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
@@ -142,19 +141,6 @@ class ScriptedSchedulerHook:
     # ============================================================
     # Lookups used by ScriptedReqHandle (driver-rank-local view).
     # ============================================================
-    def _lookup_req_status(self, rid: str) -> "ScriptedReqStatus":
-        # TODO(reimplement): the previous implementation was wrong. It never
-        # reported "finished", ignored the chunked_req slot, and under PP only
-        # inspected the current microbatch's running_batch — so a req running
-        # in another microbatch read as "unknown". A correct version must fold
-        # in finished / chunked / cross-microbatch state before callers can
-        # trust it; until then use the narrower observables (is_chunking,
-        # finished, _find_req_by_rid + waiting_queue) instead.
-        raise NotImplementedError(
-            "scripted_runtime: _lookup_req_status needs reimplementation — see "
-            "the chunked / PP / finished caveats in the comment above"
-        )
-
     def _find_req_by_rid(self, rid: str) -> Optional[Any]:
         """Locate the raw ``Req`` by rid across scheduler queues / batches.
 

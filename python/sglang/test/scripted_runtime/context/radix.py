@@ -6,7 +6,7 @@ prefix entries. Each takes the facade ``ctx`` first.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Dict
 
 if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
@@ -48,32 +48,3 @@ def get_all_node_lock_refs(ctx: "ScriptedContext") -> Dict[int, int]:
         lock_refs[node.id] = node.lock_ref
         stack.extend(node.children.values())
     return lock_refs
-
-
-def warmup_radix(ctx: "ScriptedContext", *, prompt_tokens: List[int]) -> None:
-    """Seed the radix cache with ``prompt_tokens`` without dispatching a real req.
-
-    Pre-populates the prefix tree so subsequent :meth:`start_req` calls
-    can hit a deterministic cached prefix length.
-
-    Consumed by: test_radix_prefix_hit_skips_extend (radix),
-                 test_radix_warmup_then_evict_roundtrip (radix).
-    """
-    raise NotImplementedError(
-        "scripted_runtime: warmup_radix is wishlist — see "
-        "2026-05-26-round-5-de-skip-and-api-wishlist.md"
-    )
-
-
-def evict_radix(ctx: "ScriptedContext", *, prompt_tokens: List[int]) -> None:
-    """Evict the radix entry that matches ``prompt_tokens`` (if present).
-
-    Inverse of :meth:`warmup_radix`. Used to set up a "warm then
-    evict then re-admit" cache-miss scenario.
-
-    Consumed by: test_radix_warmup_then_evict_roundtrip (radix).
-    """
-    raise NotImplementedError(
-        "scripted_runtime: evict_radix is wishlist — see "
-        "2026-05-26-round-5-de-skip-and-api-wishlist.md"
-    )
