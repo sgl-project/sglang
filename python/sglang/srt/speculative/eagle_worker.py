@@ -1005,16 +1005,6 @@ class EAGLEWorker(TpModelWorker):
                 batch, res, logits_output, spec_info, seq_lens_pre_verify
             )
 
-        accept_lens = torch.tensor(
-            res.num_correct_drafts_per_req_cpu,
-            device=logits_output.next_token_logits.device,
-            dtype=torch.int64,
-        ) + 1
-        self.target_worker.model_runner.attn_backend.update_online_c128_state_after_mtp_verify(
-            accept_lens=accept_lens,
-            model=self.target_worker.model_runner.model,
-        )
-
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, res, logits_output)
 

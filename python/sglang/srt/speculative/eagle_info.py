@@ -731,7 +731,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
     num_accept_tokens: Optional[torch.Tensor] = None
-    online_c128_mtp_commit_events: Optional[List[object]] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -821,7 +820,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
-            self.online_c128_mtp_commit_events = spec_info.online_c128_mtp_commit_events
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -834,12 +832,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
-        if spec_info.online_c128_mtp_commit_events:
-            if self.online_c128_mtp_commit_events is None:
-                self.online_c128_mtp_commit_events = []
-            self.online_c128_mtp_commit_events.extend(
-                spec_info.online_c128_mtp_commit_events
-            )
 
 
 @dataclass

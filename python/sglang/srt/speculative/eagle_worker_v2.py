@@ -1131,24 +1131,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, verify_input, accept_lens, accept_index, bs
             )
 
-        online_c128_mtp_committed = (
-            self.target_worker.model_runner.attn_backend.update_online_c128_state_after_mtp_verify(
-                accept_lens=accept_lens,
-                model=self.target_worker.model_runner.model,
-            )
-        )
-
-        online_c128_mtp_commit_event = None
-        if (
-            online_c128_mtp_committed
-            and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
-        ):
-            online_c128_mtp_commit_event = torch.get_device_module(
-                self.device
-            ).Event()
-            online_c128_mtp_commit_event.record()
-
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
@@ -1167,10 +1149,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
-        if online_c128_mtp_commit_event is not None:
-            next_draft_input.online_c128_mtp_commit_events = [
-                online_c128_mtp_commit_event
-            ]
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent

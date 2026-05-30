@@ -150,12 +150,6 @@ class EagleDraftInputV2Mixin:
             device=batch.device, non_blocking=True
         )
 
-        commit_events = getattr(self, "online_c128_mtp_commit_events", None)
-        if commit_events:
-            for event in commit_events:
-                torch.cuda.current_stream(torch.device(batch.device)).wait_event(event)
-            self.online_c128_mtp_commit_events = None
-
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
