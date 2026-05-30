@@ -1,9 +1,11 @@
+    radix_cache      = ENABLED (fixture artifact: /sgl-workspace/sglang/runs/20260530_dsv32_loop6/ds_radix_fixture_state_int8.json)
     signature_dtype  = int8
-[2026-05-30 11:53:58 TP0] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
-[2026-05-30 11:53:58 TP1] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
-[2026-05-30 11:53:58 TP2] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
-[2026-05-30 11:53:58 TP3] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
-[2026-05-30 11:53:58 TP4] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
-[2026-05-30 11:53:58 TP5] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
-[2026-05-30 11:53:58 TP6] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
-[2026-05-30 11:53:58 TP7] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 12:24:27] DS radix-cache fixture recorded as PASSED for this ServerArgs; validator will now accept --disable-radix-cache removal. Source: record_radix_fixture_passed(). artifact=/sgl-workspace/sglang/runs/20260530_dsv32_loop6/ds_radix_fixture_state_int8.json artifact_sha256=f3b67943c0f2dd0c5ccbc8b7297dcc1d40265662c62612c6071161ffd68e5072
+[2026-05-30 12:25:43 TP0] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 12:25:43 TP1] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 12:25:43 TP2] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 12:25:43 TP3] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 12:25:43 TP4] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 12:25:43 TP5] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 12:25:43 TP6] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 12:25:43 TP7] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16

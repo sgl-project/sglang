@@ -1,0 +1,11 @@
+# AC-6 DSA-default SLO — FRESH R11 corroboration (num_prompts=64, warmup=120s, window=600s, request_rate=inf;
+#   cross-node client node0 -> DSA server node1). Reproduces the tracked Loop-5 DSA baseline at the identical
+#   operating point => confirms the established DSA SLO applies after the DS opt-in changes.
+
+conc completed  achieved errors P99_TTFT_s med_TTFT_s medTPOT_ms    TPS     SLO(<22 & >=30)   L5 baseline
+  16       832     16.00      0       0.89       0.67       21.7   46.1  TTFT PASS/TPS PASS    0.97s/46.7
+  32      1344     32.00      0       1.49       0.97       27.0   37.0  TTFT PASS/TPS PASS    1.39s/37.6
+  64      2048     64.00      0       2.18       1.75       34.0   29.4  TTFT PASS/TPS~29.4    2.02s/29.5
+
+# conc-64 per-req TPS ~29-30 reproduces the Loop-5 baseline's marginal conc-64 TPS (decode batch of 64) -- a
+# pre-existing DSA characteristic at the threshold, NOT introduced by the DS opt-in code (DSA-default runs no DS path).

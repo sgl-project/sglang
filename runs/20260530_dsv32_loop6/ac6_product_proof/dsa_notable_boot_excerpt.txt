@@ -1,3 +1,2 @@
-token_label_table line count: 0
-KV Cache is allocated
+node1 DSA boot (R11): token_label_table line count = 0
 max_total_num_tokens=910784

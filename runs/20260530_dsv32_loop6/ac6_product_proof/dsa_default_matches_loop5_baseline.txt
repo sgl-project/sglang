@@ -1,0 +1,28 @@
+# AC-6 — DSA-default operating point is IDENTICAL to the tracked Loop-5 DSA SLO baseline
+# => the established Loop-5 DSA SLO applies unchanged after the DS opt-in changes (DSA-default does not
+#    activate any DS code path). Fresh R11 DSA-default boot (node1) vs runs/20260528_dsv32_mvp/ac11_dsa_server_info.json:
+
+field                                  fresh R11              Loop-5 baseline        match
+enable_double_sparsity                 False                  False                  OK
+kv_cache_dtype                         fp8_e4m3               fp8_e4m3               OK
+page_size                              64                     64                     OK
+mem_fraction_static                    0.85                   0.85                   OK
+max_total_num_tokens                   910784                 910784                 OK
+disable_radix_cache                    False                  False                  OK
+dsa_prefill_backend                    flashmla_kv            flashmla_kv            OK
+dsa_decode_backend                     flashmla_kv            flashmla_kv            OK
+disable_overlap_schedule               True                   True                   OK
+disable_piecewise_cuda_graph           True                   True                   OK
+attention_backend                      dsa                    dsa                    OK
+
+ALL OPERATING-POINT FIELDS MATCH: True
+
+# Established Loop-5 DSA SLO baseline (runs/20260528_dsv32_mvp/ac11_results/native_nsa_*_t1.jsonl;
+#   num_prompts=64, warmup=120s, window=600s, request_rate=inf — the accepted steady-state methodology):
+conc completed  achieved P99_TTFT_s med_TTFT_s medTPOT_ms    TPS  SLO(<22 & >=30)
+  16       832     16.00       0.97       0.66       21.4   46.7  TTFT PASS / TPS PASS
+  32      1344     32.00       1.39       0.94       26.6   37.6  TTFT PASS / TPS PASS
+  64      2048     64.00       2.02       1.71       33.9   29.5  TTFT PASS / TPS ~29.5 (marginal)
+
+# NOTE: conc-64 per-req TPS ~29.5 is marginally below 30 in the Loop-5 DSA baseline itself -- a pre-existing
+#   DSA characteristic at the threshold (decode-batch of 64), NOT introduced by the DS opt-in code.
