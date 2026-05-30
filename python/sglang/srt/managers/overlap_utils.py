@@ -274,6 +274,8 @@ class FutureMap:
             return
         # Dispatch by payload type, not spec_algo: spec_v1 (non-overlap spec)
         # also passes a token Tensor here.
+        # FIXME(lsyin): unify this relay path with a dataclass instead of the
+        # Tensor / EagleDraftInput type switch.
         if isinstance(payload, torch.Tensor):
             self.output_tokens_buf[indices] = payload.to(torch.int64)
             return
