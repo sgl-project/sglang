@@ -679,14 +679,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return ret
 
     def _compute_pooling_fields(self, batch: ScheduleBatch):
-        """Populate the pooling-family per-request fields from ``batch.reqs``.
-
-        These are only meaningful for embedding / reward / scoring (pooling)
-        forwards. They are recomputed fresh at every ForwardBatch construction
-        rather than stored on the cross-iter-reused ScheduleBatch.
-        """
-        # Matryoshka output dims, one per request (fall back to hidden_size for
-        # requests that did not ask for a custom dimension).
+        """Populate per-request fields for embedding / reward / scoring forwards."""
         if batch.model_config.is_matryoshka and any(
             r.dimensions is not None for r in batch.reqs
         ):
@@ -695,16 +688,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 for r in batch.reqs
             ]
 
-        # OR across the batch so a single fused forward matches; requests that
-        # did not ask for PHS still skip attaching it in the output processor.
         self.return_pooled_hidden_states = any(
             r.return_pooled_hidden_states for r in batch.reqs
         )
 
-        # When --enable-mis is on, every request in the batch is expected to
-        # carry delimiter indices (the score endpoint always produces
-        # MIS-structured requests). Consumers index this list without
-        # None-checking.
+        # --enable-mis: every request must carry delimiter indices (the score
+        # endpoint always produces MIS-structured requests; consumers index
+        # without None-checking).
         if get_global_server_args().enable_mis and any(
             r.multi_item_delimiter_indices is not None for r in batch.reqs
         ):
