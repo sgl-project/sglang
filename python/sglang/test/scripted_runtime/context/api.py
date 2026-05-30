@@ -28,6 +28,7 @@ from sglang.test.scripted_runtime.context import (
 )
 
 if TYPE_CHECKING:
+    from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
     from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
@@ -51,11 +52,13 @@ class ScriptedContext:
         *,
         scheduler_hook: "ScriptedSchedulerHook",
         tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
+        http_poster: "BackgroundHttpPoster",
     ) -> None:
         self._scheduler_hook = scheduler_hook
         self._scheduler = scheduler_hook._scheduler
         self._is_driver = scheduler_hook._is_driver
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
+        self._http_poster = http_poster
 
         self._req_handles: dict[str, "ScriptedReqHandle"] = {}
         self._req_counter = 0

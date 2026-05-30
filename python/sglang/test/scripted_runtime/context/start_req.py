@@ -143,11 +143,11 @@ def _post_generate_async(
 
     async def _post() -> None:
         try:
-            await ctx._scheduler_hook.post_and_drain(url, payload)
+            await ctx._http_poster.post_and_drain(url, payload)
         except Exception:  # noqa: BLE001 — fire-and-forget background coroutine
             logger.exception("scripted_runtime: /generate request rid=%s failed", rid)
 
-    ctx._scheduler_hook.submit_coro(_post())
+    ctx._http_poster.submit_coro(_post())
 
 
 def _check_start_req_wishlist_kwargs(

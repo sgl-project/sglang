@@ -56,11 +56,11 @@ def _post_and_await_control(
 
     async def _post() -> None:
         try:
-            await ctx._scheduler_hook.post_no_body(url, json)
+            await ctx._http_poster.post_no_body(url, json)
         except Exception:  # noqa: BLE001 — fire-and-forget control POST
             logger.exception("scripted_runtime: control POST %s failed", path)
 
-    ctx._scheduler_hook.submit_coro(_post())
+    ctx._http_poster.submit_coro(_post())
     ctx._tokenizer_recv_proxy.wait_until_arrived(
         lambda obj: isinstance(obj, expect_type), timeout_s=timeout_s
     )
