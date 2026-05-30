@@ -1,0 +1,223 @@
+{
+ "_description": "AC-7 lifted-point 3-trial DS+DSA re-sweep (num_prompts=64, warmup120/window600, conc16/32/64). Per-trial metrics + medians + source JSONL SHA256, so the comparator numbers recompute. Raw *.jsonl are gitignored.",
+ "methodology": {
+  "num_prompts": 64,
+  "warmup_s": 120,
+  "window_s": 600,
+  "trials": 3,
+  "DS": "int8 mem0.7 radix-on (node0)",
+  "DSA": "mem0.85 radix-on (node0)"
+ },
+ "conc": {
+  "16": {
+   "DS": [
+    {
+     "trial": "1",
+     "achieved": 16,
+     "completed": 256,
+     "errors": 0,
+     "p99_ttft_s": 13.11,
+     "median_tpot_ms": 56.562,
+     "per_req_tps": 17.68,
+     "sha256": "6dfbfc9caa781eaa"
+    },
+    {
+     "trial": "2",
+     "achieved": 16,
+     "completed": 256,
+     "errors": 0,
+     "p99_ttft_s": 12.838,
+     "median_tpot_ms": 56.572,
+     "per_req_tps": 17.68,
+     "sha256": "e2885d0627e6a7f2"
+    },
+    {
+     "trial": "3",
+     "achieved": 16,
+     "completed": 256,
+     "errors": 0,
+     "p99_ttft_s": 12.814,
+     "median_tpot_ms": 56.588,
+     "per_req_tps": 17.67,
+     "sha256": "3b5c2b882aa69527"
+    }
+   ],
+   "DSA": [
+    {
+     "trial": "1",
+     "achieved": 16,
+     "completed": 896,
+     "errors": 0,
+     "p99_ttft_s": 0.928,
+     "median_tpot_ms": 21.329,
+     "per_req_tps": 46.88,
+     "sha256": "ca8c8b2938983115"
+    },
+    {
+     "trial": "2",
+     "achieved": 16,
+     "completed": 896,
+     "errors": 0,
+     "p99_ttft_s": 0.717,
+     "median_tpot_ms": 21.268,
+     "per_req_tps": 47.02,
+     "sha256": "e5c962f43a725935"
+    },
+    {
+     "trial": "3",
+     "achieved": 16,
+     "completed": 896,
+     "errors": 0,
+     "p99_ttft_s": 0.701,
+     "median_tpot_ms": 21.312,
+     "per_req_tps": 46.92,
+     "sha256": "8c6109bbb54a4d14"
+    }
+   ],
+   "DS_median_p99_ttft_s": 12.838,
+   "DS_median_tps": 17.68,
+   "DSA_median_p99_ttft_s": 0.717,
+   "DSA_median_tps": 46.92
+  },
+  "32": {
+   "DS": [
+    {
+     "trial": "1",
+     "achieved": 32,
+     "completed": 320,
+     "errors": 0,
+     "p99_ttft_s": 25.491,
+     "median_tpot_ms": 86.783,
+     "per_req_tps": 11.52,
+     "sha256": "099cb9eb252d92a7"
+    },
+    {
+     "trial": "2",
+     "achieved": 32,
+     "completed": 320,
+     "errors": 0,
+     "p99_ttft_s": 25.468,
+     "median_tpot_ms": 86.601,
+     "per_req_tps": 11.55,
+     "sha256": "280af241483eb44f"
+    },
+    {
+     "trial": "3",
+     "achieved": 32,
+     "completed": 320,
+     "errors": 0,
+     "p99_ttft_s": 25.513,
+     "median_tpot_ms": 86.818,
+     "per_req_tps": 11.52,
+     "sha256": "2ee132f4d717da32"
+    }
+   ],
+   "DSA": [
+    {
+     "trial": "1",
+     "achieved": 32,
+     "completed": 1344,
+     "errors": 0,
+     "p99_ttft_s": 1.278,
+     "median_tpot_ms": 26.65,
+     "per_req_tps": 37.52,
+     "sha256": "6968efb5f7798c33"
+    },
+    {
+     "trial": "2",
+     "achieved": 32,
+     "completed": 1344,
+     "errors": 0,
+     "p99_ttft_s": 1.284,
+     "median_tpot_ms": 26.634,
+     "per_req_tps": 37.55,
+     "sha256": "9702be31cf633b79"
+    },
+    {
+     "trial": "3",
+     "achieved": 32,
+     "completed": 1344,
+     "errors": 0,
+     "p99_ttft_s": 1.281,
+     "median_tpot_ms": 26.596,
+     "per_req_tps": 37.6,
+     "sha256": "e4471c05bbf82262"
+    }
+   ],
+   "DS_median_p99_ttft_s": 25.491,
+   "DS_median_tps": 11.52,
+   "DSA_median_p99_ttft_s": 1.281,
+   "DSA_median_tps": 37.55
+  },
+  "64": {
+   "DS": [
+    {
+     "trial": "1",
+     "achieved": 64,
+     "completed": 320,
+     "errors": 0,
+     "p99_ttft_s": 100.836,
+     "median_tpot_ms": 102.273,
+     "per_req_tps": 9.78,
+     "sha256": "ee26826037386c82"
+    },
+    {
+     "trial": "2",
+     "achieved": 64,
+     "completed": 320,
+     "errors": 0,
+     "p99_ttft_s": 100.913,
+     "median_tpot_ms": 102.278,
+     "per_req_tps": 9.78,
+     "sha256": "f39053197e40a266"
+    },
+    {
+     "trial": "3",
+     "achieved": 64,
+     "completed": 320,
+     "errors": 0,
+     "p99_ttft_s": 100.786,
+     "median_tpot_ms": 102.314,
+     "per_req_tps": 9.77,
+     "sha256": "2f74a9ff7d4f2277"
+    }
+   ],
+   "DSA": [
+    {
+     "trial": "1",
+     "achieved": 64,
+     "completed": 2048,
+     "errors": 0,
+     "p99_ttft_s": 2.12,
+     "median_tpot_ms": 33.892,
+     "per_req_tps": 29.51,
+     "sha256": "84a3d93df9ff02c9"
+    },
+    {
+     "trial": "2",
+     "achieved": 64,
+     "completed": 2048,
+     "errors": 0,
+     "p99_ttft_s": 2.044,
+     "median_tpot_ms": 33.906,
+     "per_req_tps": 29.49,
+     "sha256": "545e4ba5b9c543c4"
+    },
+    {
+     "trial": "3",
+     "achieved": 64,
+     "completed": 2048,
+     "errors": 0,
+     "p99_ttft_s": 1.941,
+     "median_tpot_ms": 33.861,
+     "per_req_tps": 29.53,
+     "sha256": "416fb0f40576cad5"
+    }
+   ],
+   "DS_median_p99_ttft_s": 100.836,
+   "DS_median_tps": 9.78,
+   "DSA_median_p99_ttft_s": 2.044,
+   "DSA_median_tps": 29.51
+  }
+ }
+}
