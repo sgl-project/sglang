@@ -1,10 +1,10 @@
 const $ = (id) => document.getElementById(id);
 
 const presets = [
-  { name: "Candid Paparazzi", tone: "accent", size: "832x480", fps: 16, prompt: "A candid street portrait, compressed perspective, flash-lit reflections, editorial realism.", actions: [["w"], ["w"], ["l"], ["l"], ["w", "l"], ["w"], [], []] },
-  { name: "Office CCTV", tone: "green", size: "832x480", fps: 16, prompt: "An overhead security-camera view of a quiet office, fluorescent light, subtle human motion.", actions: [[], [], ["j"], ["j"], [], ["l"], ["l"], []] },
-  { name: "Free Fall", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled falling camera move through a surreal interior, cinematic motion blur, crisp subject.", actions: [["k"], ["k"], ["w"], ["w"], ["w"], ["i"], [], []] },
-  { name: "Slow Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth dolly-in shot, natural light, shallow depth of field, calm cinematic pacing.", actions: [["w"], ["w"], ["w"], ["w"], ["w"], ["w"], [], []] },
+  { name: "Reference Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth dolly-in from the reference image, natural light, steady camera, cinematic realism.", actions: [["w"], ["w"], ["w"], ["w"], ["w"], ["w"], [], []] },
+  { name: "Look Around", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled camera look-around of the same scene, consistent geometry, subtle parallax.", actions: [["j"], ["j"], [], ["l"], ["l"], [], ["i"], ["k"]] },
+  { name: "Scene Scout", tone: "accent", size: "832x480", fps: 16, prompt: "A scouting shot through a quiet interior, responsive camera movement, stable subject detail.", actions: [["w"], ["w"], ["d"], ["d"], ["w", "l"], ["w"], ["a"], []] },
+  { name: "Surveillance", tone: "green", size: "832x480", fps: 16, prompt: "A fixed-lens surveillance view of a room, fluorescent light, understated motion, documentary feel.", actions: [[], [], ["j"], ["j"], [], ["l"], ["l"], []] },
 ];
 
 let ws = null;
@@ -21,6 +21,13 @@ const ctx = canvas.getContext("2d", { alpha: false });
 function setStatus(text, kind = "") {
   $("statusText").textContent = text;
   $("statusDot").className = "dot" + (kind ? ` ${kind}` : "");
+}
+
+function addHistory(text) {
+  const item = document.createElement("span");
+  item.textContent = text;
+  $("historyList").prepend(item);
+  while ($("historyList").children.length > 8) $("historyList").lastChild.remove();
 }
 
 function drawIdle() {
@@ -92,6 +99,23 @@ async function readFirstFrame() {
   return file ? new Uint8Array(await file.arrayBuffer()) : undefined;
 }
 
+function drawReferencePreview(file) {
+  const preview = $("referencePreview");
+  const previewCtx = preview.getContext("2d", { alpha: false });
+  previewCtx.fillStyle = "#e5e7df";
+  previewCtx.fillRect(0, 0, preview.width, preview.height);
+  if (!file) return;
+  const img = new Image();
+  img.onload = () => {
+    const scale = Math.min(preview.width / img.width, preview.height / img.height);
+    const w = img.width * scale, h = img.height * scale;
+    previewCtx.fillRect(0, 0, preview.width, preview.height);
+    previewCtx.drawImage(img, (preview.width - w) / 2, (preview.height - h) / 2, w, h);
+    URL.revokeObjectURL(img.src);
+  };
+  img.src = URL.createObjectURL(file);
+}
+
 async function connect() {
   if (ws) ws.close();
   const firstFrame = await readFirstFrame();
@@ -109,9 +133,9 @@ async function connect() {
   });
   ws = new WebSocket($("serverUrl").value);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { ws.send(pack(init)); setStatus("Live", "live"); };
-  ws.onclose = () => { ws = null; setStatus("Closed"); };
-  ws.onerror = () => setStatus("Socket error", "error");
+  ws.onopen = () => { ws.send(pack(init)); setStatus("Live", "live"); addHistory("session started"); };
+  ws.onclose = () => { ws = null; setStatus("Closed"); addHistory("session closed"); };
+  ws.onerror = () => { setStatus("Socket error", "error"); addHistory("socket error"); };
   ws.onmessage = (event) => receive(event.data);
 }
 
@@ -120,6 +144,7 @@ function receive(data) {
     pendingHeader = unpack(new Uint8Array(data));
     if (pendingHeader.type === "error") {
       setStatus(pendingHeader.content || "Server error", "error");
+      addHistory(pendingHeader.content || "server error");
       pendingHeader = null;
     }
     return;
@@ -136,6 +161,7 @@ function receive(data) {
 function sendEvent(kind, payload) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(pack({ type: "event", kind, payload }));
+  addHistory(`${kind} event sent`);
 }
 
 function repeatActions(actions) {
@@ -149,6 +175,14 @@ function applyPreset(preset) {
   $("fps").value = preset.fps;
   sendEvent("prompt", preset.prompt);
   sendEvent("camera_actions", repeatActions(preset.actions));
+  addHistory(`preset ${preset.name}`);
+}
+
+function enhancePrompt() {
+  const suffix = " high-fidelity temporal consistency, stable camera geometry, natural motion, clean lighting.";
+  if (!$("prompt").value.includes("temporal consistency")) {
+    $("prompt").value = `${$("prompt").value.trim()},${suffix}`;
+  }
 }
 
 function compact(obj) {
@@ -172,6 +206,7 @@ function pack(value) {
   const bytes = (arr) => out.push(...arr);
   const str = (s) => new TextEncoder().encode(s);
   const u16 = (n) => [(n >> 8) & 255, n & 255];
+  const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
   const write = (v) => {
     if (v === null) return out.push(0xc0);
     if (typeof v === "boolean") return out.push(v ? 0xc3 : 0xc2);
@@ -190,7 +225,7 @@ function pack(value) {
       return bytes(b);
     }
     if (v instanceof Uint8Array) {
-      if (v.length < 256) bytes([0xc4, v.length]); else bytes([0xc5, ...u16(v.length)]);
+      if (v.length < 256) bytes([0xc4, v.length]); else if (v.length < 65536) bytes([0xc5, ...u16(v.length)]); else bytes([0xc6, ...u32(v.length)]);
       return bytes(v);
     }
     if (Array.isArray(v)) {
@@ -239,6 +274,8 @@ requestAnimationFrame(renderLoop);
 $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => ws && ws.close();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
+$("enhanceBtn").onclick = enhancePrompt;
+$("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
 document.querySelectorAll("[data-action]").forEach((btn) => {
   btn.onclick = () => sendEvent("camera_actions", repeatActions([[btn.dataset.action]]));
 });

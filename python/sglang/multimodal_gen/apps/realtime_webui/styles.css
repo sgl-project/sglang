@@ -60,6 +60,26 @@ button, input, textarea { font: inherit; }
 
 .brand strong { font-size: 18px; font-weight: 650; }
 
+.tabs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-bottom: 18px;
+}
+
+.tabs button {
+  min-height: 30px;
+  padding: 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tabs .active {
+  color: var(--panel);
+  background: var(--green);
+  border-color: var(--green);
+}
+
 label {
   display: grid;
   gap: 7px;
@@ -135,11 +155,53 @@ canvas {
 }
 
 .section-title {
-  margin: 2px 0 12px;
+  margin: 18px 0 12px;
   color: var(--muted);
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
+}
+
+.reference-upload {
+  margin-top: 0;
+}
+
+.reference-upload input {
+  border: 1px dashed var(--line);
+}
+
+#referencePreview {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #e5e7df;
+}
+
+.spec-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.spec-grid span {
+  display: grid;
+  gap: 2px;
+  min-height: 54px;
+  align-content: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fffdf7;
+  padding: 9px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.spec-grid b {
+  color: var(--ink);
+  font-size: 14px;
 }
 
 .preset-list { display: grid; gap: 9px; margin-bottom: 18px; }
@@ -162,8 +224,10 @@ canvas {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 8px;
+  margin-bottom: 12px;
 }
 
+.camera-pad span { min-height: 42px; }
 .camera-pad button { min-height: 42px; font-size: 12px; }
 .telemetry { display: grid; gap: 8px; margin-top: 18px; }
 .telemetry span {
@@ -175,6 +239,22 @@ canvas {
   font-size: 12px;
 }
 .telemetry b { color: var(--ink); font-weight: 650; }
+
+.history-list {
+  display: grid;
+  gap: 7px;
+  max-height: 150px;
+  overflow: auto;
+}
+
+.history-list span {
+  display: block;
+  border-left: 3px solid var(--blue);
+  background: #fffdf7;
+  padding: 8px 9px;
+  color: var(--muted);
+  font-size: 12px;
+}
 
 @media (max-width: 980px) {
   .shell { grid-template-columns: 1fr; }
