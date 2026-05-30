@@ -2028,8 +2028,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_embeds_tensor = None
             replace_positions_tensor = None
 
-        self.prefill_input_ids_cpu = pinned_input_ids
         self.input_ids = None
+        self.prefill_input_ids_cpu = pinned_input_ids
         self.req_pool_indices = req_pool_indices_tensor
         self.req_pool_indices_cpu = req_pool_indices_cpu
         self.orig_seq_lens = orig_seq_lens_tensor
@@ -2229,11 +2229,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.set_extend_input_len(1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
+        self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
-        self.input_ids = None
         self.out_cache_loc = out_cache_loc
 
         # For overlap scheduler, the output_ids has one step delay
@@ -2443,9 +2443,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
-            # batch.input_ids is None at this point (relayed via future_map);
-            # build the per-req latest token from Req.output_ids instead.
-            delayed_output_ids = torch.tensor(
+            # Under overlap batch.input_ids is just a placeholder here -- the
+            # real token is relayed via future_map and resolved at forward
+            # entry. So take the last output token from Req directly
+            # (origin_input_ids[-1] on the first decode, before any output).
+            latest_output_ids = torch.tensor(
                 [
                     (
                         req.output_ids[-1]
@@ -2458,7 +2460,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
             self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                delayed_output_ids
+                latest_output_ids
             )
 
         # input_ids is set at end of previous run_batch (placeholder for
@@ -2617,8 +2619,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
-        # If either side has staged via relay (input_ids=None), drop direct
-        # tensor and let resolve_forward_inputs gather the merged req_pool_indices.
+        # Cat only when both sides hold a real token tensor; otherwise drop to
+        # None and let resolve_forward_inputs rebuild from the merged
+        # req_pool_indices. Mismatch arises e.g. with spec_v1, which keeps its
+        # tensor while a relay-staged side is None -- there the worker rebuilds.
         if self.input_ids is not None and other.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
         else:
