@@ -339,17 +339,12 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        if num_fused_shared_experts > 0:
-            from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.server_args import get_global_server_args
 
-            try:
-                self.enable_deepep_waterfill = (
-                    get_global_server_args().enable_deepep_waterfill
-                )
-            except ValueError:
-                self.enable_deepep_waterfill = False
-        else:
-            self.enable_deepep_waterfill = False
+        self.enable_deepep_waterfill = (
+            num_fused_shared_experts > 0
+            and get_global_server_args().enable_deepep_waterfill
+        )
 
         self.deepep_waterfill_balancer = None
         if self.enable_deepep_waterfill:
@@ -615,6 +610,20 @@ def fused_topk_cpu(
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
 ):
+    # TODO: add c++ kernel for cpu
+    # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
+    # correction bias. Fall back to the torch-native impl for the rest
+    # (e.g. MiniMax sets both correction_bias and scoring_func).
+    if correction_bias is not None or scoring_func != "softmax":
+        return fused_topk_torch_native(
+            hidden_states,
+            gating_output,
+            topk,
+            renormalize,
+            correction_bias=correction_bias,
+            scoring_func=scoring_func,
+        )
+
     topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
         hidden_states=hidden_states,
         gating_output=gating_output,
@@ -903,20 +912,46 @@ def biased_topk_jit_kernel_impl(
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
+    if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
+        from aiter import topk_gating
 
-    topk_weights, topk_ids = moe_fused_gate(
-        gating_output,
-        correction_bias,
-        topk=topk,
-        scoring_func=scoring_func,
-        num_fused_shared_experts=num_fused_shared_experts,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-    )
-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    return topk_weights, topk_ids
+        num_tokens = gating_output.shape[0]
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+
+        topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias,
+            renormalize,
+            routed_scaling_factor,
+            score_func="sqrtsoftplus",
+        )
+
+        return topk_weights, topk_ids
+
+    else:
+        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
+
+        topk_weights, topk_ids = moe_fused_gate(
+            gating_output,
+            correction_bias,
+            topk=topk,
+            scoring_func=scoring_func,
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+        topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(
+            torch.int32
+        )
+        return topk_weights, topk_ids
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
