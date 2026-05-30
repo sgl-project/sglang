@@ -385,3 +385,15 @@ def test_raw_rgb_frame_batches_preserve_frame_bytes_and_metadata():
         [5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19]
     )
     assert RAW_RGB_CONTENT_TYPE == "application/x-raw-rgb"
+
+
+def test_output_batch_uses_raw_frame_transport_names():
+    output_batch = OutputBatch(
+        raw_frame_batches=[[b"rgb"]],
+        raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+        raw_frame_metadata={"format": "rgb24"},
+    )
+
+    assert output_batch.raw_frame_batches == [[b"rgb"]]
+    assert output_batch.raw_frame_content_type == RAW_RGB_CONTENT_TYPE
+    assert output_batch.raw_frame_metadata == {"format": "rgb24"}

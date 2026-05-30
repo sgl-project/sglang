@@ -361,7 +361,7 @@ async def process_generation_batch(
         if (
             result.output is None
             and result.output_file_paths is None
-            and result.encoded_frame_batches is None
+            and result.raw_frame_batches is None
         ):
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
