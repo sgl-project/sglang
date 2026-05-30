@@ -9587,5 +9587,53 @@ class TestCompactScaleSidecarConsumers(unittest.TestCase):
         self.assertIs(fake._ds_deferred_bind_args, sentinel)  # early return, untouched
 
 
+class TestServeDoubleSparsityLauncherSignatureDtype(unittest.TestCase):
+    """serve_double_sparsity.sh must thread SIGNATURE_DTYPE into the DS config so
+    a cluster run can actually select the compact int8 table (default stays
+    fp16). Without this the documented `bash serve_double_sparsity.sh` boots the
+    full-precision table and any compact-path hardware claim is invalid."""
+
+    def _launcher_config(self, env_extra):
+        import subprocess, tempfile, os, json
+        repo = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "../../../../../")
+        )
+        script = os.path.join(repo, "development", "serve_double_sparsity.sh")
+        with tempfile.TemporaryDirectory() as d:
+            stub = os.path.join(d, "python3")
+            with open(stub, "w") as fh:
+                fh.write(
+                    "#!/usr/bin/env bash\n"
+                    'args=("$@")\n'
+                    'for i in "${!args[@]}"; do\n'
+                    '  if [[ "${args[$i]}" == "--double-sparsity-config" ]]; then\n'
+                    '    echo "DSCONFIG=${args[$((i+1))]}"\n'
+                    "  fi\n"
+                    "done\n"
+                )
+            os.chmod(stub, 0o755)
+            env = dict(os.environ)
+            env["PATH"] = d + os.pathsep + env.get("PATH", "")
+            env["LOG_DIR"] = d
+            env.update(env_extra)
+            out = subprocess.run(
+                ["bash", script], env=env, capture_output=True, text=True, timeout=60
+            )
+            for line in (out.stdout + out.stderr).splitlines():
+                if line.startswith("DSCONFIG="):
+                    return json.loads(line[len("DSCONFIG="):])
+            self.fail(f"no DS config captured; stdout={out.stdout!r} stderr={out.stderr!r}")
+
+    def test_default_signature_dtype_is_fp16(self):
+        self.assertEqual(self._launcher_config({}).get("signature_dtype"), "fp16")
+
+    def test_int8_signature_dtype_is_selected(self):
+        import json
+        cfg = self._launcher_config({"SIGNATURE_DTYPE": "int8"})
+        self.assertEqual(cfg.get("signature_dtype"), "int8")
+        # The config must still parse as a valid DoubleSparsityConfig.
+        self.assertEqual(parse_double_sparsity_config(json.dumps(cfg)).signature_dtype, "int8")
+
+
 if __name__ == "__main__":
     unittest.main()

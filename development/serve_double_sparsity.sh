@@ -40,6 +40,11 @@ PAGE_SIZE="${PAGE_SIZE:-64}"
 CHANNEL_MASK_PATH="${CHANNEL_MASK_PATH:-/models/dsv32-fp8-channel-mask.safetensors}"
 TOP_K="${TOP_K:-2048}"
 DEVICE_BUFFER_SIZE="${DEVICE_BUFFER_SIZE:-4096}"
+# Per-slot label storage precision. "fp16" (default) is full precision; "int8"
+# selects the compact path (int8 signatures + per-vector fp16 scales, ~0.5625x
+# bytes). The compact table only boots when this is set to int8 — running the
+# script as-is validates the fp16 table.
+SIGNATURE_DTYPE="${SIGNATURE_DTYPE:-fp16}"
 # Double Sparsity allocates a per-rank TokenLabelTable (sized from the KV pool,
 # tens of GiB on V3.2) AFTER the static weight+KV pool is reserved, and also
 # needs headroom for the regular CUDA-graph capture set plus per-request decode
@@ -50,8 +55,8 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.6}"
 LOG_DIR="${LOG_DIR:-$(pwd)/development/logs}"
 mkdir -p "${LOG_DIR}"
 
-DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s}' \
-  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}")
+DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s"}' \
+  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}")
 
 # Radix cache: DS serves radix-off by default. To serve radix-on, set
 # RADIX_FIXTURE_ARTIFACT to a fixtures-passed state file (written by
@@ -82,6 +87,7 @@ echo "    page_size        = ${PAGE_SIZE}"
 echo "    channel_mask     = ${CHANNEL_MASK_PATH}"
 echo "    top_k            = ${TOP_K}"
 echo "    device_buffer    = ${DEVICE_BUFFER_SIZE}"
+echo "    signature_dtype  = ${SIGNATURE_DTYPE}"
 echo "    radix_cache      = $([[ -n "${RADIX_FIXTURE_ARTIFACT}" ]] && echo "ENABLED (fixture artifact: ${RADIX_FIXTURE_ARTIFACT})" || echo "disabled (no fixture artifact)")"
 echo "    log              = ${LOG_FILE}"
 
