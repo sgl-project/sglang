@@ -60,6 +60,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.causal_attention_cache import (
+    CausalSelfAttentionKVCache,
+    CrossAttentionKVCache,
+)
 from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
     CausalWanSelfAttention,
     CausalWanTransformer3DModel,
@@ -173,7 +177,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         v: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, ...],
         block_mask,
-        kv_cache: dict | None = None,
+        kv_cache: CausalSelfAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
         frame_seq_length: int | None = None,
@@ -238,100 +242,26 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
         frame_seqlen = frame_seq_length or roped_query.shape[1]
-        current_end = current_start + roped_query.shape[1]
         sink_tokens = self.sink_size * frame_seqlen
-        kv_cache_size = kv_cache["k"].shape[1]
-        num_new_tokens = roped_query.shape[1]
-        global_end_index = kv_cache.get("global_end_index_int")
-        local_end_index_prev = kv_cache.get("local_end_index_int")
-        if global_end_index is None or local_end_index_prev is None:
-            global_end_index = int(kv_cache["global_end_index"].item())
-            local_end_index_prev = int(kv_cache["local_end_index"].item())
-            kv_cache["global_end_index_int"] = global_end_index
-            kv_cache["local_end_index_int"] = local_end_index_prev
-        window_start = global_end_index - local_end_index_prev
-
-        if current_end <= global_end_index:
-            local_start_index = current_start - window_start
-            local_end_index = local_start_index + num_new_tokens
-            visible_local_end = local_end_index_prev
-            visible_global_end = global_end_index
-        else:
-            appended_tokens = current_end - global_end_index
-            if local_end_index_prev + appended_tokens > kv_cache_size:
-                num_evicted_tokens = (
-                    local_end_index_prev + appended_tokens - kv_cache_size
-                )
-                num_rolled_tokens = max(
-                    0,
-                    local_end_index_prev - num_evicted_tokens - sink_tokens,
-                )
-                if num_rolled_tokens > 0:
-                    kv_cache["k"][
-                        :, sink_tokens : sink_tokens + num_rolled_tokens
-                    ] = kv_cache["k"][
-                        :,
-                        sink_tokens
-                        + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                    kv_cache["v"][
-                        :, sink_tokens : sink_tokens + num_rolled_tokens
-                    ] = kv_cache["v"][
-                        :,
-                        sink_tokens
-                        + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                local_end_index = (
-                    local_end_index_prev + appended_tokens - num_evicted_tokens
-                )
-            else:
-                local_end_index = local_end_index_prev + appended_tokens
-            local_start_index = local_end_index - num_new_tokens
-            visible_local_end = local_end_index
-            visible_global_end = current_end
-
-        if (
-            local_start_index < 0
-            or local_end_index > kv_cache_size
-            or local_end_index - local_start_index != num_new_tokens
-        ):
-            raise RuntimeError(
-                "Invalid LingBot KV cache write range: "
-                f"local=[{local_start_index}, {local_end_index}), "
-                f"global_end={global_end_index}, "
-                f"prev_local_end={local_end_index_prev}, "
-                f"kv_cache_size={kv_cache_size}, "
-                f"num_new_tokens={num_new_tokens}, "
-                f"current_start={current_start}, current_end={current_end}"
-            )
-
-        kv_cache["k"] = kv_cache["k"].detach()
-        kv_cache["v"] = kv_cache["v"].detach()
-        kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-        kv_cache["v"][:, local_start_index:local_end_index] = v
-
-        attn_start_index = (
-            0
-            if self.local_attn_size == -1
-            else max(0, visible_local_end - self.max_attention_size)
+        cache_view = kv_cache.update_and_get_attention_kv(
+            key=roped_key,
+            value=v,
+            current_start=current_start,
+            sink_tokens=sink_tokens,
+            attention_window_size=(
+                None if self.local_attn_size == -1 else self.max_attention_size
+            ),
+            debug_name="LingBot KV cache",
         )
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         x = attn_impl(
             roped_query,
-            kv_cache["k"][:, attn_start_index:visible_local_end],
-            kv_cache["v"][:, attn_start_index:visible_local_end],
+            cache_view.k,
+            cache_view.v,
         )
         if sequence_shard_enabled:
             assert seq_splits is not None
             x = _usp_output_all_to_all_varlen(x, seq_splits, head_dim=2)
-        kv_cache["global_end_index_int"] = visible_global_end
-        kv_cache["local_end_index_int"] = visible_local_end
-        kv_cache["global_end_index"].fill_(visible_global_end)
-        kv_cache["local_end_index"].fill_(visible_local_end)
         return x
 
 
@@ -962,7 +892,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        crossattn_cache: dict | None,
+        crossattn_cache: CrossAttentionKVCache | None,
     ) -> torch.Tensor:
         attn2 = self.attn2
         q, _ = attn2.to_q(hidden_states)
@@ -972,9 +902,9 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             q = attn2.norm_q(q)
         q = q.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
 
-        if crossattn_cache is not None and crossattn_cache.get("is_init", False):
-            k = crossattn_cache["k"]
-            v = crossattn_cache["v"]
+        if crossattn_cache is not None and crossattn_cache.is_init:
+            k = crossattn_cache.k
+            v = crossattn_cache.v
         else:
             k, _ = attn2.to_k(encoder_hidden_states)
             if attn2.tp_rmsnorm:
@@ -987,9 +917,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             v = v.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
 
             if crossattn_cache is not None:
-                crossattn_cache["k"] = k.detach()
-                crossattn_cache["v"] = v.detach()
-                crossattn_cache["is_init"] = True
+                crossattn_cache.store(k, v)
 
         hidden_states = attn2.attn(q, k, v)
         hidden_states = hidden_states.flatten(2)
@@ -1003,8 +931,8 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, ...],
         block_mask,
-        kv_cache: dict | None = None,
-        crossattn_cache: dict | None = None,
+        kv_cache: CausalSelfAttentionKVCache | None = None,
+        crossattn_cache: CrossAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
         c2ws_plucker_emb: torch.Tensor | None = None,
@@ -1012,7 +940,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         num_frames = temb.shape[1]
-        frame_seqlen = hidden_states.shape[1] // num_frames
+        seqlen_per_frame = hidden_states.shape[1] // num_frames
         orig_dtype = hidden_states.dtype
         e = self.scale_shift_table + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
@@ -1021,7 +949,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         norm_hidden_states = (
             (
                 self.norm1(hidden_states.float()).unflatten(
-                    dim=1, sizes=(num_frames, frame_seqlen)
+                    dim=1, sizes=(num_frames, seqlen_per_frame)
                 )
                 * (1 + scale_msa)
                 + shift_msa
@@ -1045,7 +973,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             kv_cache,
             current_start,
             cache_start,
-            frame_seq_length=frame_seqlen,
+            frame_seq_length=seqlen_per_frame,
         )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -1179,8 +1107,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.LongTensor,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
-        kv_cache: dict = None,
-        crossattn_cache: dict = None,
+        kv_cache: list[CausalSelfAttentionKVCache] | None = None,
+        crossattn_cache: list[CrossAttentionKVCache] | None = None,
         current_start: int = 0,
         cache_start: int = 0,
         start_frame: int = 0,
