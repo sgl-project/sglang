@@ -141,14 +141,11 @@ class EagleDraftInputV2Mixin:
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+
         # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
         # barrier has chained to the prev forward -> host stalls a full forward.
-        cur_kv_lens_device = cur_kv_lens_cpu.to(
-            device=batch.device, non_blocking=True
-        )
-        nxt_kv_lens_device = nxt_kv_lens_cpu.to(
-            device=batch.device, non_blocking=True
-        )
+        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)

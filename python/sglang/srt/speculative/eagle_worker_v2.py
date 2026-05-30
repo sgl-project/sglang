@@ -850,13 +850,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
-            # Record a CUDA event after draft() GPU work is dispatched.
-            # This event will be waited on by plan_stream in verify()
-            # to ensure draft CUDA graph kernels finish before plan_stream
-            # begins metadata preparation.
-            if self.plan_stream:
-                self._draft_done_event = torch.get_device_module(self.device).Event()
-                self._draft_done_event.record()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
@@ -1025,12 +1018,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            # Wait for the draft CUDA graph to finish before plan_stream
-            # begins its work. Using an event is more targeted than
-            # wait_stream(main_stream) — it only waits for draft GPU
-            # work, not all queued main_stream operations.
-            if self.plan_stream and hasattr(self, "_draft_done_event"):
-                self.plan_stream.wait_event(self._draft_done_event)
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
