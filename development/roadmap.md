@@ -200,8 +200,12 @@ These are not tied to one client requirement but must land before "shippable to 
 - [ ] **Calibration / mask provenance for re-runs and other models.** The mask is V3.2-specific and
   carries no provenance field (caught only indirectly via AC-1.1). Add a provenance field or a
   documented re-calibration recipe so the next model isn't a from-scratch archaeology dig.
-- [ ] **Multi-node / TP scaling story.** All Loop-5 serving was single-node TP=8 (node 1 used only for
-  the cross-node AC-12). Document/validate whether the client deployment is single- or multi-node.
+- [ ] **Multi-node / TP scaling story (deferred downstream requirement — dedicated future loop).**
+  DECIDED in Loop 6 (DEC-5): the client deliverable is validated **single-node TP=8 only**; **multi-node
+  TP scaling is deferred to a dedicated future loop** and tracked here as a downstream requirement. All
+  Loop-5 serving was single-node TP=8 (node 1 used only for the cross-node AC-12). That future loop
+  validates DS multi-node (e.g. TP=8 × N replicas behind the router/SMG, or a larger TP world size)
+  against the **same unchanged** client SLO — the SLO numbers do not change across topologies.
 - [ ] **Comparator per-side `mem_fraction_static` check** is in (Round 13); keep it green when 4.1 moves
   the mem fraction.
 
@@ -278,7 +282,9 @@ From `CLIENT_SLOS.md` "Downstream requirements after client deliverables."
   opt-in knob while DSA is the default that meets the SLO? (DSA already meets both SLOs trivially.)
 - [ ] **DEC (TTFT target source):** confirm the client SLO is **absolute P99 TTFT < 22 s** at the
   client workload (not a DS-vs-DSA ratio) — and re-validate at full `NUM_PROMPTS=320` (§4.1).
-- [ ] **DEC (deployment topology):** single-node TP=8 vs multi-node for the client deliverable (§5).
+- [x] **DEC (deployment topology) — RESOLVED (Loop 6, DEC-5):** the client deliverable is validated
+  **single-node TP=8** for this loop; **multi-node TP scaling is deferred to a dedicated future loop**,
+  tracked as a downstream requirement in §5. The SLO numbers are unchanged across topologies.
 - [ ] **DEC (AC-12 long-context disposition):** the DS-fair re-scope is DECIDED for Loop 5; confirm
   whether the *original* 4K/16K/64K parity is a hard client requirement (it is **not** in the
   immediate SLO — only in the deferred 128k item).
