@@ -10,7 +10,6 @@ state through it.
 from __future__ import annotations
 
 import logging
-import threading
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -125,19 +124,15 @@ def _post_generate_async(
     prompt_len: int,
     max_new_tokens: int,
 ) -> None:
-    """Fire a ``/generate`` request in a fire-and-forget background thread.
+    """Fire a ``/generate`` request fire-and-forget on the shared async loop.
 
     The scheduler must never block waiting for the HTTP response, so the
-    POST runs on its own daemon thread with ``stream=True`` and the body
-    discarded. The request carries the caller-supplied ``rid`` so the
-    proxy can match it on the socket. Token id 1 is BOS for most
-    tokenizers; any valid token works since the harness does not validate
-    decode quality.
+    streamed POST runs as a coroutine on the hook's single background event
+    loop (``ScriptedSchedulerHook.submit_coro``) with the body drained and
+    discarded. The request carries the caller-supplied ``rid`` so the proxy
+    can match it on the socket. Token id 1 is BOS for most tokenizers; any
+    valid token works since the harness does not validate decode quality.
     """
-    # Local import keeps ``requests`` off the production scheduler load
-    # path (this module is imported unconditionally by run_scheduler_process).
-    import requests
-
     url = _generate_url(ctx)
     payload = {
         "input_ids": [1] * prompt_len,
@@ -146,17 +141,13 @@ def _post_generate_async(
         "stream": True,
     }
 
-    def _run() -> None:
+    async def _post() -> None:
         try:
-            with requests.post(url, json=payload, stream=True, timeout=600) as resp:
-                for _ in resp.iter_content(chunk_size=8192):
-                    pass
-        except Exception:  # noqa: BLE001 — fire-and-forget background thread
+            await ctx._scheduler_hook.post_and_drain(url, payload)
+        except Exception:  # noqa: BLE001 — fire-and-forget background coroutine
             logger.exception("scripted_runtime: /generate request rid=%s failed", rid)
 
-    thread = threading.Thread(target=_run, name=f"scripted-generate-{rid}", daemon=True)
-    ctx._http_threads.append(thread)
-    thread.start()
+    ctx._scheduler_hook.submit_coro(_post())
 
 
 def _check_start_req_wishlist_kwargs(

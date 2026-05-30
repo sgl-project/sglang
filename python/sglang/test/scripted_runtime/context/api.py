@@ -17,7 +17,6 @@ the free functions, which take this context as their first argument.
 from __future__ import annotations
 
 import logging
-import threading
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Union
 
 from sglang.test.scripted_runtime.context import (
@@ -60,7 +59,6 @@ class ScriptedContext:
 
         self._req_handles: dict[str, "ScriptedReqHandle"] = {}
         self._req_counter = 0
-        self._http_threads: List[threading.Thread] = []
 
     # ============================================================
     # Request submission.
