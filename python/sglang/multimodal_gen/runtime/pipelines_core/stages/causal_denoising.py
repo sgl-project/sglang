@@ -1,6 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 import torch  # type: ignore
 
@@ -26,6 +28,24 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(slots=True)
+class CausalDMDForwardContext:
+    target_dtype: torch.dtype
+    autocast_enabled: bool
+    device: torch.device
+    scheduler: Any
+    timesteps: torch.Tensor
+    latents: torch.Tensor
+    prompt_embeds: Any
+    image_kwargs: dict[str, Any]
+    pos_cond_kwargs: dict[str, Any]
+    batch_size: int
+    channels: int
+    num_frames: int
+    height: int
+    width: int
 
 
 class CausalDMDDenoisingStage(DenoisingStage):
@@ -74,6 +94,120 @@ class CausalDMDDenoisingStage(DenoisingStage):
         )
         self.frame_seq_length = (h * w) // patch_ratio
         return self.frame_seq_length
+
+    def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
+        assert batch.latents is not None, "latents must be provided"
+        return batch.latents
+
+    def _get_causal_dmd_scheduler(self, batch: Req, server_args: ServerArgs):
+        return get_or_create_request_scheduler(batch, self.scheduler)
+
+    def _prepare_causal_dmd_timesteps(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        scheduler,
+        device: torch.device,
+    ) -> torch.Tensor:
+        timesteps = torch.tensor(
+            server_args.pipeline_config.dmd_denoising_steps, dtype=torch.long
+        ).cpu()
+
+        if server_args.pipeline_config.warp_denoising_step:
+            logger.info("Warping timesteps...")
+            scheduler_timesteps = torch.cat(
+                (scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
+            )
+            timesteps = scheduler_timesteps[1000 - timesteps]
+        timesteps = timesteps.to(device)
+        logger.info("Using timesteps: %s", timesteps)
+        return timesteps
+
+    def _prepare_causal_dmd_image_kwargs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        target_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        return {}
+
+    def _prepare_causal_dmd_pos_cond_kwargs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        target_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        return self.prepare_extra_func_kwargs(
+            self.transformer.forward,
+            {
+                # "encoder_hidden_states_2": batch.clip_embedding_pos,
+                "encoder_attention_mask": batch.prompt_attention_mask,
+            },
+        )
+
+    def _prepare_causal_dmd_prompt_embeds(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        target_dtype: torch.dtype,
+    ):
+        prompt_embeds = batch.prompt_embeds
+        assert torch.isnan(prompt_embeds[0]).sum() == 0
+        return prompt_embeds
+
+    def _prepare_causal_dmd_forward_context(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> CausalDMDForwardContext:
+        target_dtype = self._target_dtype()
+        autocast_enabled = self._autocast_enabled(target_dtype, server_args)
+        device = get_local_torch_device()
+        scheduler = self._get_causal_dmd_scheduler(batch, server_args)
+        latents = self._get_causal_dmd_latents(batch)
+        b, c, t, h, w = latents.shape
+        self._prepare_frame_seq_length(h, w)
+        timesteps = self._prepare_causal_dmd_timesteps(
+            batch,
+            server_args,
+            scheduler,
+            device,
+        )
+        image_kwargs = self._prepare_causal_dmd_image_kwargs(
+            batch,
+            server_args,
+            target_dtype,
+        )
+        pos_cond_kwargs = self._prepare_causal_dmd_pos_cond_kwargs(
+            batch,
+            server_args,
+            target_dtype,
+        )
+
+        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
+            self.prepare_sta_param(batch, server_args)
+
+        prompt_embeds = self._prepare_causal_dmd_prompt_embeds(
+            batch,
+            server_args,
+            target_dtype,
+        )
+        return CausalDMDForwardContext(
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+            device=device,
+            scheduler=scheduler,
+            timesteps=timesteps,
+            latents=latents,
+            prompt_embeds=prompt_embeds,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            batch_size=b,
+            channels=c,
+            num_frames=t,
+            height=h,
+            width=w,
+        )
 
     def _build_causal_attn_metadata(
         self,
@@ -504,50 +638,20 @@ class CausalDMDDenoisingStage(DenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        target_dtype = self._target_dtype()
-        autocast_enabled = self._autocast_enabled(target_dtype, server_args)
-        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
-        device = get_local_torch_device()
+        ctx = self._prepare_causal_dmd_forward_context(batch, server_args)
+        target_dtype = ctx.target_dtype
+        autocast_enabled = ctx.autocast_enabled
+        scheduler = ctx.scheduler
+        device = ctx.device
+        timesteps = ctx.timesteps
+        image_kwargs = ctx.image_kwargs
+        pos_cond_kwargs = ctx.pos_cond_kwargs
+        latents = ctx.latents
+        prompt_embeds = ctx.prompt_embeds
+        t, h, w = ctx.num_frames, ctx.height, ctx.width
 
-        self._prepare_frame_seq_length(batch.latents.shape[-2], batch.latents.shape[-1])
         # TODO(will): make this a parameter once we add i2v support
         independent_first_frame = self.transformer.independent_first_frame
-
-        # Timesteps for DMD
-        timesteps = torch.tensor(
-            server_args.pipeline_config.dmd_denoising_steps, dtype=torch.long
-        ).cpu()
-
-        if server_args.pipeline_config.warp_denoising_step:
-            logger.info("Warping timesteps...")
-            scheduler_timesteps = torch.cat(
-                (scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
-            )
-            timesteps = scheduler_timesteps[1000 - timesteps]
-        timesteps = timesteps.to(device)
-        logger.info("Using timesteps: %s", timesteps)
-
-        # Image kwargs (kept empty unless caller provides compatible args)
-        image_kwargs: dict = {}
-
-        pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
-            {
-                # "encoder_hidden_states_2": batch.clip_embedding_pos,
-                "encoder_attention_mask": batch.prompt_attention_mask,
-            },
-        )
-
-        # STA
-        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
-            self.prepare_sta_param(batch, server_args)
-
-        # Latents and prompts
-        assert batch.latents is not None, "latents must be provided"
-        latents = batch.latents  # [B, C, T, H, W]
-        b, c, t, h, w = latents.shape
-        prompt_embeds = batch.prompt_embeds
-        assert torch.isnan(prompt_embeds[0]).sum() == 0
 
         # Initialize or reset caches
         if self.kv_cache1 is None:
