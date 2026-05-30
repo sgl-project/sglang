@@ -84,14 +84,15 @@ def _pad_actions_to_chunk(
 def _get_rotation_matrix(axis: str, angle_rad: float) -> np.ndarray:
     def calculate_c_s():
         return np.cos(angle_rad), np.sin(angle_rad)
+
     if axis == "x":
-        c, s = calculate_c_s
+        c, s = calculate_c_s()
         return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
     if axis == "y":
-        c, s = calculate_c_s
+        c, s = calculate_c_s()
         return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
     if axis == "z":
-        c, s = calculate_c_s
+        c, s = calculate_c_s()
         return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
     return np.eye(3)
 
