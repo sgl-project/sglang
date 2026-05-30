@@ -77,6 +77,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )  # type: ignore
         except Exception:
             self.local_attn_size = -1
+        self.sink_size = self.transformer.config.arch_config.sink_size
 
         self._causal_attn_metadata_builder_cls = None
         self._causal_attn_metadata_builder = None
@@ -632,6 +633,12 @@ class CausalDMDDenoisingStage(DenoisingStage):
             return self.local_attn_size * self.num_token_per_frame
         return self.num_token_per_frame * self.sliding_window_num_frames
 
+    def _get_causal_sink_tokens(self) -> int:
+        return self.sink_size * self.num_token_per_frame
+
+    def _get_causal_attention_window_size(self, kv_cache_size: int) -> int:
+        return kv_cache_size
+
     def _allocate_causal_kv_cache(
         self,
         *,
@@ -642,9 +649,13 @@ class CausalDMDDenoisingStage(DenoisingStage):
         dtype: torch.dtype,
         device,
         use_int_indices: bool = False,
+        sink_tokens: int = 0,
+        attention_window_size: int | None = None,
     ) -> list[CausalSelfAttentionKVCache]:
         causal_kv_cache = []
         int_index = 0 if use_int_indices else None
+        if attention_window_size is None:
+            attention_window_size = kv_cache_size
         for _ in range(self.num_transformer_blocks):
             causal_kv_cache.append(
                 CausalSelfAttentionKVCache(
@@ -676,6 +687,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     ),
                     global_end_index_int=int_index,
                     local_end_index_int=int_index,
+                    cache_size=kv_cache_size,
+                    sink_tokens=sink_tokens,
+                    attention_window_size=attention_window_size,
                 )
             )
         return causal_kv_cache
@@ -850,13 +864,18 @@ class CausalDMDDenoisingStage(DenoisingStage):
         """
         num_attention_heads = self.transformer.num_attention_heads
         attention_head_dim = self.transformer.attention_head_dim
+        kv_cache_size = self._get_causal_kv_cache_size()
         self.causal_kv_cache = self._allocate_causal_kv_cache(
             batch_size=batch_size,
-            kv_cache_size=self._get_causal_kv_cache_size(),
+            kv_cache_size=kv_cache_size,
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             dtype=dtype,
             device=device,
+            sink_tokens=self._get_causal_sink_tokens(),
+            attention_window_size=self._get_causal_attention_window_size(
+                kv_cache_size
+            ),
         )
 
     def _initialize_crossattn_cache(

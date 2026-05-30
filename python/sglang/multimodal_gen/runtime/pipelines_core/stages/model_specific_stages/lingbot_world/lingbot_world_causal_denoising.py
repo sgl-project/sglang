@@ -113,6 +113,10 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             dtype=dtype,
             device=device,
             use_int_indices=True,
+            sink_tokens=self._get_causal_sink_tokens(),
+            attention_window_size=self._get_causal_attention_window_size(
+                kv_cache_size
+            ),
         )
 
     def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:

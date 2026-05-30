@@ -84,9 +84,6 @@ class CausalWanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
-        self.max_attention_size = (
-            32760 if local_attn_size == -1 else local_attn_size * 1560
-        )
 
         # Scaled dot product attention
         self.attn = LocalAttention(
@@ -120,9 +117,6 @@ class CausalWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        if cache_start is None:
-            cache_start = current_start
-
         cos, sin = freqs_cis
         roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
         roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
@@ -173,14 +167,10 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            frame_seqlen = q.shape[1]
-            sink_tokens = self.sink_size * frame_seqlen
             cache_view = kv_cache.update_and_get_attention_kv(
                 key=roped_key,
                 value=v,
                 current_chunk_start=current_start,
-                sink_tokens=sink_tokens,
-                attention_window_size=self.max_attention_size,
                 debug_name="CausalWan KV cache",
             )
             x = self.attn(

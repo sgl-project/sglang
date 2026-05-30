@@ -180,11 +180,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         kv_cache: CausalSelfAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
-        frame_seq_length: int | None = None,
     ):
-        if cache_start is None:
-            cache_start = current_start
-
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
         if _is_cuda and q.dim() == 4 and q.shape == k.shape:
@@ -241,16 +237,10 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             qkv = _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
-        frame_seqlen = frame_seq_length or roped_query.shape[1]
-        sink_tokens = self.sink_size * frame_seqlen
         cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
             current_chunk_start=current_start,
-            sink_tokens=sink_tokens,
-            attention_window_size=(
-                None if self.local_attn_size == -1 else self.max_attention_size
-            ),
             debug_name="LingBot KV cache",
         )
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
@@ -973,7 +963,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             kv_cache,
             current_start,
             cache_start,
-            frame_seq_length=seqlen_per_frame,
         )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
