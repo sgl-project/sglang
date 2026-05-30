@@ -412,7 +412,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>22ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen35-397B-a17b-3_5k-1_5k-22ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen35-397b-a17b-3_5k-1_5k-22ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
 </tbody>
 </table>
@@ -631,7 +631,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen35-397B-a17b-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen35-397b-a17b-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
 </tbody>
 </table>
@@ -4850,5 +4850,5 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 176 --random-output-len 1500 --random-input-len 3500 --num-prompts 352
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 352 --random-output-len 1500 --random-input-len 3500 --num-prompts 1408
 ```
