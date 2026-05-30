@@ -107,6 +107,20 @@ class TranscriptionAdapter(ABC):
         """
         return {}
 
+    @property
+    def realtime_slicing_config(self) -> dict:
+        """Tuning knobs for the WS realtime slicing path. Only consulted
+        when ``supports_chunked_streaming`` is True. Override per adapter
+        when the model's token rate or per-chunk stability differs.
+
+        ``left_overlap_ms``: audio kept across the sliced boundary so
+            dedupe has context; cover the K-token rollback window.
+        ``min_audio_sec``: don't slice below this many seconds of
+            cumulative audio (sliced output diverges from cumulative
+            on short inputs and dedupe over-matches).
+        """
+        return {"left_overlap_ms": 2000, "min_audio_sec": 16.0}
+
     def postprocess_text(self, text: str) -> str:
         """Strip model-specific markers from raw decoded text.
 
