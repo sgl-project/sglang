@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
@@ -26,12 +27,14 @@ def make_config(
     mode: CanaryMode = CanaryMode.RAISE,
     ring_capacity: int = 1024,
     sweep_interval: int = 0,
+    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.NONE,
     enable_write_input_assert: bool = False,
 ) -> CanaryConfig:
     return CanaryConfig(
         mode=mode,
         ring_capacity=ring_capacity,
         sweep_interval=sweep_interval,
+        real_kv_hash_mode=real_kv_hash_mode,
         enable_write_input_assert=enable_write_input_assert,
     )
 

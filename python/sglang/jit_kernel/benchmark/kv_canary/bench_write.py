@@ -13,6 +13,7 @@ from sglang.jit_kernel.benchmark.kv_canary.utils import (
     build_fast_matrix_cases,
     build_full_matrix_cases,
     cases_to_x_vals,
+    make_real_kv_sources,
     naive_slot_copy_fn,
 )
 from sglang.jit_kernel.benchmark.utils import (
@@ -39,6 +40,8 @@ _X_NAMES = [
     "mode",
     "extend_len",
     "pool_kind",
+    "real_kv_kind",
+    "hash_mode",
 ]
 _X_VALS = cases_to_x_vals(
     get_benchmark_range(
@@ -142,6 +145,10 @@ def _build_write_inputs(
     kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
     enable_chain_position_assert = torch.ones(1, dtype=torch.int32, device=device)
 
+    real_kv_sources = make_real_kv_sources(
+        kind=case.real_kv_kind, num_slots=num_slots, device=device
+    )
+
     return dict(
         canary_buf=canary_buf,
         plan=plan,
@@ -155,6 +162,7 @@ def _build_write_inputs(
         slot_run_counter=slot_run_counter,
         kernel_run_counter=kernel_run_counter,
         enable_chain_position_assert=enable_chain_position_assert,
+        real_kv_sources=real_kv_sources,
     )
 
 
@@ -162,6 +170,7 @@ def _build_context(
     *,
     inputs: dict,
     kernel_kind: CanaryLaunchTag,
+    hash_mode: consts.RealKvHashMode,
 ) -> VerifyOrWriteContext:
     return VerifyOrWriteContext(
         canary_buf=inputs["canary_buf"],
@@ -170,6 +179,8 @@ def _build_context(
         violation_write_index=inputs["violation_write_index"],
         slot_run_counter=inputs["slot_run_counter"],
         kernel_run_counter=inputs["kernel_run_counter"],
+        real_kv_sources=inputs["real_kv_sources"],
+        real_kv_hash_mode=hash_mode,
         enable_chain_position_assert=inputs["enable_chain_position_assert"],
     )
 
@@ -194,6 +205,8 @@ def benchmark(
     mode: str,
     extend_len: int,
     pool_kind: str,
+    real_kv_kind: str,
+    hash_mode: str,
     provider: str,
 ) -> Tuple[float, float, float]:
     case = BenchCase(
@@ -203,14 +216,18 @@ def benchmark(
         mode=mode,
         extend_len=extend_len,
         pool_kind=pool_kind,
+        real_kv_kind=real_kv_kind,
+        hash_mode=hash_mode,
     )
     device = torch.device(DEFAULT_DEVICE)
 
     if provider == "canary":
         inputs = _build_write_inputs(case, device=device)
+        hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
         context = _build_context(
             inputs=inputs,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            hash_mode=hash_mode_enum,
         )
 
         def fn() -> None:
@@ -256,6 +273,8 @@ def benchmark_kernel_kind(
         mode="extend",
         extend_len=128,
         pool_kind="full",
+        real_kv_kind="none",
+        hash_mode="none",
     )
     device = torch.device(DEFAULT_DEVICE)
 
@@ -264,9 +283,11 @@ def benchmark_kernel_kind(
         case, device=device, mirror_expected_inputs=enable_write_verify_inputs
     )
     kernel_kind = CanaryLaunchTag[kernel_kind_name]
+    hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
     context = _build_context(
         inputs=inputs,
         kernel_kind=kernel_kind,
+        hash_mode=hash_mode_enum,
     )
 
     def fn() -> None:

@@ -6,7 +6,8 @@ from typing import List, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES
+from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patcher.adapters.mha import attach_mha
@@ -136,6 +137,7 @@ def make_base_config() -> CanaryConfig:
         mode=CanaryMode.RAISE,
         ring_capacity=1024,
         sweep_interval=0,
+        real_kv_hash_mode=consts.RealKvHashMode.NONE,
         enable_write_input_assert=False,
     )
 
@@ -223,6 +225,8 @@ def make_buffer_group(
     device: torch.device = DEFAULT_DEVICE,
     kind: PoolKind = PoolKind.FULL,
     has_v: bool = True,
+    has_real_kv: bool = False,
+    real_kv_source: Optional[RealKvSource] = None,
     swa_index_lut: Optional[torch.Tensor] = None,
     num_slots: int = 4,
     kv_token_id_vs_position_offset: int = 0,
@@ -232,12 +236,25 @@ def make_buffer_group(
             num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
         )
 
+    if has_real_kv:
+        source = real_kv_source or RealKvSource(
+            tensor=torch.zeros(num_slots, 16, dtype=torch.uint8, device=device),
+            page_size=1,
+            num_bytes_per_token=16,
+            read_bytes=16,
+        )
+        real_kv_sources = (source,)
+    else:
+        real_kv_sources = ()
+
     return CanaryBufferGroup(
         kind=kind,
         k_head=_zero(),
         k_tail=_zero(),
         v_head=_zero() if has_v else None,
         v_tail=_zero() if has_v else None,
+        real_kv_sources_k=real_kv_sources,
+        real_kv_sources_v=real_kv_sources if has_v else (),
         swa_index_lut=swa_index_lut,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )

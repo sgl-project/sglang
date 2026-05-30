@@ -6,7 +6,11 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary.verify import (
+    CanaryLaunchTag,
+    RealKvSource,
+)
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
@@ -16,6 +20,10 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     stamp_pair,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    clone_real_kv_sources,
+    make_real_kv_sources,
+)
 from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
     FUZZ_SEEDS_PR,
     run_fuzz_combo,
@@ -44,11 +52,24 @@ class WriteFuzzInputs:
     enable_write_verify_inputs: bool
     expected_input_tokens: torch.Tensor
     expected_input_positions: torch.Tensor
+    real_kv_sources_cuda: tuple[RealKvSource, ...]
+    real_kv_sources_ref: tuple[RealKvSource, ...]
+    real_kv_hash_mode: consts.RealKvHashMode
     ring_capacity: int
 
 
 def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     enable_write_verify_inputs = rng.choice([False, True])
+    hash_mode = rng.choice(
+        [
+            consts.RealKvHashMode.NONE,
+            consts.RealKvHashMode.PARTIAL,
+            consts.RealKvHashMode.ALL,
+        ]
+    )
+    src_count = rng.choice([1, 2, 4])
+    page_size = rng.choice([1, 16])
+    bytes_per = rng.choice([16, 64, 128])
     kernel_kind = rng.choice(list(CanaryLaunchTag))
     ring_capacity = rng.choice([16, 64, 256])
 
@@ -56,6 +77,16 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     per_req_tokens: list[int] = [rng.randint(1, 5) for _ in range(n_reqs)]
     total_tokens = sum(per_req_tokens)
     num_slots = max(total_tokens + 8, 16)
+
+    sources_cuda = make_real_kv_sources(
+        count=src_count,
+        num_bytes_per_token=bytes_per,
+        page_size=page_size,
+        num_slots=num_slots,
+        device=_DEVICE,
+        rng=rng,
+    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     cuda_buf = make_canary_buf(
         num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
@@ -140,6 +171,9 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
         enable_write_verify_inputs=enable_write_verify_inputs,
         expected_input_tokens=expected_input_tokens,
         expected_input_positions=expected_input_positions,
+        real_kv_sources_cuda=sources_cuda,
+        real_kv_sources_ref=sources_ref,
+        real_kv_hash_mode=hash_mode,
         ring_capacity=ring_capacity,
     )
 
@@ -163,6 +197,9 @@ def _run_one(inputs: WriteFuzzInputs) -> None:
         expected_input_positions=inputs.expected_input_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
+        real_kv_sources_cuda=inputs.real_kv_sources_cuda,
+        real_kv_sources_ref=inputs.real_kv_sources_ref,
+        real_kv_hash_mode=inputs.real_kv_hash_mode,
         kernel_kind=inputs.kernel_kind,
         assert_equal=False,
     )
@@ -196,13 +233,14 @@ def _summarize(inputs: WriteFuzzInputs) -> str:
     total = int(inputs.plan_cuda.write_offsets[n_active].item())
     return (
         f"n_reqs={n_active} total_tokens={total} kind={inputs.kernel_kind.name} "
-        f"pseudo={inputs.enable_write_verify_inputs}"
+        f"pseudo={inputs.enable_write_verify_inputs} hash_mode={inputs.real_kv_hash_mode.name} "
+        f"sources={len(inputs.real_kv_sources_cuda)}"
     )
 
 
 @pytest.mark.parametrize("seed", FUZZ_SEEDS_PR)
 def test_write_fuzz_full_combo(seed: int) -> None:
-    """Multi-dim write fuzzer: random pseudo/kernel × N iters, byte-equal."""
+    """Multi-dim write fuzzer: random pseudo/hash/kernel/page/source × N iters, byte-equal."""
     run_fuzz_combo(
         seed,
         draw_fn=_draw_random_write_inputs,

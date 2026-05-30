@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +13,7 @@ from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
+    RealKvSource,
     VerifyOrWriteContext,
     launch_canary_verify_kernel,
 )
@@ -26,6 +28,8 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
+    make_real_kv_source,
+    make_real_kv_sources,
     make_verify_plan,
     make_write_plan,
     make_write_plan_pair,
@@ -38,7 +42,12 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
     run_write_diff,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    clone_real_kv_sources,
     dummy_pseudo_tensors,
+)
+from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+    _hand_fold_all,
+    _hand_fold_partial,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -73,6 +82,10 @@ def _run_write(
     enable_write_verify_inputs: bool = False,
     expected_input_tokens: torch.Tensor | None = None,
     expected_input_positions: torch.Tensor | None = None,
+    real_kv_sources_pair: (
+        tuple[tuple[RealKvSource, ...], tuple[RealKvSource, ...]] | None
+    ) = None,
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.NONE,
     assert_equal: bool = True,
 ) -> tuple[FakeViolationLog, FakeViolationLog]:
     """Shared scaffold: build write plan + pseudo tensors and call ``run_write_diff``.
@@ -117,6 +130,9 @@ def _run_write(
         if expected_input_positions is None:
             expected_input_positions = pseudo_positions
 
+    extra_kwargs: dict = {}
+    if real_kv_sources_pair is not None:
+        extra_kwargs["real_kv_sources_pair"] = real_kv_sources_pair
     return run_write_diff(
         buf_pair=buf_pair,
         plan_pair=plan_pair,
@@ -126,7 +142,9 @@ def _run_write(
         enable_write_verify_inputs=enable_write_verify_inputs,
         expected_input_tokens=expected_input_tokens,
         expected_input_positions=expected_input_positions,
+        real_kv_hash_mode=real_kv_hash_mode,
         assert_equal=assert_equal,
+        **extra_kwargs,
     )
 
 
@@ -135,6 +153,8 @@ class _WriteSingleSlotInput:
     token: int = 42
     position: int = 0
     enable_write_verify_inputs: bool = False
+    real_kv_sources: tuple[RealKvSource, ...] = ()
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.NONE
 
 
 class _RecordingWriteModule:
@@ -146,12 +166,16 @@ class _RecordingWriteModule:
 
 
 def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
+    sources_cuda = case.real_kv_sources
+    sources_ref = clone_real_kv_sources(sources_cuda)
     _run_write(
         buf_pair=_make_default_buf_pair(),
         input_ids=[case.token],
         positions=[case.position],
         out_cache_loc=[0],
         enable_write_verify_inputs=case.enable_write_verify_inputs,
+        real_kv_sources_pair=(sources_cuda, sources_ref),
+        real_kv_hash_mode=case.real_kv_hash_mode,
     )
 
 
@@ -242,6 +266,8 @@ class TestSeedSlot:
                 slot_run_counter=verify_log.slot_run_counter,
                 kernel_run_counter=verify_log.kernel_run_counter,
                 enable_chain_position_assert=verify_log.enable_chain_position_assert,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=verify_plan,
             check_verify_expected_token=True,
@@ -270,11 +296,12 @@ class TestSeedSlot:
 
         tokens = [101, 202, 303, 404, 505]
         positions = [11, 12, 13, 14, 15]
+        real_kv = [0, 0, 0, 0, 0]
         out_cache_loc = [0, 1, 2, 3, 4]
 
         expected_prev_hashes: list[int] = []
         running = predecessor_advance
-        for t, p in zip(tokens, positions):
+        for t, p, r in zip(tokens, positions, real_kv):
             expected_prev_hashes.append(running)
             running = splitmix64_mix3(running, t, p)
 
@@ -305,6 +332,7 @@ class TestSeedSlot:
         seed_slot = 3
         seed_token = 7
         seed_position = 1
+        seed_real_kv = 0
         expected_seed_prev_hash = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         stamp_pair(
             self.buf_pair,
@@ -312,6 +340,7 @@ class TestSeedSlot:
             token=seed_token,
             position=seed_position,
             prev_hash=to_signed_int64(expected_seed_prev_hash),
+            real_kv_hash=to_signed_int64(seed_real_kv),
         )
 
         new_slot = 4
@@ -355,11 +384,12 @@ class TestChain:
         tokens = [101, 202, 303, 404, 505]
         positions = [0, 1, 2, 3, 4]
         out_cache_loc = [0, 1, 2, 3, 4]
+        real_kv_hashes = [0, 0, 0, 0, 0]
 
         # Step 1: compute the expected stored prev_hash sequence in pure Python via splitmix64.
         expected_prev_hashes_u64: list[int] = []
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
-        for token, position in zip(tokens, positions):
+        for token, position, real_kv_hash in zip(tokens, positions, real_kv_hashes):
             expected_prev_hashes_u64.append(running)
             running = splitmix64_mix3(running, token, position)
         expected_prev_hashes_signed = [
@@ -384,6 +414,41 @@ class TestChain:
             assert stored_position == expected_position
             assert stored_prev_hash == expected_prev_signed
             assert stored_real_kv_hash == 0
+
+    def test_chain_advances_with_real_kv_hash_all(self) -> None:
+        """ALL mode + 2 sources + 5-step chain: stored prev_hash recoverable from seed."""
+        cuda_buf = self.buf_pair[0]
+        sources_cuda = make_real_kv_sources(
+            count=2,
+            num_bytes_per_token=16,
+            page_size=1,
+            num_slots=16,
+            device=_DEVICE,
+        )
+        sources_ref = clone_real_kv_sources(sources_cuda)
+
+        slot_indices = [1, 2, 3, 4, 5]
+        tokens = [11, 22, 33, 44, 55]
+        positions = [0, 1, 2, 3, 4]
+
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=tokens,
+            positions=positions,
+            out_cache_loc=slot_indices,
+            real_kv_sources_pair=(sources_cuda, sources_ref),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
+        running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
+        for slot_idx, token, position in zip(slot_indices, tokens, positions):
+            stored_prev_signed, stored_real_kv_hash = read_slot_fields(
+                canary_buf=cuda_buf, slot_idx=slot_idx
+            )[2:]
+            assert stored_prev_signed == to_signed_int64(
+                running
+            ), f"slot {slot_idx}: stored prev_hash != recomputed chain step"
+            running = splitmix64_mix3(running, token, position)
 
 
 class TestMockMode:
@@ -496,6 +561,8 @@ class TestMockMode:
                 slot_run_counter=verify_log.slot_run_counter,
                 kernel_run_counter=verify_log.kernel_run_counter,
                 enable_chain_position_assert=verify_log.enable_chain_position_assert,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=verify_plan,
             check_verify_expected_token=True,
@@ -686,6 +753,265 @@ class TestSlotHandling:
             ), f"slot {slot} from earlier bs=8 run was overwritten by bs=3 run"
 
 
+class TestRealKvHash:
+    def setup_method(self) -> None:
+        self.buf_pair = _make_default_buf_pair()
+
+    def test_real_kv_mode_off_writes_zero(self) -> None:
+        """``consts.RealKvHashMode.NONE`` → ``real_kv_hash`` field is written as 0 regardless of source presence."""
+        sources = make_real_kv_sources(count=2, device=_DEVICE)
+
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=[1, 2],
+            positions=[0, 1],
+            out_cache_loc=[0, 1],
+            real_kv_sources_pair=(sources, sources),
+        )
+
+        _, _, _, real_kv_0 = read_slot_fields(canary_buf=self.buf_pair[0], slot_idx=0)
+        _, _, _, real_kv_1 = read_slot_fields(canary_buf=self.buf_pair[0], slot_idx=1)
+        assert real_kv_0 == 0
+        assert real_kv_1 == 0
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            pytest.param(consts.RealKvHashMode.PARTIAL, id="partial"),
+            pytest.param(consts.RealKvHashMode.ALL, id="all"),
+        ],
+    )
+    def test_real_kv_mode_byte_equal(self, mode: consts.RealKvHashMode) -> None:
+        """PARTIAL / ALL modes both produce CUDA-vs-ref byte-equal write state on a 3-entry chain."""
+        sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
+        sources_ref = clone_real_kv_sources(sources_cuda)
+
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=[10, 20, 30],
+            positions=[0, 1, 2],
+            out_cache_loc=[0, 1, 2],
+            real_kv_sources_pair=(sources_cuda, sources_ref),
+            real_kv_hash_mode=mode,
+        )
+
+    @pytest.mark.parametrize("count", [1, 2, 3, 4])
+    def test_real_kv_sources_fold_1_to_4(self, count: int) -> None:
+        """Folding ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
+        sources_cuda = make_real_kv_sources(count=count, device=_DEVICE)
+        sources_ref = clone_real_kv_sources(sources_cuda)
+
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=[1, 2],
+            positions=[0, 1],
+            out_cache_loc=[0, 1],
+            real_kv_sources_pair=(sources_cuda, sources_ref),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
+    def test_real_kv_source_above_4_raises(self) -> None:
+        """``len(real_kv_sources) > 4`` → host wrapper raises ValueError before launching."""
+        cuda_buf = make_canary_buf(device=_DEVICE)
+        plan = make_write_plan(
+            write_offsets=[0, 1],
+            seed_slot_indices=[-1],
+            num_valid_reqs=1,
+            device=_DEVICE,
+        )
+        input_ids = _int32_tensor([1])
+        positions = _int32_tensor([0])
+        out_cache_loc = _int32_tensor([0])
+        log = FakeViolationLog.allocate(device=_DEVICE)
+        sources = make_real_kv_sources(count=4, device=_DEVICE)
+        extra = make_real_kv_source(device=_DEVICE)
+        too_many = sources + (extra,)
+
+        with pytest.raises(ValueError, match="at most 4 RealKvSource"):
+            launch_canary_write_kernel(
+                context=VerifyOrWriteContext(
+                    canary_buf=cuda_buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=log.ring,
+                    violation_write_index=log.write_index,
+                    slot_run_counter=log.slot_run_counter,
+                    kernel_run_counter=log.kernel_run_counter,
+                    enable_chain_position_assert=log.enable_chain_position_assert,
+                    real_kv_sources=too_many,
+                    real_kv_hash_mode=consts.RealKvHashMode.NONE,
+                ),
+                plan=plan,
+                input_ids=input_ids,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
+                enable_write_input_assert=False,
+                expected_input_tokens=None,
+                expected_input_positions=None,
+            )
+
+    @pytest.mark.parametrize(
+        "mode,fold_fn,expected_hash",
+        [
+            pytest.param(
+                consts.RealKvHashMode.PARTIAL,
+                _hand_fold_partial,
+                0x6041580849E6407D,
+                id="partial",
+            ),
+            pytest.param(
+                consts.RealKvHashMode.ALL,
+                _hand_fold_all,
+                0x6041580849E6407D,
+                id="all",
+            ),
+        ],
+    )
+    def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
+        self,
+        mode: consts.RealKvHashMode,
+        fold_fn: Callable[[bytes], int],
+        expected_hash: int,
+    ) -> None:
+        # Step 1: build one RealKvSource with read_bytes=16 and a fixed byte pattern at slot 0.
+        _PATTERN = bytes(
+            [
+                0x01,
+                0x02,
+                0x04,
+                0x08,
+                0x10,
+                0x20,
+                0x40,
+                0x80,
+                0x81,
+                0x82,
+                0x84,
+                0x88,
+                0x90,
+                0xA0,
+                0xC0,
+                0xFF,
+            ]
+        )
+
+        # Step 2: verify hand-computed fold matches the hex literal.
+        assert fold_fn(_PATTERN) == expected_hash
+
+        source_cuda = make_real_kv_source(
+            num_slots=16,
+            num_bytes_per_token=16,
+            page_size=1,
+            read_bytes=16,
+            device=_DEVICE,
+        )
+        source_cuda.tensor[0, :16] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
+        source_ref = RealKvSource(
+            tensor=source_cuda.tensor.clone(),
+            page_size=source_cuda.page_size,
+            num_bytes_per_token=source_cuda.num_bytes_per_token,
+            read_bytes=source_cuda.read_bytes,
+        )
+
+        # Step 3: run write kernel on slot 0 with the given mode.
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=[7],
+            positions=[0],
+            out_cache_loc=[0],
+            real_kv_sources_pair=((source_cuda,), (source_ref,)),
+            real_kv_hash_mode=mode,
+        )
+
+        # Step 4: assert stored real_kv_hash equals the hand-computed hex literal.
+        _, _, _, stored_real_kv_hash = read_slot_fields(
+            canary_buf=self.buf_pair[0], slot_idx=0
+        )
+        assert stored_real_kv_hash == to_signed_int64(
+            expected_hash
+        ), f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
+
+    def test_paged_real_kv_hash_consistent_across_slots(self) -> None:
+        """page=16: writing two slots inside same page yields independent real_kv_hash per slot."""
+        sources_cuda = make_real_kv_sources(
+            count=1,
+            num_bytes_per_token=16,
+            page_size=16,
+            num_slots=16,
+            device=_DEVICE,
+        )
+        pattern_slot3 = bytes(range(1, 17))
+        pattern_slot7 = bytes(range(101, 117))
+        sources_cuda[0].tensor[0, 3 * 16 : 4 * 16] = torch.tensor(
+            list(pattern_slot3), dtype=torch.uint8, device=_DEVICE
+        )
+        sources_cuda[0].tensor[0, 7 * 16 : 8 * 16] = torch.tensor(
+            list(pattern_slot7), dtype=torch.uint8, device=_DEVICE
+        )
+        sources_ref = clone_real_kv_sources(sources_cuda)
+
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=[42, 84],
+            positions=[0, 1],
+            out_cache_loc=[3, 7],
+            real_kv_sources_pair=(sources_cuda, sources_ref),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
+        slot3 = read_slot_fields(canary_buf=self.buf_pair[0], slot_idx=3)
+        slot7 = read_slot_fields(canary_buf=self.buf_pair[0], slot_idx=7)
+        assert slot3[3] == to_signed_int64(_hand_fold_all(pattern_slot3))
+        assert slot7[3] == to_signed_int64(_hand_fold_all(pattern_slot7))
+        assert slot3[3] != slot7[3]
+
+    def test_multi_source_real_kv_fold_order_matters(self) -> None:
+        """Two sources folded in reverse order yields a different real_kv_hash (fold is ordered)."""
+        sources_a = make_real_kv_sources(
+            count=2, num_bytes_per_token=16, num_slots=8, device=_DEVICE
+        )
+        sources_b = tuple(reversed(sources_a))
+
+        def _run_with(srcs: tuple[RealKvSource, ...]) -> tuple[int, int, int, int]:
+            buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+            plan = make_write_plan(
+                write_offsets=[0, 1],
+                seed_slot_indices=[-1],
+                num_valid_reqs=1,
+                device=_DEVICE,
+            )
+            log = FakeViolationLog.allocate(device=_DEVICE)
+            launch_canary_write_kernel(
+                context=VerifyOrWriteContext(
+                    canary_buf=buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=log.ring,
+                    violation_write_index=log.write_index,
+                    slot_run_counter=log.slot_run_counter,
+                    kernel_run_counter=log.kernel_run_counter,
+                    enable_chain_position_assert=log.enable_chain_position_assert,
+                    real_kv_sources=srcs,
+                    real_kv_hash_mode=consts.RealKvHashMode.ALL,
+                ),
+                plan=plan,
+                input_ids=_int32_tensor([1]),
+                positions=_int32_tensor([0]),
+                out_cache_loc=_int32_tensor([2]),
+                enable_write_input_assert=False,
+                expected_input_tokens=None,
+                expected_input_positions=None,
+            )
+            torch.cuda.synchronize()
+            return read_slot_fields(canary_buf=buf, slot_idx=2)
+
+        fields_a = _run_with(sources_a)
+        fields_b = _run_with(sources_b)
+        assert fields_a[3] != 0
+        assert fields_b[3] != 0
+        assert (
+            fields_a[3] != fields_b[3]
+        ), "reversing source order must change real_kv_hash (fold is ordered)"
+
+
 class TestRunCounter:
     def setup_method(self) -> None:
         self.buf_pair = _make_default_buf_pair()
@@ -718,6 +1044,9 @@ class TestRunCounter:
                 expected_input_positions=pseudo_positions,
                 cuda_log=cuda_log,
                 ref_log=ref_log,
+                real_kv_sources_cuda=(),
+                real_kv_sources_ref=(),
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 assert_equal=False,
             )
 
@@ -806,6 +1135,8 @@ class TestMisc:
             slot_run_counter=log.slot_run_counter,
             kernel_run_counter=log.kernel_run_counter,
             enable_chain_position_assert=log.enable_chain_position_assert,
+            real_kv_sources=(),
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
         )
         module = _RecordingWriteModule()
 

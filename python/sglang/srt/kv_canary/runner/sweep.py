@@ -73,6 +73,7 @@ class SweepOrchestrator:
                 group=group,
                 verify_plan=verify_plan,
                 violation_log=violation_log,
+                real_kv_hash_mode=self._config.real_kv_hash_mode,
             )
 
         self._sweep_passes += 1
