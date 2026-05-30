@@ -49,7 +49,7 @@ export const DeepSeekV4Deployment = () => {
       title: "Quantization",
       items: [
         { id: "fp4", label: "FP4",        default: true  },
-        { id: "fp8", label: "FP8", default: false, subtitle: "H100/H200 only" },
+        { id: "fp8", label: "FP8", default: false, subtitle: "H100/H200/H20 only" },
       ],
     },
     recipe: {
