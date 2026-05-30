@@ -189,7 +189,7 @@ class EagleDraftInputV2Mixin:
             batch.out_cache_loc = torch.empty(
                 (bs * topk * num_steps,),
                 dtype=torch.int64,
-                device=batch.input_ids.device,
+                device=batch.device,
             )
             # FIXME(lsyin): align with the default code path
             assign_draft_cache_locs_page_size_1[(bs,)](
@@ -294,7 +294,7 @@ class EagleVerifyInputV2Mixin:
                 batch.model_config.vocab_size,
                 "v2 prepare_for_verify input_ids",
             )
-            device = batch.input_ids.device
+            device = batch.device
             batch.out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token=req_to_token_pool.req_to_token,
@@ -355,20 +355,16 @@ class EagleVerifyInputV2Mixin:
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
         """
+        device = batch.device
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
-            num_correct_drafts = torch.empty(
-                0, dtype=torch.int32, device=batch.input_ids.device
-            )
-            accept_index = torch.empty(
-                0, dtype=torch.int32, device=batch.input_ids.device
-            )
+            predict = torch.empty(0, dtype=torch.int32, device=device)
+            num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
+            accept_index = torch.empty(0, dtype=torch.int32, device=device)
             return predict, num_correct_drafts, accept_index
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
-        device = batch.input_ids.device
 
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.
