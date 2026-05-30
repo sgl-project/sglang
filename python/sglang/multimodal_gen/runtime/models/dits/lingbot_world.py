@@ -351,7 +351,6 @@ class LingBotWorldTransformerBlock(nn.Module):
         sla_topk: float = 0.1,
         quant_config: QuantizationConfig | None = None,
     ):
-        del attention_type, sla_topk
         super().__init__()
 
         self.norm1 = LayerNormScaleShift(
@@ -702,7 +701,6 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         c2ws_plucker_emb: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        del guidance, kwargs
         forward_batch = get_forward_context().forward_batch
         sequence_shard_enabled = (
             forward_batch is not None
@@ -946,9 +944,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
                     requires_grad=False,
                 )
 
-        del self.to_q
-        del self.to_k
-        del self.to_v
         return True
 
     def _project_qkv(
@@ -1178,7 +1173,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         )
         return c2ws_plucker_emb + self.c2ws_mlp(c2ws_plucker_emb)
 
-    def _forward_inference(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
@@ -1190,9 +1185,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         cache_start: int = 0,
         start_frame: int = 0,
         c2ws_plucker_emb: torch.Tensor | None = None,
-        **kwargs,
     ) -> torch.Tensor:
-        del kwargs
         forward_batch = get_forward_context().forward_batch
         sequence_shard_enabled = (
             forward_batch is not None
@@ -1329,115 +1322,6 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 hidden_states.contiguous(),
                 list(forward_batch.sequence_shard_splits),
                 get_sp_group().device_group,
-            )
-
-        temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
-        shift, scale = (self.scale_shift_table.unsqueeze(1) + temb).chunk(2, dim=2)
-        hidden_states = self.norm_out(hidden_states, shift, scale)
-        hidden_states = self.proj_out(hidden_states)
-        hidden_states = hidden_states.reshape(
-            batch_size,
-            post_patch_num_frames,
-            post_patch_height,
-            post_patch_width,
-            p_t,
-            p_h,
-            p_w,
-            -1,
-        )
-        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-
-    def _forward_train(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | list[torch.Tensor],
-        timestep: torch.LongTensor,
-        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
-        start_frame: int = 0,
-        c2ws_plucker_emb: torch.Tensor | None = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        del kwargs
-        orig_dtype = hidden_states.dtype
-        if not isinstance(encoder_hidden_states, torch.Tensor):
-            encoder_hidden_states = encoder_hidden_states[0]
-        if (
-            isinstance(encoder_hidden_states_image, list)
-            and len(encoder_hidden_states_image) > 0
-        ):
-            encoder_hidden_states_image = encoder_hidden_states_image[0]
-        else:
-            encoder_hidden_states_image = None
-
-        batch_size, _, num_frames, height, width = hidden_states.shape
-        p_t, p_h, p_w = self.patch_size
-        post_patch_num_frames = num_frames // p_t
-        post_patch_height = height // p_h
-        post_patch_width = width // p_w
-        d = self.hidden_size // self.num_attention_heads
-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (
-                post_patch_num_frames * get_sp_world_size(),
-                post_patch_height,
-                post_patch_width,
-            ),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=(
-                torch.float64
-                if current_platform.is_float64_supported()
-                else torch.float32
-            ),
-            rope_theta=10000,
-            start_frame=start_frame,
-        )
-        freqs_cis = (
-            freqs_cos.to(hidden_states.device).float(),
-            freqs_sin.to(hidden_states.device).float(),
-        )
-        if self.block_mask is None:
-            self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                device=hidden_states.device,
-                num_frames=num_frames,
-                frame_seqlen=post_patch_height * post_patch_width,
-                num_frame_per_block=self.num_frame_per_block,
-                local_attn_size=self.local_attn_size,
-            )
-
-        hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
-        c2ws_plucker_emb = self._prepare_c2ws_plucker_emb(
-            hidden_states, c2ws_plucker_emb
-        )
-
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
-            )
-        )
-        timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
-            dim=0, sizes=timestep.shape
-        )
-        if encoder_hidden_states_image is not None:
-            encoder_hidden_states = torch.concat(
-                [encoder_hidden_states_image, encoder_hidden_states], dim=1
-            )
-        encoder_hidden_states = (
-            encoder_hidden_states.to(orig_dtype)
-            if current_platform.is_mps()
-            else encoder_hidden_states
-        )
-
-        for block in self.blocks:
-            hidden_states = block(
-                hidden_states,
-                encoder_hidden_states,
-                timestep_proj,
-                freqs_cis,
-                block_mask=self.block_mask,
-                c2ws_plucker_emb=c2ws_plucker_emb,
             )
 
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)

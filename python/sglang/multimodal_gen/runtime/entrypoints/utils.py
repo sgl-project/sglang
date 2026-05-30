@@ -709,7 +709,7 @@ def post_process_sample(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
 ) -> list[Any]:
-    """materialize output and save outputs (optional)"""
+    """materialize frames and save outputs (optional)"""
     materialized = materialize_output_sample(
         sample,
         data_type,

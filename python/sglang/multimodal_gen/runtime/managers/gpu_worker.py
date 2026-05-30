@@ -129,6 +129,7 @@ class GPUWorker:
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
+        """release the session of a realtime connection"""
         if not session_id:
             return OutputBatch(
                 output={
@@ -298,7 +299,7 @@ class GPUWorker:
             error_context=f"request {req.request_id}",
         )
 
-    def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch:
+    def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
         # TODO: support early return or mix-stage execution for reqs in a group
         assert self.pipeline is not None
@@ -468,6 +469,7 @@ class GPUWorker:
     def _materialize_frame_outputs_for_return(
         self, output_batch: OutputBatch, req: Req
     ) -> None:
+        """materialize the output from tensor to numpy frames for faster serialization"""
         if self.rank != 0 or output_batch.output is None or not req.return_frames:
             return
 
@@ -541,6 +543,7 @@ class GPUWorker:
         return self._merge_expanded_output_batches(output_batches)
 
     def _save_output_paths(self, req: Req, output_batch: OutputBatch) -> None:
+        """save outputs to files"""
         if self.rank != 0 or output_batch.output is None:
             return
 
@@ -559,10 +562,8 @@ class GPUWorker:
             dynamic_output_paths = None
 
         if dynamic_output_paths is not None:
-
             def build_output_path(idx: int) -> str:
                 return dynamic_output_paths[idx]
-
         else:
             num_outputs = len(output_batch.output)
 

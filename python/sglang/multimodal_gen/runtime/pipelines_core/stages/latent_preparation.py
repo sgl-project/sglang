@@ -40,6 +40,7 @@ class LatentPreparationFingerprint:
 
 @dataclass(frozen=True)
 class LatentPreparationSpec:
+    """"dataclass for controlling the LatentPreparationStage runtime semantics"""
     shape: tuple[int, ...]
     dtype: torch.dtype
     device: torch.device | str
@@ -74,6 +75,7 @@ class LatentPreparationStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> int:
+        """get the number of frames to generate for the current batch"""
         return self.adjust_video_length(batch, server_args)
 
     def get_latent_preparation_spec(
@@ -384,7 +386,6 @@ class RealtimeChunkLatentPreparationStage(LatentPreparationStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> int:
-        del server_args
         return int(
             batch.realtime_chunk_size
             or self.transformer.config.arch_config.num_frames_per_block
@@ -398,7 +399,6 @@ class RealtimeChunkLatentPreparationStage(LatentPreparationStage):
         num_frames: int,
         device: torch.device | str,
     ) -> LatentPreparationSpec:
-        del server_args, batch_size
         condition_latent = batch.image_latent
         assert condition_latent is not None, (
             "Realtime chunk latent preparation requires image_latent. "

@@ -69,13 +69,18 @@ class LingBotWorldRealtimeState:
         return prompt
 
     def sample_camera_actions(self, chunk_size: int) -> list[list[str]] | None:
-        signal_payloads = self.events.sample_chunk(
+        """samples a sequence action for the chunk with chunk_size frames
+
+            Args:
+                chunk_size: number of frames
+        """
+        action_list = self.events.sample_chunk(
             "camera_actions",
             ConditionSamplingParams(chunk_size=chunk_size, default_item=[]),
         )
-        if signal_payloads is None:
+        if action_list is None:
             return None
-        return [list(actions) for actions in signal_payloads]
+        return [list(actions) for actions in action_list]
 
     def has_prompt(self) -> bool:
         return self.events.has_events("prompt")

@@ -17,7 +17,7 @@ import pprint
 from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Sequence
 
 import PIL.Image
 import torch
@@ -213,7 +213,7 @@ class Req:
     session: RealtimeSession | None = None
     block_idx: int = 0
     realtime_chunk_size: int | None = None
-    # return websocket-friendly raw RGB frame bytes instead of tensors
+    # return websocket-friendly raw RGB frame bytes instead of rwa tensors
     return_raw_frames: bool = False
 
     def __init__(self, **kwargs):
@@ -399,7 +399,8 @@ class OutputBatch:
     Final output (after pipeline completion)
     """
 
-    output: Any | None = None
+    # tensors or numpy frames
+    output: Sequence[Any] | None = None
     raw_frame_batches: list[list[bytes]] | None = None
     raw_frame_content_type: str = "application/x-raw-rgb"
     raw_frame_metadata: dict[str, Any] | None = None

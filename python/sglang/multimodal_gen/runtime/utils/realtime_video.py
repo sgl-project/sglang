@@ -29,6 +29,7 @@ def build_raw_rgb_frame_batches(
     output_batch: OutputBatch,
     post_process_sample_fn: Callable[..., Any],
 ) -> tuple[list[list[bytes]], dict[str, Any]]:
+    """post-process for realtime responses, returns only the batched frames and metadata"""
     start = time.monotonic()
     sample_to_frames_ms = 0.0
     frames_to_bytes_ms = 0.0
@@ -72,6 +73,8 @@ def build_raw_rgb_frame_batches(
         sample_to_frames_ms += (time.monotonic() - stage_start) * 1000.0
 
         stage_start = time.monotonic()
+
+        # numpy frames to RGB24 bytes
         raw_frames = []
         for frame in frames:
             if frame.ndim == 2:
