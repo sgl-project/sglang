@@ -1,0 +1,182 @@
+:root {
+  --paper: #eef1ec;
+  --panel: #fbfaf5;
+  --ink: #171a16;
+  --muted: #687164;
+  --line: #cbd2c4;
+  --accent: #b9543c;
+  --green: #4d765f;
+  --blue: #3f607c;
+  --shadow: 0 18px 60px rgba(23, 26, 22, 0.12);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    linear-gradient(90deg, rgba(23, 26, 22, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(23, 26, 22, 0.035) 1px, transparent 1px),
+    var(--paper);
+  background-size: 28px 28px;
+  color: var(--ink);
+  font-family: ui-sans-serif, "Avenir Next", "Helvetica Neue", sans-serif;
+}
+
+button, input, textarea { font: inherit; }
+
+.shell {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) minmax(420px, 1fr) minmax(260px, 320px);
+  gap: 18px;
+  min-height: 100vh;
+  padding: 18px;
+}
+
+.panel {
+  background: color-mix(in oklch, var(--panel), white 20%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 18px;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 22px;
+}
+
+.brand span {
+  color: var(--panel);
+  background: var(--ink);
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+
+.brand strong { font-size: 18px; font-weight: 650; }
+
+label {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+input, textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fffdf7;
+  color: var(--ink);
+  padding: 10px 11px;
+  outline: none;
+}
+
+textarea { resize: vertical; line-height: 1.45; }
+input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.12); }
+
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.actions { display: grid; grid-template-columns: 1fr 0.7fr; gap: 10px; margin-top: 16px; }
+
+button {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  background: #fffdf7;
+  min-height: 38px;
+  padding: 0 12px;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--ink); transform: translateY(-1px); }
+.primary { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.wide { width: 100%; margin-top: 10px; }
+
+.stage {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
+  border: 1px solid #11140f;
+  border-radius: 8px;
+  background: #11140f;
+  box-shadow: var(--shadow);
+}
+
+.topbar, .timeline {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 44px;
+  padding: 0 14px;
+  color: #e8eadf;
+  background: rgba(17, 20, 15, 0.88);
+  font-size: 12px;
+}
+
+.timeline { justify-content: flex-end; border-top: 1px solid rgba(232, 234, 223, 0.12); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.dot.live { background: #8ecf9d; box-shadow: 0 0 0 4px rgba(142, 207, 157, 0.14); }
+.dot.error { background: var(--accent); }
+
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 460px;
+  object-fit: contain;
+  image-rendering: auto;
+}
+
+.section-title {
+  margin: 2px 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.preset-list { display: grid; gap: 9px; margin-bottom: 18px; }
+.preset {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fffdf7;
+  text-align: left;
+}
+.preset b { font-size: 14px; }
+.preset span { color: var(--muted); font-size: 12px; }
+.preset[data-tone="green"] { border-left: 4px solid var(--green); }
+.preset[data-tone="blue"] { border-left: 4px solid var(--blue); }
+.preset[data-tone="accent"] { border-left: 4px solid var(--accent); }
+
+.camera-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.camera-pad button { min-height: 42px; font-size: 12px; }
+.telemetry { display: grid; gap: 8px; margin-top: 18px; }
+.telemetry span {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.telemetry b { color: var(--ink); font-weight: 650; }
+
+@media (max-width: 980px) {
+  .shell { grid-template-columns: 1fr; }
+  canvas { min-height: 320px; }
+}

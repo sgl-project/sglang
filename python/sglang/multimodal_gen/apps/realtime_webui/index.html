@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SGLD Realtime Studio</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel controls" aria-label="Session controls">
+        <div class="brand">
+          <span>SGLD</span>
+          <strong>Realtime Studio</strong>
+        </div>
+        <label>Server<input id="serverUrl" value="ws://localhost:30000/v1/realtime_video/generate" /></label>
+        <label>Model<input id="model" value="robbyant/lingbot-world-fast-diffusers" /></label>
+        <label>Prompt<textarea id="prompt" rows="4">A cinematic handheld shot of a quiet city street at dusk, soft reflections, natural motion.</textarea></label>
+        <div class="split">
+          <label>Size<input id="size" value="832x480" /></label>
+          <label>FPS<input id="fps" type="number" value="16" min="1" max="60" /></label>
+        </div>
+        <div class="split">
+          <label>Seconds<input id="seconds" type="number" value="6" min="1" /></label>
+          <label>Seed<input id="seed" type="number" value="42" /></label>
+        </div>
+        <div class="split">
+          <label>Steps<input id="steps" type="number" value="70" min="1" /></label>
+          <label>Guidance<input id="guidance" type="number" value="5" step="0.1" /></label>
+        </div>
+        <label>First frame<input id="firstFrame" type="file" accept="image/*" /></label>
+        <div class="actions">
+          <button id="connectBtn" class="primary">Connect</button>
+          <button id="stopBtn">Stop</button>
+        </div>
+        <button id="sendPromptBtn" class="wide">Send prompt update</button>
+      </section>
+
+      <section class="stage" aria-label="Realtime preview">
+        <div class="topbar">
+          <span id="statusDot" class="dot"></span>
+          <span id="statusText">Idle</span>
+          <span id="chunkText">chunk -</span>
+        </div>
+        <canvas id="viewport" width="1280" height="720"></canvas>
+        <div class="timeline">
+          <span id="queueText">queue 0</span>
+          <span id="frameText">frames 0</span>
+          <span id="byteText">0 MB</span>
+        </div>
+      </section>
+
+      <section class="panel presets" aria-label="Presets and camera">
+        <div class="section-title">Presets</div>
+        <div id="presetList" class="preset-list"></div>
+        <div class="section-title">Camera</div>
+        <div class="camera-pad">
+          <button data-action="i">Pitch +</button>
+          <button data-action="w">Forward</button>
+          <button data-action="k">Pitch -</button>
+          <button data-action="a">Left</button>
+          <button data-action="s">Back</button>
+          <button data-action="d">Right</button>
+          <button data-action="j">Yaw -</button>
+          <button data-action="l">Yaw +</button>
+        </div>
+        <label>Event frames<input id="eventFrames" type="number" value="8" min="1" max="64" /></label>
+        <div class="telemetry">
+          <span>Render FPS<b id="renderFps">0</b></span>
+          <span>Payload<b id="payloadMode">raw RGB</b></span>
+          <span>Latency<b id="latencyText">-</b></span>
+        </div>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
