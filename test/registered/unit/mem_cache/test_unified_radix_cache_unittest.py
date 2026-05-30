@@ -2781,6 +2781,140 @@ class UnifiedRadixCacheSuite:
 
         tree.sanity_check()
 
+    # ================================================================
+    # Partial write_backup tests (aux-only backup after evict-restore)
+    # ================================================================
+
+    def _select_partial_aux(self):
+        """Pick a single aux component used by the current cfg, or None."""
+        if self.cfg.has_swa and not self.cfg.has_mamba:
+            return ComponentType.SWA
+        if self.cfg.has_mamba and not self.cfg.has_swa:
+            return ComponentType.MAMBA
+        return None
+
+    def test_partial_backup_aux_only_returns_aux_tokens(self):
+        """write_backup on a fully-backuped node where aux was zeroed only
+        backs up the aux side; FULL host slot count must not change."""
+        if self._skip_unsupported_hicache_test():
+            return
+        aux = self._select_partial_aux()
+        if aux is None:
+            self.skipTest("requires exactly one aux component")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        self._backup_node(tree, node)
+        self.assertTrue(node.fully_backuped)
+
+        cd_aux = node.component_data[aux]
+        host_avail_before = tree.cache_controller.mem_pool_host.available_size()
+
+        # Drop aux host backup, keep aux device value: this is the gap state
+        # produced by an evict-then-restore path.
+        cd_aux.host_value = None
+        self.assertFalse(node.fully_backuped)
+
+        # Trigger backup again. Only aux should be transferred — FULL is intact.
+        backed_up = tree.write_backup(node, write_back=True)
+        tree.writing_check(write_back=True)
+
+        self.assertGreater(backed_up, 0)
+        self.assertEqual(backed_up, len(cd_aux.value))
+        # FULL host slot count must be unchanged: no additional KV alloc.
+        self.assertEqual(
+            tree.cache_controller.mem_pool_host.available_size(),
+            host_avail_before,
+        )
+        self.assertIsNotNone(cd_aux.host_value)
+        self.assertTrue(node.fully_backuped)
+        tree.sanity_check()
+
+    def test_partial_backup_skip_when_already_fully_backuped(self):
+        """write_backup on a fully-backuped node returns 0 with no transfer."""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        self._backup_node(tree, node)
+        self.assertTrue(node.fully_backuped)
+
+        write_queue_len_before = len(tree.cache_controller.ack_write_queue)
+        backed_up = tree.write_backup(node, write_back=True)
+        self.assertEqual(backed_up, 0)
+        self.assertEqual(
+            len(tree.cache_controller.ack_write_queue),
+            write_queue_len_before,
+            "no controller op should be enqueued for a fully-backuped node",
+        )
+        tree.sanity_check()
+
+    def test_partial_backup_reentry_returns_zero(self):
+        """Same-node reentry while a previous backup is in flight is rejected."""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+
+        first = tree.write_backup(node, write_back=True)
+        self.assertGreater(first, 0)
+        self.assertIn(node.id, tree.ongoing_write_through)
+
+        # Second call before writing_check completes the first must bail out.
+        second = tree.write_backup(node, write_back=True)
+        self.assertEqual(second, 0)
+
+        tree.writing_check(write_back=True)
+        self.assertNotIn(node.id, tree.ongoing_write_through)
+        tree.sanity_check()
+
+    def test_partial_backup_inc_hit_count_triggers_after_restore(self):
+        """An evict-then-restore sequence that re-introduces aux device value
+        on a Full-backuped node must let _inc_hit_count fire write_backup
+        again and close the gap."""
+        if self._skip_unsupported_hicache_test():
+            return
+        aux = self._select_partial_aux()
+        if aux is None:
+            self.skipTest("requires exactly one aux component")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        # Back up the whole path so write_back=False parent invariant holds.
+        self._backup_tree(tree)
+        self.assertTrue(node.fully_backuped)
+
+        # Simulate evict-restore that left the aux gap: aux device kept,
+        # aux host gone, Full both layers intact.
+        node.component_data[aux].host_value = None
+        self.assertFalse(node.fully_backuped)
+        # Lower the threshold so a single _inc_hit_count call fires backup.
+        tree.write_through_threshold = 1
+        node.hit_count = 0
+
+        # Trigger a hit through match_prefix's _inc_hit_count path, which is
+        # the same hook _insert_helper drives after recover_after_unevict.
+        tree._inc_hit_count(node)
+        tree.writing_check(write_back=True)
+
+        self.assertTrue(node.fully_backuped)
+        self.assertIsNotNone(node.component_data[aux].host_value)
+        tree.sanity_check()
+
 
 _CONFIGS: list[CacheConfig] = [
     CacheConfig(page_size=1, components=(ComponentType.FULL,)),

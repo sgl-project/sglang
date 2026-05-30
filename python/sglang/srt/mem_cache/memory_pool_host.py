@@ -2590,17 +2590,23 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
-        # 1. Anchor (KV) backup
-        self.anchor_entry.host_pool.backup_from_device_all_layer(
-            self.anchor_entry.device_pool,
-            host_indices,
-            device_indices,
-            io_backend,
-        )
+        # 1. Anchor (KV) backup. Skip when host_indices is empty: partial
+        # backup paths (FULL already on host, only aux components missing)
+        # call us with a zero-length KV slice and we must not invoke the KV
+        # kernel on it.
+        if host_indices is not None and host_indices.numel() > 0:
+            self.anchor_entry.host_pool.backup_from_device_all_layer(
+                self.anchor_entry.device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+            )
         # 2. Extra pool backup
         for transfer in pool_transfers or []:
             entry = self.entry_map.get(transfer.name)
             if entry is None or transfer.host_indices is None:
+                continue
+            if transfer.host_indices.numel() == 0:
                 continue
             entry.host_pool.backup_from_device_all_layer(
                 entry.device_pool,
