@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import (
+    RealKvHashMode,
+)
 from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
@@ -64,6 +67,7 @@ def launch_endpoints_per_forward(
     forward_batch: "ForwardBatch",
     expected_inputs: ExpectedInputs,
     violation_log: ViolationLog,
+    real_kv_hash_mode: RealKvHashMode,
     enable_write_input_assert: bool,
     enable_verify_token_assert: bool,
 ) -> None:
@@ -104,6 +108,7 @@ def launch_endpoints_per_forward(
             enable_verify_token_assert=enable_verify_token_assert,
             expected_inputs=expected_inputs,
             violation_log=violation_log,
+            real_kv_hash_mode=real_kv_hash_mode,
         )
 
 
@@ -113,6 +118,7 @@ def launch_endpoints_sweep(
     group: CanaryBufferGroup,
     verify_plan: VerifyPlan,
     violation_log: ViolationLog,
+    real_kv_hash_mode: RealKvHashMode,
 ) -> None:
     active_endpoints = [
         endpoint
@@ -127,6 +133,7 @@ def launch_endpoints_sweep(
         endpoint.launch_sweep(
             verify_plan=verify_plan,
             violation_log=violation_log,
+            real_kv_hash_mode=real_kv_hash_mode,
         )
 
 

@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary import endpoint as endpoint_module
@@ -96,6 +97,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             forward_batch=forward_batch,
             expected_inputs=ExpectedInputs.allocate(capacity=3, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.NONE,
             enable_write_input_assert=False,
             enable_verify_token_assert=False,
         )
@@ -148,6 +150,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             forward_batch=forward_batch,
             expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.NONE,
             enable_write_input_assert=False,
             enable_verify_token_assert=False,
         )
@@ -185,6 +188,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             forward_batch=forward_batch,
             expected_inputs=ExpectedInputs.allocate(capacity=3, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.NONE,
             enable_write_input_assert=False,
             enable_verify_token_assert=True,
         )
@@ -220,6 +224,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             forward_batch=forward_batch,
             expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.NONE,
             enable_write_input_assert=False,
             enable_verify_token_assert=False,
         )
