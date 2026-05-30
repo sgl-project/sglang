@@ -748,48 +748,40 @@ class DeepseekV4HipRadixBackend(
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ) -> None:
+        from types import SimpleNamespace
+
         assert req_pool_indices.size(0) == bs
         assert seq_lens.size(0) == bs
 
         bucket = _GraphBucket.of(forward_mode)
-        raw_type: Optional[type] = None
         if bucket == _GraphBucket.DECODE_OR_IDLE:
-            metadata = self.init_forward_metadata_decode(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=torch.zeros_like(seq_lens),
-            )
-            raw_type = DSV4RawDecodeMetadata
+            dummy_cache_loc = torch.zeros_like(seq_lens)
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            out_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
-            metadata = self.init_forward_metadata_target_verify(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-                use_prefill_cuda_graph=True,
-            )
-            raw_type = DSV4RawVerifyMetadata
-        elif bucket == _GraphBucket.DRAFT_EXTEND:
-            num_tokens_per_bs = num_tokens // bs
-            metadata = self.init_forward_metadata_draft_extend(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens.tolist(),
-                num_tokens_per_bs=num_tokens_per_bs,
-                use_prefill_cuda_graph=True,
-            )
+            dummy_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
         else:
-            raise NotImplementedError(f"{forward_mode=} not supported yet")
+            dummy_cache_loc = None
 
-        self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = metadata
-        self.forward_metadata = metadata
-        if raw_type is not None:
-            self._current_capture_raw = (
-                metadata if isinstance(metadata, raw_type) else None
-            )
+        self._replay_forward_batch = SimpleNamespace(
+            out_cache_loc=dummy_cache_loc,
+            forward_mode=forward_mode,
+        )
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
+        )
+        # Preserve _current_capture_raw for on_after_cuda_graph_warmup
+        metadata = self.forward_metadata
+        self._current_capture_raw = (
+            metadata
+            if isinstance(metadata, (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata))
+            else None
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -891,6 +883,11 @@ class DeepseekV4HipRadixBackend(
         ],
         bucket: _GraphBucket,
     ) -> None:
+        if bs not in self.cuda_graph_metadata_of_bucket_and_bs[bucket]:
+            # First call (from capture): store the new metadata directly.
+            self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = temp_metadata
+            self.forward_metadata = temp_metadata
+            return
         chosen_metadata = self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs]
         chosen_metadata.copy_(temp_metadata)
         self.forward_metadata = chosen_metadata
