@@ -1,6 +1,7 @@
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 
 import requests
@@ -13,21 +14,10 @@ from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=90, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
 
-# Qwen and nixl are for testing only and should not be committed
-MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-14B-Instruct"
-
-
-class NixlTransferBackendMixin(PDDisaggregationServerBase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-
-
-PDDisaggregationServerBase = NixlTransferBackendMixin
 
 FORCE_RETRY_PROB = 0.1
 
@@ -80,7 +70,7 @@ class TestOptimisticPrefill(
             envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
         )
         envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.set(FORCE_RETRY_PROB)
-        cls.model = MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.extra_prefill_args = [
             "--optimistic-prefill-retries",
             "3",
@@ -140,6 +130,73 @@ class TestOptimisticPrefill(
         self.assertGreater(j["meta_info"]["prompt_tokens"], 512)
         assert len(output_logprobs) == completion_tokens
         assert len(input_logprobs) > 0
+
+
+class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # enable optimistic prefill retry sampling and disagg failure prob
+        cls._force_retry_ctx = (
+            envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.override(
+                FORCE_RETRY_PROB
+            )
+        )
+        cls._force_retry_ctx.__enter__()
+        cls._disagg_failure_ctx = envs.SGLANG_TEST_DISAGG_FAILURE_PROB.override(
+            FORCE_RETRY_PROB
+        )
+        cls._disagg_failure_ctx.__enter__()
+
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_prefill_args = [
+            "--optimistic-prefill-retries",
+            "3",
+            "--chunked-prefill-size",
+            "128",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+            "--load-format",
+            "dummy",
+        ]
+        cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            super().tearDownClass()
+        finally:
+            if getattr(cls, "_force_retry_ctx", None):
+                cls._force_retry_ctx.__exit__(None, None, None)
+            if getattr(cls, "_disagg_failure_ctx", None):
+                cls._disagg_failure_ctx.__exit__(None, None, None)
+
+    def test_survive_requests(self):
+        # send many small requests to ensure the engine survives injected failures
+        n = 100
+        successes = 0
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            futures = []
+            for i in range(n):
+                rid = f"survive-{i}-{uuid.uuid4().hex}"
+                futures.append(
+                    executor.submit(
+                        requests.post,
+                        self.lb_url + "/generate",
+                        json={
+                            "rid": rid,
+                            "text": "Hello world",
+                            "sampling_params": {"temperature": 0, "max_new_tokens": 4},
+                        },
+                        timeout=30,
+                    )
+                )
+            for future in as_completed(futures):
+                try:
+                    _ = future.result()
+                except Exception:
+                    pass
+        time.sleep(1)  # trigger memory check
 
 
 if __name__ == "__main__":

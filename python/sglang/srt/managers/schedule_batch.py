@@ -959,7 +959,7 @@ class Req(ReqDllmMixin):
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
         # Used in overlap sequence to signal that an optimistic request should
-        # abort chunking. Set in process_prefill_chunk, consumed in process_batch_result.
+        # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
 
         # For Matryoshka embeddings

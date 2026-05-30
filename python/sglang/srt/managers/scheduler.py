@@ -53,7 +53,7 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    release_req_to_metadata_buffer,
+    maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -3489,7 +3489,7 @@ class Scheduler(
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 bootstrap_pending = req.pending_bootstrap
-                release_req_to_metadata_buffer(
+                maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
                 if (
