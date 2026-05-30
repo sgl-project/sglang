@@ -9153,5 +9153,235 @@ class TestBuildRequestCapture(unittest.TestCase):
         self.assertTrue(result["ok"])
 
 
+class TestCompactInt8Signatures(unittest.TestCase):
+    """Loop-6 compact path: int8-symmetric TokenLabelTable signatures.
+
+    fp16 stays the default; the int8 path stores symmetric-quantized labels
+    plus one fp16 scale per (layer, slot, head) vector (~0.5625x bytes). The
+    compact selection must stay within top-k overlap@2048 >= 0.99 of fp16.
+    """
+
+    # ---------- config surface: opt-in, fp16 default ----------
+    def test_config_signature_dtype_defaults_to_fp16(self):
+        cfg = parse_double_sparsity_config(_valid_payload())
+        self.assertEqual(cfg.signature_dtype, "fp16")
+
+    def test_config_signature_dtype_int8_opt_in(self):
+        cfg = parse_double_sparsity_config(
+            '{"channel_mask_path": "/tmp/cm.safetensors", "signature_dtype": "int8"}'
+        )
+        self.assertEqual(cfg.signature_dtype, "int8")
+
+    def test_config_invalid_signature_dtype_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            parse_double_sparsity_config(
+                '{"channel_mask_path": "/tmp/cm.safetensors", "signature_dtype": "int4"}'
+            )
+        self.assertIn("signature_dtype", str(ctx.exception))
+
+    def test_config_unknown_field_still_rejected(self):
+        # The explicit field must not weaken the unknown-field bypass guard.
+        with self.assertRaises(ValueError) as ctx:
+            parse_double_sparsity_config(
+                '{"channel_mask_path": "/tmp/cm.safetensors", "bogus": 1}'
+            )
+        self.assertIn("bogus", str(ctx.exception))
+
+    # ---------- table allocation + byte accounting ----------
+    @staticmethod
+    def _alloc_table(dtype, *, L=2, T=64, H=4, D=16, device=None):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        return allocate_token_label_table(
+            num_layers_local=L, max_tokens=T, num_heads_local=H, label_dim=D,
+            page_size=64, dtype=dtype, device=device or torch.device("cpu"),
+        )
+
+    def _alloc(self, dtype):
+        return self._alloc_table(dtype)
+
+    def test_fp16_default_allocates_no_scales(self):
+        t = self._alloc(torch.float16)
+        self.assertIsNone(t.scales)
+        self.assertFalse(t.is_compact)
+        self.assertEqual(t.signatures.dtype, torch.float16)
+
+    def test_int8_allocates_static_scales(self):
+        t = self._alloc(torch.int8)
+        self.assertTrue(t.is_compact)
+        self.assertEqual(t.signatures.dtype, torch.int8)
+        self.assertIsNotNone(t.scales)
+        self.assertEqual(tuple(t.scales.shape), (2, 64, 4))  # [L, T, H]
+        self.assertEqual(t.scales.dtype, torch.float16)
+
+    def test_byte_ratio_is_0p5625(self):
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            estimate_hbm_bytes,
+        )
+        dims = dict(num_layers_local=2, max_tokens=64, num_heads_local=4, label_dim=16)
+        b_fp16 = estimate_hbm_bytes(dtype=torch.float16, **dims)
+        b_int8 = estimate_hbm_bytes(dtype=torch.int8, **dims)
+        self.assertAlmostEqual(b_int8 / b_fp16, 0.5625, places=6)
+        # bytes_per_rank (allocated) agrees with estimate_hbm_bytes for both.
+        self.assertEqual(self._alloc(torch.float16).bytes_per_rank(), b_fp16)
+        self.assertEqual(self._alloc(torch.int8).bytes_per_rank(), b_int8)
+
+    # ---------- quantize-on-write round-trip ----------
+    def test_quantize_on_write_roundtrip(self):
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        torch.manual_seed(3)
+        L, T, H, D, nope = 1, 16, 4, 16, 128
+        t = self._alloc_dims(torch.int8, L, T, H, D)
+        k_nope = torch.randn(T, H, nope, dtype=torch.float16)
+        ch_sel = torch.stack(
+            [torch.randperm(nope)[:D] for _ in range(H)]
+        ).to(torch.int32)
+        cache_loc = torch.arange(T, dtype=torch.int64)
+        token_label_write(t.signatures, t.written, 0, cache_loc, k_nope, ch_sel, scales=t.scales)
+
+        # Reference gathered fp32 labels.
+        sel_idx = ch_sel.long().unsqueeze(0).expand(T, -1, -1)
+        labels = torch.gather(k_nope.to(torch.float32), dim=-1, index=sel_idx)  # [T,H,D]
+        dequant = t.signatures[0].to(torch.float32) * t.scales[0].to(torch.float32).unsqueeze(-1)
+        # Each element reconstructs within one quantization step (the per-vector scale).
+        scale_bcast = t.scales[0].to(torch.float32).unsqueeze(-1).expand_as(labels)
+        err = (dequant - labels).abs()
+        self.assertTrue(torch.all(err <= scale_bcast + 1e-2))
+        self.assertTrue(bool(t.written[0].all()))
+
+    def test_quantize_on_write_zero_vector_is_safe(self):
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        L, T, H, D, nope = 1, 4, 2, 16, 128
+        t = self._alloc_dims(torch.int8, L, T, H, D)
+        k_nope = torch.zeros(T, H, nope, dtype=torch.float16)  # all-zero labels
+        ch_sel = torch.zeros(H, D, dtype=torch.int32)
+        token_label_write(
+            t.signatures, t.written, 0, torch.arange(T, dtype=torch.int64), k_nope, ch_sel, scales=t.scales
+        )
+        self.assertFalse(torch.isnan(t.scales).any())
+        self.assertTrue(torch.all(t.signatures[0] == 0))
+        self.assertTrue(torch.all(t.scales[0] == 0))  # zero vector -> zero scale, no div-by-zero
+
+    def _alloc_dims(self, dtype, L, T, H, D):
+        return self._alloc_table(dtype, L=L, T=T, H=H, D=D)
+
+    def _build_pair(self, device):
+        """Build matched fp16 + int8 tables written from identical labels."""
+        from sglang.srt.layers.attention.double_sparsity.token_label_write import (
+            token_label_write,
+        )
+        torch.manual_seed(17)
+        L, T, H, D, nope = 1, 8192, 4, 16, 128
+        k_nope = torch.randn(T, H, nope, dtype=torch.float16, device=device)
+        ch_sel = torch.stack(
+            [torch.randperm(nope)[:D] for _ in range(H)]
+        ).to(torch.int32).to(device)
+        cache_loc = torch.arange(T, dtype=torch.int64, device=device)
+        fp16 = self._alloc_table(torch.float16, L=L, T=T, H=H, D=D, device=device)
+        i8 = self._alloc_table(torch.int8, L=L, T=T, H=H, D=D, device=device)
+        token_label_write(fp16.signatures, fp16.written, 0, cache_loc, k_nope, ch_sel, scales=None)
+        token_label_write(i8.signatures, i8.written, 0, cache_loc, k_nope, ch_sel, scales=i8.scales)
+        ch_sel_L = ch_sel.unsqueeze(0)
+        ch_w = torch.ones(L, H, D, dtype=torch.float32, device=device)
+        return fp16, i8, ch_sel_L, ch_w, (L, T, H, D, nope)
+
+    @staticmethod
+    def _topk_overlap(idx_a, idx_b, top_k):
+        overlaps = []
+        for b in range(idx_a.shape[0]):
+            sa = set(idx_a[b][idx_a[b] >= 0].tolist())
+            sb = set(idx_b[b][idx_b[b] >= 0].tolist())
+            overlaps.append(len(sa & sb) / max(len(sa), 1))
+        return min(overlaps) if overlaps else 1.0
+
+    # ---------- selection equivalence (the binding gate) ----------
+    def test_selection_equivalence_overlap_at_2048_ge_0p99(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+        device = torch.device("cpu")
+        fp16, i8, ch_sel_L, ch_w, (L, T, H, D, nope) = self._build_pair(device)
+        top_k, bs = 2048, 4
+        queries = torch.randn(bs, H, nope, dtype=torch.float16, device=device)
+        kw = dict(channel_selection=ch_sel_L, channel_weights=ch_w, layer_id=0, max_top_k=top_k)
+        idx_fp16, _ = retrieve_topk_via_labels(
+            queries=queries, token_signatures=fp16.signatures, written=fp16.written,
+            token_scales=None, **kw)
+        idx_i8, _ = retrieve_topk_via_labels(
+            queries=queries, token_signatures=i8.signatures, written=i8.written,
+            token_scales=i8.scales, **kw)
+        overlap = self._topk_overlap(idx_fp16, idx_i8, top_k)
+        self.assertGreaterEqual(
+            overlap, 0.99, f"int8 vs fp16 top-{top_k} overlap {overlap:.4f} < 0.99"
+        )
+
+    # ---------- GPU: Triton kernels + CUDA-graph safety ----------
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for int8 Triton kernels")
+    def test_int8_triton_kernels_match_torch(self):
+        from sglang.srt.layers.attention.double_sparsity import selection_kernel as sk
+        device = torch.device("cuda")
+        fp16, i8, ch_sel_L, ch_w, (L, T, H, D, nope) = self._build_pair(device)
+        bs, top_k = 4, 2048
+        queries = torch.randn(bs, H, nope, dtype=torch.float16, device=device)
+        # Physical-domain Triton int8 vs torch int8 reference.
+        sc_gpu = sk.compute_token_scores(
+            queries, i8.signatures, i8.written, ch_sel_L, ch_w, 0, token_scales=i8.scales)
+        sc_cpu = sk.compute_token_scores(
+            queries.cpu(), i8.signatures.cpu(), i8.written.cpu(),
+            ch_sel_L.cpu(), ch_w.cpu(), 0, token_scales=i8.scales.cpu())
+        fin = torch.isfinite(sc_cpu)
+        self.assertLess((sc_gpu.cpu()[fin] - sc_cpu[fin]).abs().max().item(), 1e-2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for graph-safe int8 path")
+    def test_int8_graph_safe_capture_replay_matches_eager(self):
+        from sglang.srt.layers.attention.double_sparsity import selection_kernel as sk
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, assert_no_alloc_in_region,
+        )
+        device = torch.device("cuda")
+        fp16, i8, ch_sel_L, ch_w, (L, T, H, D, nope) = self._build_pair(device)
+        bs, top_k, seq = 4, 2048, 4096
+        queries = torch.randn(bs, H, nope, dtype=torch.float16, device=device)
+        rpi = torch.arange(bs, dtype=torch.int32, device=device)
+        req_to_token = (torch.arange(bs * seq, dtype=torch.int32, device=device).reshape(bs, seq)) % T
+        seq_lens = torch.full((bs,), seq, dtype=torch.int32, device=device)
+        gs = allocate_graph_state(
+            max_bs=bs, max_top_k=top_k, max_seq_len=seq, num_local_heads=H, label_dim=D, device=device
+        )
+
+        def call():
+            sk.retrieve_topk_graph_safe(
+                queries=queries, token_signatures=i8.signatures, written=i8.written,
+                channel_selection=ch_sel_L, channel_weights=ch_w, layer_id=0,
+                req_pool_indices=rpi, req_to_token=req_to_token, seq_lens=seq_lens,
+                max_seq_len=seq, max_top_k=top_k,
+                out_indices=gs.selected_indices, out_lengths=gs.valid_lengths,
+                scratch_scores=gs.scratch_scores, scratch_topk_values=gs.scratch_topk_values,
+                scratch_topk_indices=gs.scratch_topk_indices, scratch_invalid_mask=gs.scratch_invalid_mask,
+                scratch_sorted_vals=gs.scratch_sorted_vals, scratch_boundary=gs.scratch_boundary,
+                scratch_valid_i64=gs.scratch_valid_i64, scratch_pv_mask=gs.scratch_pv_mask,
+                scratch_throwaway_idx=gs.scratch_throwaway_idx, token_scales=i8.scales,
+            )
+
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            call()
+        torch.cuda.current_stream().wait_stream(s)
+        eager = gs.selected_indices.clone()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):  # raises if the int8 path host-syncs under capture
+            call()
+        with assert_no_alloc_in_region("int8 DS decode replay"):
+            graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(gs.selected_indices, eager))
+
+
 if __name__ == "__main__":
     unittest.main()

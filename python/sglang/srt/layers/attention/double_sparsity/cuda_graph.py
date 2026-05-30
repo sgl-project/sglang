@@ -316,6 +316,7 @@ def capture_decode_step(
                 per_request_valid=sparse_mask,
                 scratch_pv_mask=state.scratch_pv_mask,
                 scratch_throwaway_idx=state.scratch_throwaway_idx,
+                token_scales=selector.token_label_table.scales,
                 process_group=getattr(selector, "process_group", None),
             )
         else:

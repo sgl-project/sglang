@@ -1967,6 +1967,13 @@ class DeepseekV2AttentionMLA(
             max_tokens = kv_pool.size + kv_pool.page_size
             label_dim = int(local_mask.label_dim)
             page_size = int(ds_parsed.page_size)
+            # fp16 is the default storage; the compact path stores int8
+            # signatures + per-(layer, slot, head) fp16 scales (~0.5625x bytes).
+            signature_dtype = (
+                torch.int8
+                if getattr(ds_parsed, "signature_dtype", "fp16") == "int8"
+                else torch.float16
+            )
             try:
                 table = allocate_token_label_table(
                     num_layers_local=num_layers_local,
@@ -1974,7 +1981,7 @@ class DeepseekV2AttentionMLA(
                     num_heads_local=self.num_local_heads,
                     label_dim=label_dim,
                     page_size=page_size,
-                    dtype=torch.float16,
+                    dtype=signature_dtype,
                     device=self.double_sparsity_selector.device,
                 )
             except Exception as exc:
@@ -2289,6 +2296,7 @@ class DeepseekV2AttentionMLA(
                         per_request_valid=_sparse_mask,
                         scratch_pv_mask=_ds_graph_state.scratch_pv_mask,
                         scratch_throwaway_idx=_ds_graph_state.scratch_throwaway_idx,
+                        token_scales=_selector.token_label_table.scales,
                         process_group=getattr(_selector, "process_group", None),
                     )
                     selected_indices = _ds_graph_state.selected_indices[:_bs]

@@ -38,9 +38,14 @@ logger = logging.getLogger(__name__)
 class TokenLabelTable:
     """GPU-resident table of per-(layer, token-slot, head) projection labels.
 
-    Layout: signatures[layer, slot, head, dim] in fp16;
-    written[layer, slot] as bool — True once a slot has been populated by
-    the write hook.
+    Layout: signatures[layer, slot, head, dim] — fp16 in the default path, or
+    symmetric int8 in the compact path; written[layer, slot] as bool — True
+    once a slot has been populated by the write hook.
+
+    Compact (int8) path: ``signatures`` holds symmetric-quantized int8 labels
+    and ``scales`` holds one fp16 scale per (layer, slot, head) vector. The
+    label for a slot is ``signatures[l, t, h, :].float() * scales[l, t, h]``.
+    The default fp16 path leaves ``scales`` as ``None``.
     """
 
     num_layers_local: int
@@ -52,17 +57,26 @@ class TokenLabelTable:
     signatures: torch.Tensor  # [L, T, H_local, label_dim]
     written: torch.Tensor  # bool [L, T]
     page_size: int
+    scales: Optional[torch.Tensor] = None  # fp16 [L, T, H_local] for the int8 compact path, else None
+
+    @property
+    def is_compact(self) -> bool:
+        """True when signatures are int8 with a companion per-vector scale."""
+        return self.scales is not None
 
     def bytes_per_rank(self) -> int:
-        """Total HBM footprint of the signatures tensor on a single rank."""
+        """Total HBM footprint of the table on a single rank (signatures + scales)."""
         elem_size = torch.tensor([], dtype=self.dtype).element_size()
-        return (
+        total = (
             self.num_layers_local
             * self.max_tokens
             * self.num_heads_local
             * self.label_dim
             * elem_size
         )
+        if self.scales is not None:
+            total += self.scales.numel() * self.scales.element_size()
+        return total
 
 
 def allocate_token_label_table(
@@ -73,12 +87,18 @@ def allocate_token_label_table(
     label_dim: int,
     page_size: int,
     dtype: torch.dtype = torch.float16,
+    scale_dtype: torch.dtype = torch.float16,
     device: Optional[torch.device] = None,
 ) -> TokenLabelTable:
     """Allocate the token label table on the target device.
 
     ``max_tokens`` must equal ``token_to_kv_pool.size + token_to_kv_pool.page_size``
     so the table covers all possible ``out_cache_loc`` physical KV slot indices.
+
+    ``dtype=torch.int8`` allocates the compact path: int8 signatures plus a
+    static ``scales`` tensor (``scale_dtype``, default fp16) of shape
+    ``[L, T, H_local]`` — one symmetric scale per signature vector. Any other
+    ``dtype`` (default fp16) leaves ``scales`` as ``None``.
     """
 
     if num_layers_local <= 0 or max_tokens <= 0 or num_heads_local <= 0 or label_dim <= 0:
@@ -100,6 +120,18 @@ def allocate_token_label_table(
         (num_layers_local, max_tokens), dtype=torch.bool, device=device
     )
 
+    # Compact int8 path: a static per-(layer, slot, head) scale, pre-allocated
+    # so the decode scoring path never allocates under CUDA-graph capture.
+    # Initialised to 1.0 — unwritten slots are masked out by ``written`` so the
+    # initial scale value is never read for selection.
+    scales = None
+    if dtype == torch.int8:
+        scales = torch.ones(
+            (num_layers_local, max_tokens, num_heads_local),
+            dtype=scale_dtype,
+            device=device,
+        )
+
     table = TokenLabelTable(
         num_layers_local=num_layers_local,
         max_tokens=max_tokens,
@@ -110,11 +142,12 @@ def allocate_token_label_table(
         signatures=signatures,
         written=written,
         page_size=page_size,
+        scales=scales,
     )
 
     gb = table.bytes_per_rank() / (1024 ** 3)
     logger.info(
-        "token_label_table: %.2f GB/rank  L=%d T=%d H=%d D=%d page=%d dtype=%s",
+        "token_label_table: %.2f GB/rank  L=%d T=%d H=%d D=%d page=%d dtype=%s scales=%s",
         gb,
         num_layers_local,
         max_tokens,
@@ -122,6 +155,7 @@ def allocate_token_label_table(
         label_dim,
         page_size,
         dtype,
+        "fp16" if scales is None else str(scale_dtype).replace("torch.", ""),
     )
     return table
 
@@ -154,7 +188,12 @@ def estimate_hbm_bytes(
     num_heads_local: int,
     label_dim: int,
     dtype: torch.dtype = torch.float16,
+    scale_dtype: torch.dtype = torch.float16,
 ) -> int:
-    """Worst-case HBM footprint without allocating."""
+    """Worst-case HBM footprint without allocating (signatures + compact scales)."""
     elem_size = torch.tensor([], dtype=dtype).element_size()
-    return num_layers_local * max_tokens * num_heads_local * label_dim * elem_size
+    total = num_layers_local * max_tokens * num_heads_local * label_dim * elem_size
+    if dtype == torch.int8:
+        scale_elem = torch.tensor([], dtype=scale_dtype).element_size()
+        total += num_layers_local * max_tokens * num_heads_local * scale_elem
+    return total

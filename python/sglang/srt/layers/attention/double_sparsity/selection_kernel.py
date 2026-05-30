@@ -59,7 +59,8 @@ if _TRITON_AVAILABLE:
         q_ptr,          # [bs, H, head_dim] fp32
         ch_sel_ptr,     # [H, label_dim] int32 (per-layer slice)
         ch_w_ptr,       # [H, label_dim] fp32 (per-layer slice)
-        sig_ptr,        # [T, H, label_dim] fp32 (per-layer slice)
+        sig_ptr,        # [T, H, label_dim] fp16/fp32/int8 (per-layer slice)
+        scale_ptr,      # [T, H] fp16 (compact int8 path) or unused when HAS_SCALE is False
         written_ptr,    # [T] bool (per-layer slice)
         rpi_ptr,        # [bs] int32
         rtt_ptr,        # [num_pools, max_pool_len] int32
@@ -76,6 +77,9 @@ if _TRITON_AVAILABLE:
         ch_w_stride_h: tl.constexpr,
         sig_stride_t: tl.constexpr,
         sig_stride_h: tl.constexpr,
+        scale_stride_t: tl.constexpr,
+        scale_stride_h: tl.constexpr,
+        HAS_SCALE: tl.constexpr,
         rtt_stride_p: tl.constexpr,
         out_stride_b: tl.constexpr,
         TOKEN_BLOCK: tl.constexpr,
@@ -133,6 +137,15 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             ).to(tl.float32)
             dot = tl.sum(q_proj_h[None, :] * sig_block, axis=1)
+            if HAS_SCALE:
+                # Dequant: scale the int8 dot by the per-(slot, head) scale
+                # before the cross-head max (scale >= 0 preserves ordering).
+                scale_h = tl.load(
+                    scale_ptr + safe_phys * scale_stride_t + h * scale_stride_h,
+                    mask=in_range,
+                    other=0.0,
+                ).to(tl.float32)
+                dot = dot * scale_h
             max_score = tl.where(dot > max_score, dot, max_score)
 
         out_score = tl.where(
@@ -146,9 +159,10 @@ if _TRITON_AVAILABLE:
     @triton.jit
     def _compute_token_scores_kernel(
         q_proj_ptr,  # [bs, H, label_dim] fp32
-        sig_ptr,     # [T, H, label_dim] fp16 or fp32
+        sig_ptr,     # [T, H, label_dim] fp16/fp32/int8
         written_ptr, # [T] bool
         out_ptr,     # [bs, T] fp32
+        scale_ptr,   # [T, H] fp16 (compact int8 path) or unused when HAS_SCALE is False
         bs: tl.constexpr,
         num_heads: tl.constexpr,
         max_tokens: tl.constexpr,
@@ -158,6 +172,9 @@ if _TRITON_AVAILABLE:
         sig_stride_t: tl.constexpr,
         sig_stride_h: tl.constexpr,
         out_stride_b: tl.constexpr,
+        scale_stride_t: tl.constexpr,
+        scale_stride_h: tl.constexpr,
+        HAS_SCALE: tl.constexpr,
         TOKEN_BLOCK: tl.constexpr,
         LABEL_DIM_POW2: tl.constexpr,
     ):
@@ -189,6 +206,15 @@ if _TRITON_AVAILABLE:
             ).to(tl.float32)
 
             dot = tl.sum(q_block[None, :] * sig_block, axis=1)
+            if HAS_SCALE:
+                # Dequant: multiply the int8 dot by the per-(token, head) scale
+                # before the cross-head max (scale >= 0 preserves ordering).
+                scale_h = tl.load(
+                    scale_ptr + token_offsets * scale_stride_t + h * scale_stride_h,
+                    mask=token_in_range,
+                    other=0.0,
+                ).to(tl.float32)
+                dot = dot * scale_h
             max_score = tl.where(dot > max_score, dot, max_score)
 
         written_block = tl.load(
@@ -209,14 +235,17 @@ def _compute_token_scores_triton(
     sig_layer: torch.Tensor,
     written_layer: torch.Tensor,
     *,
+    scale_layer: Optional[torch.Tensor] = None,
     token_block: int = 64,
 ) -> torch.Tensor:
     """Triton kernel-driven token scoring.
 
     Args:
         q_proj: ``[bs, H, label_dim]`` fp32.
-        sig_layer: ``[max_tokens, H, label_dim]`` fp16/fp32.
+        sig_layer: ``[max_tokens, H, label_dim]`` fp16/fp32/int8.
         written_layer: ``[max_tokens]`` bool.
+        scale_layer: optional ``[max_tokens, H]`` per-(slot, head) dequant scale
+            for the int8 compact path; ``None`` keeps the fp16 path.
 
     Returns:
         ``[bs, max_tokens]`` fp32. Unwritten tokens are ``-inf``.
@@ -230,6 +259,10 @@ def _compute_token_scores_triton(
     q_proj_c = q_proj.contiguous()
     sig_c = sig_layer.contiguous()
     written_c = written_layer.contiguous()
+    has_scale = scale_layer is not None
+    scale_c = scale_layer.contiguous() if has_scale else sig_c
+    scale_stride_t = scale_c.stride(0) if has_scale else 0
+    scale_stride_h = scale_c.stride(1) if has_scale else 0
 
     desired_block = min(token_block, max(max_tokens, 1))
     if desired_block <= 0:
@@ -244,6 +277,7 @@ def _compute_token_scores_triton(
         sig_c,
         written_c,
         out,
+        scale_c,
         bs=bs,
         num_heads=num_heads,
         max_tokens=max_tokens,
@@ -253,6 +287,9 @@ def _compute_token_scores_triton(
         sig_stride_t=sig_c.stride(0),
         sig_stride_h=sig_c.stride(1),
         out_stride_b=out.stride(0),
+        scale_stride_t=scale_stride_t,
+        scale_stride_h=scale_stride_h,
+        HAS_SCALE=has_scale,
         TOKEN_BLOCK=token_block_pow2,
         LABEL_DIM_POW2=label_dim_pow2,
     )
@@ -296,6 +333,7 @@ def compute_token_scores(
     channel_selection: torch.Tensor,
     channel_weights: torch.Tensor,
     layer_id: int,
+    token_scales: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute per-(batch, token) scalar scores.
 
@@ -304,6 +342,8 @@ def compute_token_scores(
     written:           [num_layers_local, max_tokens] bool
     channel_selection: [num_layers_local, num_heads_local, label_dim] int32
     channel_weights:   [num_layers_local, num_heads_local, label_dim] fp32
+    token_scales:      optional [num_layers_local, max_tokens, num_heads_local]
+                       per-(slot, head) dequant scale for the int8 compact path.
 
     Returns ``token_scores[bs, max_tokens]`` fp32. Unwritten tokens get
     ``-inf`` so the top-K step ignores them deterministically.
@@ -318,6 +358,7 @@ def compute_token_scores(
     w_layer = channel_weights[layer_id]        # [H, label_dim]
     sig_layer = token_signatures[layer_id]     # [T, H, label_dim]
     written_layer = written[layer_id]          # [T]
+    scale_layer = token_scales[layer_id] if token_scales is not None else None  # [T, H]
 
     q_proj = project_query_onto_channels(queries, sel_layer, w_layer)  # [bs, H, D]
 
@@ -331,11 +372,15 @@ def compute_token_scores(
             q_proj.to(torch.float32),
             sig_layer,
             written_layer,
+            scale_layer=scale_layer,
         )
 
     scores_full = torch.einsum(
         "bhd,thd->bth", q_proj.to(torch.float32), sig_layer.to(torch.float32)
-    )
+    )  # [bs, T, H]
+    if scale_layer is not None:
+        # Dequant the int8 dot per (token, head) before the cross-head max.
+        scores_full = scores_full * scale_layer.unsqueeze(0).to(torch.float32)
     scores = scores_full.amax(dim=-1)  # [bs, T]
     return scores.masked_fill(~written_layer.unsqueeze(0), float("-inf"))
 
@@ -436,6 +481,7 @@ def _compute_logical_token_scores(
     req_to_token: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int = 0,
+    token_scales: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Score tokens in logical-sequence-position space.
 
@@ -485,6 +531,11 @@ def _compute_logical_token_scores(
     # scores[b, i] = max_over_heads(q_proj[b] · sig[b, i])
     # q_proj: [bs, H, D] → [bs, 1, H, D]; gathered_sig: [bs, max_seq_len, H, D]
     dot = (q_proj.unsqueeze(1).to(torch.float32) * gathered_sig.to(torch.float32)).sum(-1)  # [bs, max_seq_len, H]
+    if token_scales is not None:
+        # Dequant the int8 dot per (slot, head) before the cross-head max.
+        scale_layer = token_scales[layer_id]                # [max_tokens, H]
+        scale_gathered = scale_layer[safe_phys].to(torch.float32)  # [bs, max_seq_len, H]
+        dot = dot * scale_gathered
     scores = dot.amax(dim=-1)  # [bs, max_seq_len]
 
     # Mask: unwritten physical slots and positions >= seq_len
@@ -513,6 +564,7 @@ def retrieve_topk_via_labels(
     req_to_token: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
     max_seq_len: int = 0,
+    token_scales: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """End-to-end selector flow: score → all-reduce → per-request mask → top-K → ascend.
 
@@ -552,6 +604,7 @@ def retrieve_topk_via_labels(
             req_to_token=req_to_token,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
+            token_scales=token_scales,
         )
         scores = all_reduce_token_scores(scores, process_group=process_group)
     else:
@@ -562,6 +615,7 @@ def retrieve_topk_via_labels(
             channel_selection=channel_selection,
             channel_weights=channel_weights,
             layer_id=layer_id,
+            token_scales=token_scales,
         )
         scores = all_reduce_token_scores(scores, process_group=process_group)
 
@@ -592,7 +646,7 @@ def _logical_score_triton(
     q_proj_input: torch.Tensor,         # [bs, H, head_dim] fp32 (the raw queries; gather via ch_sel inside)
     channel_selection_layer: torch.Tensor,  # [H, label_dim] int32
     channel_weights_layer: torch.Tensor,    # [H, label_dim] fp32
-    sig_layer: torch.Tensor,            # [T, H, label_dim] fp32 (cast outside if not fp32)
+    sig_layer: torch.Tensor,            # [T, H, label_dim] fp16/fp32/int8
     written_layer: torch.Tensor,        # [T] bool
     req_pool_indices: torch.Tensor,     # [bs] int32
     req_to_token: torch.Tensor,         # [num_pools, max_pool_len] int32
@@ -600,6 +654,7 @@ def _logical_score_triton(
     out: torch.Tensor,                  # [bs_buf, max_seq_len] fp32 (pre-allocated, slice [bs])
     max_seq_len: int,
     *,
+    scale_layer: Optional[torch.Tensor] = None,  # [T, H] per-(slot, head) int8 dequant scale, else None
     token_block: int = 64,
 ) -> None:
     """Fill ``out[:bs, :max_seq_len]`` with per-(batch, logical-position) scores.
@@ -610,6 +665,11 @@ def _logical_score_triton(
     label_dim = int(channel_selection_layer.shape[1])
     max_pool_len = int(req_to_token.shape[1])
     max_tokens = int(sig_layer.shape[0])
+
+    has_scale = scale_layer is not None
+    scale_ptr = scale_layer if has_scale else sig_layer
+    scale_stride_t = scale_layer.stride(0) if has_scale else 0
+    scale_stride_h = scale_layer.stride(1) if has_scale else 0
 
     desired_block = min(token_block, max(max_seq_len, 1))
     token_block_pow2 = _next_pow2(desired_block)
@@ -622,6 +682,7 @@ def _logical_score_triton(
         channel_selection_layer,
         channel_weights_layer,
         sig_layer,
+        scale_ptr,
         written_layer,
         req_pool_indices,
         req_to_token,
@@ -638,6 +699,9 @@ def _logical_score_triton(
         ch_w_stride_h=channel_weights_layer.stride(0),
         sig_stride_t=sig_layer.stride(0),
         sig_stride_h=sig_layer.stride(1),
+        scale_stride_t=scale_stride_t,
+        scale_stride_h=scale_stride_h,
+        HAS_SCALE=has_scale,
         rtt_stride_p=req_to_token.stride(0),
         out_stride_b=out.stride(0),
         TOKEN_BLOCK=token_block_pow2,
@@ -671,6 +735,7 @@ def retrieve_topk_graph_safe(
     per_request_valid: Optional[torch.Tensor] = None,      # bool [bs, max_seq_len]
     scratch_pv_mask: Optional[torch.Tensor] = None,        # bool [max_bs, max_seq_len]
     scratch_throwaway_idx: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
+    token_scales: Optional[torch.Tensor] = None,           # fp16 [L, T, H] int8 dequant scale, else None
     process_group=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Capture-safe retrieve_topk that writes results into caller-owned buffers.
@@ -721,6 +786,7 @@ def retrieve_topk_graph_safe(
             req_to_token=req_to_token,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
+            token_scales=token_scales,
         )
         mtk = indices.shape[1]
         out_indices[:bs, :mtk].copy_(indices)
@@ -736,6 +802,7 @@ def retrieve_topk_graph_safe(
     w_layer = channel_weights[layer_id]
     sig_layer = token_signatures[layer_id]
     written_layer = written[layer_id]
+    scale_layer = token_scales[layer_id] if token_scales is not None else None
     assert sel_layer.dtype == torch.int32, (
         f"channel_selection must be int32, got {sel_layer.dtype}"
     )
@@ -764,6 +831,7 @@ def retrieve_topk_graph_safe(
         seq_lens=seq_lens,
         out=scores_view,
         max_seq_len=max_seq_len,
+        scale_layer=scale_layer,
     )
 
     if process_group is not None and torch.distributed.is_available() and torch.distributed.is_initialized():

@@ -16,6 +16,7 @@ KV cache write path exactly.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import torch
 
@@ -48,14 +49,22 @@ def token_label_write(
     cache_loc: torch.Tensor,     # int64/int32 [num_tokens]    (out_cache_loc)
     k_nope: torch.Tensor,        # [num_tokens, H_local, nope_dim]  projected K_nope
     channel_selection_layer: torch.Tensor,  # [H_local, label_dim] int32
+    scales: Optional[torch.Tensor] = None,  # fp16 [L, T, H_local] (table.scales) for the int8 path
 ) -> None:
     """Write projected K_nope labels for ``cache_loc`` slots.
 
     For each token ``t`` writes:
         signatures[layer_id, cache_loc[t], :, :] = k_nope[t, :, channel_selection_layer]
 
-    Mutates ``signatures`` and ``written`` in-place.  Thread-safe under the
-    assumption that each slot is owned by exactly one request at a time.
+    When ``scales`` is provided (``signatures`` is int8), the gathered fp32
+    labels are symmetric-quantized per ``(token, head)`` vector: the scale is
+    ``max(|label|) / 127`` and the stored int8 is ``round(label / scale)``.
+    Both ``signatures`` and ``scales`` are written in-place. When ``scales`` is
+    ``None``, the labels are stored at the signature dtype (fp16) unchanged.
+
+    Mutates ``signatures``/``scales``/``written`` in-place.  No host syncs.
+    Thread-safe under the assumption that each slot is owned by exactly one
+    request at a time.
     """
 
     num_tokens = k_nope.shape[0]
@@ -70,5 +79,18 @@ def token_label_write(
     labels = torch.gather(k_nope.to(torch.float32), dim=-1, index=sel_idx)  # [T, H, label_dim]
 
     slot = cache_loc.long()
-    signatures[layer_id].index_copy_(0, slot, labels.to(signatures.dtype))
+    if scales is None:
+        signatures[layer_id].index_copy_(0, slot, labels.to(signatures.dtype))
+    else:
+        # Symmetric int8 per (token, head) vector. scale = max(|label|) / 127.
+        amax = labels.abs().amax(dim=-1, keepdim=True)  # [T, H, 1] fp32
+        scale = amax / 127.0
+        safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        quant = (
+            torch.round(labels / safe_scale)
+            .clamp_(-127, 127)
+            .to(torch.int8)
+        )  # [T, H, label_dim] int8
+        signatures[layer_id].index_copy_(0, slot, quant)
+        scales[layer_id].index_copy_(0, slot, scale.squeeze(-1).to(scales.dtype))
     written[layer_id].index_fill_(0, slot, True)

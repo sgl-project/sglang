@@ -1599,6 +1599,7 @@ class DeepseekSparseAttnBackend(
             cache_loc=cache_loc,
             k_nope=k_nope,
             channel_selection_layer=self._ds_channel_selection[layer_id],
+            scales=self._ds_token_label_table.scales,
         )
         # M3-B radix-cache fixture capture (env-gated, zero-cost when
         # off — `is_capture_enabled` is one `os.environ.get` lookup).

@@ -28,7 +28,7 @@ Real anchors:
 | anchor | status | max_total_num_tokens | table T | fp16 table | observed headroom |
 |---|---:|---:|---:|---:|---:|
 | A: `mem_fraction_static=0.6` | serves | 53,056 | 53,120 | 1.545 GiB | memory-pool-end 37.78 GiB, after-table ≈ 36.23 GiB |
-| B: `mem_fraction_static≈0.77-0.8` | boots, gen OOM | 396,096 | 396,160 | 11.523 GiB | runtime headroom ≈ 12.29 GiB; later 248 MiB alloc fails |
+| B: `mem_fraction_static≈0.70` | boots, gen OOM | 396,096 | 396,160 | 11.523 GiB | runtime headroom ≈ 12.29 GiB; later 248 MiB alloc fails |
 | C: `mem_fraction_static=0.897` | boot OOM | 1,072,000 | 1,072,064 | 31.183 GiB | memory-pool-end 7.20 GiB, table alloc fails |
 
 Raw KV cost from Anchor C:
@@ -112,9 +112,13 @@ At the 114K working pool, page-level saves ≈3.270 GiB/rank vs fp16 token-level
 
 ## Binding Lever Decision
 
-Paper budget result: int8 same-`label_dim` is predicted sufficient to restore nominal conc-64 admission with generation headroom at the actual admission target. It includes scale-storage overhead and the larger-pool feedback. The compaction implementation path should therefore be int8, not page-level/two-stage. Page-level/two-stage is reserved for failed hardware confirmation or a later requirement to operate at much larger pools.
+**Binding decision (authoritative for the implementation): build int8 same-`label_dim` as the compact `TokenLabelTable` path next.** int8 is predicted sufficient to restore nominal conc-64 admission with generation headroom at the admission target; the prediction includes the per-(layer, slot, head) scale-storage overhead and the larger-pool feedback (raising `mem_fraction_static` grows the pool, which grows the table). Page-level/two-stage is **not** built now; it is reserved strictly as an escalation if hardware shows int8 is insufficient (or a later requirement to operate at much larger pools).
 
-However, the no-code fp16 baseline is not ruled out. On paper, an fp16 table with a smaller `mem_fraction_static` bump already reaches the admission target:
+This is the binding lever for the footprint implementation and it is **not** conditional on any prior no-code experiment. The footprint reduction is the principled fix to the root cause — the per-rank table is oversized relative to HBM headroom — and int8 reduces it directly (≈1.78×). The compact path is flag-gated with fp16 as the default until hardware validates it.
+
+### fp16 lower-`mem_fraction` window — optional instrumentation only (does NOT gate the int8 build)
+
+For completeness the budget records that, on paper, an fp16 table at a smaller `mem_fraction_static` bump also reaches the admission target:
 
 ```text
 95K pool:  f≈0.612, after-table headroom ≈33.75 GiB
@@ -122,9 +126,7 @@ However, the no-code fp16 baseline is not ruled out. On paper, an fp16 table wit
 f≈0.625:   pool≈139K, after-table headroom ≈31.17 GiB
 ```
 
-The known 0.7-region generation OOM is at a much larger ≈396K-token pool with an 11.5 GiB fp16 table. It does not by itself rule out an fp16 operating window around `f≈0.612-0.650`.
-
-Cheapest hardware action first: sweep fp16 DS at approximately `f=0.612`, `0.625`, `0.650`, and stop once conc-64 admission, no-OOM long generation, and sufficient residual headroom are confirmed. If that sweep passes, it is the true minimum deployment lever. If it fails due to allocator residuals, fragmentation, or unmodeled generation memory, build the int8 compact table. Do not build page-level first.
+The known generation OOM sits at `mem_fraction_static≈0.70` (the much larger ≈396K-token pool with an 11.5 GiB fp16 table), so an fp16 window around `f≈0.612-0.650` is not ruled out on paper. **However, this is a fragile, secondary observation, not a deployment lever and not a precondition for the int8 build:** it leaves the table at full fp16 size, so it depends on allocator residual / fragmentation margins and does not scale to the larger pools that 64K servability and conc-64 robustness need. It may, at most, be logged as one extra fp16 data point *during* the int8 compact-table mem-fraction sweep (the hardware mem-lift validation), purely for comparison. It must never replace, gate, or precede building the int8 compact table.
 
 ## Selection Equivalence Gate
 
@@ -159,5 +161,6 @@ This budget was authored as an independent expert analysis and integrated after 
 
 - Table formula confirmed in `python/sglang/srt/layers/attention/double_sparsity/token_label_table.py` (`bytes_per_rank` / `estimate_hbm_bytes` = `num_layers_local * max_tokens * num_heads_local * label_dim * elem_size`).
 - All three anchors are verbatim from `runs/20260528_dsv32_mvp/` boot logs (`token_label_table: 1.55 GB/rank L=61 T=53120`; `11.52 GB/rank T=396160`; the `Tried to allocate 31.18 GiB ... 7.20 GiB free` table-alloc OOM at `mem_fraction_static=0.897`).
-- **Anchor B mem-fraction correction:** the source label said Anchor B `~=0.77-0.8`, but the budget's pool->`f` fit maps the 396K pool to `f≈0.70`, which matches the recorded Loop-5 finding "0.7 OOMs during generation". Treat Anchor B as `mem_fraction_static≈0.70`; the exact value is resolved by the hardware sweep regardless. This makes the "sweep fp16 at `f≈0.612 / 0.625 / 0.650` first" recommendation conservative — the known generation-OOM sits at `f≈0.70`, above the proposed fp16 window.
+- **Anchor B mem-fraction correction:** the source label said Anchor B `~=0.77-0.8`, but the budget's pool->`f` fit maps the 396K pool to `f≈0.70`, which matches the recorded Loop-5 finding "0.7 OOMs during generation". The Anchor B label has been corrected to `mem_fraction_static≈0.70`; the exact value is resolved by the hardware sweep regardless.
+- **Binding-decision correction (Round-0 review):** an earlier draft of the Binding Lever Decision recommended a no-code fp16 lower-`mem_fraction` sweep *before* building the compact table, which conflicted with the committed plan (int8 is the chosen compaction lever; the compact-table mem-fraction validation must use the compact path). The decision now reads unambiguously: **build int8 same-`label_dim` for the footprint reduction next**; the fp16 lower-`f` window is optional comparison instrumentation only and must not gate, replace, or precede the int8 build.
 - The linear A/C headroom fit overestimates real headroom by ~3.7 GiB at the 396K anchor (model ≈15.96 vs actual ≈12.29 GiB), so the hardware sweep — with full NVML + `torch.cuda.memory_reserved/allocated` accounting — is authoritative for the no-OOM determination, exactly as the caveat states.

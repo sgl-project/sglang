@@ -1,14 +1,23 @@
 """Configuration dataclass for standalone Double Sparsity.
 
 The configuration surface is intentionally narrow: ``top_k``, ``page_size``,
-``channel_mask_path``, ``device_buffer_size``, plus a free ``extra`` dict.
-No ``selection_mode`` / ``top_p`` / ``min_top_k`` / ``max_top_k`` — top-p
-selection (Twilight) is a separate follow-on with its own ABI design.
+``channel_mask_path``, ``device_buffer_size``, ``signature_dtype``, plus a free
+``extra`` dict.  No ``selection_mode`` / ``top_p`` / ``min_top_k`` /
+``max_top_k`` — top-p selection (Twilight) is a separate follow-on with its
+own ABI design.
 
 ``top_k`` counts maximum **tokens** per request (not pages).  At Option B
 operating point this matches the model's intrinsic ``index_topk=2048``.
 ``device_buffer_size`` is the score-scratch buffer cap (maximum concurrently
 live tokens for the decode scoring scratch tensor).
+
+``signature_dtype`` selects the per-slot label storage precision:
+
+* ``"fp16"`` (default) stores the channel labels at full fp16 precision.
+* ``"int8"`` stores symmetric-quantized int8 labels plus one fp16 scale per
+  (layer, slot, head) vector, cutting the table footprint to ~0.5625x at a
+  small selection-precision cost.  fp16 stays the default until the compact
+  path has hardware evidence.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ _ALLOWED_FIELDS = {
     "page_size",
     "channel_mask_path",
     "device_buffer_size",
+    "signature_dtype",
     "extra",
 }
 
@@ -30,6 +40,8 @@ _ALLOWED_FIELDS = {
 _DEFAULT_TOP_K = 2048           # matches DeepSeek-V3.2 index_topk (max tokens per request)
 _DEFAULT_PAGE_SIZE = 64         # FlashMLA KV layout requirement
 _DEFAULT_DEVICE_BUFFER_SIZE = 4096  # score-scratch buffer cap in tokens
+_DEFAULT_SIGNATURE_DTYPE = "fp16"   # full-precision labels until the compact path is hardware-validated
+_ALLOWED_SIGNATURE_DTYPES = ("fp16", "int8")
 
 
 @dataclass
@@ -38,6 +50,7 @@ class DoubleSparsityConfig:
     top_k: int = _DEFAULT_TOP_K
     page_size: int = _DEFAULT_PAGE_SIZE
     device_buffer_size: int = _DEFAULT_DEVICE_BUFFER_SIZE
+    signature_dtype: str = _DEFAULT_SIGNATURE_DTYPE
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -57,6 +70,11 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'device_buffer_size' must be a positive integer, "
                 f"got {self.device_buffer_size!r}."
+            )
+        if self.signature_dtype not in _ALLOWED_SIGNATURE_DTYPES:
+            raise ValueError(
+                f"Double Sparsity 'signature_dtype' must be one of "
+                f"{list(_ALLOWED_SIGNATURE_DTYPES)}, got {self.signature_dtype!r}."
             )
         if not isinstance(self.extra, dict):
             raise ValueError(
@@ -110,5 +128,6 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         top_k=int(data.get("top_k", _DEFAULT_TOP_K)),
         page_size=int(data.get("page_size", _DEFAULT_PAGE_SIZE)),
         device_buffer_size=int(data.get("device_buffer_size", _DEFAULT_DEVICE_BUFFER_SIZE)),
+        signature_dtype=str(data.get("signature_dtype", _DEFAULT_SIGNATURE_DTYPE)),
         extra=data.get("extra", {}),
     )
