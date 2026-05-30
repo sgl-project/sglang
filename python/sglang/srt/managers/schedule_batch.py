@@ -2417,42 +2417,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def _mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
-        """Pre-allocate a mamba state for reqs at the track interval boundary.
+        """Allocate a temporary second ping-pong slot for reqs at a track boundary.
 
-        In lazy mode, each request normally holds only 1 ping-pong slot.
-        At the boundary, we allocate the second slot so the forward pass
-        can write the tracked state there.
+        In lazy mode each request normally holds only 1 ping-pong slot.
+        When seq_len hits a track interval boundary, we allocate the
+        second slot so the forward pass can write the new tracked state
+        there. The old slot is freed after the forward in
+        _mamba_lazy_post_decode_at_boundary.
         """
-        req_to_token_pool = self.req_to_token_pool
-        mamba_pool = req_to_token_pool.mamba_pool
-
+        pool = self.req_to_token_pool
         for i, req in enumerate(self.reqs):
-            if req.mamba_ping_pong_track_buffer is None:
+            buf = req.mamba_ping_pong_track_buffer
+            if buf is None or self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
-            if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
-                continue
-
             other_idx = 1 - req.mamba_next_track_idx
-            if req.mamba_ping_pong_track_buffer[other_idx].item() != -1:
+            if buf[other_idx].item() != -1:
                 continue
-
-            new_slot = mamba_pool.alloc(1)
-            if new_slot is None:
-                if (
-                    self.tree_cache is not None
-                    and self.tree_cache.supports_mamba()
-                ):
-                    self.tree_cache.evict(
-                        EvictParams(num_tokens=0, mamba_num=1)
-                    )
-                    new_slot = mamba_pool.alloc(1)
-
+            new_slot = pool.mamba_pool.alloc(1)
+            if new_slot is None and self.tree_cache and self.tree_cache.supports_mamba():
+                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                new_slot = pool.mamba_pool.alloc(1)
             if new_slot is not None:
-                req.mamba_ping_pong_track_buffer[other_idx] = new_slot[0]
+                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx
-                req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                    req.req_pool_idx
-                ] = req.mamba_ping_pong_track_buffer
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE

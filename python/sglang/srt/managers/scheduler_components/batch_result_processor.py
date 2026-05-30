@@ -641,8 +641,6 @@ class SchedulerBatchResultProcessor:
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
-                if batch.req_to_token_pool.enable_mamba_extra_buffer_lazy:
-                    self._mamba_lazy_post_decode(req, batch, result, i)
                 self._handle_finished_req(req, i, logits_output)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
@@ -663,13 +661,10 @@ class SchedulerBatchResultProcessor:
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
-            # Update Mamba last track seqlen
-            self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accepted_len)
 
-            if batch.req_to_token_pool.enable_mamba_extra_buffer_lazy:
-                self._mamba_lazy_post_decode(req, batch, result, i)
+            self._mamba_prefix_cache_update(req, batch, result, i)
 
             self._handle_finished_req(req, i, logits_output)
 
@@ -857,84 +852,53 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
     ) -> None:
-        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is None:
             return
 
         mamba_track_interval = get_global_server_args().mamba_track_interval
         lazy = batch.req_to_token_pool.enable_mamba_extra_buffer_lazy
+        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        at_boundary = False
 
         if batch.spec_algorithm.is_none():
-            if lazy:
-                at_boundary = (
-                    seq_len % mamba_track_interval == mamba_track_interval - 1
-                )
-            else:
-                at_boundary = seq_len % mamba_track_interval == 0
+            check = (mamba_track_interval - 1) if lazy else 0
+            at_boundary = seq_len % mamba_track_interval == check
             if at_boundary:
-                if not lazy:
-                    req.mamba_next_track_idx = (
-                        batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                            req.mamba_next_track_idx
-                        )
-                    )
-                req.mamba_last_track_seqlen = (seq_len + 1) if lazy else seq_len
-        elif (
-            not batch.spec_algorithm.is_none()
-            and result.num_correct_drafts_per_req_cpu is not None
-        ):
+                track_seqlen = (seq_len + 1) if lazy else seq_len
+        elif result.num_correct_drafts_per_req_cpu is not None:
             actual_seq_len = req.seqlen - 1
-            prev_seq_len = (
-                actual_seq_len - result.num_correct_drafts_per_req_cpu[i] - 1
-            )
-            if (
+            prev = actual_seq_len - result.num_correct_drafts_per_req_cpu[i] - 1
+            at_boundary = (
                 actual_seq_len // mamba_track_interval
-                != prev_seq_len // mamba_track_interval
-            ):
-                if not lazy:
-                    req.mamba_next_track_idx = (
-                        batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                            req.mamba_next_track_idx
-                        )
-                    )
-                req.mamba_last_track_seqlen = (
+                != prev // mamba_track_interval
+            )
+            if at_boundary:
+                track_seqlen = (
                     actual_seq_len // mamba_track_interval * mamba_track_interval
                 )
 
-    def _mamba_lazy_post_decode(
-        self,
-        req: Req,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-        i: int,
-    ) -> None:
-        """Lazy-mode post-decode: free the temporary second slot for running reqs,
-        or mark is_insert=False for finished reqs when prealloc failed at boundary."""
-        if req.mamba_ping_pong_track_buffer is None:
-            return
+        if at_boundary:
+            if not lazy:
+                req.mamba_next_track_idx = (
+                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
+                )
+            req.mamba_last_track_seqlen = track_seqlen
+            if lazy:
+                self._mamba_lazy_post_decode_at_boundary(req, batch)
 
-        mamba_track_interval = get_global_server_args().mamba_track_interval
-        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+    def _mamba_lazy_post_decode_at_boundary(
+        self, req: Req, batch: ScheduleBatch
+    ):
+        """Post-decode cleanup at a lazy-mode track boundary.
 
-        if batch.spec_algorithm.is_none():
-            at_boundary = (
-                seq_len % mamba_track_interval == mamba_track_interval - 1
-            )
-        elif result.num_correct_drafts_per_req_cpu is not None:
-            actual_seq_len = req.seqlen - 1
-            prev_seq_len = (
-                actual_seq_len - result.num_correct_drafts_per_req_cpu[i] - 1
-            )
-            at_boundary = (
-                actual_seq_len // mamba_track_interval
-                != prev_seq_len // mamba_track_interval
-            )
-        else:
-            at_boundary = False
-
-        if not at_boundary:
-            return
-
+        For running reqs: free the old ping-pong slot so we go back to
+        holding only 1 slot until the next boundary.
+        For finished reqs: if the prealloc failed (other slot is -1),
+        mark is_insert=False so cache_finished_req skips the insert.
+        """
+        pool = batch.req_to_token_pool
         other_idx = 1 - req.mamba_next_track_idx
         if req.finished():
             if req.mamba_ping_pong_track_buffer[other_idx].item() == -1:
@@ -942,8 +906,5 @@ class SchedulerBatchResultProcessor:
         else:
             old_val = req.mamba_ping_pong_track_buffer[other_idx]
             if old_val.item() != -1:
-                batch.req_to_token_pool.mamba_pool.free(old_val.unsqueeze(0))
-            req.mamba_ping_pong_track_buffer[other_idx] = -1
-            batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                req.req_pool_idx
-            ] = req.mamba_ping_pong_track_buffer
+                pool.mamba_pool.free(old_val.unsqueeze(0))
+            pool.set_mamba_ping_pong_slot(req, other_idx, -1)
