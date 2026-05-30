@@ -555,7 +555,11 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
-        # Poll optimistic prefil requests in batch
+        # Poll optimistic prefill requests in this batch.
+        # Note: In overlap scheduling, a chunked request that was still pending
+        # during process_prefill_chunk is not checked again here.
+        # If it becomes ready in the gap, we still retry the request to keep
+        # chunked-prefill state management simple.
         optimistic_polls = {}
         optimistic_reqs = [
             (i, req)
