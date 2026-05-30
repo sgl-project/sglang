@@ -298,12 +298,7 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.enable_mamba_extra_buffer:
-                if self.enable_mamba_extra_buffer_lazy:
-                    keep_idx = req.mamba_next_track_idx
-                else:
-                    keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
+                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                 mamba_value = (
                     req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
@@ -342,12 +337,7 @@ class MambaComponent(TreeComponent):
                 insert_result.mamba_exist if insert_result is not None else True
             )
             if self.enable_mamba_extra_buffer:
-                if self.enable_mamba_extra_buffer_lazy:
-                    keep_idx = req.mamba_next_track_idx
-                else:
-                    keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
+                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
             else:
                 keep_idx = None
             if mamba_exist:

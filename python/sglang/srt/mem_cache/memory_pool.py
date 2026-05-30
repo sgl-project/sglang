@@ -646,6 +646,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         else:
             return mamba_next_track_idx
 
+    def get_mamba_ping_pong_keep_idx(self, req: "Req") -> int:
+        """Return the ping-pong index holding the most recent tracked state.
+
+        In lazy mode the valid state stays at next_track_idx (no eager swap).
+        In normal mode it is at the "other" index (swapped after each track).
+        """
+        if self.enable_mamba_extra_buffer_lazy:
+            return req.mamba_next_track_idx
+        return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+
     def _alloc_ping_pong_buffer(self, req: "Req"):
         """Allocate the ping-pong track buffer for a new request.
 
@@ -688,12 +698,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         In lazy mode the valid state is at next_track_idx; in normal mode
         it is at the "other" index.
         """
-        if self.enable_mamba_extra_buffer_lazy:
-            donate_idx = req.mamba_next_track_idx
-        else:
-            donate_idx = self.get_mamba_ping_pong_other_idx(
-                req.mamba_next_track_idx
-            )
+        donate_idx = self.get_mamba_ping_pong_keep_idx(req)
         mamba_value_donated = (
             req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
