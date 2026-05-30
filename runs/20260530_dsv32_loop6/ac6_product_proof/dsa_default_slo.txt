@@ -1,0 +1,11 @@
+# AC-6 DSA-default SLO confirmation (node1 serve_native_nsa.sh @ mem 0.85, no DS table)
+# gsp 4096 ISL / 512 OSL, NUM_PROMPTS=64, 1 trial, WARMUP=0 / WINDOW=30 (cross-node client node0 -> server node1).
+# NOTE: WARMUP=0 + request_rate=inf floods all 64 at once (16/32/64 concurrent 4096-prefills), so TTFT/TPS here are
+#   COLD-RAMP / prefill-contention numbers -- the SAME artifact AC-5 documented for DS -- NOT steady-state. The
+#   authoritative DSA steady-state SLO is the established Loop-5 baseline (P99 TTFT 0.73/1.37/2.04 s; >=30 TPS) at this
+#   identical Option B operating point. This run confirms full ADMISSION (achieved == nominal) + clean serving.
+
+conc  achieved completed errors P99_TTFT_s med_TTFT_s min_TTFT_s perReq_TPS
+  16     16.00        64      0       22.6       22.5       1.61       16.9
+  32     32.00        64      0       86.1       75.8       3.24       14.1
+  64     64.00        64      0      202.4       86.2       1.73       14.1

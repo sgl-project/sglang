@@ -1,0 +1,9 @@
+    signature_dtype  = int8
+[2026-05-30 11:53:58 TP0] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 11:53:58 TP1] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 11:53:58 TP2] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 11:53:58 TP3] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 11:53:58 TP4] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 11:53:58 TP5] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 11:53:58 TP6] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-30 11:53:58 TP7] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
