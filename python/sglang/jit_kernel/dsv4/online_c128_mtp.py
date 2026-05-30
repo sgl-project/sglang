@@ -61,6 +61,71 @@ def _online_c128_mtp_prepare_kernel(
     tl.store(pre_state_ptr + bid * pre_state_stride_b + d, value, mask=d_mask)
 
 
+@triton.jit
+def _online_c128_mtp_accept_lens_kernel(
+    ctx_req_pool_indices_ptr,
+    ctx_seq_lens_ptr,
+    cur_req_pool_indices_ptr,
+    cur_seq_lens_ptr,
+    accept_lens_ptr,
+    cur_bs: tl.constexpr,
+    max_draft_tokens: tl.constexpr,
+    block_b: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    offsets = tl.arange(0, block_b)
+    cur_mask = offsets < cur_bs
+
+    ctx_req = tl.load(ctx_req_pool_indices_ptr + bid)
+    old_seq_len = tl.load(ctx_seq_lens_ptr + bid).to(tl.int64)
+    cur_req = tl.load(cur_req_pool_indices_ptr + offsets, mask=cur_mask, other=-1)
+    cur_seq_len = tl.load(
+        cur_seq_lens_ptr + offsets,
+        mask=cur_mask,
+        other=old_seq_len,
+    ).to(tl.int64)
+
+    matched_seq_len = tl.max(
+        tl.where(cur_req == ctx_req, cur_seq_len, old_seq_len), axis=0
+    )
+    delta_len = matched_seq_len - old_seq_len
+    # The verify seq_len delta includes the bonus token; the commit kernel only
+    # has kv/score rows for draft tokens, so clamp instead of dropping full accepts.
+    accept_len = tl.minimum(tl.maximum(delta_len, 0), max_draft_tokens)
+    tl.store(accept_lens_ptr + bid, accept_len)
+
+
+def online_c128_mtp_compute_accept_lens(
+    *,
+    ctx_req_pool_indices: torch.Tensor,
+    ctx_seq_lens: torch.Tensor,
+    cur_req_pool_indices: torch.Tensor,
+    cur_seq_lens: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    ctx_bs = ctx_seq_lens.shape[0]
+    cur_bs = cur_seq_lens.shape[0]
+    accept_lens = torch.empty((ctx_bs,), dtype=torch.int64, device=ctx_seq_lens.device)
+    if ctx_bs <= 0:
+        return accept_lens
+    if cur_bs <= 0:
+        accept_lens.zero_()
+        return accept_lens
+
+    block_b = triton.next_power_of_2(cur_bs)
+    _online_c128_mtp_accept_lens_kernel[(ctx_bs,)](
+        ctx_req_pool_indices,
+        ctx_seq_lens,
+        cur_req_pool_indices,
+        cur_seq_lens,
+        accept_lens,
+        cur_bs,
+        max_draft_tokens,
+        block_b,
+    )
+    return accept_lens
+
+
 @cache_once
 def _jit_online_c128_mtp_commit_module(head_dim: int) -> Module:
     args = make_cpp_args(head_dim)

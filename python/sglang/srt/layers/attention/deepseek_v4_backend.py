@@ -50,6 +50,7 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 )
 from sglang.jit_kernel.dsv4.online_c128_mtp import (
     online_c128_mtp_commit,
+    online_c128_mtp_compute_accept_lens,
     online_c128_mtp_prepare,
 )
 from sglang.srt.layers.dp_attention import (
@@ -658,19 +659,13 @@ class DeepseekV4AttnBackend(
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
             return
 
-        cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
-        cur_seq_lens = seq_lens.to(ctx.seq_lens.device)
-        matches = ctx.req_pool_indices[:, None] == cur_req_pool_indices[None, :]
-        matched_seq_lens = torch.where(
-            matches,
-            cur_seq_lens[None, :].to(ctx.seq_lens.dtype),
-            ctx.seq_lens[:, None],
-        ).max(dim=1).values
-        delta_lens = matched_seq_lens.to(torch.int64) - ctx.seq_lens.to(torch.int64)
-        valid_lens = (delta_lens >= 0) & (
-            delta_lens <= int(self.speculative_num_draft_tokens)
+        accept_lens = online_c128_mtp_compute_accept_lens(
+            ctx_req_pool_indices=ctx.req_pool_indices,
+            ctx_seq_lens=ctx.seq_lens,
+            cur_req_pool_indices=req_pool_indices.to(ctx.req_pool_indices.device),
+            cur_seq_lens=seq_lens.to(ctx.seq_lens.device),
+            max_draft_tokens=int(self.speculative_num_draft_tokens),
         )
-        accept_lens = torch.where(valid_lens, delta_lens, torch.zeros_like(delta_lens))
         self.update_online_c128_state_after_mtp_verify(
             accept_lens=accept_lens,
             model=self.model_runner.model,
