@@ -33,6 +33,7 @@ export const DeepSeekV4Deployment = () => {
         { id: "gb300", label: "GB300", default: false },
         { id: "h200",  label: "H200",  default: false },
         { id: "h100",  label: "H100",  default: false },
+        { id: "h20",   label: "H20",   default: false, subtitle: "alias of H100" },
       ],
     },
     modelSize: {
@@ -98,7 +99,12 @@ export const DeepSeekV4Deployment = () => {
   };
 
   // Hopper GPUs supporting the SGLang FP8 repackaging path.
-  const FP8_SUPPORTED_HARDWARE = new Set(["h100", "h200"]);
+  // H20 is FP8-only (FP4 Marlin path is greyed out below — H20 96 GB doesn't
+  // have the headroom for the FP4-dequantize-to-FP16 workspace).
+  const FP8_SUPPORTED_HARDWARE = new Set(["h100", "h200", "h20"]);
+  // Hardware that ONLY supports SGLang FP8 (FP4 selection is auto-flipped /
+  // greyed out).
+  const FP8_ONLY_HARDWARE = new Set(["h20"]);
 
   // Internal "effective hardware" id used by HW_SIZE_SPEC / VERIFIED_RECIPES.
   // Combines the user-facing hardware choice with the Quantization axis:
@@ -106,10 +112,12 @@ export const DeepSeekV4Deployment = () => {
   //   h200 + fp8 → h200       (sgl-project FP8 ckpts on H200)
   //   h100 + fp4 → h100       (Marlin FP4 path on H100)
   //   h100 + fp8 → h100-fp8   (Flash-only FP8 path on H100)
+  //   h20  + *   → h20-fp8    (Flash-only PP=8 single-node FP8 path on H20)
   //   anything else → hardware unchanged
   const effHw = (hardware, quantization) => {
     if (hardware === "h200") return quantization === "fp8" ? "h200" : "h200-fp4";
     if (hardware === "h100") return quantization === "fp8" ? "h100-fp8" : "h100";
+    if (hardware === "h20")  return "h20-fp8";
     return hardware;
   };
 
@@ -124,7 +132,7 @@ export const DeepSeekV4Deployment = () => {
   // low-latency / balanced / cp recipes, and on PD-Disagg (the cookbook's
   // PD command builder doesn't emit the megamoe backend / env vars yet).
   const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "balanced", "cp", "pd-disagg"]);
-  const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200"]);
+  const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200", "h20"]);
   const isMegamoeUnsupported = (vals) =>
     MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
     MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe);
@@ -160,6 +168,15 @@ export const DeepSeekV4Deployment = () => {
           : it
       );
     }
+    if (option.name === "recipe" && eff === "h20-fp8") {
+      // H20 single-node PP=8 path only has low-latency / balanced /
+      // max-throughput verified — cp and pd-disagg are not exposed.
+      return option.items.map((it) =>
+        MARLIN_UNSUPPORTED_RECIPES.has(it.id)
+          ? { ...it, disabled: true, disabledReason: "Not supported on H20 (SGLang FP8)" }
+          : it
+      );
+    }
     if (option.name === "megamoe" && vals && isMegamoeUnsupported(vals)) {
       const reason = MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware)
         ? "MegaMoE is only supported on Blackwell"
@@ -180,7 +197,14 @@ export const DeepSeekV4Deployment = () => {
     if (option.name === "quantization" && vals && !FP8_SUPPORTED_HARDWARE.has(vals.hardware)) {
       return option.items.map((it) =>
         it.id === "fp8"
-          ? { ...it, disabled: true, disabledReason: "SGLang FP8 is only available on H100 / H200" }
+          ? { ...it, disabled: true, disabledReason: "SGLang FP8 is only available on H100 / H200 / H20" }
+          : it
+      );
+    }
+    if (option.name === "quantization" && vals && FP8_ONLY_HARDWARE.has(vals.hardware)) {
+      return option.items.map((it) =>
+        it.id === "fp4"
+          ? { ...it, disabled: true, disabledReason: "H20 only ships the SGLang FP8 recipe in this cookbook" }
           : it
       );
     }
@@ -188,6 +212,13 @@ export const DeepSeekV4Deployment = () => {
       return option.items.map((it) =>
         it.id === "big"
           ? { ...it, disabled: true, disabledReason: "H100 SGLang FP8 only ships a Flash variant" }
+          : it
+      );
+    }
+    if (option.name === "modelSize" && vals && vals.hardware === "h20") {
+      return option.items.map((it) =>
+        it.id === "big"
+          ? { ...it, disabled: true, disabledReason: "H20 (SGLang FP8) only ships a Flash variant" }
           : it
       );
     }
@@ -237,6 +268,15 @@ export const DeepSeekV4Deployment = () => {
       ) {
         next.quantization = "fp4";
       }
+      // Switching to FP8-only hardware (e.g. H20) while FP4 is selected:
+      // auto-flip to FP8.
+      if (
+        optionName === "hardware" &&
+        FP8_ONLY_HARDWARE.has(value) &&
+        next.quantization === "fp4"
+      ) {
+        next.quantization = "fp8";
+      }
       // H100 + SGLang FP8 only supports Flash; auto-flip Pro → Flash when
       // entering that combo (via hardware or quantization switch).
       if (
@@ -246,13 +286,22 @@ export const DeepSeekV4Deployment = () => {
       ) {
         next.modelSize = "small";
       }
-      // Switching to a Marlin (FP4) Hopper path while cp / pd-disagg is
-      // selected: fall back to low-latency since those recipes are not
-      // supported on Marlin.
+      // H20 also only ships Flash in this cookbook — auto-flip Pro → Flash.
+      if (
+        optionName === "hardware" &&
+        next.hardware === "h20" &&
+        next.modelSize === "big"
+      ) {
+        next.modelSize = "small";
+      }
+      // Switching to a Marlin (FP4) Hopper path or H20 FP8 path while
+      // cp / pd-disagg is selected: fall back to low-latency since those
+      // recipes are not supported on Marlin / on the H20 PP=8 single-node
+      // recipe.
       const nextEff = effHw(next.hardware, next.quantization);
       if (
         (optionName === "hardware" || optionName === "quantization") &&
-        (MARLIN_EFFHW.has(nextEff) || nextEff === "h100-fp8") &&
+        (MARLIN_EFFHW.has(nextEff) || nextEff === "h100-fp8" || nextEff === "h20-fp8") &&
         MARLIN_UNSUPPORTED_RECIPES.has(next.recipe)
       ) {
         next.recipe = "low-latency";
@@ -342,6 +391,11 @@ export const DeepSeekV4Deployment = () => {
     // the generator. TP=8 single-node uses the same sgl-project FP8 ckpt as
     // H200; the Flash/balanced/max-throughput recipes use TP=8 DP=8 + DeepEP.
     "h100-fp8|small": { slug: "sgl-project/DeepSeek-V4-Flash-FP8", tp: 8, multinode: false },
+    // H20 (SGLang FP8) ships Flash only with a single-node PP=8 / DP=1 layout
+    // (H20 96 GB has no room for TP=8 + KV pool). Same sgl-project FP8 ckpt as
+    // H200 / H100; the same launch command is reused for low-latency, balanced
+    // and max-throughput recipes — see DeepSeek-V4.mdx §5.2.2 for details.
+    "h20-fp8|small":  { slug: "sgl-project/DeepSeek-V4-Flash-FP8", tp: 1, pp: 8, multinode: false },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
@@ -412,6 +466,9 @@ export const DeepSeekV4Deployment = () => {
     "h100-fp8|small|low-latency",
     "h100-fp8|small|balanced",
     "h100-fp8|small|max-throughput",
+    "h20-fp8|small|low-latency",
+    "h20-fp8|small|balanced",
+    "h20-fp8|small|max-throughput",
   ]);
   // Recipes whose command is intentionally not yet provided (e.g. blocked by an
   // upstream limitation). Showing a minimal placeholder is friendlier to users
@@ -596,6 +653,47 @@ export const DeepSeekV4Deployment = () => {
       return VERIFIED_RECIPES.has(verifyKey)
         ? h100WithNote
         : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(h100WithNote)}`;
+    }
+
+    // H20 (SGLang FP8) path: single-node Flash-only, PP=8 / DP=1, no TP.
+    // The same launch command is reused for low-latency / balanced /
+    // max-throughput; only the upstream client-side concurrency differs
+    // (see DeepSeek-V4.mdx §5.2.2 for the matching bench_serving commands).
+    //   Envs: SGLANG_DSV4_FP4_EXPERTS=0  (keep experts FP8 end-to-end)
+    //         SGLANG_JIT_DEEPGEMM_PRECOMPILE=1  (warm DeepGEMM JIT on startup)
+    if (hardware === "h20-fp8") {
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
+
+      const h20EnvBlock =
+        "SGLANG_DSV4_FP4_EXPERTS=0 \\\nSGLANG_JIT_DEEPGEMM_PRECOMPILE=1 \\\n";
+      const h20Flags = [
+        "  --trust-remote-code",
+        `  --model-path ${slug}`,
+        "  --mem-fraction-static 0.8",
+        `  --tp-size ${spec.tp}`,
+        `  --pp-size ${spec.pp}`,
+        "  --dp-size 1",
+        "  --enable-dp-attention",
+        "  --max-running-requests 256",
+      ];
+      if (toolcall === "enabled") h20Flags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") h20Flags.push("  --reasoning-parser deepseek-v4");
+      if (hicache === "l2") {
+        h20Flags.push("  --enable-hierarchical-cache");
+        h20Flags.push("  --hicache-ratio 2");
+        h20Flags.push("  --hicache-size 0");
+        h20Flags.push("  --hicache-write-policy write_through");
+        h20Flags.push("  --hicache-io-backend direct");
+        h20Flags.push("  --hicache-mem-layout page_first_direct");
+      }
+      h20Flags.push("  --host 0.0.0.0");
+      h20Flags.push("  --port 30000");
+
+      const h20Cmd = `${h20EnvBlock}sglang serve \\\n${h20Flags.join(" \\\n")}`;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? h20Cmd
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(h20Cmd)}`;
     }
 
     // ---- env ----
