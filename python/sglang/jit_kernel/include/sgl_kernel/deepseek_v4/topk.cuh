@@ -147,10 +147,11 @@ SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint3
 
 /// One batch element's worth of work. `emit(pos, raw_idx)` writes the selected raw
 /// index to output slot `pos`; `transform_output` then applies the page-table
-/// transform in a separate pass.
+/// transform in a separate pass (and records the raw index in `raw_out` if set).
 struct TopKProblem {
   const float* __restrict__ in;
-  int32_t* __restrict__ out;  // page_indices [topk]
+  int32_t* __restrict__ out;      // page_indices [topk]
+  int32_t* __restrict__ raw_out;  // optional raw (pre-transform) indices [topk]; nullptr if unused
   const int32_t* __restrict__ page_table;
   uint32_t topk;
   uint32_t seq_len;
@@ -164,6 +165,7 @@ struct TopKProblem {
     out[pos] = static_cast<int32_t>(raw_idx);
   }
   SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
+    if (raw_out != nullptr) raw_out[t] = raw;
     out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
   }
 };

@@ -53,6 +53,7 @@ struct TopKLaunchParams {
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
+  int32_t* __restrict__ raw_indices;  // optional raw (pre-transform) indices output; nullptr if unused
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
@@ -77,6 +78,7 @@ struct TopKLaunchParams {
     return TopKProblem{
         .in = scores + batch_id * score_stride,
         .out = page_indices + batch_id * k,
+        .raw_out = raw_indices != nullptr ? raw_indices + batch_id * k : nullptr,
         .page_table = page_table + batch_id * page_table_stride,
         .topk = topk,
         .seq_len = seq_len,
@@ -338,7 +340,8 @@ struct CombinedTopKKernel {
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::TensorView metadata) {
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -354,6 +357,12 @@ struct CombinedTopKKernel {
     TensorMatcher({B, -1}).with_strides({P, 1}).with_dtype<int32_t>().with_device(device_).verify(page_table);
     TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(page_indices);
     TensorMatcher({Bp1, 2}).with_dtype<int32_t>().with_device(device_).verify(metadata);
+
+    int32_t* raw_indices_ptr = nullptr;
+    if (raw_indices.has_value()) {
+      TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(raw_indices.value());
+      raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
+    }
 
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
@@ -377,6 +386,7 @@ struct CombinedTopKKernel {
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
+        .raw_indices = raw_indices_ptr,
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),

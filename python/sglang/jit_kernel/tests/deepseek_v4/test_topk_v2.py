@@ -202,5 +202,46 @@ def test_topk_v2_ragged(batch: int, shape: str, k: int, per_row_pt: bool) -> Non
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, lengths.cpu(), k)
 
 
+@pytest.mark.parametrize("page_mode", ["identity", "perm"])
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (8, 256),  # trivial
+        (8, 4096),  # register
+        (4, 131072),  # fused small-batch cluster
+        (64, 131072),  # persistent cluster + main<3> epilogue
+        (256, 131072),  # non-cluster streaming
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_raw_indices(batch: int, seq: int, page_mode: str) -> None:
+    """The optional raw-index output must be the pre-transform position of each
+    transformed output slot (out[j] == page_to_indices(raw[j])), and -1 aligns."""
+    k = 512
+    torch.manual_seed(batch * 131 + seq)
+    device = "cuda"
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, page_mode, device)
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=device)
+    raw = torch.full((batch, k), -1, dtype=torch.int32, device=device)
+
+    metadata = plan_topk_v2(seq_lens)
+    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
+    torch.cuda.synchronize()
+
+    out_cpu, raw_cpu = out.cpu().tolist(), raw.cpu().tolist()
+    for i in range(batch):
+        for j in range(k):
+            o, r = out_cpu[i][j], raw_cpu[i][j]
+            if o == -1:
+                assert r == -1, f"b={i} j={j}: out=-1 but raw={r}"
+            else:
+                inv = (int(inv_cpu[i][o >> PAGE_BITS]) << PAGE_BITS) | (o & PAGE_MASK)
+                assert r == inv, f"b={i} j={j}: raw={r} != inverse(out)={inv}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
