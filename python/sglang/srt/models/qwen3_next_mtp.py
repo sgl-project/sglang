@@ -58,6 +58,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
         self.pp_group = get_pp_group()
         # self.determine_num_fused_shared_experts("Qwen3NextForCausalLMMTP")
+        # MTP head has no shared-expert MoE layer (only the target model does),
+        # so the fusion path that Qwen3NextForCausalLM.__init__ enables must be
+        # disabled here — we skip the parent __init__ entirely above.
+        self.num_fused_shared_experts = 0
+        self.enable_shared_expert_fusion = False
 
         # currently based on the provided ckpt, we:
         # (1) do not use_dedicated_mtp_embeddings provided in ckpt since not provided and directly use the target model embeddings
