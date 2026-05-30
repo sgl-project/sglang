@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patcher.utils import wrap_method
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
@@ -36,6 +37,7 @@ def install_canary(
         "when canary is enabled"
     )
 
+    perturb_config = PerturbConfig.from_env()
     device = torch.device(model_runner.device)
     # EAGLE draft worker pools rotate input_ids so slot ``p`` stores K/V for the token at position ``p+1``;
     # target pools have no such shift. Threaded into the plan-side expected-token gather kernel.
@@ -56,6 +58,7 @@ def install_canary(
     speculative_num_steps = int(server_args.speculative_num_steps or 1)
     manager = CanaryManager(
         config=config,
+        perturb_config=perturb_config,
         buffer_groups=buffer_groups,
         device=device,
         req_to_token_pool=model_runner.req_to_token_pool,
@@ -71,11 +74,12 @@ def install_canary(
     # Single-line summary of every knob that controls canary behavior at boot time.
     # Disaggregation mode is included so PD logs are unambiguous about which side this is.
     logger.info(
-        "install_canary: disaggregation_mode=%s config=%s "
+        "install_canary: disaggregation_mode=%s config=%s perturb_config=%s "
         "launch_capacities=%s n_buffer_groups=%d buffer_group_kinds=%s "
         "swa_window_size=%d speculative_num_steps=%d",
         server_args.disaggregation_mode,
         config,
+        perturb_config,
         launch_capacities,
         len(buffer_groups),
         [g.kind.name for g in buffer_groups],
