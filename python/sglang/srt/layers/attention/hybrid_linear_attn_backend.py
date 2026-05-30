@@ -403,8 +403,15 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        self.forward_metadata = self._capture_metadata(
-            bs, req_pool_indices, forward_mode, spec_info
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=None,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -539,9 +546,12 @@ class MambaAttnBackendBase(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        num_padding = torch.count_nonzero(
-            seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-        )
+        if seq_lens_cpu is None:
+            num_padding = 0
+        else:
+            num_padding = torch.count_nonzero(
+                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+            )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -576,13 +586,17 @@ class MambaAttnBackendBase(AttentionBackend):
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and self.topk > 1:
-            bs_without_pad = spec_info.retrieve_next_token.shape[0]
-            self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
-                spec_info.retrieve_next_token
-            )
-            self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
-                spec_info.retrieve_next_sibling
-            )
+            if (
+                spec_info is not None
+                and getattr(spec_info, "retrieve_next_token", None) is not None
+            ):
+                bs_without_pad = spec_info.retrieve_next_token.shape[0]
+                self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
+                    spec_info.retrieve_next_token
+                )
+                self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
+                    spec_info.retrieve_next_sibling
+                )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -703,13 +717,15 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
-        self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata,
-            seq_lens,
-            is_target_verify=forward_mode.is_target_verify(),
-            draft_token_num=draft_token_num,
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=None,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -811,8 +827,17 @@ class HybridLinearAttnBackend(AttentionBackend):
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
-        # Dispatch by the layer's runtime type
+        # Explicit linear-attention subclass → strong linear signal (KDA, GDN,
+        # Qwen3-Next, Qwen3.5 main linear layers).
         if isinstance(layer, RadixLinearAttention):
+            return False
+        # Some hybrid models (Ling-2.5/2.6) wrap their linear layers in plain
+        # `RadixAttention` rather than `RadixLinearAttention`. Those wrappers
+        # set `_is_linear_attention=True` on the attn module so we can
+        # distinguish them from full-attention RadixAttention instances —
+        # including MTP/NEXTN draft layers, which are full and must default to
+        # the full-attn path.
+        if layer is not None and getattr(layer, "_is_linear_attention", False):
             return False
         if isinstance(layer, RadixAttention):
             return True
@@ -823,6 +848,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         return layer_id in self.full_attn_layers
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2 only runs full-attn layers in the draft model,
+            # so skip linear/mamba backend metadata which requires query_start_loc.
+            self.full_attn_backend.init_forward_metadata(forward_batch)
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
