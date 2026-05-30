@@ -9382,6 +9382,210 @@ class TestCompactInt8Signatures(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(gs.selected_indices, eager))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for decode-scoring microbench")
+    def test_decode_scoring_overhead_within_tps_budget(self):
+        """The int8 dequant/scale overhead must not push DS below the 30 TPS/req
+        SLO: per-token scoring overhead (61 layers) must stay under the Loop-5
+        33.9->30 TPS margin (~3.83 ms/token). See
+        runs/20260530_dsv32_loop6/decode_scoring_microbench.md for the full run."""
+        from sglang.srt.layers.attention.double_sparsity import selection_kernel as sk
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import allocate_graph_state
+        device = torch.device("cuda")
+        H, D, head_dim, top_k, seq, bs = 16, 16, 128, 2048, 4608, 64
+        num_layers, budget_ms = 61, (1000.0 / 30.0) - (1000.0 / 33.9)  # ~3.83 ms/token
+        max_tokens = bs * seq + 64
+
+        def build(dtype):
+            return self._alloc_table(dtype, L=1, T=max_tokens, H=H, D=D, device=device)
+
+        def timed(table, scales):
+            from sglang.srt.layers.attention.double_sparsity.token_label_write import token_label_write
+            k_nope = torch.randn(max_tokens, H, head_dim, dtype=torch.float16, device=device)
+            ch = torch.stack([torch.randperm(head_dim)[:D] for _ in range(H)]).to(torch.int32).to(device)
+            token_label_write(table.signatures, table.written, 0,
+                              torch.arange(max_tokens, dtype=torch.int64, device=device), k_nope, ch, scales=table.scales)
+            ch_L = ch.unsqueeze(0); ch_w = torch.ones(1, H, D, dtype=torch.float32, device=device)
+            queries = torch.randn(bs, H, head_dim, dtype=torch.float16, device=device)
+            rpi = torch.arange(bs, dtype=torch.int32, device=device)
+            rtt = (torch.arange(bs * seq, dtype=torch.int32, device=device).reshape(bs, seq)) % max_tokens
+            seq_lens = torch.full((bs,), seq, dtype=torch.int32, device=device)
+            gs = allocate_graph_state(max_bs=bs, max_top_k=top_k, max_seq_len=seq, num_local_heads=H, label_dim=D, device=device)
+            def call():
+                sk.retrieve_topk_graph_safe(queries=queries, token_signatures=table.signatures, written=table.written,
+                    channel_selection=ch_L, channel_weights=ch_w, layer_id=0, req_pool_indices=rpi, req_to_token=rtt,
+                    seq_lens=seq_lens, max_seq_len=seq, max_top_k=top_k, out_indices=gs.selected_indices,
+                    out_lengths=gs.valid_lengths, scratch_scores=gs.scratch_scores, scratch_topk_values=gs.scratch_topk_values,
+                    scratch_topk_indices=gs.scratch_topk_indices, scratch_invalid_mask=gs.scratch_invalid_mask,
+                    scratch_sorted_vals=gs.scratch_sorted_vals, scratch_boundary=gs.scratch_boundary,
+                    scratch_valid_i64=gs.scratch_valid_i64, scratch_pv_mask=gs.scratch_pv_mask,
+                    scratch_throwaway_idx=gs.scratch_throwaway_idx, token_scales=table.scales)
+            for _ in range(10): call()
+            torch.cuda.synchronize()
+            st = torch.cuda.Event(enable_timing=True); en = torch.cuda.Event(enable_timing=True)
+            st.record()
+            for _ in range(50): call()
+            en.record(); torch.cuda.synchronize()
+            return st.elapsed_time(en) / 50.0
+
+        fp16_ms = timed(build(torch.float16), None)
+        int8_ms = timed(build(torch.int8), True)
+        overhead_per_token = (int8_ms - fp16_ms) * num_layers
+        self.assertLess(
+            overhead_per_token, budget_ms,
+            f"int8 decode-scoring overhead {overhead_per_token:.3f} ms/token exceeds "
+            f"the {budget_ms:.3f} ms/token TPS budget (fp16={fp16_ms:.4f} int8={int8_ms:.4f} ms/call)",
+        )
+
+
+class TestCompactScaleSidecarConsumers(unittest.TestCase):
+    """Loop-6 R2: the int8 compact label is `signatures * scales`, so every
+    signature consumer (sanity probe, radix-capture proof, radix fingerprint)
+    must be scale-aware — otherwise it can prove the wrong thing.
+    """
+
+    def _bound_compact_selector(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import ChannelMask
+        from sglang.srt.layers.attention.double_sparsity.token_label_table import (
+            allocate_token_label_table,
+        )
+        cfg = parse_double_sparsity_config(
+            '{"channel_mask_path": "/tmp/cm.safetensors", "signature_dtype": "int8"}'
+        )
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
+        )
+        table = allocate_token_label_table(
+            num_layers_local=1, max_tokens=512, num_heads_local=2, label_dim=4,
+            page_size=64, dtype=torch.int8, device=torch.device("cpu"),
+        )
+        sel_t = torch.zeros(1, 2, 4, dtype=torch.int32)
+        sel_t[0, 0, 0] = 3; sel_t[0, 1, 0] = 7
+        sel_t[0, 0, 1] = 4; sel_t[0, 0, 2] = 5; sel_t[0, 0, 3] = 6
+        sel_t[0, 1, 1] = 8; sel_t[0, 1, 2] = 9; sel_t[0, 1, 3] = 10
+        mask = ChannelMask(
+            channel_selection=sel_t, channel_weights=torch.ones(1, 2, 4, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=64, page_size=64,
+            label_dim=4, content_sha256="x",
+        )
+        sel.bind_runtime_data(table, mask)
+        return sel, mask, table, sel_t
+
+    # ---------- startup_sanity_probe is scale-aware ----------
+    def test_compact_sanity_probe_finds_needle_and_restores_scales(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            startup_sanity_probe,
+        )
+        sel, mask, table, _ = self._bound_compact_selector()
+        scales_before = table.scales.clone()
+        r = startup_sanity_probe(mask, sel, haystack_pages=8, page_size=64, needle_page=4)
+        self.assertTrue(r.passed, f"compact probe should find planted needle; got {r}")
+        self.assertEqual(r.score, 1.0)
+        # Probe must restore signatures AND scales.
+        self.assertTrue(torch.equal(table.signatures[0, :512], torch.zeros_like(table.signatures[0, :512])))
+        self.assertTrue(torch.equal(table.scales, scales_before))
+
+    def test_compact_scorer_requires_scales(self):
+        """The planted compact field is flat in int8 and discriminates only via
+        scales — so the needle is selected only when token_scales is passed."""
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+        _, _, table, sel_t = self._bound_compact_selector()
+        H, T, need = 2, 512, 256
+        table.signatures.zero_(); table.signatures[0, :, :, 0] = 1  # equal int8 magnitude
+        table.scales[0, :] = 0.1; table.scales[0, need] = 10.0
+        table.written[0, :] = True
+        q = torch.zeros(1, H, 64)
+        for h in range(H):
+            q[0, h, int(sel_t[0, h, 0])] = 1.0
+        pv = torch.ones(1, T, dtype=torch.bool)
+        kw = dict(token_signatures=table.signatures, written=table.written,
+                  channel_selection=sel_t, channel_weights=torch.ones(1, 2, 4),
+                  layer_id=0, max_top_k=128, per_request_valid=pv, queries=q)
+        idx_none, _ = retrieve_topk_via_labels(token_scales=None, **kw)
+        idx_scl, _ = retrieve_topk_via_labels(token_scales=table.scales, **kw)
+        self.assertNotIn(need, idx_none[0].tolist())  # flat int8 -> needle not found
+        self.assertIn(need, idx_scl[0].tolist())       # scales -> needle found
+
+    # ---------- radix-capture proof compares scales ----------
+    def _capture(self, scales):
+        from sglang.srt.layers.attention.double_sparsity import radix_fixture_capture as rc
+        import os
+        os.environ["SGLANG_DS_RADIX_FIXTURE_CAPTURE"] = "1"
+        L, T, H, D = 1, 8, 2, 4
+        sigs = torch.ones(L, T, H, D, dtype=torch.int8)
+        written = torch.ones(L, T, dtype=torch.bool)
+        rtt = torch.arange(T, dtype=torch.int32).reshape(1, T)
+        return rc.build_request_capture(
+            signatures=sigs, written=written, req_to_token=rtt,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([T], dtype=torch.int32), scales=scales,
+        )[0]
+
+    def test_radix_capture_diverges_on_scale_only_change(self):
+        from sglang.srt.layers.attention.double_sparsity import radix_fixture_capture as rc
+        sc_a = torch.full((1, 8, 2), 0.1)
+        sc_b = sc_a.clone(); sc_b[0, 3] = 9.9  # equal int8 bytes, different scale at token 3
+        cold = self._capture(sc_a); warm = self._capture(sc_b)
+        res = rc.compare_cached_prefix(cold=cold, warm=warm, cached_tokens=8)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["divergence_kind"], "scale")
+        self.assertEqual(res["first_diverging_position"], 3)
+        same = rc.compare_cached_prefix(cold=cold, warm=self._capture(sc_a), cached_tokens=8)
+        self.assertTrue(same["ok"])
+
+    def test_radix_capture_scale_mode_mismatch_diverges(self):
+        from sglang.srt.layers.attention.double_sparsity import radix_fixture_capture as rc
+        compact = self._capture(torch.full((1, 8, 2), 0.1))
+        fp16 = self._capture(None)  # no scale keys recorded
+        res = rc.compare_cached_prefix(cold=compact, warm=fp16, cached_tokens=8)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["divergence_kind"], "scale")
+
+    # ---------- radix fingerprint binds signature_dtype (fail-closed) ----------
+    def test_fp16_radix_artifact_cannot_authorize_int8_boot(self):
+        import json, tempfile, os
+        from types import SimpleNamespace
+        from sglang.srt.layers.attention.double_sparsity import validator as v
+
+        with tempfile.TemporaryDirectory() as d:
+            mask_path = os.path.join(d, "cm.safetensors")
+            with open(mask_path, "wb") as fh:
+                fh.write(b"deterministic-mask-bytes")
+            cfg_json = json.dumps({"channel_mask_path": mask_path, "signature_dtype": "int8"})
+            sa = SimpleNamespace(
+                enable_double_sparsity=True, disable_radix_cache=False,
+                model_path="/m", tp_size=8, page_size=64, kv_cache_dtype="fp8_e4m3",
+                double_sparsity_config=cfg_json,
+            )
+            # The live (int8) fingerprint; the recorded artifact says fp16.
+            current = v.radix_fixture_config_fingerprint(sa)
+            self.assertEqual(current["signature_dtype"], "int8")
+            recorded = dict(current); recorded["signature_dtype"] = "fp16"
+            artifact = os.path.join(d, "state.json")
+            with open(artifact, "w") as fh:
+                json.dump({
+                    "schema": v.RADIX_FIXTURE_STATE_SCHEMA,
+                    "label_capture_passed": True, "fp8_scale_stability_passed": True,
+                    "config": recorded,
+                }, fh)
+            sa.double_sparsity_radix_fixture_artifact = artifact
+            with self.assertRaises(ValueError) as ctx:
+                v.apply_radix_fixture_artifact(sa)
+            self.assertIn("signature_dtype", str(ctx.exception))
+
+    # ---------- AC-6: DSA-default boot allocates no DS table ----------
+    def test_dsa_default_finalize_bind_is_noop_no_table(self):
+        from types import SimpleNamespace
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+        sentinel = object()
+        called = []
+        fake = SimpleNamespace(use_double_sparsity=False, _ds_deferred_bind_args=sentinel)
+        fake._bind_double_sparsity_runtime_data = lambda **kw: called.append(kw)
+        DeepseekV2AttentionMLA.finalize_double_sparsity_bind(fake)
+        self.assertEqual(called, [])  # DS off -> bind not invoked -> no TokenLabelTable allocated
+        self.assertIs(fake._ds_deferred_bind_args, sentinel)  # early return, untouched
+
 
 if __name__ == "__main__":
     unittest.main()

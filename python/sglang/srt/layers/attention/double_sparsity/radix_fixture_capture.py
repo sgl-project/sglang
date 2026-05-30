@@ -139,6 +139,7 @@ def record_table_snapshot(
     written: torch.Tensor,
     slots: torch.Tensor,
     label: str = "snapshot",
+    scales: Optional[torch.Tensor] = None,
 ) -> None:
     """Append a post-forward snapshot of the table's label rows for
     ``slots``, broken down per local layer.
@@ -146,6 +147,11 @@ def record_table_snapshot(
     The fixture calls this once after each paired request completes so
     the warm-vs-cold comparison can be by-slot, by-layer, with no
     sensitivity to ordering of intervening writes.
+
+    ``scales`` (``[L, T, H]``) is the int8 compact path's per-vector scale;
+    when provided, the semantic label is ``signatures * scales``, so its
+    per-layer SHA is recorded alongside the raw signature SHA — otherwise two
+    snapshots with equal int8 bytes but different scales would false-match.
     """
     if not is_capture_enabled() or _capturing_cuda_graph():
         return
@@ -159,6 +165,7 @@ def record_table_snapshot(
     L = signatures.shape[0]
     per_layer_label_sha: List[str] = []
     per_layer_written_sha: List[str] = []
+    per_layer_scale_sha: List[str] = []
     for layer_id in range(L):
         per_layer_label_sha.append(
             _tensor_bytes_sha(signatures[layer_id, slots_long])
@@ -166,6 +173,10 @@ def record_table_snapshot(
         per_layer_written_sha.append(
             _tensor_bytes_sha(written[layer_id, slots_long])
         )
+        if scales is not None:
+            per_layer_scale_sha.append(
+                _tensor_bytes_sha(scales[layer_id, slots_long.to(scales.device)])
+            )
     record = {
         "kind": "snapshot",
         "label": label,
@@ -175,6 +186,8 @@ def record_table_snapshot(
         "per_layer_label_sha": per_layer_label_sha,
         "per_layer_written_sha": per_layer_written_sha,
     }
+    if scales is not None:
+        record["per_layer_scale_sha"] = per_layer_scale_sha
     with _LOCK:
         _LOG.append(record)
 
@@ -199,6 +212,7 @@ def build_request_capture(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
+    scales: Optional[torch.Tensor] = None,
 ) -> List[Dict[str, Any]]:
     """Build per-request post-forward capture records.
 
@@ -262,7 +276,7 @@ def build_request_capture(
         slots = req_to_token[int(rpi[b].item()), :prompt_len]
         slots_long = slots.long().to(signatures.device)
         if prompt_len == 0 or slots_long.numel() == 0:
-            records.append({
+            empty = {
                 "prompt_len": prompt_len,
                 "slots_sha": _tensor_bytes_sha(slots_long),
                 "per_token_slot_sha": [],
@@ -270,12 +284,16 @@ def build_request_capture(
                 "per_layer_written_sha": ["<empty>"] * L,
                 "per_layer_written_all_true": [True] * L,
                 "per_layer_per_token_label_sha": [[] for _ in range(L)],
-            })
+            }
+            if scales is not None:
+                empty["per_layer_per_token_scale_sha"] = [[] for _ in range(L)]
+            records.append(empty)
             continue
         per_layer_label_sha: List[str] = []
         per_layer_written_sha: List[str] = []
         per_layer_written_all_true: List[bool] = []
         per_layer_per_token_label_sha: List[List[str]] = []
+        per_layer_per_token_scale_sha: List[List[str]] = []
         for layer_id in range(L):
             per_layer_label_sha.append(
                 _tensor_bytes_sha(signatures[layer_id, slots_long])
@@ -294,11 +312,19 @@ def build_request_capture(
                 _tensor_bytes_sha(layer_slice[t])
                 for t in range(layer_slice.shape[0])
             ])
+            # The int8 compact label is signatures*scales; record the scale
+            # per token so equal int8 bytes with different scales diverge.
+            if scales is not None:
+                scale_slice = scales[layer_id, slots_long.to(scales.device)]
+                per_layer_per_token_scale_sha.append([
+                    _tensor_bytes_sha(scale_slice[t])
+                    for t in range(scale_slice.shape[0])
+                ])
         per_token_slot_sha = [
             _tensor_bytes_sha(slots_long[t : t + 1])
             for t in range(slots_long.shape[0])
         ]
-        records.append({
+        record = {
             "prompt_len": prompt_len,
             "slots_sha": _tensor_bytes_sha(slots_long),
             "per_token_slot_sha": per_token_slot_sha,
@@ -306,7 +332,10 @@ def build_request_capture(
             "per_layer_written_sha": per_layer_written_sha,
             "per_layer_written_all_true": per_layer_written_all_true,
             "per_layer_per_token_label_sha": per_layer_per_token_label_sha,
-        })
+        }
+        if scales is not None:
+            record["per_layer_per_token_scale_sha"] = per_layer_per_token_scale_sha
+        records.append(record)
     return records
 
 
@@ -394,6 +423,46 @@ def compare_cached_prefix(
                         f"cold={c_layer[t]!r} warm={w_layer[t]!r}"
                     ),
                 }
+    # int8 compact path: the semantic label is signatures*scales, so equal int8
+    # bytes with different per-vector scales must diverge. Records carry
+    # per_layer_per_token_scale_sha only in compact mode; a mode mismatch between
+    # the two passes is itself a divergence.
+    c_pls = cold.get("per_layer_per_token_scale_sha")
+    w_pls = warm.get("per_layer_per_token_scale_sha")
+    if (c_pls is None) != (w_pls is None):
+        return {
+            "ok": False,
+            "first_diverging_position": -1,
+            "divergence_kind": "scale",
+            "reason": "one pass recorded compact scales and the other did not",
+        }
+    if c_pls is not None and w_pls is not None:
+        if len(c_pls) != len(w_pls):
+            return {
+                "ok": False,
+                "first_diverging_position": -1,
+                "divergence_kind": "scale",
+                "reason": (
+                    f"per_layer_per_token_scale_sha layer count mismatch: "
+                    f"cold={len(c_pls)} warm={len(w_pls)}"
+                ),
+            }
+        for layer_id in range(len(c_pls)):
+            c_layer = c_pls[layer_id]
+            w_layer = w_pls[layer_id]
+            m = min(n, len(c_layer), len(w_layer))
+            for t in range(m):
+                if c_layer[t] != w_layer[t]:
+                    return {
+                        "ok": False,
+                        "first_diverging_position": t,
+                        "divergence_kind": "scale",
+                        "reason": (
+                            f"per_layer_per_token_scale_sha differs at "
+                            f"layer={layer_id} position={t}: "
+                            f"cold={c_layer[t]!r} warm={w_layer[t]!r}"
+                        ),
+                    }
     return {
         "ok": True,
         "first_diverging_position": -1,

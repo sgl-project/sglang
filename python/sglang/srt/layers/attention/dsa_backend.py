@@ -401,6 +401,7 @@ def _ds_radix_publish_extend_snapshot(*, backend, forward_batch) -> None:
                 req_to_token=req_to_token,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
+                scales=table.scales,
             )
         )
     except Exception as exc:  # noqa: BLE001 — fixture-only branch

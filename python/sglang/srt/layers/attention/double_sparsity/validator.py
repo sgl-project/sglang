@@ -333,6 +333,11 @@ def radix_fixture_config_fingerprint(server_args: "ServerArgs") -> dict:
         "kv_cache_dtype": getattr(server_args, "kv_cache_dtype", None),
         "channel_mask_path": config.channel_mask_path,
         "channel_mask_sha256": _sha256_file(config.channel_mask_path),
+        # The compact int8 path changes the on-device label semantics
+        # (signatures * scales), so a fixture recorded under one
+        # signature_dtype must not authorize a boot under another. Older
+        # artifacts lack this key and fail closed in apply_radix_fixture_artifact.
+        "signature_dtype": config.signature_dtype,
     }
 
 

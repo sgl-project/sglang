@@ -518,14 +518,27 @@ def startup_sanity_probe(
     w_layer = mask.channel_weights[layer_id].to(device)  # [H, label_dim] fp32
 
     # Snapshot the layer's signatures and written so we can restore on exit.
+    is_compact = table.scales is not None
     sig_snapshot = table.signatures[layer_id, :haystack_tokens].clone()
     written_snapshot = table.written[layer_id, :haystack_tokens].clone()
+    scale_snapshot = (
+        table.scales[layer_id, :haystack_tokens].clone() if is_compact else None
+    )
 
     try:
         # Plant: weak baseline along label-dim 0, strong signal at needle_token.
+        # In the int8 compact path the signatures carry equal magnitude and the
+        # discrimination lives entirely in the per-vector scale, so the probe
+        # genuinely exercises the dequant-at-scoring path — a probe that ignored
+        # scales would see a flat int8 field and fail to find the needle.
         table.signatures[layer_id, :haystack_tokens].zero_()
-        table.signatures[layer_id, :haystack_tokens, :, 0] = 0.1
-        table.signatures[layer_id, needle_token, :, 0] = 10.0
+        if is_compact:
+            table.signatures[layer_id, :haystack_tokens, :, 0] = 1  # equal int8 magnitude
+            table.scales[layer_id, :haystack_tokens] = 0.1
+            table.scales[layer_id, needle_token] = 10.0
+        else:
+            table.signatures[layer_id, :haystack_tokens, :, 0] = 0.1
+            table.signatures[layer_id, needle_token, :, 0] = 10.0
         table.written[layer_id, :haystack_tokens] = True
 
         # Build a query that, when projected through (sel_layer, w_layer),
@@ -554,10 +567,13 @@ def startup_sanity_probe(
             layer_id=layer_id,
             max_top_k=probe_top_k,
             per_request_valid=per_request_valid,
+            token_scales=table.scales,
         )
     finally:
         table.signatures[layer_id, :haystack_tokens] = sig_snapshot
         table.written[layer_id, :haystack_tokens] = written_snapshot
+        if is_compact:
+            table.scales[layer_id, :haystack_tokens] = scale_snapshot
 
     row = selected_indices[0]
     length = int(valid_lengths[0])
