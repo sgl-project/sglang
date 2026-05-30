@@ -1,5 +1,6 @@
 import unittest
 
+import deep_gemm
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -111,6 +112,24 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
         diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
         diff_count = (diff > 1e-5).count_nonzero()
         assert diff_count / diff.numel() < 1e-4
+
+    def test_per_token_group_quant_fp8_ue8m0_matches_manual_rounding(self):
+        if not _is_cuda:
+            return
+
+        torch.manual_seed(0)
+        A = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+
+        A_quant_fused, scale_fused = per_token_group_quant_fp8(
+            x=A, group_size=self.group_size, scale_ue8m0=True
+        )
+        A_quant_manual, scale_manual = per_token_group_quant_fp8(
+            x=A, group_size=self.group_size, scale_ue8m0=False
+        )
+        scale_manual = deep_gemm.ceil_to_ue8m0(scale_manual)
+
+        torch.testing.assert_close(A_quant_fused, A_quant_manual, rtol=0, atol=0)
+        torch.testing.assert_close(scale_fused, scale_manual, rtol=0, atol=0)
 
 
 class TestW8A8BlockFP8Matmul(TestFP8Base):
