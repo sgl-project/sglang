@@ -119,11 +119,11 @@ export const DeepSeekV4Deployment = () => {
   const MARLIN_EFFHW = new Set(["h200-fp4", "h100"]);
   const MARLIN_LABEL = { "h200-fp4": "H200 (FP4)", h100: "H100 (FP4)" };
 
-  // MegaMoE is only wired into the deepep-replacing recipes on Blackwell
-  // (balanced / max-throughput). Disabled on Hopper (H100 / H200, both FP4
-  // and FP8), on low-latency / cp recipes, and on PD-Disagg (the cookbook's
+  // MegaMoE is only wired into the max-throughput recipe on Blackwell.
+  // Disabled on Hopper (H100 / H200, both FP4 and FP8), on
+  // low-latency / balanced / cp recipes, and on PD-Disagg (the cookbook's
   // PD command builder doesn't emit the megamoe backend / env vars yet).
-  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "cp", "pd-disagg"]);
+  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "balanced", "cp", "pd-disagg"]);
   const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200"]);
   const isMegamoeUnsupported = (vals) =>
     MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
@@ -863,12 +863,6 @@ export const DeepSeekV4Deployment = () => {
     const megamoeEnv = [];
     if (megamoe !== "disabled" && recipe === "max-throughput") {
       megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320");
-    }
-    // Blackwell balanced always runs with MTP (1/1/2) — when MegaMoE is layered on
-    // top, cap the per-rank dispatch buffer at 4096 to keep MoE memory in budget.
-    // (megamoe is gated to Blackwell by MEGAMOE_UNSUPPORTED_HARDWARE.)
-    if (megamoe !== "disabled" && recipe === "balanced") {
-      megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096");
     }
     if (megamoe === "w4a4") {
       megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1");
