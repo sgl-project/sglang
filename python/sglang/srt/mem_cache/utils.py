@@ -14,9 +14,19 @@
 """Common utilities."""
 
 import hashlib
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.evict_policy import (
+    EvictionStrategy,
+    FIFOStrategy,
+    FILOStrategy,
+    LFUStrategy,
+    LRUStrategy,
+    MRUStrategy,
+    PriorityStrategy,
+    SLRUStrategy,
+)
 from sglang.srt.mem_cache.triton_ops.mla_buffer import (
     get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
 )
@@ -41,6 +51,27 @@ from sglang.srt.mem_cache.triton_ops.mla_buffer import (
 from sglang.srt.mem_cache.triton_ops.mla_buffer import (
     set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
 )
+
+_EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
+    "lru": LRUStrategy,
+    "lfu": LFUStrategy,
+    "fifo": FIFOStrategy,
+    "mru": MRUStrategy,
+    "filo": FILOStrategy,
+    "priority": PriorityStrategy,
+    "slru": SLRUStrategy,
+}
+
+
+def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+    policy = eviction_policy.lower()
+    try:
+        return _EVICTION_POLICY_FACTORIES[policy]()
+    except KeyError:
+        supported = "', '".join(_EVICTION_POLICY_FACTORIES)
+        raise ValueError(
+            f"Unknown eviction policy: {policy}. Supported policies: '{supported}'."
+        ) from None
 
 
 def maybe_init_custom_mem_pool(
