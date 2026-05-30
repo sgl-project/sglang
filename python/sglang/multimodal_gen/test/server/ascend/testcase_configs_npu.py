@@ -1,5 +1,4 @@
 import os
-from dataclasses import replace
 
 from sglang.multimodal_gen.test.server.testcase_configs import (
     T2V_PROMPT,
@@ -25,7 +24,7 @@ WAN2_2_T2V_A14B_DIFFUSERS_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8"
 )
 
-EXTRAS_DISABLE_WARMUP = {"--server-warmup": "false"}
+EXTRAS_DISABLE_WARMUP = ["--server-warmup", "false"]
 
 ONE_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
@@ -33,11 +32,9 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         "flux_image_t2i_npu",
         DiffusionServerArgs(
             model_path=FLUX_1_DEV_WEIGHTS_PATH,
+            extras=EXTRAS_DISABLE_WARMUP,
         ),
-        replace(
-            T2I_sampling_params,
-            extras={**T2I_sampling_params.extras, **EXTRAS_DISABLE_WARMUP},
-        ),
+        T2I_sampling_params,
         run_consistency_check=False,
     ),
     # === Text to Video (T2V) ===
@@ -45,10 +42,10 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b_1_npu",
         DiffusionServerArgs(
             model_path=WAN2_1_T2V_1_3B_DIFFUSERS_WEIGHTS_PATH,
+            extras=EXTRAS_DISABLE_WARMUP,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            extras=EXTRAS_DISABLE_WARMUP,
         ),
         run_consistency_check=False,
     ),
@@ -62,11 +59,9 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             model_path=FLUX_2_DEV_WEIGHTS_PATH,
             num_gpus=2,
             tp_size=2,
+            extras=EXTRAS_DISABLE_WARMUP,
         ),
-        replace(
-            T2I_sampling_params,
-            extras={**T2I_sampling_params.extras, **EXTRAS_DISABLE_WARMUP},
-        ),
+        T2I_sampling_params,
         run_consistency_check=False,
     ),
     DiffusionTestCase(
@@ -77,11 +72,9 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             # test ring attn
             ulysses_degree=1,
             ring_degree=2,
+            extras=EXTRAS_DISABLE_WARMUP,
         ),
-        replace(
-            T2I_sampling_params,
-            extras={**T2I_sampling_params.extras, **EXTRAS_DISABLE_WARMUP},
-        ),
+        T2I_sampling_params,
         run_consistency_check=False,
     ),
     # === Text to Video (T2V) ===
@@ -92,10 +85,10 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             num_gpus=2,
             tp_size=1,
             ulysses_degree=2,
+            extras=EXTRAS_DISABLE_WARMUP,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            extras=EXTRAS_DISABLE_WARMUP,
         ),
         run_consistency_check=False,
     ),
