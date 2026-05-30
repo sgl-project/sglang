@@ -180,21 +180,22 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
     PlanItem* __restrict__ metadata,  // [0]=GlobalMetadata, [1+i]=PlanItem
     const uint32_t batch_size,
     const uint32_t static_cluster_threshold) {
-  // Candidate thresholds (strictly increasing) with the max number of "long"
-  // items at which clustering still beats streaming for that context length.
-  // Cluster efficiency rises with context length (the 8-way split amortizes), so
-  // longer thresholds tolerate more long items. Tuned from the cluster/stream
-  // crossover on B200.
+  // Candidate thresholds (strictly increasing). Route items with seq_len > T to
+  // the cluster pool only while the routed count stays <= max_batch_size, chosen
+  // as the pool size: up to a full one-wave pool of long items is worth
+  // clustering (measured faster than streaming for small batch on B200), but
+  // beyond that the pool would serial-loop and one-block-per-element streaming
+  // wins. (Plan is tunable; this aligns the routing cap with the pool.)
   struct Pair {
     uint32_t threshold;
     uint32_t max_batch_size;
   };
   constexpr Pair kCandidates[] = {
-      {65536, 16},
-      {98304, 48},
-      {131072, 96},
-      {196608, 128},
-      {262144, 128},
+      {65536, kNumPersistentClusters},
+      {98304, kNumPersistentClusters},
+      {131072, kNumPersistentClusters},
+      {196608, kNumPersistentClusters},
+      {262144, kNumPersistentClusters},
   };
   constexpr uint32_t kNumCandidates = std::size(kCandidates);
   static_assert(kCandidates[0].threshold == kClusterFloor);
