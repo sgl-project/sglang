@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 
@@ -9,10 +9,35 @@ from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def decide_needs_cpu_seq_lens(
+    server_args: "ServerArgs",
+    attn_backends: Sequence["AttentionBackend"],
+) -> bool:
+    """Whether FutureMap must publish seq_lens_cpu / sum.
+
+    OR over per-backend needs_cpu_seq_lens; force True under TBO / piecewise CG
+    (they read the CPU mirror outside the backend layer).
+    """
+    if server_args.enable_two_batch_overlap:
+        # FIXME: support TBO without seq lens cpu value
+        return True
+    if not server_args.disable_piecewise_cuda_graph:
+        # FIXME: support PCG without seq lens cpu value
+        return True
+    # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
+    # missing flag -> True so undeclared backends stay on the legacy path.
+    return any(
+        getattr(b, "needs_cpu_seq_lens", True) for b in attn_backends if b is not None
+    )
+
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -88,11 +113,15 @@ class FutureMap:
         device: torch.device,
         spec_algo: SpeculativeAlgorithm,
         req_to_token_pool: ReqToTokenPool,
+        needs_cpu_seq_lens: bool = True,
     ):
         # Bufs indexed by req_pool_idx; slot 0 mirrors KV padding row so
         # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
         self.device = device
         self.spec_algo = spec_algo
+        # Computed by decide_needs_cpu_seq_lens(); see that helper for the
+        # full decision (per-backend flag + TBO / piecewise CG overrides).
+        self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
         self.output_tokens_buf = (
@@ -106,8 +135,10 @@ class FutureMap:
             (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream).
-        if _is_cuda or _is_hip:
+        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
+        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
+        # platforms have no barrier and use the plain .cpu() bootstrap path.
+        if _is_cuda:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -204,8 +235,19 @@ class FutureMap:
         if fi is None:
             return
         if self.publish_ready is not None:
-            self.publish_ready.wait()
+            if _is_hip:
+                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                self.publish_ready.synchronize()
+            else:
+                self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if not self.needs_cpu_seq_lens:
+            # GPU gather above is kept (SB.seq_lens must advance each verify);
+            # skip the .cpu() D2H. Downstream takes the GPU-only path.
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            return
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
