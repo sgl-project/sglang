@@ -14,6 +14,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.cache_hit_kit import (
     async_request_sglang_generate,
     gen_payload,
+    run_multiturn_cache_hit_test,
 )
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
