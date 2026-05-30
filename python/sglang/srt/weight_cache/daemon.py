@@ -239,13 +239,19 @@ class WeightCacheDaemon:
         )
 
     def _export_state(self):
-        """Export model.state_dict() as CUDA IPC handles via MultiprocessingSerializer."""
+        """Export model parameters and buffers as CUDA IPC handles.
+
+        This includes both persistent buffers (in state_dict) and non-persistent
+        buffers (e.g. rotary embedding cos_sin_cache) so the engine can fully
+        reconstruct the model state via zero-copy IPC.
+        """
         self.state_entries.clear()
 
         param_names = set(name for name, _ in self.model.named_parameters())
-        state_dict = self.model.state_dict()
+        state_dict_names = set(self.model.state_dict().keys())
 
-        for name, tensor in state_dict.items():
+        # Export all items from state_dict (parameters + persistent buffers)
+        for name, tensor in self.model.state_dict().items():
             ipc_handle = MultiprocessingSerializer.serialize(tensor.data, output_str=True)
             self.state_entries[name] = {
                 "handle": ipc_handle,
@@ -254,6 +260,20 @@ class WeightCacheDaemon:
                 "is_param": name in param_names,
             }
 
+        # Also export non-persistent buffers (not in state_dict but needed
+        # for inference, e.g. rotary embedding cos_sin_cache)
+        non_persistent_count = 0
+        for name, buf in self.model.named_buffers():
+            if name not in state_dict_names:
+                ipc_handle = MultiprocessingSerializer.serialize(buf.data, output_str=True)
+                self.state_entries[name] = {
+                    "handle": ipc_handle,
+                    "shape": list(buf.shape),
+                    "dtype": str(buf.dtype).replace("torch.", ""),
+                    "is_param": False,
+                }
+                non_persistent_count += 1
+
         # Log total size
         total_bytes = sum(
             entry["handle"].__len__() if hasattr(entry["handle"], "__len__") else 0
@@ -261,7 +281,8 @@ class WeightCacheDaemon:
         )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
-            f"Exported {len(self.state_entries)} tensors, "
+            f"Exported {len(self.state_entries)} tensors "
+            f"({non_persistent_count} non-persistent buffers), "
             f"serialized handle size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
@@ -331,13 +352,25 @@ class WeightCacheDaemon:
             # Client requests full state with IPC handles
             engine_config = CacheConfig.from_dict(req["config"])
             if not self.config.matches(engine_config):
+                # Log detailed mismatch info for debugging
+                daemon_dict = self.config.to_dict()
+                engine_dict = engine_config.to_dict()
+                mismatches = {
+                    k: (daemon_dict.get(k), engine_dict.get(k))
+                    for k in daemon_dict
+                    if daemon_dict.get(k) != engine_dict.get(k)
+                }
                 logger.warning(
                     f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                    f"Config mismatch: daemon={self.config}, engine={engine_config}"
+                    f"Config mismatch: {mismatches}"
                 )
                 send_msg(conn, {"status": "mismatch", "daemon_config": self.config.to_dict()})
                 return
 
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] "
+                f"Serving {len(self.state_entries)} IPC handles to engine"
+            )
             send_msg(conn, {
                 "status": "ok",
                 "config": self.config.to_dict(),
@@ -349,6 +382,9 @@ class WeightCacheDaemon:
 
         elif req.get("type") == "release":
             # Engine has copied weights; release GPU memory to free space.
+            # This should only be called in copy mode. In zero-copy mode,
+            # releasing the daemon's memory would invalidate the engine's
+            # IPC-mapped weights.
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] "
                 f"Release requested, freeing GPU memory"

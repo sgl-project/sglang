@@ -1275,6 +1275,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # If weight cache is enabled, override load format to IPC_CACHE
         if self.server_args.weight_cache_mode != "off":
             self.load_config.load_format = LoadFormat.IPC_CACHE
+            # Compute socket path using gpu_id (not tp_rank) since the daemon
+            # binds its socket based on gpu_id. If the user hasn't specified a
+            # custom socket, derive it from the actual GPU ID.
+            if self.load_config.weight_cache_socket is None:
+                from sglang.srt.weight_cache.protocol import get_socket_path
+                self.load_config.weight_cache_socket = get_socket_path(
+                    gpu_id=self.gpu_id
+                )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
@@ -1305,6 +1313,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
+
+        # In zero-copy IPC mode, the weights are shared with the daemon via
+        # CUDA IPC and must not be offloaded/reloaded by the memory saver.
+        is_ipc_zero_copy = (
+            self.server_args.weight_cache_mode != "off"
+            and self.server_args.weight_cache_mode != "copy"
+        )
+        if is_ipc_zero_copy and enable_cpu_backup:
+            logger.warning(
+                "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
+                "IPC-mapped weights cannot be offloaded to CPU."
+            )
+            enable_cpu_backup = False
+
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,

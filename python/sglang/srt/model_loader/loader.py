@@ -3129,6 +3129,7 @@ def get_model_loader(
             load_config=load_config,
             socket_path=socket_path,
             copy_mode=copy_mode,
+            weight_cache_mode=load_config.weight_cache_mode,
         )
 
     return DefaultModelLoader(load_config)
