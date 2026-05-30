@@ -88,8 +88,12 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
             lv = sorted(scores_cpu[i, list(less)].tolist())
             if mv != lv:  # not merely a tie swap -> genuine error
                 bad += len(more)
-                print(f"b={i} L={L} k={k}: more={list(more)[:4]} less={list(less)[:4]} mv={mv[:3]} lv={lv[:3]}")
-        assert len(our) == min(k, L), f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
+                print(
+                    f"b={i} L={L} k={k}: more={list(more)[:4]} less={list(less)[:4]} mv={mv[:3]} lv={lv[:3]}"
+                )
+        assert len(our) == min(
+            k, L
+        ), f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
     assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
 
 
@@ -101,7 +105,9 @@ def _make_page_table(batch, num_pages, mode, device, per_row=False):
         return full, inv
     # permutation (optionally a distinct permutation per row)
     rows = batch if per_row else 1
-    full = torch.stack([torch.randperm(num_pages, device=device) for _ in range(rows)]).to(torch.int32)
+    full = torch.stack(
+        [torch.randperm(num_pages, device=device) for _ in range(rows)]
+    ).to(torch.int32)
     inv = torch.empty_like(full)
     ar = torch.arange(num_pages, dtype=torch.int32, device=device)
     for r in range(rows):
@@ -129,7 +135,9 @@ def _reference(scores, seq_lens, k):
         if L <= k:
             ref.append(list(range(L)))
         else:
-            ref.append(torch.topk(scores[i, :L], k, sorted=False).indices.cpu().tolist())
+            ref.append(
+                torch.topk(scores[i, :L], k, sorted=False).indices.cpu().tolist()
+            )
     return ref
 
 
@@ -188,14 +196,19 @@ def test_topk_v2_ragged(batch: int, shape: str, k: int, per_row_pt: bool) -> Non
     buckets = [max(1, k // 2), k, 4096, 12000, 40000, 65536, 98304, 262144]
     g = torch.Generator(device="cpu").manual_seed(batch + k)
     lengths = torch.tensor(
-        [buckets[int(torch.randint(0, len(buckets), (1,), generator=g))] for _ in range(batch)],
+        [
+            buckets[int(torch.randint(0, len(buckets), (1,), generator=g))]
+            for _ in range(batch)
+        ],
         dtype=torch.int32,
         device=device,
     )
     lengths[0] = max(1, k // 2)  # a trivial row
     lengths[1] = 262144  # a long (cluster) row
     num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
-    page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device, per_row=per_row_pt)
+    page_table, inv_cpu = _make_page_table(
+        batch, num_pages, "perm", device, per_row=per_row_pt
+    )
 
     our_raw = _run(scores, lengths, page_table, inv_cpu, k)
     ref_raw = _reference(scores, lengths, k)
