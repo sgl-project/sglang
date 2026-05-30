@@ -381,7 +381,7 @@ class Mistral3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixi
     }
     _tied_weights_keys = ["lm_head.weight"]
     uses_sglang_forward_context = False
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = ["model.language_model.layers"]
 
     def __init__(self, config: LlavaConfig):
