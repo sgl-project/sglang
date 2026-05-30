@@ -182,6 +182,7 @@ class Req:
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
+
     condition_inputs: dict[str, Any] = field(default_factory=dict)
 
     is_warmup: bool = False
@@ -203,11 +204,6 @@ class Req:
         default_factory=TraceNullContext
     )
 
-    # results
-    output: torch.Tensor | None = None
-    audio: torch.Tensor | None = None
-    audio_sample_rate: int | None = None
-
     # realtime
     realtime_session_id: str | None = None
     session: RealtimeSession | None = None
@@ -215,6 +211,11 @@ class Req:
     realtime_chunk_size: int | None = None
     # return websocket-friendly raw RGB frame bytes instead of rwa tensors
     return_raw_frames: bool = False
+
+    # results
+    output: torch.Tensor | None = None
+    audio: torch.Tensor | None = None
+    audio_sample_rate: int | None = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields

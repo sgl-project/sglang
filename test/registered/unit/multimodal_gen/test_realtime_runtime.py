@@ -7,7 +7,10 @@ import numpy as np
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     lingbot_world_realtime_adapter as lingbot_realtime,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import RealtimeEvent
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimeEvent,
+    RealtimeVideoGenerationsRequest,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
     GenerateSession,
 )
@@ -172,11 +175,11 @@ def test_lingbot_realtime_state_uses_generic_condition_queue():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
     assert state.sample_camera_actions(3) == [[], [], []]
-    state.append_camera_actions([["w"], ["a"], ["s"], ["d"]])
+    state.receive_camera_actions([["w"], ["a"], ["s"], ["d"]])
     assert state.sample_camera_actions(3) == [["w"], ["a"], ["s"]]
     assert state.sample_camera_actions(3) == [["d"], ["d"], ["d"]]
 
-    state.append_prompt("turn left")
+    state.receive_prompt("turn left")
     assert state.has_prompt()
     assert state.sample_prompt() == "turn left"
     assert not state.has_prompt()
@@ -202,6 +205,99 @@ def test_lingbot_realtime_adapter_ingests_generic_events():
     state = adapter._state(session)
     assert state.sample_camera_actions(3) == [["w"], ["d"], ["d"]]
     assert state.sample_prompt() == "turn left"
+
+
+def test_generate_session_tracks_active_chunk_context():
+    session = GenerateSession()
+
+    chunk = session.new_chunk()
+
+    assert chunk.session_id == session.id
+    assert chunk.index == 0
+    assert chunk.request_id.startswith(f"{session.id}_")
+    try:
+        session.new_chunk()
+    except RuntimeError as exc:
+        assert "previous realtime chunk" in str(exc)
+    else:
+        raise AssertionError("expected active chunk to block new chunk")
+
+    session.generate_chunk_completed()
+    next_chunk = session.new_chunk()
+
+    assert next_chunk.index == 1
+    assert next_chunk.request_id.startswith(f"{session.id}_")
+    assert next_chunk.request_id != chunk.request_id
+
+
+def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+            num_frames=3,
+            fps=24,
+        )
+    )
+    state = adapter._state(session)
+    state.receive_camera_actions([["w"], ["d"]])
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            dit_config=SimpleNamespace(
+                arch_config=SimpleNamespace(num_frames_per_block=3)
+            )
+        )
+    )
+    seen = {}
+
+    def fake_build_sampling_params(request_id, **kwargs):
+        seen["request_id"] = request_id
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(
+            request_id=request_id,
+            prompt=kwargs["prompt"],
+            condition_inputs=kwargs["condition_inputs"],
+            realtime_chunk_size=kwargs["realtime_chunk_size"],
+        )
+
+    def fake_prepare_backend_request(server_args, sampling_params):
+        seen["server_args"] = server_args
+        return SimpleNamespace(
+            request_id=sampling_params.request_id,
+            prompt=sampling_params.prompt,
+            condition_inputs=dict(sampling_params.condition_inputs),
+            realtime_chunk_size=sampling_params.realtime_chunk_size,
+        )
+
+    monkeypatch.setattr(
+        lingbot_realtime,
+        "build_sampling_params",
+        fake_build_sampling_params,
+    )
+    monkeypatch.setattr(
+        lingbot_realtime,
+        "prepare_backend_request",
+        fake_prepare_backend_request,
+    )
+    chunk = session.new_chunk()
+
+    batch = adapter.prepare_next_request(session, server_args, chunk)
+
+    assert seen["request_id"] == chunk.request_id
+    assert seen["kwargs"]["prompt"] == "walk forward"
+    assert seen["kwargs"]["condition_inputs"] == {
+        "camera_actions": [["w"], ["d"], ["d"]]
+    }
+    assert batch.request_id == chunk.request_id
+    assert batch.condition_inputs == {"camera_actions": [["w"], ["d"], ["d"]]}
+    assert batch.realtime_chunk_size == 3
+    assert batch.session is session.realtime_session
+    assert batch.realtime_session_id == session.id
+    assert batch.block_idx == 0
+    assert batch.return_raw_frames is True
 
 
 def test_realtime_registry_resolves_lingbot_adapter():

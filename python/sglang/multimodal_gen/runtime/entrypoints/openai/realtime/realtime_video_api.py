@@ -25,7 +25,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ReleaseRealtimeSessionReq,
-    prepare_request,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -41,19 +40,18 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
         try:
             start = time.perf_counter()
             timings: dict[str, float] = {}
-            session.new_request()
 
             # send to scheduler and generate video chunk
             stage_start = time.perf_counter()
             server_args = get_global_server_args()
-            sampling_params = session.build_sampling_params()
-            batch = prepare_request(
-                server_args=server_args,
-                sampling_params=sampling_params,
-            )
             if session.adapter is None:
                 raise ValueError("realtime adapter is not initialized")
-            batch = session.adapter.prepare_request(session, batch)
+            chunk = session.new_chunk()
+            batch = session.adapter.prepare_next_request(
+                session,
+                server_args,
+                chunk,
+            )
             if batch.condition_inputs:
                 logger.debug(
                     "consume realtime conditions, session_id=%s, block_idx=%s, kinds=%s",
@@ -94,7 +92,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 "ws_write=%.2fms chunk_total=%.2fms batches=%d frames=%d "
                 "frame_shape=%s raw_bytes=%d ws_payload_bytes=%d content_type=%s",
                 session.id,
-                session.request_id,
+                chunk.request_id,
                 batch.block_idx,
                 timings["prepare_ms"],
                 timings["scheduler_forward_ms"],
@@ -140,6 +138,7 @@ async def _await_realtime_task(task: asyncio.Task | None) -> None:
 
 
 async def _listen_events(ws: WebSocket, session: GenerateSession):
+    """listen for user events: usually condition inputs"""
     async for message in ws.iter_bytes():
         data = None
         try:
@@ -189,6 +188,7 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
 
 @router.websocket("/generate")
 async def generate(websocket: WebSocket):
+    """endpoint for creating a new realtime session"""
     await websocket.accept()
     if _ACTIVE_SESSION_IDS:
         logger.warning(
@@ -211,9 +211,9 @@ async def generate(websocket: WebSocket):
         # receive new generate request
         await _listen_generate_request(websocket, session)
 
-        # generate video chunk
+        # continuously generate video chunk
         generate_task = asyncio.create_task(_generate_loop(websocket, session))
-        # listen for user events
+        # continuously listen for user events
         listen_task = asyncio.create_task(_listen_events(websocket, session))
 
         wait_tasks = [generate_task, listen_task]

@@ -60,7 +60,10 @@ class ConditionSamplingParams:
 
 
 class ConditionEventQueue:
-    """generic per-session queue for prompt, camera, audio, and future events"""
+    """per-session queue for prompt, camera, audio, and future events
+
+      all events are stored here for per-chunk sampling
+    """
 
     def __init__(
         self,
