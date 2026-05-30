@@ -4,6 +4,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import (
     ceil_align,
+    flatten_arrays_to_pinned_cpu,
     is_pin_memory_available,
 )
 
@@ -1737,14 +1738,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             pt += req.extend_input_len
 
-        # Reassign: ED stripping rebuilds prefill_input_ids_cpu (CPU pinned,
-        # same numpy fast-path as prepare_for_extend); resolve_forward_inputs
-        # will H2D this on forward stream. self.input_ids stays None.
-        combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in input_ids])
-        stripped = torch.from_numpy(combined)
-        if _pin:
-            stripped = stripped.pin_memory()
-        self.prefill_input_ids_cpu = stripped
+        # Reassign: ED stripping rebuilds prefill_input_ids_cpu (CPU pinned);
+        # resolve_forward_inputs will H2D this on forward stream. self.input_ids
+        # stays None.
+        self.prefill_input_ids_cpu = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1848,11 +1845,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
-        # resolve_forward_inputs. Same numpy fast-path as flatten_arrays_to_int64_tensor.
-        combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in input_ids])
-        pinned_input_ids = torch.from_numpy(combined)
-        if _pin:
-            pinned_input_ids = pinned_input_ids.pin_memory()
+        # resolve_forward_inputs.
+        pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
