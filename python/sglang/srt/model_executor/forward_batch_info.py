@@ -42,6 +42,9 @@ from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
+    compute_req_all_ids_info,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -587,6 +590,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
             ret.rids_int = hashed
             ret.bootstrap_room_ids_int = bootstrap_room_ids
+
+        if envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get():
+            ret.req_all_ids_flat, ret.req_all_ids_lens = compute_req_all_ids_info(
+                batch.reqs
+            )
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
