@@ -338,6 +338,29 @@ def test_causal_kv_cache_block_supports_dict_access_and_in_place_reset():
     assert cache.local_end_index_int == 0
 
 
+def test_causal_kv_cache_allocation_sets_shapes_and_optional_int_indices():
+    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
+    stage.num_transformer_blocks = 2
+
+    cache = stage._allocate_causal_kv_cache(
+        batch_size=3,
+        kv_cache_size=5,
+        num_attention_heads=7,
+        attention_head_dim=11,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        use_int_indices=True,
+    )
+
+    assert len(cache) == 2
+    assert cache[0].k.shape == (3, 5, 7, 11)
+    assert cache[0].v.shape == (3, 5, 7, 11)
+    assert cache[0].global_end_index.shape == (1,)
+    assert cache[0].local_end_index.shape == (1,)
+    assert cache[0].global_end_index_int == 0
+    assert cache[0].local_end_index_int == 0
+
+
 def test_crossattn_cache_block_supports_dict_access_and_reset():
     stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
     stage.num_transformer_blocks = 1

@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
-    CausalSelfAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.realtime_states import (
     RealtimeCausalDiTState,
@@ -71,7 +70,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         *,
         sequence_shard_enabled: bool = False,
     ) -> None:
-        causal_kv_cache = []
         num_attention_heads = self.transformer.num_attention_heads
         if sequence_shard_enabled:
             ulysses_world_size = get_ulysses_parallel_world_size()
@@ -89,10 +87,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 )
             num_attention_heads //= ulysses_world_size
         attention_head_dim = self.transformer.attention_head_dim
-        if self.local_attn_size != -1:
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
-        else:
-            kv_cache_size = self.frame_seq_length * self.sliding_window_num_frames
+        kv_cache_size = self._get_causal_kv_cache_size()
         logger.info(
             "LingBot KV cache init: batch=%s layers=%s frame_seq_length=%s "
             "num_frames_per_block=%s sliding_window_num_frames=%s local_attn_size=%s "
@@ -110,41 +105,15 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             sequence_shard_enabled,
         )
 
-        for _ in range(self.num_transformer_blocks):
-            causal_kv_cache.append(
-                CausalSelfAttentionKVCache(
-                    k=torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    v=torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    global_end_index=torch.zeros(
-                        1, dtype=torch.long, device=device
-                    ),
-                    local_end_index=torch.zeros(
-                        1, dtype=torch.long, device=device
-                    ),
-                    global_end_index_int=0,
-                    local_end_index_int=0,
-                )
-            )
-
-        self.causal_kv_cache = causal_kv_cache
+        self.causal_kv_cache = self._allocate_causal_kv_cache(
+            batch_size=batch_size,
+            kv_cache_size=kv_cache_size,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            dtype=dtype,
+            device=device,
+            use_int_indices=True,
+        )
 
     def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
         latents = batch.latents
