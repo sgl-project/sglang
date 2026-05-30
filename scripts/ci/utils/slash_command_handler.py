@@ -217,9 +217,19 @@ def find_workflow_run_url(
                 continue
 
             # Match by display_title (set by workflow's run-name directive)
-            # This is immediately available, unlike job names which require waiting
+            # This is immediately available, unlike job names which require waiting.
+            #
+            # GitHub caps display_title at 512 chars and appends "..." when the
+            # workflow's run-name is longer (e.g. /rerun-test with many files
+            # newline-joins them into one long command). Accept the un-truncated
+            # prefix when the rest matches our submission verbatim — concurrent
+            # dispatches use different commands (different files per group), so
+            # the prefix is enough to disambiguate.
             display_title = run.get("display_title", "")
-            if display_title == expected_title:
+            if display_title == expected_title or (
+                display_title.endswith("...")
+                and expected_title.startswith(display_title[:-3])
+            ):
                 print(
                     f"Found matching workflow run: {run['id']} with title '{display_title}'"
                 )
@@ -528,6 +538,21 @@ def expand_glob_spec(file_part):
         for root in ("test/registered", MULTIMODAL_TEST_DIR):
             matches.update(glob.glob(os.path.join(root, "**", pat), recursive=True))
 
+    # If the literal glob matched any directories — e.g. `unittest/*` matching
+    # subdirs `dense/`, `dsa/`, … — descend recursively into them for
+    # test_*.py. glob's `*` doesn't cross `/`, so without this a tree of
+    # subdirs containing tests would return only the top-level entries (and
+    # then get filtered out as non-test files).
+    expanded = set()
+    for p in matches:
+        if os.path.isdir(p):
+            expanded.update(
+                glob.glob(os.path.join(p, "**", "test_*.py"), recursive=True)
+            )
+        else:
+            expanded.add(p)
+    matches = expanded
+
     def _under_test_root(path):
         return path.startswith("test/registered/") or path.startswith(
             MULTIMODAL_TEST_DIR + "/"
@@ -643,13 +668,23 @@ def detect_multimodal_suite(file_path):
     return MULTIMODAL_DEFAULT_RUNNER, None
 
 
-def _extract_runner_config(content):
-    """Pull `runner_config` and the args string from a `register_cuda_ci(...)` call."""
-    args = re.search(r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE)
-    if not args:
-        return None, None
-    m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
-    return (m.group(1), args.group(1)) if m else (None, None)
+def _extract_runner_configs(content):
+    """Pull `(runner_config, args_str)` from EVERY `register_cuda_ci(...)` call.
+
+    A test file can register itself on multiple pools (e.g. both
+    `4-gpu-b200` and `1-gpu-large`). The earlier `re.search` variant
+    returned only the first match, so /rerun-test silently dropped every
+    registration after the first — multi-pool files only ever ran on the
+    pool listed first. `re.finditer` is what makes the fan-out happen.
+    """
+    out = []
+    for args in re.finditer(
+        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+    ):
+        m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        if m:
+            out.append((m.group(1), args.group(1)))
+    return out
 
 
 def detect_suite(file_path_from_test):
@@ -657,14 +692,13 @@ def detect_suite(file_path_from_test):
     Read a test file and extract dispatch info from register_cuda_ci or
     register_cpu_ci.
 
-    CUDA tests must use `register_cuda_ci(stage=..., runner_config=...)`;
-    runner label, install script, timeout, and rdma_devices are all resolved
-    from scripts/ci/runner_configs.yml — the same single source of truth that
-    drives the main PR test pipeline.
+    A CUDA file can carry multiple `register_cuda_ci(...)` calls — one per
+    pool it should run on — so this returns a *list* of dispatch dicts, one
+    per registration. CPU files yield a single-element list. A file with no
+    recognised registration yields a one-element list whose dict has an
+    `error` set.
 
-    CPU tests (`register_cpu_ci(...)`) dispatch to the CPU job (ubuntu-latest).
-
-    Returns dict with keys: suite, runner_label, install_script,
+    Each dict has keys: suite, runner_label, install_script,
     install_timeout, rdma_devices, is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
@@ -682,70 +716,87 @@ def detect_suite(file_path_from_test):
             "error": msg,
         }
 
-    rc, args_str = _extract_runner_config(content)
-    if rc:
+    cuda_calls = _extract_runner_configs(content)
+    if cuda_calls:
         configs = _runner_configs.load()
-        cfg = configs.get(rc)
-        if cfg is None:
-            known = ", ".join(f"`{k}`" for k in sorted(configs))
-            return _err(
-                rc,
-                f"Unknown runner_config `{rc}` in `{full_path}` "
-                f"— not in scripts/ci/runner_configs.yml.\n\n"
-                f"Known runner_configs: {known}",
+        results = []
+        for rc, args_str in cuda_calls:
+            cfg = configs.get(rc)
+            if cfg is None:
+                known = ", ".join(f"`{k}`" for k in sorted(configs))
+                results.append(
+                    _err(
+                        rc,
+                        f"Unknown runner_config `{rc}` in `{full_path}` "
+                        f"— not in scripts/ci/runner_configs.yml.\n\n"
+                        f"Known runner_configs: {known}",
+                    )
+                )
+                continue
+            install_script = cfg["install"]
+            if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
+                results.append(
+                    _err(
+                        rc,
+                        f"Disallowed `install` value `{install_script}` for "
+                        f"runner_config `{rc}` in scripts/ci/runner_configs.yml. "
+                        f"The slash handler passes this string verbatim into a "
+                        f"shell step, so it must match `scripts/ci/cuda/*.sh`.",
+                    )
+                )
+                continue
+            runs_on = cfg.get("runs_on")
+            # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
+            # so always pick the non-kernel b200 pool.
+            if runs_on == "$b200_runner":
+                runs_on = _B200_DEFAULT_RUNNER
+            stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
+            suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
+            results.append(
+                {
+                    "suite": suite,
+                    "runner_label": runs_on,
+                    "install_script": install_script,
+                    "install_timeout": str(cfg["install_timeout"]),
+                    "rdma_devices": cfg.get("rdma_devices", ""),
+                    "is_cpu": False,
+                    "error": None,
+                }
             )
-        install_script = cfg["install"]
-        if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
-            return _err(
-                rc,
-                f"Disallowed `install` value `{install_script}` for runner_config "
-                f"`{rc}` in scripts/ci/runner_configs.yml. The slash handler "
-                f"passes this string verbatim into a shell step, so it must "
-                f"match `scripts/ci/cuda/*.sh`.",
-            )
-        runs_on = cfg.get("runs_on")
-        # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
-        # so always pick the non-kernel b200 pool.
-        if runs_on == "$b200_runner":
-            runs_on = _B200_DEFAULT_RUNNER
-        stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
-        suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-        return {
-            "suite": suite,
-            "runner_label": runs_on,
-            "install_script": install_script,
-            "install_timeout": str(cfg["install_timeout"]),
-            "rdma_devices": cfg.get("rdma_devices", ""),
-            "is_cpu": False,
-            "error": None,
-        }
+        return results
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
-        return {
-            "suite": "cpu",
-            "runner_label": "ubuntu-latest",
-            "install_script": "",
-            "install_timeout": "",
-            "rdma_devices": "",
-            "is_cpu": True,
-            "error": None,
-        }
+        return [
+            {
+                "suite": "cpu",
+                "runner_label": "ubuntu-latest",
+                "install_script": "",
+                "install_timeout": "",
+                "rdma_devices": "",
+                "is_cpu": True,
+                "error": None,
+            }
+        ]
 
-    return _err(
-        None,
-        f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
-        f"found in `{full_path}`. /rerun-test only supports tests registered "
-        f"via the new-style yml-driven API; nightly/weekly tests aren't "
-        f"dispatchable through this command.",
-    )
+    return [
+        _err(
+            None,
+            f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
+            f"found in `{full_path}`. /rerun-test only supports tests "
+            f"registered via the new-style yml-driven API; nightly/weekly "
+            f"tests aren't dispatchable through this command.",
+        )
+    ]
 
 
 def _resolve_test_spec(test_spec):
     """
-    Resolve a single test spec into its components without dispatching.
+    Resolve a single test spec into one or more dispatch entries.
 
-    Returns a dict with keys: spec, test_command, mode, runs_on,
-    install_script, install_timeout, rdma_devices, error.
+    A file registered on N pools (multiple `register_cuda_ci(...)` calls)
+    yields N entries — handle_rerun_test's grouping then sends one workflow
+    per pool. Multimodal and CPU files yield a single entry. Resolution
+    errors yield a one-element list with {"spec","error"}.
     """
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
@@ -759,12 +810,12 @@ def _resolve_test_spec(test_spec):
 
     resolved_path, is_multimodal, err = resolve_test_file(file_part)
     if err:
-        return {"spec": test_spec, "error": err}
+        return [{"spec": test_spec, "error": err}]
 
     if is_multimodal:
         runner_label, err = detect_multimodal_suite(resolved_path)
         if err:
-            return {"spec": test_spec, "error": err}
+            return [{"spec": test_spec, "error": err}]
 
         # For multimodal pytest tests, use :: separator for test selection
         test_command = resolved_path
@@ -772,45 +823,52 @@ def _resolve_test_spec(test_spec):
             test_command = f"{resolved_path}::{test_selector}"
 
         print(
-            f"Resolved (multimodal_gen): file={resolved_path}, selector={test_selector}, "
-            f"runner={runner_label}, command='{test_command}'"
+            f"Resolved (multimodal_gen): file={resolved_path}, "
+            f"selector={test_selector}, runner={runner_label}, "
+            f"command='{test_command}'"
         )
-        return {
-            "spec": test_spec,
-            "test_command": test_command,
-            "mode": "multimodal_gen",
-            "runs_on": runner_label,
-            "install_script": "",
-            "install_timeout": "",
-            "rdma_devices": "",
-            "error": None,
-        }
-
-    info = detect_suite(resolved_path)
-    if info["error"]:
-        return {"spec": test_spec, "error": info["error"]}
+        return [
+            {
+                "spec": test_spec,
+                "test_command": test_command,
+                "mode": "multimodal_gen",
+                "runs_on": runner_label,
+                "install_script": "",
+                "install_timeout": "",
+                "rdma_devices": "",
+                "error": None,
+            }
+        ]
 
     test_command = resolved_path
     if test_selector:
         test_command = f"{resolved_path} {test_selector}"
 
-    mode = "cpu" if info["is_cpu"] else "cuda"
-    print(
-        f"Resolved: file={resolved_path}, selector={test_selector}, "
-        f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
-        f"install={info['install_script']}, rdma={info['rdma_devices']}, "
-        f"command='{test_command}'"
-    )
-    return {
-        "spec": test_spec,
-        "test_command": test_command,
-        "mode": mode,
-        "runs_on": info["runner_label"],
-        "install_script": info["install_script"],
-        "install_timeout": info["install_timeout"],
-        "rdma_devices": info["rdma_devices"],
-        "error": None,
-    }
+    out = []
+    for info in detect_suite(resolved_path):
+        if info["error"]:
+            out.append({"spec": test_spec, "error": info["error"]})
+            continue
+        mode = "cpu" if info["is_cpu"] else "cuda"
+        print(
+            f"Resolved: file={resolved_path}, selector={test_selector}, "
+            f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
+            f"install={info['install_script']}, rdma={info['rdma_devices']}, "
+            f"command='{test_command}'"
+        )
+        out.append(
+            {
+                "spec": test_spec,
+                "test_command": test_command,
+                "mode": mode,
+                "runs_on": info["runner_label"],
+                "install_script": info["install_script"],
+                "install_timeout": info["install_timeout"],
+                "rdma_devices": info["rdma_devices"],
+                "error": None,
+            }
+        )
+    return out
 
 
 def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
@@ -1035,20 +1093,22 @@ def handle_rerun_test(
     # Phase 1: Resolve all specs, de-duping by the *resolved* identity. A glob
     # expands to `test/`-prefixed paths while an explicit spec keeps the form
     # the user typed, so the same file requested both ways resolves to two
-    # different raw strings — keying de-dup on the resolved (mode, test_command)
-    # is what collapses them into a single dispatch instead of running twice.
+    # different raw strings — keying de-dup on the resolved identity is what
+    # collapses them into a single dispatch instead of running twice.
+    # `runs_on` is included in the key so a file registered on N pools fans
+    # out into one dispatch per pool, instead of all-but-the-first collapsing.
     resolved = []
     seen_commands = set()
     for spec in expanded_specs:
-        r = _resolve_test_spec(spec)
-        if r.get("error"):
-            _record_failure(r["spec"], r["error"])
-            continue
-        key = (r["mode"], r["test_command"])
-        if key in seen_commands:
-            continue
-        seen_commands.add(key)
-        resolved.append(r)
+        for r in _resolve_test_spec(spec):
+            if r.get("error"):
+                _record_failure(r["spec"], r["error"])
+                continue
+            key = (r["mode"], r["runs_on"], r["test_command"])
+            if key in seen_commands:
+                continue
+            seen_commands.add(key)
+            resolved.append(r)
 
     # Phase 2: Group by dispatch shape.
     groups = {}
