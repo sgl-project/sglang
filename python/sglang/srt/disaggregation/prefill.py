@@ -354,13 +354,13 @@ class PrefillBootstrapQueue:
                     and not req.is_retracted  # engine paused
                 ):
                     if not self.ensure_metadata_buffer(req):
-                        break  # no more metadata buffer
+                        continue  # no more metadata buffer
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
                 if not self.finalize_bootstrap(req):
-                    break
+                    continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
