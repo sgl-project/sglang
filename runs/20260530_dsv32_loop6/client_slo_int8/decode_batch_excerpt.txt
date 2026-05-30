@@ -1,0 +1,26 @@
+# AC-5 TPS root-cause: server decode-batch evidence (per-request decode speed vs decode-batch size)
+# Source: full server log /tmp/ac5/boot_radixon.log. Steady-state Decode-batch lines (gen throughput >= 10 tok/s; ramp rows dropped).
+# per-request decode TPS = gen_throughput(aggregate) / #running-req. This is why restoring admission lowers per-req TPS:
+# a bigger decode batch shares the same ~270-300 tok/s aggregate decode budget across more in-flight requests.
+
+#running-req | n_lines | gen tok/s (med) | #token (med) | usage (med) | per-req tok/s
+--------------------------------------------------------------------------------------------
+           1 |       2 |            67.0 |        21248 |        0.05 |          67.0
+          16 |     255 |           282.8 |       170432 |        0.43 |          17.7
+          19 |       5 |           263.8 |       204160 |        0.52 |          13.9
+          20 |       6 |           277.4 |       210080 |        0.53 |          13.9
+          22 |       1 |            51.5 |       227648 |        0.57 |           2.3
+          32 |     127 |           367.7 |       328896 |        0.83 |          11.5
+          36 |       2 |           364.3 |       362240 |        0.92 |          10.1
+          37 |      47 |           357.8 |       382080 |        0.96 |           9.7
+          38 |      54 |           368.8 |       388544 |        0.98 |           9.7
+
+# Representative anchors (median gen throughput at the batch sizes each conc settles into):
+#   #running-req=16: gen  282.8 tok/s aggregate => 17.7 tok/s/req
+#   #running-req=32: gen  367.7 tok/s aggregate => 11.5 tok/s/req
+#   #running-req=38: gen  368.8 tok/s aggregate =>  9.7 tok/s/req
+# => The decode batch reaches 16 (conc-16), ~32 (conc-32), and up to ~38 (conc-64); aggregate gen throughput stays
+#    ~270-300 tok/s, so per-request decode TPS FALLS as the batch grows (17.6 -> 11.5 -> 9.3 client p50 TPS).
+# This is the latency/throughput tradeoff: the footprint fix restored admission (bigger batch -> TTFT win) at the
+# cost of per-request decode TPS. (Correction to the R6 summary, which cited '#running-req: 19-20'; the real steady-
+# state batch sizes are 16 / ~32 / up to ~38, as tabulated above -- the conclusion, per-req TPS < 30, is unchanged.)

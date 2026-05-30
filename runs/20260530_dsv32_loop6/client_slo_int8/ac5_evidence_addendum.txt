@@ -1,0 +1,39 @@
+# AC-5 evidence addendum — recomputable from the tracked .meta.json sidecars + this file
+# (raw *.jsonl are gitignored; this records the per-conc distributions/percentiles so the
+#  client-SLO numbers in client_slo_report.md can be verified without the 4 MB JSONLs).
+# Run: DS int8 @ mem_fraction_static=0.7, radix-on; gsp 4096 ISL/512 OSL; 1 trial WARMUP=0/WINDOW=60.
+# Source JSONL (gitignored): development/results/double_sparsity_gsp_isl4096_osl512_c{16,32,64}_t1.jsonl
+# Sidecar (tracked): client_slo_int8/double_sparsity_gsp_isl4096_osl512_c{16,32,64}_t1.jsonl.meta.json
+
+== conc 16 ==
+  completed=320  num_prompts=320  achieved_concurrency=16.00  duration_s=829.6  measured_epochs=1
+  errors: count=0 (ALL EMPTY (no failed request))
+  input_len (ISL) tokens: min=4246 p50=4295 p99=4346 max=4357  (nominal 4096)
+  output_len (OSL) tokens: min=512 p50=512 p99=512 max=512  (nominal 512)
+  TTFT s (N=320): min=1.32 p50=12.47 p90=12.55 p99=12.79 max=12.79  [SLO < 22.0]
+  summary TPOT ms: mean=60.9 median=56.8 p99=78.4  => per-req TPS (1000/median_TPOT) = 17.6  [SLO >= 30]
+  summary ITL ms: mean=61.0 median=56.6 p95=58.4 p99=58.7
+  output_throughput (tok/s, server-window): 197.5   total_output_tokens=163840
+  radix-on proof: disable_radix_cache=False  mem_fraction_static=0.7  max_total_num_tokens=396096  enable_double_sparsity=True
+
+== conc 32 ==
+  completed=320  num_prompts=320  achieved_concurrency=32.00  duration_s=692.7  measured_epochs=1
+  errors: count=0 (ALL EMPTY (no failed request))
+  input_len (ISL) tokens: min=4225 p50=4275 p99=4329 max=4352  (nominal 4096)
+  output_len (OSL) tokens: min=512 p50=512 p99=512 max=512  (nominal 512)
+  TTFT s (N=320): min=0.69 p50=24.71 p90=25.15 p99=25.50 max=25.50  [SLO < 22.0]
+  summary TPOT ms: mean=96.3 median=87.1 p99=131.5  => per-req TPS (1000/median_TPOT) = 11.5  [SLO >= 30]
+  summary ITL ms: mean=96.4 median=87.0 p95=87.6 p99=87.9
+  output_throughput (tok/s, server-window): 236.5   total_output_tokens=163840
+  radix-on proof: disable_radix_cache=False  mem_fraction_static=0.7  max_total_num_tokens=396096  enable_double_sparsity=True
+
+== conc 64 ==
+  completed=320  num_prompts=320  achieved_concurrency=60.08  duration_s=713.1  measured_epochs=1
+  errors: count=0 (ALL EMPTY (no failed request))
+  input_len (ISL) tokens: min=4234 p50=4274 p99=4320 max=4323  (nominal 4096)
+  output_len (OSL) tokens: min=512 p50=512 p99=512 max=512  (nominal 512)
+  TTFT s (N=320): min=1.45 p50=92.13 p90=110.90 p99=111.16 max=111.26  [SLO < 22.0]
+  summary TPOT ms: mean=115.8 median=108.1 p99=171.0  => per-req TPS (1000/median_TPOT) = 9.3  [SLO >= 30]
+  summary ITL ms: mean=116.0 median=103.1 p95=103.8 p99=105.3
+  output_throughput (tok/s, server-window): 229.7   total_output_tokens=163840
+  radix-on proof: disable_radix_cache=False  mem_fraction_static=0.7  max_total_num_tokens=396096  enable_double_sparsity=True

@@ -1,0 +1,45 @@
+# AC-5 admission-wait vs prefill attribution (CORRECTED, per concurrency)
+# Source: full server request-time-stat log (--enable-request-time-stats-logging).
+# Rows: total parsed=967  health-check skipped=3  INVALID negative-queue filtered=5  valid used=959.
+#   Filtering policy: drop rows with queue_duration<0 (an impossible negative admission wait -- a clock/serialization
+#   artifact) and HEALTH_CHECK probes; both disclosed by count. Valid=959 > 3x320=960 nominal because each conc
+#   run issues warmup_requests in addition to the 320 measured prompts.
+# Per-conc bucketing: wall-clock run windows = T0(min entry_time) + cumulative measured durations (829.6/692.7/713.1 s).
+#   The 3 benchmark runs are contiguous (no inter-run idle gap), so a window split is the correct bucketing, not a gap split.
+#
+# MEASURED DIRECTLY:
+#   queue_duration  = scheduler/admission wait before the forward pass starts (the admission-wait term).
+#   client TTFT     = authoritative end-to-end time-to-first-token (from the benchmark JSONL).
+#   min(TTFT)       = uncontended prefill-compute floor (a single un-queued request's first-token latency).
+# INFERRED (not a raw counter):
+#   post-admission residual = TTFT_p99 - queue_p99 (tail-to-tail). This is time-to-first-token AFTER admission; under
+#     continuous batching it is prefill compute PLUS chunked-prefill/decode interleave, NOT pure prefill -- the pure
+#     prefill floor is min(TTFT). Tail-to-tail (p99-p99) is used, not p50-p50, since per-percentile rows are not the same request.
+# CONTEXT ONLY (not used as the prefill term):
+#   forward_duration = COMPLETION-time (prefill + ALL 512 decode steps), so it is ~the whole request, not first-token.
+
+== conc 16 (server rows in window: 306; client requests completed: 320) ==
+  queue_duration s (admission-wait, MEASURED): p50=4.6 p95=10.5 p99=10.5 max=10.6
+  client TTFT s (authoritative, MEASURED):      p50=12.5 p99=12.8  min(prefill floor)=1.32
+  post-admission residual s (TTFT_p99-queue_p99, INFERRED): 2.2  (prefill + chunked-prefill/decode interleave)
+  forward_duration s (completion-time, context only): p50=36.0 p99=41.6
+  => P99 TTFT 12.8s is dominated by ADMISSION-WAIT (queue): queue_p99 10.5s vs post-admission residual 2.2s.
+
+== conc 32 (server rows in window: 337; client requests completed: 320) ==
+  queue_duration s (admission-wait, MEASURED): p50=10.4 p95=21.7 p99=22.3 max=22.5
+  client TTFT s (authoritative, MEASURED):      p50=24.7 p99=25.5  min(prefill floor)=0.69
+  post-admission residual s (TTFT_p99-queue_p99, INFERRED): 3.2  (prefill + chunked-prefill/decode interleave)
+  forward_duration s (completion-time, context only): p50=57.3 p99=69.2
+  => P99 TTFT 25.5s is dominated by ADMISSION-WAIT (queue): queue_p99 22.3s vs post-admission residual 3.2s.
+
+== conc 64 (server rows in window: 316; client requests completed: 320) ==
+  queue_duration s (admission-wait, MEASURED): p50=84.0 p95=97.4 p99=99.4 max=100.2
+  client TTFT s (authoritative, MEASURED):      p50=92.1 p99=111.2  min(prefill floor)=1.45
+  post-admission residual s (TTFT_p99-queue_p99, INFERRED): 11.8  (prefill + chunked-prefill/decode interleave)
+  forward_duration s (completion-time, context only): p50=69.0 p99=82.9
+  => P99 TTFT 111.2s is dominated by ADMISSION-WAIT (queue): queue_p99 99.4s vs post-admission residual 11.8s.
+
+# Across conc the queue term grows 10.5 -> 22.3 -> 99.4 s while the uncontended prefill floor stays ~1.3 s: the TTFT
+# blow-up is admission-wait, not prefill compute. KV-pool check: 64 reqs x ~4608 tok (4096 ISL + 512 OSL) = ~295K < the
+# 396K pool => NOT KV-pool-admission-bound; the queue is THROUGHPUT contention (the 320-prompt flood at max_concurrency
+# saturates prefill+decode capacity). The conc-32/64 residual is therefore a chunked-prefill/scheduling follow-up, not more footprint.
