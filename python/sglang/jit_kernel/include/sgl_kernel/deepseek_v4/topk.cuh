@@ -1,22 +1,20 @@
 /// \file topk.cuh
 /// \brief DeepSeek-V4 (DSA indexer) top-k implementation classes.
 ///
-/// Ported from the cudalib scratchpad kernel (github.com/DarkSharpness/cuda,
-/// `dark` branch @ 3c9225f "feat: optimize topk bandwidth"). This header holds
-/// ONLY the device-side implementation classes + helpers; the `__global__`
-/// kernels and the host dispatcher live in csrc/deepseek_v4/topk_v2.cuh.
+/// This header holds ONLY the device-side implementation classes + helpers; the
+/// `__global__` kernels and the host dispatcher live in csrc/deepseek_v4/topk_v2.cuh.
 ///
-/// Differences from the upstream cudalib kernel:
+/// Design notes:
 ///  - top-k (`topk`) is a *runtime* value (<= kMaxTopK = 2048), never a
 ///    compile-time constant.
-///  - the output is the result of a page-table transform of the selected raw
-///    indices (`TopKProblem::emit`), with an optional raw-index side output.
+///  - the output is the page-table transform of the selected raw indices
+///    (`TopKProblem::emit` then `transform_output`).
 ///  - each block reads its own `seq_len` (per-batch ragged lengths) -- the host
 ///    launches one universal kernel and dispatches per block.
 ///  - the cluster size is fixed at 8 (dynamic persistent clusters are hard).
 ///
-/// The algorithm itself (fp16 coarse histogram -> threshold bin -> fp32-boundary
-/// collect -> exact radix tie-break) is unchanged from upstream.
+/// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
+/// exact radix tie-break.
 
 #pragma once
 
@@ -34,7 +32,7 @@ namespace device::topk {
 
 namespace cg = cooperative_groups;
 
-/// Upstream uses `kWarpSize`; sgl_kernel calls it `kWarpThreads`.
+/// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
 
 /// PTX pragma that lets the compiler spill registers into otherwise-unused
@@ -147,13 +145,12 @@ SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint3
   return (page_table[i >> page_bits] << page_bits) | (i & mask);
 }
 
-/// One batch element's worth of work. `emit(pos, raw_idx)` writes the selected
-/// raw index `raw_idx` to output slot `pos`, applying the page-table transform
-/// for `out` and (optionally) recording the raw index in `raw_out`.
+/// One batch element's worth of work. `emit(pos, raw_idx)` writes the selected raw
+/// index to output slot `pos`; `transform_output` then applies the page-table
+/// transform in a separate pass.
 struct TopKProblem {
   const float* __restrict__ in;
-  int32_t* __restrict__ out;      // page_indices  [topk]
-  int32_t* __restrict__ raw_out;  // optional raw indices [topk]; nullptr if unused
+  int32_t* __restrict__ out;  // page_indices [topk]
   const int32_t* __restrict__ page_table;
   uint32_t topk;
   uint32_t seq_len;
@@ -166,11 +163,7 @@ struct TopKProblem {
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx);
   }
-  SGL_DEVICE void emit_invalid(uint32_t pos) const {
-    out[pos] = -1;
-  }
   SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
-    if (raw_out != nullptr) raw_out[t] = raw;
     out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
   }
 };

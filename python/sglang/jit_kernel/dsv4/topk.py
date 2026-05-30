@@ -61,7 +61,6 @@ def topk_transform_512(
         )
 
 
-_WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
 # rows 1..N = {batch_id, seq_len} of items routed to the persistent cluster pool.
 _PLAN_METADATA_INTS_PER_BATCH = 2
@@ -84,14 +83,11 @@ def topk_transform_512_v2(
     metadata: torch.Tensor,
 ) -> None:
     module = _jit_topk_v2_module()
-    bs = scores.shape[0]
-    workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
     module.topk_transform(
         scores,
         seq_lens,
         page_tables,
         out_page_indices,
         page_size,
-        workspace,
         metadata,
     )

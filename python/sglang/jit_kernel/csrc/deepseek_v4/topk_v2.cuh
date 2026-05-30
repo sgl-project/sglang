@@ -77,7 +77,6 @@ struct TopKLaunchParams {
     return TopKProblem{
         .in = scores + batch_id * score_stride,
         .out = page_indices + batch_id * k,
-        .raw_out = nullptr,
         .page_table = page_table + batch_id * page_table_stride,
         .topk = topk,
         .seq_len = seq_len,
@@ -333,15 +332,12 @@ struct CombinedTopKKernel {
         static_cluster_threshold);
   }
 
-  /// `workspace` is accepted to preserve the FFI interface (the new kernels use
-  /// distributed shared memory, no global workspace); it is ignored.
   static void transform(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      [[maybe_unused]] const tvm::ffi::TensorView workspace,
       const tvm::ffi::TensorView metadata) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
