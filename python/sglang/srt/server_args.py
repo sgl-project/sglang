@@ -280,7 +280,12 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
+MAMBA_SCHEDULER_STRATEGY_CHOICES = [
+    "auto",
+    "no_buffer",
+    "extra_buffer",
+    "extra_buffer_lazy",
+]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
@@ -7102,7 +7107,10 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return self.mamba_scheduler_strategy == "extra_buffer"
+        return self.mamba_scheduler_strategy in ("extra_buffer", "extra_buffer_lazy")
+
+    def enable_mamba_extra_buffer_lazy(self) -> bool:
+        return self.mamba_scheduler_strategy == "extra_buffer_lazy"
 
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:

@@ -139,6 +139,8 @@ def _set_kv_buffer_impl(
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
+    enable_mamba_extra_buffer_lazy: bool = False
+
     def __init__(
         self,
         size: int,
@@ -512,6 +514,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         cache_params: BaseLinearStateParams,
         mamba_layer_ids: List[int],
         enable_mamba_extra_buffer: bool,
+        enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
@@ -525,11 +528,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
-        from sglang.srt.environ import envs
-
-        self._mamba_lazy_extra_buffer = (
-            enable_mamba_extra_buffer and envs.SGLANG_MAMBA_LAZY_EXTRA_BUFFER.get()
-        )
+        self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
@@ -605,7 +604,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
-                    if self._mamba_lazy_extra_buffer:
+                    if self.enable_mamba_extra_buffer_lazy:
                         alloc_result = self.mamba_pool.alloc(1)
                         assert (
                             alloc_result is not None
@@ -664,6 +663,28 @@ class HybridReqToTokenPool(ReqToTokenPool):
         else:
             return mamba_next_track_idx
 
+    def donate_mamba_ping_pong_slot(
+        self, req: "Req", new_slot: torch.Tensor
+    ) -> torch.Tensor:
+        """Donate a ping-pong slot to the radix cache and replace it with new_slot.
+
+        Returns the donated mamba value tensor (shape [1]) for insertion into the cache.
+        """
+        if self.enable_mamba_extra_buffer_lazy:
+            donate_idx = req.mamba_next_track_idx
+        else:
+            donate_idx = self.get_mamba_ping_pong_other_idx(
+                req.mamba_next_track_idx
+            )
+        mamba_value_donated = (
+            req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
+        )
+        req.mamba_ping_pong_track_buffer[donate_idx] = new_slot[0]
+        self.req_index_to_mamba_ping_pong_track_buffer_mapping[
+            req.req_pool_idx
+        ] = req.mamba_ping_pong_track_buffer
+        return mamba_value_donated
+
     def free_mamba_cache(
         self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
@@ -703,7 +724,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     mamba_ping_pong_track_buffer_to_free = (
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
-            if self._mamba_lazy_extra_buffer:
+            if self.enable_mamba_extra_buffer_lazy:
                 mamba_ping_pong_track_buffer_to_free = (
                     mamba_ping_pong_track_buffer_to_free[
                         mamba_ping_pong_track_buffer_to_free != -1

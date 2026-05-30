@@ -409,7 +409,7 @@ def alloc_req_slots(
         if tree_cache.supports_mamba():
             factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool._mamba_lazy_extra_buffer
+                if req_to_token_pool.enable_mamba_extra_buffer_lazy
                 else MAMBA_STATE_PER_REQ_PREFIX_CACHE
             )
         else:

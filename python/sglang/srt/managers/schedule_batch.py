@@ -768,6 +768,8 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
         self.mamba_needs_clear: bool = False
+        # Lazy extra buffer: whether to insert into radix cache on finish
+        self.mamba_lazy_is_insert: bool = True
 
         # Check finish
         self.tokenizer = None
@@ -2157,7 +2159,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            if not self.req_to_token_pool._mamba_lazy_extra_buffer:
+            if not self.req_to_token_pool.enable_mamba_extra_buffer_lazy:
                 req.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.mamba_next_track_idx
@@ -2537,7 +2539,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_interval = get_global_server_args().mamba_track_interval
 
             if (
-                self.req_to_token_pool._mamba_lazy_extra_buffer
+                self.req_to_token_pool.enable_mamba_extra_buffer_lazy
                 and len(self.reqs) > 0
             ):
                 self._mamba_lazy_prealloc_at_boundary(mamba_track_interval)

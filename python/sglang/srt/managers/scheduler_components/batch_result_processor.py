@@ -644,7 +644,7 @@ class SchedulerBatchResultProcessor:
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
-                if getattr(batch.req_to_token_pool, "_mamba_lazy_extra_buffer", False):
+                if batch.req_to_token_pool.enable_mamba_extra_buffer_lazy:
                     self._mamba_lazy_post_decode(req, batch, result, i)
                 self._handle_finished_req(req, i, logits_output)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
@@ -671,7 +671,7 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accepted_len)
 
-            if getattr(batch.req_to_token_pool, "_mamba_lazy_extra_buffer", False):
+            if batch.req_to_token_pool.enable_mamba_extra_buffer_lazy:
                 self._mamba_lazy_post_decode(req, batch, result, i)
 
             self._handle_finished_req(req, i, logits_output)
@@ -836,9 +836,8 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                lazy_is_insert = getattr(req, "_mamba_lazy_is_insert", True)
                 release_kv_cache(
-                    req, self.tree_cache, is_insert=lazy_is_insert
+                    req, self.tree_cache, is_insert=req.mamba_lazy_is_insert
                 )
 
             req.time_stats.set_completion_time()
@@ -856,7 +855,7 @@ class SchedulerBatchResultProcessor:
 
     def _mamba_lazy_swap_before_cache(self, req: Req, batch: ScheduleBatch):
         """Swap mamba_next_track_idx so the valid slot is at 'other' for cache_finished_req."""
-        if not getattr(batch.req_to_token_pool, "_mamba_lazy_extra_buffer", False):
+        if not batch.req_to_token_pool.enable_mamba_extra_buffer_lazy:
             return
         if req.mamba_ping_pong_track_buffer is None:
             return
@@ -876,7 +875,7 @@ class SchedulerBatchResultProcessor:
             return
 
         mamba_track_interval = get_global_server_args().mamba_track_interval
-        lazy = getattr(batch.req_to_token_pool, "_mamba_lazy_extra_buffer", False)
+        lazy = batch.req_to_token_pool.enable_mamba_extra_buffer_lazy
 
         if lazy:
             self._mamba_lazy_prefix_cache_update(
@@ -975,12 +974,12 @@ class SchedulerBatchResultProcessor:
                 other_idx = 1 - req.mamba_next_track_idx
                 other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
                 if other_val == -1:
-                    req._mamba_lazy_is_insert = False
+                    req.mamba_lazy_is_insert = False
                 else:
-                    req._mamba_lazy_is_insert = True
+                    req.mamba_lazy_is_insert = True
                     req.mamba_next_track_idx = other_idx
             else:
-                req._mamba_lazy_is_insert = True
+                req.mamba_lazy_is_insert = True
                 other_idx = 1 - req.mamba_next_track_idx
                 other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
                 if other_val == -1:

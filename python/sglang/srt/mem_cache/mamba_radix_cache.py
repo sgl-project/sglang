@@ -644,24 +644,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Donate the mamba index to the radix cache instead of copying.
         # This avoids a data copy that would race with the forward stream.
         if self.enable_mamba_extra_buffer:
-            if self.req_to_token_pool._mamba_lazy_extra_buffer:
-                donate_idx = req.mamba_next_track_idx
-            else:
-                donate_idx = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
-                )
-            mamba_value_donated = (
-                req.mamba_ping_pong_track_buffer[donate_idx]
-                .unsqueeze(-1)
-                .clone()
-            )
             new_slot = self._alloc_mamba_slot()
-            req.mamba_ping_pong_track_buffer[donate_idx] = new_slot[0]
-            self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                req.req_pool_idx
-            ] = req.mamba_ping_pong_track_buffer
+            mamba_value_donated = self.req_to_token_pool.donate_mamba_ping_pong_slot(
+                req, new_slot
+            )
         else:
             mamba_value_donated = self._alloc_mamba_slot()
             self.req_to_token_pool.mamba_pool.copy_from(
