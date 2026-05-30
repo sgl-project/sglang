@@ -57,12 +57,6 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
         self.pp_group = get_pp_group()
-        # self.determine_num_fused_shared_experts("Qwen3NextForCausalLMMTP")
-        # MTP head has no shared-expert MoE layer (only the target model does),
-        # so the fusion path that Qwen3NextForCausalLM.__init__ enables must be
-        # disabled here — we skip the parent __init__ entirely above.
-        self.num_fused_shared_experts = 0
-        self.enable_shared_expert_fusion = False
 
         # currently based on the provided ckpt, we:
         # (1) do not use_dedicated_mtp_embeddings provided in ckpt since not provided and directly use the target model embeddings
@@ -89,6 +83,13 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # Mirror Qwen3NextForCausalLM.__init__'s shared-expert fusion setup so
+        # the inherited load_weights() can find the attribute on the MTP path.
+        # We compute it from the actual MTP MoE layer (1 layer with is_nextn=True),
+        # not hardcode it — when the layer's MoE pre-fuses the shared expert,
+        # load_weights must remap mlp.shared_expert.* into the fused slot.
+        self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
     @torch.no_grad()
     def forward(
