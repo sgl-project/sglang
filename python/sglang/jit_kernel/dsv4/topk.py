@@ -62,7 +62,9 @@ def topk_transform_512(
 
 
 _WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
-_PLAN_METADATA_INTS_PER_BATCH = 4
+# metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
+# rows 1..N = {batch_id, seq_len} of items routed to the persistent cluster pool.
+_PLAN_METADATA_INTS_PER_BATCH = 2
 
 
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:

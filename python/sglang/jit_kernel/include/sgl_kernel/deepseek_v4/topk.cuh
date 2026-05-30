@@ -631,7 +631,10 @@ struct TopKCluster : TopKRadixBase<10> {
     int32_t tmp_out[kMaxTopK];
   };
 
-  template <bool kUsePDL>
+  // Process ONE batch element (one cluster). NO PDL and NO trailing barrier --
+  // the persistent kernel does PDLWaitPrimary once before its item loop and a
+  // cluster.sync() after each forward(). Writes raw indices to out; the kernel's
+  // transform pass applies the page-table transform.
   SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -656,7 +659,6 @@ struct TopKCluster : TopKRadixBase<10> {
       smem->count_gt = 0;
     }
     __syncthreads();
-    device::PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram over this rank's contiguous chunk.
     for_each_input(problem.in, local_seq_len, [&](float val, uint32_t) {
