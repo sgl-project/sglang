@@ -96,8 +96,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
             self.transformer.config.arch_config.patch_size[-1]
             * self.transformer.config.arch_config.patch_size[-2]
         )
-        self.frame_seq_length = (h * w) // patch_ratio
-        return self.frame_seq_length
+        self.num_token_per_frame = (h * w) // patch_ratio
+        return self.num_token_per_frame
 
     def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
         assert batch.latents is not None, "latents must be provided"
@@ -512,7 +512,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             prompt_embeds=prompt_embeds,
             kv_cache=kv_cache,
             crossattn_cache=crossattn_cache,
-            current_start_tokens=current_start_frame * self.frame_seq_length,
+            current_start_tokens=current_start_frame * self.num_token_per_frame,
             start_frame=current_start_frame,
             image_kwargs=image_kwargs,
             pos_cond_kwargs=pos_cond_kwargs,
@@ -629,8 +629,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
     def _get_causal_kv_cache_size(self) -> int:
         if self.local_attn_size != -1:
-            return self.local_attn_size * self.frame_seq_length
-        return self.frame_seq_length * self.sliding_window_num_frames
+            return self.local_attn_size * self.num_token_per_frame
+        return self.num_token_per_frame * self.sliding_window_num_frames
 
     def _allocate_causal_kv_cache(
         self,
@@ -811,7 +811,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
                 current_start_tokens = (
                     pos_start_base + start_index
-                ) * self.frame_seq_length
+                ) * self.num_token_per_frame
                 current_latents = self._denoise_and_update_causal_block(
                     batch,
                     server_args,

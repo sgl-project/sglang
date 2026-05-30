@@ -101,9 +101,9 @@ def test_causal_dmd_forward_context_uses_prepare_hooks(monkeypatch):
     seen = {}
 
     def fake_prepare_frame_seq_length(self, h, w):
-        self.frame_seq_length = h * w
+        self.num_token_per_frame = h * w
         seen["frame_shape"] = (h, w)
-        return self.frame_seq_length
+        return self.num_token_per_frame
 
     stage._target_dtype = MethodType(lambda self: torch.float16, stage)
     stage._autocast_enabled = MethodType(lambda self, dtype, server_args: False, stage)
@@ -218,7 +218,7 @@ def test_causal_dmd_block_updates_context_after_denoising():
 
 def test_causal_context_warmup_uses_context_cache_update_path():
     stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
-    stage.frame_seq_length = 4
+    stage.num_token_per_frame = 4
     seen = {}
 
     def fake_update(self, *args, **kwargs):
@@ -393,7 +393,7 @@ def test_causal_kv_cache_update_handles_append_roll_and_recompute():
     first_view = cache.update_and_get_attention_kv(
         key=torch.tensor([[[[1.0]], [[2.0]], [[3.0]]]]),
         value=torch.tensor([[[[10.0]], [[20.0]], [[30.0]]]]),
-        current_start=0,
+        current_chunk_start=0,
         sink_tokens=0,
         attention_window_size=None,
     )
@@ -407,7 +407,7 @@ def test_causal_kv_cache_update_handles_append_roll_and_recompute():
     rolled_view = cache.update_and_get_attention_kv(
         key=torch.tensor([[[[4.0]], [[5.0]], [[6.0]]]]),
         value=torch.tensor([[[[40.0]], [[50.0]], [[60.0]]]]),
-        current_start=3,
+        current_chunk_start=3,
         sink_tokens=0,
         attention_window_size=None,
     )
@@ -419,7 +419,7 @@ def test_causal_kv_cache_update_handles_append_roll_and_recompute():
     recompute_view = cache.update_and_get_attention_kv(
         key=torch.tensor([[[[50.0]]]]),
         value=torch.tensor([[[[500.0]]]]),
-        current_start=4,
+        current_chunk_start=4,
         sink_tokens=0,
         attention_window_size=2,
     )
