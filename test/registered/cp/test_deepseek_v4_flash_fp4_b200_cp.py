@@ -116,7 +116,7 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
                 "--dsa-prefill-cp-mode",
                 "round-robin-split",
                 "--moe-runner-backend",  # for fp4 checkpoint
-                "marlin",
+                "flashinfer_mxfp4",
             ],
         )
 
