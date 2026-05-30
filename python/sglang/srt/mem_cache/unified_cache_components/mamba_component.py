@@ -312,13 +312,22 @@ class MambaComponent(TreeComponent):
                 return 0
             # Donate the mamba index to the radix cache instead of copying.
             if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
+                if self.cache.req_to_token_pool._mamba_lazy_extra_buffer:
+                    donate_idx = req.mamba_next_track_idx
+                else:
+                    donate_idx = (
+                        self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                            req.mamba_next_track_idx
+                        )
+                    )
                 mamba_value_donated = (
-                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
+                    req.mamba_ping_pong_track_buffer[donate_idx]
+                    .unsqueeze(-1)
+                    .clone()
                 )
-                req.mamba_ping_pong_track_buffer[keep_idx] = self._alloc_mamba_slot()[0]
+                req.mamba_ping_pong_track_buffer[donate_idx] = (
+                    self._alloc_mamba_slot()[0]
+                )
                 self.cache.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
                     req.req_pool_idx
                 ] = req.mamba_ping_pong_track_buffer

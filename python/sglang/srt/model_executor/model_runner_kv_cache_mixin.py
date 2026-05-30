@@ -238,6 +238,11 @@ class ModelRunnerKVCacheMixin:
             else:
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
+            from sglang.srt.environ import envs
+
+            if envs.SGLANG_MAMBA_LAZY_EXTRA_BUFFER.get():
+                additional_ratio = max(0, additional_ratio - 1)
+
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
     def _validate_prefill_only_disable_kv_cache_pool_family(

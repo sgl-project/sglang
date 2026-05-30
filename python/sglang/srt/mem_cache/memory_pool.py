@@ -525,6 +525,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
+        from sglang.srt.environ import envs
+
+        self._mamba_lazy_extra_buffer = (
+            enable_mamba_extra_buffer and envs.SGLANG_MAMBA_LAZY_EXTRA_BUFFER.get()
+        )
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
@@ -600,12 +605,23 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
-                    req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
-                        self.mamba_ping_pong_track_buffer_size
-                    )
-                    assert (
-                        req.mamba_ping_pong_track_buffer is not None
-                    ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+                    if self._mamba_lazy_extra_buffer:
+                        alloc_result = self.mamba_pool.alloc(1)
+                        assert (
+                            alloc_result is not None
+                        ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+                        req.mamba_ping_pong_track_buffer = torch.tensor(
+                            [alloc_result[0].item(), -1],
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                    else:
+                        req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
+                            self.mamba_ping_pong_track_buffer_size
+                        )
+                        assert (
+                            req.mamba_ping_pong_track_buffer is not None
+                        ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
                     req.mamba_next_track_idx = 0
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
         assert len(select_index) == len(
@@ -687,6 +703,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     mamba_ping_pong_track_buffer_to_free = (
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
+            if self._mamba_lazy_extra_buffer:
+                mamba_ping_pong_track_buffer_to_free = (
+                    mamba_ping_pong_track_buffer_to_free[
+                        mamba_ping_pong_track_buffer_to_free != -1
+                    ]
+                )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
 
     def clear(self):
