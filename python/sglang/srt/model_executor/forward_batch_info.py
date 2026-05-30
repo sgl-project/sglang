@@ -40,6 +40,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -447,6 +448,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+
+    # kv-canary token-id validator snapshot
+    req_all_ids_flat: Optional[torch.Tensor] = None
+    req_all_ids_lens: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -1314,3 +1319,5 @@ if is_cuda() or is_hip():
     clamp_position = clamp_position_cuda
 else:
     clamp_position = _clamp_position_native
+
+
