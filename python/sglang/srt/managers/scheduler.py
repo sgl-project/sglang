@@ -452,7 +452,9 @@ class Scheduler(
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
-            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+            self.hisparse_coordinator = (
+                self.model_worker.model_runner.hisparse_coordinator
+            )
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
         if (
@@ -802,7 +804,8 @@ class Scheduler(
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
 
-        # Dispatch the model worker
+        # Dispatch the active polymorphic worker. Use model_worker for features
+        # that should work for both TpModelWorker and BaseSpecWorker wrappers.
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
         else:
@@ -1174,16 +1177,12 @@ class Scheduler(
         )
 
         # FutureMap is always-on: input_ids relay used in both modes.
-        # Workers not on BaseSpecWorker (e.g. FrozenKVMTPWorker) lack the
-        # override; fall back to target-only so the helper still produces a
-        # safe decision (no accidental opt-out for unaudited shapes).
-        if self.draft_worker is not None:
-            attn_backends = getattr(
-                self.draft_worker,
-                "spec_v2_attn_backends",
-                (self.tp_worker.model_runner.attn_backend,),
-            )
+        # All spec workers now expose spec_v2_attn_backends via BaseSpecWorker.
+        # Use model_worker for unified interface (which delegates to target or draft as needed).
+        if hasattr(self.model_worker, "spec_v2_attn_backends"):
+            attn_backends = self.model_worker.spec_v2_attn_backends
         else:
+            # Fallback for non-spec workers: just target backend
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
         self.future_map = self.spec_algorithm.create_future_map(
@@ -1201,7 +1200,7 @@ class Scheduler(
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
-            self.token_table = self.tp_worker.model_runner.token_table
+            self.token_table = self.model_worker.model_runner.token_table
             hf_config = self.tp_worker.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
@@ -1566,6 +1565,7 @@ class Scheduler(
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
+            model_worker=self.model_worker,
             tp_cpu_group=self.tp_cpu_group,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
@@ -1584,7 +1584,7 @@ class Scheduler(
     def init_lora_overlap_loader(self) -> None:
         if self.enable_lora_overlap_loading:
             self.lora_overlap_loader = LoRAOverlapLoader(
-                self.tp_worker.model_runner.lora_manager
+                self.model_worker.model_runner.lora_manager
             )
 
     def init_grammar_manager(self) -> None:
@@ -2804,7 +2804,7 @@ class Scheduler(
             )
         else:
             new_lora_set = {req.lora_id} | running_loras
-            return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
+            return self.model_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
             )
 
@@ -3451,12 +3451,12 @@ class Scheduler(
         ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         ret["memory_usage"] = {
-            "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
+            "weight": round(self.model_worker.model_runner.weight_load_mem_usage, 2),
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
             "token_capacity": int(self.max_total_num_tokens),
-            "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
+            "graph": round(self.model_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
@@ -3720,7 +3720,7 @@ class Scheduler(
     ) -> LoadLoRAAdapterReqOutput:
         """In-place loading a new lora adapter from disk or huggingface."""
 
-        result = self.tp_worker.load_lora_adapter(recv_req)
+        result = self.model_worker.load_lora_adapter(recv_req)
         return result
 
     def load_lora_adapter_from_tensors(
@@ -3728,7 +3728,7 @@ class Scheduler(
     ) -> LoadLoRAAdapterFromTensorsReqOutput:
         """In-place loading a new lora adapter from serialized tensors."""
 
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+        result = self.model_worker.load_lora_adapter_from_tensors(recv_req)
         return result
 
     def unload_lora_adapter(
@@ -3736,7 +3736,7 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
-        result = self.tp_worker.unload_lora_adapter(recv_req)
+        result = self.model_worker.unload_lora_adapter(recv_req)
         return result
 
     def init_weights_send_group_for_remote_instance(

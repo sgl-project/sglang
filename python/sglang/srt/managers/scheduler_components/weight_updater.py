@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
+    model_worker: Any
     tp_cpu_group: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
@@ -144,7 +145,7 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
-                self.tp_worker.model_runner.model
+                self.model_worker.model_runner.model
             )
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
@@ -172,7 +173,7 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(
-                self.tp_worker.model_runner.model,
+                self.model_worker.model_runner.model,
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
@@ -184,7 +185,7 @@ class SchedulerWeightUpdaterManager:
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            payload = self.model_worker.check_weights(recv_req.action)
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
@@ -194,23 +195,10 @@ class SchedulerWeightUpdaterManager:
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
     def save_remote_model(self, params):
-        url = params["url"]
-
-        self.tp_worker.model_runner.save_remote_model(url)
-
-        if self.draft_worker is not None:
-            draft_url = params.get("draft_url", None)
-            assert (
-                draft_url is not None
-            ), "draft_url must be provided when draft model is enabled"
-            self.draft_worker.model_runner.save_remote_model(draft_url)
+        self.model_worker.save_remote_model(params)
 
     def save_sharded_model(self, params):
-        self.tp_worker.model_runner.save_sharded_model(
-            path=params["path"],
-            pattern=params["pattern"],
-            max_size=params["max_size"],
-        )
+        self.model_worker.save_sharded_model(params)
 
 
 def _export_static_state(model):
