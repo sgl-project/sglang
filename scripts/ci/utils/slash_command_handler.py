@@ -871,6 +871,33 @@ def _resolve_test_spec(test_spec):
     return out
 
 
+def _resolve_dispatch_target(gh_repo, pr):
+    """Decide the dispatch ref and the commit the test actually runs on.
+
+    workflow_dispatch only accepts a branch/tag for `ref`, so a specific
+    commit is threaded through the `pr_head_sha` input and checked out by
+    rerun-test.yml. Three cases:
+      - merged PR: the head branch is often deleted, so we run on the merge
+        commit that actually landed on `main` (reachable forever via main's
+        history) -- i.e. the code as it was really merged, matching what the
+        main PR CI exercises via refs/pull/N/merge.
+      - fork PR (open): run on the PR head via refs/pull/N/head.
+      - same-repo open PR: check out the head branch by name.
+
+    Returns (ref, pr_head_sha, checkout_sha):
+      - ref: branch/tag passed to workflow_dispatch
+      - pr_head_sha: commit passed as the `pr_head_sha` input, or None when
+        `ref` itself already points at the right commit
+      - checkout_sha: the commit the run will check out (for display)
+    """
+    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+    if pr.merged:
+        return "main", pr.merge_commit_sha, pr.merge_commit_sha
+    if is_fork:
+        return "main", pr.head.sha, pr.head.sha
+    return pr.head.ref, None, pr.head.sha
+
+
 def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
     """
     Dispatch a single workflow run for a batch of resolved test specs that
@@ -905,11 +932,8 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
                 "error": f"{workflow_name} workflow not found",
             }
 
-        is_fork = (
-            pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
-        )
+        ref, pr_head_sha, _ = _resolve_dispatch_target(gh_repo, pr)
 
-        pr_head_sha = None
         inputs = {
             "mode": mode,
             "test_command": combined_command,
@@ -920,12 +944,8 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
         }
-        if is_fork:
-            ref = "main"
-            pr_head_sha = pr.head.sha
+        if pr_head_sha:
             inputs["pr_head_sha"] = pr_head_sha
-        else:
-            ref = pr.head.ref
 
         dispatch_time = time.time()
 
@@ -1181,6 +1201,23 @@ def handle_rerun_test(
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
+
+    # State which commit the run checks out, so the reply is unambiguous --
+    # especially for merged PRs, where we run the merge commit on main rather
+    # than the (possibly deleted) head branch.
+    _, _, checkout_sha = _resolve_dispatch_target(gh_repo, pr)
+    if checkout_sha:
+        commit_url = f"https://github.com/{gh_repo.full_name}/commit/{checkout_sha}"
+        commit_link = f"[`{checkout_sha[:7]}`]({commit_url})"
+        if pr.merged:
+            target_note = (
+                f"> Running on merge commit {commit_link} "
+                f"(PR is merged -- testing the code as it landed on `main`)."
+            )
+        else:
+            target_note = f"> Running on {commit_link}."
+        body = f"{target_note}\n\n{body}"
+
     # Echo the originating command so each reply is self-identifying when
     # several /rerun-test commands are in flight at once. Backtick-wrapping
     # also keeps any `*` in the pattern from rendering as italics.

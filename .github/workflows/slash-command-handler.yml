@@ -35,7 +35,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_DATA=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefName,headRepositoryOwner) || {
+          PR_DATA=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefName,headRepositoryOwner,state) || {
             echo "::error::Failed to fetch PR data"
             exit 1
           }
@@ -48,10 +48,19 @@ jobs:
           else
             IS_FORK="false"
           fi
+          # A merged PR's head branch is often auto-deleted, so checking it out
+          # by name fails. Fall back to main for the handler checkout in that
+          # case (the dispatch step targets the merge commit; see slash_command_handler.py).
+          if [[ "$(echo "$PR_DATA" | jq -r '.state // empty')" == "MERGED" ]]; then
+            MERGED="true"
+          else
+            MERGED="false"
+          fi
           echo "is_fork=$IS_FORK" >> $GITHUB_OUTPUT
+          echo "merged=$MERGED" >> $GITHUB_OUTPUT
           echo "ref=$(echo "$PR_DATA" | jq -r '.headRefName')" >> $GITHUB_OUTPUT
           echo "pr_ref=refs/pull/${{ github.event.issue.number }}/head" >> $GITHUB_OUTPUT
-          echo "PR owner: $HEAD_OWNER, Repo owner: $REPO_OWNER, Is fork: $IS_FORK"
+          echo "PR owner: $HEAD_OWNER, Repo owner: $REPO_OWNER, Is fork: $IS_FORK, Merged: $MERGED"
 
       - name: Check commenter permission for fork PRs
         id: perm
@@ -74,10 +83,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # For non-fork PRs: checkout PR branch by name
+          # For merged PRs: head branch may be deleted, so stay on main
+          # For non-fork open PRs: checkout PR branch by name
           # For fork PRs with trusted commenter: checkout via refs/pull/N/head
           # For fork PRs with untrusted commenter: stay on main for security
-          ref: ${{ steps.pr.outputs.is_fork == 'false' && steps.pr.outputs.ref || (steps.perm.outputs.safe_to_checkout_pr == 'true' && steps.pr.outputs.pr_ref || '') }}
+          ref: ${{ steps.pr.outputs.merged != 'true' && (steps.pr.outputs.is_fork == 'false' && steps.pr.outputs.ref || (steps.perm.outputs.safe_to_checkout_pr == 'true' && steps.pr.outputs.pr_ref || '')) || '' }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
