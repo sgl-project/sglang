@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
@@ -13,8 +14,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory, is_musa
+from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -420,11 +422,6 @@ def pp_parallel_deep_gemm_warmup(model_runner) -> None:
     /generate flowing through the pipeline. Opt-in via
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.
     """
-    import time
-
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.utils import ceil_align
-
     # n_splits ~= n_sms / ceil(bs/block_m) with block_m=64; sweep 5 bs to
     # cover the brackets real /generate hits (smallest decode shape,
     # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
