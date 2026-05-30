@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class Qwen25Detector(BaseFormatDetector):
         self.eot_token = "\n</tool_call>"
         self.tool_call_separator = "\n"
         self._normal_text_buffer = ""  # Buffer for handling partial end tokens
+        self._xml_detector = Qwen3CoderDetector()
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Qwen 2.5 format tool call."""
@@ -56,6 +58,8 @@ class Qwen25Detector(BaseFormatDetector):
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
+        if "<function=" in text:
+            return self._xml_detector.detect_and_parse(text, tools)
 
         # Find all <tool_call>\n...\n</tool_call> blocks
         pattern = rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}"

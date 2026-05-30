@@ -4885,6 +4885,36 @@ class TestQwen25Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertIn("let me check", result.normal_text)
 
+    def test_detect_and_parse_xml_style_tool_call(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_current_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        text = (
+            "Thinking Process:\n...</think>\n\n"
+            "<tool_call>\n"
+            "<function=get_current_weather>\n"
+            "<parameter=location>\nNew York\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+        self.assertIn("Thinking Process", result.normal_text)
+        self.assertNotIn("<function=", result.normal_text)
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"location": "New York"}
+        )
+
     # -- Streaming tests --
 
     def _collect_streaming_tool_calls(self, chunks):
