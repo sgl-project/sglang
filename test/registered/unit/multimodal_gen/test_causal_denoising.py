@@ -7,6 +7,7 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
     CausalSelfAttentionKVCache,
+    CrossAttentionKVCache,
 )
 
 
@@ -335,3 +336,23 @@ def test_causal_kv_cache_block_supports_dict_access_and_in_place_reset():
     assert int(cache.local_end_index.item()) == 0
     assert cache.global_end_index_int == 0
     assert cache.local_end_index_int == 0
+
+
+def test_crossattn_cache_block_supports_dict_access_and_reset():
+    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
+    stage.num_transformer_blocks = 1
+    k = torch.ones(1, 8, 2, 3)
+    v = torch.ones(1, 8, 2, 3)
+    cache = CrossAttentionKVCache(k=k, v=v, is_init=True)
+
+    assert cache["k"] is k
+    assert cache.get("is_init") is True
+    detached_v = v.detach()
+    cache["v"] = detached_v
+    assert cache.v is detached_v
+
+    stage._reset_crossattn_cache([cache])
+
+    assert cache.k is k
+    assert cache.v is detached_v
+    assert cache.is_init is False
