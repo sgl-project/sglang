@@ -51,6 +51,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     Req,
     build_pipeline,
 )
+from sglang.multimodal_gen.runtime.realtime.session import (
+    RealtimeSessionCache,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
@@ -63,6 +66,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
+)
+from sglang.multimodal_gen.runtime.utils.realtime_video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
@@ -118,6 +125,23 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+
+    def release_realtime_session(self, session_id: str) -> OutputBatch:
+        if not session_id:
+            return OutputBatch(
+                output={
+                    "released": False,
+                    "session_id": session_id,
+                    "reason": "empty_session_id",
+                }
+            )
+
+        released = self._realtime_sessions.release(session_id)
+        if released:
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+        return OutputBatch(output={"released": released, "session_id": session_id})
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -309,6 +333,7 @@ class GPUWorker:
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
+            self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
@@ -354,6 +379,24 @@ class GPUWorker:
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
+            # Realtime raw-frame responses avoid serializing generated tensors between
+            # scheduler_client and gpu_worker.
+            if req.return_encoded_frames and self.rank == 0:
+                if output_batch.output is not None:
+                    output_batch.encoded_frame_content_type = RAW_RGB_CONTENT_TYPE
+                    (
+                        output_batch.encoded_frame_batches,
+                        output_batch.encoded_frame_metadata,
+                    ) = build_raw_rgb_frame_batches(
+                        output_batch.output,
+                        req,
+                        output_batch,
+                        post_process_sample,
+                    )
+                    output_batch.output = None
+                output_batch.audio = None
+                output_batch.audio_sample_rate = None
+
             # file-path-only responses avoid serializing generated tensors between
             # scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only:
@@ -368,7 +411,11 @@ class GPUWorker:
             # Keep return_frames payloads off the scheduler's tensor ZMQ path.
             self._materialize_frame_outputs_for_return(output_batch, req)
 
-            if torch.cuda.is_initialized() and output_batch.output is None:
+            if (
+                torch.cuda.is_initialized()
+                and output_batch.output is None
+                and not req.return_encoded_frames
+            ):
                 torch.cuda.empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
@@ -500,10 +547,15 @@ class GPUWorker:
             dynamic_output_paths = None
 
         if dynamic_output_paths is not None:
-            build_output_path = lambda idx: dynamic_output_paths[idx]
+
+            def build_output_path(idx: int) -> str:
+                return dynamic_output_paths[idx]
+
         else:
             num_outputs = len(output_batch.output)
-            build_output_path = lambda idx: req.output_file_path(num_outputs, idx)
+
+            def build_output_path(idx: int) -> str:
+                return req.output_file_path(num_outputs, idx)
 
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
