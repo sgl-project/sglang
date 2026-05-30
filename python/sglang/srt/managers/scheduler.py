@@ -450,6 +450,24 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        # Decode radix cache is unsupported with hybrid SWA/SSM models —
+        # these use specialized memory pools incompatible with the
+        # prefix-match-and-lock allocation path.
+        if (
+            server_args.disaggregation_decode_enable_radix_cache
+            and server_args.disaggregation_mode == "decode"
+        ):
+            if self.is_hybrid_swa:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with sliding window attention (SWA) models"
+                )
+            if self.is_hybrid_ssm:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with Mamba/SSM models"
+                )
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator

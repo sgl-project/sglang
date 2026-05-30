@@ -807,6 +807,10 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
+    disaggregation_decode_enable_hicache: bool = False
+    disaggregation_decode_hicache_ratio: float = 1.0
+    disaggregation_decode_hicache_size: int = 0
+    disaggregation_decode_hicache_write_policy: str = "write_through"
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
@@ -3863,7 +3867,6 @@ class ServerArgs:
             )
         except Exception:
             return False
-
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
@@ -6805,6 +6808,30 @@ class ServerArgs:
             "--disaggregation-decode-enable-radix-cache",
             action="store_true",
             help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl or mooncake and is incompatible with --enable-hisparse.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-enable-hicache",
+            action="store_true",
+            help="Enable hierarchical cache (HiRadixCache) on decode server (PD mode). Requires --disaggregation-decode-enable-radix-cache. Adds host (L2) and optional storage (L3) cache layers.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-hicache-ratio",
+            type=float,
+            default=ServerArgs.disaggregation_decode_hicache_ratio,
+            help="The ratio of host KV cache memory pool to device pool for decode server HiRadixCache.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-hicache-size",
+            type=int,
+            default=ServerArgs.disaggregation_decode_hicache_size,
+            help="The size of host KV cache memory pool in GB for decode server HiRadixCache. Overrides --disaggregation-decode-hicache-ratio if set.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-hicache-write-policy",
+            type=str,
+            choices=["write_back", "write_through", "write_through_selective"],
+            default=ServerArgs.disaggregation_decode_hicache_write_policy,
+            help="The write policy for decode server HiRadixCache.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
