@@ -1099,25 +1099,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                             time.perf_counter() - tic,
                         )
 
-    def prewarm_mhc_token_count_buckets(
-        self, max_num_tokens: int, device: torch.device
-    ) -> Tuple[int, ...]:
-        from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
-
-        token_counts = get_mhc_pre_token_count_representatives(
-            max_num_tokens, self.hc_mult * self.hidden_size
-        )
-        if not token_counts:
-            return token_counts
-
-        logger.info(
-            "DeepSeek V4 MHC prewarm max_num_tokens=%s representative token counts: %s",
-            max_num_tokens,
-            token_counts,
-        )
-        self.prewarm_mhc_token_counts(token_counts, device)
-        return token_counts
-
     def hc_pre(
         self,
         x: torch.Tensor,
