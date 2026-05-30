@@ -1,3 +1,14 @@
+/**
+ * \file topk_v2.cuh
+ * \brief TopK kernel for DeepSeek v4.
+ * Adapted from
+ * 1:
+ *   https://github.com/vllm-project/vllm/blob/a8c6ee9b787d273916206a29b77feebadb80c368/csrc/persistent_topk.cuh
+ * 2:
+ *   https://github.com/flashinfer-ai/flashinfer/blob/c2b4db2b1a84448d802f0e6ac445243312bd6a4c/include/flashinfer/topk.cuh
+ * DarkSharpness never took a detailed look at these 2 implementation, but his claude code did.
+ * So we add credit to the reference implementations.
+ */
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -53,7 +64,7 @@ struct TopKLaunchParams {
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
-  int32_t* __restrict__ raw_indices;  // optional raw (pre-transform) indices output; nullptr if unused
+  int32_t* __restrict__ raw_indices;      // optional raw (pre-transform) indices output; nullptr if unused
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
@@ -96,24 +107,17 @@ struct TopKLaunchParams {
  */
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
-  impl::enable_smem_spilling();
+  device::enable_smem_spilling();
   __shared__ impl::MaxSmem<Cluster::Smem> smem;
   const uint32_t num_cluster_items = params.global().num_cluster_items;
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
+#pragma unroll 1
   for (uint32_t w = blockIdx.x; w < num_cluster_items; w += kNumPersistentClusters) {
     const auto it = params.item(w);
     const auto problem = params.problem(it.batch_id, it.seq_len);
-    // forward()'s cross-rank DSMEM phases (histogram all-reduce, tie gather) are
-    // each bounded by its own internal cluster.sync(); after them it only touches
-    // its OWN block's smem. So the lone unguarded hazard before this cluster reuses
-    // `smem` for its next item is WITHIN a block: a fast thread re-initializing the
-    // radix smem (which unions with tie_handle_smem) while a slow thread is still in
-    // the previous item's handle_tie. A block barrier covers that -- no cluster-wide
-    // barrier needed. The LAST item needs none: kernel completion flushes its global
-    // writes before main_kernel<kLevel=3>'s PDL-gated epilogue reads them.
     Cluster::forward<false>(problem, &smem);
-    if (w + kNumPersistentClusters < num_cluster_items) __syncthreads();
+    __syncthreads();
   }
 }
 
@@ -158,7 +162,7 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
  */
 template <bool kPDL, int kLevel>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
-  impl::enable_smem_spilling();
+  device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
@@ -199,7 +203,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
 
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
-  impl::enable_smem_spilling();
+  device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
   if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
@@ -309,7 +313,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
   }
 }
 
-struct CombinedTopKKernel {
+struct TopKKernel {
   static void plan(  //
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::TensorView metadata,
@@ -320,8 +324,14 @@ struct CombinedTopKKernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
-    TensorMatcher({Bp1, 2}).with_dtype<int32_t>().with_device(device_).verify(metadata);
+    TensorMatcher({B})  // seq_lens
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(seq_lens);
+    TensorMatcher({Bp1, 2})  // metadata: [0]=GlobalMetadata, [1..N]=PlanItem(batch_id, seq_len)
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(metadata);
 
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
@@ -352,11 +362,28 @@ struct CombinedTopKKernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({B, L}).with_strides({S, 1}).with_dtype<float>().with_device(device_).verify(scores);
-    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
-    TensorMatcher({B, -1}).with_strides({P, 1}).with_dtype<int32_t>().with_device(device_).verify(page_table);
-    TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(page_indices);
-    TensorMatcher({Bp1, 2}).with_dtype<int32_t>().with_device(device_).verify(metadata);
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(scores);
+    TensorMatcher({B})  // seq_lens
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(seq_lens);
+    TensorMatcher({B, -1})  // page_table
+        .with_strides({P, 1})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(page_table);
+    TensorMatcher({B, K})  // page_indices
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(page_indices);
+    TensorMatcher({Bp1, 2})  // metadata: [0]=GlobalMetadata, [1..N]=PlanItem(batch_id, seq_len)
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(metadata);
 
     int32_t* raw_indices_ptr = nullptr;
     if (raw_indices.has_value()) {
@@ -400,25 +427,29 @@ struct CombinedTopKKernel {
     if (use_cluster) {
       if (batch_size <= kNumPersistentClusters) {
         LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
-            .enable_cluster(dim3{1, kClusterSize})
-            .enable_pdl(kUsePDL)(topk_small_batch_kernel<kUsePDL>, params);
+            .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+            .launch(topk_small_batch_kernel<kUsePDL>, params);
       } else {
         const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
         LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
-            .enable_cluster(dim3{1, kClusterSize})
-            .enable_pdl(kUsePDL)(topk_persistent_cluster_kernel<kUsePDL>, params);
-        LaunchKernel(batch_size, kBlockSize, device)  //
-            .enable_pdl(kUsePDL)(topk_main_kernel<kUsePDL, /*kLevel=*/3>, params);
+            .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+            .launch(topk_persistent_cluster_kernel<kUsePDL>, params);
+        LaunchKernel(batch_size, kBlockSize, device)
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3>, params);
       }
     } else if (max_seq_len <= kReg2MaxSeqLen) {
-      LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);
+      LaunchKernel(batch_size, kBlockSize, device)
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);
     } else if (max_seq_len <= kReg4MaxSeqLen) {
-      LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_main_kernel<kUsePDL, /*kLevel=*/1>, params);
+      LaunchKernel(batch_size, kBlockSize, device)
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1>, params);
     } else {
-      LaunchKernel(batch_size, kBlockSize, device)  //
-          .enable_pdl(kUsePDL)(topk_main_kernel<kUsePDL, /*kLevel=*/2>, params);
+      LaunchKernel(batch_size, kBlockSize, device)
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2>, params);
     }
   }
 };

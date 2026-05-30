@@ -35,15 +35,6 @@ namespace cg = cooperative_groups;
 /// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
 
-/// PTX pragma that lets the compiler spill registers into otherwise-unused
-/// shared memory instead of local memory. The radix kernels run at occupancy 2
-/// (32 regs/thread) and rely on this to avoid local-memory traffic.
-SGL_DEVICE void enable_smem_spilling() {
-#if defined(__CUDA_ARCH__) && CUDART_VERSION >= 13000
-  asm(".pragma \"enable_smem_spilling\";");
-#endif
-}
-
 // ---------------------------------------------------------------------------
 // Shared-memory storage sized/aligned for several impl `Smem` types
 // ---------------------------------------------------------------------------
@@ -697,6 +688,7 @@ struct TopKCluster : TopKRadixBase<10> {
     const auto threshold_bin = smem->threshold_bin;
     const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
     const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const auto cur_out = is_primary ? problem.out : smem->tmp_out;
     for_each_input(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
       const auto idx = chunk_start + local_idx;
       if (val >= v_hi) {
@@ -704,11 +696,7 @@ struct TopKCluster : TopKRadixBase<10> {
         if (pos < topk) [[likely]] {
           // rank 0's slots [0, a0) are final; other ranks stage raw indices and
           // page-translate them after the cross-rank prefix sum is known.
-          if (is_primary) {
-            problem.emit(pos, idx);
-          } else {
-            smem->tmp_out[pos] = idx;
-          }
+          cur_out[pos] = idx;
         }
       } else if (val >= v_lo) {
         const auto count_eq = atomicAdd(&smem->count_eq, 1);
@@ -752,7 +740,6 @@ struct TopKCluster : TopKRadixBase<10> {
       }
     } else {
       // Phase 4: Handle ties.
-      __syncthreads();
       const auto above_count = smem->count_gt;
       const auto equal_count = smem->count_eq;
       const auto remain_topk = above_count < topk ? topk - above_count : 0;

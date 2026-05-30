@@ -36,8 +36,8 @@ def _jit_topk_v2_module():
         make_name("topk_v2"),
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
-            ("topk_transform", "CombinedTopKKernel::transform"),
-            ("topk_plan", "CombinedTopKKernel::plan"),
+            ("topk_transform", "TopKKernel::transform"),
+            ("topk_plan", "TopKKernel::plan"),
         ],
     )
 
