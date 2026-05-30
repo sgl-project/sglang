@@ -140,6 +140,7 @@ def make_base_config() -> CanaryConfig:
         real_kv_hash_mode=consts.RealKvHashMode.NONE,
         enable_write_input_assert=False,
         enable_verify_token_assert=True,
+        stats_print_every_n_steps=100,
     )
 
 

@@ -753,6 +753,7 @@ class Envs:
     # KV-Canary / Token-Oracle (testing-only)
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
     SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)

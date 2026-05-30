@@ -47,6 +47,8 @@ class CanaryConfig:
             expected_tokens from each req's ``origin_input_ids + output_ids`` (snapshotted at
             ForwardBatch.init_new) and compare against the canary's stored tokens at verify time.
             Independent of ``enable_write_input_assert``.
+        stats_print_every_n_steps: 0 disables periodic stats logging; positive N prints
+            "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
     """
 
     mode: CanaryMode
@@ -55,6 +57,7 @@ class CanaryConfig:
     real_kv_hash_mode: RealKvHashMode
     enable_write_input_assert: bool
     enable_verify_token_assert: bool
+    stats_print_every_n_steps: int
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
@@ -73,4 +76,5 @@ class CanaryConfig:
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             enable_write_input_assert=envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.get(),
             enable_verify_token_assert=envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get(),
+            stats_print_every_n_steps=envs.SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS.get(),
         )
