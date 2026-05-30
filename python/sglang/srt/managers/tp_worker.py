@@ -209,6 +209,36 @@ class BaseTpWorker(ABC):
         )
         return result
 
+    def check_weights(self, action):
+        target_worker = getattr(self, "target_worker", None)
+        if target_worker is not None and target_worker is not self:
+            return target_worker.check_weights(action)
+        return self.model_runner.check_weights(action=action)
+
+    def save_remote_model(self, params):
+        target_worker = getattr(self, "target_worker", None)
+        if target_worker is not None and target_worker is not self:
+            target_worker.save_remote_model(params)
+            draft_url = params.get("draft_url", None)
+            assert (
+                draft_url is not None
+            ), "draft_url must be provided when draft model is enabled"
+            self.model_runner.save_remote_model(draft_url)
+            return
+
+        self.model_runner.save_remote_model(params["url"])
+
+    def save_sharded_model(self, params):
+        target_worker = getattr(self, "target_worker", None)
+        if target_worker is not None and target_worker is not self:
+            return target_worker.save_sharded_model(params)
+
+        self.model_runner.save_sharded_model(
+            path=params["path"],
+            pattern=params["pattern"],
+            max_size=params["max_size"],
+        )
+
     def forward_batch_embedding(self, batch: ScheduleBatch):
         forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         output = self.model_runner.forward(forward_batch).logits_output
