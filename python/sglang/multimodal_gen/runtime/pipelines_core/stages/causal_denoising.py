@@ -1,5 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+from collections.abc import Callable
+
 import torch  # type: ignore
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -52,23 +54,314 @@ class CausalDMDDenoisingStage(DenoisingStage):
         except Exception:
             self.local_attn_size = -1
 
+        self._causal_attn_metadata_builder_cls = None
+        self._causal_attn_metadata_builder = None
+
+    def _target_dtype(self) -> torch.dtype:
+        return torch.bfloat16
+
+    def _autocast_enabled(
+        self,
+        target_dtype: torch.dtype,
+        server_args: ServerArgs,
+    ) -> bool:
+        return (target_dtype != torch.float32) and not server_args.disable_autocast
+
+    def _prepare_frame_seq_length(self, h: int, w: int) -> int:
+        patch_ratio = (
+            self.transformer.config.arch_config.patch_size[-1]
+            * self.transformer.config.arch_config.patch_size[-2]
+        )
+        self.frame_seq_length = (h * w) // patch_ratio
+        return self.frame_seq_length
+
+    def _build_causal_attn_metadata(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        current_timestep: int,
+        raw_latent_shape: tuple[int, int, int],
+        device: torch.device,
+    ):
+        if self.attn_backend.get_enum() != AttentionBackendEnum.VIDEO_SPARSE_ATTN:
+            return None
+
+        builder_cls = self.attn_backend.get_builder_cls()
+        if builder_cls is None:
+            return None
+        if self._causal_attn_metadata_builder_cls is not builder_cls:
+            self._causal_attn_metadata_builder_cls = builder_cls
+            self._causal_attn_metadata_builder = builder_cls()
+        attn_metadata = self._causal_attn_metadata_builder.build(
+            current_timestep=current_timestep,
+            raw_latent_shape=raw_latent_shape,
+            patch_size=server_args.pipeline_config.dit_config.patch_size,
+            STA_param=batch.STA_param,
+            VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+            device=device,
+        )
+        assert attn_metadata is not None, "attn_metadata cannot be None"
+        return attn_metadata
+
+    @staticmethod
+    def _single_generator(batch: Req):
+        if isinstance(batch.generator, list):
+            return batch.generator[0]
+        return batch.generator
+
+    @staticmethod
+    def _expand_timestep(
+        timestep: torch.Tensor, batch_size: int, device
+    ) -> torch.Tensor:
+        return timestep.reshape(1).to(device=device, dtype=torch.long).expand(batch_size)
+
+    def _forward_causal_transformer(
+        self,
+        batch: Req,
+        *,
+        latent_model_input: torch.Tensor,
+        prompt_embeds,
+        timestep: torch.Tensor,
+        kv_cache,
+        crossattn_cache,
+        current_start_tokens: int,
+        start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        current_timestep: int,
+        attn_metadata,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+    ) -> torch.Tensor:
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ),
+            set_forward_context(
+                current_timestep=current_timestep,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ),
+        ):
+            return self.transformer(
+                latent_model_input,
+                prompt_embeds,
+                timestep,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start_tokens,
+                start_frame=start_frame,
+                **image_kwargs,
+                **pos_cond_kwargs,
+            )
+
+    def _predict_x0_btchw(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        latent_model_input: torch.Tensor,
+        noise_latents_btchw: torch.Tensor,
+        timestep: torch.Tensor,
+        scheduler,
+        prompt_embeds,
+        kv_cache,
+        crossattn_cache,
+        current_start_tokens: int,
+        start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        attn_raw_latent_shape: tuple[int, int, int],
+        current_timestep: int,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, object | None]:
+        attn_metadata = self._build_causal_attn_metadata(
+            batch,
+            server_args,
+            current_timestep=current_timestep,
+            raw_latent_shape=attn_raw_latent_shape,
+            device=device,
+        )
+        batch_size = latent_model_input.shape[0]
+        timestep_2d = self._expand_timestep(
+            timestep, batch_size, latent_model_input.device
+        )
+        pred_noise = self._forward_causal_transformer(
+            batch,
+            latent_model_input=latent_model_input,
+            prompt_embeds=prompt_embeds,
+            timestep=timestep_2d.unsqueeze(1),
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start_tokens=current_start_tokens,
+            start_frame=start_frame,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            current_timestep=current_timestep,
+            attn_metadata=attn_metadata,
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+        )
+        pred_noise_btchw = pred_noise.permute(0, 2, 1, 3, 4)
+        x0_btchw = pred_noise_to_pred_video(
+            pred_noise=pred_noise_btchw.flatten(0, 1),
+            noise_input_latent=noise_latents_btchw.flatten(0, 1),
+            timestep=timestep_2d,
+            scheduler=scheduler,
+        ).unflatten(0, pred_noise_btchw.shape[:2])
+        return x0_btchw, attn_metadata
+
+    def _add_noise_for_next_timestep(
+        self,
+        batch: Req,
+        *,
+        x0_btchw: torch.Tensor,
+        raw_latent_shape: torch.Size,
+        next_timestep: torch.Tensor,
+        scheduler,
+        device,
+    ) -> torch.Tensor:
+        noise = torch.randn(
+            raw_latent_shape,
+            dtype=x0_btchw.dtype,
+            generator=self._single_generator(batch),
+            device=device,
+        )
+        return scheduler.add_noise(
+            x0_btchw.flatten(0, 1),
+            noise.flatten(0, 1),
+            next_timestep,
+        ).unflatten(0, x0_btchw.shape[:2])
+
+    def _denoise_causal_dmd_chunk(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        chunk_latents: torch.Tensor,
+        scheduler,
+        timesteps: torch.Tensor,
+        prompt_embeds,
+        kv_cache,
+        crossattn_cache,
+        current_start_tokens: int,
+        start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+        device: torch.device,
+        attn_raw_latent_shape: tuple[int, int, int],
+        prepare_model_input: Callable[[torch.Tensor], torch.Tensor],
+        progress_bar=None,
+    ) -> tuple[torch.Tensor, object | None]:
+        current_latents = chunk_latents
+        noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
+        raw_latent_shape = noise_latents_btchw.shape
+        attn_metadata = None
+
+        for i, timestep in enumerate(timesteps):
+            noise_latents = noise_latents_btchw
+            latent_model_input = prepare_model_input(current_latents).to(target_dtype)
+            x0_btchw, attn_metadata = self._predict_x0_btchw(
+                batch,
+                server_args,
+                latent_model_input=latent_model_input,
+                noise_latents_btchw=noise_latents,
+                timestep=timestep,
+                scheduler=scheduler,
+                prompt_embeds=prompt_embeds,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_tokens=current_start_tokens,
+                start_frame=start_frame,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                attn_raw_latent_shape=attn_raw_latent_shape,
+                current_timestep=i,
+                target_dtype=target_dtype,
+                autocast_enabled=autocast_enabled,
+                device=device,
+            )
+
+            if i < len(timesteps) - 1:
+                next_timestep = timesteps[i + 1] * torch.ones(
+                    [1], dtype=torch.long, device=device
+                )
+                noise_latents_btchw = self._add_noise_for_next_timestep(
+                    batch,
+                    x0_btchw=x0_btchw,
+                    raw_latent_shape=raw_latent_shape,
+                    next_timestep=next_timestep,
+                    scheduler=scheduler,
+                    device=device,
+                )
+                current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
+            else:
+                current_latents = x0_btchw.permute(0, 2, 1, 3, 4)
+
+            if progress_bar is not None:
+                progress_bar.update()
+
+        return current_latents, attn_metadata
+
+    def _update_causal_context_cache(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        context_input: torch.Tensor,
+        prompt_embeds,
+        kv_cache,
+        crossattn_cache,
+        current_start_tokens: int,
+        start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        attn_metadata,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+    ) -> None:
+        context_noise = getattr(server_args.pipeline_config, "context_noise", 0)
+        timestep = torch.full(
+            (context_input.shape[0], 1),
+            int(context_noise),
+            device=context_input.device,
+            dtype=torch.long,
+        )
+        self._forward_causal_transformer(
+            batch,
+            latent_model_input=context_input.to(target_dtype),
+            prompt_embeds=prompt_embeds,
+            timestep=timestep,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start_tokens=current_start_tokens,
+            start_frame=start_frame,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            current_timestep=0,
+            attn_metadata=attn_metadata,
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+        )
+
     def forward(
         self,
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        target_dtype = torch.bfloat16
-        autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        target_dtype = self._target_dtype()
+        autocast_enabled = self._autocast_enabled(target_dtype, server_args)
         scheduler = get_or_create_request_scheduler(batch, self.scheduler)
+        device = get_local_torch_device()
 
-        latent_seq_length = batch.latents.shape[-1] * batch.latents.shape[-2]
-        patch_ratio = (
-            self.transformer.config.arch_config.patch_size[-1]
-            * self.transformer.config.arch_config.patch_size[-2]
-        )
-        self.frame_seq_length = latent_seq_length // patch_ratio
+        self._prepare_frame_seq_length(batch.latents.shape[-2], batch.latents.shape[-1])
         # TODO(will): make this a parameter once we add i2v support
         independent_first_frame = self.transformer.independent_first_frame
 
@@ -83,7 +376,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 (scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
             )
             timesteps = scheduler_timesteps[1000 - timesteps]
-        timesteps = timesteps.to(get_local_torch_device())
+        timesteps = timesteps.to(device)
         logger.info("Using timesteps: %s", timesteps)
 
         # Image kwargs (kept empty unless caller provides compatible args)
@@ -231,162 +524,62 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 current_latents = latents[
                     :, :, start_index : start_index + current_num_frames, :, :
                 ]
-                # use BTCHW for DMD conversion routines
-                noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
-                video_raw_latent_shape = noise_latents_btchw.shape
-
-                for i, t_cur in enumerate(timesteps):
-                    # Copy for pred conversion
-                    noise_latents = noise_latents_btchw.clone()
-                    latent_model_input = current_latents.to(target_dtype)
-
+                def prepare_model_input(current_latents):
+                    latent_model_input = current_latents
                     if (
                         batch.image_latent is not None
                         and independent_first_frame
                         and start_index == 0
                     ):
                         latent_model_input = torch.cat(
-                            [latent_model_input, batch.image_latent.to(target_dtype)],
+                            [latent_model_input, batch.image_latent],
                             dim=2,
                         )
+                    return latent_model_input
 
-                    # Prepare inputs
-                    t_expand = t_cur.repeat(latent_model_input.shape[0])
-
-                    # Attention metadata if needed
-                    if (
-                        self.attn_backend.get_enum()
-                        == AttentionBackendEnum.VIDEO_SPARSE_ATTN
-                    ):
-                        self.attn_metadata_builder_cls = (
-                            self.attn_backend.get_builder_cls()
-                        )
-                        if self.attn_metadata_builder_cls is not None:
-                            self.attn_metadata_builder = (
-                                self.attn_metadata_builder_cls()
-                            )
-                            attn_metadata = self.attn_metadata_builder.build(  # type: ignore
-                                current_timestep=i,  # type: ignore
-                                raw_latent_shape=(
-                                    current_num_frames,
-                                    h,
-                                    w,
-                                ),  # type: ignore
-                                patch_size=server_args.pipeline_config.dit_config.patch_size,  # type: ignore
-                                STA_param=batch.STA_param,  # type: ignore
-                                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,  # type: ignore
-                                device=get_local_torch_device(),  # type: ignore
-                            )  # type: ignore
-                            assert (
-                                attn_metadata is not None
-                            ), "attn_metadata cannot be None"
-                        else:
-                            attn_metadata = None
-                    else:
-                        attn_metadata = None
-
-                    with (
-                        torch.autocast(
-                            device_type=current_platform.device_type,
-                            dtype=target_dtype,
-                            enabled=autocast_enabled,
-                        ),
-                        set_forward_context(
-                            current_timestep=i,
-                            attn_metadata=attn_metadata,
-                            forward_batch=batch,
-                        ),
-                    ):
-                        # Run transformer; follow DMD stage pattern
-                        t_expanded_noise = t_cur * torch.ones(
-                            (latent_model_input.shape[0], 1),
-                            device=latent_model_input.device,
-                            dtype=torch.long,
-                        )
-                        pred_noise_btchw = self.transformer(
-                            latent_model_input,
-                            prompt_embeds,
-                            t_expanded_noise,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=(pos_start_base + start_index)
-                            * self.frame_seq_length,
-                            start_frame=start_index,
-                            **image_kwargs,
-                            **pos_cond_kwargs,
-                        ).permute(0, 2, 1, 3, 4)
-
-                    # Convert pred noise to pred video with FM Euler scheduler utilities
-                    pred_video_btchw = pred_noise_to_pred_video(
-                        pred_noise=pred_noise_btchw.flatten(0, 1),
-                        noise_input_latent=noise_latents.flatten(0, 1),
-                        timestep=t_expand,
-                        scheduler=scheduler,
-                    ).unflatten(0, pred_noise_btchw.shape[:2])
-
-                    if i < len(timesteps) - 1:
-                        next_timestep = timesteps[i + 1] * torch.ones(
-                            [1], dtype=torch.long, device=pred_video_btchw.device
-                        )
-                        noise = torch.randn(
-                            video_raw_latent_shape,
-                            dtype=pred_video_btchw.dtype,
-                            generator=(
-                                batch.generator[0]
-                                if isinstance(batch.generator, list)
-                                else batch.generator
-                            ),
-                            device=self.device,
-                        )
-                        noise_btchw = noise
-                        noise_latents_btchw = scheduler.add_noise(
-                            pred_video_btchw.flatten(0, 1),
-                            noise_btchw.flatten(0, 1),
-                            next_timestep,
-                        ).unflatten(0, pred_video_btchw.shape[:2])
-                        current_latents = noise_latents_btchw.permute(0, 2, 1, 3, 4)
-                    else:
-                        current_latents = pred_video_btchw.permute(0, 2, 1, 3, 4)
-
-                    if progress_bar is not None:
-                        progress_bar.update()
+                current_latents, attn_metadata = self._denoise_causal_dmd_chunk(
+                    batch,
+                    server_args,
+                    chunk_latents=current_latents,
+                    scheduler=scheduler,
+                    timesteps=timesteps,
+                    prompt_embeds=prompt_embeds,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start_tokens=(pos_start_base + start_index)
+                    * self.frame_seq_length,
+                    start_frame=start_index,
+                    image_kwargs=image_kwargs,
+                    pos_cond_kwargs=pos_cond_kwargs,
+                    target_dtype=target_dtype,
+                    autocast_enabled=autocast_enabled,
+                    device=device,
+                    attn_raw_latent_shape=(current_num_frames, h, w),
+                    prepare_model_input=prepare_model_input,
+                    progress_bar=progress_bar,
+                )
 
                 # Write back and advance
                 latents[:, :, start_index : start_index + current_num_frames, :, :] = (
                     current_latents
                 )
 
-                # Re-run with context timestep to update KV cache using clean context
-                context_noise = getattr(server_args.pipeline_config, "context_noise", 0)
-                t_context = torch.ones(
-                    [latents.shape[0]], device=latents.device, dtype=torch.long
-                ) * int(context_noise)
-                context_bcthw = current_latents.to(target_dtype)
-                with (
-                    torch.autocast(
-                        device_type=current_platform.device_type,
-                        dtype=target_dtype,
-                        enabled=autocast_enabled,
-                    ),
-                    set_forward_context(
-                        current_timestep=0,
-                        attn_metadata=attn_metadata,
-                        forward_batch=batch,
-                    ),
-                ):
-                    t_expanded_context = t_context.unsqueeze(1)
-                    _ = self.transformer(
-                        context_bcthw,
-                        prompt_embeds,
-                        t_expanded_context,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=(pos_start_base + start_index)
-                        * self.frame_seq_length,
-                        start_frame=start_index,
-                        **image_kwargs,
-                        **pos_cond_kwargs,
-                    )
+                self._update_causal_context_cache(
+                    batch,
+                    server_args,
+                    context_input=current_latents,
+                    prompt_embeds=prompt_embeds,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start_tokens=(pos_start_base + start_index)
+                    * self.frame_seq_length,
+                    start_frame=start_index,
+                    image_kwargs=image_kwargs,
+                    pos_cond_kwargs=pos_cond_kwargs,
+                    attn_metadata=attn_metadata,
+                    target_dtype=target_dtype,
+                    autocast_enabled=autocast_enabled,
+                )
                 start_index += current_num_frames
 
         batch.latents = latents
