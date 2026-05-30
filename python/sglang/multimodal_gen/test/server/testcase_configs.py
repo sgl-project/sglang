@@ -26,7 +26,7 @@ import statistics
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.registry import (
@@ -245,6 +245,11 @@ class DiffusionSamplingParams:
     output_format: str | None = None  # "png", "jpeg", "mp4", etc.
 
     num_outputs_per_prompt: int = 1
+
+    # Realtime video consistency harness. When set, server tests use
+    # /v1/realtime_video/generate and fold streamed chunks back into mp4 bytes.
+    realtime_num_chunks: int | None = None
+    realtime_events: list[dict[str, Any]] = field(default_factory=list)
 
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
