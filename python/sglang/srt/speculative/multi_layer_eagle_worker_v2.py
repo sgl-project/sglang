@@ -665,6 +665,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         return self._draft_worker
 
+    @property
+    def spec_v2_attn_backends(self) -> tuple:
+        return (
+            self._target_worker.model_runner.attn_backend,
+            *self._draft_worker.draft_extend_attn_backend_list,
+        )
+
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
