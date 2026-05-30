@@ -39,12 +39,6 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
-from sglang.srt.layers.attention.aiter_fused_qk_norm_rope import (
-    fused_qk_norm_rope_cache as aiter_fused_qk_norm_rope_cache,
-)
-from sglang.srt.layers.attention.aiter_fused_qk_norm_rope import (
-    is_available as aiter_fused_qk_norm_rope_available,
-)
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -119,6 +113,15 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
     )
+
+_aiter_fused_qkv_split_qk_norm_rope_cache = None
+if _is_hip and get_bool_env_var("SGLANG_USE_AITER_FUSED_QK_NORM_ROPE_CACHE", "false"):
+    try:
+        from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
+            fused_qkv_split_qk_norm_rope_cache as _aiter_fused_qkv_split_qk_norm_rope_cache,
+        )
+    except ImportError:
+        _aiter_fused_qkv_split_qk_norm_rope_cache = None
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -891,40 +894,55 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
         return q, k, v, gate
 
-    def forward_prepare_aiter_fused(self, positions, hidden_states, forward_batch):
-        """ROCm/aiter fused path: qkv_proj -> [split + QK-RMSNorm + RoPE + KV-cache-write]
-        in a single Triton kernel.
-
-        Returns ``(q, k, v, gate)`` post-norm/post-RoPE. K and V are ALREADY written to
-        the KV cache; the caller must pass ``save_kv_cache=False`` to ``self.attn``.
-        """
+    def _prepare_qkv_aiter_fused(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
         pool = forward_batch.token_to_kv_pool
         k_buffer = pool.get_key_buffer(self.attn.layer_id)
         v_buffer = pool.get_value_buffer(self.attn.layer_id)
 
-        q, gate, k, v = aiter_fused_qk_norm_rope_cache(
-            qkv,
+        # Pool stores K/V as flat per-token NHD: [size+page_size, head_num, head_dim].
+        # The aiter kernel wants paged NHD: [num_blocks, page_size, head_num, head_dim].
+        page_size = pool.page_size
+        num_blocks = k_buffer.shape[0] // page_size
+        key_cache = k_buffer.view(
+            num_blocks, page_size, k_buffer.shape[1], k_buffer.shape[2]
+        )
+        value_cache = v_buffer.view(
+            num_blocks, page_size, v_buffer.shape[1], v_buffer.shape[2]
+        )
+
+        # SGLang stores cos|sin concatenated along last dim; aiter wants them split.
+        cos, sin = self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
+
+        result = _aiter_fused_qkv_split_qk_norm_rope_cache(
+            qkv=qkv,
             q_weight=self.q_norm.weight,
             k_weight=self.k_norm.weight,
-            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            cos=cos,
+            sin=sin,
             positions=positions,
-            k_buffer=k_buffer,
-            v_buffer=v_buffer,
+            key_cache=key_cache,
+            value_cache=value_cache,
             slot_mapping=forward_batch.out_cache_loc,
-            num_q_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
+            qh=self.num_heads,
+            kvh=self.num_kv_heads,
             head_dim=self.head_dim,
-            page_size=pool.page_size,
-            eps=self.q_norm.variance_epsilon,
             is_neox=getattr(self.rotary_emb, "is_neox_style", True),
             attn_output_gate=self.attn_output_gate,
             gated_qkv_layout="interleaved",
+            kv_cache_layout="NHD",
             # TODO: thread FP8 KV scales when fp8_kv cache is enabled.
             k_scale=getattr(self.attn, "k_scale", None),
             v_scale=getattr(self.attn, "v_scale", None),
+            eps=self.q_norm.variance_epsilon,
         )
+
+        if self.attn_output_gate:
+            q, gate, k, v = result
+        else:
+            q, k, v = result
+            gate = None
         return q, k, v, gate
 
     def self_attention(
@@ -936,14 +954,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         # ROCm fused path: split + QK-norm + RoPE + KV-cache-write in one kernel.
         # Skip the subsequent in-attention cache write because the kernel did it.
+        # Partial rotary (rope dim < head dim) isn't wired into the kernel yet.
         use_aiter_fused = (
-            _is_hip
-            and aiter_fused_qk_norm_rope_available()
+            _aiter_fused_qkv_split_qk_norm_rope_cache is not None
             and self.partial_rotary_factor == 1.0
         )
 
         if use_aiter_fused:
-            q, k, v, gate = self.forward_prepare_aiter_fused(
+            q, k, v, gate = self._prepare_qkv_aiter_fused(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
