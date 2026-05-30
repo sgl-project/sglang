@@ -216,6 +216,7 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = field(default=False, metadata={"batch_sig_exclude": True})
 
+    # return output file paths directly to client
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
     diffusers_kwargs: dict | None = None

@@ -98,6 +98,12 @@ class ConditionEventQueue:
         kind: str,
         params: ConditionSamplingParams,
     ) -> list[Any] | None:
+        """samples a list of actions for a chunk
+
+        Args:
+            params: the sampling strategy
+
+        """
         if params.chunk_size <= 0:
             return None
 
