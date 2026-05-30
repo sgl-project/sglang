@@ -639,9 +639,8 @@ class SchedulerBatchResultProcessor:
                 continue
 
             if is_spec_v1:
-                self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
-                self._handle_finished_req(req, i, logits_output)
+                self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
@@ -664,9 +663,7 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accepted_len)
 
-            self._mamba_prefix_cache_update(req, batch, result, i)
-
-            self._handle_finished_req(req, i, logits_output)
+            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -802,12 +799,18 @@ class SchedulerBatchResultProcessor:
             self.abort_request(AbortReq(rid=req.rid))
         req.grammar.finished = req.finished()
 
-    def _handle_finished_req(
+    def _handle_finish_state_updated_req(
         self,
         req: Req,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
+        # Called here (after update_finish_state) so req.finished() is valid
+        # for mamba_lazy_post_decode_at_boundary inside.
+        self._mamba_prefix_cache_update(req, batch, result, i)
+
         if (
             self.server_args.disaggregation_decode_enable_offload_kvcache
             and not req.finished()
@@ -828,9 +831,8 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(
-                    req, self.tree_cache, is_insert=req.mamba_lazy_is_insert
-                )
+                is_insert = req.mamba_lazy_is_insert if self.server_args.enable_mamba_extra_buffer_lazy() else True
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
 
@@ -852,41 +854,57 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
     ) -> None:
+        """Update mamba track state at ping-pong boundaries.
+
+        Non-lazy: swap the ping-pong index so the next forward writes to
+        the alternate slot.
+        Lazy: keep the same index (prealloc handles the swap) and run
+        post-decode cleanup to free the temporary second slot.
+        """
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        mamba_track_interval = get_global_server_args().mamba_track_interval
+        at_boundary, track_seqlen = self._mamba_check_track_boundary(
+            req, batch, result, i
+        )
+        if not at_boundary:
+            return
+
         lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
-        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        at_boundary = False
+        if not lazy:
+            req.mamba_next_track_idx = (
+                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    req.mamba_next_track_idx
+                )
+            )
+        req.mamba_last_track_seqlen = track_seqlen
+        if lazy:
+            self.mamba_lazy_post_decode_at_boundary(req, batch)
+
+    def _mamba_check_track_boundary(self, req, batch, result, i):
+        """Check if this decode step crosses a mamba track interval boundary.
+
+        Returns (at_boundary, track_seqlen). In lazy mode the boundary is
+        detected one step early (interval-1) so the prealloc in
+        prepare_for_decode can allocate the second slot before the forward.
+        For spec decode, the boundary is detected by comparing the accepted
+        seq_len range against interval boundaries.
+        """
+        interval = get_global_server_args().mamba_track_interval
+        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
 
         if batch.spec_algorithm.is_none():
-            check = (mamba_track_interval - 1) if lazy else 0
-            at_boundary = seq_len % mamba_track_interval == check
-            if at_boundary:
-                track_seqlen = (seq_len + 1) if lazy else seq_len
+            seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            check = (interval - 1) if lazy else 0
+            if seq_len % interval == check:
+                return True, (seq_len + 1) if lazy else seq_len
         elif result.num_correct_drafts_per_req_cpu is not None:
-            actual_seq_len = req.seqlen - 1
-            prev = actual_seq_len - result.num_correct_drafts_per_req_cpu[i] - 1
-            at_boundary = (
-                actual_seq_len // mamba_track_interval
-                != prev // mamba_track_interval
-            )
-            if at_boundary:
-                track_seqlen = (
-                    actual_seq_len // mamba_track_interval * mamba_track_interval
-                )
+            cur = req.seqlen - 1
+            prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
+            if cur // interval != prev // interval:
+                return True, cur // interval * interval
 
-        if at_boundary:
-            if not lazy:
-                req.mamba_next_track_idx = (
-                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
-                )
-            req.mamba_last_track_seqlen = track_seqlen
-            if lazy:
-                self.mamba_lazy_post_decode_at_boundary(req, batch)
+        return False, 0
 
     def mamba_lazy_post_decode_at_boundary(
         self, req: Req, batch: ScheduleBatch
