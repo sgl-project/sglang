@@ -127,8 +127,10 @@ class FullComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.num_tokens
-        # Heap-based eviction from evictable_device_leaves, ordered by LRU.
-        heap = [(n.last_access_time, n) for n in self.cache.evictable_device_leaves]
+        heap = [
+            (self.cache.eviction_strategy.get_priority(n), n)
+            for n in self.cache.evictable_device_leaves
+        ]
         heapq.heapify(heap)
         ct = self.component_type
         while tracker[ct] < request and heap:
@@ -137,13 +139,19 @@ class FullComponent(TreeComponent):
                 continue
             self.cache._evict_device_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
-                heapq.heappush(heap, (x.parent.last_access_time, x.parent))
+                heapq.heappush(
+                    heap,
+                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                )
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:
         """Evict host leaves to free KV host pool space."""
-        heap = [(n.last_access_time, n) for n in self.cache.evictable_host_leaves]
+        heap = [
+            (self.cache.eviction_strategy.get_priority(n), n)
+            for n in self.cache.evictable_host_leaves
+        ]
         heapq.heapify(heap)
         ct = self.component_type
         while tracker[ct] < num_tokens and heap:
@@ -152,7 +160,10 @@ class FullComponent(TreeComponent):
                 continue
             self.cache._evict_host_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
-                heapq.heappush(heap, (x.parent.last_access_time, x.parent))
+                heapq.heappush(
+                    heap,
+                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                )
 
     def acquire_component_lock(
         self,
