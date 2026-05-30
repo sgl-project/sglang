@@ -221,12 +221,6 @@ class Gemma4MoE(nn.Module):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             # softmax(all)[topk] / sum(softmax(all)[topk]) = softmax(topk_logits),
             # so we softmax only the top-k logits (fewer kernel launches).
-            #
-            # Fast path: a single Triton kernel that produces (weights, ids)
-            # already scaled by per_expert_scale.  Mathematically identical
-            # to the torch fallback below.  Active when on CUDA with a 2-D
-            # router-logits tensor and num_experts a power-of-two-rounded
-            # value the kernel supports (always true for Gemma4: E=128).
             if (
                 gating_output.is_cuda
                 and gating_output.dim() == 2

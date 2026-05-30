@@ -300,63 +300,43 @@ def _gemma4_routing_kernel(
     offs_e = tl.arange(0, BLOCK_E)
     valid = offs_e < E
 
-    # Load logits into fp32; out-of-bound lanes get -inf so they sort last.
     logits = tl.load(
         gating_ptr + pid * stride_g_t + offs_e,
         mask=valid,
         other=-float("inf"),
     ).to(tl.float32)
 
-    # Build a sortable int64 key: high 32 bits = bijective(logit_bits) +
-    # expert id in the low 32 bits.  The bijection is anti-monotone on the
-    # float value, and the ``<<32`` shift below moves the int32 key's high
-    # bit into the int64 sign bit, so ``tl.sort(..., descending=False)``
-    # (which is *signed* int64 ascending) yields the original logits in
-    # *descending* float order.  Ties are broken by expert id ascending
-    # (lower id wins), which is a stable choice but not guaranteed to
-    # match ``torch.topk``'s tie-break (torch.topk's order is
-    # implementation-defined).
+    # Pack (sort_key, expert_id) into one int64 so a single signed-ascending
+    # tl.sort yields logits in descending float order. The key bijection is
+    # anti-monotone on the float value, and the <<32 shift moves its high bit
+    # into the int64 sign bit. Ties break by expert id ascending. Invalid
+    # lanes use a max key so they sort last.
     MIN32 = -2147483648
     logit_bits = logits.to(tl.int32, bitcast=True)
     sign = logit_bits >> 31
     key = tl.where(sign == 0, logit_bits ^ -1, logit_bits ^ MIN32)
-    # Force invalid lanes to the max positive key so they end up *after* the
-    # real logits when we sort ascending: positive int32 key -> positive
-    # int64 packed -> sorts after the bit-63-set packed values that carry
-    # real logits.
     key = tl.where(valid, key, 0x7FFFFFFF)
     sk64 = key.to(tl.int64) & 0x00000000FFFFFFFF
     packed = (sk64 << 32) | offs_e.to(tl.int64)
 
-    # Signed ascending int64 sort.  Real positive logits become negative
-    # int64 (bit 63 set) and sort first; negative logits become positive
-    # int64 and sort after; invalid lanes (key=0x7fffffff) sort last.
     sorted_p = tl.sort(packed, descending=False)
     all_keys = ((sorted_p >> 32) & 0x00000000FFFFFFFF).to(tl.int32)
     all_ids = (sorted_p & 0x00000000FFFFFFFF).to(tl.int32)
 
-    # Invert the bijection to recover the original logit value.
+    # Invert the key bijection to recover the original logit value.
     sign_k = all_keys >> 31
     all_bits = tl.where(sign_k < 0, all_keys ^ -1, all_keys ^ MIN32)
     all_logits = all_bits.to(tl.float32, bitcast=True)
 
-    # Softmax over the K largest logits only (identity proven by SGLang's
-    # torch routing function comment).  Subtract the max for stability;
-    # since the list is sorted descending by logit value, the max sits at
-    # index 0.
+    # softmax over the top-K logits; max sits at index 0 (sorted descending).
     top_mask = offs_e < K
     max_l = tl.max(tl.where(top_mask, all_logits, -float("inf")), axis=0)
-    # exp2(x * log2(e)) is what tl.math.exp expands to; spell it out so we
-    # can tolerate older Triton releases that lack tl.math.exp.
-    raw_exp = tl.math.exp2((all_logits - max_l) * 1.4426950408889634)
-    raw_exp = tl.where(top_mask, raw_exp, 0.0)
+    raw_exp = tl.where(top_mask, tl.exp(all_logits - max_l), 0.0)
 
     denom = tl.sum(raw_exp, axis=0)
     denom = tl.where(denom > 0.0, denom, 1.0)
     weights = raw_exp / denom
 
-    # Multiply by per_expert_scale[topk_ids].  per_expert_scale lives in
-    # any float dtype; cast to fp32 for the final write.
     scales = tl.load(
         per_expert_scale_ptr + all_ids.to(tl.int64),
         mask=top_mask,
@@ -390,16 +370,9 @@ def gemma4_fused_routing(
     assert per_expert_scale.dim() == 1
     assert per_expert_scale.shape[0] == gating_output.shape[1]
     T, E = gating_output.shape
-    assert topk <= E
-    # Guard against pathological E that would blow up the compiler / register
-    # budget.  Gemma4 ships with E=128; even hypothetical 4x variants stay
-    # well under this cap.
+    assert topk <= E, f"topk ({topk}) must be <= E ({E})"
     assert E <= 1024, f"gemma4_fused_routing only supports E<=1024, got E={E}"
 
-    # The kernel reads the token row with stride_g_t; force the inner-most
-    # dim to be contiguous so the masked load is coalesced.  Most call
-    # sites already pass a contiguous tensor (router proj output); contiguous
-    # is cheap.
     gating_output = gating_output.contiguous()
     per_expert_scale = per_expert_scale.contiguous()
 

@@ -51,14 +51,8 @@ def test_matches_reference(fused_routing, dtype, T, E, K):
     assert out_w.shape == (T, K)
     assert out_i.shape == (T, K)
 
-    # IDs must match exactly (top-K with stable tie-breaking on expert id).
-    # In practice with random logits ties almost never happen; if they do we
-    # accept either order as long as the weight sum and the selected set are
-    # equivalent.
-    # The fused kernel does softmax in fp32 throughout, while the torch
-    # fallback runs softmax in the input dtype before casting to fp32.  For
-    # bf16 inputs that means our kernel is *more* accurate; loosen the
-    # tolerance to roughly the input-dtype eps so we don't false-fail.
+    # The fused kernel does softmax in fp32 while the torch fallback uses the
+    # input dtype, so tolerances are set to roughly the input-dtype eps.
     if dtype == torch.bfloat16:
         atol, rtol = 5e-3, 5e-3
     elif dtype == torch.float16:
@@ -67,14 +61,12 @@ def test_matches_reference(fused_routing, dtype, T, E, K):
         atol, rtol = 1e-5, 1e-5
 
     if (out_i != ref_i).any():
-        # Compare as sets per row.
+        # Tie-break order may differ; require the same top-K set and weight sum.
         ref_set = ref_i.sort(dim=-1).values
         out_set = out_i.sort(dim=-1).values
         assert torch.equal(
             out_set, ref_set
         ), "fused routing picked a different top-K set than reference"
-        # Sum of weights per row should still be close (softmax over the same
-        # K logits).
         torch.testing.assert_close(
             out_w.sum(dim=-1).to(torch.float32),
             ref_w.sum(dim=-1).to(torch.float32),
@@ -82,7 +74,6 @@ def test_matches_reference(fused_routing, dtype, T, E, K):
             rtol=rtol,
         )
     else:
-        # Same IDs in the same order — weights must match within input dtype eps.
         torch.testing.assert_close(out_w, ref_w, atol=atol, rtol=rtol)
 
 
