@@ -26,8 +26,9 @@ import numpy as np
 import torch
 
 import sglang
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.utils import (
     empty_context,
@@ -83,10 +84,16 @@ class NPUGraphRunner(CudaGraphRunner):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
 
     def _init_arch_map(self):
-        self.attr_name: Dict[str, str] = {
-            AttentionArch.MLA: "actual_seq_lengths_kv",
-            AttentionArch.MHA: "context_lens",
-        }
+        if self.is_dllm:
+            self.attr_name: Dict[str, str] = {
+                AttentionArch.MLA: "actual_seq_lengths_kv",
+                AttentionArch.MHA: "actual_seq_lengths_kv",
+            }
+        else:
+            self.attr_name: Dict[str, str] = {
+                AttentionArch.MLA: "actual_seq_lengths_kv",
+                AttentionArch.MHA: "context_lens",
+            }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
@@ -101,11 +108,14 @@ class NPUGraphRunner(CudaGraphRunner):
         else:
             skip_guard_context = empty_context()
 
-        with skip_guard_context, torch.npu.graph(
-            graph,
-            pool=pool,
-            stream=stream,
-            auto_dispatch_capture=True,
+        with (
+            skip_guard_context,
+            torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ),
         ):
             out = run_once_fn()
         return out
@@ -167,11 +177,18 @@ class NPUGraphRunner(CudaGraphRunner):
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if (
+                envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+                and forward_batch.mrope_positions is not None
+            ):
+                self.buffers.mrope_positions[:, : self.raw_num_token].copy_(
+                    forward_batch.mrope_positions
+                )
 
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
         # Replay
-        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
@@ -188,8 +205,15 @@ class NPUGraphRunner(CudaGraphRunner):
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
+            if self.is_dllm:
+                next_token_logits = None
+                full_logits = output.full_logits[: self.raw_num_token]
+            else:
+                full_logits = None
+                next_token_logits = output.next_token_logits[: self.raw_num_token]
             return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                next_token_logits=next_token_logits,
+                full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None

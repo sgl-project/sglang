@@ -1,9 +1,13 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+import asyncio
 import base64
 import os
 import re
+import shutil
+import tempfile
 import time
-from typing import Any, List, Optional, Union
+from contextlib import contextmanager
+from typing import Any, Generator, List, Optional, Union
 
 import httpx
 from fastapi import UploadFile
@@ -29,6 +33,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
 
 # re-export LoRA protocol types for backward compatibility
 __all__ = [
@@ -45,6 +50,23 @@ logger = init_logger(__name__)
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
 DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
+
+
+@contextmanager
+def temp_dir_if_disabled(
+    configured_path: str | None,
+) -> Generator[str, None, None]:
+    """Yield *configured_path* when it is set, otherwise create a temporary
+    directory that is automatically removed when the context exits."""
+    if configured_path is not None:
+        os.makedirs(configured_path, exist_ok=True)
+        yield configured_path
+    else:
+        tmp = tempfile.mkdtemp(prefix="sglang_")
+        try:
+            yield tmp
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
@@ -89,8 +111,11 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     if size:
         w, h = _parse_size(size)
         if w is not None:
-            kwargs.setdefault("width", w)
-            kwargs.setdefault("height", h)
+            # treat None dimensions as unset so parsed size can fill them
+            if kwargs.get("width") is None:
+                kwargs["width"] = w
+            if kwargs.get("height") is None:
+                kwargs["height"] = h
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -114,8 +139,15 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     return sampling_params
 
 
-async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
-    input_path = await _maybe_url_image(image, target_path)
+async def save_image_to_path(
+    image: Union[UploadFile, str],
+    target_path: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str:
+    input_path = await _maybe_url_image(
+        image, target_path, prefer_remote_source=prefer_remote_source
+    )
     if input_path is None:
         input_path = await _save_upload_to_path(image, target_path)
     return input_path
@@ -130,16 +162,27 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
+async def _maybe_url_image(
+    img_url: str,
+    target_path: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str | None:
     if not isinstance(img_url, str):
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Download image from URL
+        # Only bypass persistence when the caller explicitly disables input saves.
+        # Otherwise keep the prefetch outside the measured server stages.
+        if prefer_remote_source:
+            return img_url
+        # download image from URL and persist on disk
         input_path = await _save_url_image_to_path(img_url, target_path)
         return input_path
     elif img_url.startswith("data:image"):
-        # encode image base64 url
+        if prefer_remote_source:
+            return img_url
+        # encode image base64 url and persist on disk
         input_path = await _save_base64_image_to_path(img_url, target_path)
         return input_path
     else:
@@ -149,47 +192,92 @@ async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
 async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
     """Download image from URL and save to target path."""
 
+    def _is_retryable_download_error(error: Exception) -> bool:
+        if isinstance(error, httpx.HTTPStatusError):
+            status_code = error.response.status_code
+            # Retry on rate limit and transient server-side failures.
+            return status_code == 429 or 500 <= status_code < 600
+        # Retry on transient network/protocol issues.
+        return isinstance(
+            error,
+            (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ),
+        )
+
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    max_attempts = 3
+    backoff_seconds = 0.2
+    last_error: Exception | None = None
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(image_url, timeout=10.0)
-            response.raise_for_status()
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = await client.get(image_url, timeout=10.0)
+                    response.raise_for_status()
 
-            # Determine file extension from content type or URL after downloading
-            if not os.path.splitext(target_path)[1]:
-                content_type = response.headers.get("content-type", "").lower()
+                    # Determine file extension from content type or URL after downloading
+                    if not os.path.splitext(target_path)[1]:
+                        content_type = response.headers.get("content-type", "").lower()
 
-                url_path = image_url.split("?")[0]
-                _, url_ext = os.path.splitext(url_path)
-                url_ext = url_ext.lower()
+                        url_path = image_url.split("?")[0]
+                        _, url_ext = os.path.splitext(url_path)
+                        url_ext = url_ext.lower()
 
-                if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
-                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
-                elif content_type.startswith("image/"):
-                    if "jpeg" in content_type or "jpg" in content_type:
-                        ext = ".jpg"
-                    elif "png" in content_type:
-                        ext = ".png"
-                    elif "webp" in content_type:
-                        ext = ".webp"
-                    else:
-                        ext = ".jpg"  # Default to jpg
-                elif content_type == "application/octet-stream":
-                    # for octet-stream, if we couldn't get it from URL, default to jpg
-                    ext = ".jpg"
-                else:
-                    raise ValueError(
-                        f"URL does not point to an image. Content-Type: {content_type}"
+                        if url_ext in {
+                            ".jpg",
+                            ".jpeg",
+                            ".png",
+                            ".webp",
+                            ".gif",
+                            ".bmp",
+                        }:
+                            ext = ".jpg" if url_ext == ".jpeg" else url_ext
+                        elif content_type.startswith("image/"):
+                            if "jpeg" in content_type or "jpg" in content_type:
+                                ext = ".jpg"
+                            elif "png" in content_type:
+                                ext = ".png"
+                            elif "webp" in content_type:
+                                ext = ".webp"
+                            else:
+                                ext = ".jpg"  # Default to jpg
+                        elif content_type == "application/octet-stream":
+                            # for octet-stream, if we couldn't get it from URL, default to jpg
+                            ext = ".jpg"
+                        else:
+                            raise ValueError(
+                                f"URL does not point to an image. Content-Type: {content_type}"
+                            )
+                        target_path = f"{target_path}{ext}"
+
+                    with open(target_path, "wb") as f:
+                        f.write(response.content)
+
+                    return target_path
+                except Exception as e:
+                    last_error = e
+                    if attempt == max_attempts or not _is_retryable_download_error(e):
+                        raise
+                    wait_s = backoff_seconds * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Retrying image download (%s/%s) for %s after %.1fs due to: %s",
+                        attempt,
+                        max_attempts,
+                        image_url,
+                        wait_s,
+                        e,
                     )
-                target_path = f"{target_path}{ext}"
-
-            with open(target_path, "wb") as f:
-                f.write(response.content)
-
-            return target_path
+                    await asyncio.sleep(wait_s)
     except Exception as e:
-        raise Exception(f"Failed to download image from URL: {str(e)}")
+        final_error = last_error or e
+        raise Exception(
+            f"Failed to download image from URL {image_url}: {str(final_error)}"
+        )
 
 
 async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
@@ -237,7 +325,7 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
-    with log_generation_timer(logger, batch.prompt):
+    with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
         if result.output is None and result.output_file_paths is None:
@@ -259,10 +347,22 @@ async def process_generation_batch(
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
                 output_compression=batch.output_compression,
+                enable_frame_interpolation=batch.enable_frame_interpolation,
+                frame_interpolation_exp=batch.frame_interpolation_exp,
+                frame_interpolation_scale=batch.frame_interpolation_scale,
+                frame_interpolation_model_path=batch.frame_interpolation_model_path,
+                enable_upscaling=batch.enable_upscaling,
+                upscaling_model_path=batch.upscaling_model_path,
+                upscaling_scale=batch.upscaling_scale,
             )
 
     total_time = time.perf_counter() - total_start_time
-    log_batch_completion(logger, 1, total_time)
+    if get_global_server_args().batching_max_size > 1:
+        log_batch_completion(
+            logger,
+            len(save_file_path_list),
+            total_time,
+        )
 
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")

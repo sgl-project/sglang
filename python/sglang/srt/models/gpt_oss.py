@@ -17,6 +17,7 @@
 
 import logging
 import math
+import re
 from collections.abc import Iterable
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -75,10 +76,38 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_npu, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    get_cuda_version,
+    is_blackwell_supported,
+    is_cpu,
+    is_cuda,
+    is_flashinfer_available,
+    is_npu,
+    is_sm90_supported,
+    make_layers,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_cuda = is_cuda()
+_is_tinygemm_supported = (
+    _is_cuda
+    and is_flashinfer_available()
+    and (is_sm90_supported() or is_blackwell_supported())
+)
+
+if _is_tinygemm_supported and get_cuda_version()[0] < 13:
+    try:
+        from flashinfer.gemm import tinygemm_bf16
+    except ImportError:
+        tinygemm_bf16 = None
+        _is_tinygemm_supported = False
+else:
+    tinygemm_bf16 = None
+    _is_tinygemm_supported = False
 
 
 class GptOssConfig(PretrainedConfig):
@@ -95,6 +124,45 @@ logger = logging.getLogger(__name__)
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
+
+
+class TinyGemmLinear(ReplicatedLinear):
+    """ReplicatedLinear with a FlashInfer tinygemm BF16 fast path."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_tinygemm = (
+            _is_tinygemm_supported
+            and not self.skip_bias_add
+            and self.weight.is_contiguous()
+            and self.weight.shape[0] % 16 == 0
+            and self.weight.shape[1] % 64 == 0
+            and self.weight.dtype == torch.bfloat16
+            and (
+                self.bias is None
+                or (
+                    self.bias.dtype == torch.bfloat16
+                    and self.bias.is_contiguous()
+                    and self.bias.shape[0] == self.weight.shape[0]
+                )
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if (
+            self._use_tinygemm
+            and x.ndim == 2
+            and x.is_cuda
+            and x.shape[0] <= 128
+            and x.is_contiguous()
+            and x.shape[1] == self.weight.shape[1]
+            and x.dtype == torch.bfloat16
+        ):
+            out = x.new_empty((x.shape[0], self.output_size))
+            tinygemm_bf16(x, self.weight, out, self.bias)
+            return out, None
+
+        return super().forward(x)
 
 
 class GptOssSparseMoeBlock(nn.Module):
@@ -147,13 +215,13 @@ class GptOssSparseMoeBlock(nn.Module):
             **extra_kwargs,
         )
 
-        self.router = ReplicatedLinear(
+        self.router = TinyGemmLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=True,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
     def forward(
@@ -374,8 +442,8 @@ class GptOssDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -402,7 +470,7 @@ class GptOssDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
         self.layer_id = layer_id
@@ -587,6 +655,13 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    _lora_pattern_moe = re.compile(
+        r"^(?:model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern_moe.match(module_name))
 
     def __init__(
         self,
@@ -808,7 +883,8 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
         for name, weight in weights:
-            weight = weight.cuda()
+            if _is_cuda:
+                weight = weight.cuda()
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1090,6 +1166,22 @@ class GptOssForCausalLM(nn.Module):
                         param = params_dict[name]
                         if "sinks" in name:
                             start = get_attention_tp_rank() * param.numel()
+                            tp_size = get_tensor_model_parallel_world_size()
+                            full_shard_size = param.numel() * tp_size
+                            # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
+                            # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.
+                            if (
+                                _is_cpu
+                                and full_shard_size > loaded_weight.size(0)
+                                and start + param.numel() >= loaded_weight.size(0)
+                            ):
+                                pad_size = start + param.numel() - loaded_weight.size(0)
+                                pad_tensor = torch.zeros(pad_size).to(
+                                    loaded_weight.dtype
+                                )
+                                loaded_weight = torch.cat(
+                                    [loaded_weight, pad_tensor], dim=0
+                                ).to(loaded_weight.dtype)
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1103,6 +1195,9 @@ class GptOssForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -1125,6 +1220,18 @@ class GptOssForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -1,13 +1,40 @@
 import io
 import random
+from argparse import Namespace
+from dataclasses import dataclass
 from typing import List, Optional
 
 import pybase64
 from datasets import load_dataset
 from transformers import AutoProcessor, AutoTokenizer
 
-from sglang.benchmark.datasets.common import DatasetRow
+from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 from sglang.benchmark.datasets.image import create_mm_data_row
+from sglang.benchmark.utils import get_processor
+
+
+@dataclass
+class MMMUDataset(BaseDataset):
+    num_requests: int
+    backend: str
+    fixed_output_len: Optional[int]
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "MMMUDataset":
+        return cls(
+            num_requests=args.num_prompts,
+            backend=args.backend,
+            fixed_output_len=args.random_output_len,
+        )
+
+    def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
+        processor = get_processor(model_id)
+        return sample_mmmu_requests(
+            num_requests=self.num_requests,
+            processor=processor,
+            backend=self.backend,
+            fixed_output_len=self.fixed_output_len,
+        )
 
 
 def sample_mmmu_requests(

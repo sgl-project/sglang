@@ -36,6 +36,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -92,6 +93,81 @@ class AnthropicServing:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
         openai_messages = []
 
+        def _convert_anthropic_image_source_to_openai_part(
+            source: Optional[dict],
+        ) -> Optional[dict]:
+            if not isinstance(source, dict):
+                return None
+
+            source_type = source.get("type")
+            if source_type == "base64":
+                media_type = source.get("media_type", "image/png")
+                data = source.get("data", "")
+                if not data:
+                    return None
+                return {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media_type};base64,{data}",
+                    },
+                }
+
+            url = source.get("url")
+            if url:
+                return {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": url,
+                    },
+                }
+
+            return None
+
+        def _convert_tool_result_content(
+            content: Optional[str | list[dict]],
+        ) -> tuple[str | list[dict], str]:
+            if isinstance(content, list):
+                tool_content_parts = []
+                tool_text_parts = []
+
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_type = item.get("type")
+                    if item_type == "text":
+                        text = item.get("text", "")
+                        if text:
+                            tool_text_parts.append(text)
+                            tool_content_parts.append({"type": "text", "text": text})
+                    elif item_type == "image":
+                        image_part = _convert_anthropic_image_source_to_openai_part(
+                            item.get("source")
+                        )
+                        if image_part is not None:
+                            tool_content_parts.append(image_part)
+                    elif item_type == "tool_reference":
+                        # Anthropic uses `tool_name`; the SGLang chat template
+                        # matches on `name`. Translate at the boundary.
+                        ref_name = item.get("tool_name") or item.get("name")
+                        if ref_name:
+                            tool_content_parts.append(
+                                {"type": "tool_reference", "name": ref_name}
+                            )
+
+                tool_text = "\n".join(tool_text_parts)
+                if (
+                    len(tool_content_parts) == 1
+                    and tool_content_parts[0]["type"] == "text"
+                ):
+                    return tool_content_parts[0]["text"], tool_text
+                if tool_content_parts:
+                    return tool_content_parts, tool_text
+                return "", tool_text
+
+            tool_text = str(content) if content else ""
+            return tool_text, tool_text
+
         # Add system message if provided
         if anthropic_request.system:
             if isinstance(anthropic_request.system, str):
@@ -122,16 +198,11 @@ class AnthropicServing:
                     content_parts.append({"type": "text", "text": block.text})
 
                 elif block.type == "image" and block.source:
-                    media_type = block.source.get("media_type", "image/png")
-                    data = block.source.get("data", "")
-                    content_parts.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{data}",
-                            },
-                        }
+                    image_part = _convert_anthropic_image_source_to_openai_part(
+                        block.source
                     )
+                    if image_part is not None:
+                        content_parts.append(image_part)
 
                 elif block.type == "tool_use":
                     tool_call = {
@@ -145,15 +216,9 @@ class AnthropicServing:
                     tool_calls.append(tool_call)
 
                 elif block.type == "tool_result":
-                    # Extract text content from list or string
-                    if isinstance(block.content, list):
-                        tool_content = "\n".join(
-                            item.get("text", "")
-                            for item in block.content
-                            if isinstance(item, dict) and item.get("type") == "text"
-                        )
-                    else:
-                        tool_content = str(block.content) if block.content else ""
+                    tool_content, tool_text = _convert_tool_result_content(
+                        block.content
+                    )
 
                     # Use tool_use_id (per spec) with fallback to id
                     tool_call_id = block.tool_use_id or block.id or ""
@@ -171,7 +236,7 @@ class AnthropicServing:
                         content_parts.append(
                             {
                                 "type": "text",
-                                "text": f"Tool result: {tool_content}",
+                                "text": f"Tool result: {tool_text}",
                             }
                         )
 
@@ -213,39 +278,41 @@ class AnthropicServing:
 
         chat_request = ChatCompletionRequest(**request_data)
 
-        # Convert tools
+        # Convert tools. Deferred tools stay in the list with defer_loading=True;
+        # the chat template hides them from the initial <tools> block and renders
+        # them on demand when a tool_reference block names them.
         if anthropic_request.tools:
-            tools = []
-            for tool in anthropic_request.tools:
-                tools.append(
-                    Tool(
-                        type="function",
-                        function={
-                            "name": tool.name,
-                            "description": tool.description or "",
-                            "parameters": tool.input_schema,
-                        },
-                    )
+            chat_request.tools = [
+                Tool(
+                    type="function",
+                    defer_loading=tool.defer_loading,
+                    function={
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": tool.input_schema,
+                    },
                 )
-            chat_request.tools = tools
+                for tool in anthropic_request.tools
+            ]
 
         # Convert tool choice
         if anthropic_request.tool_choice is not None:
-            if anthropic_request.tool_choice.type == "none":
+            tc_type = anthropic_request.tool_choice.type
+            if tc_type == "none":
                 chat_request.tool_choice = "none"
-            elif anthropic_request.tool_choice.type == "auto":
-                chat_request.tool_choice = "auto"
-            elif anthropic_request.tool_choice.type == "any":
-                chat_request.tool_choice = "required"
-            elif anthropic_request.tool_choice.type == "tool":
-                chat_request.tool_choice = ToolChoice(
-                    type="function",
-                    function=ToolChoiceFuncName(
-                        name=anthropic_request.tool_choice.name
-                    ),
-                )
-        elif anthropic_request.tools:
-            # Default to auto when tools are provided
+            elif chat_request.tools:
+                if tc_type == "auto":
+                    chat_request.tool_choice = "auto"
+                elif tc_type == "any":
+                    chat_request.tool_choice = "required"
+                elif tc_type == "tool":
+                    chat_request.tool_choice = ToolChoice(
+                        type="function",
+                        function=ToolChoiceFuncName(
+                            name=anthropic_request.tool_choice.name
+                        ),
+                    )
+        elif chat_request.tools:
             chat_request.tool_choice = "auto"
 
         return chat_request
@@ -257,7 +324,7 @@ class AnthropicServing:
         raw_request: Request,
     ) -> JSONResponse:
         """Handle non-streaming Anthropic request by delegating to OpenAI handler."""
-        received_time = time.time()
+        received_time = monotonic_time()
         received_time_perf = time.perf_counter()
 
         # Validate
@@ -313,7 +380,7 @@ class AnthropicServing:
         raw_request: Request,
     ) -> Union[StreamingResponse, JSONResponse]:
         """Handle streaming Anthropic request."""
-        received_time = time.time()
+        received_time = monotonic_time()
         received_time_perf = time.perf_counter()
 
         # Validate

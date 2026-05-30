@@ -172,6 +172,9 @@ def _layer_norm_fwd_1pass_kernel(
 @lru_cache
 def _get_sm_count(device: torch.device) -> int:
     """Get and cache the SM count for a given device."""
+    if device.type == "xpu":
+        assert torch.xpu.is_available(), "XPU device is not available"
+        return torch.xpu.get_device_properties(device).gpu_subslice_count
     props = torch.cuda.get_device_properties(device)
     return props.multi_processor_count
 
@@ -180,7 +183,7 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     # When piecewise cuda graph is enabled, use a constant value to avoid
     # torch.compile creating guards on the dynamic batch dimension.
     try:
-        if get_global_server_args().enable_piecewise_cuda_graph:
+        if not get_global_server_args().disable_piecewise_cuda_graph:
             return MAX_ROWS_PER_BLOCK
     except ValueError:
         # Global server args not initialized (e.g., in unit tests)

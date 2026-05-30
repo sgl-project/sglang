@@ -1,5 +1,7 @@
 import io
 import warnings
+from argparse import Namespace
+from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
@@ -8,10 +10,57 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.benchmark.datasets.common import (
+    BaseDataset,
     DatasetRow,
     compute_random_lens,
     gen_mm_prompt,
 )
+from sglang.benchmark.utils import get_processor
+
+
+@dataclass
+class ImageDataset(BaseDataset):
+    num_requests: int
+    image_count: int
+    input_len: int
+    output_len: int
+    range_ratio: float
+    image_content: str
+    image_format: str
+    image_resolution: str
+    backend: str
+    random_image_count: bool
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "ImageDataset":
+        return cls(
+            num_requests=args.num_prompts,
+            image_count=args.image_count,
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            range_ratio=args.random_range_ratio,
+            image_content=args.image_content,
+            image_format=args.image_format,
+            image_resolution=args.image_resolution,
+            backend=args.backend,
+            random_image_count=args.random_image_count,
+        )
+
+    def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
+        processor = get_processor(model_id)
+        return sample_image_requests(
+            num_requests=self.num_requests,
+            image_count=self.image_count,
+            input_len=self.input_len,
+            output_len=self.output_len,
+            range_ratio=self.range_ratio,
+            processor=processor,
+            image_content=self.image_content,
+            image_format=self.image_format,
+            image_resolution=self.image_resolution,
+            backend=self.backend,
+            random_image_count=self.random_image_count,
+        )
 
 
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
@@ -69,12 +118,20 @@ def create_mm_data_row(
         prompt_str = f"<image>{text_prompt}"
 
     # Calculate total tokens (text + vision)
-    prompt_len = processor(
-        text=[prompt_str],
-        images=images,
-        padding=False,
-        return_tensors="pt",
-    )["input_ids"].numel()
+    if type(processor).__name__ == "KimiK25Processor":
+        medias = [{"type": "image", "image": img} for img in images]
+        prompt_len = processor(
+            text=prompt_str,
+            medias=medias,
+            return_tensors="pt",
+        )["input_ids"].numel()
+    else:
+        prompt_len = processor(
+            text=[prompt_str],
+            images=images,
+            padding=False,
+            return_tensors="pt",
+        )["input_ids"].numel()
 
     # Calculate text-only tokens
     try:
@@ -99,15 +156,18 @@ def create_mm_data_row(
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
-    use_raw_prompt = backend in [
-        "sglang",
-        "sglang-oai",
-        "sglang-oai-chat",
-        "vllm",
-        "vllm-chat",
-        "lmdeploy",
-        "lmdeploy-chat",
-    ]
+    supported_backends = ["sglang", "sglang-native", "sglang-oai-chat"]
+    if backend not in supported_backends:
+        raise ValueError(
+            f"Image dataset only supports backends: {supported_backends}, "
+            f"got '{backend}'."
+        )
+
+    # sglang-oai-chat: server's chat handler applies chat template, so send raw text.
+    # sglang/sglang-native: /generate does not apply chat template, so send prompt_str
+    #         which contains image placeholder tokens needed by the multimodal processor.
+    use_raw_prompt = backend == "sglang-oai-chat"
+
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,
@@ -200,7 +260,7 @@ def sample_image_requests(
 
         # Generate text prompt
         text_prompt = gen_mm_prompt(
-            processor.tokenizer,
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
             int(input_lens[i]),
         )
@@ -232,6 +292,20 @@ def sample_image_requests(
         )
     else:
         print(f"#Images per request: {image_count} (fixed)")
+
+    # Detailed token breakdown (derived from dataset + input_lens)
+    text_prompt_lens = np.array([r.text_prompt_len for r in dataset])
+    vision_prompt_lens = np.array([r.vision_prompt_len for r in dataset])
+    text_prompt_overheads = text_prompt_lens - input_lens
+    stat_fields = [
+        ("Raw text prompt tokens (without overhead)", input_lens),
+        ("Text prompt tokens (with chat template)", text_prompt_lens),
+        ("Text prompt overhead", text_prompt_overheads),
+        ("Vision tokens", vision_prompt_lens),
+    ]
+    print("\n=== Token Breakdown (per request avg / total) ===")
+    for label, vals in stat_fields:
+        print(f"  {label}: avg={np.mean(vals):.1f}, total={np.sum(vals)}")
 
     print(
         f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"

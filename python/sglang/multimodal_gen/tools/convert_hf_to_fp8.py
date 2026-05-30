@@ -147,6 +147,16 @@ def process_file(
             and "lm_head" not in key
             and "eh_proj" not in key
             and "net" not in key
+            and "txt_mod" not in key
+            and "img_mod" not in key
+            and "modulation" not in key
+            and "img_in" not in key
+            and "txt_in" not in key
+            and "time_in" not in key
+            and "vector_in" not in key
+            and "adaLN_modulation" not in key
+            and "all_final_layer" not in key
+            and "feed_forward" not in key
             and "proj_out.weight" != key
         ):
             qw, s = quant_fp8(weights[key], strategy, block_size)
@@ -294,7 +304,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=1,
+        default=8,
         help="Number of worker threads for parallel processing",
     )
     args = parser.parse_args()

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -144,14 +147,14 @@ class StablelmAttention(nn.Module):
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
-                base=self.config.rope_theta,
+                base=self.config.rope_parameters["rope_theta"],
             )
         else:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
-                base=self.config.rope_theta,
+                base=self.config.rope_parameters["rope_theta"],
                 dtype=torch.float32,
             )
         self.attn = RadixAttention(

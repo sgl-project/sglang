@@ -52,6 +52,7 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
+        self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
 
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
 
@@ -69,13 +70,23 @@ class QuarkConfig(QuantizationConfig):
     def get_name(self) -> str:
         return "quark"
 
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper):
+        mapped = hf_to_sglang_mapper.apply_list(self.exclude_layers)
+        expanded = []
+        for name in mapped:
+            expanded.append(name)
+            if name.startswith("language_model."):
+                expanded.append(name.removeprefix("language_model."))
+        self.exclude_layers = list(dict.fromkeys(expanded))
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         # Check if the layer is skipped for quantization.
-        exclude_layers = cast(list[str], self.quant_config.get("exclude"))
         if should_ignore_layer(
-            prefix, ignore=exclude_layers, fused_mapping=self.packed_modules_mapping
+            prefix,
+            ignore=self.exclude_layers,
+            fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()

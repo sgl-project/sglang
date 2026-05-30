@@ -17,15 +17,15 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -47,41 +47,95 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = (
+    _is_cuda or _is_musa
+)  # This kernel is only available for CUDA and MUSA now
+
+
+def record_stream_each(tensors, stream):
+    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
+    non-tensor / non-cuda entries. Tells the caching allocator that the
+    tensors are also used on `stream`, so memory is not recycled while
+    queued work is still in flight after Python refs drop.
+    """
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.is_cuda:
+            t.record_stream(stream)
+
+
+def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
+    """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
+
+    Spec V2 mutates SB mid-forward (`prepare_for_v2_verify` rebinds
+    `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
+    replaces `batch.input_ids` again). Each rebind drops the only SB Python
+    ref to the old tensor while the verify forward kernel may still be
+    reading its memory on `fwd_stream`; `record_stream` tells the caching
+    allocator to wait for `fwd_stream` before recycling the block.
+
+    Covers pre-prepare tensors only; caller must also `record_stream_each`
+    the post-prepare rebinds (new `batch.input_ids` / `out_cache_loc`).
+    """
+    candidates = [
+        batch.seq_lens,
+        batch.req_pool_indices,
+        batch.input_ids,
+        batch.out_cache_loc,
+    ]
+    if verify_input is not None:
+        candidates.extend(
+            [
+                getattr(verify_input, attr, None)
+                for attr in (
+                    "draft_token",
+                    "custom_mask",
+                    "positions",
+                    "retrieve_index",
+                    "retrieve_next_token",
+                    "retrieve_next_sibling",
+                )
+            ]
+        )
+    record_stream_each(candidates, fwd_stream)
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
-    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
+    # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
+    # multi_layer_eagle handles hidden_states internally, not via FutureMap.
+    # TODO(lsyin): also skip when step == 1.
+    if server_args.speculative_algorithm == "STANDALONE":
+        return False
     return not server_args.enable_multi_layer_eagle
 
 
 @triton.jit
 def create_extend_after_decode_spec_info(
-    verified_id,
+    accept_tokens,
     seq_lens,
     accept_lens,
     positions,
-    new_verified_id,
+    bonus_tokens_ptr,
     bs_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     offsets = tl.arange(0, bs_upper)
     seq_length = tl.load(seq_lens + pid)
-    accept_length = tl.load(accept_lens + pid)
+    # `accept_lens` includes the bonus token; load this req's value.
+    accept_len = tl.load(accept_lens + pid)
 
     accept_len_cumsum = tl.sum(
         tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
     )
     positions_ptr = positions + accept_len_cumsum
-    mask = offsets < accept_length
-    tl.store(positions_ptr + offsets, seq_length - accept_length + offsets, mask)
+    mask = offsets < accept_len
+    tl.store(positions_ptr + offsets, seq_length - accept_len + offsets, mask)
 
-    accept_len_cumsum += accept_length - 1
-    verified_id_data = tl.load(verified_id + accept_len_cumsum)
-    tl.store(new_verified_id + pid, verified_id_data)
+    accept_len_cumsum += accept_len - 1
+    bonus_token = tl.load(accept_tokens + accept_len_cumsum)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit
@@ -178,7 +232,8 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-    if page_size != 1 and topk != 1 and duplicate_cache_len > 0:
+    # XXX (MUSA): Triton issue: chained boolean operators (A or B or C) are not supported.
+    if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:
         # Part 2: Copy indices into source_cache_loc and target_cache_loc
         # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
         prefix_len = tl.load(seq_lens + pid)
@@ -357,7 +412,7 @@ def align_evict_mask_to_page_size(
 def get_target_cache_loc(
     tgt_cache_loc,
     to_free_slots,
-    accept_length,
+    num_correct_drafts,
     to_free_num_slots,
     out_cache_loc,
     num_verify_tokens: tl.constexpr,
@@ -369,9 +424,9 @@ def get_target_cache_loc(
     bs_offset = tl.arange(0, bs_upper)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    accept_len_all = tl.load(num_correct_drafts + bs_offset, mask=bs_offset < bid)
     tgt_cache_loc_start = tl.sum(accept_len_all) + bid
-    copy_len = tl.load(accept_length + bid) + 1
+    copy_len = tl.load(num_correct_drafts + bid) + 1
     out_cache_loc_row = tl.load(
         out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
     )
@@ -404,15 +459,17 @@ def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
     accept_index: torch.Tensor,
-    accept_length: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
     draft_token_num: int,
     page_size: int,
 ):
     src_cache_loc = out_cache_loc[accept_index]
-    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    # zeros_like, not empty_like: any uncovered tail stays at slot 0 (padding)
+    # instead of caching-allocator garbage.
+    tgt_cache_loc = torch.zeros_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
-        (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,
+        (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
         extended_len,
     )
     to_free_num_slots = extended_len - keep_len
@@ -423,23 +480,25 @@ def get_src_tgt_cache_loc(
 def filter_finished_cache_loc_kernel(
     out_cache_loc,
     tgt_cache_loc,
-    accept_length,
-    accept_length_filter,
+    num_correct_drafts,
+    num_accept_tokens_filter,
     bs_upper: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
 ):
     bid = tl.program_id(0)
     bs_offset = tl.arange(0, bs_upper)
 
-    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
-    old_start = tl.sum(accept_length_all) + bid
-
-    accept_length_filter_all = tl.load(
-        accept_length_filter + bs_offset, mask=bs_offset < bid
+    num_correct_drafts_all = tl.load(
+        num_correct_drafts + bs_offset, mask=bs_offset < bid
     )
-    new_start = tl.sum(accept_length_filter_all)
+    old_start = tl.sum(num_correct_drafts_all) + bid
 
-    copy_len = tl.load(accept_length_filter + bid)
+    num_accept_tokens_filter_all = tl.load(
+        num_accept_tokens_filter + bs_offset, mask=bs_offset < bid
+    )
+    new_start = tl.sum(num_accept_tokens_filter_all)
+
+    copy_len = tl.load(num_accept_tokens_filter + bid)
     copy_offset = tl.arange(0, num_verify_tokens_upper)
     value = tl.load(
         tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
@@ -450,20 +509,76 @@ def filter_finished_cache_loc_kernel(
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
-def create_accept_length_filter(
-    accept_length: torch.Tensor,
+def create_num_accept_tokens_filter(
+    num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
     seq_lens: torch.Tensor,
 ):
-    accept_length_filter = torch.zeros_like(accept_length)
-    accept_length_filter[unfinished_index_device] = (
-        accept_length[unfinished_index_device] + 1
+    num_accept_tokens_filter = torch.zeros_like(num_correct_drafts)
+    num_accept_tokens_filter[unfinished_index_device] = (
+        num_correct_drafts[unfinished_index_device] + 1
     )
-    seq_lens.add_(accept_length + 1)
-    return accept_length_filter
+    seq_lens.add_(num_correct_drafts + 1)
+    return num_accept_tokens_filter
+
+
+def _select_top_k_tokens_first(
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    topk: int,
+):
+    input_ids = topk_index.flatten()
+    if hidden_states is not None:
+        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+
+    tree_info = (
+        topk_p.unsqueeze(1),  # (b, 1, topk)
+        topk_index,  # (b, topk)
+        torch.arange(-1, topk, dtype=torch.long, device=input_ids.device).expand(
+            topk_p.shape[0], -1
+        ),  # (b, topk + 1) — expand avoids the allocation of repeat
+    )
+    return input_ids, hidden_states, topk_p, tree_info
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
+def _select_top_k_tokens_later(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+):
+    topk_sq = topk * topk
+
+    expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
+    # (b, topk, 1) * (b, topk, topk) -> (b, topk, topk)
+
+    topk_cs_p, topk_cs_index = fast_topk(
+        expand_scores.flatten(start_dim=1), topk, dim=-1
+    )  # (b, topk)
+
+    topk_index = topk_index.view(-1, topk_sq)
+    input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()
+
+    if hidden_states is not None and hidden_states.shape[0] > 0:
+        flat_cs = topk_cs_index.flatten()
+        batch_offsets = torch.arange(
+            0, hidden_states.shape[0], step=topk, device=flat_cs.device
+        )
+        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(topk)
+        hidden_states = hidden_states[selected_input_index]
+
+    tree_info = (
+        expand_scores,  # (b, topk, topk)
+        topk_index,  # (b, topk * topk)
+        topk_cs_index + (topk_sq * (i - 1) + topk),  # (b, topk)
+    )
+    return input_ids, hidden_states, topk_cs_p, tree_info
+
+
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -473,51 +588,16 @@ def select_top_k_tokens(
     topk: int,
 ):
     if i == 0:
-        # The first step after extend
-        input_ids = topk_index.flatten()
-        if hidden_states is not None:
-            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-        scores = topk_p  # shape: (b, topk)
-
-        tree_info = (
-            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
-        )
-    else:
-        # The later decode steps
-        expand_scores = torch.mul(
-            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
-        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.flatten(start_dim=1), topk, dim=-1
-        )  # (b, topk)
-        scores = topk_cs_p  # shape: (b, topk)
-
-        topk_index = topk_index.reshape(-1, topk**2)
-        input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
-
-        if hidden_states.shape[0] > 0:
-            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device=topk_index.device
-            ).repeat_interleave(topk)
-            hidden_states = hidden_states[selected_input_index, :]
-
-        tree_info = (
-            expand_scores,  # shape: (b, topk, topk)
-            topk_index,  # shape: (b, topk * topk)
-            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
-        )
-
-    return input_ids, hidden_states, scores, tree_info
+        return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
+    return _select_top_k_tokens_later(
+        i, topk_p, topk_index, hidden_states, scores, topk
+    )
 
 
 def generate_simulated_accept_index(
     accept_index,
     predict,
-    accept_length,
+    num_correct_drafts,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
@@ -562,7 +642,7 @@ def generate_simulated_accept_index(
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
-    accept_length.fill_(simulate_acc_len - 1)
+    num_correct_drafts.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
 
@@ -591,29 +671,29 @@ def traverse_tree(
         if curr == 0:
             # the first token generated by the target model, and thus it is always
             # accepted from the previous iteration
-            accepted = True
+            is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
             curr_token_id = draft_tokens[curr]
             if vocab_size and curr_token_id >= vocab_size:
-                accepted = False
+                is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
-                accepted = (
+                is_accepted = (
                     parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
                 ) != 0
 
-        if accepted:
+        if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(draft_tokens[curr])
+                grammar.accept_token(int(draft_tokens[curr]))
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)
                 if retrieve_next_token[curr] != -1:
                     # Visit the child node
                     dfs(
-                        retrieve_next_token[curr],
+                        int(retrieve_next_token[curr]),
                         retrieve_next_token,
                         retrieve_next_sibling,
                         curr,
@@ -626,7 +706,7 @@ def traverse_tree(
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
             dfs(
-                retrieve_next_sibling[curr],
+                int(retrieve_next_sibling[curr]),
                 retrieve_next_token,
                 retrieve_next_sibling,
                 parent_pos,
@@ -689,11 +769,30 @@ def generate_token_bitmask(
 
 def load_token_map(token_map_path: str) -> List[int]:
     if not os.path.exists(token_map_path):
-        cache_dir = snapshot_download(
-            os.path.dirname(token_map_path),
-            ignore_patterns=["*.bin", "*.safetensors"],
-        )
-        token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
+        repo_id = os.path.dirname(token_map_path)
+        file_name = os.path.basename(token_map_path)
+
+        cache_dir = None
+        if envs.SGLANG_USE_MODELSCOPE.get():
+            from modelscope.utils.file_utils import get_model_cache_root
+
+            cached_repo_path = os.path.join(get_model_cache_root(), repo_id)
+            if os.path.exists(cached_repo_path):
+                cache_dir = cached_repo_path
+
+        if cache_dir is None:
+            if envs.SGLANG_USE_MODELSCOPE.get():
+                from modelscope.hub.snapshot_download import (
+                    snapshot_download as download_func,
+                )
+            else:
+                download_func = snapshot_download
+            cache_dir = download_func(
+                repo_id,
+                ignore_patterns=["*.bin", "*.safetensors"],
+            )
+
+        token_map_path = os.path.join(cache_dir, file_name)
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
 
@@ -704,13 +803,6 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
-
-
-def detect_nan(logits_output: LogitsProcessorOutput):
-    logits = logits_output.next_token_logits
-    if torch.any(torch.isnan(logits)):
-        logger.error("Detected errors during sampling! NaN in the logits.")
-        raise ValueError("Detected errors during sampling! NaN in the logits.")
 
 
 # Disable torch.compile for this function because it will be

@@ -33,6 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
@@ -133,9 +134,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.rope_scaling = config.rope_parameters
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.layer_id = layer_id
 
@@ -338,7 +339,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             )
             attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 
-            attn_backend = forward_batch.attn_backend
+            attn_backend = get_attn_backend()
             assert isinstance(attn_backend, HybridLinearAttnBackend)
             assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
             # Mamba block
@@ -348,6 +349,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 hidden_states * self.ssm_in_multiplier,
                 mamba_hidden_states,
                 layer_id=self.layer_id,
+                forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier

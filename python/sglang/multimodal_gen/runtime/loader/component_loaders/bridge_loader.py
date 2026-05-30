@@ -71,11 +71,10 @@ class BridgeLoader(ComponentLoader):
             default_dtype,
         )
 
-        # Check if FSDP loading is available
-        if (
-            server_args.hsdp_shard_dim is not None
-            and hasattr(model_cls, "_fsdp_shard_conditions")
-            and model_cls._fsdp_shard_conditions
+        # Use the FSDP loader when FSDP is requested or shard rules are declared.
+        fsdp_shard_conditions = getattr(model_cls, "_fsdp_shard_conditions", None)
+        if server_args.use_fsdp_inference or (
+            server_args.hsdp_shard_dim is not None and fsdp_shard_conditions
         ):
             # Load with FSDP support
             model = maybe_load_fsdp_model(

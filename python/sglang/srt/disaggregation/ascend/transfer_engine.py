@@ -8,6 +8,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 try:
     from memfabric_hybrid import TransferEngine
@@ -47,13 +48,15 @@ class AscendTransferEngine(MooncakeTransferEngine):
         else:
             logger.error(f"Unsupported DisaggregationMode: {disaggregation_mode}")
             raise ValueError(f"Unsupported DisaggregationMode: {disaggregation_mode}")
-        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+        self.session_id = NetworkAddress(
+            self.hostname, self.engine.get_rpc_port()
+        ).to_host_port_str()
         self.initialize()
 
     def initialize(self) -> None:
-        from sglang.srt.layers.dp_attention import (
-            get_tensor_model_parallel_world_size,
-            get_tp_group,
+        from sglang.srt.distributed.parallel_state import (
+            get_world_group,
+            get_world_size,
         )
 
         transfer_protocol = self._get_transfer_protocol()
@@ -64,12 +67,11 @@ class AscendTransferEngine(MooncakeTransferEngine):
             """with device RDMA for PD transfer"""
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [
-                torch.empty_like(tmp_tensor)
-                for _ in range(get_tensor_model_parallel_world_size())
+                torch.empty_like(tmp_tensor) for _ in range(get_world_size())
             ]
             # Initialize hccl in advance through all_gather to avoid conflicts with rdma initialization.
             torch.distributed.all_gather(
-                output_tensor_list, tmp_tensor, group=get_tp_group().device_group
+                output_tensor_list, tmp_tensor, group=get_world_group().device_group
             )
         """Initialize the ascend transfer instance."""
         ret_value = self.engine.initialize(

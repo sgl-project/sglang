@@ -1,19 +1,73 @@
+from __future__ import annotations
+
 import math
 from enum import IntEnum
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+def per_step_draft_out_cache_loc(
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+    topk: int,
+    num_steps: int,
+) -> torch.Tensor:
+    """Per-step slice of the multi-step EAGLE draft out_cache_loc buffer.
+
+    Single source of truth for the layout shared by EagleWorkerV2.draft_forward
+    (per-step write target) and DeepseekV4AttnBackend (per-step compression
+    write target baked into metadata).
+    """
+    expected = batch_size * topk * num_steps
+    assert out_cache_loc.shape[0] == expected, (
+        f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
+        f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
+    )
+    return (
+        out_cache_loc.view(batch_size, topk, num_steps)
+        .permute(2, 0, 1)
+        .reshape(num_steps, -1)
+    )
+
+
+def apply_eagle_prefill_input_rotation(
+    batch: ScheduleBatch, next_token_ids: torch.Tensor
+) -> None:
+    """EAGLE input rotation for draft prefill.
+
+    Each req's slice [t_0..t_{n-1}] -> [t_1..t_{n-1}, t_n] with
+    t_n = next_token_ids[i]. Aligns draft's position-i hidden with
+    target's label at i+1 — the basis of EAGLE chain prediction.
+    Vectorized: one whole-tensor left shift + scatter at segment tails.
+    """
+    if batch.forward_mode.is_idle():
+        return
+    assert len(next_token_ids) == len(batch.seq_lens)
+    extend_lens = torch.tensor(
+        batch.extend_lens, dtype=torch.int64, device=batch.input_ids.device
+    )
+    seg_ends = extend_lens.cumsum(0) - 1
+    rotated = torch.empty_like(batch.input_ids)
+    rotated[:-1] = batch.input_ids[1:]
+    rotated[seg_ends] = next_token_ids.to(batch.input_ids.dtype)
+    batch.input_ids = rotated
 
 
 def organize_draft_results(
@@ -45,7 +99,7 @@ class TreeMaskMode(IntEnum):
 
 
 def build_tree_kernel_efficient(
-    verified_id: torch.Tensor,
+    bonus_tokens: torch.Tensor,
     parent_list: List[torch.Tensor],
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -58,7 +112,7 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
-    draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
+    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
@@ -104,10 +158,10 @@ def build_tree_kernel_efficient(
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
-    retrive_buf = torch.full(
+    retrieve_buf = torch.full(
         (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
     )
-    retrive_index, retrive_next_token, retrive_next_sibling = retrive_buf
+    retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve_buf
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
@@ -125,9 +179,9 @@ def build_tree_kernel_efficient(
             seq_lens,
             tree_mask,
             positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             topk,
             spec_steps,
             num_verify_tokens,
@@ -140,9 +194,9 @@ def build_tree_kernel_efficient(
             seq_lens,
             tree_mask,
             positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             topk,
             spec_steps,
             num_verify_tokens,
@@ -151,9 +205,9 @@ def build_tree_kernel_efficient(
     return (
         tree_mask,
         positions,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
         draft_tokens,
     )
 
@@ -163,13 +217,13 @@ def verify_tree_greedy_func(
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
     candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
-    if _is_cuda or _is_hip:
+    if _is_cuda or _is_hip or _is_musa:
         from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(
@@ -177,9 +231,10 @@ def verify_tree_greedy_func(
             accept_index=accept_index,  # mutable
             accept_token_num=accept_token_num,  # mutable
             candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
 
@@ -191,9 +246,27 @@ def verify_tree_greedy_func(
             accept_index=accept_index,
             accept_token_num=accept_token_num,
             candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num
+
+
+def get_draft_hidden_dim(model_runner: ModelRunner) -> int:
+    """Derive the hidden dimension of target hidden states fed to the draft model."""
+    hf_config = model_runner.model_config.hf_config
+    eagle_config = getattr(hf_config, "eagle_config", {})
+    use_aux = eagle_config.get("use_aux_hidden_state", False)
+    spec_algorithm = model_runner.spec_algorithm
+
+    if spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux:
+        base = getattr(hf_config, "target_hidden_size", None)
+        if base is None:
+            base = model_runner.model_config.hidden_size
+        layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", [])
+        num_aux = max(len(layer_ids), 1)
+        return base * num_aux
+    return model_runner.model_config.spec_hidden_size
