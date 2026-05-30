@@ -68,6 +68,7 @@ for CONCURRENCY in ${CONCURRENCIES}; do
 
     python3 -m sglang.bench_serving \
       --backend sglang \
+      --host "${HOST}" \
       --port "${PORT}" \
       --seed "${SEED}" \
       --dataset-name generated-shared-prefix \
