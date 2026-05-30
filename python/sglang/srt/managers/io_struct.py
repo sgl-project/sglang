@@ -25,9 +25,10 @@ from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Union
 
 import torch
+from pydantic import PlainValidator
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -40,6 +41,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -136,8 +138,13 @@ MultimodalDataInputFormat = Union[
 class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can specify either text or input_ids
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # The token ids for text.
+    #
+    # Use C-loop validator to replace Pydantic per-element type check for efficiency.
+    input_ids: Annotated[
+        Optional[Union[List[List[int]], List[int]]],
+        PlainValidator(validate_optional_list_i64_1d_2d),
+    ] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -250,6 +257,7 @@ class GenerateReqInput(BaseReq):
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    mm_data_mooncake: Optional[List] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -793,6 +801,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+    mm_data_mooncake: Optional[List] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -1764,6 +1773,7 @@ class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     log_requests_format: Optional[str] = None
+    log_level: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
