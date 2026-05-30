@@ -146,7 +146,6 @@ class EagleDraftInputV2Mixin:
         # barrier has chained to the prev forward -> host stalls a full forward.
         cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
