@@ -180,11 +180,11 @@ class DeepseekV4AscendAttnBackend(
         self.graph_metadata["c128_page_table"] = torch.full(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
-        self.graph_metadata["c4_state_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c4_state_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c128_state_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c128_state_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
 
         # 1 kernel_metadata slot per ratio, 1024 int32 entries per source ref.
@@ -417,6 +417,7 @@ class DeepseekV4AscendAttnBackend(
             device=device,
             req_to_token_pool=forward_batch.req_to_token_pool,
             out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
+            is_graph=True,
         )
 
         # In-place copy result into preallocated fm buffers.
@@ -465,10 +466,28 @@ class DeepseekV4AscendAttnBackend(
         # block_tables_swa or block_tables. Replay does the same in-place into
         # the preallocated swa_page_table buffer. Use fm.block_tables_swa if the
         # backend is hybrid-SWA (set by the base class replay), else fm.block_tables.
-        swa_src = getattr(fm, "block_tables_swa", None)
-        if swa_src is None:
-            swa_src = fm.block_tables
-        _copy_2d(fm.swa_page_table, swa_src)
+        swa_src = (
+            fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
+        )
+        _copy_2d(fm.swa_page_table, swa_src, -1)
+        # The base graph replay 0-pads block_tables{,_swa} past the real pages
+        # (AscendAttnBackend: block_tables_swa[:bs, max_seq_pages:].fill_(0)). The
+        # full-width copy above thus overwrites the -1 sentinel with page id 0 in
+        # the tail, so the ori/swa sparse-attn kernel (oriMaxBlockNumPerBatch =
+        # block_table.shape[1], full width) could read page 0 past a request's
+        # real pages. Restore the -1 sentinel beyond the valid pages so swa
+        # matches the c4/c128 page tables (and the reference impl, which copies a
+        # tight src into a -1-filled buffer). max_seq_pages mirrors the base.
+        if bs > 0:
+            # Over-estimate max_len by the spec draft tokens (a safety margin):
+            # over-estimating only leaves a few extra 0s in the UNREAD tail,
+            # while under-estimating would -1 over valid pages. Plain decode
+            # adds 0.
+            _spec = int(getattr(self, "speculative_num_draft_tokens", 0) or 0)
+            max_len = int(seq_lens_cpu[:bs].max()) + _spec
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+            if 0 < max_seq_pages < fm.swa_page_table.shape[1]:
+                fm.swa_page_table[:, max_seq_pages:].fill_(-1)
 
         # Kernel metadata refresh via shared helper from Task 1.
         kernel_metadata_new = self._kernel_metadata_from_parts(
@@ -488,6 +507,15 @@ class DeepseekV4AscendAttnBackend(
         # runs. The indexer will overwrite valid entries; any unset rows must
         # read -1 (= "no sparse index") to keep npu_sparse_attn_sharedkv stable.
         fm.c4_topk_indices.fill_(-1)
+
+        # [debug] per-replay ForwardMetadata dump for mainbase-vs-reference
+        # comparison. No-op unless env DSV4_REPLAY_DUMP=1. Debug only (the
+        # .cpu()/.tolist() inside force a device sync) — keep OFF for perf runs.
+        from sglang.srt.hardware_backend.npu.attention._dsv4_dump import (
+            dump_replay_metadata,
+        )
+
+        dump_replay_metadata(fm, forward_mode, bs, req_pool_indices, live_seq_lens)
 
         self.forward_metadata = fm
 
@@ -598,9 +626,8 @@ class DeepseekV4AscendAttnBackend(
         # hybrid-SWA, else None. Aliased under the name forward_sparse uses.
         # Use explicit `is not None` check (not `or`) because
         # `bool(multi-element tensor)` raises.
-        block_tables_swa = getattr(fm, "block_tables_swa", None)
         fm.swa_page_table = (
-            block_tables_swa if block_tables_swa is not None else fm.block_tables
+            fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
         )
 
         # actual_seq_lengths_kv defaults to None on main; the V4 metadata
@@ -862,6 +889,7 @@ class DeepseekV4AscendAttnBackend(
         device: torch.device,
         req_to_token_pool,
         out_cache_loc_dsv4,
+        is_graph: bool = False,
     ) -> dict:
         """Pure compress-loc computation shared by eager and graph-replay paths.
 
@@ -999,8 +1027,13 @@ class DeepseekV4AscendAttnBackend(
                 if ratio == 4
                 else req_to_token_pool.req_to_token_c128
             )
-            n_c_tokens = max(1, seq_lens_max // ratio)
-            n_c_tokens = min(n_c_tokens, c_table.shape[1])
+            # Graph mode: raw `seq_lens_max // ratio` keeps the slice shape
+            # aligned with the preallocated (max_bs, max_pages) buffer copy.
+            # Eager: clamp to >=1 so downstream kernels always see a column.
+            if is_graph:
+                n_c_tokens = seq_lens_max // ratio
+            else:
+                n_c_tokens = max(1, seq_lens_max // ratio)
             slots = c_table[req_pool.to(torch.int64), :n_c_tokens]
             c_page_table = (
                 slots[:, :: self.page_size] // self.page_size

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
@@ -415,13 +416,11 @@ class Compressor(nn.Module):
             #
             # Fused path (_forward_npu_fused) is decode-only: it reads write
             # locations from fm.c{ratio}_loc, which _compute_compress_locs
-            # populates only in its is_decode branch. Prefill / extend keep
-            # the per-request forward_npu path, which derives write_locs
-            # inline via req_to_token_c{4,128}[req_pool, pos_in_req]. The
-            # per-request loop is safe in non-decode modes because prefill /
-            # extend are never CUDA-graph-captured under our setup
-            # (--cuda-graph-bs only enumerates decode bs values), so the
-            # capture-time loop-skip bug (decode-graph-only) does not apply.
+            # populates only in its is_decode branch. Prefill / extend keep the
+            # per-request forward_npu path. (A prefill-fused experiment was
+            # tested and REJECTED: it produced the same prefill HS as forward_npu
+            # AND crashed long decode runs — the prefill compressor was not the
+            # accuracy root cause; the MoE sqrtsoftplus gating was.)
             if (
                 envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get()
                 and forward_batch.forward_mode.is_decode()
@@ -711,16 +710,41 @@ class Compressor(nn.Module):
                     if ratio == 4
                     else bundle.out_c128_state_loc
                 )
-                assert bundle_state_loc is not None and bundle_state_loc.numel() > 0, (
-                    f"Compressor.forward_npu prefill: bundle.out_c{ratio}_state_loc "
-                    f"is empty/None — DSV4NPUTokenToKVPoolAllocator's "
-                    f"c{ratio}_state_attn_allocator was not initialized (check "
-                    f"pool_configurator's NPU branch + npu_state_pool_size)."
-                )
-                out_cache_loc = bundle_state_loc[
-                    state_bundle_offset : state_bundle_offset + c_alloc_len
-                ]
-                state_bundle_offset += c_alloc_len
+                if c_alloc_len > 0:
+                    # Only require a populated state bundle when this req
+                    # actually allocates slots. A 128-aligned prefill at
+                    # ratio==128 has c_alloc_len == seqlen % 128 == 0: there is
+                    # no partial tail to cache (the whole sequence compresses
+                    # cleanly into c128 chunks, and the next chunk is opened by
+                    # decode), so this req contributes zero state slots. If
+                    # EVERY req in the batch is 128-aligned, out_c128_state_loc
+                    # is legitimately empty (allocator returns _empty_loc) — not
+                    # a misconfiguration. An empty bundle while c_alloc_len > 0
+                    # *does* mean c{ratio}_state_attn_allocator was never
+                    # initialized.
+                    assert (
+                        bundle_state_loc is not None
+                        and bundle_state_loc.numel() > 0
+                    ), (
+                        f"Compressor.forward_npu prefill: bundle.out_c{ratio}_state_loc "
+                        f"is empty/None — DSV4NPUTokenToKVPoolAllocator's "
+                        f"c{ratio}_state_attn_allocator was not initialized (check "
+                        f"pool_configurator's NPU branch + npu_state_pool_size)."
+                    )
+                    out_cache_loc = bundle_state_loc[
+                        state_bundle_offset : state_bundle_offset + c_alloc_len
+                    ]
+                    state_bundle_offset += c_alloc_len
+                else:
+                    # No tail to cache: empty slot view, never indexed below.
+                    # For c128 (overlap=False) the only state-write branch is
+                    # `remainder > 0`, and remainder == seqlen % 128 ==
+                    # c_alloc_len, so c_alloc_len == 0 skips it. For c4
+                    # c_alloc_len is always > 0 (tail + 128 when tail <= 3), so
+                    # this branch is reached only for c128.
+                    out_cache_loc = torch.empty(
+                        (0,), dtype=torch.int64, device=device
+                    )
                 remainder = seqlen % ratio
                 cutoff = seqlen - remainder
                 # ``cutoff`` in raw coords; subtract ``c_alloc_offset`` for

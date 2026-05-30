@@ -1138,6 +1138,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
         )
+        if self.layer_id <= 5:
+            # sub-layer seed bisection: RAW self_attn output (attn kernel, before
+            # hc/norm). vs khalil same point: attnout matches but layer output
+            # (post-mlp) diverges -> seed op is MoE side; attnout already diverges
+            # -> seed is attn side (input_norm / hc_pre / self_attn kernel).
+            from sglang.srt.hardware_backend.npu.attention._dsv4_dump import (
+                dump_hidden_state,
+            )
+
+            dump_hidden_state("attnout", hidden_states, forward_batch, self.layer_id)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states
@@ -1296,6 +1306,12 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        # [debug] per-layer hidden_state dump (HS_DUMP=1), eager numerical-diff bisect
+        from sglang.srt.hardware_backend.npu.attention._dsv4_dump import (
+            dump_hidden_state,
+        )
+
+        dump_hidden_state("embed", hidden_states, forward_batch, -1)
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -1323,6 +1339,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
             )
+            dump_hidden_state("layer", hidden_states, forward_batch, i)
 
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
@@ -1338,6 +1355,7 @@ class DeepseekV4Model(nn.Module):
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
+        dump_hidden_state("final", hidden_states, forward_batch, 999)
 
         return hidden_states, pre_hc_head
 
