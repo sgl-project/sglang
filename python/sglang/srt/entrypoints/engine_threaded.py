@@ -38,7 +38,6 @@ import traceback
 from typing import Callable, Dict, List, Optional
 
 import psutil
-import torch
 
 from sglang.srt.entrypoints.engine import (
     Engine,
@@ -51,7 +50,6 @@ from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.scheduler import (
     Scheduler,
     configure_scheduler_process,
-    dispatch_event_loop,
 )
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
@@ -155,6 +153,12 @@ class _ThreadedScheduler(Scheduler):
     the hub set on ``_pending_hub`` by ``ThreadedEngine`` just before
     construction.  ``init_idle_sleeper`` is disabled because
     ``zmq.Poller`` can't poll our queue-backed receivers.
+
+    NOTE: this override must mirror any non-socket side-effects that the
+    parent's ``init_ipc_channels`` performs — currently
+    ``self.load_snapshot_writer = None``. When upstream adds more, they
+    have to be replicated here or the scheduler thread will crash with
+    ``AttributeError`` deep inside the event loop.
     """
 
     def init_ipc_channels(self, port_args: PortArgs) -> None:
@@ -165,6 +169,9 @@ class _ThreadedScheduler(Scheduler):
                 "Only ThreadedEngine should instantiate this class."
             )
         self.ipc_channels = _make_threaded_scheduler_ipc(hub)
+        # Load snapshot writer publishes via ZMQ to peer processes; in
+        # single-process threaded mode there are no peers, so disable it.
+        self.load_snapshot_writer = None
 
     def init_idle_sleeper(self) -> None:
         # Queue-backed receivers can't register with zmq.Poller.  Skip the
@@ -310,9 +317,10 @@ class ThreadedEngine(Engine):
                 scheduler_info_box.update(sched.get_init_info())
                 scheduler_ready.set()
 
-                sched.schedule_stream = torch.cuda.Stream(priority=0)
-                with torch.cuda.StreamContext(sched.schedule_stream):
-                    dispatch_event_loop(sched)
+                # Use the scheduler's own entry point so device-specific
+                # setup (schedule_stream, _war_barrier_enabled, MLX dispatch)
+                # stays in one place.
+                sched.run_event_loop()
             except Exception:
                 tb = get_exception_traceback()
                 # Always log so the cause isn't masked by an atexit-driven
