@@ -544,8 +544,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
-            dimensions=batch.dimensions,
-            return_pooled_hidden_states=batch.return_pooled_hidden_states,
+            dimensions=(
+                [
+                    r.dimensions if r.dimensions else batch.model_config.hidden_size
+                    for r in batch.reqs
+                ]
+                if batch.model_config.is_matryoshka
+                and any(r.dimensions is not None for r in batch.reqs)
+                else None
+            ),
+            # OR across the batch so a single fused forward matches; requests that
+            # did not ask for PHS still skip attaching it in the output processor.
+            return_pooled_hidden_states=any(
+                r.return_pooled_hidden_states for r in batch.reqs
+            ),
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata

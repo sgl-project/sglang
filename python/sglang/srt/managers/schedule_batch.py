@@ -1582,12 +1582,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
-    # For matryoshka embeddings
-    dimensions: Optional[list[int]] = None
-
-    # Whether to return pooled hidden states (pre-head transformer output)
-    return_pooled_hidden_states: bool = False
-
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -1817,21 +1811,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
-
-        # For matryoshka embeddings
-        if self.model_config.is_matryoshka and any(
-            r.dimensions is not None for r in reqs
-        ):
-            self.dimensions = [
-                r.dimensions if r.dimensions else self.model_config.hidden_size
-                for r in reqs
-            ]
-
-        # OR across the batch so ForwardBatch matches a single fused forward; requests
-        # that did not ask for PHS still skip attaching it in the output processor.
-        self.return_pooled_hidden_states = any(
-            r.return_pooled_hidden_states for r in reqs
-        )
 
         token_type_ids = [
             r.token_type_ids for r in reqs if r.token_type_ids is not None
