@@ -511,6 +511,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        # When --enable-mis is on, every request in the batch is expected to
+        # carry delimiter indices (the score endpoint always produces MIS-structured
+        # requests). Consumers index this list without None-checking.
+        if get_global_server_args().enable_mis and any(
+            r.multi_item_delimiter_indices is not None for r in batch.reqs
+        ):
+            assert all(
+                r.multi_item_delimiter_indices is not None for r in batch.reqs
+            ), "MIS batch must have delimiter indices on every request"
+            multi_item_delimiter_indices = [
+                torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
+                for r in batch.reqs
+            ]
+        else:
+            multi_item_delimiter_indices = None
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -566,7 +582,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
-            multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
+            multi_item_delimiter_indices=multi_item_delimiter_indices,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             # Compound (carry their own device tensors)

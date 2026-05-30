@@ -1609,9 +1609,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     encoder_cached: Optional[List[bool]] = None
     encoder_lens_cpu: Optional[List[int]] = None
 
-    # Multi-item scoring delimiter indices (set during prepare_for_extend)
-    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
-
     # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
@@ -2030,23 +2027,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
-
-        # Pre-compute delimiter indices as CPU tensors for MIS.
-        # When --enable-mis is on, every request in the batch is expected to
-        # carry delimiter indices (the score endpoint always produces MIS-structured
-        # requests). Consumers index this list without None-checking.
-        if get_global_server_args().enable_mis and any(
-            r.multi_item_delimiter_indices is not None for r in reqs
-        ):
-            assert all(
-                r.multi_item_delimiter_indices is not None for r in reqs
-            ), "MIS batch must have delimiter indices on every request"
-            self.multi_item_delimiter_indices = [
-                torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
-                for r in reqs
-            ]
-        else:
-            self.multi_item_delimiter_indices = None
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
