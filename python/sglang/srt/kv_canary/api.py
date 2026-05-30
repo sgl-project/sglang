@@ -35,11 +35,14 @@ def install_canary(
     )
 
     device = torch.device(model_runner.device)
+    # EAGLE draft worker pools rotate input_ids so slot ``p`` stores K/V for the token at position ``p+1``;
+    # target pools have no such shift. Threaded into the plan-side expected-token gather kernel.
+    kv_token_id_vs_position_offset = 1 if model_runner.is_draft_worker else 0
     buffer_groups = attach_canary_buffers(
         pool=model_runner.token_to_kv_pool,
         config=config,
         device=device,
-        kv_token_id_vs_position_offset=0,
+        kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     launch_capacities = CanaryLaunchCapacities.from_args(
         server_args=model_runner.server_args,
@@ -48,6 +51,7 @@ def install_canary(
         pool_slot_count=model_runner.max_total_num_tokens,
     )
     swa_window_size = model_runner.sliding_window_size or 0
+    speculative_num_steps = int(server_args.speculative_num_steps or 1)
     manager = CanaryManager(
         config=config,
         buffer_groups=buffer_groups,
@@ -55,6 +59,7 @@ def install_canary(
         req_to_token_pool=model_runner.req_to_token_pool,
         launch_capacities=launch_capacities,
         swa_window_size=swa_window_size,
+        speculative_num_steps=speculative_num_steps,
     )
 
     _patch_model_forward(model_runner=model_runner, manager=manager)
@@ -64,13 +69,14 @@ def install_canary(
     logger.info(
         "install_canary: disaggregation_mode=%s config=%s "
         "launch_capacities=%s n_buffer_groups=%d buffer_group_kinds=%s "
-        "swa_window_size=%d",
+        "swa_window_size=%d speculative_num_steps=%d",
         server_args.disaggregation_mode,
         config,
         launch_capacities,
         len(buffer_groups),
         [g.kind.name for g in buffer_groups],
         swa_window_size,
+        speculative_num_steps,
     )
     return manager
 

@@ -255,5 +255,40 @@ def _drive_one_cycle(manager, forward_batch) -> None:
             manager.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
 
 
+class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase):
+    def test_pre_ops_maybe_inside_graph_dispatches_to_bracketed_sfm(
+        self,
+    ) -> None:
+        """Verify the dispatcher routes phase 2 to the bracketed SingleForwardManager."""
+        manager = make_manager(device=self.device, speculative_num_steps=3)
+        forward_batch = make_forward_batch(self.device)
+        target_sfm = manager._single_forward_managers[1]
+        observed: list[object] = []
+        original_phase_2 = target_sfm.pre_ops_maybe_inside_graph
+
+        def _record(fb):
+            observed.append(fb)
+            return original_phase_2(fb)
+
+        target_sfm.pre_ops_maybe_inside_graph = _record
+        manager._single_forward_managers[0].pre_ops_outside_graph(
+            maybe_inaccurate_forward_batch=forward_batch
+        )
+        manager._single_forward_managers[1].pre_ops_outside_graph(
+            maybe_inaccurate_forward_batch=forward_batch
+        )
+        with manager.with_active_single_forward_manager(1):
+            manager.pre_ops_maybe_inside_graph(forward_batch)
+        self.assertEqual(observed, [forward_batch])
+
+    def test_pre_ops_maybe_inside_graph_asserts_outside_bracket(
+        self,
+    ) -> None:
+        manager = make_manager(device=self.device)
+        forward_batch = make_forward_batch(self.device)
+        with self.assertRaises(AssertionError):
+            manager.pre_ops_maybe_inside_graph(forward_batch)
+
+
 if __name__ == "__main__":
     unittest.main()
