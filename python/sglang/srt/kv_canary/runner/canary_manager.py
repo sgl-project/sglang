@@ -23,6 +23,7 @@ from sglang.srt.kv_canary.single_forward_manager.manager import (
     _PreOpsMaybeInsideGraphOutput,
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -42,7 +43,9 @@ class CanaryManager:
         req_to_token_pool: "ReqToTokenPool",
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
+        token_oracle_manager: Optional[TokenOracleManager] = None,
         speculative_num_steps: int = 1,
+        is_eagle_draft_decode: bool = False,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
@@ -107,6 +110,8 @@ class CanaryManager:
                 per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
                 per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
                 d2h_stream=self._d2h_stream,
+                token_oracle_manager=token_oracle_manager,
+                is_eagle_draft_decode=is_eagle_draft_decode,
             )
             for _ in range(num_sfms)
         )

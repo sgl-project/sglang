@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -22,6 +22,7 @@ from sglang.srt.kv_canary.single_forward_manager.data import (
     PostOpsInsideGraphOutputBuffer,
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 from sglang.srt.utils.phase_checker import SimplePhaseChecker
 
 if TYPE_CHECKING:
@@ -67,6 +68,8 @@ class SingleForwardManager:
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
         d2h_stream: torch.cuda.Stream,
+        token_oracle_manager: Optional[TokenOracleManager],
+        is_eagle_draft_decode: bool,
     ) -> None:
         self._config = config
         self._device = device
@@ -76,6 +79,8 @@ class SingleForwardManager:
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
         self._d2h_stream = d2h_stream
+        self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
+        self._is_eagle_draft_decode: bool = is_eagle_draft_decode
 
         self._write_req_capacity = per_forward_write_req_capacity
         self._write_entry_capacity = per_forward_write_entry_capacity
@@ -153,6 +158,22 @@ class SingleForwardManager:
             bs_capacity=self._write_req_capacity, device=self._device
         )
 
+        enable_write_input_assert = self._should_enable_write_input_assert_for_launch(
+            forward_batch
+        )
+        if enable_write_input_assert:
+            manager = self._token_oracle_manager
+            if manager is None:
+                raise RuntimeError(
+                    "kv-canary: enable_write_input_assert=True requires a TokenOracleManager; pass "
+                    "token_oracle_manager=install_oracle_sampler(oracle=...) into "
+                    "install_canary(...)"
+                )
+            manager.fill_expected_inputs(
+                forward_batch=forward_batch,
+                expected_inputs_out=expected_inputs,
+            )
+
         plan_input.fill_from_forward_batch(forward_batch=forward_batch)
 
         violation_log = self._device_state.violation_log
@@ -180,6 +201,8 @@ class SingleForwardManager:
                 forward_batch=forward_batch,
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
+                enable_write_input_assert=enable_write_input_assert,
+                enable_verify_token_assert=False,
             )
 
         return _PreOpsMaybeInsideGraphOutput(
@@ -202,6 +225,9 @@ class SingleForwardManager:
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = pre_ops_output.expected_inputs.slice(num_tokens)
+        enable_write_input_assert = self._should_enable_write_input_assert_for_launch(
+            forward_batch
+        )
         for group_idx, group in enumerate(self._buffer_groups):
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
@@ -212,6 +238,8 @@ class SingleForwardManager:
                 forward_batch=forward_batch,
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
+                enable_write_input_assert=enable_write_input_assert,
+                enable_verify_token_assert=False,
             )
 
         verify_plan_enable_combined = _torch_reduce_minimum(
@@ -232,6 +260,20 @@ class SingleForwardManager:
         )
 
         self._enable_warner.tick(self._output_buffer.verify_plan_enable)
+
+    def _should_enable_write_input_assert_for_launch(
+        self, forward_batch: "ForwardBatch"
+    ) -> bool:
+        if not self._config.enable_write_input_assert:
+            return False
+        forward_mode = forward_batch.forward_mode
+        if (
+            self._is_eagle_draft_decode
+            and forward_mode is not None
+            and forward_mode.is_decode()
+        ):
+            return False
+        return True
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:

@@ -13,6 +13,7 @@ from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
+    from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
@@ -23,6 +24,7 @@ def install_canary(
     *,
     server_args: "ServerArgs",
     model_runner: "ModelRunner",
+    token_oracle_manager: Optional["TokenOracleManager"] = None,
 ) -> Optional[CanaryManager]:
     config = CanaryConfig.from_env(server_args)
     if config.mode is CanaryMode.NONE:
@@ -59,7 +61,9 @@ def install_canary(
         req_to_token_pool=model_runner.req_to_token_pool,
         launch_capacities=launch_capacities,
         swa_window_size=swa_window_size,
+        token_oracle_manager=token_oracle_manager,
         speculative_num_steps=speculative_num_steps,
+        is_eagle_draft_decode=model_runner.is_draft_worker,
     )
 
     _patch_model_forward(model_runner=model_runner, manager=manager)

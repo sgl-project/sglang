@@ -25,11 +25,13 @@ def make_config(
     mode: CanaryMode = CanaryMode.RAISE,
     ring_capacity: int = 1024,
     sweep_interval: int = 0,
+    enable_write_input_assert: bool = False,
 ) -> CanaryConfig:
     return CanaryConfig(
         mode=mode,
         ring_capacity=ring_capacity,
         sweep_interval=sweep_interval,
+        enable_write_input_assert=enable_write_input_assert,
     )
 
 
