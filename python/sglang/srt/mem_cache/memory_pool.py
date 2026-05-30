@@ -604,24 +604,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
-                    if self.enable_mamba_extra_buffer_lazy:
-                        alloc_result = self.mamba_pool.alloc(1)
-                        assert (
-                            alloc_result is not None
-                        ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-                        req.mamba_ping_pong_track_buffer = torch.tensor(
-                            [alloc_result[0].item(), -1],
-                            dtype=torch.int64,
-                            device=self.device,
-                        )
-                    else:
-                        req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
-                            self.mamba_ping_pong_track_buffer_size
-                        )
-                        assert (
-                            req.mamba_ping_pong_track_buffer is not None
-                        ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-                    req.mamba_next_track_idx = 0
+                    self._alloc_ping_pong_buffer(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
         assert len(select_index) == len(
             mamba_indices
@@ -662,6 +645,26 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return 1 - mamba_next_track_idx
         else:
             return mamba_next_track_idx
+
+    def _alloc_ping_pong_buffer(self, req: "Req"):
+        """Allocate the ping-pong track buffer for a new request.
+
+        Lazy mode allocates 1 slot with the second set to -1 (allocated
+        on demand at track boundaries). Normal mode allocates all slots upfront.
+        """
+        n = 1 if self.enable_mamba_extra_buffer_lazy else self.mamba_ping_pong_track_buffer_size
+        slots = self.mamba_pool.alloc(n)
+        assert slots is not None, (
+            "Not enough space for mamba ping pong idx, "
+            "try to increase --mamba-full-memory-ratio."
+        )
+        if self.enable_mamba_extra_buffer_lazy:
+            req.mamba_ping_pong_track_buffer = torch.tensor(
+                [slots[0].item(), -1], dtype=slots.dtype, device=slots.device,
+            )
+        else:
+            req.mamba_ping_pong_track_buffer = slots
+        req.mamba_next_track_idx = 0
 
     def set_mamba_ping_pong_slot(self, req: "Req", idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
