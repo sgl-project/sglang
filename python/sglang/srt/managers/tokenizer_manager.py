@@ -73,16 +73,14 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
-    WatchLoadUpdateReq,
 )
+from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
-)
+from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -377,6 +375,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            self.server_args,
+            port_args,
+            caller="tokenizer",
+        )
 
     def init_running_status(self):
         # Request states
@@ -1647,6 +1651,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
+        if obj.log_level is not None:
+            # setLevel() may raise exception if obj.log_level is illegal string.
+            # Let the exception propagate to the caller.
+            # Only legal requests will be sent to scheduler.
+            logging.getLogger().setLevel(obj.log_level.upper())
+            self.send_to_scheduler.send_pyobj(obj)
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
@@ -1774,7 +1784,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ]
 
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                hidden_states = recv_obj.output_hidden_states[i]
+                if hidden_states is not None:
+                    meta_info["hidden_states"] = hidden_states
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
@@ -1946,16 +1958,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
-
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
-        if (
-            self.server_args.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
-            and recv_obj.load is not None
-        ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,
