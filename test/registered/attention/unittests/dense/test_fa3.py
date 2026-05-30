@@ -428,20 +428,27 @@ class TestFA3DenseAttentionBackendCorrectness(CustomTestCase):
                     )
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
-        self.skipTest(
-            "deferred: FA3 DRAFT_EXTEND_V2 CUDA-graph replay requires "
-            "`cache_seqlens = prefix + extend` in init_forward_metadata_replay_cuda_graph "
-            "(flashattention_backend.py); without that fix the kernel reads prefix-only KV "
-            "and produces ~82 % wrong attention values. Tracked in KNOWN_FAILURES.md §C.3."
-        )
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dense_draft_extend_v2_cuda_graph_case(
-                    self,
-                    case,
-                    head_dim=self.HEAD_DIM,
-                    hidden_size=self.HIDDEN_SIZE,
-                )
+            for pad_style in ("small_real", "prod_fill"):
+                for capture_bs in (
+                    case.batch_size,
+                    case.batch_size * 2,
+                    case.batch_size * 4,
+                ):
+                    with self.subTest(
+                        case=case.name,
+                        backend=case.backend,
+                        pad_style=pad_style,
+                        capture_bs=capture_bs,
+                    ):
+                        run_dense_draft_extend_v2_cuda_graph_case(
+                            self,
+                            case,
+                            head_dim=self.HEAD_DIM,
+                            hidden_size=self.HIDDEN_SIZE,
+                            cuda_graph_capture_batch_size=capture_bs,
+                            pad_style=pad_style,
+                        )
 
     def test_runner_mode_eagle_draft_extend_cases(self):
         for case, spec_kind in self.DRAFT_EXTEND_CASES:
