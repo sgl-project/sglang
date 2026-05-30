@@ -5,8 +5,12 @@
    32      32.0       320     4276        25.5        24.7         0.7         87.1        11.5        236.5      True
    64      60.1       320     4274       111.2        92.3         1.4        108.1         9.3        229.7      True
 
-# Attribution (ReqTimeStats, all-conc aggregate, N=959, excl HEALTH_CHECK):
-#   queue_duration (admission-wait): median 10.5s, p99 98.5s, max 100.2s
-#   forward_duration (prefill+decode): median 55.4s, p99 82.5s, max 83.2s
-#   prefill-only floor (min TTFT/conc): ~1.3 / 0.7 / 1.4 s  => residual TTFT is queue/throughput-bound, not KV-pool-admission (64x4608=295K < 396K pool).
-# Steady decode (server Decode-batch log @ conc64): #running-req 19-20, gen ~277 tok/s => ~14 tok/s/req (decode-batch growth from restored admission lowers per-req TPS).
+# Attribution (corrected, PER-CONC) — see attribution_per_conc.txt for the full reconciliation.
+#   Server request-time-stat rows: 967 parsed = 3 HEALTH_CHECK + 4 warmup (output_len 8/32) + 960 benchmark (output_len=512);
+#   5 invalid negative-queue rows dropped (all conc-64) => 955 valid; per-conc valid 320 / 320 / 315; grouped by request-completion print-time.
+#   queue_duration (admission-wait, MEASURED) p50/p95/p99 s:  conc16 4.9/10.5/10.5  conc32 10.5/21.7/22.3  conc64 84.2/97.4/99.4
+#   post-admission residual (TTFT_p99 - queue_p99, INFERRED) s: conc16 2.3  conc32 3.2  conc64 11.8  (prefill + chunked-prefill/decode interleave)
+#   uncontended prefill floor (min TTFT/conc) s: 1.3 / 0.7 / 1.4  => P99 TTFT is admission-wait-dominated, NOT KV-pool-admission (64x~4608=~295K < 396K pool).
+#   forward_duration is COMPLETION-time (prefill + all 512 decode), context only — NOT a first-token prefill term.
+# Per-request TPS root cause (decode_batch_excerpt.txt): steady-state decode batch 16 / ~32 / ~38, gen ~270-370 tok/s
+#   => per-req gen/#running-req = 17.7 / 11.5 / 9.7 tok/s, reproducing the client p50 TPS (17.6 / 11.5 / 9.3).

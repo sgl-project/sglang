@@ -1,6 +1,8 @@
-# AC-5 evidence addendum — recomputable from the tracked .meta.json sidecars + this file
-# (raw *.jsonl are gitignored; this records the per-conc distributions/percentiles so the
-#  client-SLO numbers in client_slo_report.md can be verified without the 4 MB JSONLs).
+# AC-5 evidence addendum — human-readable per-conc distributions/percentiles.
+# EXACT recomputation source: ac5_metrics_arrays.json (exact per-request arrays + source JSONL SHA256).
+#   Run `python3 ac5_metrics_tool.py --verify` to recompute every TTFT/TPOT/TPS percentile from the
+#   committed JSON alone (asserts recomputed == stored; PASS at all conc). This file is the readable view;
+#   raw *.jsonl are gitignored, and the numbers below verify without the 4 MB JSONLs.
 # Run: DS int8 @ mem_fraction_static=0.7, radix-on; gsp 4096 ISL/512 OSL; 1 trial WARMUP=0/WINDOW=60.
 # Source JSONL (gitignored): development/results/double_sparsity_gsp_isl4096_osl512_c{16,32,64}_t1.jsonl
 # Sidecar (tracked): client_slo_int8/double_sparsity_gsp_isl4096_osl512_c{16,32,64}_t1.jsonl.meta.json
