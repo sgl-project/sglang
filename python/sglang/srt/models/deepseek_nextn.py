@@ -25,8 +25,8 @@ from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -174,9 +174,7 @@ class DeepseekModelNextN(nn.Module):
             buffer_size=2,
             dtype=torch.float32,
             device=(
-                input_embeds.device
-                if input_embeds is not None
-                else input_ids.device
+                input_embeds.device if input_embeds is not None else input_ids.device
             ),
         )
 
