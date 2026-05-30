@@ -1122,6 +1122,10 @@ class CudaGraphRunner:
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
 
+            from sglang.srt.utils.graph_debug_utils import gdebug
+
+            gdebug.set_phase("capture", batch_size=bs)
+
             for _ in range(2):
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
@@ -1133,9 +1137,13 @@ class CudaGraphRunner:
             # Set graph pool id globally to be able to use symmetric memory
             set_graph_pool_id(get_global_graph_memory_pool())
 
+            gdebug.set_capturing_graph(True)
             out = self._capture_graph(
                 graph, get_global_graph_memory_pool(), stream, run_once
             )
+            gdebug.set_capturing_graph(False)
+
+            gdebug.set_phase("idle")
 
         return graph, out
 
@@ -1290,6 +1298,11 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
+
+        from sglang.srt.utils.graph_debug_utils import gdebug
+
+        gdebug.set_phase("replay", batch_size=self.bs)
+
         ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={
@@ -1301,6 +1314,8 @@ class CudaGraphRunner:
         )
         with ctx:
             self.graphs[graph_key].replay()
+
+        gdebug.flush()
 
         output = self.output_buffers[graph_key]
 
