@@ -381,12 +381,12 @@ class GPUWorker:
 
             # Realtime raw-frame responses avoid serializing generated tensors between
             # scheduler_client and gpu_worker.
-            if req.return_encoded_frames and self.rank == 0:
+            if req.return_raw_frames and self.rank == 0:
                 if output_batch.output is not None:
-                    output_batch.encoded_frame_content_type = RAW_RGB_CONTENT_TYPE
+                    output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
                     (
-                        output_batch.encoded_frame_batches,
-                        output_batch.encoded_frame_metadata,
+                        output_batch.raw_frame_batches,
+                        output_batch.raw_frame_metadata,
                     ) = build_raw_rgb_frame_batches(
                         output_batch.output,
                         req,
@@ -414,7 +414,7 @@ class GPUWorker:
             if (
                 torch.cuda.is_initialized()
                 and output_batch.output is None
-                and not req.return_encoded_frames
+                and not req.return_raw_frames
             ):
                 torch.cuda.empty_cache()
 

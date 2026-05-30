@@ -196,7 +196,7 @@ class LingBotWorldRealtimeAdapter:
         state = self._state(session)
         batch.session = session.realtime_session
         batch.realtime_session_id = session.id
-        batch.return_encoded_frames = True
+        batch.return_raw_frames = True
         batch.block_idx = session.generate_chunk_cnt
         pipeline_config = get_global_server_args().pipeline_config
         chunk_size = int(pipeline_config.dit_config.arch_config.num_frames_per_block)

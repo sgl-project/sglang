@@ -213,7 +213,8 @@ class Req:
     session: RealtimeSession | None = None
     block_idx: int = 0
     realtime_chunk_size: int | None = None
-    return_encoded_frames: bool = False
+    # return websocket-friendly raw RGB frame bytes instead of tensors
+    return_raw_frames: bool = False
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
@@ -393,9 +394,9 @@ class OutputBatch:
     """
 
     output: Any | None = None
-    encoded_frame_batches: list[list[bytes]] | None = None
-    encoded_frame_content_type: str = "image/jpeg"
-    encoded_frame_metadata: dict[str, Any] | None = None
+    raw_frame_batches: list[list[bytes]] | None = None
+    raw_frame_content_type: str = "application/x-raw-rgb"
+    raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None

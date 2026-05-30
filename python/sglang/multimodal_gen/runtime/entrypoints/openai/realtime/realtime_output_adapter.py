@@ -109,18 +109,18 @@ class RawRGBRealtimeOutputAdapter:
         result: OutputBatch,
         batch: Req,
     ) -> RealtimeFrameSendStats:
-        content_type = result.encoded_frame_content_type
-        if result.encoded_frame_batches is None:
+        content_type = result.raw_frame_content_type
+        if result.raw_frame_batches is None:
             return empty_frame_send_stats(content_type)
 
         frame_metadata = (
-            result.encoded_frame_metadata or _raw_rgb_frame_metadata(batch)
+            result.raw_frame_metadata or _raw_rgb_frame_metadata(batch)
             if content_type == RAW_RGB_CONTENT_TYPE
             else {}
         )
         stats = await self._send_frame_batches(
             ws,
-            result.encoded_frame_batches,
+            result.raw_frame_batches,
             content_type=content_type,
             chunk_index_start=batch.block_idx,
             request_id=session.request_id,

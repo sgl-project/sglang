@@ -68,7 +68,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 time.perf_counter() - stage_start
             ) * 1000.0
 
-            send_stats = empty_frame_send_stats(result.encoded_frame_content_type)
+            send_stats = empty_frame_send_stats(result.raw_frame_content_type)
             if session.adapter is not None:
                 send_stats = await session.adapter.send_output(
                     ws,
