@@ -506,24 +506,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
             max_len = seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = max_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
 
             if forward_mode.is_draft_extend_v2():
-                # V2: fixed shape per request, use num_tokens // bs
-                num_tokens_per_bs = metadata.max_seq_len_q  # set during capture
-                metadata.cu_seqlens_q[: bs + 1].copy_(
-                    torch.arange(
-                        0,
-                        bs * num_tokens_per_bs + 1,
-                        step=num_tokens_per_bs,
-                        dtype=torch.int32,
-                        device=seq_lens.device,
-                    )
-                )
+                # V2: fixed shape per request, cu_seqlens_q is set during capture
+                # and doesn't change across replays — skip redundant recomputation.
+                pass
             else:
                 # V1: variable accept lengths per request
                 extend_lens = spec_info.num_accept_tokens[:bs]
@@ -535,9 +527,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
                 )
 
-            max_seq_pages = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             page_indices = self.req_to_token[
                 req_pool_indices[:, None],
                 self.draft_extend_metadata["strided_indices"][:max_seq_pages],
