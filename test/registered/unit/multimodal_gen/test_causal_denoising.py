@@ -85,6 +85,72 @@ def test_causal_dmd_chunk_loop_uses_model_input_builder():
     assert torch.equal(result, torch.full_like(result, 11))
 
 
+def test_causal_dmd_forward_context_uses_prepare_hooks(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages import causal_denoising
+
+    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
+    stage.attn_backend = SimpleNamespace(get_enum=lambda: None)
+    monkeypatch.setattr(
+        causal_denoising, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    latents = torch.zeros(2, 3, 4, 5, 6)
+    seen = {}
+
+    def fake_prepare_frame_seq_length(self, h, w):
+        self.frame_seq_length = h * w
+        seen["frame_shape"] = (h, w)
+        return self.frame_seq_length
+
+    stage._target_dtype = MethodType(lambda self: torch.float16, stage)
+    stage._autocast_enabled = MethodType(lambda self, dtype, server_args: False, stage)
+    stage._get_causal_dmd_scheduler = MethodType(
+        lambda self, batch, server_args: "scheduler", stage
+    )
+    stage._get_causal_dmd_latents = MethodType(lambda self, batch: latents, stage)
+    stage._prepare_frame_seq_length = MethodType(fake_prepare_frame_seq_length, stage)
+    stage._prepare_causal_dmd_timesteps = MethodType(
+        lambda self, batch, server_args, scheduler, device: torch.tensor(
+            [9], device=device
+        ),
+        stage,
+    )
+    stage._prepare_causal_dmd_image_kwargs = MethodType(
+        lambda self, batch, server_args, target_dtype: {"image": target_dtype},
+        stage,
+    )
+    stage._prepare_causal_dmd_pos_cond_kwargs = MethodType(
+        lambda self, batch, server_args, target_dtype: {"pos": target_dtype},
+        stage,
+    )
+    stage._prepare_causal_dmd_prompt_embeds = MethodType(
+        lambda self, batch, server_args, target_dtype: ["prompt"],
+        stage,
+    )
+
+    ctx = stage._prepare_causal_dmd_forward_context(
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    assert ctx.target_dtype == torch.float16
+    assert ctx.autocast_enabled is False
+    assert ctx.device == torch.device("cpu")
+    assert ctx.scheduler == "scheduler"
+    assert ctx.timesteps.tolist() == [9]
+    assert ctx.latents is latents
+    assert ctx.prompt_embeds == ["prompt"]
+    assert ctx.image_kwargs == {"image": torch.float16}
+    assert ctx.pos_cond_kwargs == {"pos": torch.float16}
+    assert (ctx.batch_size, ctx.channels, ctx.num_frames, ctx.height, ctx.width) == (
+        2,
+        3,
+        4,
+        5,
+        6,
+    )
+    assert seen["frame_shape"] == (5, 6)
+
+
 def test_causal_dmd_block_updates_context_after_denoising():
     stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
     seen = {}

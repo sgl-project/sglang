@@ -11,7 +11,6 @@ Extends CausalDMDDenoisingStage with:
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
@@ -29,7 +28,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -147,62 +145,87 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
         self.kv_cache1 = kv_cache1
 
-    @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        target_dtype = self._target_dtype()
-        autocast_enabled = self._autocast_enabled(target_dtype, server_args)
-        device = get_local_torch_device()
-
-        # --- Condition: take current chunk's slice ---
-        condition_full = batch.image_latent
-        assert condition_full is not None, (
-            "LingBot-World causal DMD requires image_latent as condition. "
-            "Ensure ImageVAEEncodingStage runs before this stage."
-        )
+    def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
         latents = batch.latents
         assert latents is not None, (
             "LingBot-World causal DMD requires prepared chunk latents. "
             "Ensure RealtimeChunkLatentPreparationStage runs before this stage."
         )
+        return latents
+
+    def _get_causal_dmd_scheduler(self, batch: Req, server_args: ServerArgs):
         scheduler = batch.scheduler
         assert scheduler is not None, (
             "LingBot-World causal DMD requires prepared DMD timesteps. "
             "Ensure DMDTimestepPreparationStage runs before this stage."
         )
+        return scheduler
+
+    def _prepare_causal_dmd_timesteps(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        scheduler,
+        device: torch.device,
+    ) -> torch.Tensor:
         timesteps = batch.timesteps
         assert timesteps is not None
+        return timesteps.to(device)
 
-        b = condition_full.shape[0]
-        _, _, t, h, w = latents.shape
-
-        self._prepare_frame_seq_length(h, w)
-
-        timesteps = timesteps.to(device)
-
-        # --- Transformer kwargs ---
-        # Note: bypass prepare_extra_func_kwargs because
-        # CausalWanTransformer3DModel.forward uses (*args, **kwargs) which
-        # causes inspect-based filtering to drop all keyword arguments.
-        # The underlying _forward_inference accepts these explicitly.
+    def _prepare_causal_dmd_image_kwargs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        target_dtype: torch.dtype,
+    ) -> dict:
         image_embeds = getattr(batch, "image_embeds", [])
         if len(image_embeds) > 0:
             image_embeds = [ie.to(target_dtype) for ie in image_embeds]
-
-        image_kwargs = {
+        return {
             "encoder_hidden_states_image": image_embeds,
         }
 
-        pos_cond_kwargs = server_args.pipeline_config.prepare_pos_cond_kwargs(
+    def _prepare_causal_dmd_pos_cond_kwargs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        target_dtype: torch.dtype,
+    ) -> dict:
+        # lingbot transformer forward uses varargs, so inspect filtering drops valid kwargs
+        return server_args.pipeline_config.prepare_pos_cond_kwargs(
             batch,
             self.device,
             getattr(self.transformer, "rotary_emb", None),
             dtype=target_dtype,
         )
 
-        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
-            self.prepare_sta_param(batch, server_args)
+    def _prepare_causal_dmd_prompt_embeds(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        target_dtype: torch.dtype,
+    ):
+        return server_args.pipeline_config.get_pos_prompt_embeds(batch)
 
-        prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        # --- Condition: take current chunk's slice ---
+        condition_full = batch.image_latent
+        assert condition_full is not None, (
+            "LingBot-World causal DMD requires image_latent as condition. "
+            "Ensure ImageVAEEncodingStage runs before this stage."
+        )
+        ctx = self._prepare_causal_dmd_forward_context(batch, server_args)
+        target_dtype = ctx.target_dtype
+        autocast_enabled = ctx.autocast_enabled
+        device = ctx.device
+        scheduler = ctx.scheduler
+        timesteps = ctx.timesteps
+        image_kwargs = ctx.image_kwargs
+        pos_cond_kwargs = ctx.pos_cond_kwargs
+        latents = ctx.latents
+        prompt_embeds = ctx.prompt_embeds
+        b, t, h, w = ctx.batch_size, ctx.num_frames, ctx.height, ctx.width
 
         # --- KV cache from session state ---
         cache_state, persist_cache_state = self._get_cache_state(batch)
