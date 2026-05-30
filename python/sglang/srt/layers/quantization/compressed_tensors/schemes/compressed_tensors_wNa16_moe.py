@@ -16,7 +16,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
+from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+    gptq_marlin_moe_repack,
+)
 from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,
     marlin_moe_permute_scales,

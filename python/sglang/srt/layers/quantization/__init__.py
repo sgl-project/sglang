@@ -30,11 +30,11 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
+    CPUGPTQConfig,
     GPTQAscendConfig,
     GPTQConfig,
     GPTQMarlinConfig,
 )
-from sglang.srt.layers.quantization.gptq_cpu import CPUGPTQConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,

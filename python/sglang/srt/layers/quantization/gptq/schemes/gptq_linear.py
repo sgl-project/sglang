@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import GPTQLinearKernel
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
@@ -30,6 +29,10 @@ class GPTQLinearScheme(GPTQLinearSchemeBase):
         self.kernel = self._init_kernel(quant_config)
 
     def _init_kernel(self, quant_config: "GPTQConfig"):
+        from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+            GPTQLinearKernel,
+        )
+
         return GPTQLinearKernel(quant_config)
 
     def create_weights(
