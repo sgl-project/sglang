@@ -125,8 +125,11 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import shuffle_weight
-    from aiter.utility.fp4_utils import e8m0_shuffle
+    from aiter.ops.shuffle import (
+        shuffle_scale_a16w4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -1217,8 +1220,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
                 scale = getattr(layer, scale_name)
                 num_experts, num_rows, _ = scale.shape
-                scale.data = e8m0_shuffle(scale.view(num_experts * num_rows, -1)).view(
-                    num_experts, num_rows, -1
+                # a8w4: aiter flydsl scale layout
+                is_w13_scale = scale_name == "w13_weight_scale_inv"
+                scale.data = shuffle_scale_a16w4(
+                    scale.view(num_experts * num_rows, -1), num_experts, is_w13_scale
                 )
 
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
@@ -1226,11 +1231,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             is_shuffled = _is_shuffle_moe_mxfp4
             if is_shuffled:
-                layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight.contiguous(), (16, 16)
+                # a8w4: aiter flydsl weight layout
+                layer.w13_weight.data = shuffle_weight_a16w4(
+                    layer.w13_weight.contiguous(), 16, True
                 )
-                layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight.contiguous(), (16, 16)
+                layer.w2_weight.data = shuffle_weight_a16w4(
+                    layer.w2_weight.contiguous(), 16, False
                 )
             layer.w13_weight.is_shuffled = is_shuffled
             layer.w2_weight.is_shuffled = is_shuffled
@@ -1822,6 +1828,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 None,  # w1_zp
                 None,  # w2_zp
                 self.quant_config.weight_block_size,  # block_size
+                None,  # w1 bias
+                None,  # w3 bias
+                None,  # alpha
+                None,  # limit
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
@@ -2075,6 +2085,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
+            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
         )
 
 
