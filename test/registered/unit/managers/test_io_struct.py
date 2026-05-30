@@ -363,7 +363,8 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         """Test that single input_embeds are properly converted to batch when using parallel sampling."""
         # Test the specific case that was fixed: single input_embeds with n > 1
         req = GenerateReqInput(
-            input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 2}  # Single embedding
+            input_embeds=[[0.1, 0.2, 0.3]],
+            sampling_params={"n": 2},  # Single embedding
         )
         req.normalize_batch_and_arguments()
 
@@ -418,6 +419,47 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         req.normalize_batch_and_arguments()
         self.assertEqual(req.lora_path, expected_lora_paths)
+
+    def test_extra_key_list_normalization(self):
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            extra_key=["tenant-A", "tenant-B"],
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.extra_key, ["tenant-A", "tenant-B"])
+        self.assertEqual(req[0].extra_key, "tenant-A")
+        self.assertEqual(req[1].extra_key, "tenant-B")
+
+    def test_extra_key_list_with_parallel_sampling(self):
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params={"n": 2},
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            req.extra_key,
+            ["tenant-A", "tenant-B", "tenant-A", "tenant-B"],
+        )
+        self.assertEqual(req[0].extra_key, "tenant-A")
+        self.assertEqual(req[1].extra_key, "tenant-B")
+        self.assertEqual(req[2].extra_key, "tenant-A")
+        self.assertEqual(req[3].extra_key, "tenant-B")
+
+    def test_extra_key_list_length_mismatch(self):
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            extra_key=["tenant-A"],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "length of extra_key should be equal to the batch size"
+        ):
+            req.normalize_batch_and_arguments()
 
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
