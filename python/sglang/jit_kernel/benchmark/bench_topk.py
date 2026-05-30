@@ -1,15 +1,18 @@
 """Benchmark for the DeepSeek-V4 (DSA indexer) top-k transform kernels.
 
-Providers:
-  - jit_v1      : the JIT radix kernel (`topk_transform_512`, fixed K=512/1024)
-  - jit_v2      : the JIT register/streaming/cluster kernel (`topk_transform_512_v2`)
-  - flashinfer  : `flashinfer.top_k` (plain top-k, no page-table transform)
-  - torch       : `torch.topk` (plain top-k, no page-table transform)
+All four providers do top-k selection AND a page-table transform of the selected
+indices, so the comparison is apples-to-apples (top-k + transform):
+  - jit_v1      : JIT radix kernel `topk_transform_512` (page_size=64)
+  - jit_v2      : JIT register/streaming/cluster `topk_transform_512_v2` (page_size=64)
+  - flashinfer  : `flashinfer.top_k_page_table_transform` -- a fused top-k + transform.
+                  Its API is page_size=1, so it gathers through a per-token table.
+  - torch       : `torch.topk` followed by a `gather` (page_size=1).
 
-The JIT kernels perform top-k AND a page-table transform over an arbitrary page
-size + page table; the flashinfer / torch baselines only do a *naive* top-k (they
-do not support arbitrary page size + page table), so they are included purely as a
-memory-bandwidth reference, as requested.
+The JIT kernels support an arbitrary page size and run at the production page_size=64;
+flashinfer only supports page_size=1 (a per-token table), so its transform is over a
+64x larger table. The page-table tensor is excluded from the reported footprint (only
+~top-k of its entries are read per row); bandwidth counts the fully-read scores plus
+the written output.
 
 Run:
     CUDA_VISIBLE_DEVICES=7 python -m sglang.jit_kernel.benchmark.bench_topk
@@ -44,6 +47,21 @@ def _make_inputs(batch_size: int, seq_len: int, k: int):
     )
     out = torch.empty(batch_size, k, dtype=torch.int32, device="cuda")
     return scores, seq_lens, page_table, out
+
+
+def _make_p1_table(batch_size: int, seq_len: int):
+    """Per-token (page_size=1) page table + lengths for the flashinfer/torch
+    baselines. flashinfer's fused transform only supports page_size=1, so its
+    src_page_table is (batch, seq); a 1:1 row->batch mapping (row_to_batch=None)
+    keeps it on the same cluster path the JIT kernels are compared against."""
+    src_page_table = (
+        torch.arange(seq_len, dtype=torch.int32, device="cuda")
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .contiguous()
+    )
+    lengths = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+    return src_page_table, lengths
 
 
 def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
@@ -81,15 +99,22 @@ def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
     if provider == "flashinfer":
         import flashinfer
 
+        # Fused top-k + page-table transform (apples-to-apples with the JIT kernels).
+        # page_size=1 per-token table; row_to_batch=None keeps the B200 cluster path.
+        src_page_table, lengths = _make_p1_table(batch_size, seq_len)
+
         def fn(scores):
-            return flashinfer.top_k(scores, k)[1]
+            return flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
 
         return fn, (scores,), (scores,), "out"
 
     if provider == "torch":
+        # torch.topk followed by a page_size=1 gather, so it also does the transform.
+        src_page_table, _ = _make_p1_table(batch_size, seq_len)
 
         def fn(scores):
-            return scores.topk(k, dim=-1).indices
+            idx = scores.topk(k, dim=-1).indices  # (batch, k) int64
+            return torch.gather(src_page_table, 1, idx)
 
         return fn, (scores,), (scores,), "out"
 
