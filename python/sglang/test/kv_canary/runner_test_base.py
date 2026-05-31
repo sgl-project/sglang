@@ -30,6 +30,7 @@ def make_config(
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.NONE,
     enable_write_input_assert: bool = False,
     enable_verify_token_assert: bool = True,
+    stats_print_every_n_steps: int = 100,
 ) -> CanaryConfig:
     return CanaryConfig(
         mode=mode,
@@ -38,6 +39,7 @@ def make_config(
         real_kv_hash_mode=real_kv_hash_mode,
         enable_write_input_assert=enable_write_input_assert,
         enable_verify_token_assert=enable_verify_token_assert,
+        stats_print_every_n_steps=stats_print_every_n_steps,
     )
 
 
