@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.server_args import ServerArgs
+    from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
@@ -59,7 +60,7 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
-    scripted_scheduler_hook: Optional[Any] = None
+    scripted_scheduler_hook: Optional["ScriptedSchedulerHook"] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
