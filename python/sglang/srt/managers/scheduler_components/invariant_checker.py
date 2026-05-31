@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 from dataclasses import dataclass
 from typing import (
@@ -33,6 +34,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Minimum interval (seconds) between idle-time tree-cache sanity checks.
+# The check is a full recursive walk of the radix tree (O(N) over every
+# node, and more for hybrid SWA/SSM caches), so running it on every idle
+# tick can starve the scheduler under sustained load with a large cache.
+TREE_CACHE_SANITY_CHECK_INTERVAL_S = 30.0
+
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
@@ -52,6 +59,9 @@ class SchedulerInvariantChecker:
     get_running_batch: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
+    # Throttles the expensive idle-time tree-cache sanity check. 0.0 lets the
+    # first idle tick run the check, then it runs at most once per interval.
+    last_tree_cache_sanity_check_time: float = 0.0
 
     @staticmethod
     def _check_pool_invariant(
@@ -267,6 +277,16 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def _check_tree_cache(self):
+        # sanity_check is a full recursive tree walk; throttle it so a busy
+        # scheduler with a large cache does not spend every idle tick here.
+        now = time.perf_counter()
+        next_allowed = (
+            self.last_tree_cache_sanity_check_time + TREE_CACHE_SANITY_CHECK_INTERVAL_S
+        )
+        if now <= next_allowed:
+            return
+        self.last_tree_cache_sanity_check_time = now
+
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())
