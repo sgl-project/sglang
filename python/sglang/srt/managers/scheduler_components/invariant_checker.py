@@ -283,7 +283,10 @@ class SchedulerInvariantChecker:
         next_allowed = (
             self.last_tree_cache_sanity_check_time + TREE_CACHE_SANITY_CHECK_INTERVAL_S
         )
-        if now <= next_allowed:
+        # The 0.0 sentinel forces the first idle tick to run even when the
+        # process has been up for less than the interval (perf_counter() can be
+        # below the interval right after boot).
+        if self.last_tree_cache_sanity_check_time != 0.0 and now <= next_allowed:
             return
         self.last_tree_cache_sanity_check_time = now
 
