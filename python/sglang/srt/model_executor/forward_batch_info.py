@@ -558,7 +558,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        ret._maybe_init_embedding_mode_fields(batch)
+        ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
 
@@ -677,10 +677,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         return ret
 
-    def _maybe_init_embedding_mode_fields(self, batch: ScheduleBatch):
-        """Derive per-request fields for embedding-mode (max_new_tokens==0)
-        forwards from ``batch.reqs``. Two independent parts, each with its own
-        gate:
+    def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
+        """Derive per-request fields for non-generation (max_new_tokens==0)
+        forwards -- embedding / reward / scoring / cross-encoder -- from
+        ``batch.reqs``. Two independent parts, each with its own gate:
 
         - Pooling fields (dimensions / return_pooled_hidden_states / MIS
           delimiter indices): gated on ``is_prefill_only`` (the spec-disabled
