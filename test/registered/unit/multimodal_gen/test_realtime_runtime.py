@@ -479,12 +479,19 @@ def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():
     assert state.sample_camera_actions(3) == [["s"], ["s"], ["s"]]
 
 
-def test_lingbot_realtime_adapter_skips_stale_output_after_new_event():
+def test_lingbot_realtime_adapter_sends_stale_output_for_client_cutover():
     adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
     session = GenerateSession()
     session.set_adapter(adapter)
     state = adapter._state(session)
     state.receive_camera_actions([["d"]], event_id=7)
+    calls = []
+
+    async def fake_send(ws, session_arg, result_arg, batch_arg):
+        calls.append((ws, session_arg, result_arg, batch_arg))
+        return empty_frame_send_stats("sent")
+
+    adapter.output_adapter = SimpleNamespace(send=fake_send)
     batch = SimpleNamespace(block_idx=3, realtime_event_id=6)
     result = OutputBatch(
         raw_frame_batches=[[b"stale"]],
@@ -493,7 +500,10 @@ def test_lingbot_realtime_adapter_skips_stale_output_after_new_event():
 
     stats = asyncio.run(adapter.send_output(SimpleNamespace(), session, result, batch))
 
-    assert stats == empty_frame_send_stats("skipped-stale")
+    assert stats == empty_frame_send_stats("sent")
+    assert calls[0][1] is session
+    assert calls[0][2] is result
+    assert calls[0][3] is batch
 
 
 def test_lingbot_i2v_condition_does_not_repeat_reference_chunk():
