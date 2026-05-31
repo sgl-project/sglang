@@ -435,6 +435,41 @@ def test_wait_for_active_session_slot_observes_release(monkeypatch):
     assert asyncio.run(run())
 
 
+def test_cleanup_realtime_session_keeps_active_slot_during_scheduler_release(
+    monkeypatch,
+):
+    async def run():
+        session = GenerateSession()
+        realtime_video_api._ACTIVE_SESSION_IDS.clear()
+        realtime_video_api._ACTIVE_SESSION_IDS.add(session.id)
+        release_seen = []
+
+        async def fake_forward(req):
+            release_seen.append(
+                (req.session_id, session.id in realtime_video_api._ACTIVE_SESSION_IDS)
+            )
+
+        monkeypatch.setattr(
+            realtime_video_api.async_scheduler_client,
+            "forward",
+            fake_forward,
+        )
+        try:
+            await realtime_video_api._cleanup_realtime_session(session, None, None)
+            still_active_after_cleanup = (
+                session.id in realtime_video_api._ACTIVE_SESSION_IDS
+            )
+        finally:
+            realtime_video_api._ACTIVE_SESSION_IDS.clear()
+
+        return session.id, release_seen, still_active_after_cleanup
+
+    session_id, release_seen, still_active_after_cleanup = asyncio.run(run())
+
+    assert release_seen == [(session_id, True)]
+    assert still_active_after_cleanup
+
+
 def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
     session = GenerateSession()

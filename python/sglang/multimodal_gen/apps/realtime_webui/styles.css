@@ -312,7 +312,9 @@ button:focus-visible {
   color: #11140f;
 }
 
-.stage-controls .camera-pad button:is(:active, .is-pressed, .is-key-active):not(:disabled) {
+.stage-controls .camera-pad button:active:not(:disabled),
+.stage-controls .camera-pad button.is-pressed:not(:disabled),
+.stage-controls .camera-pad button.is-key-active:not(:disabled) {
   border-color: #5f625c;
   background: #5f625c;
   color: #fffdf7;
@@ -332,7 +334,9 @@ button:focus-visible {
   font-weight: 650;
 }
 
-.stage-controls .camera-pad button:is(:active, .is-pressed, .is-key-active)::after {
+.stage-controls .camera-pad button:active::after,
+.stage-controls .camera-pad button.is-pressed::after,
+.stage-controls .camera-pad button.is-key-active::after {
   color: rgba(255, 253, 247, 0.78);
 }
 

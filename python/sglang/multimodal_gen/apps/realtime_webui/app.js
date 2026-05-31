@@ -4,8 +4,8 @@ const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
 const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
-const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker";
-const PREVIEW_OUTPUT_FORMAT = "jpeg";
+const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v2";
+const PREVIEW_OUTPUT_FORMAT = "";
 const PREVIEW_OUTPUT_QUALITY = 95;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
@@ -25,14 +25,24 @@ const CONTROL_KEY_ACTIONS = new Map([
   ["arrowright", "l"],
 ]);
 const CONTROL_ACTION_META = {
-  w: { label: "Forward", type: "move", amount: "0.05/frame" },
-  a: { label: "Left", type: "move", amount: "0.05/frame" },
-  s: { label: "Back", type: "move", amount: "0.05/frame" },
-  d: { label: "Right", type: "move", amount: "0.05/frame" },
-  i: { label: "Pitch +", type: "pitch", amount: "4deg/frame" },
-  j: { label: "Yaw -", type: "yaw", amount: "6deg/frame" },
-  k: { label: "Pitch -", type: "pitch", amount: "4deg/frame" },
-  l: { label: "Yaw +", type: "yaw", amount: "6deg/frame" },
+  w: {
+    label: "Forward",
+    type: "translation",
+    axis: "+forward",
+    amount: "0.05/frame",
+  },
+  a: { label: "Left", type: "translation", axis: "-right", amount: "0.05/frame" },
+  s: {
+    label: "Back",
+    type: "translation",
+    axis: "-forward",
+    amount: "0.05/frame",
+  },
+  d: { label: "Right", type: "translation", axis: "+right", amount: "0.05/frame" },
+  i: { label: "Pitch +", type: "rotation", axis: "+pitch", amount: "4deg/frame" },
+  j: { label: "Yaw -", type: "rotation", axis: "-yaw", amount: "6deg/frame" },
+  k: { label: "Pitch -", type: "rotation", axis: "-pitch", amount: "4deg/frame" },
+  l: { label: "Yaw +", type: "rotation", axis: "+yaw", amount: "6deg/frame" },
 };
 
 const presets = [
@@ -548,6 +558,12 @@ async function connect() {
       $("connectBtn").disabled = false;
       return;
     }
+    const previewTransportParams = PREVIEW_OUTPUT_FORMAT
+      ? {
+          output_compression: PREVIEW_OUTPUT_QUALITY,
+          realtime_output_format: PREVIEW_OUTPUT_FORMAT,
+        }
+      : {};
     const init = compact({
       type: "init",
       model: $("model").value,
@@ -558,10 +574,9 @@ async function connect() {
       seed: Number($("seed").value),
       num_inference_steps: Number($("steps").value),
       guidance_scale: Number($("guidance").value),
-      output_compression: PREVIEW_OUTPUT_QUALITY,
-      realtime_output_format: PREVIEW_OUTPUT_FORMAT,
       max_chunks: $("continuous").checked ? undefined : 1,
       first_frame: firstFrame,
+      ...previewTransportParams,
     });
     ws = new WebSocket($("serverUrl").value);
     ws.binaryType = "arraybuffer";
@@ -606,8 +621,6 @@ async function connect() {
       if (!socketCloseExpected) {
         socketHadError = true;
         $("connectBtn").disabled = false;
-        setStatus("Socket issue", "error");
-        addHistory("socket transport issue; waiting for close code");
       }
     };
     ws.onmessage = (event) => {
@@ -715,7 +728,7 @@ function sendEvent(kind, payload, historyText = null) {
     updateStats();
     setStatus("Updating", "live");
   }
-  addHistory(historyText || `${kind} event sent`);
+  addHistory(`${historyText || `${kind} event sent`} · event#${eventId}`);
 }
 
 function sendCameraControl(actions) {
@@ -750,18 +763,20 @@ async function applyPreset(preset, options = {}) {
 
 function describeCameraEvent(actions, samples) {
   const parts = actions.map(describeControlAction).join(" + ") || "No-op";
-  return `camera · ${parts} · samples=${samples}`;
+  return `camera · ${parts} · duration=${samples} frames`;
 }
 
 function describeCameraScript(name, script, samples) {
   const uniqueActions = Array.from(new Set(script.flat()));
   const parts = uniqueActions.map(describeControlAction).join(" + ") || "No-op";
-  return `camera preset · ${name} · ${parts} · samples=${samples}`;
+  return `camera preset · ${name} · ${parts} · duration=${samples} frames`;
 }
 
 function describeControlAction(action) {
   const meta = CONTROL_ACTION_META[action];
-  return meta ? `${meta.label} [${meta.type} · ${meta.amount}]` : `${action} [custom]`;
+  return meta
+    ? `${meta.label} (${meta.type} ${meta.axis}, ${meta.amount})`
+    : `${action} (custom)`;
 }
 
 function enhancePrompt() {
@@ -902,6 +917,7 @@ function sendActiveKeyboardActions(force = false) {
 function setControlButtonActive(action, active) {
   document.querySelectorAll(`[data-action="${action}"]`).forEach((btn) => {
     btn.classList.toggle("is-key-active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
   });
 }
 

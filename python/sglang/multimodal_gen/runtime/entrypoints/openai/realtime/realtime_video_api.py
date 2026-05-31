@@ -270,6 +270,34 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
             continue
 
 
+async def _cleanup_realtime_session(
+    session: GenerateSession,
+    generate_task: asyncio.Task | None,
+    listen_task: asyncio.Task | None,
+) -> None:
+    logger.info("terminating session, session_id=%s", session.id)
+    for task in (generate_task, listen_task):
+        if task and not task.done():
+            task.cancel()
+    for task in (generate_task, listen_task):
+        if task is None:
+            continue
+        await _await_realtime_task(task)
+    try:
+        await async_scheduler_client.forward(
+            ReleaseRealtimeSessionReq(session_id=session.id)
+        )
+    except Exception as e:
+        logger.warning(
+            "failed to release realtime session on scheduler, session_id=%s, error=%s",
+            session.id,
+            e,
+        )
+    if session.input_temp_dir is not None:
+        shutil.rmtree(session.input_temp_dir, ignore_errors=True)
+    session.dispose()
+
+
 @router.websocket("/generate")
 async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
@@ -306,29 +334,10 @@ async def generate(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("client disconnected, session_id=%s", session.id)
     finally:
-        logger.info("terminating session, session_id=%s", session.id)
-        _ACTIVE_SESSION_IDS.discard(session.id)
-        for task in (generate_task, listen_task):
-            if task and not task.done():
-                task.cancel()
-        for task in (generate_task, listen_task):
-            if task is None:
-                continue
-            await _await_realtime_task(task)
         try:
-            await async_scheduler_client.forward(
-                ReleaseRealtimeSessionReq(session_id=session.id)
-            )
-        except Exception as e:
-            logger.warning(
-                "failed to release realtime session on scheduler, session_id=%s, error=%s",
-                session.id,
-                e,
-            )
-        if session.input_temp_dir is not None:
-            shutil.rmtree(session.input_temp_dir, ignore_errors=True)
-        if session:
-            session.dispose()
+            await _cleanup_realtime_session(session, generate_task, listen_task)
+        finally:
+            _ACTIVE_SESSION_IDS.discard(session.id)
 
 
 async def write_error_msg(error_msg: str, websocket: WebSocket):
