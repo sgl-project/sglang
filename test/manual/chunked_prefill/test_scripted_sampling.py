@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -22,7 +23,7 @@ class TestSamplingBasic(ScriptedTestCase):
     def _script_max_new_tokens_zero_rejected(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=0)
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.error_message is not None:
+            if r.req is not None and isinstance(r.req.finished_reason, FINISH_ABORT):
                 return
             if r.finished:
                 return
@@ -38,9 +39,9 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 1, (
+        assert len(r.req.output_ids) == 1, (
             f"max_new_tokens=1 must produce exactly 1 token, got "
-            f"{len(r.output_tokens)}"
+            f"{len(r.req.output_ids)}"
         )
 
     def test_max_new_tokens_1000_long_chunked(self):
@@ -56,9 +57,9 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.finished, max_steps=2000)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 1000, (
+        assert len(r.req.output_ids) == 1000, (
             f"ignore_eos=True + max_new_tokens=1000 must produce 1000 "
-            f"output tokens; got {len(r.output_tokens)}"
+            f"output tokens; got {len(r.req.output_ids)}"
         )
 
     def test_greedy_chunked_deterministic(self):
@@ -81,9 +82,9 @@ class TestSamplingBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r2)
         assert (
-            r1.output_tokens == r2.output_tokens
-        ), f"greedy non-determinism: {r1.output_tokens} != {r2.output_tokens}"
-        assert len(r1.output_tokens) == 8
+            r1.req.output_ids == r2.req.output_ids
+        ), f"greedy non-determinism: {r1.req.output_ids} != {r2.req.output_ids}"
+        assert len(r1.req.output_ids) == 8
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2
 
     def test_return_logprob_chunked(self):
@@ -114,9 +115,9 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 16
-        assert r.finish_reason == "length", (
-            f"ignore_eos=True must finish via length cap; got " f"{r.finish_reason!r}"
+        assert len(r.req.output_ids) == 16
+        assert r.req.finished_reason == "length", (
+            f"ignore_eos=True must finish via length cap; got " f"{r.req.finished_reason!r}"
         )
 
     def test_stop_str_chunked(self):
@@ -130,10 +131,10 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.finished, max_steps=2000)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) < 512
-        assert r.finish_reason in ("stop", "length"), (
+        assert len(r.req.output_ids) < 512
+        assert r.req.finished_reason in ("stop", "length"), (
             f"finish_reason must be populated for chunked stop-str runs; "
-            f"got {r.finish_reason!r}"
+            f"got {r.req.finished_reason!r}"
         )
 
     def test_high_temperature_chunked(self):
@@ -150,7 +151,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_greedy_two_sequential_reqs(self):
         self.server.execute_script(self._script_greedy_two_sequential_reqs)
@@ -164,7 +165,7 @@ class TestSamplingBasic(ScriptedTestCase):
             ignore_eos=True,
         )
         yield from run_until_finished(r1)
-        out_a = list(r1.output_tokens)
+        out_a = list(r1.req.output_ids)
 
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
@@ -173,7 +174,7 @@ class TestSamplingBasic(ScriptedTestCase):
             ignore_eos=True,
         )
         yield from run_until_finished(r2)
-        assert list(r2.output_tokens) == out_a
+        assert list(r2.req.output_ids) == out_a
         assert len(out_a) == 4
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2
 
@@ -196,10 +197,10 @@ class TestSamplingBasic(ScriptedTestCase):
             ignore_eos=True,
         )
         yield from run_until_finished(r2)
-        assert list(r1.output_tokens) == list(r2.output_tokens)
-        assert len(r1.output_tokens) == 4
-        assert r2.cached_tokens > 0, (
-            f"r2 must hit r1's radix prefix; got cached_tokens=" f"{r2.cached_tokens}"
+        assert list(r1.req.output_ids) == list(r2.req.output_ids)
+        assert len(r1.req.output_ids) == 4
+        assert r2.req.cached_tokens > 0, (
+            f"r2 must hit r1's radix prefix; got cached_tokens=" f"{r2.req.cached_tokens}"
         )
 
     def test_return_logprob_top_logprobs_chunked(self):
@@ -243,13 +244,13 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) < 64, (
+        assert len(r.req.output_ids) < 64, (
             f"a 64-token decode budget over common stop chars must stop "
-            f"early; got {len(r.output_tokens)} tokens"
+            f"early; got {len(r.req.output_ids)} tokens"
         )
-        assert r.finish_reason == "stop", (
+        assert r.req.finished_reason == "stop", (
             f"finish_reason must reflect a stop-string match; got "
-            f"{r.finish_reason!r}"
+            f"{r.req.finished_reason!r}"
         )
 
     def test_stop_token_ids_chunked(self):
@@ -265,17 +266,17 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert r.finish_reason in ("stop", "length"), (
+        assert r.req.finished_reason in ("stop", "length"), (
             f"finish_reason must be set after chunked decode; got "
-            f"{r.finish_reason!r}"
+            f"{r.req.finished_reason!r}"
         )
-        if r.finish_reason == "stop":
-            assert r.output_tokens[-1] in (2, 3), (
-                f"finish_reason=stop but last token {r.output_tokens[-1]} "
+        if r.req.finished_reason == "stop":
+            assert r.req.output_ids[-1] in (2, 3), (
+                f"finish_reason=stop but last token {r.req.output_ids[-1]} "
                 f"is not in stop_token_ids"
             )
         else:
-            assert len(r.output_tokens) == 64
+            assert len(r.req.output_ids) == 64
 
     def test_min_new_tokens_chunked(self):
         self.server.execute_script(self._script_min_new_tokens_chunked)
@@ -288,11 +289,11 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) >= 4, (
+        assert len(r.req.output_ids) >= 4, (
             f"min_new_tokens=4 must produce at least 4 tokens; got "
-            f"{len(r.output_tokens)}"
+            f"{len(r.req.output_ids)}"
         )
-        assert len(r.output_tokens) <= 16
+        assert len(r.req.output_ids) <= 16
 
     def test_repetition_penalty_chunked(self):
         self.server.execute_script(self._script_repetition_penalty_chunked)
@@ -308,7 +309,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_explicit_rid_chunked(self):
         self.server.execute_script(self._script_explicit_rid_chunked)
@@ -325,7 +326,7 @@ class TestSamplingBasic(ScriptedTestCase):
         assert r.rid == "custom-rid-1"
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 2
+        assert len(r.req.output_ids) == 2
 
     def test_default_sampling_chunked(self):
         self.server.execute_script(self._script_default_sampling_chunked)
@@ -340,7 +341,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_greedy_chunked(self):
         self.server.execute_script(self._script_greedy_chunked)
@@ -363,10 +364,10 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2
-        assert len(r1.output_tokens) == 4 and len(r2.output_tokens) == 4
-        assert list(r1.output_tokens) == list(r2.output_tokens), (
+        assert len(r1.req.output_ids) == 4 and len(r2.req.output_ids) == 4
+        assert list(r1.req.output_ids) == list(r2.req.output_ids), (
             f"greedy chunked must be deterministic; "
-            f"{r1.output_tokens} != {r2.output_tokens}"
+            f"{r1.req.output_ids} != {r2.req.output_ids}"
         )
 
     def test_high_temperature_short(self):
@@ -386,7 +387,7 @@ class TestSamplingBasic(ScriptedTestCase):
             f"short prompt must not trigger chunked path; got "
             f"chunks_done={r.chunks_done}"
         )
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_low_temperature_short(self):
         self.server.execute_script(self._script_low_temperature_short)
@@ -402,7 +403,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 0
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_default_top_p(self):
         self.server.execute_script(self._script_default_top_p)
@@ -418,7 +419,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 0
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_default_top_k(self):
         self.server.execute_script(self._script_default_top_k)
@@ -434,7 +435,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 0
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_combined_sampling_chunked(self):
         self.server.execute_script(self._script_combined_sampling_chunked)
@@ -452,7 +453,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_default_sampling_short(self):
         self.server.execute_script(self._script_default_sampling_short)
@@ -463,7 +464,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 0
-        assert len(r.output_tokens) == 2
+        assert len(r.req.output_ids) == 2
 
     def test_sampling_diversity_two_reqs(self):
         self.server.execute_script(self._script_sampling_diversity_two_reqs)
@@ -486,7 +487,7 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2
-        assert len(r1.output_tokens) == 4 and len(r2.output_tokens) == 4
+        assert len(r1.req.output_ids) == 4 and len(r2.req.output_ids) == 4
 
     def test_chunked_logprob_input_accumulates_across_chunks(self):
         self.server.execute_script(
@@ -578,9 +579,9 @@ class TestSamplingBasic(ScriptedTestCase):
         assert (
             r_eos.chunks_done >= 2
         ), f"scenario 1 should chunk; got chunks_done={r_eos.chunks_done}"
-        assert r_eos.finish_reason == "stop", (
+        assert r_eos.req.finished_reason == "stop", (
             f"ignore_eos=False + max_new_tokens=999 chunked must finish via "
-            f"EOS (stop); got {r_eos.finish_reason!r}"
+            f"EOS (stop); got {r_eos.req.finished_reason!r}"
         )
 
         r_length = t.start_req(
@@ -593,9 +594,9 @@ class TestSamplingBasic(ScriptedTestCase):
         assert (
             r_length.chunks_done >= 2
         ), f"scenario 2 should chunk; got chunks_done={r_length.chunks_done}"
-        assert r_length.finish_reason == "length", (
+        assert r_length.req.finished_reason == "length", (
             f"ignore_eos=True + max_new_tokens=4 chunked must finish via "
-            f"length cap; got {r_length.finish_reason!r}"
+            f"length cap; got {r_length.req.finished_reason!r}"
         )
 
     def test_seed_chunked_bit_identical_runs(self):
@@ -611,7 +612,7 @@ class TestSamplingBasic(ScriptedTestCase):
             seed=seed,
         )
         yield from run_until_finished(r1)
-        out1 = list(r1.output_tokens)
+        out1 = list(r1.req.output_ids)
 
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
@@ -620,7 +621,7 @@ class TestSamplingBasic(ScriptedTestCase):
             seed=seed,
         )
         yield from run_until_finished(r2)
-        out2 = list(r2.output_tokens)
+        out2 = list(r2.req.output_ids)
 
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2, (
             f"both runs should be chunked, got chunks_done="

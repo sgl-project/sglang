@@ -63,10 +63,10 @@ class TestSWABasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(400):
             if r.is_chunking:
-                assert r.prefix_indices_len <= r.kv_committed_len, (
+                assert len(r.req.prefix_indices) <= r.req.kv_committed_len, (
                     f"prefix_indices must be bounded by kv_committed_len, "
-                    f"got prefix_indices_len={r.prefix_indices_len}, "
-                    f"kv_committed_len={r.kv_committed_len}"
+                    f"got prefix_indices_len={len(r.req.prefix_indices)}, "
+                    f"kv_committed_len={r.req.kv_committed_len}"
                 )
             if r.finished:
                 break
@@ -93,7 +93,7 @@ class TestSWAHalfWindowChunk(ScriptedTestCase):
         assert (
             r.chunks_done >= 4
         ), f"expected >=4 chunks for 2*window / (window/2), got {r.chunks_done}"
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
 
 class TestSWAChunkSizeExceedsWindow(ScriptedTestCase):
@@ -112,7 +112,7 @@ class TestSWAChunkSizeExceedsWindow(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        assert len(r.output_tokens) == 2
+        assert len(r.req.output_ids) == 2
 
 
 class TestSWAOverlap(ScriptedTestCase):
@@ -163,8 +163,8 @@ class TestSWARadix(ScriptedTestCase):
         yield from run_until_finished(r2, max_steps=800)
         assert r2.finished
         assert (
-            r2.cached_tokens > 0
-        ), f"r2 must hit the radix prefix, got cached_tokens={r2.cached_tokens}"
+            r2.req.cached_tokens > 0
+        ), f"r2 must hit the radix prefix, got cached_tokens={r2.req.cached_tokens}"
 
 
 if __name__ == "__main__":

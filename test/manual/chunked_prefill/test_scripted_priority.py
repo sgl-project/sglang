@@ -175,7 +175,7 @@ class TestPriorityBasic(ScriptedTestCase):
         t.force_retract(r)
         yield
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req.req_pool_idx is None
         assert r.status in ("waiting", "finished")
 
     def test_two_retracts_same_yield(self):

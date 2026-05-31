@@ -71,8 +71,8 @@ class TestLoRAOverlapH2dDuringChunk(ScriptedTestCase):
         yield from run_until_all_finished(handles=[r_a, r_b], max_steps=1200)
         assert r_a.finished and r_b.finished
         assert r_a.chunks_done >= 2 and r_b.chunks_done >= 2
-        assert r_a.lora_path == _LORA_ADAPTER
-        assert r_b.lora_path == _LORA_ADAPTER_B
+        assert r_a.req.lora_id == _LORA_ADAPTER
+        assert r_b.req.lora_id == _LORA_ADAPTER_B
 
 
 class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
@@ -116,7 +116,7 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
         )
         yield from run_until_finished(r_a, max_steps=800)
         assert r_a.finished
-        assert r_a.lora_path == _LORA_ADAPTER
+        assert r_a.req.lora_id == _LORA_ADAPTER
 
     def test_lora_overlap_back_to_back_adapters_chunked(self):
         self.server.execute_script(
@@ -138,7 +138,7 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
         assert all(r.finished for r in reqs)
         assert all(r.chunks_done >= 2 for r in reqs)
         for r, adapter in zip(reqs, adapters):
-            assert r.lora_path == adapter
+            assert r.req.lora_id == adapter
 
 
 if __name__ == "__main__":

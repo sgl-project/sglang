@@ -99,7 +99,7 @@ class TestInvariantsBasic(ScriptedTestCase):
     def _script_is_idle_excludes_chunked_in_flight(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
-            if t.chunked_in_flight_count() > 0:
+            if (1 if t._scheduler.chunked_req is not None else 0) > 0:
                 assert not t.is_idle, "is_idle must be False when chunked is in flight"
             if r.finished:
                 return
@@ -148,7 +148,7 @@ class TestInvariantsBasic(ScriptedTestCase):
     def _script_inflight_middle_chunks_non_negative(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
-            assert r.inflight_middle_chunks >= 0
+            assert r.req.inflight_middle_chunks >= 0
             if r.finished:
                 return
             yield
@@ -177,7 +177,7 @@ class TestInvariantsBasic(ScriptedTestCase):
             for _ in range(3)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 3):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if all(r.finished for r in reqs):
                 return
             yield
@@ -325,7 +325,7 @@ class TestInvariantsBasic(ScriptedTestCase):
             for _ in range(30)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 20):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if all(r.finished for r in reqs):
                 break
             yield
@@ -359,7 +359,11 @@ class TestInvariantsBasic(ScriptedTestCase):
         shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(50)]
         all_reqs = [long_decode] + shorts
         for _ in range(DEFAULT_MAX_STEPS * 20):
-            assert t.get_chunked_req_rid() is None
+            assert (
+                t._scheduler.chunked_req.rid
+                if t._scheduler.chunked_req is not None
+                else None
+            ) is None
             if all(r.finished for r in all_reqs):
                 return
             yield
@@ -377,7 +381,7 @@ class TestInvariantsBasic(ScriptedTestCase):
             for _ in range(50)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 60):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if all(r.finished for r in reqs):
                 return
             yield
@@ -504,9 +508,9 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert (
             r.chunks_done >= 2
         ), f"VERY_LONG_PROMPT_LEN should chunk; got chunks_done={r.chunks_done}"
-        assert len(r.output_tokens) == n, (
+        assert len(r.req.output_ids) == n, (
             f"ignore_eos=True + max_new_tokens={n} must produce exactly "
-            f"{n} output tokens; got len(output_tokens)={len(r.output_tokens)}"
+            f"{n} output tokens; got len(output_tokens)={len(r.req.output_ids)}"
         )
 
     def test_num_input_tokens_equals_prompt_len_for_chunked(self):
@@ -520,9 +524,9 @@ class TestInvariantsBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.num_input_tokens == prompt_len, (
+        assert len(r.req.origin_input_ids) == prompt_len, (
             f"num_input_tokens must equal prompt_len after chunked finish; "
-            f"expected {prompt_len}, got {r.num_input_tokens}"
+            f"expected {prompt_len}, got {len(r.req.origin_input_ids)}"
         )
 
     def test_chunked_in_flight_count_exactly_zero_after_finish(self):
@@ -534,16 +538,16 @@ class TestInvariantsBasic(ScriptedTestCase):
     def _script_chunked_in_flight_count_exactly_zero_after_finish(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        assert t.chunked_in_flight_count() == 1, (
+        assert (1 if t._scheduler.chunked_req is not None else 0) == 1, (
             f"chunked_in_flight_count should be 1 mid-chunk; got "
-            f"{t.chunked_in_flight_count()}"
+            f"{(1 if t._scheduler.chunked_req is not None else 0)}"
         )
         yield from run_until_finished(r)
         for _ in range(3):
             yield
-            assert t.chunked_in_flight_count() == 0, (
+            assert (1 if t._scheduler.chunked_req is not None else 0) == 0, (
                 f"chunked_in_flight_count must be 0 after finish; got "
-                f"{t.chunked_in_flight_count()}"
+                f"{(1 if t._scheduler.chunked_req is not None else 0)}"
             )
 
     def test_pending_middle_outputs_zero_at_idle_yields(self):
@@ -640,9 +644,13 @@ class TestInvariantsBasic(ScriptedTestCase):
     def _script_decode_side_chunked_req_always_none(t: ScriptedContext):
         reqs = [t.start_req(prompt_len=8, max_new_tokens=16) for _ in range(4)]
         for _ in range(50):
-            assert t.get_chunked_req_rid() is None, (
+            assert (
+                t._scheduler.chunked_req.rid
+                if t._scheduler.chunked_req is not None
+                else None
+            ) is None, (
                 f"pure decode workload must keep chunked_req None; got "
-                f"{t.get_chunked_req_rid()!r}"
+                f"{(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
             )
             if all(r.finished for r in reqs):
                 return

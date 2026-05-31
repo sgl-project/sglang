@@ -70,7 +70,7 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_finished(r2)
         assert r2.finished
         assert r2.chunks_done >= 2
-        assert r2.cached_tokens == 0
+        assert r2.req.cached_tokens == 0
         assert r2.kv_pages == 0
         assert r2.lock_refs == 0
 
@@ -88,9 +88,9 @@ class TestRadixBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r2)
         assert r2.finished
-        assert r2.cached_tokens > 0, (
+        assert r2.req.cached_tokens > 0, (
             f"r2 must hit r1's prefix to exercise the partial-hit chunked-"
-            f"resume branch; got cached_tokens={r2.cached_tokens}"
+            f"resume branch; got cached_tokens={r2.req.cached_tokens}"
         )
         assert r2.chunks_done >= 1, (
             f"residual tail beyond cached prefix should still chunk; got "
@@ -174,7 +174,7 @@ class TestRadixBasic(ScriptedTestCase):
             f"r2 should hit r1's committed prefix; r2.chunks_done="
             f"{r2.chunks_done} not < r1.chunks_done={r1.chunks_done}"
         )
-        assert r2.cached_tokens > 0
+        assert r2.req.cached_tokens > 0
 
     def test_radix_evict_during_inflight_chunk(self):
         self.server.execute_script(self._script_radix_evict_during_inflight_chunk)
@@ -379,7 +379,7 @@ class TestRadixFcfs(ScriptedTestCase):
         )
         yield from run_until_finished(r2)
         assert r2.finished
-        assert r2.cached_tokens > 0
+        assert r2.req.cached_tokens > 0
         assert r2.chunks_done >= 1
 
 
@@ -427,7 +427,7 @@ class TestRadixLpm(ScriptedTestCase):
             assert r.finished
             assert r.kv_pages == 0
             assert r.lock_refs == 0
-            assert r.cached_tokens > 0
+            assert r.req.cached_tokens > 0
 
 
 class TestRadixDfsWeight(ScriptedTestCase):
@@ -449,7 +449,7 @@ class TestRadixDfsWeight(ScriptedTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r2)
         assert r2.finished
-        assert r2.cached_tokens > 0
+        assert r2.req.cached_tokens > 0
         assert r2.kv_pages == 0
         assert r2.lock_refs == 0
 
@@ -474,7 +474,7 @@ class TestRadixPriority(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.cached_tokens > 0
+        assert r.req.cached_tokens > 0
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 

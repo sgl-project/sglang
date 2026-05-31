@@ -37,10 +37,10 @@ class TestLoRASingleAdapter(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert r.lora_path == _LORA_ADAPTER
+        assert r.req.lora_id == _LORA_ADAPTER
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_lora_logprob_chunked_pass_idx(self):
         self.server.execute_script(self._script_lora_logprob_chunked_pass_idx)
@@ -131,8 +131,8 @@ class TestLoRAAdapterSwitch(ScriptedTestCase):
         yield from run_until_all_finished(handles=[r_a, r_b])
         assert r_a.finished and r_b.finished
         assert r_a.chunks_done >= 2 and r_b.chunks_done >= 2
-        assert r_a.lora_path == _LORA_ADAPTER
-        assert r_b.lora_path == _LORA_ADAPTER_B
+        assert r_a.req.lora_id == _LORA_ADAPTER
+        assert r_b.req.lora_id == _LORA_ADAPTER_B
 
 
 class TestLoRAAllDistinctAdapters(ScriptedTestCase):
@@ -162,9 +162,9 @@ class TestLoRAAllDistinctAdapters(ScriptedTestCase):
         yield from run_until_all_finished(handles=reqs, max_steps=2000)
         assert all(r.finished for r in reqs)
         for r, adapter in zip(reqs, adapters):
-            assert r.lora_path == adapter, (
+            assert r.req.lora_id == adapter, (
                 f"adapter drift under rotation; expected {adapter}, got "
-                f"{r.lora_path}"
+                f"{r.req.lora_id}"
             )
             assert r.kv_pages == 0
             assert r.lock_refs == 0
@@ -200,7 +200,7 @@ class TestLoRAAdapterEviction(ScriptedTestCase):
         )
         yield from run_until_all_finished(handles=[r_a, r_b], max_steps=800)
         assert r_a.finished and r_b.finished
-        assert r_a.lora_path == _LORA_ADAPTER
+        assert r_a.req.lora_id == _LORA_ADAPTER
 
     def test_lora_chunked_abort_during_eviction(self):
         self.server.execute_script(self._script_lora_chunked_abort_during_eviction)
@@ -229,7 +229,7 @@ class TestLoRAAdapterEviction(ScriptedTestCase):
         assert r_a.lock_refs == 0
         yield from run_until_finished(r_b)
         assert r_b.finished
-        assert r_b.lora_path == _LORA_ADAPTER_B
+        assert r_b.req.lora_id == _LORA_ADAPTER_B
         assert r_b.kv_pages == 0
         assert r_b.lock_refs == 0
 

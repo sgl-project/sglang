@@ -40,8 +40,8 @@ class TestAbortBasic(ScriptedTestCase):
             r.kv_pages == 0
         ), f"abort must release KV; r.kv_pages={r.kv_pages} after abort"
         assert (
-            r.row_idx is None
-        ), f"abort must release row; r.row_idx={r.row_idx} after abort"
+            r.req is None or r.req.req_pool_idx is None
+        ), f"abort must release row; r.req={r.req} after abort"
         assert (
             r.lock_refs == 0
         ), f"abort must release lock_refs; r.lock_refs={r.lock_refs}"
@@ -59,7 +59,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield
 
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req is None or r.req.req_pool_idx is None
 
     def test_abort_at_chunk_mid(self):
         self.server.execute_script(self._script_abort_at_chunk_mid)
@@ -117,7 +117,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req is None or r.req.req_pool_idx is None
         assert r.lock_refs == 0
 
     def test_abort_at_admission_step(self):
@@ -130,7 +130,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req is None or r.req.req_pool_idx is None
 
     def test_abort_then_start_same_step_new_rid(self):
         self.server.execute_script(self._script_abort_then_start_same_step_new_rid)
@@ -175,7 +175,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield
         for r in reqs:
             assert r.kv_pages == 0
-            assert r.row_idx is None
+            assert r.req is None or r.req.req_pool_idx is None
 
     def test_abort_unknown_rid_noop(self):
         self.server.execute_script(self._script_abort_unknown_rid_noop)
@@ -227,7 +227,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield
         yield from run_until_finished(r)
         assert r.finished, "chunked-resume must survive waiting-timeout sweep"
-        assert len(r.output_tokens) == 2
+        assert len(r.req.output_ids) == 2
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -381,7 +381,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until_finished(r2)
         assert r2.finished, "resubmit under same rid must complete independently"
         assert r1.kv_pages == 0, "aborted r1 must release KV before resubmit"
-        assert r1.row_idx is None
+        assert r1.req is None or r1.req.req_pool_idx is None
         assert r1.lock_refs == 0
 
     def test_abort_during_gap_pending_middle_outputs_positive(self):
@@ -407,7 +407,7 @@ class TestAbortBasic(ScriptedTestCase):
             f"Stage A revival; got {r.pending_middle_outputs}"
         )
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req is None or r.req.req_pool_idx is None
 
     def test_abort_when_chunked_only_then_idle(self):
         self.server.execute_script(self._script_abort_when_chunked_only_then_idle)
@@ -416,14 +416,14 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_abort_when_chunked_only_then_idle(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        assert t.chunked_in_flight_count() == 1
+        assert (1 if t._scheduler.chunked_req is not None else 0) == 1
 
         t.abort(r)
         yield
         yield
 
         assert r.kv_pages == 0
-        assert t.chunked_in_flight_count() == 0
+        assert (1 if t._scheduler.chunked_req is not None else 0) == 0
         assert t.is_idle, "engine must be idle after the only chunked req is aborted"
 
     def test_chunked_req_then_abort_then_new_short_in_one_yield(self):
@@ -435,16 +435,16 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_chunked_req_then_abort_then_new_short_in_one_yield(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
-        assert t.get_chunked_req_rid() == r1.rid, (
+        assert (t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None) == r1.rid, (
             f"r1 should hold the chunked slot before abort; got "
-            f"{t.get_chunked_req_rid()!r}"
+            f"{(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
         )
 
         t.abort(r1)
         r2 = t.start_req(prompt_len=16, max_new_tokens=2)
         yield
 
-        cur = t.get_chunked_req_rid()
+        cur = (t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)
         assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
         assert r1.kv_pages == 0
         yield from run_until_finished(r2)
@@ -466,8 +466,8 @@ class TestAbortBasic(ScriptedTestCase):
         assert r1.kv_pages == 0, (
             f"force_retract + abort same yield must release KV; got " f"{r1.kv_pages}"
         )
-        assert r1.row_idx is None, (
-            f"force_retract + abort same yield must release row; got " f"{r1.row_idx}"
+        assert r1.req is None or r1.req.req_pool_idx is None, (
+            f"force_retract + abort same yield must release row; got " f"{r1.req}"
         )
         assert r1.lock_refs == 0, (
             f"force_retract + abort same yield must release lock_refs; "
@@ -487,14 +487,14 @@ class TestAbortBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
-        assert t.chunked_in_flight_count() == 1
+        assert (1 if t._scheduler.chunked_req is not None else 0) == 1
 
         t.abort(r1)
         yield
 
         yield from run_until(r2, lambda h: h.is_chunking)
         assert r1.kv_pages == 0
-        assert r1.row_idx is None
+        assert r1.req is None or r1.req.req_pool_idx is None
         assert r1.lock_refs == 0
         yield from run_until_finished(r2)
         assert r2.finished, "baton handoff must let r2 complete"
@@ -584,7 +584,7 @@ class TestAbortPP(ScriptedTestCase):
         yield
 
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req is None or r.req.req_pool_idx is None
         assert r.lock_refs == 0
         assert (
             r.finish_event_count == 1

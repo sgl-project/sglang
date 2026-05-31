@@ -25,7 +25,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
         for _ in range(DEFAULT_MAX_STEPS):
-            in_flight = t.chunked_in_flight_count()
+            in_flight = (1 if t._scheduler.chunked_req is not None else 0)
             assert in_flight <= 1, (
                 f"single-in-flight invariant violated: "
                 f"chunked_in_flight_count()={in_flight}"
@@ -120,7 +120,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(10)]
         all_reqs = chunked + shorts
         for _ in range(DEFAULT_MAX_STEPS * 20):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if all(r.finished for r in all_reqs):
                 return
             yield
@@ -194,7 +194,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         for _ in range(5):
             yield
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req is None or r.req.req_pool_idx is None
 
     def test_rid_reuse_after_finish(self):
         self.server.execute_script(self._script_rid_reuse_after_finish)
@@ -220,7 +220,7 @@ class TestMultiReqBasic(ScriptedTestCase):
             for _ in range(3)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 10):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if all(r.finished for r in reqs):
                 break
             yield
@@ -236,7 +236,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-200")
         yield from run_until_finished(r1)
         for _ in range(200):
-            assert t.chunked_in_flight_count() == 0
+            assert (1 if t._scheduler.chunked_req is not None else 0) == 0
             yield
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-200")
         yield from run_until_finished(r2)
@@ -253,7 +253,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.status == "running")
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS * 5):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if r1.finished and r2.finished:
                 break
             yield
@@ -283,7 +283,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=16, max_new_tokens=4)
         r2 = t.start_req(prompt_len=16, max_new_tokens=4)
         for _ in range(DEFAULT_MAX_STEPS):
-            assert t.get_chunked_req_rid() is None
+            assert (t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None) is None
             if r1.finished and r2.finished:
                 break
             yield
@@ -297,7 +297,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         shorts = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(5)]
         for _ in range(DEFAULT_MAX_STEPS * 5):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if chunked.finished and all(s.finished for s in shorts):
                 break
             yield
@@ -315,10 +315,10 @@ class TestMultiReqBasic(ScriptedTestCase):
         for _ in range(4):
             reqs.append(t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2))
             yield
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             yield
         for _ in range(DEFAULT_MAX_STEPS * 10):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if all(r.finished for r in reqs):
                 break
             yield
@@ -335,7 +335,7 @@ class TestMultiReqBasic(ScriptedTestCase):
             for _ in range(8)
         ]
         for _ in range(DEFAULT_MAX_STEPS * 5):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if all(r.finished for r in reqs):
                 return
             yield
@@ -349,9 +349,9 @@ class TestMultiReqBasic(ScriptedTestCase):
         reqs = [t.start_req(prompt_len=4, max_new_tokens=8) for _ in range(10)]
         for _ in range(DEFAULT_MAX_STEPS * 3):
             assert (
-                t.get_chunked_req_rid() is None
+                (t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None) is None
             ), "pure decode workload must never populate chunked_req"
-            assert t.chunked_in_flight_count() == 0
+            assert (1 if t._scheduler.chunked_req is not None else 0) == 0
             if all(r.finished for r in reqs):
                 return
             yield
@@ -365,7 +365,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         lens = [8, 16, 32, 64, 128, 256, 512, 1024]
         reqs = [t.start_req(prompt_len=L, max_new_tokens=2) for L in lens]
         for _ in range(DEFAULT_MAX_STEPS * 10):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if all(r.finished for r in reqs):
                 break
             yield
@@ -404,7 +404,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         chunked2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         short = t.start_req(prompt_len=8, max_new_tokens=4)
         for _ in range(DEFAULT_MAX_STEPS * 10):
-            assert t.chunked_in_flight_count() <= 1
+            assert (1 if t._scheduler.chunked_req is not None else 0) <= 1
             if chunked1.finished and chunked2.finished and short.finished:
                 break
             yield
