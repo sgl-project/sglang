@@ -1571,9 +1571,7 @@ def select_experts(
             )
             steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
             step = max(num_experts // k, 1)
-            topk_ids = ((offsets + steps * step) % num_experts).to(
-                topk_ids.dtype
-            )
+            topk_ids = ((offsets + steps * step) % num_experts).to(topk_ids.dtype)
             topk_weights = torch.ones_like(topk_weights) / k
     elif simulate_round_robin_experts:
         # Benchmark-only: override gating with deterministic expert assignment
