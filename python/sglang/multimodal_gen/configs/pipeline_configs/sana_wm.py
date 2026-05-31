@@ -1,17 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# Pipeline configuration for SANA-WM TI2V (Text+Image-to-Video) world model.
-#
-# Key differences vs SanaPipelineConfig (T2I):
-#   - task_type = TI2V: requires first-frame image input
-#   - 5D latent (B, C, T, H, W) via LTX-2 VAE (8× temporal, 32× spatial, 128 ch)
-#   - Camera trajectory conditioning (optional): camera_to_world + intrinsics
-#   - flow_shift = 9.95 (linear_flow training schedule, from config.yaml)
-#   - inference_flow_shift = 9.8 (official inference schedule)
-#   - Two-stage optional: Stage-1 (SANA-WM) + Stage-2 (LTX-2 Refiner)
-#
-# The SANA-WM pre-denoising stage converts camera_to_world + intrinsics into
-# the latent-frame raymap and chunk Pluecker tensors consumed by the DiT.
+
 
 from collections.abc import Callable
 from dataclasses import dataclass, field

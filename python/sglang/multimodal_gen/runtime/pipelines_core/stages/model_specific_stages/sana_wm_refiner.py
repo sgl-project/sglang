@@ -1,21 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# SANA-WM stage-2 LTX-2 latent refiner.
-#
-# Runs a 3-step Euler loop on top of the SANA-WM stage-1 latent using the
-# official NVlabs LTX-2 video-only refiner path. The quality-critical default
-# uses Diffusers' native `LTX2VideoTransformer3DModel` and `LTX2TextConnectors`;
-# the older SGLang-native refiner port remains as a fallback for compatibility.
-#
-# All four modules are loaded by `SanaWMTwoStagePipeline` and handed to this
-# stage. The stage owns only the narrow video-only forward surface that
-# Diffusers does not expose publicly for SANA-WM.
-#
-# Sink/current split: the first stage-1 latent frame is preserved as the
-# clean "anchor" (sink) and only the remaining frames are denoised. The
-# refiner forward feeds the packed (sink + noisy current) token sequence with
-# `n_context_tokens` set so streaming SLA isolates the two halves the same
-# way NVlabs' `inference_sana_wm.py` does.
 
 from __future__ import annotations
 

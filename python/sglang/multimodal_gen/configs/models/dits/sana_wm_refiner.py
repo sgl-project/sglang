@@ -1,11 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# Architecture config for the SANA-WM stage-2 LTX-2 video-only refiner.
-#
-# The refiner reuses Diffusers-format LTX-2 transformer weights from
-# `<model_path>/refiner/transformer/`. Defaults below are conservative; the
-# framework's `update_model_arch(hf_config)` overrides them with the values
-# parsed from `refiner/transformer/config.json`.
 
 from dataclasses import dataclass, field
 

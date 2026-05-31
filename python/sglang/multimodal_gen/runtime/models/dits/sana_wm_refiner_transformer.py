@@ -1,30 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# SANA-WM LTX-2 video-only refiner transformer.
-#
-# The SANA-WM stage-2 refiner is, in NVlabs' inference reference, the LTX-2
-# transformer driven through a video-only forward path: the joint audio modules
-# present in the checkpoint are loaded but never invoked. This file implements
-# the same video-only forward against sglang's LTX-2 primitives so the framework
-# loader can drive it as a regular `transformer_2` component.
-#
-# Weight compatibility:
-#   * Refiner safetensors live under <model_path>/refiner/transformer/ and use
-#     Diffusers naming (`proj_in`, `time_embed.emb.timestep_embedder.linear_1`,
-#     `caption_projection.linear_1`, `transformer_blocks.<i>.norm1`,
-#     `transformer_blocks.<i>.attn1.to_{q,k,v,out}`, `ff.net.0.proj`,
-#     `scale_shift_table`, `norm_out`, `proj_out`).
-#   * The Diffusers checkpoint also stores joint-mode `audio_*` keys; the
-#     transformer loader runs `load_state_dict(strict=False)`
-#     (`transformer_loader.py:137`) and silently drops keys we do not register.
-#   * Diffusers' `ff.net.0.proj` / `ff.net.2` are remapped to sglang's
-#     `LTX2FeedForward.proj_in` / `proj_out` via `param_names_mapping`
-#     declared in `SanaWMRefinerArchConfig`.
-#
-# Forward signature matches NVlabs' `_forward_video_only` in
-# `inference_sana_wm.py`: per-token timestep enables sink/current streaming
-# sink-local attention (SLA), where context (sink) tokens attend only to
-# themselves and current (noisy) tokens attend to the full sequence.
 
 from __future__ import annotations
 

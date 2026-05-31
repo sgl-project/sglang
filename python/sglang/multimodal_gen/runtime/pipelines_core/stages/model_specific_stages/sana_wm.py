@@ -1,20 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# SANA-WM BeforeDenoisingStage.
-#
-# Consolidates all model-specific pre-processing for SANA-WM TI2V inference:
-#   1. Adjust num_frames to satisfy (F-1) % temporal_stride == 0
-#   2. Initialize random noise latents (5D: B, 128, T_latent, H_sp, W_sp)
-#   3. VAE-encode the first-frame conditioning image and splice into noisy latents
-#      (replaces latent[:, :, 0] with the encoded first-frame latent)
-#   4. Build the (B, T_latent, 20) latent-frame ``camera_conditions`` raymap
-#      consumed by the UCPE camera branch.
-#   5. Compute the 48-channel packed Plücker raymap consumed by the
-#      ``plucker_embedder`` (one chunk = vae_temporal_stride original frames).
-#   6. Prepare FlowMatch timesteps and sigmas (uses inference_flow_shift=9.8).
-#
-# Text encoding is handled by SanaWMTextEncodingStage so it can mirror the
-# official chi-prompt token window without changing the shared text stage.
 
 import math
 import os

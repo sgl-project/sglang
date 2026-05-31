@@ -1,11 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# Architecture config for SANA-WM (NVlabs/Sana ``SanaMSVideoCamCtrl_1600M_P1_D20``).
-#
-# Field names and defaults track the upstream training config
-# (``configs/sana_wm/sana_wm_1600m_720p.yaml`` in NVlabs/Sana) so the released
-# checkpoint ``Efficient-Large-Model/SANA-WM_bidirectional`` loads with no
-# manual key surgery.
 
 from dataclasses import dataclass, field
 
