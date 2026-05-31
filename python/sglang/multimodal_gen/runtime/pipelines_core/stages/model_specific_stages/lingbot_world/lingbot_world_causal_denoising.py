@@ -141,6 +141,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             attention_window_size=self._get_causal_attention_window_size(
                 kv_cache_size
             ),
+            allow_growth=self.local_attn_size == -1,
         )
 
     def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
@@ -310,7 +311,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             or crossattn_cache is None
             or len(causal_kv_cache) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
-            or causal_kv_cache[0]["k"].shape[1] != expected_cache_tokens
+            or causal_kv_cache[0]["k"].shape[1] < expected_cache_tokens
             or causal_kv_cache[0]["k"].shape[2] != expected_cache_heads
         )
 

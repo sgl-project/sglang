@@ -649,6 +649,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         use_int_indices: bool = False,
         sink_tokens: int = 0,
         attention_window_size: int | None = None,
+        allow_growth: bool = False,
     ) -> list[CausalSelfAttentionKVCache]:
         causal_kv_cache = []
         int_index = 0 if use_int_indices else None
@@ -688,6 +689,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     cache_size=kv_cache_size,
                     sink_tokens=sink_tokens,
                     attention_window_size=attention_window_size,
+                    allow_growth=allow_growth,
                 )
             )
         return causal_kv_cache
