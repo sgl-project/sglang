@@ -6,7 +6,7 @@ const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker";
 const PREVIEW_OUTPUT_FORMAT = "jpeg";
-const PREVIEW_OUTPUT_QUALITY = 85;
+const PREVIEW_OUTPUT_QUALITY = 90;
 const LIVE_QUEUE_SECONDS = 2;
 const LOW_LATENCY_FPS_FLOOR = 10;
 const LOW_LATENCY_QUEUE_SECONDS = 0.8;
