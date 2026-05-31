@@ -20,7 +20,6 @@ import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs as sglang_envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa
 
@@ -418,6 +417,9 @@ def can_use_custom_all_reduce_with_nvlink(
     supported_world_size: List[int],
     cls_name: str,
 ) -> Optional[bool]:  # None if fail; otherwise return whether NVLink is available
+    # lazy init to avoid circular import
+    from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
     assert (
         dist.get_backend(group) != dist.Backend.NCCL
     ), f"{cls_name} should be attached to a non-NCCL group."

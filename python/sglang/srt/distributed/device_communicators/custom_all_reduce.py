@@ -5,7 +5,6 @@
 import ctypes
 import logging
 from contextlib import contextmanager
-from functools import partial
 from typing import Any, List, Optional, Union
 
 import torch
@@ -14,11 +13,6 @@ from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-    can_use_custom_all_reduce_with_nvlink,
-    is_weak_contiguous,
-)
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -28,6 +22,13 @@ from sglang.srt.utils import (
     log_info_on_rank0,
 )
 
+from .base import AllReduceMode, BaseCommunicator
+from .cuda_wrapper import CudaRTLibrary
+from .custom_all_reduce_utils import (
+    can_use_custom_all_reduce_with_nvlink,
+    is_weak_contiguous,
+)
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_musa = is_musa()
@@ -35,7 +36,9 @@ _is_musa = is_musa()
 logger = logging.getLogger(__name__)
 
 
-class CustomAllreduce:
+class CustomAllreduce(BaseCommunicator):
+    name = "custom_all_reduce"
+
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 8192 * 1024
     if _is_hip:
@@ -63,17 +66,14 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
-        self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
-        self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
 
         if not ops.IS_CUSTOM_AR_AVAILABLE:
-            # disable because of missing custom allreduce library
-            # e.g. in a non-cuda environment
-            return
+            raise RuntimeError("custom all-reduce library is not available")
 
         rank = dist.get_rank(group=group)
         world_size = dist.get_world_size(group=group)
+        assert world_size > 1
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -89,13 +89,14 @@ class CustomAllreduce:
             cls_name="CustomAllreduce",
         )
         if full_nvlink is None:
-            return  # fail to get nvlink status
+            raise RuntimeError("failed to determine NVLink connectivity")
 
         self.group = group
         self.max_size = max_size
         self.rank = rank
         self.world_size = world_size
         self.full_nvlink = full_nvlink
+        super().__init__(world_size=world_size)
 
         if not _is_hip:
             # Buffers memory are owned by this Python class and passed to C++.
@@ -137,8 +138,6 @@ class CustomAllreduce:
             )
             self.register_buffer(self.buffer)
 
-        self.disabled = False
-        self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
     @staticmethod
@@ -190,6 +189,12 @@ class CustomAllreduce:
             self._IS_CAPTURING = False
             if not self.disabled:
                 self.register_graph_buffers()
+
+    def should_use_custom_op(self) -> bool:
+        return True
+
+    def graph_capture_context(self):
+        return self.capture()
 
     def _get_ipc_meta(self, inp: torch.Tensor):
         # _share_cuda_() doesn't accept meta buffer not allocated from
@@ -255,30 +260,30 @@ class CustomAllreduce:
             offsets = [d[1] for d in all_data]  # type: ignore
             ops.register_graph_buffers(self._ptr, handles, offsets)
 
-    def should_custom_ar(self, inp: torch.Tensor):
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         if self.disabled:
-            return False
-        inp_size = inp.numel() * inp.element_size()
+            return None
+        inp_size = input_.numel() * input_.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
-            return False
-        if not is_weak_contiguous(inp):
-            return False
+            return None
+        if not is_weak_contiguous(input_):
+            return None
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
-                return inp_size <= self.max_size
-            return False
+                return AllReduceMode.OUTPLACE if inp_size <= self.max_size else None
+            return None
 
         if _is_hip:
             if self.use_amd_deterministic_impl:
-                return True
+                return AllReduceMode.OUTPLACE
             if self.full_nvlink:
-                return inp_size <= self.max_size
-            return False
+                return AllReduceMode.OUTPLACE if inp_size <= self.max_size else None
+            return None
 
-        return False
+        return None
 
     def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):
         out = torch.empty_like(inp)
@@ -304,35 +309,40 @@ class CustomAllreduce:
                 ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         return out
 
-    def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
-        """The main allreduce API that provides support for cuda graph."""
-        # When custom allreduce is disabled, this will be None.
-        if self.disabled or not self.should_custom_ar(input):
-            return None
+    @BaseCommunicator.validate
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        *,
+        inplace: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """The main all-reduce API with CUDA-graph-aware behavior."""
+        self.assert_outplace("all_reduce", inplace)
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                return self._all_reduce_impl(input_, registered=not self.tms_cudagraph)
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
                 # but _IS_CAPTURING is still True. We need to do real all-reduce.
                 if is_in_piecewise_cuda_graph():
                     # Split op execution - do real all-reduce
-                    return self._all_reduce_impl(input, registered=False)
+                    return self._all_reduce_impl(input_, registered=False)
                 else:
                     # True warmup - mimic the allocation pattern since custom
                     # allreduce is out-of-place.
-                    return torch.zeros_like(input)
+                    return torch.zeros_like(input_)
         else:
-            return self._all_reduce_impl(input, registered=False)
+            return self._all_reduce_impl(input_, registered=False)
 
     def close(self):
-        if not self.disabled and self._ptr:
+        if not getattr(self, "_disabled", True) and getattr(self, "_ptr", 0):
             ops.dispose(self._ptr)
             if _is_cuda:
                 self.free_shared_buffer(self.meta_ptrs)
                 self.free_shared_buffer(self.buffer_ptrs)
             self._ptr = 0
+            self._disabled = True
 
     def __del__(self):
         self.close()
@@ -388,23 +398,16 @@ def dispatch_custom_allreduce(
 
     if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
-            from aiter.dist.device_communicators.custom_all_reduce import (
-                CustomAllreduce as AiterCustomAllreduce,
-            )
+            from .custom_all_reduce_aiter import AiterCustomAllReduce
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
-            tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-            return partial(
-                AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
-            )
+            return AiterCustomAllReduce
         except ImportError as e:
             logger.warning(
                 "[AR] Aiter custom all-reduce not available; "
                 "falling back to sglang CustomAllreduce. Details: %s",
                 e,
             )
-            return CustomAllreduce
 
     return CustomAllreduce
 
