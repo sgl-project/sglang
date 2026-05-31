@@ -37,9 +37,10 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
 
     @property
     def realtime_slicing_config(self) -> dict:
-        # Tuned for Qwen3-ASR: 2s left overlap covers the K=5 token rollback
-        # window; 16s min audio keeps slicing off on short inputs, where manual
-        # fixtures showed sliced output diverging from cumulative.
+        # Empirically tuned for Qwen3-ASR: in our fixtures a 2s left overlap
+        # gave enough acoustic context for the K=5 (unfixed_token_num) rollback
+        # window; 16s min audio keeps slicing off on short inputs, where sliced
+        # output diverged from cumulative.
         return {"enabled": True, "left_overlap_ms": 2000, "min_audio_sec": 16.0}
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
