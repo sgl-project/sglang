@@ -83,6 +83,26 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
+def copy_weight_into_buffer(
+    buffer_view: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    """
+    Copy a LoRA weight tensor into a destination buffer.
+
+    When a pinned CPU source has a dtype mismatch with a device destination,
+    cast on the destination device instead of doing the conversion on CPU.
+    """
+    if weight.dtype == buffer_view.dtype:
+        buffer_view.copy_(weight, non_blocking=True)
+        return
+
+    if weight.device.type == "cpu" and buffer_view.device.type != "cpu":
+        weight = weight.to(device=buffer_view.device, non_blocking=True)
+
+    buffer_view.copy_(weight.to(dtype=buffer_view.dtype), non_blocking=True)
+
+
 def get_hidden_dim(
     module_name: str,
     config: AutoConfig,
