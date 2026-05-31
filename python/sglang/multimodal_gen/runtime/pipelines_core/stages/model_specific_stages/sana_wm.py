@@ -713,6 +713,49 @@ class SanaWMDenoisingStage(DenoisingStage):
                 "run dummy forwards and contribute zeros."
             )
 
+        if cfg_parallel:
+            if cfg_rank == 1:
+                branch_embeds = neg_embeds
+                branch_mask = neg_mask
+            else:
+                branch_embeds = pos_embeds
+                branch_mask = pos_mask
+            model_kwargs = {
+                "encoder_hidden_states": branch_embeds,
+                "encoder_attention_mask": branch_mask,
+                "camera_conditions": camera_conditions,
+                "chunk_plucker": chunk_plucker,
+            }
+        else:
+            model_kwargs = {
+                "encoder_hidden_states": (
+                    torch.cat([neg_embeds, pos_embeds], dim=0)
+                    if do_cfg
+                    else pos_embeds
+                ),
+                "encoder_attention_mask": (
+                    _cat_optional_tensors(neg_mask, pos_mask) if do_cfg else pos_mask
+                ),
+                "camera_conditions": (
+                    torch.cat([camera_conditions, camera_conditions], dim=0)
+                    if do_cfg and camera_conditions is not None
+                    else camera_conditions
+                ),
+                "chunk_plucker": (
+                    torch.cat([chunk_plucker, chunk_plucker], dim=0)
+                    if do_cfg and chunk_plucker is not None
+                    else chunk_plucker
+                ),
+            }
+        model_kwargs.update(chunk_kwargs)
+
+        condition_mask_input = (
+            condition_mask
+            if cfg_parallel or not do_cfg
+            else torch.cat([condition_mask, condition_mask], dim=0)
+        )
+        timestep_condition_limit = (1.0 - condition_mask_input.float()) * 1000.0
+
         self.log_info(
             "SANA-WM flow_euler_ltx denoising: latent=%s, steps=%d, cfg=%s, "
             "cfg_parallel=%s, guidance_scale=%.4f, first_frame_locked=yes",
@@ -734,61 +777,14 @@ class SanaWMDenoisingStage(DenoisingStage):
             for step_idx, t in enumerate(self.progress_bar(timesteps)):
                 if cfg_parallel:
                     latent_model_input = latents
-                    condition_mask_input = condition_mask
                 else:
                     latent_model_input = (
                         torch.cat([latents, latents], dim=0) if do_cfg else latents
                     )
-                    condition_mask_input = (
-                        torch.cat([condition_mask, condition_mask], dim=0)
-                        if do_cfg
-                        else condition_mask
-                    )
 
                 timestep = t.expand(condition_mask_input.shape).float()
-                timestep = torch.minimum(
-                    timestep,
-                    (1.0 - condition_mask_input.float()) * 1000.0,
-                )
+                timestep = torch.minimum(timestep, timestep_condition_limit)
                 model_timestep = timestep[:, :1, :, 0, 0]
-
-                if cfg_parallel:
-                    if cfg_rank == 1:
-                        branch_embeds = neg_embeds
-                        branch_mask = neg_mask
-                    else:
-                        branch_embeds = pos_embeds
-                        branch_mask = pos_mask
-                    model_kwargs = {
-                        "encoder_hidden_states": branch_embeds,
-                        "encoder_attention_mask": branch_mask,
-                        "camera_conditions": camera_conditions,
-                        "chunk_plucker": chunk_plucker,
-                    }
-                else:
-                    model_kwargs = {
-                        "encoder_hidden_states": (
-                            torch.cat([neg_embeds, pos_embeds], dim=0)
-                            if do_cfg
-                            else pos_embeds
-                        ),
-                        "encoder_attention_mask": (
-                            _cat_optional_tensors(neg_mask, pos_mask)
-                            if do_cfg
-                            else pos_mask
-                        ),
-                        "camera_conditions": (
-                            torch.cat([camera_conditions, camera_conditions], dim=0)
-                            if do_cfg and camera_conditions is not None
-                            else camera_conditions
-                        ),
-                        "chunk_plucker": (
-                            torch.cat([chunk_plucker, chunk_plucker], dim=0)
-                            if do_cfg and chunk_plucker is not None
-                            else chunk_plucker
-                        ),
-                    }
-                model_kwargs.update(chunk_kwargs)
 
                 with set_forward_context(
                     current_timestep=step_idx,

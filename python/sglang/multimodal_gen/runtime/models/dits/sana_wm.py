@@ -20,6 +20,19 @@ logger = init_logger(__name__)
 
 _SANA_WM_TRITON_GDN_DISABLED_REASON: Optional[str] = None
 _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = False
+_SANA_WM_TRITON_CAM_GDN_DISABLED_REASON: Optional[str] = None
+_SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED = False
+
+
+def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.device),
+        tensor.dtype,
+        tensor.data_ptr(),
+        int(getattr(tensor, "_version", 0)),
+    )
 
 
 def _log_sana_wm_triton_gdn_fallback(reason: str) -> None:
@@ -31,6 +44,17 @@ def _log_sana_wm_triton_gdn_fallback(reason: str) -> None:
             reason,
         )
         _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = True
+
+
+def _log_sana_wm_triton_cam_gdn_fallback(reason: str) -> None:
+    global _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED
+    if not _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED:
+        logger.warning(
+            "SANA-WM Triton camera GDN fast path is unavailable; falling back "
+            "to torch camera scan. reason=%s",
+            reason,
+        )
+        _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED = True
 
 
 # ---------------------------------------------------------------------------
@@ -1589,6 +1613,15 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 num_heads=heads,
                 head_size=head_dim,
             )
+        self._triton_rope_tables_cache: Optional[
+            Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None
+        self._triton_norm_weights_cache: Optional[
+            Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None
+        self._cam_qkv_params_cache: Optional[
+            Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None
 
     # ------------------------------------------------------------------ #
 
@@ -1610,6 +1643,42 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             y, _ = conv(y)
         # back to (B, T*S, C)
         return y.reshape(B, S, T, C).permute(0, 2, 1, 3).reshape(B, N, C)
+
+    # ------------------------------------------------------------------ #
+
+    def _get_cam_qkv_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        weights = (
+            self.q_proj_cam.weight,
+            self.k_proj_cam.weight,
+            self.v_proj_cam.weight,
+        )
+        biases = (
+            self.q_proj_cam.bias,
+            self.k_proj_cam.bias,
+            self.v_proj_cam.bias,
+        )
+        if torch.is_grad_enabled():
+            return torch.cat(weights, dim=0), torch.cat(biases, dim=0)
+
+        key = (
+            "cam_qkv_params",
+            tuple(_tensor_cache_key(weight) for weight in weights),
+            tuple(_tensor_cache_key(bias) for bias in biases),
+        )
+        cached = self._cam_qkv_params_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        params = (
+            torch.cat(weights, dim=0).contiguous(),
+            torch.cat(biases, dim=0).contiguous(),
+        )
+        self._cam_qkv_params_cache = (key, params)
+        return params
+
+    def _cam_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv_weight, qkv_bias = self._get_cam_qkv_params()
+        return F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
 
     # ------------------------------------------------------------------ #
 
@@ -1652,6 +1721,49 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             return "requires learned q/k RMSNorm weights"
         return None
 
+    def _get_triton_norm_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_weight = self.q_norm.weight
+        k_weight = self.k_norm.weight
+        key = (
+            "triton_norm_weights",
+            _tensor_cache_key(q_weight),
+            _tensor_cache_key(k_weight),
+        )
+        cached = self._triton_norm_weights_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        weights = (
+            q_weight.float().contiguous(),
+            k_weight.float().contiguous(),
+        )
+        self._triton_norm_weights_cache = (key, weights)
+        return weights
+
+    def _get_triton_rope_tables(
+        self,
+        prepare_rope_tables: Callable,
+        rotary_emb: Optional[torch.Tensor],
+        *,
+        N: int,
+        head_dim: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = (
+            "triton_rope_tables",
+            N,
+            head_dim,
+            str(device),
+            None if rotary_emb is None else _tensor_cache_key(rotary_emb),
+        )
+        cached = self._triton_rope_tables_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        tables = prepare_rope_tables(rotary_emb, N, head_dim, device)
+        self._triton_rope_tables_cache = (key, tables)
+        return tables
+
     def _maybe_main_branch_triton_gdn(
         self,
         qkv: torch.Tensor,
@@ -1678,12 +1790,15 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             B, N, _, heads, head_dim = qkv.shape
             T, H_sp, W_sp = HW
             S = H_sp * W_sp
-            q_norm_weight = self.q_norm.weight.float().contiguous()
-            k_norm_weight = self.k_norm.weight.float().contiguous()
+            q_norm_weight, k_norm_weight = self._get_triton_norm_weights()
             norm_eps = float(getattr(self.q_norm, "eps", 1e-5))
             q_inv_rms, k_inv_rms = fused_qk_inv_rms(qkv, eps=norm_eps)
-            rope_cos, rope_sin = prepare_rope_tables(
-                rotary_emb, N, head_dim, qkv.device
+            rope_cos, rope_sin = self._get_triton_rope_tables(
+                prepare_rope_tables,
+                rotary_emb,
+                N=N,
+                head_dim=head_dim,
+                device=qkv.device,
             )
             out = fused_bigdn_func(
                 qkv,
@@ -1706,6 +1821,119 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 raise
             _SANA_WM_TRITON_GDN_DISABLED_REASON = str(exc)
             _log_sana_wm_triton_gdn_fallback(str(exc))
+            return None
+
+    # ------------------------------------------------------------------ #
+
+    def _triton_cam_gdn_unavailable_reason(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        HW: Tuple[int, int, int],
+    ) -> Optional[str]:
+        if self.gdn_backend == "torch":
+            return "gdn_backend=torch"
+        if _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
+            return _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        if self.training or torch.is_grad_enabled():
+            return "requires eval/inference mode"
+        if not q.is_cuda:
+            return "requires CUDA tensor"
+        if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
+            return f"requires fp32 q/k/v, got {q.dtype}/{k.dtype}/{v.dtype}"
+        if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+            return "q/k/v must be contiguous"
+        if beta.ndim not in (3, 4):
+            return f"requires beta rank 3 or 4, got {tuple(beta.shape)}"
+
+        B, heads, head_dim, N = q.shape
+        T, H_sp, W_sp = HW
+        S = H_sp * W_sp
+        if k.shape != q.shape or v.shape != q.shape:
+            return f"q/k/v shape mismatch: {q.shape}/{k.shape}/{v.shape}"
+        if N != T * S:
+            return f"requires N=T*S, got N={N}, T*S={T * S}"
+        if beta.ndim == 3 and beta.shape != (B, heads, T):
+            return f"requires beta shape {(B, heads, T)}, got {tuple(beta.shape)}"
+        if beta.ndim == 4 and beta.shape != (B, heads, T, S):
+            return (
+                f"requires beta shape {(B, heads, T, S)}, "
+                f"got {tuple(beta.shape)}"
+            )
+        if decay.shape != (B, heads, T):
+            return f"requires decay shape {(B, heads, T)}, got {tuple(decay.shape)}"
+        if head_dim > 128:
+            return f"requires head_dim <= 128, got {head_dim}"
+        return None
+
+    def _maybe_cam_branch_triton_scan(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        HW: Tuple[int, int, int],
+    ) -> Optional[torch.Tensor]:
+        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+
+        precheck_reason = None
+        if self.gdn_backend == "torch":
+            precheck_reason = "gdn_backend=torch"
+        elif _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
+            precheck_reason = _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        elif self.training or torch.is_grad_enabled():
+            precheck_reason = "requires eval/inference mode"
+        elif not q.is_cuda:
+            precheck_reason = "requires CUDA tensor"
+
+        if precheck_reason is not None:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(
+                    "SANA-WM Triton camera GDN backend unavailable: "
+                    f"{precheck_reason}"
+                )
+            return None
+
+        q = q.float().contiguous()
+        k = k.float().contiguous()
+        v = v.float().contiguous()
+        reason = self._triton_cam_gdn_unavailable_reason(q, k, v, beta, decay, HW)
+        if reason is not None:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(
+                    f"SANA-WM Triton camera GDN backend unavailable: {reason}"
+                )
+            return None
+
+        try:
+            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn_chunkwise import (
+                cam_scan_bidi_chunkwise,
+            )
+
+            B, heads, _, _ = q.shape
+            T, H_sp, W_sp = HW
+            S = H_sp * W_sp
+            if beta.ndim == 3:
+                beta_in = beta.unsqueeze(-1).expand(B, heads, T, S).contiguous()
+            else:
+                beta_in = beta.contiguous()
+            out = cam_scan_bidi_chunkwise(
+                q,
+                k,
+                v,
+                beta_in.float(),
+                decay.float().contiguous(),
+            )
+            return out
+        except Exception as exc:
+            if self.gdn_backend == "triton":
+                raise
+            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
             return None
 
     # ------------------------------------------------------------------ #
@@ -1881,9 +2109,10 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         T, H_sp, W_sp = HW
         S = H_sp * W_sp
 
-        q = self.q_proj_cam(x).reshape(B, N, self.heads, self.dim)
-        k = self.k_proj_cam(x).reshape(B, N, self.heads, self.dim)
-        v = self.v_proj_cam(x).reshape(B, N, self.heads, self.dim)
+        q, k, v = self._cam_qkv(x)
+        q = q.reshape(B, N, self.heads, self.dim)
+        k = k.reshape(B, N, self.heads, self.dim)
+        v = v.reshape(B, N, self.heads, self.dim)
 
         # Short conv on K only (k_conv_only)
         if self.conv_k_cam is not None:
@@ -1934,18 +2163,23 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             beta = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
 
         dtype = q_dn.dtype
-        scan_chunk_size = (
-            self.chunk_gdn_chunk_size if self.cam_update_rule == "torch_chunk" else None
-        )
-        out = _single_path_delta_scan_bidirectional(
-            q_dn.float(),
-            k_dn.float(),
-            v_dn.float(),
-            beta.float(),
-            decay.float(),
-            HW=HW,
-            chunk_size=scan_chunk_size,
-        ).to(dtype)
+        out = self._maybe_cam_branch_triton_scan(q_dn, k_dn, v_dn, beta, decay, HW)
+        if out is None:
+            scan_chunk_size = (
+                self.chunk_gdn_chunk_size
+                if self.cam_update_rule == "torch_chunk"
+                else None
+            )
+            out = _single_path_delta_scan_bidirectional(
+                q_dn.float(),
+                k_dn.float(),
+                v_dn.float(),
+                beta.float(),
+                decay.float(),
+                HW=HW,
+                chunk_size=scan_chunk_size,
+            )
+        out = out.to(dtype)
         # apply inverse UCPE projection on output
         out_bhnd = out.permute(0, 1, 3, 2)
         out_bhnd = apply_o(out_bhnd)
@@ -1964,9 +2198,10 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     ) -> torch.Tensor:
         B, N, C = x.shape
 
-        q = self.q_proj_cam(x).reshape(B, N, self.heads, self.dim)
-        k = self.k_proj_cam(x).reshape(B, N, self.heads, self.dim)
-        v = self.v_proj_cam(x).reshape(B, N, self.heads, self.dim)
+        q, k, v = self._cam_qkv(x)
+        q = q.reshape(B, N, self.heads, self.dim)
+        k = k.reshape(B, N, self.heads, self.dim)
+        v = v.reshape(B, N, self.heads, self.dim)
 
         if self.conv_k_cam is not None:
             k = self._temporal_short_conv(
@@ -2441,6 +2676,12 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Cache RoPE freqs per shape -- avoids recomputation across denoising
         # steps with constant latent shapes.
         self._freqs_cache: dict = {}
+        self._ucpe_apply_fns_cache: Optional[
+            Tuple[Tuple, torch.Tensor, Tuple[Callable, Callable, Callable]]
+        ] = None
+        self._plucker_emb_cache: Optional[
+            Tuple[Tuple, torch.Tensor, torch.Tensor]
+        ] = None
 
         # FSDP shard targets
         self.layer_names = ["blocks"]
@@ -2463,6 +2704,81 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if key not in self._freqs_cache:
             self._freqs_cache[key] = self.rope((T, H, W), device)
         return self._freqs_cache[key]
+
+    def _get_ucpe_apply_fns(
+        self,
+        camera_conditions: torch.Tensor,
+        *,
+        HW: Tuple[int, int, int],
+        freqs: torch.Tensor,
+    ) -> Tuple[Callable, Callable, Callable]:
+        head_dim = self.attention_head_dim
+        if torch.is_grad_enabled():
+            raymats = process_camera_conditions_ucpe(
+                camera_conditions,
+                HW=HW,
+                patch_size=self.patch_size,
+            )
+            raymats_flat = raymats.reshape(camera_conditions.shape[0], -1, 4, 4)
+            return _build_ucpe_apply_fns(head_dim, raymats_flat, freqs)
+
+        key = (
+            "ucpe",
+            HW,
+            self.patch_size,
+            head_dim,
+            _tensor_cache_key(camera_conditions),
+            _tensor_cache_key(freqs),
+        )
+        cached = self._ucpe_apply_fns_cache
+        if cached is not None and cached[0] == key:
+            return cached[2]
+
+        raymats = process_camera_conditions_ucpe(
+            camera_conditions,
+            HW=HW,
+            patch_size=self.patch_size,
+        )
+        raymats_flat = raymats.reshape(camera_conditions.shape[0], -1, 4, 4)
+        prope_fns = _build_ucpe_apply_fns(head_dim, raymats_flat, freqs)
+        self._ucpe_apply_fns_cache = (key, camera_conditions, prope_fns)
+        return prope_fns
+
+    def _get_plucker_emb(
+        self,
+        chunk_plucker: torch.Tensor,
+        *,
+        latent_token_count: int,
+    ) -> torch.Tensor:
+        if self.plucker_embedder is None:
+            raise ValueError("SANA-WM plucker_embedder is not initialized.")
+
+        weight = self.plucker_embedder.proj.weight
+        bias = self.plucker_embedder.proj.bias
+        key = (
+            "plucker_emb",
+            latent_token_count,
+            self.patch_size,
+            _tensor_cache_key(chunk_plucker),
+            _tensor_cache_key(weight),
+            None if bias is None else _tensor_cache_key(bias),
+        )
+        if not torch.is_grad_enabled():
+            cached = self._plucker_emb_cache
+            if cached is not None and cached[0] == key:
+                return cached[2]
+
+        plucker_emb = self.plucker_embedder(chunk_plucker.to(weight.dtype))
+        if plucker_emb.shape[1] != latent_token_count:
+            raise ValueError(
+                f"plucker_emb token count {plucker_emb.shape[1]} != "
+                f"latent token count {latent_token_count}; "
+                "expected chunk_plucker shape (B, 48, T, H, W)."
+            )
+
+        if not torch.is_grad_enabled():
+            self._plucker_emb_cache = (key, chunk_plucker, plucker_emb)
+        return plucker_emb
 
     def forward(
         self,
@@ -2542,39 +2858,30 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     f"frames: got {camera_conditions.shape[1]} frames, "
                     f"expected T={T}."
                 )
-            head_dim = self.attention_head_dim
-            raymats = process_camera_conditions_ucpe(
+            prope_fns = self._get_ucpe_apply_fns(
                 camera_conditions,
                 HW=(T, H, W),
-                patch_size=self.patch_size,
+                freqs=freqs,
             )
-            raymats_flat = raymats.reshape(B, -1, 4, 4)
-            prope_fns = _build_ucpe_apply_fns(head_dim, raymats_flat, freqs)
 
         # Plücker post-attn embedding (shared across all blocks)
         plucker_emb = None
-        if (
-            self.use_chunk_plucker_post_attn
-            and chunk_plucker is not None
+        needs_plucker_emb = (
+            chunk_plucker is not None
             and self.plucker_embedder is not None
-        ):
-            plucker_emb = self.plucker_embedder(
-                chunk_plucker.to(self.plucker_embedder.proj.weight.dtype),
+            and (self.use_chunk_plucker_post_attn or self.use_chunk_plucker_input)
+        )
+        if needs_plucker_emb:
+            plucker_emb = self._get_plucker_emb(
+                chunk_plucker,
+                latent_token_count=x.shape[1],
             )  # (B, T*H*W, D)
-            if plucker_emb.shape[1] != x.shape[1]:
-                raise ValueError(
-                    f"plucker_emb token count {plucker_emb.shape[1]} != latent token count {x.shape[1]}; "
-                    f"expected chunk_plucker shape (B, 48, T={T}, H={H}, W={W})."
-                )
 
-        if (
-            self.use_chunk_plucker_input
-            and chunk_plucker is not None
-            and self.plucker_embedder is not None
-        ):
-            x = x + self.plucker_embedder(
-                chunk_plucker.to(self.plucker_embedder.proj.weight.dtype)
-            )
+        if self.use_chunk_plucker_input and plucker_emb is not None:
+            x = x + plucker_emb
+
+        if not self.use_chunk_plucker_post_attn:
+            plucker_emb = None
 
         # --- 6. Transformer blocks ---
         HW = (T, H, W)

@@ -42,6 +42,8 @@ import torch
 import triton
 import triton.language as tl
 
+_CAM_IDENTITY_CACHE: dict = {}
+
 # ════════════════════════════════════════════════════════════════
 #  Per-architecture launch config (auto-selected via compute capability)
 # ════════════════════════════════════════════════════════════════
@@ -1486,3 +1488,129 @@ def fused_bigdn_bidi_chunkwise(
         return out, state_kv, state_z
     return out
 
+
+def _default_dot_prec() -> int:
+    try:
+        from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
+            _resolve_launch_config,
+        )
+
+        _, dot_prec, _, _ = _resolve_launch_config()
+        return dot_prec
+    except Exception:
+        return 0
+
+
+def _cam_identity_tables(
+    *,
+    B: int,
+    N: int,
+    H: int,
+    D: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device_index = device.index if device.type == "cuda" else None
+    key = (device.type, device_index, B, N, H * D, D)
+    cached = _CAM_IDENTITY_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    ones_inv_rms = torch.ones(B, N, device=device, dtype=torch.float32)
+    ones_nw = torch.ones(H * D, device=device, dtype=torch.float32)
+    ones_cos = torch.ones(N, D, device=device, dtype=torch.float32)
+    zeros_sin = torch.zeros(N, D, device=device, dtype=torch.float32)
+    cached = (ones_inv_rms, ones_nw, ones_cos, zeros_sin)
+    _CAM_IDENTITY_CACHE[key] = cached
+    return cached
+
+
+def cam_scan_bidi_chunkwise(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    dot_precision: int | None = None,
+) -> torch.Tensor:
+    """Bidirectional camera scan for SANA-WM's numerator-only branch.
+
+    Args:
+        q, k, v: camera-prepared tensors shaped ``(B, H, D, N)`` in fp32.
+        beta: frame gates shaped ``(B, H, F, S)`` in fp32.
+        decay: decay gates shaped ``(B, H, F)`` in fp32.
+
+    Returns:
+        Tensor shaped ``(B, H, D, N)`` in fp32.
+    """
+    assert q.shape == k.shape == v.shape, (
+        f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
+    )
+    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    assert beta.is_contiguous() and decay.is_contiguous()
+    assert q.dtype == torch.float32, (
+        f"cam_scan_bidi_chunkwise requires fp32 q/k/v, got {q.dtype}"
+    )
+
+    B, H, D, N = q.shape
+    F = beta.shape[2]
+    assert N % F == 0
+    S = N // F
+    assert beta.shape == (B, H, F, S)
+    assert decay.shape == (B, H, F)
+
+    if dot_precision is None:
+        dot_precision = _default_dot_prec()
+
+    qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
+    qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
+    qkv[:, :, 1].copy_(k.permute(0, 3, 1, 2))
+    qkv[:, :, 2].copy_(v.permute(0, 3, 1, 2))
+
+    ones_inv_rms, ones_nw, ones_cos, zeros_sin = _cam_identity_tables(
+        B=B, N=N, H=H, D=D, device=q.device
+    )
+    I_P_kv, A, I_P_z, B_z = phase_a(
+        qkv,
+        beta,
+        ones_inv_rms,
+        ones_inv_rms,
+        ones_nw,
+        ones_nw,
+        ones_cos,
+        zeros_sin,
+        F=F,
+        S=S,
+        k_scale=1.0,
+        norm_eps=1e-5,
+        dot_precision=dot_precision,
+        skip_relu=True,
+        skip_z=True,
+    )
+    M_hist, z_hist, _, _ = phase_b_triton(
+        I_P_kv,
+        A,
+        I_P_z,
+        B_z,
+        decay,
+        F=F,
+        dot_precision=dot_precision,
+        direction=0,
+        combined_history=True,
+        skip_z=True,
+    )
+    num_out, _ = phase_c(
+        qkv,
+        ones_inv_rms,
+        ones_nw,
+        ones_cos,
+        zeros_sin,
+        M_hist,
+        z_hist,
+        F=F,
+        S=S,
+        dot_precision=dot_precision,
+        skip_relu=True,
+        num_only=True,
+    )
+    return num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
