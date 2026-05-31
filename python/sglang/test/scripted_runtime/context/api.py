@@ -31,7 +31,9 @@ class ScriptedContext:
         tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
         http_poster: "BackgroundHttpPoster",
     ) -> None:
-        assert scheduler_hook._is_driver, "ScriptedContext only exists on the driver rank"
+        assert (
+            scheduler_hook._is_driver
+        ), "ScriptedContext only exists on the driver rank"
         self._scheduler = scheduler_hook._scheduler
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._http_poster = http_poster

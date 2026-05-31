@@ -16,7 +16,9 @@ if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
-def _await_control(ctx: "ScriptedContext", *, path: str, json, expect_type: type) -> None:
+def _await_control(
+    ctx: "ScriptedContext", *, path: str, json, expect_type: type
+) -> None:
     _http_post_and_await_recv_msg(
         ctx,
         path=path,
