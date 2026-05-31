@@ -3,7 +3,8 @@
 Both SM90 and SM100+ use the same pool layout: [pool, HV, V, K] (K-last).
 
 SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
-SM100+ (Blackwell+): decode and prefill with bf16 state.  MTP verify on the way.
+SM100+ (Blackwell+): decode and prefill with bf16 state. MTP verify is enabled
+when FlashInfer provides the bf16-state MTP entry point.
 
 Requires flashinfer >= 0.6.4 (SM90) or >= 0.6.5 (SM100+).
 """
@@ -27,14 +28,17 @@ _flashinfer_gdn_available: Optional[bool] = None
 _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
+_flashinfer_bf16_mtp_fn = None
 
 
 def _get_flashinfer_gdn_kernels():
     """Lazy import for FlashInfer GDN prefill, decode and verify (MTP) kernels.
 
-    Returns (available, prefill_fn, mtp_fn, decode_fn).
+    Returns (available, prefill_fn, mtp_fn, decode_fn, bf16_mtp_fn).
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode
+    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule
+    global _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode
+    global _flashinfer_bf16_mtp_fn
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -48,6 +52,17 @@ def _get_flashinfer_gdn_kernels():
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
+            try:
+                from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                    gated_delta_rule_mtp as bf16_mtp_fn,
+                )
+
+                _flashinfer_bf16_mtp_fn = bf16_mtp_fn
+            except (ImportError, RuntimeError, AttributeError) as e:
+                logger.debug(
+                    "FlashInfer GDN bf16-state MTP kernel not available: %s", e
+                )
+                _flashinfer_bf16_mtp_fn = None
             _flashinfer_gdn_available = (
                 torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
             )
@@ -62,6 +77,7 @@ def _get_flashinfer_gdn_kernels():
         _flashinfer_chunk_gated_delta_rule,
         _flashinfer_gated_delta_rule_mtp,
         _flashinfer_gated_delta_rule_decode,
+        _flashinfer_bf16_mtp_fn,
     )
 
 
@@ -74,7 +90,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """FlashInfer kernel for GDN with K-last SSM state layout.
 
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
-    SM100+ (Blackwell+): decode and prefill supported; MTP verify not yet supported.
+    SM100+ (Blackwell+): decode and prefill supported; MTP verify is enabled
+    when the optional bf16-state MTP kernel is available.
 
     Requires flashinfer >= 0.6.4 (SM90) or >= 0.6.5 (SM100+).
     """
@@ -85,6 +102,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             self._prefill_fn,
             self._mtp_fn,
             self._decode_fn,
+            self._bf16_mtp_fn,
         ) = _get_flashinfer_gdn_kernels()
 
         if not available:
@@ -97,7 +115,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
-        self.supports_target_verify = sm_major == 9
+        self.supports_target_verify = sm_major == 9 or (
+            self.use_state_pool and self._bf16_mtp_fn is not None
+        )
+        self.target_verify_intermediate_state_indexing = "cache"
 
         if sm_major == 9:
             if self._prefill_fn is None:
@@ -280,12 +301,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if self.use_state_pool:
-            raise NotImplementedError(
-                "FlashInfer GDN MTP verify is not yet supported on SM100+."
-            )
-
-        # SM90: MTP verify using FlashInfer gated_delta_rule_mtp kernel.
         if retrieve_parent_token is not None:
             raise RuntimeError(
                 "FlashInfer GDN verify kernel only supports topk=1 "
@@ -313,21 +328,45 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
         b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
 
-        output_fi, _ = self._mtp_fn(
-            q=query_mtp,
-            k=key_mtp,
-            v=value_mtp,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
-            A_log=A_log.detach(),
-            a=a_mtp,
-            dt_bias=dt_bias.detach(),
-            b=b_mtp,
-            scale=None,
-            output=None,
-            intermediate_states_buffer=intermediate_states_buffer,
-            disable_state_update=True,
-            use_qk_l2norm=True,
-        )
+        if self.use_state_pool:
+            if self._bf16_mtp_fn is None:
+                raise RuntimeError(
+                    "FlashInfer GDN bf16-state MTP kernel is unavailable."
+                )
+
+            output_fi = self._bf16_mtp_fn(
+                A_log=A_log.detach().float(),
+                a=a_mtp,
+                dt_bias=dt_bias.detach(),
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=query_mtp,
+                k=key_mtp,
+                v=value_mtp,
+                b=b_mtp,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=True,
+                use_qk_l2norm_in_kernel=True,
+                scale=None,
+            )
+        else:
+            output_fi, _ = self._mtp_fn(
+                q=query_mtp,
+                k=key_mtp,
+                v=value_mtp,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                A_log=A_log.detach(),
+                a=a_mtp,
+                dt_bias=dt_bias.detach(),
+                b=b_mtp,
+                scale=None,
+                output=None,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=True,
+                use_qk_l2norm=True,
+            )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
