@@ -135,20 +135,10 @@ _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
 _NO_SPACE_AFTER = frozenset("([{（【《「『")
 
 
-# Two predicates: dedup = CJK script only; spacing also includes fullwidth forms.
-# scx (not Script) so kana marks ー/・ count; Hangul excluded (Korean uses spaces).
+# No-inter-word-space characters, for needs_space() output spacing. scx (not
+# Script) so the kana marks ー/・ count; the halfwidth Hangul jamo (U+FFA0-FFDC)
+# the fullwidth block would re-add is subtracted, since Korean is space-delimited.
 _HALFWIDTH_HANGUL = chr(0xFFA0) + "-" + chr(0xFFDC)
-
-# Dedup set: &&\p{P} adds fullwidth punctuation but not fullwidth ASCII/digits.
-_CJK_DEDUPE_RE = regex.compile(
-    "(?V1)["
-    r"\p{Han}\p{scx=Hiragana}\p{scx=Katakana}\p{Bopomofo}"
-    r"\p{Block=CJK_Symbols_and_Punctuation}"
-    r"[\p{Block=Halfwidth_and_Fullwidth_Forms}&&\p{P}]]"
-)
-
-# Spacing set: dedup set + fullwidth ASCII/digits (wide glyphs take no space),
-# minus the halfwidth Hangul jamo (U+FFA0-FFDC) the block would re-add.
 _CJK_NO_SPACE_RE = regex.compile(
     "(?V1)["
     r"\p{Han}\p{scx=Hiragana}\p{scx=Katakana}\p{Bopomofo}"
@@ -158,13 +148,8 @@ _CJK_NO_SPACE_RE = regex.compile(
 
 
 def _is_cjk_no_space(c: str) -> bool:
-    """No-inter-word-space char (CJK script + fullwidth forms); spacing only."""
+    """No-inter-word-space char (CJK script + fullwidth forms); for spacing."""
     return bool(_CJK_NO_SPACE_RE.match(c))
-
-
-def _is_cjk_dedupe(c: str) -> bool:
-    """Genuine CJK script char eligible for char-level dedup (no fullwidth ASCII)."""
-    return bool(_CJK_DEDUPE_RE.match(c))
 
 
 def needs_space(prev: str, cur: str) -> bool:
@@ -226,63 +211,16 @@ def _dedupe_by_word(committed_text: str, candidate_out: str) -> str:
     return candidate_out
 
 
-def _is_punctuation(c: str) -> bool:
-    return unicodedata.category(c)[0] == "P"
-
-
-def _get_leading_cjk_chars(text: str) -> List[str]:
-    """Return the CJK characters at the start of ``text``, stopping at the first
-    non-CJK character (leading whitespace is skipped)."""
-    chars: List[str] = []
-    for char in text.lstrip():
-        if not _is_cjk_dedupe(char):
-            break
-        chars.append(char)
-    return chars
-
-
-def _get_trailing_cjk_chars(text: str) -> List[str]:
-    """Return the CJK characters at the end of ``text``, stopping at the first
-    non-CJK character (trailing whitespace is skipped)."""
-    chars: List[str] = []
-    for char in reversed(text.rstrip()):
-        if not _is_cjk_dedupe(char):
-            break
-        chars.append(char)
-    chars.reverse()
-    return chars
-
-
-def _dedupe_by_cjk_char(committed_text: str, candidate_out: str) -> str:
-    """Drop the CJK characters at the start of ``candidate_out`` when they repeat
-    the CJK characters at the end of ``committed_text``. Only those boundary
-    characters are compared, so a non-CJK prefix ("today ") is never deleted to
-    reach a later match."""
-    lead = _get_leading_cjk_chars(candidate_out)
-    tail = _get_trailing_cjk_chars(committed_text)
-    if not lead or not tail:
-        return candidate_out
-    for overlap in range(min(len(lead), len(tail)), 0, -1):
-        if tail[-overlap:] != lead[:overlap]:
-            continue
-        # Single-glyph matches collide too often for CJK letters; require >=2,
-        # allow 1 only for punctuation.
-        if overlap == 1 and not _is_punctuation(lead[0]):
-            continue
-        return candidate_out.lstrip()[overlap:].lstrip()
-    return candidate_out
-
-
 def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
-    """Trim words / CJK characters at the start of ``candidate_out`` that
-    re-transcribe ``committed_text``'s tail. Matches by whole word first, then
-    falls back to matching the leading/trailing CJK characters."""
+    """Trim words at the start of ``candidate_out`` that re-transcribe
+    ``committed_text``'s tail (word-level, case- and punctuation-insensitive).
+
+    CJK has no inter-word spaces, so the word-level matcher does not help there;
+    a character-level CJK dedupe is deferred to M3, where slicing also engages
+    for CJK (today it stays on the cumulative path)."""
     if not committed_text or not candidate_out:
         return candidate_out
-    deduped = _dedupe_by_word(committed_text, candidate_out)
-    if deduped != candidate_out:
-        return deduped
-    return _dedupe_by_cjk_char(committed_text, candidate_out)
+    return _dedupe_by_word(committed_text, candidate_out)
 
 
 async def process_asr_chunk(
