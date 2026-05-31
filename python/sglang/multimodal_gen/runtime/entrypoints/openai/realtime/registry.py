@@ -31,7 +31,7 @@ def _register_builtin_realtime_model_adapters() -> None:
     from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
         LingBotWorldCausalDMDConfig,
     )
-    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.lingbot_world_realtime_adapter import (
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.lingbot_world_realtime_adapter import (
         LingBotWorldRealtimeAdapter,
     )
 

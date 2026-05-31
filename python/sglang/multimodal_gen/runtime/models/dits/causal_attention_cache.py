@@ -93,6 +93,11 @@ class CausalSelfAttentionKVCache:
     def _write_indices(
         self, *, global_end_index: int, local_end_index: int
     ) -> None:
+        if (
+            self.global_end_index_int == global_end_index
+            and self.local_end_index_int == local_end_index
+        ):
+            return
         if self.global_end_index_int is not None:
             self.global_end_index_int = global_end_index
         if self.local_end_index_int is not None:
@@ -201,8 +206,10 @@ class CausalSelfAttentionKVCache:
                 f"current_start={current_chunk_start}, current_end={current_chunk_end}"
             )
 
-        self.k = self.k.detach()
-        self.v = self.v.detach()
+        if self.k.requires_grad:
+            self.k = self.k.detach()
+        if self.v.requires_grad:
+            self.v = self.v.detach()
         self.k[:, local_start_index:local_end_index] = key
         self.v[:, local_start_index:local_end_index] = value
 

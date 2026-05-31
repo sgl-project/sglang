@@ -209,6 +209,8 @@ class Req:
     session: RealtimeSession | None = None
     block_idx: int = 0
     realtime_chunk_size: int | None = None
+    realtime_event_id: int | None = None
+    realtime_output_format: str | None = None
     # return websocket-friendly raw RGB frame bytes instead of rwa tensors
     return_raw_frames: bool = False
 

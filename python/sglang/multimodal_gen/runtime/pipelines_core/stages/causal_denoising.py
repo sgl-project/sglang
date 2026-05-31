@@ -429,9 +429,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )
 
             if i < len(timesteps) - 1:
-                next_timestep = timesteps[i + 1] * torch.ones(
-                    [1], dtype=torch.long, device=device
-                )
+                next_timestep = timesteps[i + 1 : i + 2]
                 noise_latents_btchw = self._add_noise_for_next_timestep(
                     batch,
                     x0_btchw=x0_btchw,

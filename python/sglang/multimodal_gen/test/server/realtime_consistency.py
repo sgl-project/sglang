@@ -14,7 +14,12 @@ import pytest
 from msgpack import packb, unpackb
 from openai import Client
 
-from sglang.multimodal_gen.runtime.utils.realtime_video import RAW_RGB_CONTENT_TYPE
+from sglang.multimodal_gen.runtime.utils.realtime_video import (
+    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
+    RAW_RGB_CONTENT_TYPE,
+    RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
+    restore_delta_gzip_raw_rgb_payload,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionSamplingParams
 from sglang.multimodal_gen.test.test_utils import is_image_url
 
@@ -83,10 +88,16 @@ def build_realtime_event_payload(event: dict[str, Any]) -> dict[str, Any]:
 def decode_realtime_raw_rgb_frames(
     header: dict[str, Any],
     payload: bytes,
+    previous_frame: bytes | None = None,
 ) -> list[np.ndarray]:
-    if header.get("content_type") != RAW_RGB_CONTENT_TYPE:
+    content_type = header.get("content_type")
+    if content_type not in (
+        RAW_RGB_CONTENT_TYPE,
+        RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
+        RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
+    ):
         raise ValueError(
-            f"Unsupported realtime frame content type: {header.get('content_type')}"
+            f"Unsupported realtime frame content type: {content_type}"
         )
 
     width = int(header["width"])
@@ -95,6 +106,18 @@ def decode_realtime_raw_rgb_frames(
     num_frames = int(header["num_frames"])
     bytes_per_frame = int(header["bytes_per_frame"])
     expected_size = num_frames * bytes_per_frame
+    if content_type in (
+        RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
+        RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
+    ):
+        if header.get("delta_reference") != "previous-frame":
+            previous_frame = None
+        payload = restore_delta_gzip_raw_rgb_payload(
+            payload,
+            bytes_per_frame=bytes_per_frame,
+            num_frames=num_frames,
+            reference_frame=previous_frame,
+        )
     if len(payload) != expected_size:
         raise ValueError(
             f"Realtime payload size mismatch: expected {expected_size}, got {len(payload)}"
@@ -106,7 +129,10 @@ def decode_realtime_raw_rgb_frames(
         frame = np.frombuffer(
             payload[offset : offset + bytes_per_frame], dtype=np.uint8
         )
-        frames.append(frame.reshape(height, width, channels).copy())
+        frame = frame.reshape(height, width, channels)
+        if channels > 3:
+            frame = frame[:, :, :3]
+        frames.append(frame.copy())
     return frames
 
 
@@ -157,11 +183,12 @@ async def collect_realtime_frames(
             await ws.send(packb(build_realtime_event_payload(event), use_bin_type=True))
             sent_event_indices.add(event_idx)
 
-    async with websockets.connect(ws_url, max_size=None) as ws:
+    async with websockets.connect(ws_url, max_size=None, ping_interval=None) as ws:
         await ws.send(packb(init_payload, use_bin_type=True))
         await send_events_for_boundary(ws, -1)
 
         received_chunks: set[int] = set()
+        previous_frame: bytes | None = None
         while len(received_chunks) < num_chunks:
             header_payload = await asyncio.wait_for(
                 ws.recv(), timeout=_REALTIME_WS_TIMEOUT_SECS
@@ -178,9 +205,17 @@ async def collect_realtime_frames(
             if not isinstance(raw_payload, bytes):
                 raise ValueError("Realtime frame payload must be bytes")
 
-            frames.extend(decode_realtime_raw_rgb_frames(header, raw_payload))
+            chunk_frames = decode_realtime_raw_rgb_frames(
+                header,
+                raw_payload,
+                previous_frame,
+            )
+            frames.extend(chunk_frames)
+            if chunk_frames:
+                previous_frame = chunk_frames[-1].tobytes()
             chunk_index = int(header["chunk_index"])
-            received_chunks.add(chunk_index)
-            await send_events_for_boundary(ws, chunk_index)
+            if header.get("is_final_frame_batch", True):
+                received_chunks.add(chunk_index)
+                await send_events_for_boundary(ws, chunk_index)
 
     return frames

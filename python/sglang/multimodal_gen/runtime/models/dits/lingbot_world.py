@@ -968,14 +968,11 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        null_scale = torch.zeros(
+        residual_zero = torch.zeros(
             (1,), device=hidden_states.device, dtype=hidden_states.dtype
         )
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, residual_zero, residual_zero
         )
         hidden_states = self.cam_conditioner(
             hidden_states.to(orig_dtype), c2ws_plucker_emb
@@ -1081,14 +1078,123 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         return self.rotary_emb.forward_uncached(positions)
 
     def _prepare_c2ws_plucker_emb(
-        self, hidden_states: torch.Tensor, c2ws_plucker_emb: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        c2ws_plucker_emb: torch.Tensor | None,
+        forward_batch=None,
     ) -> torch.Tensor | None:
         if c2ws_plucker_emb is None:
             return None
+        cache = self._get_request_cache(forward_batch, "lingbot_c2ws_plucker_emb")
+        cache_key = (
+            c2ws_plucker_emb.data_ptr(),
+            tuple(c2ws_plucker_emb.shape),
+            tuple(c2ws_plucker_emb.stride()),
+            c2ws_plucker_emb.dtype,
+            c2ws_plucker_emb.device.type,
+            c2ws_plucker_emb.device.index,
+            hidden_states.dtype,
+            hidden_states.device.type,
+            hidden_states.device.index,
+        )
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
         c2ws_plucker_emb = self.patch_embedding_wancamctrl(
             c2ws_plucker_emb.to(device=hidden_states.device, dtype=hidden_states.dtype)
         )
-        return c2ws_plucker_emb + self.c2ws_mlp(c2ws_plucker_emb)
+        c2ws_plucker_emb = c2ws_plucker_emb + self.c2ws_mlp(c2ws_plucker_emb)
+        if cache is not None:
+            cache.clear()
+            cache[cache_key] = c2ws_plucker_emb
+        return c2ws_plucker_emb
+
+    @staticmethod
+    def _get_request_cache(forward_batch, name: str) -> dict | None:
+        if forward_batch is None:
+            return None
+        extra = getattr(forward_batch, "extra", None)
+        if extra is None:
+            return None
+        return extra.setdefault(name, {})
+
+    @staticmethod
+    def _all_crossattn_caches_initialized(
+        crossattn_cache: list[CrossAttentionKVCache] | None,
+    ) -> bool:
+        return crossattn_cache is not None and all(
+            cache.is_init for cache in crossattn_cache
+        )
+
+    def _prepare_cached_rope(
+        self,
+        *,
+        forward_batch,
+        post_patch_num_frames: int,
+        post_patch_height: int,
+        post_patch_width: int,
+        start_frame: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, ...]:
+        cache = self._get_request_cache(forward_batch, "lingbot_rope")
+        cache_key = (
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            start_frame,
+            device.type,
+            device.index,
+        )
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
+        freqs_cos, freqs_sin = get_rotary_pos_embed(
+            (
+                post_patch_num_frames * get_sp_world_size(),
+                post_patch_height,
+                post_patch_width,
+            ),
+            self.hidden_size,
+            self.num_attention_heads,
+            self.rope_dim_list,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+            rope_theta=10000,
+            start_frame=start_frame,
+        )
+        freqs_cos = freqs_cos.to(device).float()
+        freqs_sin = freqs_sin.to(device).float()
+        freqs_cis: tuple[torch.Tensor, ...] = (freqs_cos, freqs_sin)
+        if _is_cuda:
+            freqs_cis = (
+                freqs_cos,
+                freqs_sin,
+                torch.cat([freqs_cos.contiguous(), freqs_sin.contiguous()], dim=-1),
+            )
+        if cache is not None:
+            cache.clear()
+            cache[cache_key] = freqs_cis
+        return freqs_cis
+
+    def _prepare_condition_embeddings(
+        self,
+        *,
+        timestep: torch.LongTensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: torch.Tensor | None,
+        crossattn_cache: list[CrossAttentionKVCache] | None,
+    ):
+        if self._all_crossattn_caches_initialized(crossattn_cache):
+            temb = self.condition_embedder.time_embedder(timestep.flatten())
+            timestep_proj = self.condition_embedder.time_modulation(temb)
+            return temb, timestep_proj, encoder_hidden_states, None
+
+        return self.condition_embedder(
+            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
+        )
 
     def forward(
         self,
@@ -1141,36 +1247,18 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             )
             forward_batch.sequence_shard_splits = tuple(seq_shard_splits)
         if not sequence_shard_enabled:
-            freqs_cos, freqs_sin = get_rotary_pos_embed(
-                (
-                    post_patch_num_frames * get_sp_world_size(),
-                    post_patch_height,
-                    post_patch_width,
-                ),
-                self.hidden_size,
-                self.num_attention_heads,
-                self.rope_dim_list,
-                dtype=(
-                    torch.float64
-                    if current_platform.is_float64_supported()
-                    else torch.float32
-                ),
-                rope_theta=10000,
+            freqs_cis = self._prepare_cached_rope(
+                forward_batch=forward_batch,
+                post_patch_num_frames=post_patch_num_frames,
+                post_patch_height=post_patch_height,
+                post_patch_width=post_patch_width,
                 start_frame=start_frame,
+                device=hidden_states.device,
             )
-            freqs_cos = freqs_cos.to(hidden_states.device).float()
-            freqs_sin = freqs_sin.to(hidden_states.device).float()
-            freqs_cis = (freqs_cos, freqs_sin)
-            if _is_cuda:
-                freqs_cis = (
-                    freqs_cos,
-                    freqs_sin,
-                    torch.cat([freqs_cos.contiguous(), freqs_sin.contiguous()], dim=-1),
-                )
 
         hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
         c2ws_plucker_emb = self._prepare_c2ws_plucker_emb(
-            hidden_states, c2ws_plucker_emb
+            hidden_states, c2ws_plucker_emb, forward_batch
         )
         if sequence_shard_enabled:
             sp_rank = get_sp_parallel_rank()
@@ -1203,8 +1291,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 )
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
+            self._prepare_condition_embeddings(
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+                crossattn_cache=crossattn_cache,
             )
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(

@@ -901,17 +901,15 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         iter_ = z.shape[2]
         x = self.post_quant_conv(z)
+        outs = []
         with forward_context(
             feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
         ):
             for i in range(iter_):
                 feat_idx.set(0)
                 first_chunk.set(is_first_chunk and i == 0)
-                out_i = self.decoder(x[:, :, i : i + 1, :, :])
-                if i == 0:
-                    out = out_i
-                else:
-                    out = torch.cat([out, out_i], 2)
+                outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
+        out = torch.cat(outs, 2)
 
         if self.config.patch_size is not None:
             out = unpatchify(out, patch_size=self.config.patch_size)
@@ -984,6 +982,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
             iter_ = z.shape[2]
             x = self.post_quant_conv(z)
+            outs = []
             with forward_context(
                 feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
             ):
@@ -991,11 +990,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
                     feat_idx.set(0)
                     if i == 0:
                         first_chunk.set(True)
-                        out = self.decoder(x[:, :, i : i + 1, :, :])
                     else:
                         first_chunk.set(False)
-                        out_ = self.decoder(x[:, :, i : i + 1, :, :])
-                        out = torch.cat([out, out_], 2)
+                    outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
+            out = torch.cat(outs, 2)
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)

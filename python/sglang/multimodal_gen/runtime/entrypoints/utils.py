@@ -494,7 +494,7 @@ def _sample_to_uint8_frames(sample: Any) -> list[Any]:
         if sample.dim() == 3:
             sample = sample.unsqueeze(1)
         sample = (sample * 255).clamp(0, 255).to(torch.uint8)
-        videos = sample.permute(1, 2, 3, 0).cpu().numpy()
+        videos = sample.permute(1, 2, 3, 0).contiguous().cpu().numpy()
         return list(videos)
 
     if not isinstance(sample, np.ndarray):
@@ -515,7 +515,7 @@ def _sample_to_uint8_frames(sample: Any) -> list[Any]:
         if t.dim() == 3:
             t = t.unsqueeze(1)
         t = (t * 255).clamp(0, 255).to(torch.uint8)
-        videos = t.permute(1, 2, 3, 0).cpu().numpy()
+        videos = t.permute(1, 2, 3, 0).contiguous().cpu().numpy()
         return list(videos)
 
     if arr.dtype != np.uint8:

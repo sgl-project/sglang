@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import zlib
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -20,7 +21,80 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RAW_RGB_CONTENT_TYPE = "application/x-raw-rgb"
+RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip"
+RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip"
+WEBP_FRAME_CONTENT_TYPE = "image/webp"
+JPEG_FRAME_CONTENT_TYPE = "image/jpeg"
 RAW_RGB_CHANNELS = 3
+RAW_RGBA_CHANNELS = 4
+
+
+def build_delta_gzip_raw_rgb_payload(
+    frames: list[bytes],
+    *,
+    reference_frame: bytes | None = None,
+) -> bytes:
+    if not frames:
+        return b""
+
+    frame_size = len(frames[0])
+    if reference_frame is not None and len(reference_frame) != frame_size:
+        raise ValueError("raw RGB delta gzip reference frame size mismatch")
+
+    previous = (
+        np.frombuffer(reference_frame, dtype=np.uint8)
+        if reference_frame is not None
+        else None
+    )
+    delta_chunks = []
+    for frame in frames:
+        if len(frame) != frame_size:
+            raise ValueError("raw RGB delta gzip requires fixed-size frames")
+        current = np.frombuffer(frame, dtype=np.uint8)
+        if previous is None:
+            delta_chunks.append(frame)
+        else:
+            delta_chunks.append(np.bitwise_xor(current, previous).tobytes())
+        previous = current
+
+    compressor = zlib.compressobj(level=1, method=zlib.DEFLATED, wbits=31)
+    delta_payload = b"".join(delta_chunks)
+    return compressor.compress(delta_payload) + compressor.flush()
+
+
+def restore_delta_gzip_raw_rgb_payload(
+    payload: bytes,
+    *,
+    bytes_per_frame: int,
+    num_frames: int,
+    reference_frame: bytes | None = None,
+) -> bytes:
+    if reference_frame is not None and len(reference_frame) != bytes_per_frame:
+        raise ValueError("delta gzip reference frame size mismatch")
+
+    delta_payload = zlib.decompress(payload, wbits=31)
+    expected_size = bytes_per_frame * num_frames
+    if len(delta_payload) != expected_size:
+        raise ValueError(
+            "delta gzip payload size mismatch: "
+            f"expected {expected_size}, got {len(delta_payload)}"
+        )
+
+    restored = bytearray(delta_payload)
+    previous = (
+        np.frombuffer(reference_frame, dtype=np.uint8)
+        if reference_frame is not None
+        else None
+    )
+    for frame_idx in range(num_frames):
+        offset = frame_idx * bytes_per_frame
+        current = np.frombuffer(
+            restored, dtype=np.uint8, count=bytes_per_frame, offset=offset
+        )
+        if previous is not None:
+            current ^= previous
+        previous = current
+    return bytes(restored)
 
 
 def build_raw_rgb_frame_batches(
@@ -44,32 +118,39 @@ def build_raw_rgb_frame_batches(
 
     for sample in outputs:
         stage_start = time.monotonic()
-        frames = post_process_sample_fn(
-            sample,
-            req.data_type,
-            req.fps,
-            False,
-            None,
-            audio_sample_rate=output_batch.audio_sample_rate,
-            output_compression=req.output_compression,
-            enable_frame_interpolation=req.enable_frame_interpolation,
-            frame_interpolation_exp=req.frame_interpolation_exp,
-            frame_interpolation_scale=req.frame_interpolation_scale,
-            frame_interpolation_model_path=req.frame_interpolation_model_path,
-            enable_upscaling=False,
-            upscaling_model_path=req.upscaling_model_path,
-            upscaling_scale=req.upscaling_scale,
-        )
-        if req.enable_upscaling and frames:
-            from sglang.multimodal_gen.runtime.postprocess import (
-                batch_upscale_frames,
+        if (
+            isinstance(sample, torch.Tensor)
+            and not req.enable_frame_interpolation
+            and not req.enable_upscaling
+        ):
+            frames = _tensor_sample_to_rgb24_array(sample)
+        else:
+            frames = post_process_sample_fn(
+                sample,
+                req.data_type,
+                req.fps,
+                False,
+                None,
+                audio_sample_rate=output_batch.audio_sample_rate,
+                output_compression=req.output_compression,
+                enable_frame_interpolation=req.enable_frame_interpolation,
+                frame_interpolation_exp=req.frame_interpolation_exp,
+                frame_interpolation_scale=req.frame_interpolation_scale,
+                frame_interpolation_model_path=req.frame_interpolation_model_path,
+                enable_upscaling=False,
+                upscaling_model_path=req.upscaling_model_path,
+                upscaling_scale=req.upscaling_scale,
             )
+            if req.enable_upscaling and frames:
+                from sglang.multimodal_gen.runtime.postprocess import (
+                    batch_upscale_frames,
+                )
 
-            frames = batch_upscale_frames(
-                frames,
-                model_path=req.upscaling_model_path,
-                scale=req.upscaling_scale,
-            )
+                frames = batch_upscale_frames(
+                    frames,
+                    model_path=req.upscaling_model_path,
+                    scale=req.upscaling_scale,
+                )
         sample_to_frames_ms += (time.monotonic() - stage_start) * 1000.0
 
         stage_start = time.monotonic()
@@ -120,3 +201,10 @@ def build_raw_rgb_frame_batches(
             "bytes_per_frame": frame_width * frame_height * channels,
         }
     return frame_batches, frame_metadata
+
+
+def _tensor_sample_to_rgb24_array(sample: torch.Tensor) -> np.ndarray:
+    if sample.dim() == 3:
+        sample = sample.unsqueeze(1)
+    sample = (sample * 255).clamp(0, 255).to(torch.uint8)
+    return sample.permute(1, 2, 3, 0).contiguous().cpu().numpy()
