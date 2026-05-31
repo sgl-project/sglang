@@ -57,6 +57,15 @@ def abort_all(ctx: "ScriptedContext") -> None:
     )
 
 
+def abort(ctx: "ScriptedContext", *, rid: str) -> None:
+    _await_control(
+        ctx,
+        path="/abort_request",
+        json={"rid": rid, "abort_all": False},
+        expect_type=AbortReq,
+    )
+
+
 def flush_cache(ctx: "ScriptedContext") -> None:
     _await_control(
         ctx,

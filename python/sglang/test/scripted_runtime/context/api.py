@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 from sglang.test.scripted_runtime.context import (
+    engine,
     lifecycle,
     queries,
     radix,
@@ -47,11 +48,17 @@ class ScriptedContext:
         prompt_len: int,
         max_new_tokens: int = 8,
         rid: Optional[str] = None,
+        ignore_eos: bool = False,
+        priority: Optional[int] = None,
+        dp_rank: Optional[int] = None,
     ) -> "ScriptedReqHandle":
         return self._req_starter.start_req(
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
             rid=rid,
+            ignore_eos=ignore_eos,
+            priority=priority,
+            dp_rank=dp_rank,
         )
 
     def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:
@@ -63,6 +70,9 @@ class ScriptedContext:
     def abort_all(self) -> None:
         return lifecycle.abort_all(self)
 
+    def abort(self, handle: "ScriptedReqHandle") -> None:
+        return lifecycle.abort(self, rid=handle.rid)
+
     def flush_cache(self) -> None:
         return lifecycle.flush_cache(self)
 
@@ -70,6 +80,9 @@ class ScriptedContext:
         return radix.get_all_node_hit_counts(self)
 
     def get_all_node_lock_refs(self) -> Dict[int, int]:
+        return radix.get_all_node_lock_refs(self)
+
+    def lock_refs_snapshot(self) -> Dict[int, int]:
         return radix.get_all_node_lock_refs(self)
 
     def find_req_by_rid(self, rid: str) -> Optional["Req"]:
@@ -80,3 +93,30 @@ class ScriptedContext:
 
     def is_chunking(self, rid: str) -> bool:
         return queries.is_chunking(self, rid)
+
+    def list_active_reqs(self) -> List["Req"]:
+        return queries.list_active_reqs(self)
+
+    def running_rids(self) -> List[str]:
+        return queries.running_rids(self)
+
+    def waiting_rids(self) -> List[str]:
+        return queries.waiting_rids(self)
+
+    def batch_rids(self) -> List[str]:
+        return queries.batch_rids(self)
+
+    def batch_size(self) -> int:
+        return queries.batch_size(self)
+
+    def get_chunked_req_rid(self) -> Optional[str]:
+        return queries.get_chunked_req_rid(self)
+
+    def chunked_in_flight_count(self) -> int:
+        return queries.chunked_in_flight_count(self)
+
+    def engine_stats(self) -> Dict[str, int]:
+        return engine.engine_stats(self)
+
+    def row_pool_used(self) -> int:
+        return engine.row_pool_used(self)
