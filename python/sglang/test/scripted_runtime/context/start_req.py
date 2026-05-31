@@ -63,7 +63,7 @@ def _post_generate_async(
 
     async def _post() -> None:
         try:
-            await ctx._http_poster.post_and_drain(url, payload)
+            await ctx._http_poster.post(url, payload)
         except Exception:  # noqa: BLE001 — fire-and-forget background coroutine
             logger.exception("scripted_runtime: /generate request rid=%s failed", rid)
 

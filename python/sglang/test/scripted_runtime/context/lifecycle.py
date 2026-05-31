@@ -35,7 +35,7 @@ def _post_and_await_control(
 
     async def _post() -> None:
         try:
-            await ctx._http_poster.post_no_body(url, json)
+            await ctx._http_poster.post(url, json)
         except Exception:  # noqa: BLE001 — fire-and-forget control POST
             logger.exception("scripted_runtime: control POST %s failed", path)
 
