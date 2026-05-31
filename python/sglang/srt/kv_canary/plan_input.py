@@ -29,8 +29,7 @@ class PlanInput:
             ``sot_pos`` when gathering the expected token; everything past the snapshot
             (e.g. EAGLE draft / verify positions, or stale residue from a longer recycled
             slot owner) returns the ``-1`` sentinel and the verify kernel skips the check.
-            The naive build never populates the verify-token-id cross-check, so this stays all
-            zeros and the plan kernel's gather degrades to the ``-1`` skip sentinel.
+            Set only when ``CanaryConfig.enable_verify_token_assert`` is on.
 
     Allocated fresh per forward by :class:`SingleForwardManager`. The boundary
     ForwardBatch token/position/slot tensors must already be int64
@@ -83,6 +82,12 @@ class PlanInput:
             out_extend_seq_lens=self.extend_seq_lens[:bs],
             bs=bs,
         )
+
+        req_all_ids_lens = forward_batch.req_all_ids_lens
+        if req_all_ids_lens is not None:
+            self.req_to_verify_expected_tokens_valid_lens[:bs].copy_(
+                req_all_ids_lens.to(torch.int64), non_blocking=True
+            )
 
 
 def _extract_prefix_lens_and_extend_seq_lens(
