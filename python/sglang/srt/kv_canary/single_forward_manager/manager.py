@@ -21,6 +21,7 @@ from sglang.srt.kv_canary.runner.kernel_launcher import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReporter
 from sglang.srt.kv_canary.single_forward_manager.data import (
     PostOpsInsideGraphOutputBuffer,
 )
@@ -72,6 +73,7 @@ class SingleForwardManager:
         per_forward_write_entry_capacity: int,
         d2h_stream: torch.cuda.Stream,
         token_oracle_manager: Optional[TokenOracleManager],
+        swa_divergence_report: Optional[SwaDivergenceReporter],
         is_eagle_draft_decode: bool,
     ) -> None:
         self._config = config
@@ -83,6 +85,9 @@ class SingleForwardManager:
         self._swa_window_size = swa_window_size
         self._d2h_stream = d2h_stream
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
+        self._swa_divergence_report: Optional[SwaDivergenceReporter] = (
+            swa_divergence_report
+        )
         self._is_eagle_draft_decode: bool = is_eagle_draft_decode
 
         self._write_req_capacity = per_forward_write_req_capacity
@@ -101,6 +106,11 @@ class SingleForwardManager:
         self._output_buffer = PostOpsInsideGraphOutputBuffer.allocate(
             num_kernel_tags=int(device_state.kernel_run_counters.shape[0]),
             num_slot_tags=int(device_state.slot_run_counters.shape[0]),
+            swa_verify_total_count_shape=(
+                None
+                if swa_divergence_report is None
+                else tuple(swa_divergence_report.verify_total_count_device.shape)
+            ),
             device=device,
         )
 
@@ -201,6 +211,11 @@ class SingleForwardManager:
                 swa_window_size=self._swa_window_size,
                 req_to_verify_expected_tokens=self._device_state.req_to_verify_expected_tokens,
             )
+            if self._swa_divergence_report is not None:
+                self._swa_divergence_report.observe_after_invoke_plan(
+                    group=group,
+                    verify_plan=verify_plan,
+                )
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
                 group=group,
@@ -261,6 +276,11 @@ class SingleForwardManager:
             kernel_run_counters=self._device_state.kernel_run_counters,
             slot_run_counters=self._device_state.slot_run_counters,
             violation_write_index=self._device_state.violation_log.violation_write_index,
+            swa_verify_total_count=(
+                None
+                if self._swa_divergence_report is None
+                else self._swa_divergence_report.verify_total_count_device
+            ),
         )
 
     def post_ops_outside_graph(self) -> None:

@@ -28,6 +28,7 @@ class _BaselineBase(CanaryE2EBase):
         for _ in range(self.workload_n_batches):
             self.send_parallel_requests()
         self.assert_no_violation(wait_seconds=2.0)
+        self.maybe_assert_swa_divergence_observed()
 
 
 class TestBaselineMha(_BaselineBase):
