@@ -653,16 +653,17 @@ def test_lingbot_denoising_stage_does_not_own_realtime_cache_refs():
     assert stage.crossattn_cache is None
 
 
-def test_lingbot_global_attention_cache_uses_model_window_and_disables_sink():
+def test_lingbot_realtime_attention_cache_uses_bounded_sink_window():
     stage = LingBotWorldCausalDMDDenoisingStage.__new__(
         LingBotWorldCausalDMDDenoisingStage
     )
     stage.local_attn_size = -1
+    stage.sink_size = 9
     stage.sliding_window_num_frames = 18
     stage.num_frames_per_block = 3
     stage.num_token_per_frame = 10
 
-    assert stage._get_causal_sink_tokens() == 0
+    assert stage._get_causal_sink_tokens() == 9 * 10
     assert (
         stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=False)
         == 18 * 10
@@ -673,22 +674,22 @@ def test_lingbot_global_attention_cache_uses_model_window_and_disables_sink():
     )
 
 
-def test_lingbot_global_attention_cache_can_grow_past_initial_window():
+def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
     stage = LingBotWorldCausalDMDDenoisingStage.__new__(
         LingBotWorldCausalDMDDenoisingStage
     )
     stage.num_transformer_blocks = 1
     stage.local_attn_size = -1
-    stage.sink_size = 9
+    stage.sink_size = 2
     stage.num_token_per_frame = 1
     stage.num_frames_per_block = 3
-    stage.sliding_window_num_frames = 2
+    stage.sliding_window_num_frames = 6
     stage.transformer = SimpleNamespace(
         num_attention_heads=1,
         attention_head_dim=1,
         config=SimpleNamespace(
             arch_config=SimpleNamespace(
-                sink_size=9,
+                sink_size=2,
             )
         ),
     )
@@ -700,8 +701,9 @@ def test_lingbot_global_attention_cache_can_grow_past_initial_window():
     )
     assert stage.causal_kv_cache is not None
     cache = stage.causal_kv_cache[0]
-    assert cache.allow_growth is True
-    assert cache.cache_size == 2
+    assert cache.allow_growth is False
+    assert cache.cache_size == 6
+    assert cache.sink_tokens == 2
 
     cache.update_and_get_attention_kv(
         key=torch.ones(1, 3, 1, 1),
@@ -709,9 +711,25 @@ def test_lingbot_global_attention_cache_can_grow_past_initial_window():
         current_chunk_start=0,
     )
 
-    assert cache.cache_size >= 3
     assert cache.local_end_index_int == 3
     assert cache.global_end_index_int == 3
+
+    cache.update_and_get_attention_kv(
+        key=torch.full((1, 3, 1, 1), 2.0),
+        value=torch.full((1, 3, 1, 1), 2.0),
+        current_chunk_start=3,
+    )
+    cache.update_and_get_attention_kv(
+        key=torch.full((1, 3, 1, 1), 3.0),
+        value=torch.full((1, 3, 1, 1), 3.0),
+        current_chunk_start=6,
+    )
+
+    assert cache.cache_size == 6
+    assert cache.local_end_index_int == 6
+    assert cache.global_end_index_int == 9
+    assert torch.equal(cache.k[:, :2], torch.ones(1, 2, 1, 1))
+    assert torch.equal(cache.k[:, 3:6], torch.full((1, 3, 1, 1), 3.0))
 
 
 def test_lingbot_i2v_model_input_writer_reuses_buffer():

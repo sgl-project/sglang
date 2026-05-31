@@ -5,8 +5,8 @@ const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v2";
-const PREVIEW_OUTPUT_FORMAT = "jpeg";
-const PREVIEW_OUTPUT_QUALITY = 100;
+const PREVIEW_OUTPUT_FORMAT = "";
+const PREVIEW_OUTPUT_QUALITY = null;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
@@ -769,18 +769,29 @@ function describeCameraEvent(actions, samples) {
 }
 
 function describeCameraScript(name, script, samples) {
-  const uniqueActions = Array.from(new Set(script.flat()));
+  const actionCounts = countRepeatedActions(script, samples);
   const parts =
-    uniqueActions.map((action) => describeControlAction(action, samples)).join(" + ") ||
+    Array.from(actionCounts.entries())
+      .map(([action, count]) => describeControlAction(action, count))
+      .join(" + ") ||
     "No-op";
   return `camera preset · ${name} · ${parts} · duration=${samples} frames`;
+}
+
+function countRepeatedActions(script, samples) {
+  const counts = new Map();
+  for (let i = 0; i < samples; i++) {
+    const actions = script[i % script.length] || [];
+    actions.forEach((action) => counts.set(action, (counts.get(action) || 0) + 1));
+  }
+  return counts;
 }
 
 function describeControlAction(action, samples = 1) {
   const meta = CONTROL_ACTION_META[action];
   if (!meta) return `${action} (custom)`;
   const distance = describeControlDistance(meta.amount, samples);
-  return `${meta.label} [${meta.type} ${meta.axis}, ${distance}]`;
+  return `${meta.label} [${meta.type}, ${meta.axis}, ${distance}]`;
 }
 
 function describeControlDistance(amount, samples) {
@@ -789,7 +800,7 @@ function describeControlDistance(amount, samples) {
   const perFrame = Number(match[1]);
   const unit = match[2] || "";
   const total = perFrame * Math.max(1, Number(samples || 1));
-  return `${amount} x ${samples} = ${formatControlDistance(total, unit)}`;
+  return `${amount} x ${samples} frames = ${formatControlDistance(total, unit)}`;
 }
 
 function formatControlDistance(value, unit) {
