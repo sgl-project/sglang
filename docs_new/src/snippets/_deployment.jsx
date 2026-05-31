@@ -60,6 +60,37 @@
 //                                                    Falls back to
 //                                                    `lmsysorg/sglang:dev` if
 //                                                    a hw id is missing.
+//   benchmarkCommands  {speed: string,             — optional. Powers the
+//                       accuracy: {[accKey]:          benchmark card's
+//                       string},                      "⚡ Reproduce" modal.
+//                       numPromptsByConc?:           `speed` is ONE
+//                       {[c]: number}}                bench_serving template;
+//                                                    the engine fills
+//                                                    {{DATASET}}/{{ISL}}/{{OSL}}
+//                                                    from the cell's workload,
+//                                                    the chip-picked
+//                                                    {{MAX_CONCURRENCY}}, and
+//                                                    {{NUM_PROMPTS}} resolved
+//                                                    as workload.num_prompts
+//                                                    ?? numPromptsByConc[c]
+//                                                    ?? max(c*2, 200).
+//                                                    `accuracy` maps an
+//                                                    accuracy field (e.g.
+//                                                    gsm8k_pct) to a per-eval
+//                                                    template — a string, or a
+//                                                    {[variant]: string} object
+//                                                    when the command differs
+//                                                    per variant. Both also use
+//                                                    {{MODEL_NAME}} +
+//                                                    {{CURL_HOST}}/{{CURL_PORT}}
+//                                                    like `curl`.
+//   defaultAccuracy    {[variant]:                 — optional. Model-level
+//                       {[accKey]: number}}           accuracy applied to EVERY
+//                                                    cell of a variant (e.g.
+//                                                    GPQA/AIME — hardware-
+//                                                    independent). Merged UNDER
+//                                                    each cell's measured
+//                                                    `accuracy` (per-cell wins).
 //
 // MINTLIFY CAVEATS THIS FILE ROUTES AROUND
 // ----------------------------------------
@@ -290,6 +321,26 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "11px",
       color: isDark ? "#9ca3af" : "#6b7280",
     },
+    // Right side of the benchmark header: version annotation + "⚡ Reproduce".
+    benchHeaderRight: {
+      display: "flex", alignItems: "center", gap: "10px", flexShrink: 0,
+    },
+    // Concurrency chip row inside the Reproduce modal's Speed section.
+    benchChipRow: {
+      display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap",
+      margin: "2px 0 8px",
+    },
+    benchChip: {
+      padding: "2px 10px", fontSize: "12px", cursor: "pointer",
+      border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+      borderRadius: "4px",
+      background: isDark ? "#1f2937" : "#fff",
+      color: isDark ? "#e5e7eb" : "#374151",
+      fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+    },
+    // Selected concurrency chip — same terracotta as the Deploy panel's
+    // selected button (`checked`).
+    benchChipActive: { background: "#D45D44", color: "white", borderColor: "#D45D44" },
     benchBlock: {
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
       borderRadius: "4px",
@@ -434,17 +485,26 @@ export const Deployment = ({ config, benchmarks }) => {
     return Array.isArray(speed) ? speed : [speed];
   };
 
+  // Variant-level default accuracy merged UNDER the per-cell measured accuracy.
+  // GPQA / AIME are model-quality numbers — identical across every cell of a
+  // variant — so they live ONCE in `config.defaultAccuracy[variant]` instead of
+  // being copied onto all ~40 benchmark entries. A per-cell `entry.accuracy`
+  // field still overrides (e.g. a cell-specific gsm8k score). Returns the
+  // merged accuracy object the card + modal both read from.
+  const effectiveAccuracy = (entry, sel) => ({
+    ...((config.defaultAccuracy && config.defaultAccuracy[sel.variant]) || {}),
+    ...((entry && entry.accuracy) || {}),
+  });
+
   // True iff the entry has no numeric content worth rendering. Used to
   // decide between rendering the metric blocks vs the empty-state line.
-  // An entry is "empty" if every speed measurement is null-only AND
-  // accuracy is null-only. The `workload` slot is metadata about the
-  // test conditions (dataset / isl / osl / max_concurrency), not a
-  // measurement — skip it when deciding whether a measurement has
-  // data, otherwise a workload-only stub would falsely suppress the
-  // "pending" empty card.
-  const benchmarkIsEmpty = (entry) => {
-    if (!entry) return true;
-    for (const m of normalizeSpeed(entry.speed)) {
+  // An entry is "empty" if every speed measurement is null-only AND the
+  // (already-merged) `accuracy` is null-only. The `workload` slot is metadata
+  // about the test conditions (dataset / isl / osl / max_concurrency), not a
+  // measurement — skip it when deciding whether a measurement has data,
+  // otherwise a workload-only stub would falsely suppress the "pending" card.
+  const benchmarkIsEmpty = (entry, accuracy) => {
+    for (const m of normalizeSpeed(entry && entry.speed)) {
       if (m && typeof m === "object") {
         for (const [key, v] of Object.entries(m)) {
           if (key === "workload") continue;
@@ -452,8 +512,8 @@ export const Deployment = ({ config, benchmarks }) => {
         }
       }
     }
-    if (entry.accuracy && typeof entry.accuracy === "object") {
-      for (const v of Object.values(entry.accuracy)) {
+    if (accuracy && typeof accuracy === "object") {
+      for (const v of Object.values(accuracy)) {
         if (v !== null && v !== undefined) return false;
       }
     }
@@ -672,6 +732,18 @@ export const Deployment = ({ config, benchmarks }) => {
   // carries only a workload (no measured numbers) doesn't count toward
   // "has data" — the card falls back to the pending empty state when
   // nothing across all measurements has a value.
+  // Accuracy labels. Starts with GSM8K; add new accuracy benchmarks here as
+  // they come online (e.g. MATH, HumanEval). Shared by the benchmark card
+  // (collapses present fields into a row) AND the "⚡ Reproduce" modal (one
+  // chip per present-and-templated field, picking which eval command shows).
+  // Keys must match the `accuracy` field names in the benchmarks file +
+  // `benchmarkCommands.accuracy`.
+  const ACCURACY_LABELS = [
+    ["gpqa_pct",   "GPQA Diamond", "%"],
+    ["aime25_pct", "AIME25",       "%"],
+    ["gsm8k_pct",  "GSM8K (1-shot)", "%"],
+  ];
+
   const renderBenchmarkCard = (entry) => {
     // Speed labels. Four metrics measured per workload: TTFT, TPOT,
     // tokens/sec/GPU (system aggregate), interactivity (per-user
@@ -688,14 +760,6 @@ export const Deployment = ({ config, benchmarks }) => {
           ? Math.round((1000 / m.tpot_ms) * 10) / 10
           : null],
     ];
-    // Accuracy labels. Starts with GSM8K; add new accuracy benchmarks
-    // here as they come online (e.g. MATH, HumanEval). The render
-    // collapses whichever fields are present into a single line, so
-    // partial coverage degrades gracefully.
-    const ACCURACY_LABELS = [
-      ["gsm8k_pct", "GSM8K", "%"],
-    ];
-
     // Workload field keys, in display order. Used both for the shared
     // workload line and to decide column headers via set diff.
     const WORKLOAD_KEYS = ["dataset", "isl", "osl", "max_concurrency"];
@@ -858,18 +922,27 @@ export const Deployment = ({ config, benchmarks }) => {
                rows, colCount: 1 };
     };
 
-    const isEmpty = benchmarkIsEmpty(entry);
+    const accuracy = effectiveAccuracy(entry, sel);
+    const isEmpty = benchmarkIsEmpty(entry, accuracy);
     const measurements = !isEmpty ? normalizeSpeed(entry && entry.speed) : [];
-    const accuracyTable = !isEmpty ? buildAccuracyTable(entry.accuracy) : null;
+    const accuracyTable = !isEmpty ? buildAccuracyTable(accuracy) : null;
     const speedTable = !isEmpty ? buildSpeedTable(measurements) : null;
+    // Show "⚡ Reproduce" only when the cookbook supplied benchmarkCommands AND
+    // there is at least one renderable command for this entry.
+    const hasBenchCmds = !isEmpty && buildBenchCommands(entry, sel) !== null;
 
     return (
       <div style={s.benchCard}>
         <div style={s.benchHeader}>
           <div style={s.benchTitle}>Benchmark</div>
-          {!isEmpty && entry && entry.sglang_version && (
-            <div style={s.benchVersion}>measured on sglang <code>{entry.sglang_version}</code></div>
-          )}
+          <div style={s.benchHeaderRight}>
+            {!isEmpty && entry && entry.sglang_version && (
+              <div style={s.benchVersion}>measured on sglang <code>{entry.sglang_version}</code></div>
+            )}
+            {hasBenchCmds && (
+              <button style={s.iconButton} onClick={() => setModal("bench")}>⚡ Reproduce</button>
+            )}
+          </div>
         </div>
         {isEmpty ? (
           <div style={s.benchEmpty}>
@@ -886,6 +959,76 @@ export const Deployment = ({ config, benchmarks }) => {
         )}
       </div>
     );
+  };
+
+  // Build the data for the "⚡ Reproduce" modal from `config.benchmarkCommands`
+  // + a matched benchmark `entry`. Returns the raw templates + the metadata
+  // the modal needs to fill them (concurrency list, a representative workload,
+  // a per-concurrency num-prompts resolver). The actual {{...}} interpolation
+  // happens in the modal (where `env` is in scope), reusing `interpolate`.
+  //
+  //   accuracy : [{ key, label, template }]  — one per ACCURACY_LABELS field
+  //              that has a value (merged: per-cell `entry.accuracy` over
+  //              `config.defaultAccuracy[variant]`) AND a template. A template
+  //              may be a string OR a `{[variant]: string}` object (resolved by
+  //              `sel.variant`) — used when a command differs per variant.
+  //   speed    : { template, concurrencies[], workload, numPromptsOf(c) }
+  //              or null. `workload` is the first measured workload (dataset/
+  //              isl/osl are uniform across a cell's speed rows; only
+  //              concurrency varies, which is the chip-switched knob).
+  // Returns null when nothing is renderable (caller hides the button).
+  const buildBenchCommands = (entry, sel) => {
+    const bc = config.benchmarkCommands;
+    if (!bc) return null;
+
+    // Accuracy commands run for every eval that has a value (merged: per-cell
+    // override or variant default) AND a template. A template may be a plain
+    // string (variant-agnostic, e.g. gsm8k) OR a `{flash, pro, …}` object
+    // keyed by variant (e.g. GPQA/AIME differ only in --max-tokens per variant).
+    const acc = effectiveAccuracy(entry, sel);
+    const accuracy = [];
+    if (bc.accuracy) {
+      for (const [key, label] of ACCURACY_LABELS) {
+        if (acc[key] == null) continue;
+        const tmpl = bc.accuracy[key];
+        const resolved = (typeof tmpl === "string")
+          ? tmpl
+          : (tmpl && tmpl[sel.variant]) || null;
+        if (resolved) accuracy.push({ key, label, template: resolved });
+      }
+    }
+
+    let speed = null;
+    if (bc.speed && entry) {
+      const ms = normalizeSpeed(entry.speed)
+        .filter((m) => m && m.workload && m.workload.max_concurrency != null);
+      const concurrencies = [...new Set(ms.map((m) => m.workload.max_concurrency))]
+        .sort((a, b) => a - b);
+      if (concurrencies.length) {
+        speed = {
+          template: bc.speed,
+          concurrencies,
+          workload: ms[0].workload,
+          // Resolve {{NUM_PROMPTS}} in priority order, mirroring the
+          // harness's NUM_PROMPTS_BY_CONC lookup with fallback max(c*2, 200):
+          //   1. workload.num_prompts on the matched measurement (per-row
+          //      override — most faithful to what was actually measured)
+          //   2. config.benchmarkCommands.numPromptsByConc[c] (cookbook-wide
+          //      canonical table)
+          //   3. max(c * 2, 200) (sane default when neither is supplied)
+          numPromptsOf: (c) => {
+            const m = ms.find((x) => x.workload.max_concurrency === c);
+            if (m && m.workload.num_prompts != null) return m.workload.num_prompts;
+            const tbl = bc.numPromptsByConc;
+            if (tbl && tbl[c] != null) return tbl[c];
+            return Math.max(c * 2, 200);
+          },
+        };
+      }
+    }
+
+    if (accuracy.length === 0 && !speed) return null;
+    return { accuracy, speed };
   };
 
   const buildHardwareGroups = () => {
@@ -1018,6 +1161,15 @@ export const Deployment = ({ config, benchmarks }) => {
   const [copied, setCopied] = useState(false);
   const [curlCopied, setCurlCopied] = useState(false);
   const [envDraft, setEnvDraft] = useState(env);
+  // "⚡ Reproduce" modal state. Both Speed and Accuracy are chip-selected:
+  //   benchConc — which concurrency the Speed command shows (null → the
+  //               cell's first measured concurrency).
+  //   benchAcc  — which eval the Accuracy command shows (null → first eval).
+  //   benchCopied — which command area last flashed "✓ Copied" ("speed" /
+  //               "acc"). Both stale picks fall back gracefully in the render.
+  const [benchConc, setBenchConc] = useState(null);
+  const [benchAcc, setBenchAcc] = useState(null);
+  const [benchCopied, setBenchCopied] = useState(null);
   // Output framing: "python" emits a bare `sglang serve ...`, "docker" wraps
   // the same args in `docker run` against the per-hardware image. The Copy /
   // cURL / Env buttons all behave identically — the toggle only changes the
@@ -1034,6 +1186,10 @@ export const Deployment = ({ config, benchmarks }) => {
   const modelName = resolveModelName(sel);
   const curlText = interpolate(config.curl || "", env, modelName);
   const hwGroups = buildHardwareGroups();
+  // Matched benchmark entry for the current selection (null when no
+  // `benchmarks` prop or no entry). Computed once; reused by both the
+  // benchmark card and the "⚡ Reproduce" modal.
+  const benchEntry = benchmarks ? findBenchmark(benchmarks, sel) : null;
 
   const isEnabled = (dim, value) => isOptionAvailable(config.cells, sel, dim, value);
 
@@ -1050,6 +1206,13 @@ export const Deployment = ({ config, benchmarks }) => {
     navigator.clipboard.writeText(curlText);
     setCurlCopied(true);
     setTimeout(() => setCurlCopied(false), 1200);
+  };
+  // Per-block copy for the "⚡ Reproduce" modal — `key` identifies which block
+  // flashed "✓ Copied" (so only that block's button changes label).
+  const copyBench = (key, text) => {
+    navigator.clipboard.writeText(text);
+    setBenchCopied(key);
+    setTimeout(() => setBenchCopied(null), 1200);
   };
 
   // Group placeholders by `target` for the Env modal.
@@ -1172,7 +1335,7 @@ export const Deployment = ({ config, benchmarks }) => {
           renderBenchmarkCard the empty-state path covers "match exists
           but no measured numbers yet" — so cookbooks can ship the file
           with placeholder entries and the card stays useful. */}
-      {benchmarks && cell && renderBenchmarkCard(findBenchmark(benchmarks, sel))}
+      {benchmarks && cell && renderBenchmarkCard(benchEntry)}
 
       {/* Playground link. scrollIntoView (instead of an href anchor) so the
           URL hash — which carries the Deploy panel's selection — isn't
@@ -1289,6 +1452,125 @@ export const Deployment = ({ config, benchmarks }) => {
           </div>
         </div>
       )}
+
+      {/* "⚡ Reproduce" modal — benchmark commands for the current selection.
+          Accuracy: one command per present-and-templated eval. Speed: ONE
+          command, with concurrency chips that rewrite --max-concurrency /
+          --num-prompts. Fill reuses `interpolate` (same machinery as cURL);
+          speed merges the picked workload values into the env map. */}
+      {modal === "bench" && benchEntry && (() => {
+        const bc = buildBenchCommands(benchEntry, sel);
+        if (!bc) return null;
+        const selSummary =
+          `${sel.hw.toUpperCase()} · ${sel.variant} · ${sel.quant.toUpperCase()} · ${sel.strategy} · ${sel.nodes}`;
+        let selConc = null;
+        let speedCmd = null;
+        if (bc.speed) {
+          selConc = bc.speed.concurrencies.includes(benchConc)
+            ? benchConc : bc.speed.concurrencies[0];
+          const w = bc.speed.workload;
+          speedCmd = interpolate(bc.speed.template, {
+            ...env,
+            DATASET: w.dataset,
+            ISL: w.isl,
+            OSL: w.osl,
+            MAX_CONCURRENCY: selConc,
+            NUM_PROMPTS: bc.speed.numPromptsOf(selConc),
+          }, modelName);
+        }
+        // Accuracy is chip-selected too — chips swap WHICH eval template shows.
+        // Same stale-pick fallback as Speed (a benchAcc carried over from a
+        // cell that doesn't have that eval falls back to the first one here).
+        let selAcc = null;
+        let accCmd = null;
+        if (bc.accuracy.length > 0) {
+          selAcc = bc.accuracy.find((a) => a.key === benchAcc) || bc.accuracy[0];
+          accCmd = interpolate(selAcc.template, env, modelName);
+        }
+        return (
+          <div style={s.modalBackdrop} onClick={() => setModal(null)}>
+            <div style={s.modalBox} onClick={(e) => e.stopPropagation()}>
+              <div style={s.modalHeader}>
+                <div style={s.modalTitle}>Benchmark commands</div>
+                <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
+              </div>
+              <p style={{ fontSize: 11, opacity: 0.7, margin: "0 0 12px" }}>
+                For <code>{selSummary}</code>. Start the server with the Deploy command above, then run these against it.
+              </p>
+
+              {selAcc && (
+                <div>
+                  <div style={s.sectionHeading}>Accuracy</div>
+                  {bc.accuracy.length > 1 && (
+                    <div style={s.benchChipRow}>
+                      <span style={{ fontSize: 11, opacity: 0.7 }}>benchmark:</span>
+                      {bc.accuracy.map((a) => (
+                        <button
+                          key={a.key}
+                          style={{ ...s.benchChip, ...(a.key === selAcc.key ? s.benchChipActive : {}) }}
+                          onClick={() => setBenchAcc(a.key)}
+                        >
+                          {a.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ ...s.commandWrap, marginBottom: 6 }}>
+                    <div style={s.commandHeader}>
+                      <div style={{ fontSize: 11, opacity: 0.7 }}>{selAcc.label}</div>
+                      <button style={s.iconButton} onClick={() => copyBench("acc", accCmd)}>
+                        {benchCopied === "acc" ? "✓ Copied" : "⧉ Copy"}
+                      </button>
+                    </div>
+                    <pre style={s.commandPre}>{accCmd}</pre>
+                  </div>
+                  {bc.accuracy.length > 1 && (
+                    <p style={{ fontSize: 11, opacity: 0.7, margin: "0 0 4px" }}>
+                      Switch the benchmark chip to see each eval's command.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {bc.speed && (
+                <div>
+                  <div style={s.sectionHeading}>Speed</div>
+                  {bc.speed.concurrencies.length > 1 && (
+                    <div style={s.benchChipRow}>
+                      <span style={{ fontSize: 11, opacity: 0.7 }}>max-concurrency:</span>
+                      {bc.speed.concurrencies.map((c) => (
+                        <button
+                          key={c}
+                          style={{ ...s.benchChip, ...(c === selConc ? s.benchChipActive : {}) }}
+                          onClick={() => setBenchConc(c)}
+                        >
+                          {c}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ ...s.commandWrap, marginBottom: 6 }}>
+                    <div style={s.commandHeader}>
+                      <div style={{ fontSize: 11, opacity: 0.7 }}>max-concurrency = {selConc}</div>
+                      <button style={s.iconButton} onClick={() => copyBench("speed", speedCmd)}>
+                        {benchCopied === "speed" ? "✓ Copied" : "⧉ Copy"}
+                      </button>
+                    </div>
+                    <pre style={s.commandPre}>{speedCmd}</pre>
+                  </div>
+                  <p style={{ fontSize: 11, opacity: 0.7, margin: "0 0 4px" }}>
+                    One command — switch the concurrency chip (or edit <code>--max-concurrency</code>) to reproduce each Speed column.
+                  </p>
+                </div>
+              )}
+
+              <p style={{ fontSize: 11, opacity: 0.7, marginTop: 12 }}>
+                Edit <code>CURL_HOST</code> / <code>CURL_PORT</code> in the Env panel.
+              </p>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

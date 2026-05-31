@@ -76,6 +76,104 @@ export const config = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
+  // Commands that reproduce the numbers in the Benchmark card. Surfaced by
+  // the card's "⚡ Reproduce" button → modal. Optional (like `benchmarks`);
+  // drop it and the button disappears. These mirror the ACTUAL commands the
+  // harness ran (see `cookbook-benchmark/gen_cookbook_configs.py`
+  // `build_bench_cmd`) — running them against a server started with the
+  // Deploy command above reproduces the rendered numbers.
+  //
+  // The engine fills templates with the SAME placeholder machinery as `curl`:
+  // {{MODEL_NAME}} from `modelNames`, {{CURL_HOST}}/{{CURL_PORT}} from the
+  // Env panel. For `speed` it ALSO injects per-measurement values from each
+  // cell's `speed[].workload`: {{DATASET}} / {{ISL}} / {{OSL}} (uniform
+  // across a cell's rows) plus the user-picked {{MAX_CONCURRENCY}} and a
+  // {{NUM_PROMPTS}} resolved as
+  //   workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)
+  // (same fallback path as the harness's NUM_PROMPTS_BY_CONC lookup).
+  benchmarkCommands: {
+    // ONE speed command, reused across the cell's measured concurrencies —
+    // only --max-concurrency / --num-prompts change (chip-switched in the UI).
+    // Mirrors the harness command verbatim (sglang.bench_serving with
+    // --output-file capturing the jsonl summary). Flags verified against
+    // python/sglang/bench_serving.py.
+    speed:
+`python3 -m sglang.bench_serving \\
+  --backend sglang \\
+  --host {{CURL_HOST}} --port {{CURL_PORT}} \\
+  --model {{MODEL_NAME}} \\
+  --dataset-name {{DATASET}} \\
+  --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
+    // ONE command per accuracy benchmark, keyed by the SAME field name used in
+    // ACCURACY_LABELS (_deployment.jsx) + the entry/defaultAccuracy values.
+    // A template is EITHER a plain string (variant-agnostic, e.g. gsm8k) OR a
+    // `{flash, pro}` object keyed by variant — GPQA/AIME share one shape and
+    // differ only in --max-tokens (Flash 200000 / Pro 400000). The modal shows
+    // a chip per eval that has a value AND a template. All use sgl-eval against
+    // the v1 OpenAI route; {{MODEL_NAME}} resolves to the served model.
+    accuracy: {
+      gsm8k_pct:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gsm8k \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --num-threads 32`,
+      gpqa_pct: {
+        flash:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 200000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+        pro:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 400000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+      },
+      aime25_pct: {
+        flash:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run aime25 \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 200000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+        pro:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run aime25 \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 400000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+      },
+    },
+    // Canonical num-prompts per measured concurrency, mirroring the harness's
+    // NUM_PROMPTS_BY_CONC table in gen_cookbook_configs.py. Engine uses these
+    // when a workload entry doesn't carry its own `num_prompts`, with the same
+    // fallback the harness uses for unlisted concurrencies: max(c*2, 200).
+    numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
+  },
+
+  // Model-level accuracy that applies to EVERY cell of a variant. GPQA Diamond
+  // and AIME25 are model-quality numbers (hardware-/strategy-independent), so
+  // they live here once — keyed by variant id — instead of being copied onto
+  // all 43 benchmark entries. The engine merges this UNDER each cell's measured
+  // `accuracy` (a per-cell value, e.g. a specific gsm8k score, still wins). Add
+  // a variant key for each `variants[]` id; add a `<bench>_pct` field per eval
+  // (must match a key in ACCURACY_LABELS + benchmarkCommands.accuracy).
+  defaultAccuracy: {
+    flash: { gpqa_pct: 88.1, aime25_pct: 95,   gsm8k_pct: 96.13 },
+    pro:   { gpqa_pct: 90.1, aime25_pct: 97.5, gsm8k_pct: 96.13 },
+  },
+
   multiNodeHints: {
     h100: [
       "The following env vars may be needed depending on your cluster:",

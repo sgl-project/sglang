@@ -15,13 +15,18 @@
 //     sglang_version:  string,                                       // card header
 //     speed: [
 //       {
-//         workload: { dataset, isl, osl, max_concurrency },          // structured
+//         workload: { dataset, isl, osl, max_concurrency,            // structured
+//                     num_prompts? },                                //   (num_prompts optional)
 //         ttft_ms, tpot_ms, tokens_per_sec_per_gpu,                  // measured
 //       },                                                           // one entry per
 //       ...                                                          //   workload (typically
 //                                                                    //   varying max-concurrency
 //                                                                    //   for a Pareto sweep)
 //     ],
+//     // `workload.num_prompts` is optional: it ONLY feeds the "⚡ Reproduce"
+//     // modal's speed command (config.benchmarkCommands). When absent the
+//     // engine derives {{NUM_PROMPTS}} = max_concurrency * 10. It does not
+//     // affect the rendered numbers table.
 //     accuracy: { gsm8k_pct, ... },                                  // extensible — add
 //                                                                    //   more keys when new
 //                                                                    //   accuracy benches land
@@ -200,7 +205,6 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
         ttft_ms: 3995, tpot_ms: 82.56, tokens_per_sec_per_gpu: 718 },
     ],
-    accuracy: { gsm8k_pct: 99 },
   },
   {
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
@@ -211,7 +215,6 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
         ttft_ms: 330479, tpot_ms: 86.7, tokens_per_sec_per_gpu: 741 },
     ],
-    accuracy: { gsm8k_pct: 98 },
   },
   {
     match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },

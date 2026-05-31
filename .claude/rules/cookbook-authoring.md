@@ -112,6 +112,8 @@ and any non-literal value crashes with `ReferenceError`.
 | `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). |
 | `dockerImages` | `{[hwId]: string}` | Per-hw image name for `docker run` framing. Falls back to `lmsysorg/sglang:dev` if missing. |
 | `playgroundFeatures` | `{[axisId]: {...}}` | Opts into the Playground widget. See §2.3. |
+| `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. Optional; the button only appears when this AND `benchmarks` are present. |
+| `defaultAccuracy` | `{[variant]: {[accKey]: number}}` | Model-level accuracy applied to **every** cell of a variant (e.g. GPQA Diamond / AIME25 — hardware-independent). Merged UNDER each cell's measured `accuracy` (a per-cell value wins), so you set a variant's score once instead of copying it onto every benchmark entry. Keys must match `ACCURACY_LABELS` + `benchmarkCommands.accuracy`. |
 | `github` | `{owner?, repo?, issueTemplate?, cookbookModel?}` | Overrides for the "Submit verified cell" CTA in the playground. Defaults: `sgl-project/sglang` + `3-playground-verified-cell.yml` + `"deepseek-ai/deepseek-v4"`. Set `cookbookModel` to the value that matches the `model` dropdown in your issue template so it's pre-selected when the issue opens. |
 
 ### 2.2 Author the 5-dim matrix (`cells[]`)
@@ -240,6 +242,13 @@ The `benchmarks` prop is **optional**. It points at a sibling
 box; omit the import and the prop if the cookbook has no measured numbers
 yet. See the `_deployment.jsx` header and `deepseek-v4-benchmarks.jsx` for
 the full speed/accuracy schema.
+
+To let users *reproduce* those numbers, add a `benchmarkCommands` block to
+the config (§2.1, next to `curl`). When present alongside `benchmarks`, the
+benchmark card grows a **"⚡ Reproduce"** button that opens a modal listing
+the runnable commands for the current cell — one `bench_serving` command for
+Speed (with concurrency chips that rewrite `--max-concurrency`) plus an
+Accuracy command with a chip per eval. No separate benchmark section needed.
 
 ### 2.5 Verify
 
