@@ -101,6 +101,7 @@ class CanaryManager:
         )
         self._perturb_manager = PerturbManager(
             config=perturb_config,
+            req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
             outer_step_counter_getter=self._get_outer_step_counter,
             swa_window_size=self._swa_window_size,
@@ -205,6 +206,9 @@ class CanaryManager:
     ) -> None:
         for idx in single_forward_indices:
             self._single_forward_managers[idx].post_ops_outside_graph()
+        self._perturb_manager.perturb_post_forward(
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+        )
         self._sweep_orchestrator.maybe_run_sweep()
         self._outer_step_counter += 1
         self._violation_manager.step()
