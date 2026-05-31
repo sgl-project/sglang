@@ -120,6 +120,7 @@ RAW_RGB_FRAMES_PER_WS_MESSAGE = 3
 WEBP_DEFAULT_QUALITY = 90
 JPEG_DEFAULT_QUALITY = 95
 JPEG_SUBSAMPLING = 0
+RAW_LOSSLESS_OUTPUT_FORMAT = "raw"
 ENCODED_PREVIEW_FORMATS = {"webp", "jpeg"}
 
 
@@ -267,6 +268,16 @@ class RawRGBRealtimeOutputAdapter:
                     payload_metadata = {
                         "format": output_format,
                         "encoding": output_format,
+                    }
+                elif (
+                    output_format == RAW_LOSSLESS_OUTPUT_FORMAT
+                    and content_type == RAW_RGB_CONTENT_TYPE
+                    and transport_frames
+                ):
+                    raw_payload = b"".join(transport_frames)
+                    payload_metadata = {
+                        "raw_size": len(raw_payload),
+                        "encoding": RAW_LOSSLESS_OUTPUT_FORMAT,
                     }
                 elif content_type == RAW_RGB_CONTENT_TYPE and transport_frames:
                     reference_frame = self._last_raw_rgb_frame

@@ -560,6 +560,16 @@ def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():
     assert state.sample_camera_actions(3) == [["s"], ["s"], ["s"]]
 
 
+def test_realtime_video_request_accepts_raw_lossless_output_format():
+    request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="walk forward",
+        realtime_output_format="raw",
+    )
+
+    assert request.realtime_output_format == "raw"
+
+
 def test_lingbot_realtime_adapter_does_not_wait_for_idle_chunks():
     async def run():
         adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
@@ -1267,6 +1277,57 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
         num_frames=2,
     )
     assert restored == expected_frames
+
+
+def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
+    class _WebSocket:
+        def __init__(self):
+            self.payloads = []
+
+        async def send_bytes(self, payload):
+            self.payloads.append(payload)
+
+    async def run():
+        ws = _WebSocket()
+        adapter = RawRGBRealtimeOutputAdapter()
+        frame0 = bytes([1, 2, 3]) * 1000
+        frame1 = bytes([1, 2, 4]) * 1000
+        batch = SimpleNamespace(
+            block_idx=0,
+            request_id="req-raw",
+            width=1000,
+            height=1,
+            enable_upscaling=False,
+            realtime_event_id=3,
+            realtime_output_format="raw",
+        )
+        result = OutputBatch(
+            raw_frame_batches=[[frame0, frame1]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata={
+                "format": "rgb24",
+                "width": 1000,
+                "height": 1,
+                "channels": 3,
+                "bytes_per_frame": 3000,
+            },
+        )
+
+        stats = await adapter.send(ws, SimpleNamespace(), result, batch)
+        return ws.payloads, stats, frame0 + frame1
+
+    payloads, stats, expected_frames = asyncio.run(run())
+
+    from msgpack import unpackb
+
+    header = unpackb(payloads[0], raw=False)
+    assert header["content_type"] == RAW_RGB_CONTENT_TYPE
+    assert header["encoding"] == "raw"
+    assert header["raw_size"] == 6000
+    assert header["total_size"] == 6000
+    assert payloads[1] == expected_frames
+    assert stats["raw_bytes"] == 6000
+    assert stats["ws_payload_bytes"] == 6000 + len(payloads[0])
 
 
 def test_raw_rgb_realtime_output_adapter_uses_previous_frame_reference():
