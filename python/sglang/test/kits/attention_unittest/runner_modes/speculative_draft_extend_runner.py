@@ -226,10 +226,12 @@ def _make_eagle_draft_extend_v2_input(case, batch, *, device: str):
 
 
 def _set_draft_extend_v2_prefix_lens(batch, case, *, device: str):
-    prefix_lens = torch.tensor(case.prefix_lens, dtype=torch.int32, device=device)
-    batch.seq_lens = prefix_lens
-    batch.seq_lens_cpu = torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu")
-    batch.seq_lens_sum = sum(case.prefix_lens)
+    # Production sets seq_lens = prefix + extend before init_forward_metadata
+    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
+    seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
+    batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
+    batch.seq_lens_sum = sum(seq_lens)
 
 
 def _prepare_draft_extend_batch(
@@ -1415,9 +1417,12 @@ def _set_draft_extend_v2_prefix_lens(
     *,
     device: str,
 ) -> None:
-    batch.seq_lens = torch.tensor(case.prefix_lens, dtype=torch.int32, device=device)
-    batch.seq_lens_cpu = torch.tensor(case.prefix_lens, dtype=torch.int32, device="cpu")
-    batch.seq_lens_sum = sum(case.prefix_lens)
+    # Production sets seq_lens = prefix + extend before init_forward_metadata
+    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
+    seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
+    batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
+    batch.seq_lens_sum = sum(seq_lens)
 
 
 def _make_dense_eagle_draft_extend_forward_batch(
