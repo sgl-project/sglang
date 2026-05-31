@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     ComponentType,
     EvictLayer,
     FullComponent,
+    LRURefreshPhase,
     MambaComponent,
     SWAComponent,
     TreeComponent,
@@ -797,7 +798,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
-            comp.refresh_lru_on_match_end(node_update, self.root_node)
+            comp.refresh_lru(
+                LRURefreshPhase.MATCH_END, node_update, self.root_node
+            )
 
         cur_time = get_and_increase_time_counter()
         while node_update:
@@ -874,7 +877,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for comp in self._components_tuple:
                 if comp.component_type == BASE_COMPONENT_TYPE:
                     continue
-                comp.refresh_lru_on_walkdown(node)
+                comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
     def _add_new_node(
         self,
@@ -1009,7 +1012,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for component in self._components_tuple:
                 if component.component_type == BASE_COMPONENT_TYPE:
                     continue
-                component.refresh_lru_on_insert_end(target_node, self.root_node)
+                component.refresh_lru(
+                    LRURefreshPhase.INSERT_END, target_node, self.root_node
+                )
 
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)

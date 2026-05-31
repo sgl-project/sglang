@@ -1149,7 +1149,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(pre), 4)
         side_node, c_node, b_node, a_node = pre
 
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_abc)))
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
         self.assertEqual(len(m.device_indices), len(seq_abc))
 
         post = self._swa_lru_order(tree)
@@ -1184,15 +1184,19 @@ class UnifiedRadixCacheSuite:
         seq_side = self._make_seq(900, 5)
         self._insert(tree, allocator, req_to_token_pool, seq_side)
 
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_abc)))
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
         self.assertEqual(len(m.device_indices), len(seq_abc))
 
-        m_side_before = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_side)))
+        m_side_before = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_side)))
+        )
         self.assertEqual(len(m_side_before.device_indices), len(seq_side))
 
         tree.evict(EvictParams(num_tokens=0, swa_num_tokens=self.cfg.page_size))
 
-        m_side_after = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_side)))
+        m_side_after = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_side)))
+        )
         self.assertEqual(
             len(m_side_after.device_indices),
             len(seq_side),
@@ -1220,7 +1224,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(pre), 4)
         side_node, c_node, b_node, a_node = pre
 
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_abc)))
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
         self.assertEqual(len(m.device_indices), len(seq_abc))
         post = self._swa_lru_order(tree)
 
@@ -1249,7 +1253,9 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, self._make_seq(900, 5))
 
         for _ in range(3):
-            m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_abc)))
+            m = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq_abc)))
+            )
             self.assertEqual(len(m.device_indices), len(seq_abc))
             tree.sanity_check()
 

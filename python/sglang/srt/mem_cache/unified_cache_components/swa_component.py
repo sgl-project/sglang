@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, override
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LRURefreshPhase,
     TreeComponent,
     next_component_uuid,
 )
@@ -60,28 +61,31 @@ class SWAComponent(TreeComponent):
             full_indices
         )
 
-    def refresh_lru_on_walkdown(self, node: UnifiedTreeNode) -> None:
-        return
-
-    def _bounded_refresh(
-        self, last_node: UnifiedTreeNode, root_node: UnifiedTreeNode
+    @override
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
     ) -> None:
-        self.cache.lru_lists[self.component_type].reset_node_and_window_ancestors_mru(
-            last_node,
-            root_node,
-            self.sliding_window_size + self.cache.page_size,
-            self.node_has_component_data,
-        )
-
-    def refresh_lru_on_match_end(
-        self, last_node: UnifiedTreeNode, root_node: UnifiedTreeNode
-    ) -> None:
-        self._bounded_refresh(last_node, root_node)
-
-    def refresh_lru_on_insert_end(
-        self, target_node: UnifiedTreeNode, root_node: UnifiedTreeNode
-    ) -> None:
-        self._bounded_refresh(target_node, root_node)
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                # Walk-down would refresh every visited ancestor to MRU,
+                # but most are outside the active sliding window and must
+                # stay evictable. Window-bounded refresh runs at
+                # MATCH_END / INSERT_END instead.
+                return
+            case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
+                self.cache.lru_lists[
+                    self.component_type
+                ].reset_node_and_window_ancestors_mru(
+                    node,
+                    root_node,
+                    self.sliding_window_size + self.cache.page_size,
+                    self.node_has_component_data,
+                )
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type
