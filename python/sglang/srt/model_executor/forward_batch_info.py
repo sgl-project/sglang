@@ -558,22 +558,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        ret._maybe_init_prefill_only(batch)
+        ret._maybe_init_embedding_mode_fields(batch)
 
         device = model_runner.device
-
-        # Cross-encoder token_type_ids: gather from reqs and H2D on the forward
-        # stream. Built here (not in ScheduleBatch) so SB carries no
-        # forward-only device tensor; consumed by bert/roberta/transformers.
-        token_type_ids = [
-            r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
-        ]
-        if token_type_ids:
-            ret.token_type_ids = torch.tensor(
-                sum(token_type_ids, []),
-                dtype=torch.int64,
-                pin_memory=is_pin_memory_available(device),
-            ).to(device, non_blocking=True)
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -690,37 +677,56 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         return ret
 
-    def _maybe_init_prefill_only(self, batch: ScheduleBatch):
-        """Derive per-request fields from ``batch.reqs`` for non-generation
-        (embedding / reward / scoring) forwards; a no-op otherwise."""
-        if not self.is_prefill_only:
-            return
+    def _maybe_init_embedding_mode_fields(self, batch: ScheduleBatch):
+        """Derive per-request fields for embedding-mode (max_new_tokens==0)
+        forwards from ``batch.reqs``. Two independent parts, each with its own
+        gate:
 
-        if batch.model_config.is_matryoshka and any(
-            r.dimensions is not None for r in batch.reqs
-        ):
-            self.dimensions = [
-                r.dimensions if r.dimensions else batch.model_config.hidden_size
-                for r in batch.reqs
-            ]
+        - Pooling fields (dimensions / return_pooled_hidden_states / MIS
+          delimiter indices): gated on ``is_prefill_only`` (the spec-disabled
+          subset of embedding mode); a missing value is a harmless default.
+        - Cross-encoder ``token_type_ids``: gated on presence in reqs, NOT on
+          ``is_prefill_only`` -- a missing tensor makes bert/roberta silently
+          fall back to zeros, so we key on the actual data. Built here (not in
+          ScheduleBatch) so SB carries no forward-only device tensor; consumed
+          by bert/roberta/transformers.
+        """
+        if self.is_prefill_only:
+            if batch.model_config.is_matryoshka and any(
+                r.dimensions is not None for r in batch.reqs
+            ):
+                self.dimensions = [
+                    r.dimensions if r.dimensions else batch.model_config.hidden_size
+                    for r in batch.reqs
+                ]
 
-        self.return_pooled_hidden_states = any(
-            r.return_pooled_hidden_states for r in batch.reqs
-        )
+            self.return_pooled_hidden_states = any(
+                r.return_pooled_hidden_states for r in batch.reqs
+            )
 
-        # --enable-mis: every request must carry delimiter indices (the score
-        # endpoint always produces MIS-structured requests; consumers index
-        # without None-checking).
-        if get_global_server_args().enable_mis and any(
-            r.multi_item_delimiter_indices is not None for r in batch.reqs
-        ):
-            assert all(
+            # --enable-mis: every request must carry delimiter indices (the score
+            # endpoint always produces MIS-structured requests; consumers index
+            # without None-checking).
+            if get_global_server_args().enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
-            ), "MIS batch must have delimiter indices on every request"
-            self.multi_item_delimiter_indices = [
-                torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
-                for r in batch.reqs
-            ]
+            ):
+                assert all(
+                    r.multi_item_delimiter_indices is not None for r in batch.reqs
+                ), "MIS batch must have delimiter indices on every request"
+                self.multi_item_delimiter_indices = [
+                    torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
+                    for r in batch.reqs
+                ]
+
+        token_type_ids = [
+            r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
+        ]
+        if token_type_ids:
+            self.token_type_ids = torch.tensor(
+                sum(token_type_ids, []),
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(batch.device),
+            ).to(batch.device, non_blocking=True)
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
