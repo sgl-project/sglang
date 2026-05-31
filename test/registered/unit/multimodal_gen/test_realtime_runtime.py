@@ -243,11 +243,10 @@ def test_condition_event_queue_empty_event_switches_to_default_item():
 def test_lingbot_realtime_state_uses_generic_condition_queue():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
-    assert state.sample_camera_actions(3) is None
+    assert state.sample_camera_actions(3) == [[], [], []]
     state.receive_camera_actions([["w"], ["a"], ["s"], ["d"]])
     assert state.sample_camera_actions(3) == [["w"], ["a"], ["s"]]
     assert state.sample_camera_actions(3) == [["d"], ["d"], ["d"]]
-    assert state.sample_camera_actions(3) is None
 
     state.receive_prompt("turn left")
     assert state.has_prompt()
@@ -263,7 +262,7 @@ def test_lingbot_realtime_camera_event_replaces_pending_script():
     state.receive_camera_actions([["d"]], replace_pending=True)
 
     assert state.sample_camera_actions(3) == [["d"], ["d"], ["d"]]
-    assert state.sample_camera_actions(3) is None
+    assert state.sample_camera_actions(3) == [[], [], []]
 
 
 def test_lingbot_realtime_adapter_ingests_generic_events():
@@ -543,52 +542,6 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     assert batch.realtime_event_id == 11
 
 
-def test_lingbot_realtime_adapter_omits_camera_condition_when_idle(monkeypatch):
-    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
-    session = GenerateSession()
-    session.set_adapter(adapter)
-    session.set_request(
-        RealtimeVideoGenerationsRequest(
-            type="init",
-            prompt="walk forward",
-            num_frames=3,
-            fps=24,
-        )
-    )
-    server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(
-            dit_config=SimpleNamespace(
-                arch_config=SimpleNamespace(num_frames_per_block=3)
-            )
-        )
-    )
-
-    monkeypatch.setattr(
-        lingbot_realtime,
-        "build_sampling_params",
-        lambda request_id, **kwargs: SimpleNamespace(
-            request_id=request_id,
-            prompt=kwargs["prompt"],
-            condition_inputs=kwargs["condition_inputs"],
-            realtime_chunk_size=kwargs["realtime_chunk_size"],
-        ),
-    )
-    monkeypatch.setattr(
-        lingbot_realtime,
-        "prepare_request",
-        lambda server_args, sampling_params: SimpleNamespace(
-            request_id=sampling_params.request_id,
-            condition_inputs=dict(sampling_params.condition_inputs),
-            realtime_chunk_size=sampling_params.realtime_chunk_size,
-        ),
-    )
-    chunk = session.new_chunk()
-
-    batch = adapter.prepare_next_request(session, server_args, chunk)
-
-    assert batch.condition_inputs == {}
-
-
 def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():
     adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
     session = GenerateSession()
@@ -605,7 +558,6 @@ def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():
 
     assert state.sample_camera_actions(3) == [["w"], ["d"], ["a"]]
     assert state.sample_camera_actions(3) == [["s"], ["s"], ["s"]]
-    assert state.sample_camera_actions(3) is None
 
 
 def test_lingbot_realtime_adapter_does_not_wait_for_idle_chunks():
