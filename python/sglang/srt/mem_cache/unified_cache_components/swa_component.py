@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional, override
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -61,7 +61,6 @@ class SWAComponent(TreeComponent):
             full_indices
         )
 
-    @override
     def refresh_lru(
         self,
         phase: LRURefreshPhase,
