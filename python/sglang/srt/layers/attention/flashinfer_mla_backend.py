@@ -384,7 +384,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+        seq_lens_sum = seq_lens.sum().item()
+        seq_lens_cpu = seq_lens.cpu()
+
         if forward_mode.is_decode_or_idle():
+            # Decode: create wrapper, run the initial full begin_forward (False),
+            # then install the fast plan.  After that, call replay so the
+            # data-update path (update(True)) is also exercised during capture.
             decode_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
                 use_cuda_graph=True,
@@ -394,8 +400,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_len_arr=self.cuda_graph_kv_lens[:num_tokens],
                 backend="auto",
             )
-
-            seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
                 req_pool_indices,
                 seq_lens,
@@ -406,8 +410,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrapper
             self.forward_metadata = DecodeMetadata(decode_wrapper)
+            # fast_mla_decode_plan requires _cached_module set by the initial
+            # begin_forward above; install it only after that call completes.
             decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            # Prefill: create wrapper and store — replay handles the update call.
             prefill_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
                 use_cuda_graph=True,
@@ -417,20 +424,21 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_len_arr=self.cuda_graph_kv_lens[:bs],
                 backend="auto",
             )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=prefill_wrapper,
-                use_ragged=False,
-                spec_info=spec_info,
-            )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrapper
             self.forward_metadata = PrefillMetadata(prefill_wrapper, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
+
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,

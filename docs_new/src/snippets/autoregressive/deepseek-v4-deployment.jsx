@@ -119,14 +119,22 @@ export const DeepSeekV4Deployment = () => {
   const MARLIN_EFFHW = new Set(["h200-fp4", "h100"]);
   const MARLIN_LABEL = { "h200-fp4": "H200 (FP4)", h100: "H100 (FP4)" };
 
-  // MegaMoE is only supported on Blackwell with DeepEP-based recipes
-  // (balanced / max-throughput / pd-disagg). It's disabled on Hopper
-  // (H100 / H200, both FP4 and FP8) and on low-latency / cp recipes.
-  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "cp"]);
+  // MegaMoE is only wired into the max-throughput recipe on Blackwell.
+  // Disabled on Hopper (H100 / H200, both FP4 and FP8), on
+  // low-latency / balanced / cp recipes, and on PD-Disagg (the cookbook's
+  // PD command builder doesn't emit the megamoe backend / env vars yet).
+  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "balanced", "cp", "pd-disagg"]);
   const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200"]);
   const isMegamoeUnsupported = (vals) =>
     MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
     MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe);
+
+  // HiCache works on PD-Disagg in SGLang itself (prefill worker only, per
+  // mooncake_store/README.md), but the cookbook generator doesn't yet emit
+  // the hicache flags into buildPDDisaggCommand. Grey it out for now.
+  const HICACHE_UNSUPPORTED_RECIPES = new Set(["pd-disagg"]);
+  const isHicacheUnsupported = (vals) =>
+    HICACHE_UNSUPPORTED_RECIPES.has(vals.recipe);
 
   // H100 + SGLang FP8 only ships a Flash variant — Pro FP8 on H100 isn't
   // covered by the generator yet, so the Pro radio is greyed out there.
@@ -155,9 +163,18 @@ export const DeepSeekV4Deployment = () => {
     if (option.name === "megamoe" && vals && isMegamoeUnsupported(vals)) {
       const reason = MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware)
         ? "MegaMoE is only supported on Blackwell"
+        : vals.recipe === "pd-disagg"
+        ? "MegaMoE is not yet wired into the PD-Disagg cookbook command"
         : "MegaMoE is not supported on this recipe";
       return option.items.map((it) =>
         it.id === "disabled" ? it : { ...it, disabled: true, disabledReason: reason }
+      );
+    }
+    if (option.name === "hicache" && vals && isHicacheUnsupported(vals)) {
+      return option.items.map((it) =>
+        it.id === "disabled"
+          ? it
+          : { ...it, disabled: true, disabledReason: "HiCache is not yet wired into the PD-Disagg cookbook command" }
       );
     }
     if (option.name === "quantization" && vals && !FP8_SUPPORTED_HARDWARE.has(vals.hardware)) {
@@ -248,6 +265,15 @@ export const DeepSeekV4Deployment = () => {
         isMegamoeUnsupported(next)
       ) {
         next.megamoe = "disabled";
+      }
+      // Switching to a recipe that doesn't support HiCache (pd-disagg) while
+      // L2 is selected: fall back to disabled.
+      if (
+        optionName === "recipe" &&
+        next.hicache !== "disabled" &&
+        isHicacheUnsupported(next)
+      ) {
+        next.hicache = "disabled";
       }
       // Switching to max-throughput on supported hardware: default MegaMoE to
       // W4A8 if it's currently disabled (best throughput config).
@@ -488,7 +514,14 @@ export const DeepSeekV4Deployment = () => {
         fp4Flags.push("  --speculative-eagle-topk 1");
         fp4Flags.push("  --speculative-num-draft-tokens 2");
       }
-      if (isBig) fp4Flags.push("  --mem-fraction-static 0.88");
+      // H200 Pro (FP4) low-latency runs MTP 3/1/4 with flashinfer_mxfp4, which
+      // needs more headroom for the draft model + MTP buffers than the
+      // balanced / max-throughput recipes — drop mem-frac to 0.83.
+      if (isBig) {
+        fp4Flags.push(recipe === "low-latency"
+          ? "  --mem-fraction-static 0.83"
+          : "  --mem-fraction-static 0.88");
+      }
       if (toolcall === "enabled") fp4Flags.push("  --tool-call-parser deepseekv4");
       if (reasoningParser === "enabled") fp4Flags.push("  --reasoning-parser deepseek-v4");
       if (hicache === "l2") {
@@ -762,8 +795,12 @@ export const DeepSeekV4Deployment = () => {
       flags.push(`  --tp ${tp}`);
       if (multinode) flags.push(...multiNodeFlags(nnodes));
       flags.push("  --moe-a2a-backend deepep");
-      flags.push("  --enable-dsa-prefill-context-parallel");
-      flags.push("  --dsa-prefill-cp-mode round-robin-split");
+      // PR #25821 (merged 2026-05-20) renamed these flags from --enable-nsa-* /
+      // --nsa-prefill-cp-mode to --enable-dsa-* / --dsa-prefill-cp-mode. The
+      // :latest release image predates that PR, so we emit the old nsa-* names
+      // here and surface a note above the command for main-branch users.
+      flags.push("  --enable-nsa-prefill-context-parallel");
+      flags.push("  --nsa-prefill-cp-mode round-robin-split");
       flags.push("  --chunked-prefill-size 16384");
       // GB300 big CP needs higher mem-fraction-static: Pro 1.6T weights at
       // tp=4 are ~224 GB/card on a 273 GB GB300, so 0.78 leaves a negative
@@ -849,12 +886,35 @@ export const DeepSeekV4Deployment = () => {
     // GB200 multinode may need machine-specific NVSHMEM / Gloo env vars;
     // emit them as commented hints above the env block so users know to check.
     let cmd = base;
+    if (recipe === "cp") {
+      cmd =
+        `# NOTE: --enable-nsa-prefill-context-parallel / --nsa-prefill-cp-mode were\n` +
+        `# renamed to --enable-dsa-prefill-context-parallel / --dsa-prefill-cp-mode\n` +
+        `# in PR #25821 (merged 2026-05-20). The cookbook emits the old nsa-* names\n` +
+        `# because the :latest release image predates that PR. If you're running\n` +
+        `# SGLang built from main, replace nsa- with dsa- in the two flags below.\n` +
+        cmd;
+    }
     if (hardware === "gb200" && multinode) {
       cmd =
         `# The following env vars may be needed depending on your cluster:\n` +
         `#   GLOO_SOCKET_IFNAME=<your-nic>\n` +
         `#   NVSHMEM_ENABLE_NIC_PE_MAPPING=1\n` +
         `#   NVSHMEM_HCA_LIST=<your-hca-list>\n` +
+        cmd;
+    }
+    // GB200 Pro with MegaMoE disabled runs the DeepEP a2a backend, which is
+    // currently only packaged in the CUDA 12.9 image — the default `:latest`
+    // ships CUDA 13 and does not include a compatible DeepEP build.
+    if (
+      hardware === "gb200" &&
+      isBig &&
+      megamoe === "disabled" &&
+      flags.some((f) => f.includes("--moe-a2a-backend deepep"))
+    ) {
+      cmd =
+        `# NOTE: for the DeepEP backend, use the cu129 docker image\n` +
+        `# (lmsysorg/sglang:latest-cu129) instead of the default \`:latest\`.\n` +
         cmd;
     }
     const withMultinode = multinode ? prependMultiNodeNote(cmd, nnodes) : cmd;
@@ -1011,6 +1071,13 @@ export const DeepSeekV4Deployment = () => {
         } else {
           flags.push("  --max-running-requests 256");
         }
+        // Reasoning / tool-call parsers are the OpenAI response formatter
+        // running in serving_chat.py. The PD HTTP router (sgl-model-gateway
+        // pd_router.rs::execute_dual_dispatch) returns the decode server's
+        // response to the client and discards prefill's, so the parsers only
+        // need to be set on decode. Adding them to prefill would be inert.
+        if (values.toolcall === "enabled") flags.push("  --tool-call-parser deepseekv4");
+        if (values.reasoningParser === "enabled") flags.push("  --reasoning-parser deepseek-v4");
       }
       flags.push("  --host 0.0.0.0");
       flags.push(`  --port ${port}`);
