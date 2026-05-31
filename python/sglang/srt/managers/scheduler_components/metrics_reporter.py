@@ -44,6 +44,13 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
+def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
+    """Sync-free sum of seq_lens for decode metrics."""
+    if batch.seq_lens_cpu is not None:
+        return int(batch.seq_lens_cpu.sum().item())
+    return sum(req.seqlen for req in batch.reqs)
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -430,7 +437,7 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        total_context = float(batch.seq_lens_cpu.sum().item())
+        total_context = float(_decode_total_seq_lens(batch))
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * total_context
@@ -736,7 +743,7 @@ class SchedulerMetricsReporter:
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+            self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
