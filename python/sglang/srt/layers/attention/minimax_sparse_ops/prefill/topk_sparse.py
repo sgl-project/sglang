@@ -25,11 +25,12 @@ from ..common.utils import get_cu_seqblocks, robust_allocator
     }
 )
 @triton.autotune(
+    # Configs that fail to compile on the target arch are skipped, so widening
+    # the num_warps x num_stages grid only adds candidates, never a bad kernel.
     configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=nw, num_stages=ns)
+        for nw in (2, 4, 8)
+        for ns in (2, 3, 4)
     ],
     key=[
         "BLOCK_SIZE_Q",
