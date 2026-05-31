@@ -46,4 +46,17 @@ constexpr FailReason& operator|=(FailReason& a, FailReason b) {
   return a;
 }
 
+enum class RealKvHashMode : int32_t {
+  kNone = 0,
+  kPartial = 1,
+  kAll = 2,
+};
+
+constexpr int kMaxRealKvSources = 4;
+
+constexpr int kRealKvSourceFieldsPerEntry = 3;
+constexpr int kRealKvSourceFieldPageSize = 0;
+constexpr int kRealKvSourceFieldNumBytesPerToken = 1;
+constexpr int kRealKvSourceFieldReadBytes = 2;
+
 }  // namespace canary

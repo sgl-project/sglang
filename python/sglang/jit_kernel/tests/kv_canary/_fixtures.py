@@ -5,8 +5,12 @@ from typing import Literal, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.jit_kernel.kv_canary.verify import (
+    RealKvSource,
+    VerifyPlan,
+)
 from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.jit_kernel.tests.kv_canary._constants import DEFAULT_NUM_SLOTS
 
 _DEVICE = torch.device("cuda")
 
@@ -70,6 +74,83 @@ def make_req_to_token(
         cursor += max_seq_len
         rtt[rp, :] = torch.tensor(per_req, dtype=torch.int32, device=device)
     return rtt.contiguous()
+
+
+def make_real_kv_source(
+    *,
+    num_slots: int = DEFAULT_NUM_SLOTS,
+    num_bytes_per_token: int = 16,
+    page_size: int = 1,
+    read_bytes: Optional[int] = None,
+    pad_dim1: int = 0,
+    device: torch.device,
+    fill: int = 0,
+) -> RealKvSource:
+    """Allocate one RealKvSource with the canonical [num_rows, dim1_bytes] uint8 shape.
+
+    ``pad_dim1`` adds trailing per-row bytes the canary should skip — used by the "holey dim 1" case to
+    confirm the kernel never reads past ``page_size * num_bytes_per_token``.
+    """
+    num_rows = (num_slots + page_size - 1) // page_size
+    cols = page_size * num_bytes_per_token + pad_dim1
+    tensor = torch.full(
+        (num_rows, cols), fill_value=fill, dtype=torch.uint8, device=device
+    )
+    effective_read = read_bytes if read_bytes is not None else num_bytes_per_token
+    return RealKvSource(
+        tensor=tensor,
+        page_size=page_size,
+        num_bytes_per_token=num_bytes_per_token,
+        read_bytes=effective_read,
+    )
+
+
+FillStrategy = Literal["constant_per_source", "random_bytes"]
+
+
+def make_real_kv_sources(
+    *,
+    count: int,
+    num_bytes_per_token: int = 16,
+    page_size: int = 1,
+    num_slots: int = DEFAULT_NUM_SLOTS,
+    device: torch.device,
+    rng: Optional[random.Random] = None,
+    fill_strategy: FillStrategy = "constant_per_source",
+) -> tuple[RealKvSource, ...]:
+    sources: list[RealKvSource] = []
+    for i in range(count):
+        read_bytes_eff = num_bytes_per_token
+        src = make_real_kv_source(
+            num_slots=num_slots,
+            num_bytes_per_token=num_bytes_per_token,
+            page_size=page_size,
+            read_bytes=read_bytes_eff,
+            device=device,
+            fill=(i + 1) * 17,
+        )
+        if fill_strategy == "random_bytes":
+            if rng is None:
+                rng = random.Random(0)
+            seed = rng.randint(0, 0xFFFFFFFF)
+            gen = torch.Generator(device=device).manual_seed(seed)
+            src.tensor.random_(generator=gen)
+        sources.append(src)
+    return tuple(sources)
+
+
+def clone_real_kv_sources(
+    sources: tuple[RealKvSource, ...],
+) -> tuple[RealKvSource, ...]:
+    return tuple(
+        RealKvSource(
+            tensor=src.tensor.clone(),
+            page_size=src.page_size,
+            num_bytes_per_token=src.num_bytes_per_token,
+            read_bytes=src.read_bytes,
+        )
+        for src in sources
+    )
 
 
 PaddingKind = Literal["none", "trailing", "interleaved"]

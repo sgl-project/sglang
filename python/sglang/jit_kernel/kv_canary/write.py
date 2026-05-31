@@ -5,9 +5,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     VerifyOrWriteContext,
     _assert_contiguous,
+    _build_real_kv_source_abi,
 )
 from sglang.jit_kernel.utils import cache_once, load_jit
 
@@ -92,7 +94,7 @@ def launch_canary_write_kernel(
 
     - ``slot`` = ``out_cache_loc[i]`` (caller-pre-translated for SWA groups; entries set to -1 are skipped).
     - ``token / position`` = ``input_ids[i] / positions[i]``.
-    - ``real_kv_hash`` is always 0 (the naive canary writes a constant 0 into field[3]).
+    - ``real_kv_hash`` = ``real_kv_fold_sources(real_kv_sources, slot)`` if ``real_kv_hash_mode != NONE`` else 0.
     - Store 4 int64s ``(token, position, running_prev_hash, real_kv_hash)`` into ``canary_buf[slot]``.
     - Advance ``running_prev_hash = splitmix64_mix3(prev, token, position)``, where
       splitmix64_mix3 folds each input via ``acc = splitmix64(acc ^ next)`` starting from ``splitmix64(prev)``.
@@ -121,7 +123,7 @@ def launch_canary_write_kernel(
 
     Args:
         context: Shared verify/write launch context, including canary buffer, launch tag, violation sink,
-            and health counters.
+            health counters, and real KV fingerprint sources.
         plan: Pre-allocated WritePlan.
         input_ids: ForwardBatch.input_ids; token ids being written, shape [num_tokens_padded], int64.
             Flattened across reqs in plan.write_offsets order; tail beyond
@@ -157,7 +159,8 @@ def launch_canary_write_kernel(
               slot = out_cache_loc[i];  // caller-pre-translated; the kernel never consults a LUT
               if (slot < 0) continue;       // -1 sentinel = skip (SWA out-of-window or padding)
               token = input_ids[i]; position = positions[i];
-              real_kv_hash = 0;  // naive canary always stores 0 into field[3]
+              real_kv_hash = (real_kv_hash_mode == NONE) ? 0 : real_kv_fold_sources(real_kv_sources, slot);
+                  // applies RealKvSource access invariant
               if enable_write_input_assert:
                   if token != expected_input_tokens[i] or position != expected_input_positions[i]:
                       record_violation();  // chain still advances on the ACTUAL (token, position) below
@@ -181,6 +184,12 @@ def launch_canary_write_kernel(
     byte-for-byte.
     """
     canary_buf = context.canary_buf
+    real_kv_sources = context.real_kv_sources
+    if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:
+        raise ValueError(
+            f"kv-canary: at most {consts.MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
+            f"got {len(real_kv_sources)}"
+        )
 
     _assert_contiguous(canary_buf, "canary_buf")
     _assert_contiguous(plan.write_offsets, "plan.write_offsets")
@@ -209,6 +218,10 @@ def launch_canary_write_kernel(
         context.enable_chain_position_assert, "enable_chain_position_assert"
     )
 
+    padded_bufs, source_params = _build_real_kv_source_abi(
+        real_kv_sources=real_kv_sources, device=canary_buf.device
+    )
+
     module = _jit_canary_write_module()
     module.canary_write_step_cuda(
         canary_buf,
@@ -227,6 +240,13 @@ def launch_canary_write_kernel(
         context.slot_run_counter,
         context.kernel_run_counter,
         context.enable_chain_position_assert,
+        padded_bufs[0],
+        padded_bufs[1],
+        padded_bufs[2],
+        padded_bufs[3],
+        source_params,
+        len(real_kv_sources),
+        int(context.real_kv_hash_mode),
     )
 
 

@@ -38,6 +38,11 @@ struct VerifyKernelParams {
   // Health counters.
   int64_t* slot_run_counter;
   int64_t* kernel_run_counter;
+
+  // Real-KV sources (fixed-size ABI; padding slots have read_bytes = 0).
+  RealKvSourceHandle sources[kMaxRealKvSources];
+  int32_t num_sources;
+  RealKvHashMode real_kv_hash_mode;
 };
 
 template <bool CHECK_VERIFY_EXPECTED_TOKEN>
@@ -76,12 +81,17 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
         canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
     const int64_t stored_chain_hash =
         canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash);
-    // field[3] (kCanaryFieldRealKvHash) is always 0 in the naive canary; not loaded or checked.
+    const int64_t stored_real_kv_hash =
+        canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash);
 
     const bool prev_reachable = (prev_slot_idx != kTokenToKvSlotPadding);
     const int64_t expected_chain_hash =
         prev_reachable ? static_cast<int64_t>(compute_slot_hash(p.canary_buf, p.slot_stride_bytes, prev_slot_idx))
                        : stored_chain_hash;
+
+    const uint64_t expected_real_kv_hash_u64 =
+        real_kv_fold_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
+    const int64_t expected_real_kv_hash = static_cast<int64_t>(expected_real_kv_hash_u64);
 
     FailReason fail_reason_bits{};
     if (prev_reachable && stored_chain_hash != expected_chain_hash) {
@@ -94,6 +104,9 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     }
     if (stored_position != expected_position) {
       fail_reason_bits |= FailReason::kVerifyPositionMismatch;
+    }
+    if (stored_real_kv_hash != expected_real_kv_hash) {
+      fail_reason_bits |= FailReason::kVerifyRealKvHashMismatch;
     }
 
     if (fail_reason_bits != FailReason{}) {
@@ -124,6 +137,14 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
 }  // namespace
 
 // API source of truth: docstring of canary_verify_step in python/sglang/jit_kernel/kv_canary/verify.py.
+//
+// ABI notes:
+// - real_kv_buf_0 .. real_kv_buf_3 are 4 fixed uint8 tensor slots. Unused slots are dummy 1-byte tensors;
+//   the host wrapper sets real_kv_source_params[s, 2] (read_bytes) = 0 for them.
+// - real_kv_source_params is a CPU int32 tensor of shape [kMaxRealKvSources, 3]: per-source (page_size,
+//   num_bytes_per_token, read_bytes). Lives on CPU because the host wrapper materializes it from a tuple
+//   of Python dataclasses.
+// - num_sources is passed as int64 (tvm-ffi scalar convention) but always in [0, kMaxRealKvSources].
 template <bool CHECK_VERIFY_EXPECTED_TOKEN>
 struct CanaryVerifyKernel {
   static void
@@ -138,7 +159,14 @@ struct CanaryVerifyKernel {
       tvm::ffi::TensorView violation_ring,
       tvm::ffi::TensorView violation_write_index,
       tvm::ffi::TensorView slot_run_counter,
-      tvm::ffi::TensorView kernel_run_counter) {
+      tvm::ffi::TensorView kernel_run_counter,
+      tvm::ffi::TensorView real_kv_buf_0,
+      tvm::ffi::TensorView real_kv_buf_1,
+      tvm::ffi::TensorView real_kv_buf_2,
+      tvm::ffi::TensorView real_kv_buf_3,
+      tvm::ffi::TensorView real_kv_source_params,
+      int64_t num_sources,
+      int64_t real_kv_hash_mode) {
     using namespace host;
 
     SymbolicSize N_slots = {"num_canary_slots"};
@@ -171,6 +199,37 @@ struct CanaryVerifyKernel {
         .verify(slot_run_counter)
         .verify(kernel_run_counter);
 
+    // Real-KV source buffers are 2-D uint8 (any shape); dim 1 carries the row-stride in bytes. They live on
+    // CUDA. real_kv_source_params is a small CPU int32 table of length kMaxRealKvSources * 3.
+    SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
+    SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
+    TensorMatcher({N_real_kv_rows_0, N_real_kv_cols_0})
+        .with_dtype<uint8_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(real_kv_buf_0);
+    SymbolicSize N_real_kv_rows_1 = {"real_kv_rows_1"};
+    SymbolicSize N_real_kv_cols_1 = {"real_kv_cols_1"};
+    TensorMatcher({N_real_kv_rows_1, N_real_kv_cols_1})
+        .with_dtype<uint8_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(real_kv_buf_1);
+    SymbolicSize N_real_kv_rows_2 = {"real_kv_rows_2"};
+    SymbolicSize N_real_kv_cols_2 = {"real_kv_cols_2"};
+    TensorMatcher({N_real_kv_rows_2, N_real_kv_cols_2})
+        .with_dtype<uint8_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(real_kv_buf_2);
+    SymbolicSize N_real_kv_rows_3 = {"real_kv_rows_3"};
+    SymbolicSize N_real_kv_cols_3 = {"real_kv_cols_3"};
+    TensorMatcher({N_real_kv_rows_3, N_real_kv_cols_3})
+        .with_dtype<uint8_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(real_kv_buf_3);
+    TensorMatcher({static_cast<int64_t>(kMaxRealKvSources), static_cast<int64_t>(kRealKvSourceFieldsPerEntry)})
+        .with_dtype<int32_t>()
+        .with_device<kDLCPU>()
+        .verify(real_kv_source_params);
+
     const int64_t slot_stride_bytes = N_stride.unwrap();
     const int32_t verify_capacity = static_cast<int32_t>(N_verify.unwrap());
     const int32_t ring_capacity = static_cast<int32_t>(N_ring.unwrap());
@@ -182,6 +241,12 @@ struct CanaryVerifyKernel {
         static_cast<int64_t>(kCanaryFieldsPerSlot * sizeof(int64_t)),
         " bytes per slot, got ",
         slot_stride_bytes);
+    RuntimeCheck(
+        num_sources >= 0 && num_sources <= static_cast<int64_t>(kMaxRealKvSources),
+        "canary_verify: num_sources must be in [0, ",
+        static_cast<int64_t>(kMaxRealKvSources),
+        "], got ",
+        num_sources);
 
     VerifyKernelParams p{};
     p.canary_buf = static_cast<const uint8_t*>(canary_buf.data_ptr());
@@ -199,6 +264,19 @@ struct CanaryVerifyKernel {
     p.violation_sink.kernel_kind = static_cast<int32_t>(kernel_kind);
     p.slot_run_counter = static_cast<int64_t*>(slot_run_counter.data_ptr());
     p.kernel_run_counter = static_cast<int64_t*>(kernel_run_counter.data_ptr());
+
+    // Materialize the source handle array on the host. The CPU param tensor carries the per-source ints.
+    const int32_t* params = static_cast<const int32_t*>(real_kv_source_params.data_ptr());
+    tvm::ffi::TensorView source_bufs[kMaxRealKvSources] = {real_kv_buf_0, real_kv_buf_1, real_kv_buf_2, real_kv_buf_3};
+    for (int s = 0; s < kMaxRealKvSources; ++s) {
+      p.sources[s].tensor = static_cast<const uint8_t*>(source_bufs[s].data_ptr());
+      p.sources[s].row_stride_bytes = static_cast<int32_t>(source_bufs[s].size(1));
+      p.sources[s].page_size = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldPageSize];
+      p.sources[s].num_bytes_per_token = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldNumBytesPerToken];
+      p.sources[s].read_bytes = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldReadBytes];
+    }
+    p.num_sources = static_cast<int32_t>(num_sources);
+    p.real_kv_hash_mode = static_cast<RealKvHashMode>(real_kv_hash_mode);
 
     const uint32_t grid = kPersistentBlocks;
     LaunchKernel(grid, kVerifyBlockSize, device)(canary_verify_kernel<CHECK_VERIFY_EXPECTED_TOKEN>, p);

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import IntFlag
+from enum import IntEnum, IntFlag
 from typing import Final
 
 CANARY_CHAIN_ANCHOR: Final[int] = 0xC0FFEE1234567890
@@ -38,6 +38,20 @@ class FailReason(IntFlag):
     WRITE_TOKEN_MISMATCH = 1 << 3
     WRITE_POSITION_MISMATCH = 1 << 4
     VERIFY_TOKEN_MISMATCH = 1 << 5
+
+
+MAX_REAL_KV_SOURCES: Final[int] = 4
+
+REAL_KV_SOURCE_FIELDS_PER_ENTRY: Final[int] = 3
+REAL_KV_SOURCE_FIELD_PAGE_SIZE: Final[int] = 0
+REAL_KV_SOURCE_FIELD_NUM_BYTES_PER_TOKEN: Final[int] = 1
+REAL_KV_SOURCE_FIELD_READ_BYTES: Final[int] = 2
+
+
+class RealKvHashMode(IntEnum):
+    NONE = 0
+    PARTIAL = 1
+    ALL = 2
 
 
 _U64_MASK: int = (1 << 64) - 1

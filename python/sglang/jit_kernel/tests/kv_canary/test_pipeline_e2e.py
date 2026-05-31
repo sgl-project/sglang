@@ -12,6 +12,7 @@ from sglang.jit_kernel.kv_canary.plan_ref import (
 )
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
+    RealKvSource,
     VerifyOrWriteContext,
     VerifyPlan,
     launch_canary_verify_kernel,
@@ -28,10 +29,12 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     assert_canary_buf_equal,
     assert_canary_state_equal,
     make_canary_buf,
+    make_real_kv_sources,
     stamp_clean_chain,
     write_slot_fields,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    clone_real_kv_sources,
     empty_extras,
     make_req_to_token,
 )
@@ -62,6 +65,8 @@ def _run_pipeline(
     enable_write_verify_inputs: bool,
     expected_input_tokens: torch.Tensor,
     expected_input_positions: torch.Tensor,
+    real_kv_sources: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
     verify_capacity: int,
     write_req_capacity: int,
     req_to_verify_expected_tokens: Optional[torch.Tensor] = None,
@@ -115,6 +120,8 @@ def _run_pipeline(
             slot_run_counter=log.slot_run_counter,
             kernel_run_counter=log.kernel_run_counter,
             enable_chain_position_assert=log.enable_chain_position_assert,
+            real_kv_sources=real_kv_sources,
+            real_kv_hash_mode=real_kv_hash_mode,
         )
         launch_canary_write_kernel(
             context=context,
@@ -142,6 +149,8 @@ def _run_pipeline(
                 slot_run_counter=log.slot_run_counter,
                 kernel_run_counter=log.kernel_run_counter,
                 enable_chain_position_assert=log.enable_chain_position_assert,
+                real_kv_sources=real_kv_sources,
+                real_kv_hash_mode=real_kv_hash_mode,
             ),
             plan=plan_w,
             input_ids=input_ids,
@@ -160,6 +169,8 @@ def _run_pipeline(
                 slot_run_counter=log.slot_run_counter,
                 kernel_run_counter=log.kernel_run_counter,
                 enable_chain_position_assert=log.enable_chain_position_assert,
+                real_kv_sources=real_kv_sources,
+                real_kv_hash_mode=real_kv_hash_mode,
             ),
             plan=plan_v,
             check_verify_expected_token=check_verify_expected_token,
@@ -185,6 +196,9 @@ def _run_both_and_assert_pipeline_equal(
     enable_write_verify_inputs: bool = False,
     expected_input_tokens: Optional[torch.Tensor] = None,
     expected_input_positions: Optional[torch.Tensor] = None,
+    real_kv_sources_real: tuple[RealKvSource, ...] = (),
+    real_kv_sources_ref: tuple[RealKvSource, ...] = (),
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.NONE,
     ring_capacity: int = 64,
     verify_capacity: int = 256,
     write_req_capacity: int = 16,
@@ -240,6 +254,7 @@ def _run_both_and_assert_pipeline_equal(
         enable_write_verify_inputs=enable_write_verify_inputs,
         expected_input_tokens=expected_input_tokens,
         expected_input_positions=expected_input_positions,
+        real_kv_hash_mode=real_kv_hash_mode,
         verify_capacity=verify_capacity,
         write_req_capacity=write_req_capacity,
         req_to_verify_expected_tokens=req_to_verify_expected_tokens,
@@ -251,12 +266,14 @@ def _run_both_and_assert_pipeline_equal(
         real=True,
         canary_buf=buf_real,
         log=log_real,
+        real_kv_sources=real_kv_sources_real,
         **shared,
     )
     plan_v_ref, plan_w_ref = _run_pipeline(
         real=False,
         canary_buf=buf_ref,
         log=log_ref,
+        real_kv_sources=real_kv_sources_ref,
         **shared,
     )
 
@@ -436,6 +453,35 @@ def test_pipeline_sweep_no_write() -> None:
     assert int(log_ref.slot_run_counter[0].item()) == prefix_len
 
 
+@pytest.mark.parametrize(
+    "real_kv_hash_mode",
+    [
+        consts.RealKvHashMode.NONE,
+        consts.RealKvHashMode.PARTIAL,
+        consts.RealKvHashMode.ALL,
+    ],
+)
+def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None:
+    """real_kv_hash_mode OFF/PARTIAL/ALL: real and ref use cloned sources to prevent ALL-mode hash aliasing."""
+    sources_real = make_real_kv_sources(count=2, num_slots=64, device=_DEVICE)
+    sources_ref = clone_real_kv_sources(sources_real)
+
+    _run_both_and_assert_pipeline_equal(
+        req_pool_indices=_t([1]),
+        prefix_lens=_t([0]),
+        extend_seq_lens=_t([3]),
+        input_ids=_t([5, 6, 7]),
+        positions=_t([0, 1, 2]),
+        out_cache_loc=_contiguous_out_cache_loc(req_pool_idx=1, start=0, count=3),
+        req_to_token=_linear_r2t(),
+        num_slots=64,
+        extras=empty_extras(),
+        real_kv_sources_real=sources_real,
+        real_kv_sources_ref=sources_ref,
+        real_kv_hash_mode=real_kv_hash_mode,
+    )
+
+
 def test_pipeline_pseudo_mode_on_match() -> None:
     """enable_write_verify_inputs=ON, expected==actual: zero violations, buf byte-equal."""
     input_ids = _t([1, 2, 3, 4])
@@ -560,6 +606,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
                 token=slot_idx + 1,
                 position=slot_idx,
                 prev_hash=0x1234_DEAD_BEEF_0000 + slot_idx,
+                real_kv_hash=0,
             )
 
     # Step 2: run real pipeline (plan + no write + verify); overflow ring capacity=4 with all n_slots violations.
@@ -609,6 +656,8 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
             slot_run_counter=log_real.slot_run_counter,
             kernel_run_counter=log_real.kernel_run_counter,
             enable_chain_position_assert=log_real.enable_chain_position_assert,
+            real_kv_sources=(),
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
         ),
         plan=plan_v_real,
         check_verify_expected_token=True,
@@ -624,6 +673,8 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
             slot_run_counter=log_ref.slot_run_counter,
             kernel_run_counter=log_ref.kernel_run_counter,
             enable_chain_position_assert=log_ref.enable_chain_position_assert,
+            real_kv_sources=(),
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
         ),
         plan=plan_v_ref,
         check_verify_expected_token=True,
@@ -649,6 +700,7 @@ def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
         token=7,
         position=99,
         prev_hash=0,
+        real_kv_hash=0,
     )
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(

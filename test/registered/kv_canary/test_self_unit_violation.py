@@ -53,6 +53,7 @@ class TestViolationReporter(CustomTestCase):
             fail_reason_bits=int(
                 FailReason.VERIFY_CHAIN_HASH_MISMATCH
                 | FailReason.VERIFY_POSITION_MISMATCH
+                | FailReason.VERIFY_REAL_KV_HASH_MISMATCH
             ),
         )
         out = _format_violation(
@@ -60,12 +61,12 @@ class TestViolationReporter(CustomTestCase):
         )
         self.assertEqual(
             out,
-            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_chain_hash+verify_position "
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_chain_hash+verify_position+verify_real_kv_hash "
             "slot_idx=17 position=42 stored_token=111 expected_token=0 stored_chain_hash=0x1111111111111111 "
             "expected_aux=0x2222222222222222\n"
             "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=17, position=42)\n"
             "canary_kind:       per_forward_head_k_full\n"
-            "  fail_reasons: verify_chain_hash verify_position\n"
+            "  fail_reasons: verify_chain_hash verify_position verify_real_kv_hash\n"
             "  stored:   token_id=111   position=42 prev_hash=0x1111111111111111\n"
             "  expected: prev_hash=0x2222222222222222\n"
             "  total_violations=1 ring_overflow=False step_when_pumped=7",
@@ -199,7 +200,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
         self.assertFalse(reporter.is_raised)
 
     def test_log_mode_emits_one_warning_per_violation(self) -> None:
-        """Log mode with 2 valid rows emits 2 warnings, each a full _format_violation snapshot for that row."""
+        """Log mode with 3 valid rows emits 3 warnings, each a full _format_violation snapshot for that row."""
         rows = [
             _make_row(
                 slot_idx=11,
@@ -211,14 +212,19 @@ class TestLogOrRaiseViolation(CustomTestCase):
                 position=202,
                 fail_reason_bits=int(FailReason.VERIFY_POSITION_MISMATCH),
             ),
+            _make_row(
+                slot_idx=33,
+                position=303,
+                fail_reason_bits=int(FailReason.VERIFY_REAL_KV_HASH_MISMATCH),
+            ),
         ]
         reporter = _make_reporter(
-            rows=rows, write_index=2, ring_capacity=4, mode=CanaryMode.LOG
+            rows=rows, write_index=3, ring_capacity=4, mode=CanaryMode.LOG
         )
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
             reporter.log_or_raise_violation(outer_step_counter=7)
 
-        self.assertEqual(mock_warning.call_count, 2)
+        self.assertEqual(mock_warning.call_count, 3)
         messages: list[str] = [call.args[0] for call in mock_warning.call_args_list]
         self.assertEqual(
             messages[0],
@@ -230,7 +236,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
             "  fail_reasons: verify_chain_hash\n"
             "  stored:   token_id=111   position=101 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
-            "  total_violations=2 ring_overflow=False step_when_pumped=7",
+            "  total_violations=3 ring_overflow=False step_when_pumped=7",
         )
         self.assertEqual(
             messages[1],
@@ -242,12 +248,24 @@ class TestLogOrRaiseViolation(CustomTestCase):
             "  fail_reasons: verify_position\n"
             "  stored:   token_id=111   position=202 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
-            "  total_violations=2 ring_overflow=False step_when_pumped=7",
+            "  total_violations=3 ring_overflow=False step_when_pumped=7",
+        )
+        self.assertEqual(
+            messages[2],
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_real_kv_hash slot_idx=33 position=303 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=33, position=303)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: verify_real_kv_hash\n"
+            "  stored:   token_id=111   position=303 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=7",
         )
         self.assertFalse(reporter.is_raised)
 
     def test_raise_mode_raises_one_error_containing_all_violations(self) -> None:
-        """Raise mode raises a single RuntimeError whose text is the 2 formatted rows joined with single newlines."""
+        """Raise mode raises a single RuntimeError whose text is the 3 formatted rows joined with single newlines."""
         rows = [
             _make_row(
                 slot_idx=11,
@@ -259,9 +277,14 @@ class TestLogOrRaiseViolation(CustomTestCase):
                 position=202,
                 fail_reason_bits=int(FailReason.VERIFY_POSITION_MISMATCH),
             ),
+            _make_row(
+                slot_idx=33,
+                position=303,
+                fail_reason_bits=int(FailReason.VERIFY_REAL_KV_HASH_MISMATCH),
+            ),
         ]
         reporter = _make_reporter(
-            rows=rows, write_index=2, ring_capacity=4, mode=CanaryMode.RAISE
+            rows=rows, write_index=3, ring_capacity=4, mode=CanaryMode.RAISE
         )
         with self.assertRaises(RuntimeError) as ctx:
             reporter.log_or_raise_violation(outer_step_counter=5)
@@ -276,7 +299,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
             "  fail_reasons: verify_chain_hash\n"
             "  stored:   token_id=111   position=101 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
-            "  total_violations=2 ring_overflow=False step_when_pumped=5\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=5\n"
             "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_position slot_idx=22 position=202 "
             "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
             "expected_aux=0x0000000000000000\n"
@@ -285,7 +308,16 @@ class TestLogOrRaiseViolation(CustomTestCase):
             "  fail_reasons: verify_position\n"
             "  stored:   token_id=111   position=202 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
-            "  total_violations=2 ring_overflow=False step_when_pumped=5",
+            "  total_violations=3 ring_overflow=False step_when_pumped=5\n"
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=verify_real_kv_hash slot_idx=33 position=303 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=33, position=303)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: verify_real_kv_hash\n"
+            "  stored:   token_id=111   position=303 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=5",
         )
         self.assertTrue(reporter.is_raised)
 

@@ -49,6 +49,11 @@ struct WriteKernelParams {
   // Gates the chain-step position assert below. Default-on (1); CanaryManager zeros during the
   // warmup window and flips back in mark_init_finished().
   const int32_t* enable_chain_position_assert;
+
+  // Real-KV sources.
+  RealKvSourceHandle sources[kMaxRealKvSources];
+  int32_t num_sources;
+  RealKvHashMode real_kv_hash_mode;
 };
 
 __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p) {
@@ -98,8 +103,8 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     const int64_t token = p.input_ids[entry_idx];
     const int64_t position = p.positions[entry_idx];
 
-    // field[3] (kCanaryFieldRealKvHash) is always 0 in the naive canary.
-    const int64_t real_kv_hash = 0;
+    const uint64_t real_kv_hash_u64 = real_kv_fold_sources(p.sources, p.num_sources, slot, p.real_kv_hash_mode);
+    const int64_t real_kv_hash = static_cast<int64_t>(real_kv_hash_u64);
 
     if (p.enable_write_input_assert) {
       const int64_t expected_token = p.expected_input_tokens[entry_idx];
@@ -163,7 +168,10 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
 
 // API source of truth: docstring of canary_write_step in python/sglang/jit_kernel/kv_canary/write.py.
 //
-// ABI notes:
+// ABI notes (same as verify):
+// - real_kv_buf_0 .. real_kv_buf_3 are 4 fixed uint8 tensor slots.
+// - real_kv_source_params is a CPU int32 [kMaxRealKvSources, 3] table of (page_size, num_bytes_per_token,
+//   read_bytes) triplets.
 // - out_cache_loc is caller-pre-translated for SWA groups; -1 entries mark skip. The kernel does not
 //   consult any LUT.
 inline void canary_write_step_cuda(
@@ -182,7 +190,14 @@ inline void canary_write_step_cuda(
     tvm::ffi::TensorView violation_write_index,
     tvm::ffi::TensorView slot_run_counter,
     tvm::ffi::TensorView kernel_run_counter,
-    tvm::ffi::TensorView enable_chain_position_assert) {
+    tvm::ffi::TensorView enable_chain_position_assert,
+    tvm::ffi::TensorView real_kv_buf_0,
+    tvm::ffi::TensorView real_kv_buf_1,
+    tvm::ffi::TensorView real_kv_buf_2,
+    tvm::ffi::TensorView real_kv_buf_3,
+    tvm::ffi::TensorView real_kv_source_params,
+    int64_t num_sources,
+    int64_t real_kv_hash_mode) {
   using namespace host;
 
   SymbolicSize N_slots = {"num_canary_slots"};
@@ -235,6 +250,35 @@ inline void canary_write_step_cuda(
       .verify(kernel_run_counter);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(enable_chain_position_assert);
 
+  SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
+  SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
+  TensorMatcher({N_real_kv_rows_0, N_real_kv_cols_0})
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(real_kv_buf_0);
+  SymbolicSize N_real_kv_rows_1 = {"real_kv_rows_1"};
+  SymbolicSize N_real_kv_cols_1 = {"real_kv_cols_1"};
+  TensorMatcher({N_real_kv_rows_1, N_real_kv_cols_1})
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(real_kv_buf_1);
+  SymbolicSize N_real_kv_rows_2 = {"real_kv_rows_2"};
+  SymbolicSize N_real_kv_cols_2 = {"real_kv_cols_2"};
+  TensorMatcher({N_real_kv_rows_2, N_real_kv_cols_2})
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(real_kv_buf_2);
+  SymbolicSize N_real_kv_rows_3 = {"real_kv_rows_3"};
+  SymbolicSize N_real_kv_cols_3 = {"real_kv_cols_3"};
+  TensorMatcher({N_real_kv_rows_3, N_real_kv_cols_3})
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(real_kv_buf_3);
+  TensorMatcher({static_cast<int64_t>(kMaxRealKvSources), static_cast<int64_t>(kRealKvSourceFieldsPerEntry)})
+      .with_dtype<int32_t>()
+      .with_device<kDLCPU>()
+      .verify(real_kv_source_params);
+
   const int64_t slot_stride_bytes = N_stride.unwrap();
   const int32_t write_req_capacity = static_cast<int32_t>(N_write_reqs.unwrap());
   const int32_t ring_capacity = static_cast<int32_t>(N_ring.unwrap());
@@ -252,6 +296,12 @@ inline void canary_write_step_cuda(
       static_cast<int64_t>(kCanaryFieldsPerSlot * sizeof(int64_t)),
       " bytes per slot, got ",
       slot_stride_bytes);
+  RuntimeCheck(
+      num_sources >= 0 && num_sources <= static_cast<int64_t>(kMaxRealKvSources),
+      "canary_write: num_sources must be in [0, ",
+      static_cast<int64_t>(kMaxRealKvSources),
+      "], got ",
+      num_sources);
 
   WriteKernelParams p{};
   p.canary_buf = static_cast<uint8_t*>(canary_buf.data_ptr());
@@ -276,6 +326,18 @@ inline void canary_write_step_cuda(
   p.slot_run_counter = static_cast<int64_t*>(slot_run_counter.data_ptr());
   p.kernel_run_counter = static_cast<int64_t*>(kernel_run_counter.data_ptr());
   p.enable_chain_position_assert = static_cast<const int32_t*>(enable_chain_position_assert.data_ptr());
+
+  const int32_t* params = static_cast<const int32_t*>(real_kv_source_params.data_ptr());
+  tvm::ffi::TensorView source_bufs[kMaxRealKvSources] = {real_kv_buf_0, real_kv_buf_1, real_kv_buf_2, real_kv_buf_3};
+  for (int s = 0; s < kMaxRealKvSources; ++s) {
+    p.sources[s].tensor = static_cast<const uint8_t*>(source_bufs[s].data_ptr());
+    p.sources[s].row_stride_bytes = static_cast<int32_t>(source_bufs[s].size(1));
+    p.sources[s].page_size = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldPageSize];
+    p.sources[s].num_bytes_per_token = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldNumBytesPerToken];
+    p.sources[s].read_bytes = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldReadBytes];
+  }
+  p.num_sources = static_cast<int32_t>(num_sources);
+  p.real_kv_hash_mode = static_cast<RealKvHashMode>(real_kv_hash_mode);
 
   // Grid: one block per write req capacity slot; the kernel early-exits on r >= write_num_valid_reqs[0].
   // Always launch at least one block so the unconditional kernel_run_counter bump runs even when capacity
