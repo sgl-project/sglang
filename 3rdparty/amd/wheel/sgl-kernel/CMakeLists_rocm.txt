@@ -57,17 +57,17 @@ set(CMAKE_HIP_ARCHITECTURES ${AMDGPU_TARGETS})
 
 # FP8 macro selection
 # Always define HIP_FP8_TYPE_FNUZ=1 (for gfx942 and host compilation)
-# Additionally define HIP_FP8_TYPE_E4M3=1 when building for gfx950
+# Additionally define HIP_FP8_TYPE_E4M3=1 when building for gfx950 or gfx1100
 # The existing utils.h logic will pick the right one based on architecture
 set(SGL_FP8_MACROS "-DHIP_FP8_TYPE_FNUZ=1")
 
-if(AMDGPU_TARGETS MATCHES "gfx950")
+if(AMDGPU_TARGETS MATCHES "gfx950" OR AMDGPU_TARGETS MATCHES "gfx1100")
   list(APPEND SGL_FP8_MACROS "-DHIP_FP8_TYPE_E4M3=1")
   message(STATUS "Multi-arch build: Enabling both HIP_FP8_TYPE_FNUZ (gfx942) and HIP_FP8_TYPE_E4M3 (gfx950)")
 elseif(AMDGPU_TARGETS MATCHES "gfx942")
   message(STATUS "Single-arch build: Enabling HIP_FP8_TYPE_FNUZ for gfx942")
 else()
-  message(FATAL_ERROR "Unsupported AMDGPU_TARGET '${AMDGPU_TARGETS}'. Expected 'gfx942' or 'gfx950' or both.")
+  message(FATAL_ERROR "Unsupported AMDGPU_TARGET '${AMDGPU_TARGETS}'. Expected 'gfx942', 'gfx950', or 'gfx1100'.")
 endif()
 
 # TopK dynamic smem bytes
@@ -75,7 +75,8 @@ endif()
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
 # - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-if(AMDGPU_TARGET_ONE STREQUAL "gfx942")
+# - gfx1100 (7900XTX): LDS is 64KB per CU (same as gfx942), keep 48KB.
+if(AMDGPU_TARGETS MATCHES "gfx942" OR AMDGPU_TARGETS MATCHES "gfx1100")
   math(EXPR SGL_TOPK_DYNAMIC_SMEM_BYTES "48 * 1024")
 else()
   math(EXPR SGL_TOPK_DYNAMIC_SMEM_BYTES "32 * 1024 * 4")
