@@ -190,6 +190,9 @@ def _spawn_server_process(
         kwargs=dict(
             host=SERVER_HOST,
             port=get_free_port(),
+            kv_canary="raise",
+            kv_canary_real_data="partial",
+            kv_canary_sweep_interval=100,
             **engine_kwargs,
         ),
         name="scripted-runtime-http-server",
