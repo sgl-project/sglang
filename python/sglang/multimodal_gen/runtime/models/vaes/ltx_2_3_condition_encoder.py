@@ -114,7 +114,7 @@ def _make_ltx23_encoder_block(
 
 
 class LTX23VideoConditionEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = ["down_blocks"]
 
     def __init__(self, config: dict[str, Any]) -> None:

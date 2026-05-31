@@ -31,7 +31,8 @@ if __name__ == "__main__":
         "--log-level",
         type=str,
         default=None,
-        help="Set runtime log level, e.g. debug/info/warning/error/critical.",
+        choices=["debug", "info", "warning", "error", "critical"],
+        help="Set runtime log level",
     )
     parser.add_argument("--log-requests", action="store_true")
     parser.add_argument("--log-requests-level", type=int, default=3)
