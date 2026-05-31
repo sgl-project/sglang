@@ -248,7 +248,7 @@ def _prepare_lingbot_world_condition(
         state = batch.session.get_or_create_state(_LingBotWorldCameraState)
         if batch.block_idx == 0:
             state.reset_camera_actions()
-        state.receive_camera_actions(normalized_actions)
+        state.append_camera_actions(normalized_actions)
         action_history = state.action_history
 
     if len(action_history) == 0:

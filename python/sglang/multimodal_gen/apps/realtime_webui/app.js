@@ -1,19 +1,53 @@
 const $ = (id) => document.getElementById(id);
+const RAW_RGB_CONTENT_TYPE = "application/x-raw-rgb";
+const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
+const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
+const WEBP_FRAME_CONTENT_TYPE = "image/webp";
+const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
+const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker";
+const PREVIEW_OUTPUT_FORMAT = "jpeg";
+const PREVIEW_OUTPUT_QUALITY = 85;
+const LIVE_QUEUE_SECONDS = 2;
+const LOW_LATENCY_FPS_FLOOR = 10;
+const LOW_LATENCY_QUEUE_SECONDS = 0.8;
+const MAX_CATCHUP_FPS = 24;
 
 const presets = [
-  { name: "Reference Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth dolly-in from the reference image, natural light, steady camera, cinematic realism.", actions: [["w"], ["w"], ["w"], ["w"], ["w"], ["w"], [], []] },
-  { name: "Look Around", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled camera look-around of the same scene, consistent geometry, subtle parallax.", actions: [["j"], ["j"], [], ["l"], ["l"], [], ["i"], ["k"]] },
-  { name: "Scene Scout", tone: "accent", size: "832x480", fps: 16, prompt: "A scouting shot through a quiet interior, responsive camera movement, stable subject detail.", actions: [["w"], ["w"], ["d"], ["d"], ["w", "l"], ["w"], ["a"], []] },
-  { name: "Surveillance", tone: "green", size: "832x480", fps: 16, prompt: "A fixed-lens surveillance view of a room, fluorescent light, understated motion, documentary feel.", actions: [[], [], ["j"], ["j"], [], ["l"], ["l"], []] },
+  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth first-person dolly toward the castle, natural parallax, stable fantasy scene detail.", actions: [["w"], ["w"], ["w"], ["w"], ["w"], ["w"], [], []], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
+  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", actions: [["j"], ["j"], [], ["l"], ["l"], [], ["i"], ["k"]], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
+  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 16, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", actions: [["i"], ["i"], ["w"], ["w"], ["d"], [], ["j"], []], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
+  { name: "Lake Scout", tone: "green", size: "832x480", fps: 16, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", actions: [["w"], ["w"], ["d"], ["d"], ["w", "l"], ["w"], ["a"], []], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
+  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 16, prompt: "A slow aerial orbit around a pastel floating island hotel in the open ocean, hazy sunlight, turquoise water, toy-like architectural detail, clean horizon, cinematic but playful.", actions: [["w"], ["d"], ["d"], ["l"], ["l"], [], ["i"], []], referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
+  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 16, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", actions: [[], ["w"], ["w"], ["j"], [], ["l"], [], []], referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
+  { name: "Kid A", tone: "accent", size: "832x480", fps: 16, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", actions: [["d"], ["d"], ["l"], [], ["w"], ["w"], ["j"], []], referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
 ];
 
 let ws = null;
+const referenceCache = new Map();
+let selectedPreset = null;
+let selectedReferenceBytes = null;
+let selectedReferenceLabel = "";
 let pendingHeader = null;
 let queue = [];
 let frames = 0;
 let bytes = 0;
 let lastFrameAt = 0;
+let chunkWaitStartedAt = 0;
+let clearQueueOnClose = false;
 let fpsSamples = [];
+let playbackFps = 0;
+let droppedFrames = 0;
+let receiveChain = Promise.resolve();
+let nextEventId = 1;
+let awaitedEventId = 0;
+let lastRawRgbFrame = null;
+let decoderWorker = null;
+let decodeWorkerUnavailable = false;
+let decodeRequestId = 1;
+let streamEpoch = 0;
+let lastDecodeMs = 0;
+let lastDisplayLagMs = 0;
+const decodeRequests = new Map();
 
 const canvas = $("viewport");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -47,18 +81,150 @@ function drawIdle() {
   }
 }
 
+function resetStreamStats() {
+  pendingHeader = null;
+  queue = [];
+  frames = 0;
+  bytes = 0;
+  fpsSamples = [];
+  chunkWaitStartedAt = 0;
+  clearQueueOnClose = false;
+  playbackFps = Number($("fps").value || 16);
+  droppedFrames = 0;
+  receiveChain = Promise.resolve();
+  awaitedEventId = 0;
+  resetDecoderState();
+  updateStats();
+  $("renderFps").textContent = "0";
+  $("stageRenderFps").textContent = "0";
+  $("latencyText").textContent = "-";
+  $("stageLatencyText").textContent = "-";
+  $("decodeText").textContent = "-";
+  $("displayLagText").textContent = "-";
+  $("chunkText").textContent = "chunk -";
+}
+
+function rejectPendingDecodes(message) {
+  for (const request of decodeRequests.values()) {
+    request.reject(new Error(message));
+  }
+  decodeRequests.clear();
+}
+
+function ensureDecoderWorker() {
+  if (decoderWorker || decodeWorkerUnavailable) return;
+  if (typeof Worker === "undefined") {
+    decodeWorkerUnavailable = true;
+    return;
+  }
+
+  decoderWorker = new Worker(DECODER_WORKER_URL);
+  decoderWorker.onmessage = (event) => {
+    const message = event.data;
+    const request = decodeRequests.get(message.id);
+    if (!request) return;
+    decodeRequests.delete(message.id);
+    if (message.type === "error") {
+      request.reject(new Error(message.message || "decode failed"));
+      return;
+    }
+    request.resolve(message);
+  };
+  decoderWorker.onerror = (event) => {
+    decodeWorkerUnavailable = true;
+    decoderWorker?.terminate();
+    decoderWorker = null;
+    rejectPendingDecodes(event.message || "decode worker failed");
+  };
+}
+
+function resetDecoderState() {
+  lastRawRgbFrame = null;
+  if (decoderWorker) decoderWorker.postMessage({ type: "reset" });
+}
+
+async function decodeFrameBatch(header, data) {
+  const decodeStartedAt = performance.now();
+  if (header.content_type !== RAW_RGB_CONTENT_TYPE) {
+    const items = await framePayloadToImageData(header, data);
+    const decodedAt = performance.now();
+    lastDecodeMs = decodedAt - decodeStartedAt;
+    return items.map((item) => ({
+      ...item,
+      receivedAt: header.__received_at,
+      decodedAt,
+      decodeMs: lastDecodeMs,
+    }));
+  }
+
+  ensureDecoderWorker();
+  if (!decoderWorker || decodeWorkerUnavailable) {
+    const items = await framePayloadToImageData(header, data);
+    const decodedAt = performance.now();
+    lastDecodeMs = decodedAt - decodeStartedAt;
+    return items.map((item) => ({
+      ...item,
+      receivedAt: header.__received_at,
+      decodedAt,
+      decodeMs: lastDecodeMs,
+    }));
+  }
+
+  const payload = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
+  const id = decodeRequestId++;
+  const decodeHeader = { ...header, __decode_id: id };
+  return new Promise((resolve, reject) => {
+    decodeRequests.set(id, {
+      resolve: (message) => {
+        const decodedAt = performance.now();
+        lastDecodeMs = decodedAt - decodeStartedAt;
+        resolve(message.frames.map((buffer) => ({
+          image: new ImageData(new Uint8ClampedArray(buffer), message.width, message.height),
+          chunk: message.chunk,
+          receivedAt: header.__received_at,
+          decodedAt,
+          decodeMs: lastDecodeMs,
+        })));
+      },
+      reject,
+    });
+    try {
+      decoderWorker.postMessage(
+        { type: "decode", header: decodeHeader, payload },
+        [payload],
+      );
+    } catch (error) {
+      decodeRequests.delete(id);
+      reject(error);
+    }
+  });
+}
+
 function updateStats(header) {
-  $("queueText").textContent = `queue ${queue.length}`;
+  $("queueText").textContent = droppedFrames
+    ? `queue ${queue.length} · drop ${droppedFrames}`
+    : `queue ${queue.length}`;
   $("frameText").textContent = `frames ${frames}`;
   $("byteText").textContent = `${(bytes / 1048576).toFixed(1)} MB`;
-  if (header) $("chunkText").textContent = `chunk ${header.chunk_index}`;
+}
+
+function trimLiveQueue(latestFrameCount) {
+  const targetFps = Number($("fps").value || 16);
+  const maxQueue = Math.max(
+    Number(latestFrameCount || 0),
+    Math.round(targetFps * LIVE_QUEUE_SECONDS),
+  );
+  if (queue.length <= maxQueue) return;
+  const dropCount = queue.length - maxQueue;
+  queue.splice(0, dropCount);
+  droppedFrames += dropCount;
 }
 
 function rgbToImageData(header, payload) {
   const width = Number(header.width), height = Number(header.height);
   const channels = Number(header.channels), count = Number(header.num_frames);
   const frameBytes = Number(header.bytes_per_frame);
-  const src = new Uint8Array(payload);
+  const src = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
   const items = [];
   for (let f = 0; f < count; f++) {
     const img = ctx.createImageData(width, height);
@@ -75,8 +241,107 @@ function rgbToImageData(header, payload) {
   return items;
 }
 
+function rgbaToImageData(header, payload) {
+  const width = Number(header.width), height = Number(header.height);
+  const count = Number(header.num_frames);
+  const frameBytes = Number(header.bytes_per_frame);
+  const src = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+  const items = [];
+  for (let f = 0; f < count; f++) {
+    const offset = f * frameBytes;
+    const imageBytes = new Uint8ClampedArray(
+      src.buffer,
+      src.byteOffset + offset,
+      frameBytes,
+    );
+    items.push({ image: new ImageData(imageBytes, width, height), chunk: header.chunk_index });
+  }
+  return items;
+}
+
+async function gunzipBytes(payload) {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("This browser does not support gzip stream decoding");
+  }
+  const stream = new Blob([payload]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function restoreDeltaGzipRawRgb(header, payload) {
+  const frameBytes = Number(header.bytes_per_frame);
+  const count = Number(header.num_frames);
+  const expectedSize = frameBytes * count;
+  const restored = await gunzipBytes(payload);
+  if (restored.length !== expectedSize) {
+    throw new Error(`delta payload size mismatch: expected ${expectedSize}, got ${restored.length}`);
+  }
+  let previous = header.delta_reference === "previous-frame" ? lastRawRgbFrame : null;
+  if (header.delta_reference === "previous-frame" && !previous) {
+    throw new Error("Missing previous frame for delta payload");
+  }
+  for (let f = 0; f < count; f++) {
+    const current = f * frameBytes;
+    if (previous) {
+      for (let i = 0; i < frameBytes; i++) {
+        restored[current + i] ^= previous[i];
+      }
+    }
+    previous = restored.slice(current, current + frameBytes);
+  }
+  return restored;
+}
+
+async function framePayloadToImageData(header, payload) {
+  let rawPayload;
+  const isRgba = header.content_type === RAW_RGBA_DELTA_GZIP_CONTENT_TYPE;
+  if (
+    header.content_type === WEBP_FRAME_CONTENT_TYPE ||
+    header.content_type === JPEG_FRAME_CONTENT_TYPE
+  ) {
+    return encodedImageToImageData(header, payload);
+  } else if (header.content_type === RAW_RGB_CONTENT_TYPE) {
+    rawPayload = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+  } else if (header.content_type === RAW_RGB_DELTA_GZIP_CONTENT_TYPE) {
+    rawPayload = await restoreDeltaGzipRawRgb(header, payload);
+  } else if (isRgba) {
+    rawPayload = await restoreDeltaGzipRawRgb(header, payload);
+  } else {
+    throw new Error(`Unsupported content type ${header.content_type}`);
+  }
+  const frameBytes = Number(header.bytes_per_frame);
+  const frameCount = Number(header.num_frames);
+  if (frameCount > 0) {
+    const offset = (frameCount - 1) * frameBytes;
+    lastRawRgbFrame = rawPayload.slice(offset, offset + frameBytes);
+  }
+  if (isRgba) {
+    return rgbaToImageData(header, rawPayload);
+  }
+  return rgbToImageData(header, rawPayload);
+}
+
+async function encodedImageToImageData(header, payload) {
+  const blob = new Blob([payload], { type: header.content_type });
+  const bitmap = await createImageBitmap(blob);
+  const offscreen = typeof OffscreenCanvas !== "undefined"
+    ? new OffscreenCanvas(bitmap.width, bitmap.height)
+    : document.createElement("canvas");
+  offscreen.width = bitmap.width;
+  offscreen.height = bitmap.height;
+  const imageCtx = offscreen.getContext("2d", { alpha: false });
+  imageCtx.drawImage(bitmap, 0, 0);
+  const image = imageCtx.getImageData(0, 0, bitmap.width, bitmap.height);
+  bitmap.close?.();
+  return [{ image, chunk: header.chunk_index }];
+}
+
 function renderLoop(now) {
-  const targetMs = 1000 / Math.max(1, Number($("fps").value || 16));
+  const targetFps = playbackFps || Number($("fps").value || 16);
+  const queueSeconds = queue.length / Math.max(1, targetFps);
+  const catchupFps = queueSeconds > LOW_LATENCY_QUEUE_SECONDS
+    ? Math.min(MAX_CATCHUP_FPS, Math.ceil(queue.length / LOW_LATENCY_QUEUE_SECONDS))
+    : targetFps;
+  const targetMs = 1000 / Math.max(1, catchupFps);
   if (queue.length && now - lastFrameAt >= targetMs) {
     const item = queue.shift();
     if (canvas.width !== item.image.width || canvas.height !== item.image.height) {
@@ -87,8 +352,13 @@ function renderLoop(now) {
     lastFrameAt = now;
     fpsSamples.push(now);
     fpsSamples = fpsSamples.filter((t) => now - t < 1000);
-    $("renderFps").textContent = String(fpsSamples.length);
+    const renderedFps = String(fpsSamples.length);
+    $("renderFps").textContent = renderedFps;
+    $("stageRenderFps").textContent = renderedFps;
     $("chunkText").textContent = `chunk ${item.chunk}`;
+    lastDisplayLagMs = now - (item.receivedAt || now);
+    $("decodeText").textContent = `${Math.round(item.decodeMs || lastDecodeMs)} ms`;
+    $("displayLagText").textContent = `${(lastDisplayLagMs / 1000).toFixed(1)} s`;
     updateStats();
   }
   requestAnimationFrame(renderLoop);
@@ -96,85 +366,240 @@ function renderLoop(now) {
 
 async function readFirstFrame() {
   const file = $("firstFrame").files[0];
-  return file ? new Uint8Array(await file.arrayBuffer()) : undefined;
+  if (file) return new Uint8Array(await file.arrayBuffer());
+  return selectedReferenceBytes || undefined;
 }
 
-function drawReferencePreview(file) {
+function drawReferencePreviewFromImageSource(src, label) {
   const preview = $("referencePreview");
   const previewCtx = preview.getContext("2d", { alpha: false });
   previewCtx.fillStyle = "#e5e7df";
   previewCtx.fillRect(0, 0, preview.width, preview.height);
-  if (!file) return;
+  $("referenceName").textContent = label;
   const img = new Image();
   img.onload = () => {
     const scale = Math.min(preview.width / img.width, preview.height / img.height);
     const w = img.width * scale, h = img.height * scale;
     previewCtx.fillRect(0, 0, preview.width, preview.height);
     previewCtx.drawImage(img, (preview.width - w) / 2, (preview.height - h) / 2, w, h);
-    URL.revokeObjectURL(img.src);
+    if (src.startsWith("blob:")) URL.revokeObjectURL(src);
   };
-  img.src = URL.createObjectURL(file);
+  img.onerror = () => {
+    if (src.startsWith("blob:")) URL.revokeObjectURL(src);
+  };
+  img.src = src;
+}
+
+function drawReferencePreview(file) {
+  selectedReferenceBytes = null;
+  selectedReferenceLabel = file ? file.name : "";
+  if (!file) return;
+  drawReferencePreviewFromImageSource(URL.createObjectURL(file), file.name);
+}
+
+async function fetchPresetReference(preset) {
+  if (!referenceCache.has(preset.referenceUrl)) {
+    referenceCache.set(preset.referenceUrl, fetch(preset.referenceUrl).then(async (response) => {
+      if (!response.ok) throw new Error(`failed to load ${preset.source}`);
+      return new Uint8Array(await response.arrayBuffer());
+    }).catch((error) => {
+      referenceCache.delete(preset.referenceUrl);
+      throw error;
+    }));
+  }
+  return referenceCache.get(preset.referenceUrl);
+}
+
+async function setPresetReference(preset) {
+  selectedReferenceBytes = await fetchPresetReference(preset);
+  selectedReferenceLabel = preset.source;
+  $("firstFrame").value = "";
+  const blob = new Blob([selectedReferenceBytes], { type: preset.mime || "image/jpeg" });
+  drawReferencePreviewFromImageSource(URL.createObjectURL(blob), selectedReferenceLabel);
+}
+
+function showError(error) {
+  setStatus("Reference load failed", "error");
+  addHistory(error.message || "reference load failed");
+}
+
+function closeSession(reason = "session closed by client", clearFrames = true) {
+  clearQueueOnClose = clearFrames;
+  if (clearFrames) {
+    queue = [];
+    updateStats();
+  }
+  if (!ws) {
+    clearQueueOnClose = false;
+    setStatus("Closed");
+    return;
+  }
+  setStatus("Closing");
+  addHistory(reason);
+  ws.close(1000, "client close");
 }
 
 async function connect() {
-  if (ws) ws.close();
-  const firstFrame = await readFirstFrame();
-  const init = compact({
-    type: "init",
-    model: $("model").value,
-    prompt: $("prompt").value,
-    size: $("size").value,
-    seconds: Number($("seconds").value),
-    fps: Number($("fps").value),
-    seed: Number($("seed").value),
-    num_inference_steps: Number($("steps").value),
-    guidance_scale: Number($("guidance").value),
-    first_frame: firstFrame,
-  });
-  ws = new WebSocket($("serverUrl").value);
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => { ws.send(pack(init)); setStatus("Live", "live"); addHistory("session started"); };
-  ws.onclose = () => { ws = null; setStatus("Closed"); addHistory("session closed"); };
-  ws.onerror = () => { setStatus("Socket error", "error"); addHistory("socket error"); };
-  ws.onmessage = (event) => receive(event.data);
+  const epoch = ++streamEpoch;
+  $("connectBtn").disabled = true;
+  setStatus("Preparing");
+  addHistory("preparing session");
+  try {
+    if (ws) ws.close();
+    resetStreamStats();
+    if (!$("firstFrame").files[0] && !selectedReferenceBytes) {
+      await setPresetReference(presets[0]);
+    }
+    const firstFrame = await readFirstFrame();
+    if (!firstFrame) {
+      setStatus("Pick a reference", "error");
+      addHistory("reference image required");
+      $("connectBtn").disabled = false;
+      return;
+    }
+    const init = compact({
+      type: "init",
+      model: $("model").value,
+      prompt: $("prompt").value,
+      size: $("size").value,
+      fps: Number($("fps").value),
+      num_frames: Number($("numFrames").value),
+      seed: Number($("seed").value),
+      num_inference_steps: Number($("steps").value),
+      guidance_scale: Number($("guidance").value),
+      output_compression: PREVIEW_OUTPUT_QUALITY,
+      realtime_output_format: PREVIEW_OUTPUT_FORMAT,
+      condition_inputs: selectedPreset
+        ? { camera_actions: repeatActions(selectedPreset.actions, 24) }
+        : undefined,
+      max_chunks: $("continuous").checked ? undefined : 1,
+      first_frame: firstFrame,
+    });
+    ws = new WebSocket($("serverUrl").value);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      if (epoch !== streamEpoch) return;
+      chunkWaitStartedAt = performance.now();
+      ws.send(pack(init));
+      setStatus("Starting", "live");
+      addHistory(
+        `session started with ${selectedReferenceLabel || "uploaded reference"}`
+      );
+    };
+    ws.onclose = () => {
+      if (epoch !== streamEpoch) return;
+      ws = null;
+      $("connectBtn").disabled = false;
+      if (clearQueueOnClose) {
+        queue = [];
+        updateStats();
+      }
+      clearQueueOnClose = false;
+      setStatus("Closed");
+      addHistory("session closed");
+    };
+    ws.onerror = () => {
+      if (epoch !== streamEpoch) return;
+      $("connectBtn").disabled = false; setStatus("Socket error", "error"); addHistory("socket error");
+    };
+    ws.onmessage = (event) => {
+      receiveChain = receiveChain
+        .then(() => {
+          if (epoch !== streamEpoch) return undefined;
+          return receive(event.data);
+        })
+        .catch((error) => {
+          if (epoch !== streamEpoch) return;
+          setStatus("Receive failed", "error");
+          addHistory(error.message || "receive failed");
+        });
+    };
+  } catch (error) {
+    $("connectBtn").disabled = false;
+    setStatus("Init failed", "error");
+    addHistory(error.message || "init failed");
+  }
 }
 
-function receive(data) {
+async function receive(data) {
   if (!pendingHeader) {
     pendingHeader = unpack(new Uint8Array(data));
+    pendingHeader.__received_at = performance.now();
     if (pendingHeader.type === "error") {
       setStatus(pendingHeader.content || "Server error", "error");
       addHistory(pendingHeader.content || "server error");
       pendingHeader = null;
     }
+    if (pendingHeader) setStatus("Receiving", "live");
     return;
   }
   const now = performance.now();
-  queue.push(...rgbToImageData(pendingHeader, data));
-  frames += Number(pendingHeader.num_frames || 0);
-  bytes += data.byteLength;
-  $("latencyText").textContent = `${Math.round(performance.now() - now)} ms`;
-  updateStats(pendingHeader);
+  const header = pendingHeader;
   pendingHeader = null;
+  const eventId = Number(header.event_id || 0);
+  const chunkFrameCount = Number(header.num_frames || 0);
+  const payloadBytes = data.byteLength || data.size || 0;
+  if (awaitedEventId && eventId < awaitedEventId) {
+    droppedFrames += chunkFrameCount;
+    updateStats();
+    return;
+  }
+  const decodedFrames = await decodeFrameBatch(header, data);
+  if (awaitedEventId && eventId < awaitedEventId) {
+    droppedFrames += chunkFrameCount;
+    updateStats();
+    return;
+  }
+  if (awaitedEventId && eventId >= awaitedEventId) awaitedEventId = 0;
+  queue.push(...decodedFrames);
+  trimLiveQueue(chunkFrameCount);
+  frames += chunkFrameCount;
+  bytes += payloadBytes;
+  $("payloadMode").textContent = header.encoding || "raw RGB";
+  if (chunkWaitStartedAt) {
+    const waitSeconds = (now - chunkWaitStartedAt) / 1000;
+    const generatedFps = chunkFrameCount / Math.max(0.001, waitSeconds);
+    const requestedFps = Number($("fps").value || 16);
+    playbackFps = Math.min(
+      requestedFps,
+      Math.max(LOW_LATENCY_FPS_FLOOR, generatedFps * 1.05),
+    );
+    const latencyText = `${waitSeconds.toFixed(1)}s · ${playbackFps.toFixed(1)}fps`;
+    $("latencyText").textContent = latencyText;
+    $("stageLatencyText").textContent = latencyText;
+  }
+  chunkWaitStartedAt = performance.now();
+  setStatus("Live", "live");
+  updateStats(header);
 }
 
 function sendEvent(kind, payload) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(pack({ type: "event", kind, payload }));
+  const eventId = nextEventId++;
+  ws.send(pack({ type: "event", kind, payload, event_id: eventId }));
+  if (kind === "camera_actions" || kind === "prompt") {
+    awaitedEventId = eventId;
+    queue = [];
+    lastFrameAt = 0;
+    updateStats();
+    setStatus("Updating", "live");
+  }
   addHistory(`${kind} event sent`);
 }
 
-function repeatActions(actions) {
-  const n = Math.max(1, Number($("eventFrames").value || 8));
+function repeatActions(actions, frameCount) {
+  const n = Math.max(1, Number(frameCount || $("eventFrames").value || 3));
   return Array.from({ length: n }, (_, i) => actions[i % actions.length] || []);
 }
 
-function applyPreset(preset) {
+async function applyPreset(preset) {
+  selectedPreset = preset;
   $("prompt").value = preset.prompt;
   $("size").value = preset.size;
   $("fps").value = preset.fps;
+  await setPresetReference(preset);
   sendEvent("prompt", preset.prompt);
-  sendEvent("camera_actions", repeatActions(preset.actions));
+  sendEvent("camera_actions", repeatActions(preset.actions, 24));
   addHistory(`preset ${preset.name}`);
 }
 
@@ -195,15 +620,23 @@ function renderPresets() {
     const btn = document.createElement("button");
     btn.className = "preset";
     btn.dataset.tone = preset.tone;
-    btn.innerHTML = `<b>${preset.name}</b><span>${preset.size} · ${preset.fps}fps</span>`;
-    btn.onclick = () => applyPreset(preset);
+    btn.innerHTML = `<img class="preset-thumb" src="${preset.referenceUrl}" alt="" loading="lazy" /><b>${preset.name}</b><span>${preset.source} · ${preset.size} · ${preset.fps}fps</span>`;
+    btn.onclick = () => applyPreset(preset).catch(showError);
     $("presetList").appendChild(btn);
   });
 }
 
+function applyQueryParams() {
+  const params = new URLSearchParams(window.location.search);
+  const server = params.get("server");
+  if (server) $("serverUrl").value = server;
+}
+
 function pack(value) {
   const out = [];
-  const bytes = (arr) => out.push(...arr);
+  const bytes = (arr) => {
+    for (const item of arr) out.push(item);
+  };
   const str = (s) => new TextEncoder().encode(s);
   const u16 = (n) => [(n >> 8) & 255, n & 255];
   const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
@@ -268,14 +701,22 @@ function unpack(buf) {
   return read();
 }
 
+applyQueryParams();
 renderPresets();
 drawIdle();
+applyPreset(presets[0]).catch(showError);
 requestAnimationFrame(renderLoop);
 $("connectBtn").onclick = connect;
-$("stopBtn").onclick = () => ws && ws.close();
+$("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
 $("enhanceBtn").onclick = enhancePrompt;
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
+document.querySelectorAll("button").forEach((btn) => {
+  btn.addEventListener("pointerdown", () => btn.classList.add("is-pressed"));
+  ["pointerup", "pointercancel", "pointerleave", "blur"].forEach((eventName) => {
+    btn.addEventListener(eventName, () => btn.classList.remove("is-pressed"));
+  });
+});
 document.querySelectorAll("[data-action]").forEach((btn) => {
   btn.onclick = () => sendEvent("camera_actions", repeatActions([[btn.dataset.action]]));
 });

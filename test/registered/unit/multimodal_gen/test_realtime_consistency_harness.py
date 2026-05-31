@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from sglang.multimodal_gen.runtime.utils.realtime_video import RAW_RGB_CONTENT_TYPE
+from sglang.multimodal_gen.runtime.utils.realtime_video import (
+    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
+    RAW_RGB_CONTENT_TYPE,
+    RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
+    build_delta_gzip_raw_rgb_payload,
+)
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     build_realtime_event_payload,
     build_realtime_init_payload,
@@ -127,6 +132,58 @@ def test_decode_realtime_raw_rgb_frames_rejects_truncated_payload():
 
     with pytest.raises(ValueError, match="payload size mismatch"):
         decode_realtime_raw_rgb_frames(header, b"too-short")
+
+
+def test_decode_realtime_delta_gzip_raw_rgb_frames_roundtrips():
+    first = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+    second = (np.arange(12, dtype=np.uint8) + 1).reshape(2, 2, 3)
+    header = {
+        "type": "frame_batch_header",
+        "content_type": RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
+        "num_frames": 2,
+        "width": 2,
+        "height": 2,
+        "channels": 3,
+        "bytes_per_frame": 12,
+    }
+
+    frames = decode_realtime_raw_rgb_frames(
+        header,
+        build_delta_gzip_raw_rgb_payload([first.tobytes(), second.tobytes()]),
+    )
+
+    assert len(frames) == 2
+    np.testing.assert_array_equal(frames[0], first)
+    np.testing.assert_array_equal(frames[1], second)
+
+
+def test_decode_realtime_rgba_delta_gzip_strips_alpha():
+    first = np.array(
+        [[[1, 2, 3, 255], [4, 5, 6, 255]]],
+        dtype=np.uint8,
+    )
+    second = np.array(
+        [[[1, 2, 4, 255], [4, 6, 6, 255]]],
+        dtype=np.uint8,
+    )
+    header = {
+        "type": "frame_batch_header",
+        "content_type": RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
+        "num_frames": 2,
+        "width": 2,
+        "height": 1,
+        "channels": 4,
+        "bytes_per_frame": 8,
+    }
+
+    frames = decode_realtime_raw_rgb_frames(
+        header,
+        build_delta_gzip_raw_rgb_payload([first.tobytes(), second.tobytes()]),
+    )
+
+    assert len(frames) == 2
+    np.testing.assert_array_equal(frames[0], first[:, :, :3])
+    np.testing.assert_array_equal(frames[1], second[:, :, :3])
 
 
 # Generate function routing

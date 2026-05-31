@@ -29,6 +29,18 @@ class RealtimeVAEState(BaseRealtimeState):
         self.image_latent = None
 
 
+class RealtimeVAEDecodeState(BaseRealtimeState):
+    def __init__(self):
+        super().__init__()
+        self.reset_causal_decode_state = None
+
+    def dispose(self):
+        reset_causal_decode_state = self.reset_causal_decode_state
+        self.reset_causal_decode_state = None
+        if callable(reset_causal_decode_state):
+            reset_causal_decode_state()
+
+
 class RealtimeImageVAEEncodingStage(ImageVAEEncodingStage):
     """Reuse the first chunk's conditioning image latent across a realtime session."""
 
@@ -112,6 +124,8 @@ class CausalVaeDecodingStage(DecodingStage):
         self.load_model()
 
         reset_causal_state = getattr(self.vae, "reset_causal_decode_state", None)
+        decode_state = batch.session.get_or_create_state(RealtimeVAEDecodeState)
+        decode_state.reset_causal_decode_state = reset_causal_state
         if batch.block_idx == 0 and callable(reset_causal_state):
             reset_causal_state()
 

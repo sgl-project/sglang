@@ -19,13 +19,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
     RealtimeFrameSendStats,
+    empty_frame_send_stats,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    prepare_request as prepare_backend_request,
+    prepare_request,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
     ConditionEvent,
@@ -34,6 +35,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
     ControlSignal,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
@@ -52,24 +56,38 @@ class LingBotWorldRealtimeState:
         self.events = ConditionEventQueue(
             max_events={"prompt": 1, "camera_actions": 512}
         )
+        self.latest_event_id: int | None = None
 
     def clear(self) -> None:
         self.events.clear()
+        self.latest_event_id = None
 
-    def receive_prompt(self, prompt: str) -> None:
+    def receive_prompt(self, prompt: str, *, event_id: int | None = None) -> None:
         self.events.push(
             ConditionEvent(
                 kind="prompt",
                 payload=ControlSignal(kind="prompt", payload=prompt),
             )
         )
+        self.latest_event_id = event_id
 
-    def receive_camera_actions(self, camera_actions: list[list[str]]) -> None:
+    def receive_camera_actions(
+        self,
+        camera_actions: list[list[str]],
+        *,
+        replace_pending: bool = False,
+        event_id: int | None = None,
+    ) -> None:
         signals = [
             ControlSignal(kind="camera_actions", payload=list(actions))
             for actions in camera_actions
         ]
-        self.events.push(ConditionEvent(kind="camera_actions", payload=signals))
+        event = ConditionEvent(kind="camera_actions", payload=signals)
+        if replace_pending:
+            self.events.replace(event)
+        else:
+            self.events.push(event)
+        self.latest_event_id = event_id
 
     def sample_prompt(self) -> str:
         prompt = self.events.pop_latest("prompt")
@@ -115,6 +133,12 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         session: GenerateSession,
         request: RealtimeVideoGenerationsRequest,
     ) -> None:
+        condition_inputs = request.condition_inputs or {}
+        camera_actions = condition_inputs.get("camera_actions")
+        if camera_actions is not None:
+            state = self._state(session)
+            state.receive_camera_actions(self._validate_camera_actions(camera_actions))
+
         if request.first_frame is None:
             return
 
@@ -150,12 +174,16 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         state = self._state(session)
         if event.kind == "camera_actions":
             camera_actions = self._validate_camera_actions(event.payload)
-            state.receive_camera_actions(camera_actions)
+            state.receive_camera_actions(
+                camera_actions,
+                replace_pending=True,
+                event_id=event.event_id,
+            )
             return f"kind=camera_actions, frames={len(camera_actions)}"
         elif event.kind == "prompt":
             if not isinstance(event.payload, str) or not event.payload:
                 raise ValueError("prompt event payload must be a non-empty string")
-            state.receive_prompt(event.payload)
+            state.receive_prompt(event.payload, event_id=event.event_id)
             return f"kind=prompt, prompt_len={len(event.payload)}"
         raise ValueError(f"unsupported event kind: {event.kind}")
 
@@ -165,6 +193,7 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         chunk: RealtimeChunkContext,
         chunk_size: int,
     ) -> RealtimeChunkInputs:
+        """Samples user inputs (conditions) for the current RealtimeChunk from RealtimeStates"""
         state = self._state(session)
         request = session.request
         if request is None:
@@ -236,6 +265,7 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         server_args: ServerArgs,
         chunk: RealtimeChunkContext,
     ) -> Req:
+        """build a new request for the next chunk"""
         pipeline_config = server_args.pipeline_config
         chunk_size = int(pipeline_config.dit_config.arch_config.num_frames_per_block)
         chunk_inputs = self._sample_chunk_inputs(session, chunk, chunk_size)
@@ -245,7 +275,7 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
             chunk_inputs,
             chunk_size,
         )
-        batch = prepare_backend_request(
+        batch = prepare_request(
             server_args=server_args,
             sampling_params=sampling_params,
         )
@@ -253,6 +283,9 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         batch.realtime_session_id = session.id
         batch.return_raw_frames = True
         batch.block_idx = chunk.index
+        batch.realtime_event_id = self._state(session).latest_event_id
+        if session.request is not None:
+            batch.realtime_output_format = session.request.realtime_output_format
         return batch
 
     async def send_output(
@@ -262,7 +295,24 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         result: OutputBatch,
         batch: Req,
     ) -> RealtimeFrameSendStats:
+        if self._should_skip_stale_output(session, batch):
+            logger.info(
+                "skip stale realtime output, session_id=%s, block_idx=%s, "
+                "chunk_event_id=%s, latest_event_id=%s",
+                session.id,
+                batch.block_idx,
+                batch.realtime_event_id,
+                self._state(session).latest_event_id,
+            )
+            return empty_frame_send_stats("skipped-stale")
         return await self.output_adapter.send(ws, session, result, batch)
+
+    def _should_skip_stale_output(self, session: GenerateSession, batch: Req) -> bool:
+        latest_event_id = self._state(session).latest_event_id
+        if latest_event_id is None:
+            return False
+        chunk_event_id = batch.realtime_event_id
+        return chunk_event_id is None or chunk_event_id < latest_event_id
 
     def on_chunk_complete(self, session: GenerateSession, result: OutputBatch) -> None:
         del result
@@ -272,3 +322,4 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         state = session.adapter_state
         if isinstance(state, LingBotWorldRealtimeState):
             state.clear()
+        self.output_adapter.reset()

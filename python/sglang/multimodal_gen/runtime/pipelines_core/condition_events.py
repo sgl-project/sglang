@@ -80,6 +80,10 @@ class ConditionEventQueue:
         queue.append(event)
         self._seen_kinds.add(event.kind)
 
+    def replace(self, event: ConditionEvent) -> None:
+        self.clear_kind(event.kind)
+        self.push(event)
+
     def pop_latest(self, kind: str) -> Any | None:
         queue = self._events.get(kind)
         if not queue:
@@ -131,6 +135,11 @@ class ConditionEventQueue:
                 return None
             return [params.default_item for _ in range(params.chunk_size)]
 
+        if len(chunk) == 0:
+            if params.default_item is _MISSING:
+                return None
+            return [params.default_item for _ in range(params.chunk_size)]
+
         if not params.repeat_last:
             return chunk
 
@@ -146,6 +155,12 @@ class ConditionEventQueue:
         self._pending_signals.clear()
         self._last_payloads.clear()
         self._seen_kinds.clear()
+
+    def clear_kind(self, kind: str) -> None:
+        self._events.pop(kind, None)
+        self._pending_signals.pop(kind, None)
+        self._last_payloads.pop(kind, None)
+        self._seen_kinds.discard(kind)
 
     def _queue_for(self, kind: str) -> deque[ConditionEvent]:
         queue = self._events.get(kind)

@@ -69,3 +69,10 @@ class GenerateSession:
     def generate_chunk_completed(self):
         self.generate_chunk_cnt += 1
         self.current_chunk = None
+
+    def reached_max_chunks(self) -> bool:
+        return (
+            self.request is not None
+            and self.request.max_chunks is not None
+            and self.generate_chunk_cnt >= self.request.max_chunks
+        )

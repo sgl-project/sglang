@@ -9,6 +9,8 @@ Extends CausalDMDDenoisingStage with:
 - Session-persistent KV cache with cumulative frame position tracking
 """
 
+from contextlib import nullcontext
+
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -50,6 +52,10 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             state = batch.session.get_or_create_state(RealtimeCausalDiTState)
             return state, True
         return RealtimeCausalDiTState(), False
+
+    def _clear_stage_causal_cache_refs(self) -> None:
+        self.causal_kv_cache = None
+        self.crossattn_cache = None
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -181,6 +187,66 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     ):
         return server_args.pipeline_config.get_pos_prompt_embeds(batch)
 
+    @staticmethod
+    def _select_i2v_condition_chunk(
+        condition_full: torch.Tensor,
+        chunk_idx: int,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        condition_chunks = condition_full.split(chunk_size, dim=2)
+        if chunk_idx < len(condition_chunks):
+            condition = condition_chunks[chunk_idx]
+        else:
+            # only the first global condition chunk carries the reference frame;
+            # later realtime chunks must not be re-anchored to that first frame
+            condition = torch.zeros_like(condition_chunks[-1])
+
+        if condition.shape[2] == chunk_size:
+            return condition
+        pad_frames = chunk_size - condition.shape[2]
+        return torch.cat(
+            [
+                condition,
+                condition.new_zeros(
+                    condition.shape[0],
+                    condition.shape[1],
+                    pad_frames,
+                    condition.shape[3],
+                    condition.shape[4],
+                ),
+            ],
+            dim=2,
+        )
+
+    @staticmethod
+    def _build_i2v_model_input_writer(
+        *,
+        latents: torch.Tensor,
+        condition: torch.Tensor,
+        target_dtype: torch.dtype,
+        device: torch.device,
+    ):
+        b, latent_channels, t, h, w = latents.shape
+        condition = condition.to(device=device, dtype=target_dtype)
+        model_input = torch.empty(
+            (
+                b,
+                latent_channels + condition.shape[1],
+                t,
+                h,
+                w,
+            ),
+            dtype=target_dtype,
+            device=device,
+        )
+        model_input[:, latent_channels:].copy_(condition)
+
+        def write(current_latents: torch.Tensor) -> torch.Tensor:
+            model_input[:, :latent_channels].copy_(current_latents)
+            return model_input
+
+        return write
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # --- Condition: take current chunk's slice ---
@@ -238,6 +304,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
             cache_state.kv_cache = causal_kv_cache
             cache_state.crossattn_cache = crossattn_cache
+            self._clear_stage_causal_cache_refs()
             # Reset frame position on cache reset
             cache_state.current_chunk_start_frame = 0
             cache_state.chunk_idx = 0
@@ -248,20 +315,28 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         current_start_frame = cache_state.current_chunk_start_frame
 
         # Slice condition to current chunk
-        condition_chunks = condition_full.split(t, dim=2)
-        cond_idx = min(cache_state.chunk_idx, len(condition_chunks) - 1)
-        condition = condition_chunks[cond_idx]
+        condition = self._select_i2v_condition_chunk(
+            condition_full,
+            cache_state.chunk_idx,
+            t,
+        )
 
         # --- Denoising loop (single chunk) ---
         current_latents = latents
+        prepare_model_input = self._build_i2v_model_input_writer(
+            latents=current_latents,
+            condition=condition,
+            target_dtype=target_dtype,
+            device=device,
+        )
+        prepare_context_input = prepare_model_input
 
-        def prepare_model_input(current_latents):
-            return torch.cat([current_latents, condition], dim=1)
-
-        def prepare_context_input(current_latents):
-            return torch.cat([current_latents, condition], dim=1)
-
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
+        progress_bar_context = (
+            nullcontext(None)
+            if batch.session is not None
+            else self.progress_bar(total=len(timesteps))
+        )
+        with progress_bar_context as progress_bar:
             current_latents = self._denoise_and_update_causal_block(
                 batch,
                 server_args,

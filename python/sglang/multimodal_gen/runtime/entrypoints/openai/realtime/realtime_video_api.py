@@ -2,6 +2,7 @@
 
 import asyncio
 import shutil
+import time
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -79,15 +80,23 @@ def _log_realtime_chunk_timing(
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
-    while True:
+    adapter = session.adapter
+    if adapter is None:
+        raise ValueError("realtime adapter is not initialized")
+
+    pending_send_task = None
+    while not session.reached_max_chunks():
         try:
+            if pending_send_task is not None and pending_send_task.done():
+                await pending_send_task
+                pending_send_task = None
+
             timer = RealtimeStageTimer()
+            chunk_started = time.perf_counter()
 
             # send to scheduler and generate video chunk
             server_args = get_global_server_args()
-            adapter = session.adapter
-            if adapter is None:
-                raise ValueError("realtime adapter is not initialized")
+
             chunk = session.new_chunk()
             batch = adapter.prepare_next_request(
                 session,
@@ -106,30 +115,33 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             _, result = await process_generation_batch(async_scheduler_client, batch)
             scheduler_forward_ms = timer.mark_ms()
 
-            send_stats = await adapter.send_output(
-                ws,
-                session,
-                result,
-                batch,
-            )
-            chunk_total_ms = timer.total_ms()
-
             # finish
             adapter.on_chunk_complete(session, result)
-            _log_realtime_chunk_timing(
-                session,
-                chunk,
-                batch,
-                request_prepare_ms,
-                scheduler_forward_ms,
-                chunk_total_ms,
-                send_stats,
+            if pending_send_task is not None:
+                await pending_send_task
+            pending_send_task = asyncio.create_task(
+                _send_output_and_log(
+                    ws,
+                    session,
+                    chunk,
+                    batch,
+                    result,
+                    request_prepare_ms,
+                    scheduler_forward_ms,
+                    chunk_started,
+                )
             )
 
         except asyncio.CancelledError:
+            if pending_send_task is not None:
+                pending_send_task.cancel()
+                await _await_realtime_task(pending_send_task)
             logger.info("generation completed, session_id=%s", session.id)
             break
         except Exception as e:
+            if pending_send_task is not None:
+                pending_send_task.cancel()
+                await _await_realtime_task(pending_send_task)
             err_msg = str(e).splitlines()[0]
             logger.error("error during generate loop: %s", err_msg)
             try:
@@ -140,6 +152,45 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                     send_error,
                 )
             break
+    else:
+        if pending_send_task is not None:
+            await pending_send_task
+        logger.info(
+            "generation reached max chunks, session_id=%s, max_chunks=%s",
+            session.id,
+            session.request.max_chunks if session.request is not None else None,
+        )
+
+
+async def _send_output_and_log(
+    ws: WebSocket,
+    session: GenerateSession,
+    chunk: RealtimeChunkContext,
+    batch: "Req",
+    result,
+    request_prepare_ms: float,
+    scheduler_forward_ms: float,
+    chunk_started: float,
+) -> RealtimeFrameSendStats:
+    if session.adapter is None:
+        raise ValueError("realtime adapter is not initialized")
+    send_stats = await session.adapter.send_output(
+        ws,
+        session,
+        result,
+        batch,
+    )
+    chunk_total_ms = (time.perf_counter() - chunk_started) * 1000
+    _log_realtime_chunk_timing(
+        session,
+        chunk,
+        batch,
+        request_prepare_ms,
+        scheduler_forward_ms,
+        chunk_total_ms,
+        send_stats,
+    )
+    return send_stats
 
 
 async def _await_realtime_task(task: asyncio.Task | None) -> None:
