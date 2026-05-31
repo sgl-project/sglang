@@ -4,7 +4,8 @@ Owned by :class:`ScriptedTestCase`. Spawns a dedicated subprocess
 that runs :func:`launch_scripted_http_server`, which launches a real sglang
 HTTP server; the caller communicates with the scheduler-side dispatch loop
 (owned by :class:`ScriptedSchedulerHook`) over a ZMQ ``PAIR`` socket bound
-to an ``ipc://`` endpoint.
+to a loopback ``tcp://`` endpoint — the same transport sglang uses for its
+own inter-process ZMQ channels.
 
 One :class:`ScriptedHttpServer` instance per test class — every
 ``test_*`` method shares the same HTTP server / engine and submits a fresh
@@ -26,7 +27,7 @@ from typing import Any, Callable, Optional, Tuple
 import zmq
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.network import get_free_port, get_zmq_socket
+from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
 from sglang.test.scripted_runtime.http_server_subprocess import (
     launch_scripted_http_server,
 )
@@ -53,13 +54,11 @@ class ScriptedHttpServer:
         ctx: zmq.Context,
         socket: zmq.Socket,
         server_process: mp.process.BaseProcess,
-        socket_dir: Path,
         traceback_path: Path,
     ) -> None:
         self._ctx = ctx
         self._socket = socket
         self._server_process = server_process
-        self._socket_dir = socket_dir
         self._traceback_path = traceback_path
         self._shutdown_done = False
         self._dirty: Optional[str] = None
@@ -68,7 +67,7 @@ class ScriptedHttpServer:
     def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
         """Spawn the HTTP-server process and await the dispatch loop's handshake.
 
-        The PAIR socket is bound to an ``ipc://`` endpoint *before* the
+        The PAIR socket binds to a random loopback ``tcp://`` port *before* the
         server process starts so the dispatch loop's connect call never
         races. If the server fails to start (slow load, model error, CUDA
         failure) the first-message poll times out after
@@ -76,22 +75,20 @@ class ScriptedHttpServer:
         indefinitely. The dispatch loop sends a :class:`HookReady` as its
         first message once it connects, which the startup handshake confirms.
 
-        The ipc socket lives in a private 0700 temp dir, so we rely on
-        filesystem permissions instead of an authkey — matching sglang's
-        no-auth ZMQ posture.
+        The socket binds to ``127.0.0.1`` only (no authkey), so it is reachable
+        from the spawned server process but not from the network — matching
+        sglang's no-auth, loopback-only ZMQ posture (CVE-2026-3060).
 
         ``engine_kwargs`` (notably ``model_path`` plus any ServerArgs
         overrides) are forwarded to :func:`launch_scripted_http_server`.
         """
-        socket_dir = Path(tempfile.mkdtemp(prefix="sglang_scripted_ipc_"))
-        endpoint = f"ipc://{socket_dir}/ipc.sock"
-
         tb_fd, tb_path = tempfile.mkstemp(prefix="scripted_runtime_tb_", suffix=".txt")
         os.close(tb_fd)
         traceback_path = Path(tb_path)
 
         ctx = zmq.Context()
-        socket = get_zmq_socket(ctx, zmq.PAIR, endpoint, bind=True)
+        dispatch_port, socket = get_zmq_socket_on_host(ctx, zmq.PAIR, host=SERVER_HOST)
+        endpoint = f"tcp://{SERVER_HOST}:{dispatch_port}"
 
         host = SERVER_HOST
         port = get_free_port()
@@ -137,7 +134,6 @@ class ScriptedHttpServer:
             ctx=ctx,
             socket=socket,
             server_process=server_process,
-            socket_dir=socket_dir,
             traceback_path=traceback_path,
         )
 
@@ -236,12 +232,6 @@ class ScriptedHttpServer:
     def _cleanup_files(self) -> None:
         try:
             self._traceback_path.unlink()
-        except OSError:
-            pass
-        try:
-            for p in self._socket_dir.iterdir():
-                p.unlink()
-            self._socket_dir.rmdir()
         except OSError:
             pass
 
