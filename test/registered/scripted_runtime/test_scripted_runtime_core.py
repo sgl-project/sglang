@@ -390,7 +390,9 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield from run_until_finished(r)
         for _ in range(5):
             yield
-        assert t.list_active_reqs() == [], "active reqs should drain to empty after finish"
+        assert (
+            t.list_active_reqs() == []
+        ), "active reqs should drain to empty after finish"
 
     def test_empty_script_returns_immediately(self):
         self.server.execute_script(self._script_empty_return)
