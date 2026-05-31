@@ -4,6 +4,14 @@ import importlib
 import sys
 from typing import Callable, Optional
 
+import zmq
+
+
+def close_zmq_socket(socket: zmq.Socket, ctx: zmq.Context) -> None:
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.close()
+    ctx.term()
+
 
 def ensure_script_importable(sys_path_entry: Optional[str]) -> None:
     if sys_path_entry and sys_path_entry not in sys.path:

@@ -14,9 +14,8 @@ def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
     yield from s.waiting_queue
     if s.running_batch is not None:
         yield from s.running_batch.reqs
-    last_batch = getattr(s, "last_batch", None)
-    if last_batch is not None:
-        yield from last_batch.reqs
+    if s.last_batch is not None:
+        yield from s.last_batch.reqs
 
 
 def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:

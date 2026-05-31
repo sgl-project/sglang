@@ -20,7 +20,7 @@ from sglang.test.scripted_runtime.io_struct import (
     ScriptSucceeded,
     Shutdown,
 )
-from test.manual.dsv4 import _common
+from sglang.test.scripted_runtime.utils import close_zmq_socket
 
 DEFAULT_RUN_TIMEOUT_S: float = 120.0
 SHUTDOWN_JOIN_TIMEOUT_S: float = 60.0
@@ -139,9 +139,7 @@ class ScriptedHttpServer:
 
     def _teardown(self) -> None:
         try:
-            self._socket.setsockopt(zmq.LINGER, 0)
-            self._socket.close()
-            self._ctx.term()
+            close_zmq_socket(self._socket, self._ctx)
         except Exception:  # noqa: BLE001 — best-effort cleanup
             pass
         self._terminate_process(self._server_process)

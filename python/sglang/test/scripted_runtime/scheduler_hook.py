@@ -21,7 +21,11 @@ from sglang.test.scripted_runtime.io_struct import (
     ScriptSucceeded,
     Shutdown,
 )
-from sglang.test.scripted_runtime.utils import ensure_script_importable, resolve_fn
+from sglang.test.scripted_runtime.utils import (
+    close_zmq_socket,
+    ensure_script_importable,
+    resolve_fn,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -82,7 +86,7 @@ class ScriptedSchedulerHook:
                         sub_gen = fn(ctx, *args)
                         try:
                             yield from sub_gen
-                        except BaseException:
+                        except Exception:
                             socket.send_pyobj(
                                 ScriptFailed(traceback=traceback.format_exc())
                             )
@@ -91,9 +95,7 @@ class ScriptedSchedulerHook:
                     case _:
                         raise ValueError(f"dispatch loop: unknown command {msg!r}")
         finally:
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.close()
-            ctx_zmq.term()
+            close_zmq_socket(socket, ctx_zmq)
             self._http_poster.close()
 
     def step(self) -> None:
