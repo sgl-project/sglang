@@ -132,51 +132,71 @@ and competitive per-request throughput. **Outstanding for the *client SLO*: P99 
 
 ---
 
-## 4. LOOP 6 — Client-SLO MVP ("make DS shippable") — the next loop
+## 4. LOOP 6 — Client-SLO MVP ("make DS shippable") — ✅ DONE (Minimum Acceptable Scope, 2026-05-31)
 
 **Goal:** make DS *itself* (not just DSA) pass `CLIENT_SLOS.md` on the immediate workload, and
 decide whether to invest further. The spine is the **admission/TTFT fix**; everything else here is
-a small hardening or a strategic decision. A stub plan exists at `development/loop6/` — flesh out
-`development/loop6/draft.md` from `runs/20260528_dsv32_mvp/next_loop_issues.md` before `gen-plan`.
+a small hardening or a strategic decision. Executed as RLCR loop `.humanize/rlcr/2026-05-30_06-27-19`
+(plan `development/loop6/refined_plan_v1.md`).
 
-### 4.0 Strategic gate (decide FIRST — gates Tier-2 R&D for this and later loops)
-- [ ] **DEC: Is DS worth pursuing on a DSA-native model (V3.2)?** Capture as a `DEC-N` decision doc
-  `runs/<date>_dsv32_loop6/ds_on_v32_decision.md`. Rationale on the table: DS is capped at native
-  `index_topk=2048` by the shared kernel AND uses an inferior offline selector, so it cannot match
-  DSA long-context recall at the shared budget; DS's value is clearer on models without a trained
-  indexer. **This decision gates §6 Loop 7 (128k) and the Tier-2 recall R&D below.**
+> **Loop-6 outcome (Lower Bound met).** The Tier-1 engineering spine **landed** and the admission/TTFT
+> blocker is **fixed at conc-16**: a **compact int8 TokenLabelTable** (≈1.78× smaller; ~6.48 GB/rank) lets DS
+> boot+serve at **`mem_fraction_static`=0.7** (KV pool `max_total_num_tokens`=396096) with generation headroom.
+> At the full-context Option-B point DS hits **conc-16 P99 TTFT 13.13 s < 22** (the Loop-5 hard blocker —
+> was 57.7 s). Per-request **TPS** is the characterized structural decode-batch ceiling (24.9/19.5/17.3 at
+> conc 16/32/64; DS ≤ DSA; **conc-64 ≥30 unattainable even for DSA at 29.4**), and an R24 microbench proved
+> **no full-context top-k design reaches conc-16 ≥30**. AC-5 therefore closed **directional (DEC-3)** — spine
+> validated + strict misses recorded with measured attribution, **not a strict/shippable all-conc pass**. The
+> **strict all-concurrency SLO** (≥30 TPS at every conc) and **Tier-2 recall R&D (§4.4 → Loop 7)** are the
+> deferred downstream/own-loop work. As-built detail:
+> [`development/past_implementations/study/08-current-system-architecture.md`](past_implementations/study/08-current-system-architecture.md).
+> Evidence: `runs/20260530_dsv32_loop6/`.
 
-### 4.1 ⭐ THE client-SLO blocker — TokenLabelTable footprint → mem fraction → admission (handoff #2)
-- [ ] Shrink the per-rank `TokenLabelTable` (`python/.../double_sparsity/token_label_table.py`,
-  ~8 GB/rank fp16 today) so DS can serve at a higher `mem_fraction_static` **without the
-  generation-time OOM seen at 0.7**. Candidate levers: int8-symmetric signatures (+ per-layer/slot/head
-  scales applied at scoring), narrower `label_dim`, or a tighter slot model.
-- [ ] Sweep `mem_fraction_static` 0.6 → 0.7 → 0.8; record `max_total_num_tokens` rising with **no OOM**
-  under a long sustained `/generate`. Artifact: mem-fraction sweep log.
-- [ ] **Re-run AC-11 at the lifted mem fraction** (conc 16/32/64, 3 trials, 120 s/600 s) and confirm
-  achieved concurrency tracks nominal; update `ac11_analysis.md` verdict (handoff #3 / DEC-7).
-- [ ] **Direct client-SLO validation** (NEW — the actual acceptance test): run `benchmark.sh` at the
-  **full** `NUM_PROMPTS=320` client shape and assert **absolute P99 TTFT < 22 s** and **≥ 30 TPS/req**
-  at conc 16 and 64. This is the artifact that says "DS is shippable for the client."
+### 4.0 Strategic gate (decide FIRST — gates Tier-2 R&D for this and later loops) — ✅ DECIDED
+- [x] **DEC: Is DS worth pursuing on a DSA-native model (V3.2)?** **RESOLVED: pursue Tier-2 recall R&D, but
+  strictly AFTER the Tier-1 spine lands** — recorded in `runs/20260530_dsv32_loop6/ds_on_v32_decision.md`
+  (Loop-6 AC-1). Rationale confirmed on hardware: DS is capped at native `index_topk=2048` by the shared
+  kernel AND uses an inferior offline selector, so it cannot match DSA long-context recall at the shared
+  budget; DS's value is clearer on models without a trained indexer. **The Tier-1 spine has landed → this
+  gate is now OPEN for Loop 7 (§6).**
 
-### 4.2 64K servability (side-effect of 4.1; also unblocks deferred 128k) — (handoff #2)
-- [ ] At the lifted mem fraction, confirm a 64K-context `/generate` no longer returns HTTP 400
-  (or document the new ceiling). This is a *servability* win; recall accuracy at 64K is separate (Tier 2).
+### 4.1 ⭐ THE client-SLO blocker — TokenLabelTable footprint → mem fraction → admission (handoff #2) — ✅ DONE (directional)
+- [x] **Shrank the per-rank `TokenLabelTable` via int8-symmetric signatures** (+ per-`(layer,slot,head)` fp16
+  scales applied at scoring): ≈1.78× smaller, ~6.48 GB/rank at the lifted point. Implemented across
+  `token_label_table.py` (storage), `token_label_write.py` (quantize-on-write), `selection_kernel.py`
+  (scale-aware scoring), `serve_double_sparsity.sh` (`SIGNATURE_DTYPE`), + radix-fixture fail-closed on dtype.
+  `label_dim` narrowing was NOT chosen (DEC-4); page-level escalation not needed (int8 sufficient).
+- [x] **mem-fraction lift to 0.7 with no generation-time OOM** — full HBM budget closed; `max_total_num_tokens`
+  rises to 396096; NVML plateau + no-OOM long-generate proven (`runs/20260530_dsv32_loop6/`, AC-4).
+- [x] **Admission restored / client-SLO validated at conc-16**: at the **full-context** point DS hits
+  **P99 TTFT 13.13 s < 22** (conc-16), with a fail-closed verifier (recompute-from-raw) + measured
+  admission-vs-prefill attribution (`ac5_fullctx/`). conc-32/64 TTFT and all-conc **TPS** miss strict and are
+  **characterized** as the structural decode-batch ceiling (DS ≤ DSA; conc-64 ≥30 unattainable even for DSA).
+  **AC-5 closed directional (DEC-3) — not a strict/shippable all-conc pass.** The strict all-conc SLO is
+  carried downstream (§6 note).
 
-### 4.3 Accuracy-harness hardening — (handoff #4 / Codex queued #1)
-- [ ] AC-12 within-budget gate: assert `within_budget` from **actual** `usage.prompt_tokens`
-  (or tokenized chat length), not the 1024/1536 **word-count** proxy. Rename `length_tokens`→`length_words`
-  / add `input_tokens`. Must **not** change the DECIDED DS-fair gate definition.
+### 4.2 64K servability (side-effect of 4.1; also unblocks deferred 128k) — (handoff #2) — ✅ DONE
+- [x] At the lifted mem fraction a 64K-context `/generate` **serves** (no HTTP 400) — servability win recorded
+  (`runs/20260530_dsv32_loop6/ac8_servability/ac8_64k_servability.md`, AC-8). Recall at 64K is separate (Tier 2).
 
-### 4.4 Tier-2 — DS long-context recall R&D (GATED on 4.0; likely DEFER to Loop 7) — (handoff #1)
-- [ ] **Only if the strategic gate opens it:** a `flashmla_kv` decode-kernel variant accepting
-  `top_k > index_topk` (today asserts `indices.shape[-1] == dsa_index_topk`) **and/or** a query-aware /
-  learned DS selector that places the needle in the 2048 budget. Measure NIAH 4K/16K/64K recall delta
-  vs the Loop-5 baseline DS 75% / 5% / 0%. *(GPU- and engineering-heavy; do not start before 4.0.)*
+### 4.3 Accuracy-harness hardening — (handoff #4 / Codex queued #1) — ✅ DONE
+- [x] AC-12 within-budget gate asserts `within_budget` from **actual** token counts (not the word-count proxy);
+  the DECIDED DS-fair gate definition was **not** changed.
 
-**Loop 6 done = client-SLO MVP:** §4.1 lands and the full-shape benchmark shows **P99 TTFT < 22 s
-and ≥ 30 TPS/req** for DS; §4.2/§4.3 recorded; strategic gate (§4.0) decided. Tier 2 (§4.4) closed-or-opened
-explicitly (a closed gate is a legitimate outcome, not a stall).
+### 4.4 Tier-2 — DS long-context recall R&D (GATED on 4.0) — ⏩ DEFERRED to Loop 7 (gate OPEN, high priority)
+- [→] **Deferred to its own loop** (owner R24 close; plan Lower Bound: Tier-2 moves to its own loop if the
+  Tier-1 spine consumes Loop 6 — it did). The strategic gate (§4.0) is **open**. The work — a `flashmla_kv`
+  decode-kernel variant accepting `top_k > index_topk` (relaxing `indices.shape[-1] == dsa_index_topk`)
+  **and/or** a query-aware / learned DS selector — is the **high-priority Loop-7 mainline**, drafted at
+  [`development/loop7.md/draft.md`](loop7.md/draft.md). Target: NIAH 4K/16K/64K recall delta vs DS baseline
+  75% / 5% / 0%. *(GPU- and engineering-heavy.)*
+
+**Loop 6 done = client-SLO MVP (Minimum Acceptable Scope met):** §4.1 landed the admission/TTFT spine with
+**conc-16 P99 TTFT 13.13 s < 22** at full context (AC-5 **directional**, DEC-3 — TPS the characterized
+structural ceiling); §4.0 strategic gate **decided** (and now open); §4.2/§4.3 **done**; Tier-2 §4.4
+**explicitly deferred to Loop 7** (a deferral with an open gate + a written draft, not a stall). The **strict
+all-concurrency SLO** (≥30 TPS at every conc) is carried downstream — structurally DS ≤ DSA and conc-64 ≥30
+is unattainable even for DSA.
 
 ---
 
@@ -216,15 +236,24 @@ These are not tied to one client requirement but must land before "shippable to 
 From `CLIENT_SLOS.md` "Deferred Client requirements ordered from most important to least." Each is a
 candidate RLCR loop; sizing/dependencies noted.
 
-### Loop 7 — 128k ISL / 1024 OSL long-context (deferred client #2 — but engineering-gated first)
-*Most technically continuous with Loop 6.* Depends on §4.2 (admission/KV budget) **and** the §4.4
-recall R&D if the strategic gate opened it.
-- [ ] KV-budget / admission sufficient to **serve** 128k context (extends the 64K servability work).
-- [ ] Long-context **recall** at 128k: requires the query-aware/learned selector and/or `top_k>index_topk`
-  kernel variant (else DS recall collapses as in the Loop-5 4K/16K/64K characterization).
-- [ ] 128k/1024 SLO definition + benchmark shape (the current `benchmark.sh` is 4096/512 only).
-- [ ] **Strategic dependency:** if §4.0 decided DS is *not* worth pursuing on DSA-native V3.2, this loop
-  may instead be "serve 128k via DSA, DS off" — surface that explicitly.
+### Loop 7 — ⭐ DS long-context RECALL R&D (Tier-2 / AC-10) — HIGH PRIORITY (deferred out of Loop 6; gate OPEN)
+*The high-priority carryover from Loop 6.* The strategic gate (§4.0) **resolved to pursue this AFTER the
+Tier-1 spine** — which has now landed — so the gate is **open**. Draft: [`development/loop7.md/draft.md`](loop7.md/draft.md).
+The core problem (established on hardware in Loop 6): DS recall **4K 75% / 16K 5% / 64K 0%** vs DSA **100%** at
+the same 2048 budget + same kernel; dense DS = 100% and DS MMLU == DSA, so the gap is **selection quality +
+the `index_topk=2048` kernel lock**, not a decode bug.
+- [ ] **PRIMARY — adjustable-`top_k` sparse decode kernel:** a `flashmla_kv`-style decode kernel that relaxes
+  `indices.shape[-1] == dsa_index_topk` as a **new opt-in DS path** (do not weaken the default DSA assert), so
+  DS can spend > 2048 budget on hard prompts. CUDA-graph-safe, R23 deterministic tie-break carried over.
+- [ ] **SECONDARY — query-aware / learned DS selector** (or pull top-p/Twilight forward, roadmap Loop 11):
+  better needle placement inside the existing 2048 budget — **no kernel change**, cheaper to try first.
+- [ ] **Measure NIAH 4K/16K/64K recall delta** vs the DS baseline 75% / 5% / 0% (DS-vs-DSA, real hardware).
+- [ ] **Secondary engineering scope — 128k servability** (deferred client #2): KV-budget / admission to
+  **serve** 128k (extends the §4.2 64K servability work); 128k/1024 SLO definition + benchmark shape (current
+  `benchmark.sh` is 4096/512 only). Servability is separate from recall; the 128k deliverable needs both.
+- **Note:** the **strict all-concurrency client SLO** (≥30 TPS/req at every conc) is a *separate downstream*
+  concern (structurally DS ≤ DSA; conc-64 ≥30 unattainable even for DSA) — not this loop's recall goal unless
+  the owner merges them.
 
 ### Loop 8 — nvfp4 / mxfp4 quantized weight support (deferred client #3)
 - [ ] DS calibration + serving on nvfp4 and mxfp4 weights (today: FP8 e4m3 only). Channel-mask
@@ -276,10 +305,12 @@ From `CLIENT_SLOS.md` "Downstream requirements after client deliverables."
 
 ## 8. Open decisions to resolve before/while planning the above
 
-- [ ] **DEC (strategic, §4.0):** pursue DS recall R&D on DSA-native V3.2, or cap DS at "engineering
-  wins only" and lean on DSA for long context? Governs Loops 6 Tier-2, 7, and the GLM-5.1 framing.
-- [ ] **DEC (SLO scope):** is "shippable" = DS meets the client SLO *itself*, or = DS available as an
-  opt-in knob while DSA is the default that meets the SLO? (DSA already meets both SLOs trivially.)
+- [x] **DEC (strategic, §4.0) — RESOLVED (Loop 6, `ds_on_v32_decision.md`):** **pursue** DS recall R&D on
+  DSA-native V3.2, but strictly **after** the Tier-1 spine (now landed → gate open, Loop 7 §6). Primary
+  direction = adjustable-`top_k` decode kernel; secondary = learned/query-aware selector.
+- [x] **DEC (SLO scope) — RESOLVED (Loop 6, AC-6):** DS ships as an **opt-in knob with DSA as the default**;
+  the compact DS path is flag-gated (fp16/DSA default unchanged, non-regression proven). Whether DS *itself*
+  meets the strict all-conc SLO is a separate downstream question (DS ≤ DSA on decode TPS).
 - [ ] **DEC (TTFT target source):** confirm the client SLO is **absolute P99 TTFT < 22 s** at the
   client workload (not a DS-vs-DSA ratio) — and re-validate at full `NUM_PROMPTS=320` (§4.1).
 - [x] **DEC (deployment topology) — RESOLVED (Loop 6, DEC-5):** the client deliverable is validated
@@ -298,7 +329,11 @@ From `CLIENT_SLOS.md` "Downstream requirements after client deliverables."
   `ac12_analysis.md`, `mvp_compare_ac11.md`, `next_loop_issues.md`, `ac12_results/`
 - **Loop-5 process record:** `.humanize/rlcr/2026-05-28_10-17-12/` — `goal-tracker.md`, `stop-state.md`,
   round summaries/reviews
-- **Loop-6 stub:** `development/loop6/draft.md` (DUMMY — flesh out), `development/loop6/runbook.md`
+- **Loop-6 (DONE):** plan `development/loop6/refined_plan_v1.md`; process record
+  `.humanize/rlcr/2026-05-30_06-27-19/` (goal-tracker, round summaries); evidence `runs/20260530_dsv32_loop6/`
+  (`ds_on_v32_decision.md`, `footprint_feasibility.md`, `ac5_fullctx/`, `ac5_topk_design/`, `ac8_servability/`)
+- **As-built system state (read first):** `development/past_implementations/study/08-current-system-architecture.md`
+- **Loop-7 draft (Tier-2 recall R&D, high priority):** `development/loop7.md/draft.md`
 - **The lever (§4.1):** `python/sglang/srt/layers/attention/double_sparsity/token_label_table.py`
 - **The kernel cap (§4.4):** `indices.shape[-1] == dsa_index_topk` assert in
   `python/sglang/srt/layers/attention/dsa_backend.py`
