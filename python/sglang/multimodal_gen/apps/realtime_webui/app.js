@@ -648,14 +648,18 @@ function repeatActions(actions, frameCount) {
   return Array.from({ length: n }, (_, i) => actions[i % actions.length] || []);
 }
 
-async function applyPreset(preset) {
+async function applyPreset(preset, options = {}) {
+  const sendRuntimeEvents = options.sendRuntimeEvents
+    ?? Boolean(ws && ws.readyState === WebSocket.OPEN);
   selectedPreset = preset;
   $("prompt").value = preset.prompt;
   $("size").value = preset.size;
   $("fps").value = preset.fps;
   await setPresetReference(preset);
-  sendEvent("prompt", preset.prompt);
-  sendEvent("camera_actions", repeatActions(preset.actions, 24));
+  if (sendRuntimeEvents) {
+    sendEvent("prompt", preset.prompt);
+    sendEvent("camera_actions", repeatActions(preset.actions, 24));
+  }
   addHistory(`preset ${preset.name}`);
 }
 
@@ -760,7 +764,7 @@ function unpack(buf) {
 applyQueryParams();
 renderPresets();
 drawIdle();
-applyPreset(presets[0]).catch(showError);
+applyPreset(presets[0], { sendRuntimeEvents: false }).catch(showError);
 requestAnimationFrame(renderLoop);
 $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => closeSession();
@@ -792,11 +796,18 @@ function sendActiveKeyboardActions(force = false) {
   sendCameraControl(Array.from(activeControlActions));
 }
 
+function setControlButtonActive(action, active) {
+  document.querySelectorAll(`[data-action="${action}"]`).forEach((btn) => {
+    btn.classList.toggle("is-key-active", active);
+  });
+}
+
 document.addEventListener("keydown", (event) => {
   if (isTypingTarget(event.target)) return;
   const action = keyboardAction(event);
   if (!action) return;
   event.preventDefault();
+  setControlButtonActive(action, true);
   activeControlActions.add(action);
   sendActiveKeyboardActions(!event.repeat);
 });
@@ -806,6 +817,7 @@ document.addEventListener("keyup", (event) => {
   const action = keyboardAction(event);
   if (!action) return;
   event.preventDefault();
+  setControlButtonActive(action, false);
   activeControlActions.delete(action);
   sendActiveKeyboardActions(true);
 });

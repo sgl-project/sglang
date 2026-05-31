@@ -195,6 +195,14 @@ button.is-pressed:not(:disabled) {
   box-shadow: inset 0 1px 5px rgba(23, 26, 22, 0.12);
   transform: translateY(0);
 }
+button.is-key-active:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in oklch, #fffdf7, var(--accent) 22%);
+  box-shadow:
+    inset 0 1px 5px rgba(23, 26, 22, 0.16),
+    0 0 0 3px rgba(185, 84, 60, 0.18);
+  transform: translateY(1px);
+}
 button:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.18);
