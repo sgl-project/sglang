@@ -23,9 +23,9 @@ class ScriptedContextReqStarter:
         prompt_len: int,
         max_new_tokens: int,
         rid: Optional[str],
-        ignore_eos: bool = False,
-        priority: Optional[int] = None,
-        dp_rank: Optional[int] = None,
+        ignore_eos: bool,
+        priority: Optional[int],
+        dp_rank: Optional[int],
     ) -> ScriptedReqHandle:
         ctx = self._ctx
 

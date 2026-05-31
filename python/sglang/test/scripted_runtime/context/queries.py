@@ -19,13 +19,7 @@ def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
 
 
 def list_active_reqs(ctx: "ScriptedContext") -> List["Req"]:
-    seen: set[str] = set()
-    reqs: List["Req"] = []
-    for req in _get_all_reqs(ctx):
-        if req.rid not in seen:
-            seen.add(req.rid)
-            reqs.append(req)
-    return reqs
+    return list(set(_get_all_reqs(ctx)))
 
 
 def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:
