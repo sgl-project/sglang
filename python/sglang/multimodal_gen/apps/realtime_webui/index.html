@@ -60,6 +60,30 @@
           <span class="stage-stat">wait <b id="stageLatencyText">-</b></span>
         </div>
         <canvas id="viewport" width="1280" height="720"></canvas>
+        <div class="stage-controls" aria-label="Camera controls">
+          <div class="control-cluster" aria-label="Move camera">
+            <span class="control-title">Move</span>
+            <div class="camera-pad move-pad">
+              <span></span>
+              <button data-action="w" data-key="W">Forward</button>
+              <span></span>
+              <button data-action="a" data-key="A">Left</button>
+              <button data-action="s" data-key="S">Back</button>
+              <button data-action="d" data-key="D">Right</button>
+            </div>
+          </div>
+          <div class="control-cluster" aria-label="Look around">
+            <span class="control-title">Look</span>
+            <div class="camera-pad look-pad">
+              <span></span>
+              <button data-action="i" data-key="↑">Pitch +</button>
+              <span></span>
+              <button data-action="j" data-key="←">Yaw -</button>
+              <button data-action="k" data-key="↓">Pitch -</button>
+              <button data-action="l" data-key="→">Yaw +</button>
+            </div>
+          </div>
+        </div>
         <div class="timeline">
           <span id="queueText">queue 0</span>
           <span id="frameText">frames 0</span>
@@ -77,24 +101,6 @@
         </div>
         <div class="section-title">Presets</div>
         <div id="presetList" class="preset-list"></div>
-        <div class="section-title">Move</div>
-        <div class="camera-pad move-pad">
-          <span></span>
-          <button data-action="w">Forward</button>
-          <span></span>
-          <button data-action="a">Left</button>
-          <button data-action="s">Back</button>
-          <button data-action="d">Right</button>
-        </div>
-        <div class="section-title">Look</div>
-        <div class="camera-pad look-pad">
-          <span></span>
-          <button data-action="i">Pitch +</button>
-          <span></span>
-          <button data-action="j">Yaw -</button>
-          <button data-action="k">Pitch -</button>
-          <button data-action="l">Yaw +</button>
-        </div>
         <label>
           <span class="label-row">
             <span>Event frames</span>
@@ -124,6 +130,6 @@
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-  <script src="./app.js?v=jpeg-q95-cutover"></script>
+  <script src="./app.js?v=low-latency-controls"></script>
 </body>
 </html>

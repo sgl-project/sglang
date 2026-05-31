@@ -7,10 +7,22 @@ const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker";
 const PREVIEW_OUTPUT_FORMAT = "jpeg";
 const PREVIEW_OUTPUT_QUALITY = 95;
-const LIVE_QUEUE_SECONDS = 2;
+const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
-const LOW_LATENCY_QUEUE_SECONDS = 0.8;
-const MAX_CATCHUP_FPS = 24;
+const LOW_LATENCY_QUEUE_SECONDS = 0.35;
+const MAX_CATCHUP_FPS = 30;
+const EVENT_QUEUE_SECONDS = 0.25;
+const KEYBOARD_EVENT_INTERVAL_MS = 240;
+const CONTROL_KEY_ACTIONS = new Map([
+  ["w", "w"],
+  ["a", "a"],
+  ["s", "s"],
+  ["d", "d"],
+  ["arrowup", "i"],
+  ["arrowleft", "j"],
+  ["arrowdown", "k"],
+  ["arrowright", "l"],
+]);
 
 const presets = [
   { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth first-person dolly toward the castle, natural parallax, stable fantasy scene detail.", actions: [["w"], ["w"], ["w"], ["w"], ["w"], ["w"], [], []], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
@@ -41,6 +53,9 @@ let receiveChain = Promise.resolve();
 let nextEventId = 1;
 let awaitedEventId = 0;
 let awaitedEventSentAt = 0;
+let chunkReceiveStartedAt = 0;
+let currentReceiveChunk = null;
+let currentReceiveChunkFrames = 0;
 let lastRawRgbFrame = null;
 let decoderWorker = null;
 let decodeWorkerUnavailable = false;
@@ -48,7 +63,9 @@ let decodeRequestId = 1;
 let streamEpoch = 0;
 let lastDecodeMs = 0;
 let lastDisplayLagMs = 0;
+let lastControlKeySentAt = 0;
 const decodeRequests = new Map();
+const activeControlActions = new Set();
 
 const canvas = $("viewport");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -95,6 +112,11 @@ function resetStreamStats() {
   receiveChain = Promise.resolve();
   awaitedEventId = 0;
   awaitedEventSentAt = 0;
+  chunkReceiveStartedAt = 0;
+  currentReceiveChunk = null;
+  currentReceiveChunkFrames = 0;
+  activeControlActions.clear();
+  lastControlKeySentAt = 0;
   resetDecoderState();
   updateStats();
   $("renderFps").textContent = "0";
@@ -218,6 +240,15 @@ function trimLiveQueue(latestFrameCount) {
   );
   if (queue.length <= maxQueue) return;
   const dropCount = queue.length - maxQueue;
+  queue.splice(0, dropCount);
+  droppedFrames += dropCount;
+}
+
+function trimQueueForPendingEvent() {
+  const targetFps = playbackFps || Number($("fps").value || 16);
+  const keep = Math.max(1, Math.round(targetFps * EVENT_QUEUE_SECONDS));
+  if (queue.length <= keep) return;
+  const dropCount = queue.length - keep;
   queue.splice(0, dropCount);
   droppedFrames += dropCount;
 }
@@ -532,7 +563,6 @@ async function receive(data) {
     if (pendingHeader) setStatus("Receiving", "live");
     return;
   }
-  const now = performance.now();
   const header = pendingHeader;
   pendingHeader = null;
   const eventId = Number(header.event_id || 0);
@@ -557,9 +587,29 @@ async function receive(data) {
   frames += chunkFrameCount;
   bytes += payloadBytes;
   $("payloadMode").textContent = header.encoding || "raw RGB";
-  if (chunkWaitStartedAt) {
-    const waitSeconds = (now - chunkWaitStartedAt) / 1000;
-    const generatedFps = chunkFrameCount / Math.max(0.001, waitSeconds);
+  updatePlaybackPace(header, performance.now(), chunkFrameCount);
+  setStatus("Live", "live");
+  updateStats(header);
+}
+
+function updatePlaybackPace(header, now, frameCount) {
+  const chunkIndex = Number(header.chunk_index || 0);
+  if (currentReceiveChunk !== chunkIndex) {
+    currentReceiveChunk = chunkIndex;
+    currentReceiveChunkFrames = 0;
+    chunkReceiveStartedAt = chunkWaitStartedAt || now;
+  }
+  currentReceiveChunkFrames += Number(frameCount || 0);
+  const frameBatchIndex = Number(header.frame_batch_index || 0);
+  const numFrameBatches = Number(header.num_frame_batches || 1);
+  const isFinalFrameBatch =
+    Boolean(header.is_final_frame_batch) ||
+    frameBatchIndex + 1 >= numFrameBatches;
+  if (!isFinalFrameBatch || !chunkWaitStartedAt) return;
+
+  const waitSeconds = (now - chunkWaitStartedAt) / 1000;
+  if (waitSeconds > 0) {
+    const generatedFps = currentReceiveChunkFrames / Math.max(0.001, waitSeconds);
     const requestedFps = Number($("fps").value || 16);
     playbackFps = Math.min(
       requestedFps,
@@ -570,8 +620,9 @@ async function receive(data) {
     $("stageLatencyText").textContent = latencyText;
   }
   chunkWaitStartedAt = performance.now();
-  setStatus("Live", "live");
-  updateStats(header);
+  chunkReceiveStartedAt = chunkWaitStartedAt;
+  currentReceiveChunk = null;
+  currentReceiveChunkFrames = 0;
 }
 
 function sendEvent(kind, payload) {
@@ -581,10 +632,15 @@ function sendEvent(kind, payload) {
   if (kind === "camera_actions" || kind === "prompt") {
     awaitedEventId = eventId;
     awaitedEventSentAt = performance.now();
+    trimQueueForPendingEvent();
     updateStats();
     setStatus("Updating", "live");
   }
   addHistory(`${kind} event sent`);
+}
+
+function sendCameraControl(actions) {
+  sendEvent("camera_actions", repeatActions([actions]));
 }
 
 function repeatActions(actions, frameCount) {
@@ -718,5 +774,38 @@ document.querySelectorAll("button").forEach((btn) => {
   });
 });
 document.querySelectorAll("[data-action]").forEach((btn) => {
-  btn.onclick = () => sendEvent("camera_actions", repeatActions([[btn.dataset.action]]));
+  btn.onclick = () => sendCameraControl([btn.dataset.action]);
+});
+
+function isTypingTarget(target) {
+  return target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
+}
+
+function keyboardAction(event) {
+  return CONTROL_KEY_ACTIONS.get(event.key.toLowerCase()) || null;
+}
+
+function sendActiveKeyboardActions(force = false) {
+  const now = performance.now();
+  if (!force && now - lastControlKeySentAt < KEYBOARD_EVENT_INTERVAL_MS) return;
+  lastControlKeySentAt = now;
+  sendCameraControl(Array.from(activeControlActions));
+}
+
+document.addEventListener("keydown", (event) => {
+  if (isTypingTarget(event.target)) return;
+  const action = keyboardAction(event);
+  if (!action) return;
+  event.preventDefault();
+  activeControlActions.add(action);
+  sendActiveKeyboardActions(!event.repeat);
+});
+
+document.addEventListener("keyup", (event) => {
+  if (isTypingTarget(event.target)) return;
+  const action = keyboardAction(event);
+  if (!action) return;
+  event.preventDefault();
+  activeControlActions.delete(action);
+  sendActiveKeyboardActions(true);
 });

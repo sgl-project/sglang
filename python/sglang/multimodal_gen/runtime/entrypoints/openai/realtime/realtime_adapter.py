@@ -44,6 +44,8 @@ class RealtimeModelAdapter(Protocol):
         request: RealtimeVideoGenerationsRequest,
     ) -> None: ...
 
+    async def wait_for_next_chunk(self, session: GenerateSession) -> None: ...
+
     def ingest_event(
         self,
         session: GenerateSession,

@@ -213,7 +213,7 @@ button:focus-visible {
 .stage {
   position: relative;
   display: grid;
-  grid-template-rows: auto auto auto;
+  grid-template-rows: auto auto auto auto;
   align-self: start;
   justify-self: center;
   width: 100%;
@@ -262,6 +262,50 @@ button:focus-visible {
   min-height: 0;
   object-fit: contain;
   image-rendering: auto;
+}
+
+.stage-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 12px;
+  padding: 12px 14px 13px;
+  border-top: 1px solid rgba(232, 234, 223, 0.12);
+  background: #151912;
+}
+
+.control-cluster {
+  display: grid;
+  grid-template-columns: 46px 1fr;
+  gap: 10px;
+  align-items: center;
+}
+
+.control-title {
+  color: rgba(232, 234, 223, 0.62);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.stage-controls .camera-pad {
+  margin: 0;
+}
+
+.stage-controls .camera-pad button {
+  position: relative;
+  border-color: rgba(232, 234, 223, 0.18);
+  background: #eef1ec;
+  color: #11140f;
+}
+
+.stage-controls .camera-pad button::after {
+  content: attr(data-key);
+  position: absolute;
+  right: 7px;
+  top: 5px;
+  color: color-mix(in oklch, var(--muted), var(--ink) 18%);
+  font-size: 10px;
+  font-weight: 650;
 }
 
 .section-title {
@@ -408,6 +452,7 @@ button:focus-visible {
   .presets { position: static; max-height: none; overflow: visible; }
   .preset-list { max-height: 260px; }
   #viewport { max-height: 420px; }
+  .stage-controls { grid-template-columns: 1fr; }
   .topbar { flex-wrap: wrap; height: auto; min-height: 44px; padding: 10px 14px; }
   .topbar-spacer { display: none; }
 }
