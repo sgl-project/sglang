@@ -1,11 +1,11 @@
 """FlashInfer-based kernels for GDN (Gated Delta Network) linear attention.
 
-Both SM90 and SM100+ use the same pool layout: [pool, HV, V, K] (K-last).
+Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
 
 SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
-SM100+ (Blackwell+): full support — decode, prefill, MTP.
+SM100 (Blackwell): full support — decode, prefill, MTP.
 
-Requires flashinfer >= 0.6.4 (SM90) or >= 0.6.5 (SM100+).
+Requires flashinfer >= 0.6.7.
 """
 
 import logging
@@ -80,9 +80,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """FlashInfer kernel for GDN with K-last SSM state layout.
 
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
-    SM100+ (Blackwell+): decode uses gather/scatter; prefill and MTP verify supported.
+    SM100 (Blackwell): decode uses gather/scatter; prefill and MTP verify supported.
 
-    Requires flashinfer >= 0.6.4 (SM90) or >= 0.6.5 (SM100+).
+    Requires flashinfer >= 0.6.7.
     """
 
     def __init__(self):
@@ -104,7 +104,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
-        self.supports_target_verify = sm_major == 9
+        self.supports_target_verify = sm_major in (9, 10)
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -348,6 +348,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
         b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
 
+        intermediate_states_buffer_mtp = intermediate_states_buffer
+        if self.use_state_pool and intermediate_states_buffer is not None:
+            # The SM100 bf16 MTP kernel indexes this scratch buffer by the
+            # per-call batch id, while SGLang's speculative state cache is
+            # pool-scoped and may include an extra dummy slot.
+            intermediate_states_buffer_mtp = intermediate_states_buffer[:batch_size]
+
         output_fi, _ = self._mtp_fn(
             q=query_mtp,
             k=key_mtp,
@@ -360,7 +367,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             b=b_mtp,
             scale=None,
             output=None,
-            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_states_buffer=intermediate_states_buffer_mtp,
             disable_state_update=True,
             use_qk_l2norm=True,
         )

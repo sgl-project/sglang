@@ -122,7 +122,11 @@ class TestQwen35FP4MTPV2FlashInfer(ReasoningTokenUsageMixin, CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=MTP_V2_BASE_ARGS
-            + ["--linear-attn-decode-backend", "flashinfer"],
+            + [
+                "--linear-attn-decode-backend",
+                "flashinfer",
+                "--enforce-disable-flashinfer-allreduce-fusion",
+            ],
         )
 
     @classmethod
