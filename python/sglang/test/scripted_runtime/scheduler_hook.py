@@ -133,8 +133,8 @@ def _write_out_of_band_error(exc_tb: str) -> None:
 def _advance_generator(generator: Generator) -> Tuple[bool, Optional[str]]:
     try:
         next(generator)
-        return (False, None)
+        return False, None
     except StopIteration:
-        return (True, None)
+        return True, None
     except Exception:
-        return (True, traceback.format_exc())
+        return True, traceback.format_exc()
