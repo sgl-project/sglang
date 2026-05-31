@@ -160,12 +160,12 @@ class GPTQAscendLinearScheme(GPTQLinearScheme):
         return GPTQLinearAscendKernel(quant_config)
 
     def create_weights(self, layer: torch.nn.Module, **kwargs):
-        super().create_weights(layer=layer, **kwargs)
-        set_weight_attrs(layer.qzeros, {"pack_factor": self.quant_config.pack_factor})
-        set_weight_attrs(layer.qweight, {"pack_factor": self.quant_config.pack_factor})
-
         if self.quant_config.desc_act:
             raise ValueError(
                 "Currently, desc_act (True) is not supported by GPTQ "
                 "quantization on npu."
             )
+
+        super().create_weights(layer=layer, **kwargs)
+        set_weight_attrs(layer.qzeros, {"pack_factor": self.quant_config.pack_factor})
+        set_weight_attrs(layer.qweight, {"pack_factor": self.quant_config.pack_factor})

@@ -48,6 +48,7 @@ class AWQIntelAMXLinearKernel:
 class AWQIntelAMXMoEKernel:
     def __init__(self, quant_config: "AWQConfig"):
         self.quant_config = quant_config
+        self.moe_runner_config: Optional[MoeRunnerConfig] = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _amx_process_weight_after_loading(
