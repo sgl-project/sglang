@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Literal, Optional
 
+from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.kv_canary.violation_log_utils import (
     assert_no_violation_in_log,
     find_violation_in_log,
@@ -19,14 +20,33 @@ class CanaryViolationAssertMixin:
         self,
         *,
         fail_reason: str,
+        target_group: Optional[TargetGroupKind] = None,
         side: _Side = None,
         flush_wait_seconds: float = 2.0,
     ) -> None:
+        suffix = "" if target_group is None else f"_{target_group.name}"
         self.assert_violation_logged_any(
-            launch_tag_patterns=("HEAD_*", "TAIL_*"),
+            launch_tag_patterns=(f"HEAD_*{suffix}", f"TAIL_*{suffix}"),
             fail_reason=fail_reason,
             side=side,
             flush_wait_seconds=flush_wait_seconds,
+        )
+
+    def assert_sweep_violation_reported(
+        self,
+        *,
+        fail_reason: str,
+        target_group: TargetGroupKind,
+        side: _Side = None,
+        flush_wait_seconds: float = 2.0,
+        max_retries: int = 4,
+    ) -> None:
+        self.assert_violation_logged_any(
+            launch_tag_patterns=(f"SWEEP_*_{target_group.name}",),
+            fail_reason=fail_reason,
+            side=side,
+            flush_wait_seconds=flush_wait_seconds,
+            max_retries=max_retries,
         )
 
     def assert_any_launch_tag_violation_reported(

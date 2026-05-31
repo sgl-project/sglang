@@ -16,6 +16,8 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.single_forward_manager.manager import (
@@ -38,6 +40,7 @@ class CanaryManager:
         self,
         *,
         config: CanaryConfig,
+        perturb_config: PerturbConfig,
         buffer_groups: tuple[CanaryBufferGroup, ...],
         device: torch.device,
         req_to_token_pool: "ReqToTokenPool",
@@ -95,6 +98,13 @@ class CanaryManager:
             endpoints=self._endpoints,
             swa_window_size=self._swa_window_size,
             outer_step_counter_getter=self._get_outer_step_counter,
+        )
+        self._perturb_manager = PerturbManager(
+            config=perturb_config,
+            buffer_groups=self._buffer_groups,
+            outer_step_counter_getter=self._get_outer_step_counter,
+            swa_window_size=self._swa_window_size,
+            sweep_interval=config.sweep_interval,
         )
         num_sfms = max(1, speculative_num_steps - 1)
         self._single_forward_managers: tuple[SingleForwardManager, ...] = tuple(
@@ -183,6 +193,9 @@ class CanaryManager:
             self._single_forward_managers[idx].pre_ops_outside_graph(
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
+        self._perturb_manager.perturb(
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+        )
 
     def _post_ops_outside_graph(
         self,
@@ -203,6 +216,7 @@ class CanaryManager:
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
+        self._perturb_manager.attach_radix_cache(radix_cache)
 
     def _get_outer_step_counter(self) -> int:
         return self._outer_step_counter
