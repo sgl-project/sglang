@@ -70,11 +70,14 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
-    maybe_detect_nan,
-    maybe_detect_oob,
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -406,6 +409,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_seed")
+            maybe_detect_inf(logits_output.next_token_logits, "frozen_kv_mtp_seed")
             self._capture_for_decode(logits_output, draft_input)
         finally:
             batch.forward_mode = forward_mode_backup
@@ -694,6 +698,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             maybe_detect_nan(
                 logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
             )
+            maybe_detect_inf(
+                logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
+            )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
@@ -752,6 +759,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 batch.sampling_info.vocab_mask = None
 
         maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_verify")
+        maybe_detect_inf(logits_output.next_token_logits, "frozen_kv_mtp_verify")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: FrozenKVMTPVerifyOutput = spec_info.verify(
