@@ -32,6 +32,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
+    OutOfBandError,
     RunScript,
     ScriptFailed,
     ScriptSucceeded,
@@ -53,12 +54,12 @@ class ScriptedHttpServer:
         ctx: zmq.Context,
         socket: zmq.Socket,
         server_process: mp.process.BaseProcess,
-        traceback_path: Path,
+        out_of_band_error_path: Path,
     ) -> None:
         self._ctx = ctx
         self._socket = socket
         self._server_process = server_process
-        self._traceback_path = traceback_path
+        self._out_of_band_error_path = out_of_band_error_path
         self._shutdown_done = False
         self._dirty: Optional[str] = None
 
@@ -81,9 +82,11 @@ class ScriptedHttpServer:
         ``engine_kwargs`` (notably ``model_path`` plus any ServerArgs
         overrides) are forwarded to :func:`launch_scripted_http_server`.
         """
-        tb_fd, tb_path = tempfile.mkstemp(prefix="scripted_runtime_tb_", suffix=".txt")
-        os.close(tb_fd)
-        traceback_path = Path(tb_path)
+        err_fd, err_path = tempfile.mkstemp(
+            prefix="scripted_runtime_oob_error_", suffix=".json"
+        )
+        os.close(err_fd)
+        out_of_band_error_path = Path(err_path)
 
         ctx = zmq.Context()
         dispatch_port, socket = get_zmq_socket_on_host(ctx, zmq.PAIR, host=SERVER_HOST)
@@ -108,8 +111,8 @@ class ScriptedHttpServer:
         with (
             envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint),
             envs.SGLANG_TEST_SCRIPTED_RUNTIME.override(True),
-            envs.SGLANG_TEST_SCRIPTED_RUNTIME_TRACEBACK_PATH.override(
-                str(traceback_path)
+            envs.SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH.override(
+                str(out_of_band_error_path)
             ),
             envs.SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY.override(sys_path_entry),
         ):
@@ -134,7 +137,7 @@ class ScriptedHttpServer:
             ctx=ctx,
             socket=socket,
             server_process=server_process,
-            traceback_path=traceback_path,
+            out_of_band_error_path=out_of_band_error_path,
         )
 
     def execute_script(
@@ -186,12 +189,12 @@ class ScriptedHttpServer:
         """Tell the dispatch loop to return, join the server process, and clean up.
 
         Idempotent — calling twice is safe. Surfaces a fatal scheduler-side
-        traceback (written to the traceback file) as an ``AssertionError``.
+        error (written to the out-of-band error file) as an ``AssertionError``.
         """
         if self._shutdown_done:
             return
 
-        fatal_tb: Optional[str] = None
+        fatal_error: Optional[OutOfBandError] = None
         try:
             try:
                 self._socket.send_pyobj(Shutdown())
@@ -201,7 +204,7 @@ class ScriptedHttpServer:
             self._server_process.join(timeout=SHUTDOWN_JOIN_TIMEOUT_S)
             self._terminate_process(self._server_process)
 
-            fatal_tb = self._read_traceback()
+            fatal_error = self._read_out_of_band_error()
         finally:
             try:
                 self._socket.setsockopt(zmq.LINGER, 0)
@@ -212,20 +215,22 @@ class ScriptedHttpServer:
             self._cleanup_files()
             self._shutdown_done = True
 
-        if fatal_tb:
-            raise AssertionError(f"scripted-runtime server failed:\n{fatal_tb}")
+        if fatal_error:
+            raise AssertionError(
+                f"scripted-runtime server failed:\n{fatal_error.traceback}"
+            )
 
-    def _read_traceback(self) -> Optional[str]:
+    def _read_out_of_band_error(self) -> Optional[OutOfBandError]:
         try:
-            text = self._traceback_path.read_text()
+            text = self._out_of_band_error_path.read_text()
         except OSError:
             return None
         text = text.strip()
-        return text or None
+        return OutOfBandError.from_json(text) if text else None
 
     def _cleanup_files(self) -> None:
         try:
-            self._traceback_path.unlink()
+            self._out_of_band_error_path.unlink()
         except OSError:
             pass
 
@@ -259,7 +264,8 @@ def launch_scripted_http_server(**engine_kwargs: Any) -> None:
     Blocks in :func:`launch_server` until the scheduler subprocess(es)
     terminate (the dispatch loop returning on shutdown triggers a clean
     scheduler exit; the watchdog then stops the server). On a fatal
-    scheduler-side exception the traceback is written to the path named by
-    ``SGLANG_TEST_SCRIPTED_RUNTIME_TRACEBACK_PATH`` for the session to surface.
+    scheduler-side exception an :class:`OutOfBandError` is written as JSON to
+    the path named by ``SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH``
+    for the session to surface.
     """
     launch_server(ServerArgs(**engine_kwargs))
