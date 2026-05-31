@@ -1304,9 +1304,7 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, self._make_seq(900, 5))
 
         for _ in range(3):
-            m = tree.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", seq_abc)))
-            )
+            m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
             self.assertEqual(len(m.device_indices), len(seq_abc))
             tree.sanity_check()
 

@@ -819,9 +819,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
-            comp.refresh_lru(
-                LRURefreshPhase.MATCH_END, node_update, self.root_node
-            )
+            comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
         while node_update:
