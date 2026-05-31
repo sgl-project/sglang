@@ -1,21 +1,3 @@
-"""ScriptedSchedulerHook: the scheduler-side half of the scripted runtime.
-
-Constructed by ``Scheduler.__init__`` when ``SGLANG_TEST_SCRIPTED_RUNTIME``
-is set and held as a scheduler field. ``SchedulerRequestReceiver.recv_requests``
-calls :meth:`step` once per event-loop iteration. On the driver rank
-(``pp_rank == tp_rank == attn_cp_rank == 0``) the hook owns the dispatch-loop
-generator and the :class:`ScriptedContext` handed to it, advancing the
-generator one step per call; non-driver ranks join the cross-rank cpu
-broadcast that carries the script's done / error state so every rank
-``sys.exit``s together when the script finishes.
-
-This object owns everything the *scheduler* touches: the ZMQ control plane
-(the dispatch loop that pulls and runs each caller-requested sub-script),
-generator stepping, cross-rank broadcast, and per-req lookups for
-:class:`ScriptedReqHandle`. The script-facing verbs live on
-:class:`ScriptedContext`.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -51,13 +33,6 @@ logger = logging.getLogger(__name__)
 
 
 class ScriptedSchedulerHook:
-    """Generator-driven scheduler-side hook installed in every scheduler subprocess.
-
-    On the driver rank it builds the :class:`ScriptedContext`, opens the ZMQ
-    dispatch loop over it, and advances that loop one step per :meth:`step`
-    call. When the loop finishes (the caller sent :class:`Shutdown`), every
-    rank ``sys.exit``s so all scheduler subprocesses tear down together.
-    """
 
     def __init__(
         self,
@@ -89,18 +64,6 @@ class ScriptedSchedulerHook:
             self._script_fn_generator = None
 
     def _run_dispatch_loop(self) -> Generator:
-        """Receive :class:`RunScript` / :class:`Shutdown`; ``yield from`` each sub-script.
-
-        Runs forever on the scheduler driver rank until the caller sends a
-        :class:`Shutdown`, at which point the generator returns normally and
-        the scheduler tears down.
-
-        Crucially, when a sub-script raises (including ``AssertionError``), the
-        loop *captures* the traceback into a socket message and *keeps
-        running* — it does not re-raise. Re-raising would tear the engine down
-        (the hook ``sys.exit``s the scheduler subprocess), voiding every
-        remaining test in the class.
-        """
         endpoint = envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.get()
         ctx_zmq = zmq.Context()
         socket = get_zmq_socket(ctx_zmq, zmq.PAIR, endpoint, bind=False)
@@ -134,11 +97,6 @@ class ScriptedSchedulerHook:
             self._http_poster.close()
 
     def _find_req_by_rid(self, rid: str) -> Optional["Req"]:
-        """Locate the raw ``Req`` by rid across scheduler queues / batches.
-
-        Returns ``None`` if the rid is not currently held by the scheduler.
-        Used by ScriptedReqHandle properties that read per-req scheduler-side state.
-        """
         s = self._scheduler
         chunked = s.chunked_req
         if chunked is not None and chunked.rid == rid:
@@ -158,32 +116,16 @@ class ScriptedSchedulerHook:
         return None
 
     def _lookup_finished(self, rid: str) -> bool:
-        """True iff the req has reached a finished state (or already gone).
-
-        Once a req is filtered out of all scheduler structures, the lookup
-        returns ``True`` — by that point the req can only have left because
-        it finished.
-        """
         req = self._find_req_by_rid(rid)
         if req is None:
             return rid in self._context._req_handles
         return req.finished()
 
     def _lookup_is_chunking(self, rid: str) -> bool:
-        """True iff this rid is the scheduler's current chunked_req."""
         s = self._scheduler
         return s.chunked_req is not None and s.chunked_req.rid == rid
 
     def step(self) -> None:
-        """Advance the generator one step (driver only) and broadcast
-        completion state. When the script finishes or raises, every rank
-        ``sys.exit``s so all scheduler subprocesses tear down together.
-
-        ``sys.exit`` raises ``SystemExit`` (a ``BaseException``), so it sails
-        past ``run_scheduler_process``'s ``except Exception`` SIGQUIT path and
-        exits the subprocess cleanly with code 0 (ok) / 1 (script failed) —
-        no scripted-runtime hook in the production bootstrap.
-        """
         if self._is_driver:
             payload: List = list(self._advance_generator())
         else:
@@ -204,7 +146,6 @@ class ScriptedSchedulerHook:
         sys.exit(0 if exc_tb is None else 1)
 
     def _write_out_of_band_error(self, exc_tb: str) -> None:
-        """Persist a fatal scheduler-side error as JSON for the caller to surface."""
         path = envs.SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH.get()
         if not path:
             return

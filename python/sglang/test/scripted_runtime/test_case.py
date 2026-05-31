@@ -1,16 +1,3 @@
-"""unittest base class wrapping :class:`ScriptedHttpServer`.
-
-Subclass and set ``ENGINE_KWARGS`` as a class attribute. The base owns
-the HTTP-server lifecycle — one server per concrete class, shared across
-every ``test_*`` method. Tests dispatch ``_script_*`` sub-scripts via
-``self.server.execute_script(...)``.
-
-Convention (not enforced): each ``_script_*`` must drive every request
-it starts to ``finished`` before returning. The base does not perform an
-automatic state reset between tests, so leaked in-flight reqs will
-pollute the next test in the same class.
-"""
-
 from __future__ import annotations
 
 from typing import Any, ClassVar, Dict
@@ -20,7 +7,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class ScriptedTestCase(CustomTestCase):
-    """Base TestCase that owns a class-scoped :class:`ScriptedHttpServer`."""
 
     ENGINE_KWARGS: ClassVar[Dict[str, Any]] = {}
 
