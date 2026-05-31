@@ -42,6 +42,7 @@ class CanaryManager:
         req_to_token_pool: "ReqToTokenPool",
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
+        speculative_num_steps: int = 1,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
@@ -92,7 +93,8 @@ class CanaryManager:
             swa_window_size=self._swa_window_size,
             outer_step_counter_getter=self._get_outer_step_counter,
         )
-        self._single_forward_managers: tuple[SingleForwardManager, ...] = (
+        num_sfms = max(1, speculative_num_steps - 1)
+        self._single_forward_managers: tuple[SingleForwardManager, ...] = tuple(
             SingleForwardManager(
                 config=config,
                 device=device,
@@ -105,7 +107,8 @@ class CanaryManager:
                 per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
                 per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
                 d2h_stream=self._d2h_stream,
-            ),
+            )
+            for _ in range(num_sfms)
         )
 
     @contextlib.contextmanager
