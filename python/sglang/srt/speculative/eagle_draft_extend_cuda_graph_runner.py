@@ -30,11 +30,14 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
+    is_hip,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -401,7 +404,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            if self.topk == 1:
+            # ROCm's argmax tie-breaks differently from CUDA's softmax+max
+            # path on FP8 logits, which corrupts MTP draft selection on AMD.
+            # Keep the fastpath CUDA-only.
+            if self.topk == 1 and not _is_hip:
                 ret.topk_index = torch.argmax(
                     ret.next_token_logits, dim=-1, keepdim=True
                 )
@@ -427,10 +433,18 @@ class EAGLEDraftExtendCudaGraphRunner:
                 spec_info=spec_info,
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
-            self._capture_init(run_once)
-            out = self._capture_graph(
-                graph, get_global_graph_memory_pool(), stream, run_once
+
+            canary_ctx = (
+                c.with_active_single_forward_manager(0)
+                if (c := self.model_runner.canary_manager) is not None
+                else contextlib.nullcontext()
             )
+            with canary_ctx:
+                self._capture_init(run_once)
+
+                out = self._capture_graph(
+                    graph, get_global_graph_memory_pool(), stream, run_once
+                )
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out
@@ -528,12 +542,14 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
         self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
+            seq_lens_sum=seq_lens_sum,
             encoder_lens=None,
             forward_mode=self.forward_mode,
             spec_info=forward_batch.spec_info,
