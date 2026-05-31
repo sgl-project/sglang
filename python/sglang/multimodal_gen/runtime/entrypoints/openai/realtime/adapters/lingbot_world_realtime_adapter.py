@@ -19,7 +19,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
     RealtimeFrameSendStats,
-    empty_frame_send_stats,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
@@ -35,9 +34,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
     ControlSignal,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
@@ -295,24 +291,7 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         result: OutputBatch,
         batch: Req,
     ) -> RealtimeFrameSendStats:
-        if self._should_skip_stale_output(session, batch):
-            logger.info(
-                "skip stale realtime output, session_id=%s, block_idx=%s, "
-                "chunk_event_id=%s, latest_event_id=%s",
-                session.id,
-                batch.block_idx,
-                batch.realtime_event_id,
-                self._state(session).latest_event_id,
-            )
-            return empty_frame_send_stats("skipped-stale")
         return await self.output_adapter.send(ws, session, result, batch)
-
-    def _should_skip_stale_output(self, session: GenerateSession, batch: Req) -> bool:
-        latest_event_id = self._state(session).latest_event_id
-        if latest_event_id is None:
-            return False
-        chunk_event_id = batch.realtime_event_id
-        return chunk_event_id is None or chunk_event_id < latest_event_id
 
     def on_chunk_complete(self, session: GenerateSession, result: OutputBatch) -> None:
         del result

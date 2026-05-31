@@ -6,7 +6,7 @@ const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker";
 const PREVIEW_OUTPUT_FORMAT = "jpeg";
-const PREVIEW_OUTPUT_QUALITY = 90;
+const PREVIEW_OUTPUT_QUALITY = 95;
 const LIVE_QUEUE_SECONDS = 2;
 const LOW_LATENCY_FPS_FLOOR = 10;
 const LOW_LATENCY_QUEUE_SECONDS = 0.8;
@@ -40,6 +40,7 @@ let droppedFrames = 0;
 let receiveChain = Promise.resolve();
 let nextEventId = 1;
 let awaitedEventId = 0;
+let awaitedEventSentAt = 0;
 let lastRawRgbFrame = null;
 let decoderWorker = null;
 let decodeWorkerUnavailable = false;
@@ -93,6 +94,7 @@ function resetStreamStats() {
   droppedFrames = 0;
   receiveChain = Promise.resolve();
   awaitedEventId = 0;
+  awaitedEventSentAt = 0;
   resetDecoderState();
   updateStats();
   $("renderFps").textContent = "0";
@@ -469,9 +471,6 @@ async function connect() {
       guidance_scale: Number($("guidance").value),
       output_compression: PREVIEW_OUTPUT_QUALITY,
       realtime_output_format: PREVIEW_OUTPUT_FORMAT,
-      condition_inputs: selectedPreset
-        ? { camera_actions: repeatActions(selectedPreset.actions, 24) }
-        : undefined,
       max_chunks: $("continuous").checked ? undefined : 1,
       first_frame: firstFrame,
     });
@@ -539,18 +538,20 @@ async function receive(data) {
   const eventId = Number(header.event_id || 0);
   const chunkFrameCount = Number(header.num_frames || 0);
   const payloadBytes = data.byteLength || data.size || 0;
-  if (awaitedEventId && eventId < awaitedEventId) {
-    droppedFrames += chunkFrameCount;
-    updateStats();
-    return;
-  }
+  const isEventCutover = awaitedEventId && eventId >= awaitedEventId;
   const decodedFrames = await decodeFrameBatch(header, data);
-  if (awaitedEventId && eventId < awaitedEventId) {
-    droppedFrames += chunkFrameCount;
-    updateStats();
-    return;
+  if (isEventCutover) {
+    droppedFrames += queue.length;
+    queue = [];
+    lastFrameAt = 0;
+    if (awaitedEventSentAt) {
+      const eventLatency = (performance.now() - awaitedEventSentAt) / 1000;
+      $("latencyText").textContent = `${eventLatency.toFixed(1)}s · event`;
+      $("stageLatencyText").textContent = `${eventLatency.toFixed(1)}s · event`;
+    }
+    awaitedEventId = 0;
+    awaitedEventSentAt = 0;
   }
-  if (awaitedEventId && eventId >= awaitedEventId) awaitedEventId = 0;
   queue.push(...decodedFrames);
   trimLiveQueue(chunkFrameCount);
   frames += chunkFrameCount;
@@ -579,8 +580,7 @@ function sendEvent(kind, payload) {
   ws.send(pack({ type: "event", kind, payload, event_id: eventId }));
   if (kind === "camera_actions" || kind === "prompt") {
     awaitedEventId = eventId;
-    queue = [];
-    lastFrameAt = 0;
+    awaitedEventSentAt = performance.now();
     updateStats();
     setStatus("Updating", "live");
   }
