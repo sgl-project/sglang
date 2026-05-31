@@ -962,6 +962,44 @@ async def get_request(
             await asyncio.sleep(interval)
 
 
+def _build_token_arrival_times(
+    output: RequestFuncOutput,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[float]:
+    """Build per-token arrival timestamps for peak throughput calculation.
+
+    OpenAI-compatible streaming backends may batch multiple tokens into one SSE
+    chunk while ``output_len`` reflects the true token count. Expand each chunk
+    interval across its tokens (same approach as ``async_request_sglang_generate``).
+    """
+    token_times = [output.start_time + output.ttft]
+    current_time = token_times[0]
+
+    if output.text_chunks:
+        for chunk_text, itl_value in zip(output.text_chunks, output.itl):
+            num_tokens = len(tokenizer.encode(chunk_text, add_special_tokens=False))
+            if num_tokens <= 0:
+                continue
+            adjust_itl = itl_value / num_tokens
+            for _ in range(num_tokens):
+                current_time += adjust_itl
+                token_times.append(current_time)
+    else:
+        for itl_value in output.itl:
+            current_time += itl_value
+            token_times.append(current_time)
+
+    if output.output_len > len(token_times):
+        remaining = output.output_len - len(token_times)
+        decode_duration = max(output.latency - output.ttft, 0.0)
+        avg_itl = decode_duration / max(output.output_len - 1, 1)
+        for _ in range(remaining):
+            current_time += avg_itl
+            token_times.append(current_time)
+
+    return token_times
+
+
 def calculate_metrics(
     input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
@@ -1048,11 +1086,7 @@ def calculate_metrics(
             if not output.success:
                 continue
 
-            token_times = [output.start_time + output.ttft]
-            current_time = token_times[0]
-            for itl_value in output.itl:
-                current_time += itl_value
-                token_times.append(current_time)
+            token_times = _build_token_arrival_times(output, tokenizer)
 
             for token_time in token_times:
                 second_bucket = int(token_time - min_start_time)
