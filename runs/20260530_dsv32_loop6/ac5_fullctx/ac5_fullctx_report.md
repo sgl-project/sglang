@@ -24,10 +24,17 @@ TP=8, `enable_request_time_stats_logging=True`. Identical to the AC-4/AC-8 full-
 | 32 | 31.99 | 25.33 s | ❌ (close) | 19.5 | ❌ |
 | 64 | 47.03 | 77.90 s | ❌ | 17.3 | ❌ |
 
-Exact per-request arrays committed (`ac5_fullctx_arrays.json`); the verifier recomputes P99 TTFT +
-per-req TPS p50 + achieved conc from the committed JSON and is **fail-closed** with the R18 empty-latency
-class explicitly checked (every ttft>0, every request ≥1 ITL, output_len==512, errors empty, len==completed,
-64-hex source SHA256). No inferred TTFT — all measured.
+**Exact per-request source committed** (`ac5_fullctx_arrays.json`, R21 rebuild to the R9 standard):
+per-request `ttfts_s`, `itl_sum_s`, `output_lens`, `input_lens`, `errors_empty`, gen-nonempty count, full
+64-hex source SHA256, and the stored headline. The verifier **recomputes** P99 TTFT = p99(ttfts) and per-req
+TPS p50 = p50(output_len/itl_sum) **from the raw committed arrays** (never a stored derived metric — the R20
+defect where a derived `per_req_gen_tps` was tamperable), plus aggregate **mean** integrity (sensitive to
+every element, so a single-element tamper a robust median would miss is caught), the R18 empty-latency class
+(every ttft>0, every itl_sum>0, output_len==512, errors empty, len==completed, gen-nonempty==completed), and
+the operating point from ALL THREE `.meta.json` sidecars (int8 / mem0.7 / radix-on / fixture / full context /
+TP=8 / stats-on). **Fail-closed: 6 tamper tests each exit 1** (single itl_sum, single output_len, single
+ttft=0, stored TPS p50→100, stored P99 TTFT→5000, sidecar disable_radix_cache→True); clean exits 0 PASS.
+No inferred TTFT — all measured.
 
 ## Measured admission-wait attribution (`queue_duration` from ReqTimeStats; `ac5_fullctx_attribution.txt`)
 Benchmark rows (`output_len=512`) bucketed per conc by print-time gaps (n=256/320/315):

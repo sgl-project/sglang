@@ -15,4 +15,13 @@
   => P99 TTFT is ADMISSION-QUEUE-DOMINATED at every conc (queue p99 ~= TTFT; prefill floor ~min TTFT).
   forward_duration is completion-time (prefill + all 512 decode steps), context only -- NOT first-token.
 
-## Decode component (per-req TPS = gen throughput / #running-req), steady decode lines:
+## Decode component (per-req decode TPS = steady gen throughput / #running-req; stats-log decode batches)
+  #running-req  16: median gen   397.6 tok/s  -> per-req decode TPS =  24.9
+  #running-req  32: median gen   623.5 tok/s  -> per-req decode TPS =  19.5
+  #running-req  38: median gen   655.8 tok/s  -> per-req decode TPS =  17.3
+  (conc-16 decode batch ~16, conc-32 ~32, conc-64 admitted ~47 but the decode batch fluctuates ~26-38 as
+   requests stagger; per-req decode TPS falls as the batch grows -- the admission-restore tradeoff.)
+## DSA FlashMLA+MoE floor reference (AC-7 verified, steady-state): DSA per-req TPS 46.1/37.0/29.4 at
+   conc 16/32/64 -> step ~21.7 ms at batch 16 (the shared per-request cost DS cannot beat). The DS-vs-DSA
+   gap is the DS-specific selection (R17 microbench ~12.5 ms/step full-ctx, ~6 ms residual topk over-scan)
+   + token-label write (~2.7 ms) + prefill interleave under the request_rate=inf flood.
