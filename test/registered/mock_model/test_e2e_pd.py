@@ -128,5 +128,44 @@ class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
         self.assert_no_canary_violation()
 
 
+class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
+    """--kv-canary-real-data=all + sweep every step, no perturb, no violation."""
+
+    extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup",
+        "--kv-canary-real-data",
+        "all",
+        "--kv-canary-sweep-interval",
+        "1",
+    )
+    extra_decode_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup",
+        "--kv-canary-real-data",
+        "all",
+        "--kv-canary-sweep-interval",
+        "1",
+        "--disaggregation-decode-enable-radix-cache",
+    )
+
+    def test_pd_transfer_checksum_full_real_data(self) -> None:
+        # Step 1: drive traffic through the PD path with full real-KV hashing.
+        results = _send_parallel_requests(
+            self.lb_url,
+            n=_NUM_PROMPTS,
+            max_new_tokens=_OUTPUT_LEN,
+            timeout=240.0,
+            max_workers=_NUM_PROMPTS,
+        )
+
+        # Step 2: all requests must succeed.
+        for result in results:
+            self.assertEqual(result.get("status_code"), 200, result)
+
+        # Step 3: servers must stay healthy.
+        self.assertIsNone(self.process_prefill.poll(), "Prefill server died")
+        self.assertIsNone(self.process_decode.poll(), "Decode server died")
+        self.assert_no_canary_violation()
+
+
 if __name__ == "__main__":
     unittest.main()
