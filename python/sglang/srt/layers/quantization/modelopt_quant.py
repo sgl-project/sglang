@@ -2200,7 +2200,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # v2 standard path (a2a=none/flashinfer): uses CuteDslMoEWrapper
             # with [Up, Gate] interleaved weights and MMA blockscales.
-            ensure_cutedsl_wrapper(layer, dispatch_output.hidden_states.shape[0])
+            ensure_cutedsl_wrapper(layer)
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
             quant_info = CuteDslFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
