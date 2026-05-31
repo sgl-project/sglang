@@ -1,120 +1,40 @@
-// Shared deployment skeleton — the ENGINE half of the SGLang cookbook
-// deployment-command generator. Pair this with a per-model config file under
-// `/src/snippets/configs/<vendor>/<model>.jsx` and an MDX page that imports
-// both:
+// ENGINE half of the SGLang cookbook deployment-command generator. Reads a
+// per-model `config` prop (no model-specific code here). Full field semantics
+// (resolution rules, key layering) live in .claude/rules/cookbook-authoring.md §2.
 //
-//     import { Deployment } from "/src/snippets/_deployment.jsx";
-//     import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
-//     <Deployment config={config} />
+// Config fields the engine reads:
+//   modelName          display label
+//   supportedHardware  hw ids shown in the catalog (subset of HARDWARE_CATALOG)
+//   variants/quantizations/strategies/nodesOptions  the 5-dim option lists
+//                      (nodesOptions id is `single` or `multi-N` → --nnodes N)
+//   cells              {match, verified?, env, flags}[] — one per
+//                      (hw × variant × quant × strategy × nodes); env/flags are
+//                      flat literals, only {{PLACEHOLDER}} subst applied
+//   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
+//   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
+//   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
+//   benchmarkCommands  optional — powers the "⚡ Reproduce" modal (speed +
+//                      per-eval accuracy templates)
+//   defaultAccuracy    optional — per-variant accuracy merged under cell.accuracy
+//   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
+//   dockerImages       optional — per-hw image for `docker run` mode
+//   github             optional — "Submit verified cell" issue-template overrides
+//   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
-// This file contains nothing model-specific. Add a new cookbook recipe by
-// dropping a new config file and pointing an MDX at it — no engine edits
-// required. To improve the engine (new button, new UI feature, VRAM update),
-// edit this file once and every cookbook gets the upgrade.
-//
-// AUTHORING — read .claude/rules/cookbook-authoring.md for the step-by-step
-// workflow on adding a new cookbook or extending the engine.
-//
-// CONFIG CONTRACT (what the engine reads from `config`)
-// -----------------------------------------------------
-//   supportedHardware  string[]                    — hw ids visible in the UI
-//                                                    catalog (subset of
-//                                                    HARDWARE_CATALOG below).
-//   variants           {id, label, subtitle?}[]    — 2nd-dim option list.
-//   quantizations      {id, label}[]               — 3rd-dim option list.
-//   strategies         {id, label}[]               — 4th-dim option list.
-//   nodesOptions       {id, label}[]               — 5th-dim option list. The
-//                                                    id must be either
-//                                                    `single` or `multi-N`
-//                                                    (engine extracts N from
-//                                                    the id for --nnodes).
-//   cells              {match, verified?, env,
-//                       flags}[]                   — one per supported
-//                                                    (hw × variant × quant ×
-//                                                    strategy × nodes) combo.
-//                                                    `match` keys MUST be the
-//                                                    five DIMENSIONS below.
-//                                                    env/flags are flat
-//                                                    literals consumed
-//                                                    verbatim (no
-//                                                    interpolation other than
-//                                                    {{PLACEHOLDER}} subst).
-//   modelNames         {`hw|variant|quant` |
-//                       `variant|quant`: string}   — HF slug lookup. Layered:
-//                                                    triple key wins, falls
-//                                                    back to pair.
-//   placeholders       {[key]: {target: 'command'
-//                       | 'curl', label, default?}}
-//                                                  — {{KEY}} interpolation
-//                                                    map for command + curl.
-//                                                    Editable via Env modal.
-//   curl               string                      — cURL template (uses
-//                                                    {{MODEL_NAME}} +
-//                                                    placeholders).
-//   multiNodeHints     {[hwId]: string[]}          — comment lines prepended
-//                                                    to multi-node commands.
-//                                                    Each string becomes one
-//                                                    `# ...` line.
-//   dockerImages       {[hwId]: string}            — per-hw image name for
-//                                                    `docker run` mode.
-//                                                    Falls back to
-//                                                    `lmsysorg/sglang:dev` if
-//                                                    a hw id is missing.
-//   benchmarkCommands  {speed: string,             — optional. Powers the
-//                       accuracy: {[accKey]:          benchmark card's
-//                       string},                      "⚡ Reproduce" modal.
-//                       numPromptsByConc?:           `speed` is ONE
-//                       {[c]: number}}                bench_serving template;
-//                                                    the engine fills
-//                                                    {{DATASET}}/{{ISL}}/{{OSL}}
-//                                                    from the cell's workload,
-//                                                    the chip-picked
-//                                                    {{MAX_CONCURRENCY}}, and
-//                                                    {{NUM_PROMPTS}} resolved
-//                                                    as workload.num_prompts
-//                                                    ?? numPromptsByConc[c]
-//                                                    ?? max(c*2, 200).
-//                                                    `accuracy` maps an
-//                                                    accuracy field (e.g.
-//                                                    gsm8k_pct) to a per-eval
-//                                                    template — a string, or a
-//                                                    {[variant]: string} object
-//                                                    when the command differs
-//                                                    per variant. Both also use
-//                                                    {{MODEL_NAME}} +
-//                                                    {{CURL_HOST}}/{{CURL_PORT}}
-//                                                    like `curl`.
-//   defaultAccuracy    {[variant]:                 — optional. Model-level
-//                       {[accKey]: number}}           accuracy applied to EVERY
-//                                                    cell of a variant (e.g.
-//                                                    GPQA/AIME — hardware-
-//                                                    independent). Merged UNDER
-//                                                    each cell's measured
-//                                                    `accuracy` (per-cell wins).
-//
-// MINTLIFY CAVEATS THIS FILE ROUTES AROUND
-// ----------------------------------------
-//   - Module-level statements inside a `.jsx` snippet are stripped — so every
-//     helper / hook / handler stays inside the wrapper function body below.
-//   - Capitalized JSX tags inside a snippet's function body get rebound via
-//     `_provideComponents()`, so we use only lowercase HTML tags here (and
-//     factor sub-regions into `renderButton()` / `renderFlatSection()` helper
-//     functions, not into sub-components).
-//   - Imports of plain-data exports from other `.jsx` files DO work when the
-//     import lives in an MDX file. So the per-model config is imported at
-//     MDX level and passed through here as the `config` prop.
+// Mintlify caveats this file routes around:
+//   - Module-level statements are stripped — everything lives inside the
+//     wrapper function body.
+//   - Capitalized JSX tags get rebound by _provideComponents() — lowercase
+//     HTML tags only; factor into helper functions, not sub-components.
+//   - Import plain-data config from the MDX file, pass through as a prop.
 
 export const Deployment = ({ config, benchmarks }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
 
-  // ==========================================================================
-  // 1. Hardware catalog (shared across cookbooks — single source of truth)
-  // ==========================================================================
-  // VRAM is reported as per-GPU on-chip memory (HBM3/3e/E), not per-module.
-  // Adding a new SKU here makes it eligible for any cookbook to list in
-  // `config.supportedHardware`. Removing one hides it everywhere.
+  // ==== 1. Hardware catalog (shared across cookbooks) ====
+  // VRAM is per-GPU on-chip memory, not per-module.
   const HARDWARE_CATALOG = {
     nvidia: [
       { id: "h100",  label: "H100",  vram: "80GB"  },
@@ -132,9 +52,7 @@ export const Deployment = ({ config, benchmarks }) => {
     ],
   };
 
-  // ==========================================================================
-  // 2. Style helper (dark-mode-aware)
-  // ==========================================================================
+  // ==== 2. Style helper (dark-mode-aware) ====
   const makeStyles = (isDark) => ({
     container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "3px" },
     card: {
@@ -222,8 +140,6 @@ export const Deployment = ({ config, benchmarks }) => {
       display: "inline-flex", alignItems: "center", gap: "4px",
     },
     iconRow: { display: "inline-flex", gap: "6px" },
-    // Two-segment "Python | Docker" pill that sits next to the verified badge.
-    // Reuses the badge's pill silhouette so it visually groups with it.
     runModeWrap: {
       display: "inline-flex",
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
@@ -297,10 +213,6 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "13px", fontWeight: 500,
     },
 
-    // ---------- Benchmark card (rendered when the `benchmarks` prop is
-    // passed AND the current cell has a matching entry). Uses the same
-    // orange left-border family as the deploy panel so the two visually
-    // group together.
     benchCard: {
       padding: "8px 12px",
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
@@ -321,11 +233,9 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "11px",
       color: isDark ? "#9ca3af" : "#6b7280",
     },
-    // Right side of the benchmark header: version annotation + "⚡ Reproduce".
     benchHeaderRight: {
       display: "flex", alignItems: "center", gap: "10px", flexShrink: 0,
     },
-    // Concurrency chip row inside the Reproduce modal's Speed section.
     benchChipRow: {
       display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap",
       margin: "2px 0 8px",
@@ -338,8 +248,6 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#e5e7eb" : "#374151",
       fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
     },
-    // Selected concurrency chip — same terracotta as the Deploy panel's
-    // selected button (`checked`).
     benchChipActive: { background: "#D45D44", color: "white", borderColor: "#D45D44" },
     benchBlock: {
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
@@ -353,9 +261,6 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#9ca3af" : "#6b7280",
       marginBottom: "4px",
     },
-    // Workload description (e.g. "ShareGPT, in/out=1024/1024, bs=1") that
-    // sits between the block title and the metric rows. Italic + slightly
-    // muted so it reads as context, not data.
     benchWorkload: {
       fontSize: "11px", fontStyle: "italic",
       color: isDark ? "#9ca3af" : "#6b7280",
@@ -376,9 +281,6 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "11px", fontStyle: "italic",
       color: isDark ? "#9ca3af" : "#6b7280",
     },
-    // Small legend row below a bench block — used today to define
-    // `interactivity = 1000 / TPOT(ms)`. Muted, italic, mono for the
-    // formula so the equality reads as a definition not a metric.
     benchLegend: {
       fontSize: "10px", fontStyle: "italic",
       color: isDark ? "#6b7280" : "#9ca3af",
@@ -390,24 +292,11 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#9ca3af" : "#6b7280",
     },
 
-    // Speed table — rows are metrics (TTFT, TPOT, …), columns are
-    // per-workload measurements (typically varying max-concurrency).
-    // Implemented as CSS grid on a <div>, NOT a real <table>: Mintlify's
-    // page renderer wraps every <table> element in two extra divs that
-    // apply `margin: 4px -20px 12px` (negative horizontal margins so the
-    // table can bleed into the page padding for horizontal scrolling)
-    // PLUS `[&_td]:min-w-[150px]` on the table itself — both fire even
-    // inside .not-prose, and the negative-margin trick mis-aligns the
-    // contents inside a nested card. Using a grid of plain divs
-    // sidesteps the entire <table> auto-wrapping pipeline.
-    //
-    // The grid columns are set inline (`gridTemplateColumns`) since they
-    // depend on `measurements.length`: 1 auto label col + N value cols.
+    // grid (not <table>) — Mintlify wraps <table> with scroll wrappers.
+    // gridTemplateColumns set inline (depends on measurements.length).
     benchTable: {
       display: "grid",
-      // columnGap is 0 (not 16) so adjacent cells' bottom borders touch
-      // to form a single continuous line under the header row. Inter-
-      // column visual spacing comes from per-cell paddingLeft instead.
+      // columnGap 0 so cells' bottom borders form one continuous line.
       columnGap: 0,
       rowGap: "3px",
       marginTop: "4px",
@@ -424,19 +313,12 @@ export const Deployment = ({ config, benchmarks }) => {
     benchTableCornerHead: {
       paddingBottom: "4px",
     },
-    // Header underline. Single div that spans every column (gridColumn
-    // "1 / -1"), so the line is guaranteed continuous regardless of cell
-    // heights or column count. Previous approach (border-bottom per
-    // cell) broke when the empty corner cell collapsed shorter than the
-    // header cells under `alignItems: baseline`, putting their bottom
-    // borders at different Y positions.
+    // Header underline — one div spanning all columns (continuous line).
     benchTableSeparator: {
       gridColumn: "1 / -1",
       height: "1px",
       background: isDark ? "#374151" : "#e5e7eb",
-      // Negate the rowGap above so the line sits right against the
-      // header row instead of floating 3px below it.
-      marginTop: "-3px",
+      marginTop: "-3px", // negate the rowGap so it hugs the header row
     },
     benchTableLabel: {
       textAlign: "left", fontSize: "12px",
@@ -456,53 +338,30 @@ export const Deployment = ({ config, benchmarks }) => {
     },
   });
 
-  // ==========================================================================
-  // 3. Pure helpers (no React state)
-  // ==========================================================================
+  // ==== 3. Pure helpers (no React state) ====
   // DIMENSIONS is ordered by priority — higher-index dims adapt to lower-index
-  // picks, never the other way around. Order is Hardware → Variant →
-  // Quantization → Strategy → Nodes, matching the on-screen sections from top
-  // to bottom and the user's mental model ("first I pick my GPU, then the
-  // model size, then quant, then how I want to serve, then how many nodes").
+  // picks, never the reverse. Drives the grey-out/snap logic below.
   const DIMENSIONS = ["hw", "variant", "quant", "strategy", "nodes"];
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
 
-  // Mirror of findCell, but over the `benchmarks` array (per-cell results
-  // keyed by the same 5-dim match tuple). Returns the matching entry or
-  // null. The engine treats null and "no measured fields" the same way —
-  // both surface the empty-state card.
   const findBenchmark = (list, sel) =>
     (list || []).find((b) => DIMENSIONS.every((d) => b.match[d] === sel[d])) || null;
 
-  // Normalize the `speed` slot. Cookbooks may supply either:
-  //   - a single measurement object (legacy single-workload form), or
-  //   - an array of measurements (one per workload, typically varying
-  //     max-concurrency for a Pareto-style sweep).
-  // The engine always works with an array internally.
+  // Accepts a single measurement object or an array; always returns an array.
   const normalizeSpeed = (speed) => {
     if (!speed) return [];
     return Array.isArray(speed) ? speed : [speed];
   };
 
-  // Variant-level default accuracy merged UNDER the per-cell measured accuracy.
-  // GPQA / AIME are model-quality numbers — identical across every cell of a
-  // variant — so they live ONCE in `config.defaultAccuracy[variant]` instead of
-  // being copied onto all ~40 benchmark entries. A per-cell `entry.accuracy`
-  // field still overrides (e.g. a cell-specific gsm8k score). Returns the
-  // merged accuracy object the card + modal both read from.
+  // Variant default accuracy merged UNDER per-cell measured accuracy.
   const effectiveAccuracy = (entry, sel) => ({
     ...((config.defaultAccuracy && config.defaultAccuracy[sel.variant]) || {}),
     ...((entry && entry.accuracy) || {}),
   });
 
-  // True iff the entry has no numeric content worth rendering. Used to
-  // decide between rendering the metric blocks vs the empty-state line.
-  // An entry is "empty" if every speed measurement is null-only AND the
-  // (already-merged) `accuracy` is null-only. The `workload` slot is metadata
-  // about the test conditions (dataset / isl / osl / max_concurrency), not a
-  // measurement — skip it when deciding whether a measurement has data,
-  // otherwise a workload-only stub would falsely suppress the "pending" card.
+  // Empty = every speed measurement null-only AND accuracy null-only. `workload`
+  // is metadata, not a measurement — skip it so a workload-only stub stays empty.
   const benchmarkIsEmpty = (entry, accuracy) => {
     for (const m of normalizeSpeed(entry && entry.speed)) {
       if (m && typeof m === "object") {
@@ -520,16 +379,9 @@ export const Deployment = ({ config, benchmarks }) => {
     return true;
   };
 
-  // Grey-out predicate: a (dim, value) button is enabled iff there exists at
-  // least one cell that matches every HIGHER-priority dimension in the current
-  // selection AND has `dim === value`. Lower-priority dims are free to differ
-  // — they'll be adapted by snapToValidCell on click.
-  //
-  // Example: with sel = { hw:b200, variant:flash, quant:fp4, strategy:low-latency, nodes:single },
-  // the "Multi-Nodes" button on the Nodes section asks: is there a cell with
-  // hw=b200 AND variant=flash AND quant=fp4 AND strategy=low-latency AND nodes=multi-2?
-  // There isn't (B200 has no multi-node cells) → button is greyed out.
-  // It will NOT silently switch hardware to find a multi-node cell.
+  // Grey-out predicate: (dim, value) is enabled iff some cell matches every
+  // HIGHER-priority dim in `sel` AND has dim === value. Lower dims may differ
+  // (snapToValidCell adapts them on click).
   const isOptionAvailable = (cells, sel, dim, value) => {
     const idx = DIMENSIONS.indexOf(dim);
     const higher = DIMENSIONS.slice(0, idx);
@@ -538,14 +390,8 @@ export const Deployment = ({ config, benchmarks }) => {
     );
   };
 
-  // When the user clicks an ENABLED button at `dim`, snap to a real cell:
-  //   - higher-priority dims (above `dim`) stay locked to `sel[d]`
-  //   - the clicked `dim` becomes `value`
-  //   - lower-priority dims (below `dim`) adopt the best-fit cell's values,
-  //     preferring the cell that keeps the most of the user's current lower-
-  //     priority choices (minimises perceived churn).
-  // If the button was correctly greyed out by isOptionAvailable, this function
-  // is never called for a value with no matching cell.
+  // Snap to a real cell on click: higher dims stay locked, `dim` := value,
+  // lower dims adopt the best-fit cell (the one preserving the most lower picks).
   const snapToValidCell = (cells, sel, dim, value) => {
     const idx = DIMENSIONS.indexOf(dim);
     const higher = DIMENSIONS.slice(0, idx);
@@ -564,12 +410,8 @@ export const Deployment = ({ config, benchmarks }) => {
     return next;
   };
 
-  // Validate a selection from URL hash: walk dimensions in priority order,
-  // accept each parsed value if a matching cell exists with all already-
-  // accepted dims; otherwise adopt the value from the first cell consistent
-  // with the dims accepted so far. This guarantees the result is a real cell
-  // even if the URL hash names an impossible combination (e.g. a stale link
-  // after the catalog changed).
+  // Snap a parsed (possibly stale) URL-hash selection to a real cell, walking
+  // dims in priority order and falling back per-dim to the first consistent cell.
   const validateSelection = (cells, parsed) => {
     const valid = {};
     for (const dim of DIMENSIONS) {
@@ -607,26 +449,17 @@ export const Deployment = ({ config, benchmarks }) => {
     return m ? parseInt(m[1], 10) : 1;
   };
 
-  // Render a cell as either a bare `sglang serve` invocation (python mode) or
-  // wrapped in `docker run` against the per-hardware image (docker mode). Both
-  // share the multi-node flag injection, hint comments, and {{placeholder}}
-  // interpolation; only the outer framing differs.
+  // python mode → bare `sglang serve`; docker mode → wrapped in `docker run`.
   const renderCommand = (cell, sel, envValues, mode = "python") => {
     if (!cell) return "# No command available for the current selection.";
     const modelName = resolveModelName(sel);
     const nnodes = parseNnodes(sel.nodes);
     const multinode = nnodes > 1;
-    // Per-model configs are pure flat literals — cell.env and cell.flags are
-    // consumed verbatim. No fragment expansion, no aliasing, no preprocessing.
     const cellEnv = cell.env || [];
     const flags = [...(cell.flags || [])];
     if (multinode) {
-      // Insert the multi-node trio after the LAST parallelism flag in the
-      // cell (--enable-dp-attention > --dp > --tp), falling back to right
-      // after --model-path. This matches the convention used by the
-      // legacy hand-coded generator on origin/main (which is what the
-      // live cookbook page renders today) — keeps cookbook commands
-      // byte-identical across the refactor.
+      // Insert the multi-node trio after the last parallelism flag,
+      // falling back to right after --model-path.
       const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp"];
       let i = -1;
       for (const anchor of PARALLELISM_ANCHORS) {
@@ -642,12 +475,7 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Wrap as `docker run`. The port mapping uses the same {{PORT}} that the
-      // --port flag will resolve to, so they stay in sync when the user edits
-      // PORT in the Env modal. Image picked by hardware from config.dockerImages
-      // (mirrors the single image in the cookbook's "Install SGLang" accordion).
-      // If the hw isn't mapped (shouldn't happen for supported cells), we fall
-      // back to `:dev`.
+      // Image picked by hardware; falls back to `:dev` if unmapped.
       const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
       const dockerLines = [
         "docker run --gpus all",
@@ -684,61 +512,8 @@ export const Deployment = ({ config, benchmarks }) => {
     return cmd;
   };
 
-  // Render the per-cell benchmark card. Inline function (not a sub-
-  // component) — capitalized React component names get rebound by
-  // Mintlify's _provideComponents, so we keep this as a lowercase-only
-  // JSX tree. Engine consumer renders <renderBenchmarkCall(...)>{}</>
-  // by inlining the return.
-  //
-  // Layout (top → bottom):
-  //   header   : "Benchmark"   "measured on sglang vX.Y.Z" (right-aligned)
-  //   accuracy : single row collapsing whatever accuracy fields are
-  //              present (GSM8K today; add more via ACCURACY_LABELS).
-  //              Comes BEFORE speed — model quality leads serving speed.
-  //   speed    : metric × workload table. Rows are TTFT / TPOT /
-  //              tokens/sec/GPU / interactivity (1000/TPOT_ms) — all
-  //              four ALWAYS render so every cell shares the same
-  //              schema; unmeasured entries show "—". Columns are
-  //              per-workload measurements (typically varying
-  //              max-concurrency). Shared workload context (dataset,
-  //              in/out) is lifted to an italic line above the table;
-  //              the differing parts become the column headers.
-  //              A small `legend` strip below the table defines
-  //              derived metrics (e.g. `interactivity = 1000/TPOT(ms)`).
-  //   notes    : optional italic line
-  //   empty    : when the entry has no measured numbers
-  //
-  // The version annotation lives at the header, NOT under accuracy,
-  // since every block in the entry is part of the same measurement run
-  // on the same sglang build.
-  //
-  // Schema (consumed from `benchmarks` prop entries):
-  //   {
-  //     match: { hw, variant, quant, strategy, nodes },   // REQUIRED
-  //     sglang_version: string,                           // header annotation
-  //     speed: [
-  //       { workload: { dataset, isl, osl, max_concurrency },
-  //         ttft_ms, tpot_ms, tokens_per_sec_per_gpu },
-  //       ...                                             // one per workload
-  //     ],                                                // also accepts a
-  //                                                       //   single object
-  //                                                       //   (wrapped to [obj])
-  //     accuracy: { gsm8k_pct, ... },                     // extensible — add
-  //                                                       //   more keys to
-  //                                                       //   ACCURACY_LABELS
-  //     notes:    string,                                 // italic caveat
-  //   }
-  // `interactivity` is derived from tpot_ms (1000 / tpot_ms in tok/s),
-  // not stored. Missing metrics render as "—". A measurement that
-  // carries only a workload (no measured numbers) doesn't count toward
-  // "has data" — the card falls back to the pending empty state when
-  // nothing across all measurements has a value.
-  // Accuracy labels. Starts with GSM8K; add new accuracy benchmarks here as
-  // they come online (e.g. MATH, HumanEval). Shared by the benchmark card
-  // (collapses present fields into a row) AND the "⚡ Reproduce" modal (one
-  // chip per present-and-templated field, picking which eval command shows).
-  // Keys must match the `accuracy` field names in the benchmarks file +
-  // `benchmarkCommands.accuracy`.
+  // Accuracy labels: [field-key, display-label, unit]. Keys must match the
+  // `accuracy` fields in the benchmarks file + `benchmarkCommands.accuracy`.
   const ACCURACY_LABELS = [
     ["gpqa_pct",   "GPQA Diamond", "%"],
     ["aime25_pct", "AIME25",       "%"],
@@ -746,12 +521,8 @@ export const Deployment = ({ config, benchmarks }) => {
   ];
 
   const renderBenchmarkCard = (entry) => {
-    // Speed labels. Four metrics measured per workload: TTFT, TPOT,
-    // tokens/sec/GPU (system aggregate), interactivity (per-user
-    // generation speed, derived as 1000 / TPOT_ms = tok/s). The 4th
-    // tuple slot is an optional `compute(measurement)` function used
-    // for derived metrics that aren't stored — engine prefers compute()
-    // over measurement[key] when present.
+    // [key, label, unit, compute?]. Optional compute(measurement) supplies
+    // derived metrics (preferred over measurement[key] when present).
     const SPEED_LABELS = [
       ["ttft_ms",                "TTFT",            "ms"],
       ["tpot_ms",                "TPOT",            "ms"],
@@ -761,8 +532,6 @@ export const Deployment = ({ config, benchmarks }) => {
           ? Math.round((1000 / m.tpot_ms) * 10) / 10
           : null],
     ];
-    // Workload field keys, in display order. Used both for the shared
-    // workload line and to decide column headers via set diff.
     const WORKLOAD_KEYS = ["dataset", "isl", "osl", "max_concurrency"];
 
     const fmt = (val, unit) => {
@@ -770,17 +539,12 @@ export const Deployment = ({ config, benchmarks }) => {
       return `${val}${unit ? " " + unit : ""}`;
     };
 
-    // Format the given subset of workload keys into a comma-separated
-    // phrase. Used twice: once for the shared workload line above the
-    // table (with all shared `keys`), once for each column header
-    // (with only the `differing` keys). Same vocabulary in both spots
-    // so readers don't have to translate between abbreviations.
+    // Format a subset of workload keys into a comma-separated phrase.
     const formatWorkloadParts = (workload, keys) => {
       if (!workload) return "";
       const parts = [];
       if (keys.has("dataset") && workload.dataset) parts.push(workload.dataset);
-      // in/out is rendered as a single token even if only one of
-      // isl/osl is in the keys set — they read better together.
+      // in/out rendered as one token even if only one of isl/osl is present.
       if (keys.has("isl") || keys.has("osl")) {
         if (workload.isl != null || workload.osl != null) {
           parts.push(`in/out=${workload.isl != null ? workload.isl : "?"}/${workload.osl != null ? workload.osl : "?"}`);
@@ -792,14 +556,8 @@ export const Deployment = ({ config, benchmarks }) => {
       return parts.join(", ");
     };
 
-    // Split workload fields into "same across all measurements" (lifted
-    // out to the italic context line above the table) vs "differs"
-    // (becomes the per-column header). `max_concurrency` is forced
-    // into the per-column header regardless of whether it varies —
-    // it's the primary run-axis dimension and the reader needs to
-    // know at WHICH concurrency the numbers were measured, even when
-    // a cell ships with only one measurement. Other workload fields
-    // fall back to auto-decide (shared if uniform, differing if not).
+    // Split workload fields into shared (uniform → context line) vs differing
+    // (→ per-column header). max_concurrency is always per-column.
     const ALWAYS_PER_COLUMN = new Set(["max_concurrency"]);
     const partitionWorkload = (measurements) => {
       const shared = new Set();
@@ -819,16 +577,6 @@ export const Deployment = ({ config, benchmarks }) => {
       return { shared, differing };
     };
 
-    // Generic table renderer. Both speed and accuracy blocks feed it
-    // a {title, sharedText, colHeaders, rows, colCount} structure —
-    // the visual output (gray benchBlock with a CSS grid inside) is
-    // identical, only the data shape differs.
-    //
-    // The grid uses divs (not <table>) because Mintlify's page
-    // renderer auto-wraps every <table> element in two scroll
-    // wrappers with negative horizontal margins, which mis-align
-    // inside our nested card. `.not-prose` only disables prose
-    // typography, NOT the table component wrapping.
     const renderBenchTable = ({ title, sharedText, colHeaders, rows, colCount, legend }) => {
       if (rows.length === 0) return null;
       const showColHeaders = colHeaders.length > 0
@@ -875,15 +623,8 @@ export const Deployment = ({ config, benchmarks }) => {
       );
     };
 
-    // Build the speed-table data structure: rows are metrics (TTFT,
-    // TPOT, …), columns are per-workload measurements (typically
-    // varying max-concurrency). All four metric rows ALWAYS render —
-    // unmeasured cells show "—" — so the table shape is identical
-    // across every cell of the catalog (low-latency, balanced,
-    // high-throughput). Without this, partial sweeps would look like
-    // two different benchmark schemas (a "latency table" with no
-    // tokens/sec row vs a "throughput table" with no TTFT/TPOT rows),
-    // which is exactly the confusion this design unifies.
+    // All four metric rows always render (unmeasured cells show "—") so the
+    // table shape is identical across every cell.
     const buildSpeedTable = (measurements) => {
       if (measurements.length === 0) return null;
       const { shared, differing } = partitionWorkload(measurements);
@@ -904,11 +645,7 @@ export const Deployment = ({ config, benchmarks }) => {
                legend: "interactivity = 1000 / TPOT(ms)" };
     };
 
-    // Build the accuracy-table data structure. One row per benchmark
-    // in ACCURACY_LABELS that has a non-null value. Single value
-    // column today (no column header) — extend to multi-column if
-    // cookbooks ever need to compare eval configs (e.g. shots=0 vs
-    // shots=5) by changing the accuracy schema to an array.
+    // One row per ACCURACY_LABELS entry with a non-null value; single value column.
     const buildAccuracyTable = (accuracy) => {
       if (!accuracy) return null;
       const rows = ACCURACY_LABELS
@@ -928,8 +665,6 @@ export const Deployment = ({ config, benchmarks }) => {
     const measurements = !isEmpty ? normalizeSpeed(entry && entry.speed) : [];
     const accuracyTable = !isEmpty ? buildAccuracyTable(accuracy) : null;
     const speedTable = !isEmpty ? buildSpeedTable(measurements) : null;
-    // Show "⚡ Reproduce" only when the cookbook supplied benchmarkCommands AND
-    // there is at least one renderable command for this entry.
     const hasBenchCmds = !isEmpty && buildBenchCommands(entry, sel) !== null;
 
     return (
@@ -962,30 +697,15 @@ export const Deployment = ({ config, benchmarks }) => {
     );
   };
 
-  // Build the data for the "⚡ Reproduce" modal from `config.benchmarkCommands`
-  // + a matched benchmark `entry`. Returns the raw templates + the metadata
-  // the modal needs to fill them (concurrency list, a representative workload,
-  // a per-concurrency num-prompts resolver). The actual {{...}} interpolation
-  // happens in the modal (where `env` is in scope), reusing `interpolate`.
-  //
-  //   accuracy : [{ key, label, template }]  — one per ACCURACY_LABELS field
-  //              that has a value (merged: per-cell `entry.accuracy` over
-  //              `config.defaultAccuracy[variant]`) AND a template. A template
-  //              may be a string OR a `{[variant]: string}` object (resolved by
-  //              `sel.variant`) — used when a command differs per variant.
-  //   speed    : { template, concurrencies[], workload, numPromptsOf(c) }
-  //              or null. `workload` is the first measured workload (dataset/
-  //              isl/osl are uniform across a cell's speed rows; only
-  //              concurrency varies, which is the chip-switched knob).
-  // Returns null when nothing is renderable (caller hides the button).
+  // Build "⚡ Reproduce" modal data (raw templates + fill metadata). The {{...}}
+  // interpolation happens in the modal where `env` is in scope. Returns null
+  // when nothing is renderable (caller hides the button).
   const buildBenchCommands = (entry, sel) => {
     const bc = config.benchmarkCommands;
     if (!bc) return null;
 
-    // Accuracy commands run for every eval that has a value (merged: per-cell
-    // override or variant default) AND a template. A template may be a plain
-    // string (variant-agnostic, e.g. gsm8k) OR a `{flash, pro, …}` object
-    // keyed by variant (e.g. GPQA/AIME differ only in --max-tokens per variant).
+    // One entry per eval with a value AND a template. A template is a string,
+    // or a {[variant]: string} object resolved by sel.variant.
     const acc = effectiveAccuracy(entry, sel);
     const accuracy = [];
     if (bc.accuracy) {
@@ -1010,13 +730,8 @@ export const Deployment = ({ config, benchmarks }) => {
           template: bc.speed,
           concurrencies,
           workload: ms[0].workload,
-          // Resolve {{NUM_PROMPTS}} in priority order, mirroring the
-          // harness's NUM_PROMPTS_BY_CONC lookup with fallback max(c*2, 200):
-          //   1. workload.num_prompts on the matched measurement (per-row
-          //      override — most faithful to what was actually measured)
-          //   2. config.benchmarkCommands.numPromptsByConc[c] (cookbook-wide
-          //      canonical table)
-          //   3. max(c * 2, 200) (sane default when neither is supplied)
+          // {{NUM_PROMPTS}} priority: per-row override → numPromptsByConc[c]
+          // → max(c*2, 200).
           numPromptsOf: (c) => {
             const m = ms.find((x) => x.workload.max_concurrency === c);
             if (m && m.workload.num_prompts != null) return m.workload.num_prompts;
@@ -1058,9 +773,7 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   };
 
-  // ==========================================================================
-  // 4. React state + effects
-  // ==========================================================================
+  // ==== 4. React state + effects ====
   const [isDark, setIsDark] = useState(false);
   useEffect(() => {
     const check = () => {
@@ -1109,21 +822,10 @@ export const Deployment = ({ config, benchmarks }) => {
         if (key in parsed) { parsed[key] = value; touched = true; }
       });
       if (!touched) return;
-      // Snap to a real cell if the URL named an impossible combination
-      // (stale share link, manual edit, catalog changes). The hash mirror
-      // useEffect below rewrites the URL to match the validated state.
+      // Snap to a real cell if the hash named an impossible combo (stale link).
       setSel(validateSelection(config.cells, parsed));
-      // Deep-link UX: when the hash explicitly carries a selection (shared
-      // link, or an in-page anchor like "command panel above" pointing at a
-      // specific combo), scroll the Deploy section into view so the reader
-      // lands on the prefilled panel. We target the auto-slug id of the
-      // Deploy heading; cookbooks title it either "## Deployment" (→ id
-      // "deployment") or "## Deploy" (→ id "deploy"), so try both. If a
-      // cookbook MDX uses a different heading the lookup silently no-ops.
-      // NOTE: this only fires for hash navigations (link click, manual URL,
-      // back/forward) — chip clicks inside the panel mirror via
-      // `history.replaceState`, which does NOT trigger `hashchange`, so the
-      // page never self-scrolls.
+      // Scroll the Deploy section into view. Heading slugs to "deployment" or
+      // "deploy"; only fires on hash navigation (not replaceState chip clicks).
       const el = document.getElementById("deployment")
         || document.getElementById("deploy");
       if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1132,12 +834,8 @@ export const Deployment = ({ config, benchmarks }) => {
     window.addEventListener("hashchange", hydrate);
     return () => window.removeEventListener("hashchange", hydrate);
   }, []);
-  // Mirror sel → hash AND notify in-page listeners (like the §3.3 Playground).
-  // `history.replaceState` does NOT fire a `hashchange` event by spec — that
-  // event only fires when the user navigates to a new fragment (anchor click,
-  // address-bar edit, back/forward). So we dispatch a custom event ourselves
-  // and let the Playground subscribe to it; Playground also still listens to
-  // `hashchange` for the manual-URL case.
+  // history.replaceState does NOT fire hashchange — dispatch a custom event so
+  // the Playground hears chip-click selection changes.
   useEffect(() => {
     const target = "#" + new URLSearchParams(sel).toString();
     if (window.location.hash !== target) {
@@ -1162,34 +860,21 @@ export const Deployment = ({ config, benchmarks }) => {
   const [copied, setCopied] = useState(false);
   const [curlCopied, setCurlCopied] = useState(false);
   const [envDraft, setEnvDraft] = useState(env);
-  // "⚡ Reproduce" modal state. Both Speed and Accuracy are chip-selected:
-  //   benchConc — which concurrency the Speed command shows (null → the
-  //               cell's first measured concurrency).
-  //   benchAcc  — which eval the Accuracy command shows (null → first eval).
-  //   benchCopied — which command area last flashed "✓ Copied" ("speed" /
-  //               "acc"). Both stale picks fall back gracefully in the render.
+  // "⚡ Reproduce" modal: chip-selected concurrency / eval / last-copied block.
+  // null falls back to the first option in the render.
   const [benchConc, setBenchConc] = useState(null);
   const [benchAcc, setBenchAcc] = useState(null);
   const [benchCopied, setBenchCopied] = useState(null);
-  // Output framing: "python" emits a bare `sglang serve ...`, "docker" wraps
-  // the same args in `docker run` against the per-hardware image. The Copy /
-  // cURL / Env buttons all behave identically — the toggle only changes the
-  // text inside the <pre>.
-  const [runMode, setRunMode] = useState("python");
+  const [runMode, setRunMode] = useState("python"); // "python" | "docker"
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
 
-  // ==========================================================================
-  // 5. Derived values
-  // ==========================================================================
+  // ==== 5. Derived values ====
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
   const command = renderCommand(cell, sel, env, runMode);
   const modelName = resolveModelName(sel);
   const curlText = interpolate(config.curl || "", env, modelName);
   const hwGroups = buildHardwareGroups();
-  // Matched benchmark entry for the current selection (null when no
-  // `benchmarks` prop or no entry). Computed once; reused by both the
-  // benchmark card and the "⚡ Reproduce" modal.
   const benchEntry = benchmarks ? findBenchmark(benchmarks, sel) : null;
 
   const isEnabled = (dim, value) => isOptionAvailable(config.cells, sel, dim, value);
@@ -1208,8 +893,7 @@ export const Deployment = ({ config, benchmarks }) => {
     setCurlCopied(true);
     setTimeout(() => setCurlCopied(false), 1200);
   };
-  // Per-block copy for the "⚡ Reproduce" modal — `key` identifies which block
-  // flashed "✓ Copied" (so only that block's button changes label).
+  // `key` identifies which Reproduce-modal block flashed "✓ Copied".
   const copyBench = (key, text) => {
     navigator.clipboard.writeText(text);
     setBenchCopied(key);
@@ -1225,9 +909,7 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   })();
 
-  // ==========================================================================
-  // 6. JSX render
-  // ==========================================================================
+  // ==== 6. JSX render ====
   const renderButton = (item, dim, selectedId) => {
     const checked = selectedId === item.id;
     const disabled = !isEnabled(dim, item.id);
@@ -1331,17 +1013,11 @@ export const Deployment = ({ config, benchmarks }) => {
         </div>
       </div>
 
-      {/* Benchmark card. Renders only when the cookbook MDX passed a
-          `benchmarks` prop AND there is currently a matched cell. Inside
-          renderBenchmarkCard the empty-state path covers "match exists
-          but no measured numbers yet" — so cookbooks can ship the file
-          with placeholder entries and the card stays useful. */}
+      {/* Benchmark card (only with a `benchmarks` prop + matched cell). */}
       {benchmarks && cell && renderBenchmarkCard(benchEntry)}
 
-      {/* Playground link. scrollIntoView (instead of an href anchor) so the
-          URL hash — which carries the Deploy panel's selection — isn't
-          overwritten. The target id "playground" is auto-generated by
-          Mintlify from the "## Playground" heading slug. */}
+      {/* Playground link — scrollIntoView, not an href, so the hash (which
+          carries the selection) isn't overwritten. */}
       <div
         style={{
           padding: "6px 12px",
@@ -1454,11 +1130,7 @@ export const Deployment = ({ config, benchmarks }) => {
         </div>
       )}
 
-      {/* "⚡ Reproduce" modal — benchmark commands for the current selection.
-          Accuracy: one command per present-and-templated eval. Speed: ONE
-          command, with concurrency chips that rewrite --max-concurrency /
-          --num-prompts. Fill reuses `interpolate` (same machinery as cURL);
-          speed merges the picked workload values into the env map. */}
+      {/* "⚡ Reproduce" modal — benchmark commands for the current selection. */}
       {modal === "bench" && benchEntry && (() => {
         const bc = buildBenchCommands(benchEntry, sel);
         if (!bc) return null;
@@ -1479,9 +1151,7 @@ export const Deployment = ({ config, benchmarks }) => {
             NUM_PROMPTS: bc.speed.numPromptsOf(selConc),
           }, modelName);
         }
-        // Accuracy is chip-selected too — chips swap WHICH eval template shows.
-        // Same stale-pick fallback as Speed (a benchAcc carried over from a
-        // cell that doesn't have that eval falls back to the first one here).
+        // Accuracy chip-selected; stale benchAcc falls back to the first eval.
         let selAcc = null;
         let accCmd = null;
         if (bc.accuracy.length > 0) {

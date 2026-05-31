@@ -1,75 +1,6 @@
-// DeepSeek-V4 cookbook benchmarks — paired with deepseek-v4.jsx + _deployment.jsx.
-//
-// One entry per cell in `config.cells`, keyed by the same `match` tuple
-// (hw × variant × quant × strategy × nodes). When the user picks a
-// combination in the Deploy panel, the engine looks up the entry whose
-// `match` equals the current selection and renders it as a benchmark
-// sub-card under the command box. Cells without any measured numbers
-// render as the empty state ("Benchmark data pending …").
-//
-// Schema (everything except `match` is optional — present fields render,
-// absent ones collapse out):
-//
-//   {
-//     match:           { hw, variant, quant, strategy, nodes },     // REQUIRED
-//     sglang_version:  string,                                       // card header
-//     speed: [
-//       {
-//         workload: { dataset, isl, osl, max_concurrency,            // structured
-//                     num_prompts? },                                //   (num_prompts optional)
-//         ttft_ms, tpot_ms, tokens_per_sec_per_gpu,                  // measured
-//       },                                                           // one entry per
-//       ...                                                          //   workload (typically
-//                                                                    //   varying max-concurrency
-//                                                                    //   for a Pareto sweep)
-//     ],
-//     // `workload.num_prompts` is optional: it ONLY feeds the "⚡ Reproduce"
-//     // modal's speed command (config.benchmarkCommands). When absent the
-//     // engine derives {{NUM_PROMPTS}} = max_concurrency * 10. It does not
-//     // affect the rendered numbers table.
-//     accuracy: { gsm8k_pct, ... },                                  // extensible — add
-//                                                                    //   more keys when new
-//                                                                    //   accuracy benches land
-//     notes:    string,                                              // optional caveat
-//   }
-//
-// The engine renders `speed` as a metric × workload table:
-//   - rows: TTFT, TPOT, tokens/sec/GPU, interactivity (1000/TPOT_ms)
-//   - columns: one per workload entry
-//   - shared workload parts (dataset, in/out) lift to an italic line above
-//   - per-column header shows the differing parts (typically `c=N`)
-//
-// `interactivity` is derived from `tpot_ms` and never stored. Any
-// measured field set to null (or absent) renders as "—" in its cell —
-// so partial sweeps (only TTFT/TPOT at c=1; only tokens/sec at c=100)
-// degrade gracefully.
-//
-// `accuracy` renders as a single muted row ABOVE the speed table
-// (semantic priority — model quality leads serving speed). The engine
-// concatenates whichever accuracy fields are present, so adding a new
-// benchmark (e.g. `math_pct`) only requires updating ACCURACY_LABELS
-// in _deployment.jsx and adding the key here.
-//
-// `speed` also accepts a single object (e.g. `speed: { workload: ..., ttft_ms: ... }`)
-// for cookbooks that only measure one workload per cell; the engine
-// wraps it to `[speed]` internally.
-//
-// Editing policy: this file turns over independently of the cell
-// catalog (new sglang version → new numbers, but no flag changes).
-// Keep the entry count and ordering in sync with deepseek-v4.jsx's
-// `cells: [...]` so the two files diff cleanly side by side.
-
-// All numbers below were measured on **sglang v0.5.12.post1**. When that version
-// is updated, refresh the `sglang_version` field on every entry (or sweep
-// with a single find-and-replace).
-//
-// Historical note on the migration: cells originally carried separate
-// `latency` (concurrency=1) and `throughput` (concurrency=100) blocks.
-// These have been unified into the `speed` array — low-latency-only
-// cells now have one entry at c=1, high-throughput-only cells have one
-// entry at c=100, and balanced cells have both. The "—" cells in the
-// rendered table mark metrics not measured at that particular workload
-// and are candidates for the next benchmark sweep.
+// DeepSeek-V4 per-cell benchmark numbers, keyed by the same `match` tuple as
+// deepseek-v4.jsx cells. See _deployment.jsx for the speed/accuracy schema.
+// Measured on sglang v0.5.12.post1.
 export const benchmarks = [
   // ====================================================================
   // B200 + FP4
@@ -313,9 +244,6 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
         ttft_ms: 502615, tpot_ms: 130.31, tokens_per_sec_per_gpu: 490 },
     ],
-  },
-  {
-    match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" },
   },
   {
     match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "multi-2" },

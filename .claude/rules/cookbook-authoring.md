@@ -109,7 +109,7 @@ and any non-literal value crashes with `ReferenceError`.
 
 | Field | Type | Purpose |
 |---|---|---|
-| `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). |
+| `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). Per-hw, and only for hw whose **cluster fabric needs manual NIC config** (e.g. `gb200` NVL72/MNNVL → NVSHMEM/Gloo hints). NOT every multi-N hw needs an entry — standard-IB DeepEP (h200) auto-detects the HCA, and Marlin multi-node (h100) uses no DeepEP/NVSHMEM at all. |
 | `dockerImages` | `{[hwId]: string}` | Per-hw image name for `docker run` framing. Falls back to `lmsysorg/sglang:dev` if missing. |
 | `playgroundFeatures` | `{[axisId]: {...}}` | Opts into the Playground widget. See §2.3. |
 | `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. Optional; the button only appears when this AND `benchmarks` are present. |
@@ -494,7 +494,9 @@ Use this list when reviewing a new cookbook PR or a new axis PR.
       any cell.
 - [ ] `dockerImages` covers the hw ids that have cells (otherwise users
       hit the `:dev` fallback).
-- [ ] `multiNodeHints` covers the hw ids that have `multi-N` cells.
+- [ ] `multiNodeHints` is present for any hw whose multi-node fabric needs
+      manual NIC env (e.g. `gb200` NVL72). Do NOT add an entry for every
+      `multi-N` hw — standard-IB DeepEP / Marlin multi-node don't need it.
 - [ ] The MDX page imports `Deployment` AND `Playground` from
       `/src/snippets/...` (absolute paths).
 - [ ] The Deploy heading slugs to `deployment` (or `deploy`) and the

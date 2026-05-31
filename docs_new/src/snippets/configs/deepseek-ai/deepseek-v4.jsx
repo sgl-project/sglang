@@ -1,33 +1,16 @@
-// DeepSeek-V4 cookbook config — paired with /src/snippets/_deployment.jsx.
-//
-// SHAPE: must be a single literal `export const config = {...}` — no function
-// calls, spreads, fragment refs, or IIFE. Mintlify re-evaluates this export at
-// hydration time with module-level identifiers out of scope, so any non-literal
-// value fails with `ReferenceError`.
-//
-// Cells are intentionally denormalized: each enumerates its full env + flags,
-// so changing a common flag means sweeping all cells.
-//
-// `verified: true` → green "Verified" badge; absence/false → yellow "Auto-Estimated".
-//
-// Multi-node: do NOT put `--nnodes` / `--node-rank` / `--dist-init-addr` in
-// cell.flags. The engine prepends them from `match.nodes` (`single` → 1,
-// `multi-N` → N).
+// Single `export const config` literal — no spreads/calls/IIFE (Mintlify re-evals at hydration).
+// Cells are denormalized: no `--nnodes`/`--node-rank`/`--dist-init-addr`/`--host`/`--port` literals — engine injects them.
 
 export const config = {
   modelName: "DeepSeek-V4",
 
-  // `supportedHardware` is the catalog-visibility list, NOT the
-  // has-runnable-cells list. Listing AMD ids here makes those buttons appear
-  // in the UI; since no cell references them, the engine's grey-out logic
-  // disables them automatically. Drop an id to hide it entirely.
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
     "mi300x", "mi325x", "mi350x", "mi355x",
   ],
 
   variants: [
-    { id: "flash", label: "Flash", subtitle: "285B" },
+    { id: "flash", label: "Flash", subtitle: "284B" },
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
   ],
   quantizations: [
@@ -39,17 +22,12 @@ export const config = {
     { id: "balanced",       label: "Balanced"       },
     { id: "high-throughput", label: "High-Throughput" },
   ],
-  // Nodes dimension. The id format `multi-N` carries the node count so the
-  // renderer can emit `--nnodes N` automatically.
+  // `multi-N` id carries the node count for `--nnodes N`.
   nodesOptions: [
     { id: "single",  label: "Single Node" },
     { id: "multi-2", label: "Multi-Nodes" },
   ],
 
-  // HF slug: layered lookup. `${hw}|${variant}|${quant}` (override) →
-  // `${variant}|${quant}` (base). Both `--model-path` (via {{MODEL_NAME}} in
-  // cell.flags) and the cURL body's `"model"` field resolve from the same
-  // map.
   modelNames: {
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
@@ -65,8 +43,6 @@ export const config = {
     PORT:      { target: "command", label: "Bind port",       default: "30000"    },
     NODE0_IP:  { target: "command", label: "Head node IP",    default: "<node0-ip>"   },
     NODE_RANK: { target: "command", label: "This node rank",  default: "<node-rank>"  },
-    // HuggingFace access token — used only by the Docker output for the
-    // `--env "HF_TOKEN=..."` line; Python mode never injects it.
     HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     CURL_HOST: { target: "curl",    label: "Server host",     default: "localhost" },
     CURL_PORT: { target: "curl",    label: "Server port",     default: "30000"     },
@@ -76,27 +52,8 @@ export const config = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
-  // Commands that reproduce the numbers in the Benchmark card. Surfaced by
-  // the card's "⚡ Reproduce" button → modal. Optional (like `benchmarks`);
-  // drop it and the button disappears. These mirror the ACTUAL commands the
-  // harness ran (see `cookbook-benchmark/gen_cookbook_configs.py`
-  // `build_bench_cmd`) — running them against a server started with the
-  // Deploy command above reproduces the rendered numbers.
-  //
-  // The engine fills templates with the SAME placeholder machinery as `curl`:
-  // {{MODEL_NAME}} from `modelNames`, {{CURL_HOST}}/{{CURL_PORT}} from the
-  // Env panel. For `speed` it ALSO injects per-measurement values from each
-  // cell's `speed[].workload`: {{DATASET}} / {{ISL}} / {{OSL}} (uniform
-  // across a cell's rows) plus the user-picked {{MAX_CONCURRENCY}} and a
-  // {{NUM_PROMPTS}} resolved as
-  //   workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)
-  // (same fallback path as the harness's NUM_PROMPTS_BY_CONC lookup).
+  // Reproduce commands for the Benchmark card's "⚡ Reproduce" modal.
   benchmarkCommands: {
-    // ONE speed command, reused across the cell's measured concurrencies —
-    // only --max-concurrency / --num-prompts change (chip-switched in the UI).
-    // Mirrors the harness command verbatim (sglang.bench_serving with
-    // --output-file capturing the jsonl summary). Flags verified against
-    // python/sglang/bench_serving.py.
     speed:
 `python3 -m sglang.bench_serving \\
   --backend sglang \\
@@ -105,13 +62,6 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
-    // ONE command per accuracy benchmark, keyed by the SAME field name used in
-    // ACCURACY_LABELS (_deployment.jsx) + the entry/defaultAccuracy values.
-    // A template is EITHER a plain string (variant-agnostic, e.g. gsm8k) OR a
-    // `{flash, pro}` object keyed by variant — GPQA/AIME share one shape and
-    // differ only in --max-tokens (Flash 200000 / Pro 400000). The modal shows
-    // a chip per eval that has a value AND a template. All use sgl-eval against
-    // the v1 OpenAI route; {{MODEL_NAME}} resolves to the served model.
     accuracy: {
       gsm8k_pct:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
@@ -155,32 +105,17 @@ sgl-eval run aime25 \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
     },
-    // Canonical num-prompts per measured concurrency, mirroring the harness's
-    // NUM_PROMPTS_BY_CONC table in gen_cookbook_configs.py. Engine uses these
-    // when a workload entry doesn't carry its own `num_prompts`, with the same
-    // fallback the harness uses for unlisted concurrencies: max(c*2, 200).
     numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
   },
 
-  // Model-level accuracy that applies to EVERY cell of a variant. GPQA Diamond
-  // and AIME25 are model-quality numbers (hardware-/strategy-independent), so
-  // they live here once — keyed by variant id — instead of being copied onto
-  // all 43 benchmark entries. The engine merges this UNDER each cell's measured
-  // `accuracy` (a per-cell value, e.g. a specific gsm8k score, still wins). Add
-  // a variant key for each `variants[]` id; add a `<bench>_pct` field per eval
-  // (must match a key in ACCURACY_LABELS + benchmarkCommands.accuracy).
+  // Per-variant accuracy applied to every cell; per-cell `accuracy` overrides.
   defaultAccuracy: {
     flash: { gpqa_pct: 88.1, aime25_pct: 95,   gsm8k_pct: 96.13 },
     pro:   { gpqa_pct: 90.1, aime25_pct: 97.5, gsm8k_pct: 96.13 },
   },
 
+  // Prepended as `# ...` comments above multi-node commands.
   multiNodeHints: {
-    h100: [
-      "The following env vars may be needed depending on your cluster:",
-      "  GLOO_SOCKET_IFNAME=<your-nic>",
-      "  NVSHMEM_ENABLE_NIC_PE_MAPPING=1",
-      "  NVSHMEM_HCA_LIST=<your-hca-list>",
-    ],
     gb200: [
       "The following env vars may be needed depending on your cluster:",
       "  GLOO_SOCKET_IFNAME=<your-nic>",
@@ -189,9 +124,6 @@ sgl-eval run aime25 \\
     ],
   },
 
-  // Per-hardware Docker image. Mirrors the image named in the "Install SGLang"
-  // accordion (Docker tab) at the top of DeepSeek-V4.mdx's Deployment section;
-  // if you change one, change both.
   dockerImages: {
     h100:  "lmsysorg/sglang:latest",
     h200:  "lmsysorg/sglang:latest",
@@ -201,46 +133,15 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
   },
 
-  // -----------------------------------------------------------------------
-  // Playground feature axes (drives §3.3 Playground UI).
-  //
-  // OPT-IN MODEL: each axis is rendered ONLY if its key is present here.
-  // Omit any axis (or comment its block) to hide it for this model. No
-  // explicit `enabled` field — the presence of the key is the enable signal.
-  //
-  // 6 axes correspond 1:1 to the 6 cards in the old hand-written
-  // deepseek-v4-playground.jsx. The engine (_playground.jsx) owns the widget
-  // types and the strip/insert behaviour; this section just supplies the
-  // labels, value ranges, and the actual SGLang flag strings to emit per
-  // option (so model-specific things like the parser slug or the MTP_314
-  // numbers live here, not in the engine).
-  // -----------------------------------------------------------------------
+  // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
+  github: {
+    cookbookModel: "deepseek-ai/deepseek-v4",
+  },
+
   playgroundFeatures: {
 
-    // ----- Card 1: "Attention Parallelism" — 3 knobs (TP/CP/DP-Attention) -----
-    //
-    // Per-chip constraints (engine schema): an entry can be either a bare
-    // value (`null`, `1`, ...) OR an object `{value, hide?, disable?,
-    // disableReason?, label?}`. `hide` / `disable` are constraint objects —
-    // keys are base-cell fields, values are arrays of allowed matches; the
-    // constraint fires only when EVERY key in it matches the current base
-    // (AND across keys).
-    //
-    //   hide    — chip omitted entirely (used for hard impossibilities like
-    //             Pro variant on TP=1: 1.4T-param Pro can't fit on 1 GPU).
-    //   disable — chip greyed out + tooltip (soft warning, user can still
-    //             see the option exists but is unsupported here).
-    //
-    // DeepSeek-V4 specifics:
-    //   - Pro variant won't fit on TP=1/2 regardless of hardware — hide.
-    //   - TP=16 means 16 ranks → single-node has at most 8 GPUs, so
-    //     TP=16 on single-node is impossible — disable (with a hint that
-    //     they should switch §3.1's "Nodes" to multi-2 first).
-    //   - DP-Attention is a COMBINED knob: its value is the DP degree AND
-    //     simultaneously toggles `--enable-dp-attention`. `off` strips
-    //     both flags; a number N emits `--dp N --enable-dp-attention` as
-    //     a pair. The engine never emits plain `--dp` without DP-Attention
-    //     for this cookbook — that combination isn't used in DSV4 cells.
+    // ----- Card 1: "Attention Parallelism" -----
+    // DP-Attention is a combined knob: value is the DP degree AND toggles `--enable-dp-attention`.
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
@@ -268,10 +169,7 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 2: "MoE Parallelism" — Backend select + EP knob -----
-    // Each backend option's `flags` array is what the engine splices in
-    // when the user picks it (after stripping the base's --moe-a2a-backend
-    // / --moe-runner-backend flags).
+    // ----- Card 2: "MoE Parallelism" -----
     moe: {
       backend: {
         options: [
@@ -286,7 +184,6 @@ sgl-eval run aime25 \\
             flags: ["--moe-runner-backend marlin"] },
         ],
       },
-      // EP=16 is similarly bounded by total ranks — disable on single-node.
       ep: { label: "EP", values: [
         null,
         { value: 1, hide: { variant: ["pro"] } },
@@ -298,8 +195,7 @@ sgl-eval run aime25 \\
       ]},
     },
 
-    // ----- Card 3: "Parsers" — multi-toggle, one chip per item -----
-    // Per-model `flag` because parser slugs differ (deepseek-v4 / qwen3 / ...).
+    // ----- Card 3: "Parsers" -----
     parsers: {
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser deepseek-v4" },
@@ -307,10 +203,7 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 4: "Speculative Decoding" — single-select chip group -----
-    // `current` keeps the base cell's spec flags as-is; `off` strips them.
-    // Other options have their own `flags` array that the engine splices in
-    // after stripping the base's spec flags.
+    // ----- Card 4: "Speculative Decoding" -----
     speculative: {
       options: [
         { id: "current",    label: "Inherited from base" },
@@ -321,13 +214,6 @@ sgl-eval run aime25 \\
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"] },
-        // NGRAM — CUDA-only, no extra draft model. Per SGLang docs it does
-        // NOT support `--enable-dp-attention`. The `disable` here keys on the
-        // engine-derived cross-axis fact `dpAttnOn` (the LIVE effective
-        // DP-Attention state — explicit Attention-card override if set, else
-        // derived from the base cell), so NGRAM greys out exactly when
-        // DP-Attention is on and re-enables the moment it's turned off,
-        // regardless of strategy.
         { id: "ngram",      label: "NGRAM",
           flags: ["--speculative-algorithm NGRAM",
                   "--speculative-num-draft-tokens 16",
@@ -339,23 +225,15 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 5: "PD Disaggregation" — Mode + Transfer backend + IB Device -----
+    // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
       modes: [
         { id: "off",     label: "Off" },
         { id: "prefill", label: "Prefill role" },
         { id: "decode",  label: "Decode role" },
       ],
-      // KV-transfer backend between the prefill and decode roles. Each entry
-      // can carry `env` (vars appended to the command's env block) gated by
-      // `envWhen` (a constraint object over the base cell — every key must
-      // match for the env to fire; no `envWhen` = always-on).
       transferBackends: [
         { id: "mooncake", label: "Mooncake",
-          // GB200 / GB300 NVL72: cross-pod KV transfer rides the MNNVL fabric.
-          // mooncake needs these to bind onto MNNVL + NCCL cuMem; without them
-          // it can fall back to TCP or fail with `nvlink_transport.cpp:497
-          // Requested address ... not found!` on some clusters.
           env: [
             "NCCL_MNNVL_ENABLE=1",
             "NCCL_CUMEM_ENABLE=1",
@@ -365,20 +243,9 @@ sgl-eval run aime25 \\
           envWhen: { hw: ["gb200", "gb300"] } },
         { id: "nixl",     label: "NiXL" },
       ],
-      // IB device defaults differ per Blackwell variant: B200 typically uses
-      // mlx5_7, H200 uses mlx5_0, GB300 uses NVLink (no IB). The `auto`
-      // sentinel (default) emits no --disaggregation-ib-device flag; it's an
-      // {id,label} object so it displays "Auto" while the engine's
-      // `value.ibDevice !== "auto"` checks still see the lowercase id.
+      // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
-      // Router (SGLang Model Gateway) that fronts the prefill + decode roles.
-      // When a PD role is active the playground shows `command` as a separate
-      // companion block AND retargets the cURL modal to `port` (clients hit the
-      // router, NOT the role servers). Command copied verbatim from the upstream
-      // generator (docs_new/src/snippets/autoregressive/deepseek-v4-deployment.jsx
-      // on main). Substitute <prefill-host>/<decode-host> with reachable hosts
-      // (both 127.0.0.1 on a same-host deployment); ports are the canonical
-      // 30000 / 30001 / 8000 topology. Omit `router` to keep per-role-only output.
+      // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
       router: {
         port: 8000,
         command:
@@ -392,16 +259,8 @@ sgl-eval run aime25 \\
       },
     },
 
-    // ----- Card 6: "Hierarchical KV Cache" — Enable + Storage + Write Policy -----
-    // `auto` (default) for backend emits no --hicache-storage-backend flag —
-    // host RAM only. `auto` for writePolicy resolves to "write_through" in
-    // the engine.
+    // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
-      // `id` is the literal `--hicache-storage-backend` value SGLang's CLI
-      // expects (lowercase); `label` is the formal display name from
-      // docs/advanced_features/hicache_design.mdx (Mooncake / HF3FS / NIXL).
-      // We use "NiXL" here to match the PD-Disagg Transfer Backend label
-      // above (the docs write "NIXL"; the cookbook standardizes on "NiXL").
       backends: [
         { id: null,        label: "Auto" },
         { id: "file",      label: "File" },
@@ -409,10 +268,6 @@ sgl-eval run aime25 \\
         { id: "hf3fs",     label: "HF3FS" },
         { id: "nixl",      label: "NiXL" },
       ],
-      // `id` is the literal `--hicache-write-policy` value; `label` is the
-      // hyphenated prose form from the HiCache design doc's "Data Write-back"
-      // section. "auto" is the inherit sentinel (engine resolves it to
-      // write_through), not a CLI value.
       writePolicies: [
         { id: "auto",                    label: "Auto" },
         { id: "write_through",           label: "Write-through" },
@@ -421,29 +276,8 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 7: "HiSparse" — decode-only hierarchical sparse attention -----
-    // HiSparse keeps only a small hot KV buffer on GPU and the full KV in CPU
-    // pinned memory, swapping in the top-k entries on demand. It is a
-    // DECODE-INSTANCE optimization that requires PD disaggregation, so the
-    // engine only shows this card when §3.3's PD-Disagg mode is `decode`, and
-    // only emits its flags on a decode-role command.
-    //
-    // DeepSeek V4 specifics (per PR sgl-project/sglang#26249 — "[hisparse]:
-    // update user guide"):
-    //   DeepSeek V4 uses its own `dsv4` attention backend and defaults to
-    //   `fp8_e4m3` KV cache, so the DSA-family companions
-    //   `--kv-cache-dtype bfloat16` / `--dsa-decode-backend flashmla_sparse`
-    //   DO NOT apply here — those are for DSA models (DeepSeek-V3.2 /
-    //   GLM-5.1). The only extra companion the V4 hisparse recipe needs is
-    //   `--disable-radix-cache` (matches the canonical V4 decode example
-    //   in docs/advanced_features/hisparse_guide.mdx).
-    //
-    //   requiredFlags    — decode-side companions emitted alongside
-    //                      --enable-hisparse (engine strips + re-adds them).
-    //   config           — base hisparse-config JSON; the engine adds the
-    //                      selected host_to_device_ratio before serializing.
-    //   hostRatios       — host_to_device_ratio options. Tune by host RAM
-    //                      (~1TB → 5, ~2TB → 10) per the HiSparse guide.
+    // ----- Card 7: "HiSparse" -----
+    // Decode-only: shown/emitted only when the live PD-Disagg mode is `decode`.
     hisparse: {
       requiredFlags: [
         "--disable-radix-cache",
@@ -456,34 +290,10 @@ sgl-eval run aime25 \\
       defaultHostRatio: 10,
     },
 
-    // ----- Card 8: "MegaMoE" — single-select chip group, Blackwell-only -----
-    // MegaMoE fuses MoE dispatch + GEMM into a single kernel for higher MoE
-    // throughput. Only runnable on Blackwell GPUs — `requiresHw` tells the
-    // engine to hide this card when the base cell's hw is outside the list.
-    //
-    // Each option carries:
-    //   flags        : spliced into the command (swaps the base's
-    //                  --moe-a2a-backend if present, otherwise appends)
-    //   env          : appended to the cell's env block
-    //   stripEnv     : env prefixes to drop from the base cell's env before
-    //                  applying this option (MegaMoE doesn't use the DeepEP
-    //                  dispatch buffer, so the SGLANG_DEEPEP_NUM_MAX_*
-    //                  budget shouldn't be set alongside it).
-    //
-    // Visibility gates (both checked at render time):
-    //   requiresHw       : base cell's hw MUST be in this list
-    //   excludesStrategy : hide when base cell's strategy is in this list
-    //                      (MegaMoE's throughput optimization is incompatible
-    //                      with low-latency mode)
-    //
-    // `disabled` is the no-op identity option; `w4a8` is the standard MegaMoE
-    // kernel; `w4a4` additionally enables the FP4-acts variant.
+    // ----- Card 8: "MegaMoE" -----
+    // Blackwell-only, high-throughput only (see requiresHw / excludesStrategy).
     megamoe: {
       requiresHw: ["b200", "b300", "gb200", "gb300"],
-      // Per sgl-project/sglang#26451, MegaMoE is only wired into the
-      // `high-throughput` recipe on Blackwell — `balanced` joined `low-latency`
-      // on the unsupported list. (PD-Disagg is also unsupported upstream;
-      // we don't have a separate PD recipe axis, so no entry needed.)
       excludesStrategy: ["low-latency", "balanced"],
       stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
       options: [
@@ -502,11 +312,6 @@ sgl-eval run aime25 \\
     },
   },
 
-  // -----------------------------------------------------------------------
-  // Cell catalog — one entry per supported
-  // (hw × variant × quant × strategy × nodes) combination. Anything not
-  // listed here is auto-greyed-out by the engine's `isOptionAvailable`.
-  // -----------------------------------------------------------------------
   cells: [
     // ====================================================================
     // B200 + FP4
@@ -835,7 +640,6 @@ sgl-eval run aime25 \\
         "--port {{PORT}}",
       ],
     },
-    // GB200 Pro requires 2 nodes; multi-node wiring added by the renderer.
     {
       match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
@@ -1099,26 +903,6 @@ sgl-eval run aime25 \\
         "--cuda-graph-max-bs 128",
         "--max-running-requests 256",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path deepseek-ai/DeepSeek-V4-Pro",
-        "--tp 8",
-        "--moe-runner-backend marlin",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 3",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 4",
-        "--chunked-prefill-size 4096",
-        "--disable-flashinfer-autotune",
-        "--mem-fraction-static 0.88",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
