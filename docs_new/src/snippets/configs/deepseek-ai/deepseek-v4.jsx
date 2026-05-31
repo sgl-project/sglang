@@ -189,8 +189,9 @@ sgl-eval run aime25 \\
     ],
   },
 
-  // Per-hardware Docker image. Mirrors the "Docker Images by Hardware
-  // Platform" table in §2 of DeepSeek-V4.mdx; if you change one, change both.
+  // Per-hardware Docker image. Mirrors the image named in the "Install SGLang"
+  // accordion (Docker tab) at the top of DeepSeek-V4.mdx's Deployment section;
+  // if you change one, change both.
   dockerImages: {
     h100:  "lmsysorg/sglang:latest",
     h200:  "lmsysorg/sglang:latest",

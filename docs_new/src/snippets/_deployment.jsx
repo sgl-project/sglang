@@ -645,8 +645,9 @@ export const Deployment = ({ config, benchmarks }) => {
       // Wrap as `docker run`. The port mapping uses the same {{PORT}} that the
       // --port flag will resolve to, so they stay in sync when the user edits
       // PORT in the Env modal. Image picked by hardware from config.dockerImages
-      // (mirrors §2 "Docker Images by Hardware Platform" table). If the hw isn't
-      // mapped (shouldn't happen for supported cells), we fall back to `:dev`.
+      // (mirrors the single image in the cookbook's "Install SGLang" accordion).
+      // If the hw isn't mapped (shouldn't happen for supported cells), we fall
+      // back to `:dev`.
       const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
       const dockerLines = [
         "docker run --gpus all",

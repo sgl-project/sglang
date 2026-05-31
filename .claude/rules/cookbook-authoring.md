@@ -209,6 +209,17 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/<vendor>/<model>.jsx";
 import { benchmarks } from "/src/snippets/configs/<vendor>/<model>-benchmarks.jsx";
 
+{/* Install is a PREREQUISITE — keep it compact + collapsed at the top of the
+    Deploy section (NOT a numbered section). Tabs mirror the widget's
+    Python/Docker toggle. */}
+<a id="install" />
+<Accordion title="Install SGLang">
+  <Tabs>
+    <Tab title="Python (pip / uv)">…pip / uv install…</Tab>
+    <Tab title="Docker">…docker pull + a `docker run … sglang serve` example…</Tab>
+  </Tabs>
+</Accordion>
+
 <Deployment config={config} benchmarks={benchmarks} />
 
 [model-specific tuning notes, caveats, links]
