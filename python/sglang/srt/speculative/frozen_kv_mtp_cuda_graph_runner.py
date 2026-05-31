@@ -290,6 +290,11 @@ class FrozenKVMTPCudaGraphRunner:
                 global_dp_buffer_len,
                 expanded_bs,
                 forward_batch.dp_padding_mode.is_max_len(),
+                (
+                    [expanded_bs] * self.dp_size
+                    if global_dp_buffer_len is not None
+                    else None
+                ),
             )
             set_is_extend_in_batch(False)
 

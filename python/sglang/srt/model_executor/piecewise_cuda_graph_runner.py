@@ -612,6 +612,11 @@ class PiecewiseCudaGraphRunner:
                     global_dp_buffer_len,
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
+                    (
+                        [num_tokens] * self.dp_size
+                        if global_dp_buffer_len is not None
+                        else None
+                    ),
                 )
                 # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
                 # It is True in this context but we need to set it to use low latency deepep mode.

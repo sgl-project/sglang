@@ -416,6 +416,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                 forward_batch.global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
+                (
+                    [num_tokens] * self.dp_size
+                    if forward_batch.global_dp_buffer_len is not None
+                    else None
+                ),
             )
             set_is_extend_in_batch(False)
 
