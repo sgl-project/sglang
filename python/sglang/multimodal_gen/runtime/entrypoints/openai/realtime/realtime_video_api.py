@@ -97,6 +97,8 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             # send to scheduler and generate video chunk
             server_args = get_global_server_args()
 
+            await adapter.wait_for_next_chunk(session)
+
             chunk = session.new_chunk()
             batch = adapter.prepare_next_request(
                 session,

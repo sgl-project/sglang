@@ -337,6 +337,9 @@ def test_generate_loop_overlaps_previous_send_with_next_generation(monkeypatch):
     events = []
 
     class _Adapter:
+        async def wait_for_next_chunk(self, session):
+            del session
+
         def prepare_next_request(self, session, server_args, chunk):
             del session, server_args
             return SimpleNamespace(
@@ -477,6 +480,24 @@ def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():
 
     assert state.sample_camera_actions(3) == [["w"], ["d"], ["a"]]
     assert state.sample_camera_actions(3) == [["s"], ["s"], ["s"]]
+
+
+def test_lingbot_realtime_adapter_waits_for_input_after_initial_chunk():
+    async def run():
+        adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+        session = GenerateSession()
+        session.set_adapter(adapter)
+        await adapter.wait_for_next_chunk(session)
+
+        session.generate_chunk_cnt = 1
+        task = asyncio.create_task(adapter.wait_for_next_chunk(session))
+        await asyncio.sleep(0)
+
+        assert not task.done()
+        adapter._state(session).receive_camera_actions([["w"]], event_id=1)
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(run())
 
 
 def test_lingbot_realtime_adapter_sends_stale_output_for_client_cutover():

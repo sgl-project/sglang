@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from typing import TYPE_CHECKING, Any
@@ -53,10 +54,12 @@ class LingBotWorldRealtimeState:
             max_events={"prompt": 1, "camera_actions": 512}
         )
         self.latest_event_id: int | None = None
+        self._input_ready = asyncio.Event()
 
     def clear(self) -> None:
         self.events.clear()
         self.latest_event_id = None
+        self._input_ready.set()
 
     def receive_prompt(self, prompt: str, *, event_id: int | None = None) -> None:
         self.events.push(
@@ -66,6 +69,7 @@ class LingBotWorldRealtimeState:
             )
         )
         self.latest_event_id = event_id
+        self._input_ready.set()
 
     def receive_camera_actions(
         self,
@@ -84,6 +88,7 @@ class LingBotWorldRealtimeState:
         else:
             self.events.push(event)
         self.latest_event_id = event_id
+        self._input_ready.set()
 
     def sample_prompt(self) -> str:
         prompt = self.events.pop_latest("prompt")
@@ -107,6 +112,18 @@ class LingBotWorldRealtimeState:
 
     def has_prompt(self) -> bool:
         return self.events.has_events("prompt")
+
+    def has_pending_inputs(self) -> bool:
+        return self.events.has_events("prompt") or self.events.has_events(
+            "camera_actions"
+        )
+
+    async def wait_for_inputs(self) -> None:
+        while not self.has_pending_inputs():
+            self._input_ready.clear()
+            if self.has_pending_inputs():
+                return
+            await self._input_ready.wait()
 
 
 class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
@@ -150,6 +167,11 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
         image_path = await save_image_to_path(request.first_frame, target_path)
         request.first_frame = image_path
+
+    async def wait_for_next_chunk(self, session: GenerateSession) -> None:
+        if session.generate_chunk_cnt == 0:
+            return
+        await self._state(session).wait_for_inputs()
 
     @staticmethod
     def _validate_camera_actions(payload: Any) -> list[list[str]]:
