@@ -1288,7 +1288,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        if self.tree_cache.supports_mamba():
+        uses_mamba_cache = self.tree_cache.supports_mamba()
+        if uses_mamba_cache:
             required_alloc_states = self._required_alloc_mamba_states(req)
             available_states = self.req_to_token_pool.mamba_pool.available_size()
             if available_states < required_alloc_states:
