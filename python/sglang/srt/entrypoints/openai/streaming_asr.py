@@ -2,10 +2,12 @@ import asyncio
 import io
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
+import regex
 import soundfile as sf
 from fastapi import Request
 
@@ -54,9 +56,13 @@ class StreamingASRState:
 
     def _record_emit(self, delta: str) -> str:
         if delta:
-            self.emitted_text = (
-                f"{self.emitted_text} {delta}".strip() if self.emitted_text else delta
-            )
+            if self.emitted_text:
+                # needs_space avoids a space between adjacent CJK characters;
+                # this accumulator feeds the prompt prefix and the dedupe target.
+                sep = " " if needs_space(self.emitted_text, delta) else ""
+                self.emitted_text = f"{self.emitted_text}{sep}{delta}".strip()
+            else:
+                self.emitted_text = delta
         return delta
 
     def update(self, new_transcript: str) -> str:
@@ -129,23 +135,43 @@ _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
 _NO_SPACE_AFTER = frozenset("([{（【《「『")
 
 
-def _is_cjk(c: str) -> bool:
-    """CJK-context glyph that doesn't take inter-word spaces."""
-    cp = ord(c)
-    return (
-        0x3000 <= cp <= 0x303F  # CJK Symbols and Punctuation
-        or 0x3040 <= cp <= 0x309F  # Hiragana
-        or 0x30A0 <= cp <= 0x30FF  # Katakana
-        or 0x3400 <= cp <= 0x4DBF  # CJK Unified Ideographs Ext A
-        or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
-        or 0xFF00 <= cp <= 0xFFEF  # Halfwidth & Fullwidth Forms
-    )
+# Two predicates: dedup = genuine CJK script only; spacing also includes the
+# fullwidth forms. scx (not Script) so the kana marks ー/・ count; Hangul excluded
+# (Korean uses spaces).
+_HALFWIDTH_HANGUL = chr(0xFFA0) + "-" + chr(0xFFDC)
+
+# Dedup set: &&\p{P} adds fullwidth punctuation but not fullwidth ASCII/digits.
+_CJK_DEDUPE_RE = regex.compile(
+    "(?V1)["
+    r"\p{Han}\p{scx=Hiragana}\p{scx=Katakana}\p{Bopomofo}"
+    r"\p{Block=CJK_Symbols_and_Punctuation}"
+    r"[\p{Block=Halfwidth_and_Fullwidth_Forms}&&\p{P}]]"
+)
+
+# Spacing set: dedup set + fullwidth ASCII/digits (wide glyphs take no space),
+# minus the halfwidth Hangul jamo (U+FFA0-FFDC) the block would re-add.
+_CJK_NO_SPACE_RE = regex.compile(
+    "(?V1)["
+    r"\p{Han}\p{scx=Hiragana}\p{scx=Katakana}\p{Bopomofo}"
+    r"\p{Block=CJK_Symbols_and_Punctuation}"
+    r"[\p{Block=Halfwidth_and_Fullwidth_Forms}--[" + _HALFWIDTH_HANGUL + "]]]"
+)
+
+
+def _is_cjk_no_space(c: str) -> bool:
+    """No-inter-word-space char (CJK script + fullwidth forms); spacing only."""
+    return bool(_CJK_NO_SPACE_RE.match(c))
+
+
+def _is_cjk_dedupe(c: str) -> bool:
+    """Genuine CJK script char eligible for char-level dedup (no fullwidth ASCII)."""
+    return bool(_CJK_DEDUPE_RE.match(c))
 
 
 def needs_space(prev: str, cur: str) -> bool:
     """Return whether a boundary space is needed between emitted deltas.
 
-    Avoid spaces around punctuation and between adjacent CJK-context glyphs.
+    Avoid spaces around punctuation and between adjacent CJK-context characters.
     Shared by the realtime WS and HTTP SSE chunked streaming paths.
     """
     if not prev or not cur:
@@ -154,103 +180,110 @@ def needs_space(prev: str, cur: str) -> bool:
         return False
     if cur[0] in _NO_SPACE_BEFORE or prev[-1] in _NO_SPACE_AFTER:
         return False
-    if _is_cjk(prev[-1]) and _is_cjk(cur[0]):
+    if _is_cjk_no_space(prev[-1]) and _is_cjk_no_space(cur[0]):
         return False
     return True
 
 
-# Trailing punctuation stripped during dedupe match. Includes em dash
-# (U+2014), hyphen-minus, and CJK fullwidth equivalents.
-_DEDUPE_NORM_STRIP = ",.!?;:—-，。！？；：、"
-
-
 def _dedupe_norm(word: str) -> str:
-    """Lowercase + strip trailing punctuation for dedupe matching."""
-    return word.strip(_DEDUPE_NORM_STRIP).lower()
+    """Lowercase + NFKC-fold + strip edge punctuation (Unicode category P), so
+    "dinner," == "dinner" and exotic marks (《》«» …) need no hand-listed set.
+    Strips P only, not S, so "$5" / "3+4" keep their symbols."""
+    word = unicodedata.normalize("NFKC", word)
+    lo, hi = 0, len(word)
+    while lo < hi and unicodedata.category(word[lo])[0] == "P":
+        lo += 1
+    while hi > lo and unicodedata.category(word[hi - 1])[0] == "P":
+        hi -= 1
+    return word[lo:hi].lower()
 
 
-def _dedupe_word_level(committed_text: str, candidate_out: str) -> str:
+def _dedupe_by_word(committed_text: str, candidate_out: str) -> str:
     """Drop the longest prefix of ``candidate_out`` matching the suffix of
     ``committed_text`` word-for-word (case- and punctuation-insensitive)."""
     candidate_words = candidate_out.split()
     if not candidate_words:
         return candidate_out
-    committed_words = committed_text.split()
-    if not committed_words:
+    # Only the last len(candidate_words) committed words can overlap, so rsplit
+    # the tail instead of tokenizing the whole (growing) committed transcript.
+    committed_tail = committed_text.rsplit(maxsplit=len(candidate_words))[
+        -len(candidate_words) :
+    ]
+    if not committed_tail:
         return candidate_out
-    # The overlap is at most as long as the candidate, so only the last
-    # `max_overlap` committed words can match. Normalize that committed tail and
-    # the candidate prefix once, then compare list slices instead of
-    # re-normalizing inside the loop.
-    max_overlap = min(len(committed_words), len(candidate_words))
-    committed_tail_norm = [_dedupe_norm(w) for w in committed_words[-max_overlap:]]
+    # Normalize the committed tail and candidate prefix once, then compare slices.
+    max_overlap = min(len(committed_tail), len(candidate_words))
+    committed_tail_norm = [_dedupe_norm(w) for w in committed_tail]
     candidate_norm = [_dedupe_norm(w) for w in candidate_words[:max_overlap]]
     # Longest overlap first; the first match wins.
     for overlap in range(max_overlap, 0, -1):
-        if committed_tail_norm[-overlap:] == candidate_norm[:overlap]:
-            return " ".join(candidate_words[overlap:])
+        if committed_tail_norm[-overlap:] != candidate_norm[:overlap]:
+            continue
+        # Skip all-punctuation overlaps: lone "@"/"#" both normalize to "" and
+        # would match spuriously.
+        if not any(candidate_norm[:overlap]):
+            continue
+        return " ".join(candidate_words[overlap:])
     return candidate_out
 
 
-def _find_kth_cjk_pos(text: str, k: int) -> Optional[int]:
-    """Return index after the k-th CJK glyph in text, or None if text
-    contains fewer than k CJK glyphs."""
-    seen = 0
-    for i, c in enumerate(text):
-        if c.isspace() or not _is_cjk(c):
-            continue
-        seen += 1
-        if seen == k:
-            return i + 1
-    return None
+def _is_punctuation(c: str) -> bool:
+    return unicodedata.category(c)[0] == "P"
 
 
-def _dedupe_cjk_char_level(committed_text: str, candidate_out: str) -> str:
-    """Drop leading CJK glyphs of ``candidate_out`` matching the CJK-tail of
-    ``committed_text``. Non-CJK glyphs are skipped during match, preserved
-    in trimmed output."""
-    candidate_chars = [c for c in candidate_out if not c.isspace() and _is_cjk(c)]
-    if not candidate_chars:
-        return candidate_out
-    # The overlap is at most the candidate's CJK length, so collect only that
-    # many CJK glyphs from the end of committed_text (scanning in reverse and
-    # stopping early) instead of the whole history.
-    max_overlap = len(candidate_chars)
-    committed_tail_rev = []
-    for c in reversed(committed_text):
-        if c.isspace() or not _is_cjk(c):
-            continue
-        committed_tail_rev.append(c)
-        if len(committed_tail_rev) >= max_overlap:
+def _get_leading_cjk_chars(text: str) -> List[str]:
+    """Return the CJK characters at the start of ``text``, stopping at the first
+    non-CJK character (leading whitespace is skipped)."""
+    chars: List[str] = []
+    for char in text.lstrip():
+        if not _is_cjk_dedupe(char):
             break
-    if not committed_tail_rev:
+        chars.append(char)
+    return chars
+
+
+def _get_trailing_cjk_chars(text: str) -> List[str]:
+    """Return the CJK characters at the end of ``text``, stopping at the first
+    non-CJK character (trailing whitespace is skipped)."""
+    chars: List[str] = []
+    for char in reversed(text.rstrip()):
+        if not _is_cjk_dedupe(char):
+            break
+        chars.append(char)
+    chars.reverse()
+    return chars
+
+
+def _dedupe_by_cjk_char(committed_text: str, candidate_out: str) -> str:
+    """Drop the CJK characters at the start of ``candidate_out`` when they repeat
+    the CJK characters at the end of ``committed_text``. Only those boundary
+    characters are compared, so a non-CJK prefix ("today ") is never deleted to
+    reach a later match."""
+    lead = _get_leading_cjk_chars(candidate_out)
+    tail = _get_trailing_cjk_chars(committed_text)
+    if not lead or not tail:
         return candidate_out
-    committed_tail_chars = list(reversed(committed_tail_rev))
-    # Longest overlap first; the first match wins.
-    for overlap in range(len(committed_tail_chars), 0, -1):
-        if committed_tail_chars[-overlap:] != candidate_chars[:overlap]:
+    for overlap in range(min(len(lead), len(tail)), 0, -1):
+        if tail[-overlap:] != lead[:overlap]:
             continue
-        cut_pos = _find_kth_cjk_pos(candidate_out, overlap)
-        if cut_pos is None:
-            return ""
-        return candidate_out[cut_pos:].lstrip()
+        # Single-glyph matches collide too often for CJK letters; require >=2,
+        # allow 1 only for punctuation.
+        if overlap == 1 and not _is_punctuation(lead[0]):
+            continue
+        return candidate_out.lstrip()[overlap:].lstrip()
     return candidate_out
 
 
 def dedupe_overlap(committed_text: str, candidate_out: str) -> str:
-    """Trim words/CJK glyphs at the start of ``candidate_out`` that
-    re-transcribe ``committed_text``'s tail. Word-level first, CJK
-    char-level fallback."""
+    """Trim words / CJK characters at the start of ``candidate_out`` that
+    re-transcribe ``committed_text``'s tail. Matches by whole word first, then
+    falls back to matching the leading/trailing CJK characters."""
     if not committed_text or not candidate_out:
         return candidate_out
-    deduped = _dedupe_word_level(committed_text, candidate_out)
+    deduped = _dedupe_by_word(committed_text, candidate_out)
     if deduped != candidate_out:
         return deduped
-    if any(_is_cjk(c) for c in committed_text) or any(
-        _is_cjk(c) for c in candidate_out
-    ):
-        return _dedupe_cjk_char_level(committed_text, candidate_out)
-    return candidate_out
+    return _dedupe_by_cjk_char(committed_text, candidate_out)
 
 
 async def process_asr_chunk(

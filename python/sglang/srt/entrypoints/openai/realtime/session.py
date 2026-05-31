@@ -696,6 +696,8 @@ class RealtimeConnection:
             return False
 
         if use_slicing:
+            # Held-back tokens are re-covered only if their audio span fits the
+            # left overlap; slower speech can drop the earliest (see known limits).
             self.audio.committed_audio_until_bytes = len(self.audio.pcm_buffer)
 
         self.audio.last_inference_offset = len(self.audio.pcm_buffer)
