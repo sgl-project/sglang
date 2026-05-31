@@ -215,24 +215,6 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
     return MOE_RUNNER_BACKEND
 
 
-def is_deep_gemm_moe_runner_backend() -> bool:
-    """Whether the *effective* MoE runner backend is DeepGEMM (AUTO resolves to
-    DeepGEMM with JIT DeepGEMM + DeepEP-family a2a; mirrors
-    ``Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled``)."""
-    backend = get_moe_runner_backend()
-    if backend.is_deep_gemm():
-        return True
-    if backend.is_auto():
-        from sglang.srt.layers import deep_gemm_wrapper
-
-        return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_nixl()
-        )
-    return False
-
-
 def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
     global SPECULATIVE_MOE_RUNNER_BACKEND
     if SPECULATIVE_MOE_RUNNER_BACKEND is None:
