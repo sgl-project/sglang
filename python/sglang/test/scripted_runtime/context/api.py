@@ -38,7 +38,7 @@ class ScriptedContext:
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._http_poster = http_poster
 
-        self._started_rids: set[str] = set()
+        self._seen_rids: set[str] = set()
         self._req_starter = ScriptedContextReqStarter(self)
 
     def start_req(

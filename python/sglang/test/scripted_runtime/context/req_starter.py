@@ -44,5 +44,4 @@ class ScriptedContextReqStarter:
             description=f"request with rid {rid!r}",
         )
 
-        ctx._started_rids.add(rid)
         return ScriptedReqHandle(rid=rid, context=ctx)
