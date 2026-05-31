@@ -171,20 +171,20 @@ class RadixKey:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
-        i = self._first_mismatch(t0, t1)
+        first_mismatch_pos = self._first_mismatch(t0, t1)
 
         if self.is_bigram:
             # L matching raw tokens imply L-1 matching bigrams.
-            matched = max(0, min(i - 1, len(self), len(other)))
+            matched = max(0, min(first_mismatch_pos - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
         if page_size == 1:
-            return i
+            return first_mismatch_pos
 
         len0, len1 = len(t0), len(t1)
         n = len0 if len0 < len1 else len1
-        if i < n:
-            return (i // page_size) * page_size
+        if first_mismatch_pos < n:
+            return (first_mismatch_pos // page_size) * page_size
         # All compared tokens matched up to the shorter length. Mirror the
         # scalar slice-compare: a trailing partial page only counts when both
         # slices have equal length (i.e. both arrays end together).
