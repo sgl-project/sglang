@@ -259,6 +259,18 @@ class TestRadixKeyMatch(unittest.TestCase):
                 rng.randint(0, 3) for _ in range(n1 - shared)
             ]
             b_tokens = b_tokens[:n1]
+            # match() is only ever called on page-aligned keys in production,
+            # so align both sides before comparing against the scalar reference.
+            a_tokens = list(
+                RadixKey(array("q", a_tokens), is_bigram=is_bigram)
+                .page_aligned(page_size)
+                .token_ids
+            )
+            b_tokens = list(
+                RadixKey(array("q", b_tokens), is_bigram=is_bigram)
+                .page_aligned(page_size)
+                .token_ids
+            )
             expected = _reference_match(a_tokens, b_tokens, page_size, is_bigram)
             got = self._match(a_tokens, b_tokens, page_size, is_bigram)
             self.assertEqual(

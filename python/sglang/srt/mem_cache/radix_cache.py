@@ -171,26 +171,19 @@ class RadixKey:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        # first_mismatch_pos <= min(len(t0), len(t1)).
         first_mismatch_pos = self._first_mismatch(t0, t1)
 
         if self.is_bigram:
-            # L matching raw tokens imply L-1 matching bigrams.
-            matched = max(0, min(first_mismatch_pos - 1, len(self), len(other)))
-            return (matched // page_size) * page_size if page_size > 1 else matched
+            # L matching raw tokens imply L-1 matching bigrams; first_mismatch_pos
+            # is bounded by the raw lengths, so subtracting 1 already keeps it
+            # within the bigram counts (len(self) / len(other)).
+            first_mismatch_pos = max(first_mismatch_pos - 1, 0)
 
-        if page_size == 1:
-            return first_mismatch_pos
-
-        len0, len1 = len(t0), len(t1)
-        n = len0 if len0 < len1 else len1
-        if first_mismatch_pos < n:
-            return (first_mismatch_pos // page_size) * page_size
-        # All compared tokens matched up to the shorter length. Mirror the
-        # scalar slice-compare: a trailing partial page only counts when both
-        # slices have equal length (i.e. both arrays end together).
-        if len0 == len1:
-            return ((n + page_size - 1) // page_size) * page_size
-        return (n // page_size) * page_size
+        # Round down to the last page-aligned position. Keys are page-aligned
+        # before matching, so the shorter side is always a multiple of
+        # page_size and the result never overshoots it.
+        return first_mismatch_pos // page_size * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
