@@ -184,7 +184,7 @@ gap is **selection quality + the 2048 cap**, not a bug. This is Loop-7 / Tier-2.
 
 | Item | Status | Where |
 |------|--------|-------|
-| **DS long-context recall (Tier-2 / AC-10)** | **deferred — Loop 7 high priority** | adjustable-`top_k` decode kernel (relax the ABI lock) + learned/query-aware selector; gate already open (`ds_on_v32_decision.md`). See [`development/loop7.md/draft.md`](../../loop7.md/draft.md). |
+| **DS long-context recall (Tier-2 / AC-10)** | **deferred — Loop 7 high priority** | adjustable-`top_k` decode kernel (relax the ABI lock) + learned/query-aware selector; gate already open (`ds_on_v32_decision.md`). See [`development/loop7/draft.md`](../../loop7/draft.md). |
 | Strict all-concurrency client SLO (≥30 TPS @ every conc) | downstream | structural (DS ≤ DSA; conc-64 ≥30 unattainable even for DSA) — operating-point/DSA-side, not recall R&D |
 | 128k ISL servability + recall | roadmap §6 Loop 7 | extends the 64K servability work |
 | Multi-node / TP scaling | deferred (DEC-5) | dedicated future loop; SLO numbers unchanged across topologies |

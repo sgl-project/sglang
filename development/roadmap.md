@@ -188,7 +188,7 @@ a small hardening or a strategic decision. Executed as RLCR loop `.humanize/rlcr
   Tier-1 spine consumes Loop 6 — it did). The strategic gate (§4.0) is **open**. The work — a `flashmla_kv`
   decode-kernel variant accepting `top_k > index_topk` (relaxing `indices.shape[-1] == dsa_index_topk`)
   **and/or** a query-aware / learned DS selector — is the **high-priority Loop-7 mainline**, drafted at
-  [`development/loop7.md/draft.md`](loop7.md/draft.md). Target: NIAH 4K/16K/64K recall delta vs DS baseline
+  [`development/loop7/draft.md`](loop7/draft.md). Target: NIAH 4K/16K/64K recall delta vs DS baseline
   75% / 5% / 0%. *(GPU- and engineering-heavy.)*
 
 **Loop 6 done = client-SLO MVP (Minimum Acceptable Scope met):** §4.1 landed the admission/TTFT spine with
@@ -238,7 +238,7 @@ candidate RLCR loop; sizing/dependencies noted.
 
 ### Loop 7 — ⭐ DS long-context RECALL R&D (Tier-2 / AC-10) — HIGH PRIORITY (deferred out of Loop 6; gate OPEN)
 *The high-priority carryover from Loop 6.* The strategic gate (§4.0) **resolved to pursue this AFTER the
-Tier-1 spine** — which has now landed — so the gate is **open**. Draft: [`development/loop7.md/draft.md`](loop7.md/draft.md).
+Tier-1 spine** — which has now landed — so the gate is **open**. Draft: [`development/loop7/draft.md`](loop7/draft.md).
 The core problem (established on hardware in Loop 6): DS recall **4K 75% / 16K 5% / 64K 0%** vs DSA **100%** at
 the same 2048 budget + same kernel; dense DS = 100% and DS MMLU == DSA, so the gap is **selection quality +
 the `index_topk=2048` kernel lock**, not a decode bug.
@@ -333,7 +333,7 @@ From `CLIENT_SLOS.md` "Downstream requirements after client deliverables."
   `.humanize/rlcr/2026-05-30_06-27-19/` (goal-tracker, round summaries); evidence `runs/20260530_dsv32_loop6/`
   (`ds_on_v32_decision.md`, `footprint_feasibility.md`, `ac5_fullctx/`, `ac5_topk_design/`, `ac8_servability/`)
 - **As-built system state (read first):** `development/past_implementations/study/08-current-system-architecture.md`
-- **Loop-7 draft (Tier-2 recall R&D, high priority):** `development/loop7.md/draft.md`
+- **Loop-7 draft (Tier-2 recall R&D, high priority):** `development/loop7/draft.md`
 - **The lever (§4.1):** `python/sglang/srt/layers/attention/double_sparsity/token_label_table.py`
 - **The kernel cap (§4.4):** `indices.shape[-1] == dsa_index_topk` assert in
   `python/sglang/srt/layers/attention/dsa_backend.py`
