@@ -38,7 +38,7 @@ def launch_canary_plan_kernels(
       prefix_lens[r] - swa_window_size) if SWA else 0. slot_idx = req_to_token[req_pool_indices[r], pos]
       (SWA-translated via full_to_swa_index_mapping if non-None); prev_slot_idx =
       req_to_token[req_pool_indices[r], pos-1] for pos > 0, else -1. (SWA windows do NOT reset the chain —
-      the writer chains across the entire prefix; verify within an SWA window dereferences the real
+      the writer chains across the entire prefix; sweep verify within an SWA window dereferences the real
       predecessor for chain-link reconstruction.) Expected-token gather: when
       ``req_to_verify_expected_tokens`` is supplied, ``expected_input_id =
       req_to_verify_expected_tokens[rp, pos + kv_token_id_vs_position_offset]`` when ``0 <= pos +
