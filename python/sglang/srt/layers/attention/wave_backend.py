@@ -390,6 +390,39 @@ class WaveAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+    def _build_cuda_graph_forward_metadata(
+        self,
+        bs: int,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ) -> ForwardMetadata:
+        if forward_mode.is_decode_or_idle():
+            return ForwardMetadata(
+                attn_logits=self.cuda_graph_attn_logits,
+                attn_lse=self.cuda_graph_attn_lse,
+                max_extend_len=None,
+                num_kv_splits=self.cuda_graph_num_kv_splits,
+                kv_indptr=self.kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                qo_indptr=None,
+                custom_mask=None,
+                mask_indptr=None,
+            )
+        elif forward_mode.is_target_verify():
+            return ForwardMetadata(
+                attn_logits=None,
+                attn_lse=None,
+                max_extend_len=self.num_draft_tokens,
+                num_kv_splits=None,
+                kv_indptr=self.kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                qo_indptr=self.qo_indptr[: bs + 1],
+                custom_mask=self.cuda_graph_custom_mask,
+                mask_indptr=self.mask_indptr[: bs + 1],
+            )
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -402,76 +435,34 @@ class WaveAttnBackend(AttentionBackend):
     ):
         assert encoder_lens is None, "Not supported"
 
-        if forward_mode.is_decode_or_idle():
-            if spec_info is None:
-                kv_indptr = self.kv_indptr
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-            else:
-                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-
-            attn_logits = self.cuda_graph_attn_logits
-            attn_lse = self.cuda_graph_attn_lse
-            max_extend_len = None
-            num_kv_splits = self.cuda_graph_num_kv_splits
-            qo_indptr = None
-            custom_mask = None
-            mask_indptr = None
-        elif forward_mode.is_target_verify():
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+        # Multi-step speculative decode: kv buffers come from spec_info rather than
+        # the cuda-graph pool, so replay is not involved for this path.
+        if forward_mode.is_decode_or_idle() and spec_info is not None:
+            self.forward_metadata = ForwardMetadata(
+                attn_logits=self.cuda_graph_attn_logits,
+                attn_lse=self.cuda_graph_attn_lse,
+                max_extend_len=None,
+                num_kv_splits=self.cuda_graph_num_kv_splits,
+                kv_indptr=spec_info.kv_indptr,
+                kv_indices=spec_info.kv_indices,
+                qo_indptr=None,
+                custom_mask=None,
+                mask_indptr=None,
             )
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
+            return
 
-            custom_mask = self.cuda_graph_custom_mask
-            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
-            mask_indptr = self.mask_indptr[: bs + 1]
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
-            max_extend_len = self.num_draft_tokens
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
-        else:
-            raise ValueError(
-                f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
-            )
-
-        self.forward_metadata = ForwardMetadata(
-            attn_logits,
-            attn_lse,
-            max_extend_len,
-            num_kv_splits,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=None,
+        )
+        self.forward_metadata = self._build_cuda_graph_forward_metadata(
+            bs, forward_mode, spec_info
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -485,9 +476,7 @@ class WaveAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
-            # Update kv_indptr, kv_indices
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
             num_kv_splits = self.cuda_graph_num_kv_splits
@@ -510,7 +499,6 @@ class WaveAttnBackend(AttentionBackend):
                 num_token = spec_info.kv_indptr.shape[0] - 1
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
         elif forward_mode.is_target_verify():
-            # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
             bs = len(req_pool_indices)
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
