@@ -91,13 +91,13 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 await pending_send_task
                 pending_send_task = None
 
-            timer = RealtimeStageTimer()
-            chunk_started = time.perf_counter()
-
             # send to scheduler and generate video chunk
             server_args = get_global_server_args()
 
             await adapter.wait_for_next_chunk(session)
+
+            timer = RealtimeStageTimer()
+            chunk_started = time.perf_counter()
 
             chunk = session.new_chunk()
             batch = adapter.prepare_next_request(
