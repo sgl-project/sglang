@@ -580,6 +580,26 @@ def test_lingbot_denoising_stage_does_not_own_realtime_cache_refs():
     assert stage.crossattn_cache is None
 
 
+def test_lingbot_global_attention_cache_disables_sink_and_expands_sequence_shard():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.local_attn_size = -1
+    stage.sliding_window_num_frames = 18
+    stage.num_frames_per_block = 3
+    stage.num_token_per_frame = 10
+
+    assert stage._get_causal_sink_tokens() == 0
+    assert (
+        stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=False)
+        == 18 * 10
+    )
+    assert (
+        stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=True)
+        == 32 * 3 * 10
+    )
+
+
 def test_lingbot_i2v_model_input_writer_reuses_buffer():
     latents = torch.ones(1, 16, 3, 2, 2)
     condition = torch.full((1, 20, 3, 2, 2), 2.0)

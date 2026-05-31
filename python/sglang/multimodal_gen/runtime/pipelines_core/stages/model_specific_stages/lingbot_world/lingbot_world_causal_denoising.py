@@ -35,6 +35,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_LINGBOT_SEQUENCE_SHARDED_GLOBAL_CACHE_CHUNKS = 32
+
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     """Causal DMD denoising with I2V condition concatenation for LingBot-World.
@@ -56,6 +58,26 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     def _clear_stage_causal_cache_refs(self) -> None:
         self.causal_kv_cache = None
         self.crossattn_cache = None
+
+    def _get_lingbot_causal_kv_cache_size(
+        self, *, sequence_shard_enabled: bool
+    ) -> int:
+        if self.local_attn_size != -1:
+            return self.local_attn_size * self.num_token_per_frame
+
+        cache_num_frames = self.sliding_window_num_frames
+        if sequence_shard_enabled:
+            cache_num_frames = max(
+                cache_num_frames,
+                self.num_frames_per_block
+                * _LINGBOT_SEQUENCE_SHARDED_GLOBAL_CACHE_CHUNKS,
+            )
+        return cache_num_frames * self.num_token_per_frame
+
+    def _get_causal_sink_tokens(self) -> int:
+        if self.local_attn_size == -1:
+            return 0
+        return super()._get_causal_sink_tokens()
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -93,11 +115,15 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 )
             num_attention_heads //= ulysses_world_size
         attention_head_dim = self.transformer.attention_head_dim
-        kv_cache_size = self._get_causal_kv_cache_size()
+        kv_cache_size = self._get_lingbot_causal_kv_cache_size(
+            sequence_shard_enabled=sequence_shard_enabled
+        )
+        sink_tokens = self._get_causal_sink_tokens()
         logger.info(
             "LingBot KV cache init: batch=%s layers=%s frame_seq_length=%s "
             "num_frames_per_block=%s sliding_window_num_frames=%s local_attn_size=%s "
-            "sink_size=%s kv_cache_tokens=%s heads=%s head_dim=%s sequence_shard=%s",
+            "sink_size=%s effective_sink_tokens=%s kv_cache_tokens=%s heads=%s "
+            "head_dim=%s sequence_shard=%s",
             batch_size,
             self.num_transformer_blocks,
             self.num_token_per_frame,
@@ -105,6 +131,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             self.sliding_window_num_frames,
             self.local_attn_size,
             self.transformer.config.arch_config.sink_size,
+            sink_tokens,
             kv_cache_size,
             num_attention_heads,
             attention_head_dim,
@@ -119,7 +146,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             dtype=dtype,
             device=device,
             use_int_indices=True,
-            sink_tokens=self._get_causal_sink_tokens(),
+            sink_tokens=sink_tokens,
             attention_window_size=self._get_causal_attention_window_size(
                 kv_cache_size
             ),
@@ -282,6 +309,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                     "LingBot causal sequence sharding currently supports ulysses_degree > 1 with ring_degree = 1 only."
                 )
             expected_cache_heads //= get_ulysses_parallel_world_size()
+        expected_cache_tokens = self._get_lingbot_causal_kv_cache_size(
+            sequence_shard_enabled=sequence_shard_enabled
+        )
 
         should_reset_cache = (
             batch.block_idx == 0
@@ -289,6 +319,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             or crossattn_cache is None
             or len(causal_kv_cache) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
+            or causal_kv_cache[0]["k"].shape[1] != expected_cache_tokens
             or causal_kv_cache[0]["k"].shape[2] != expected_cache_heads
         )
 
