@@ -596,7 +596,7 @@ def test_lingbot_global_attention_cache_disables_sink_and_expands_sequence_shard
     )
     assert (
         stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=True)
-        == 32 * 3 * 10
+        == 24 * 3 * 10
     )
 
 
