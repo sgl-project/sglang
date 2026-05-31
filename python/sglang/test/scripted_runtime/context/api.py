@@ -4,7 +4,6 @@ import logging
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 from sglang.test.scripted_runtime.context import (
-    engine,
     lifecycle,
     queries,
     radix,
@@ -82,9 +81,6 @@ class ScriptedContext:
     def get_all_node_lock_refs(self) -> Dict[int, int]:
         return radix.get_all_node_lock_refs(self)
 
-    def lock_refs_snapshot(self) -> Dict[int, int]:
-        return radix.get_all_node_lock_refs(self)
-
     def find_req_by_rid(self, rid: str) -> Optional["Req"]:
         return queries.find_req_by_rid(self, rid)
 
@@ -96,27 +92,3 @@ class ScriptedContext:
 
     def list_active_reqs(self) -> List["Req"]:
         return queries.list_active_reqs(self)
-
-    def running_rids(self) -> List[str]:
-        return queries.running_rids(self)
-
-    def waiting_rids(self) -> List[str]:
-        return queries.waiting_rids(self)
-
-    def batch_rids(self) -> List[str]:
-        return queries.batch_rids(self)
-
-    def batch_size(self) -> int:
-        return queries.batch_size(self)
-
-    def get_chunked_req_rid(self) -> Optional[str]:
-        return queries.get_chunked_req_rid(self)
-
-    def chunked_in_flight_count(self) -> int:
-        return queries.chunked_in_flight_count(self)
-
-    def engine_stats(self) -> Dict[str, int]:
-        return engine.engine_stats(self)
-
-    def row_pool_used(self) -> int:
-        return engine.row_pool_used(self)

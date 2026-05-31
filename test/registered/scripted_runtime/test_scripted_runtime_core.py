@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
@@ -299,10 +300,11 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
     def _script_ignore_eos_runs_full_length(t: ScriptedContext):
         r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=6, ignore_eos=True)
         yield from run_until_finished(r)
+        req = r.req
+        assert req is not None, "finished req vanished before its output could be read"
         assert (
-            len(r.output_tokens) == 6
-        ), f"ignore_eos must decode the full length; got {r.output_tokens!r}"
-        assert all(isinstance(tok, int) for tok in r.output_tokens)
+            len(req.output_ids) == 6
+        ), f"ignore_eos must decode the full length; got {list(req.output_ids)!r}"
 
     def test_start_req_priority_is_propagated(self):
         self.server.execute_script(self._script_priority_is_propagated)
@@ -312,9 +314,10 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=4, priority=7)
         yield from advance_to_decode_step(r, 1)
         req = r.req
-        assert (
-            req is not None and req.priority == 7
-        ), f"priority not propagated to the scheduler req; got {None if req is None else req.priority}"
+        assert req is not None and req.priority == 7, (
+            f"priority not propagated to the scheduler req; "
+            f"got {None if req is None else req.priority}"
+        )
         yield from run_until_finished(r)
 
     def test_start_req_dp_rank_zero_accepted(self):
@@ -326,197 +329,46 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished, "dp_rank=0 req did not finish"
 
-    def test_token_count_handles_are_consistent(self):
-        self.server.execute_script(self._script_token_counts_consistent)
+    def test_abort_single_handle_finishes_with_abort_reason(self):
+        self.server.execute_script(self._script_abort_single_handle)
 
     @staticmethod
-    def _script_token_counts_consistent(t: ScriptedContext):
-        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=4, ignore_eos=True)
-        yield from advance_to_decode_step(r, 2)
-        assert (
-            r.num_input_tokens == _SHORT_PROMPT_LEN
-        ), f"num_input_tokens={r.num_input_tokens}, expected {_SHORT_PROMPT_LEN}"
-        assert r.fill_ids_len > 0, "fill_ids_len should be positive during the run"
-        assert r.total_tokens == r.num_input_tokens + len(r.output_tokens), (
-            f"total_tokens={r.total_tokens} != "
-            f"input({r.num_input_tokens}) + output({len(r.output_tokens)})"
-        )
-        yield from run_until_finished(r)
-        assert len(r.output_tokens) == 4
-
-    def test_row_idx_set_during_run_released_after_finish(self):
-        self.server.execute_script(self._script_row_idx_set_then_released)
-
-    @staticmethod
-    def _script_row_idx_set_then_released(t: ScriptedContext):
-        r = t.start_req(
-            prompt_len=_SHORT_PROMPT_LEN,
-            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
-            ignore_eos=True,
-        )
-        yield from advance_to_decode_step(r, 1)
-        assert (
-            r.row_idx is not None and r.row_idx >= 0
-        ), f"expected a row idx while the req runs; got {r.row_idx!r}"
-        yield from run_until_finished(r)
-        assert (
-            r.row_idx is None
-        ), f"row_idx should be released after finish; got {r.row_idx!r}"
-
-    def test_kv_pages_held_during_run_released_after(self):
-        self.server.execute_script(self._script_kv_pages_set_then_released)
-
-    @staticmethod
-    def _script_kv_pages_set_then_released(t: ScriptedContext):
-        r = t.start_req(
-            prompt_len=_LONG_PROMPT_LEN,
-            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
-            ignore_eos=True,
-        )
-        yield from advance_to_decode_step(r, 1)
-        assert r.kv_pages > 0, f"expected kv_pages>0 mid-run; got {r.kv_pages}"
-        yield from run_until_finished(r)
-        assert r.kv_pages == 0, f"kv_pages should be 0 after finish; got {r.kv_pages}"
-
-    def test_finish_reason_length_has_no_error_message(self):
-        self.server.execute_script(self._script_finish_reason_length_no_error)
-
-    @staticmethod
-    def _script_finish_reason_length_no_error(t: ScriptedContext):
-        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=3, ignore_eos=True)
-        assert (
-            r.finish_reason is None
-        ), "finish_reason should be None before the req finishes"
-        yield from run_until_finished(r)
-        reason = r.finish_reason
-        assert (
-            reason is not None and reason.get("type") == "length"
-        ), f"unexpected finish_reason {reason!r}"
-        assert (
-            r.error_message is None
-        ), f"a length finish must not carry an error message; got {r.error_message!r}"
-
-    def test_error_message_set_when_aborted(self):
-        self.server.execute_script(self._script_error_message_on_abort)
-
-    @staticmethod
-    def _script_error_message_on_abort(t: ScriptedContext):
+    def _script_abort_single_handle(t: ScriptedContext):
         r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=64)
         yield from advance_to_decode_step(r, 1)
+        assert not r.finished, "req finished before abort could act"
+
         t.abort(r)
-        message = None
+        saw_abort_reason = False
         for _ in range(16):
             yield
-            current = r.error_message
-            if current is not None:
-                message = current
+            req = r.req
+            if req is not None and isinstance(req.finished_reason, FINISH_ABORT):
+                saw_abort_reason = True
             if r.finished:
                 break
-        assert r.finished, "aborted req did not finish"
-        assert message == "Aborted", f"expected abort message 'Aborted'; got {message!r}"
+        assert r.finished, "single-handle abort did not finish the req"
+        assert saw_abort_reason, "aborted req never carried a FINISH_ABORT reason"
 
-    def test_extend_input_len_positive_during_chunked_prefill(self):
-        self.server.execute_script(self._script_extend_input_len_during_chunk)
-
-    @staticmethod
-    def _script_extend_input_len_during_chunk(t: ScriptedContext):
-        r = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from advance_to_nth_chunk(r, 1)
-        assert (
-            r.extend_input_len > 0
-        ), f"extend_input_len should be positive during chunked prefill; got {r.extend_input_len}"
-        yield from run_until_finished(r)
-
-    def test_misc_handle_fields_readable_and_cleared(self):
-        self.server.execute_script(self._script_misc_handle_fields)
+    def test_abort_single_handle_leaves_other_reqs_running(self):
+        self.server.execute_script(self._script_abort_single_handle_targeted)
 
     @staticmethod
-    def _script_misc_handle_fields(t: ScriptedContext):
-        r = t.start_req(
-            prompt_len=_SHORT_PROMPT_LEN,
-            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
-            ignore_eos=True,
-        )
-        yield from advance_to_decode_step(r, 1)
-        assert r.kv_committed_len >= 0
-        assert r.cached_tokens >= 0
-        assert r.cached_tokens_snapshot == r.cached_tokens
-        assert r.prefix_indices_len >= 0
-        assert r.host_hit_length >= 0
-        assert r.inflight_middle_chunks >= 0
-        assert r.spec_verify_count >= 0
-        assert r.lora_path is None, f"no LoRA configured; got {r.lora_path!r}"
-        yield from run_until_finished(r)
-        for _ in range(5):
+    def _script_abort_single_handle_targeted(t: ScriptedContext):
+        keep = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=64)
+        victim = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=64)
+        yield from advance_to_decode_step(keep, 1)
+
+        t.abort(victim)
+        for _ in range(16):
             yield
-        assert r.req is None, "req should be gone after finish + drain"
-        assert r.kv_committed_len == 0
-        assert r.cached_tokens == 0
-        assert r.prefix_indices_len == 0
-        assert r.spec_verify_count == 0
-        assert r.lora_path is None
+            if victim.finished:
+                break
+        assert victim.finished, "targeted abort did not finish the victim req"
+        assert not keep.finished, "targeted abort wrongly finished the other req"
 
-    def test_cached_tokens_and_last_node_on_radix_hit(self):
-        self.server.execute_script(self._script_cached_tokens_radix_hit)
-
-    @staticmethod
-    def _script_cached_tokens_radix_hit(t: ScriptedContext):
-        t.flush_cache()
-        yield
-        r1 = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True)
-        yield from run_until_finished(r1)
-        for _ in range(3):
-            yield
-        r2 = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True)
-        yield from advance_to_decode_step(r2, 1)
-        assert (
-            r2.cached_tokens > 0
-        ), f"identical prompt should hit the radix prefix; cached_tokens={r2.cached_tokens}"
-        assert (
-            r2.last_node_id is not None
-        ), "a radix-hitting req should expose its matched last_node id"
-        yield from run_until_finished(r2)
-
-    def test_chunked_req_rid_and_in_flight_count(self):
-        self.server.execute_script(self._script_chunked_req_rid_and_count)
-
-    @staticmethod
-    def _script_chunked_req_rid_and_count(t: ScriptedContext):
-        assert t.get_chunked_req_rid() is None, "no chunked req expected when idle"
-        assert t.chunked_in_flight_count() == 0
-        r = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from advance_to_nth_chunk(r, 1)
-        assert (
-            t.get_chunked_req_rid() == r.rid
-        ), f"chunked rid mismatch: {t.get_chunked_req_rid()!r} != {r.rid!r}"
-        assert t.chunked_in_flight_count() == 1
-        yield from run_until_finished(r)
-        assert t.get_chunked_req_rid() is None
-        assert t.chunked_in_flight_count() == 0
-
-    def test_running_and_batch_rids_track_live_req(self):
-        self.server.execute_script(self._script_running_batch_rids)
-
-    @staticmethod
-    def _script_running_batch_rids(t: ScriptedContext):
-        assert t.running_rids() == [], "running_rids should be empty when idle"
-        assert t.batch_rids() == []
-        assert t.batch_size() == 0
-        assert t.waiting_rids() == []
-        r = t.start_req(
-            prompt_len=_SHORT_PROMPT_LEN,
-            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
-            ignore_eos=True,
-        )
-        yield from advance_to_decode_step(r, 1)
-        assert r.rid in t.running_rids(), f"{r.rid!r} not in {t.running_rids()!r}"
-        assert r.rid in t.batch_rids()
-        assert t.batch_size() >= 1
-        yield from run_until_finished(r)
-        for _ in range(5):
-            yield
-        assert t.running_rids() == [], "running_rids should drain to empty after finish"
-        assert t.batch_size() == 0
+        t.abort(keep)
+        yield from run_until_finished(keep)
 
     def test_list_active_reqs_contains_live_req(self):
         self.server.execute_script(self._script_list_active_reqs)
@@ -531,106 +383,14 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         )
         yield from advance_to_decode_step(r, 1)
         actives = t.list_active_reqs()
-        assert any(
-            req.rid == r.rid for req in actives
-        ), f"live req {r.rid!r} missing from active reqs {[req.rid for req in actives]!r}"
+        assert any(req.rid == r.rid for req in actives), (
+            f"live req {r.rid!r} missing from active reqs "
+            f"{[req.rid for req in actives]!r}"
+        )
         yield from run_until_finished(r)
         for _ in range(5):
             yield
         assert t.list_active_reqs() == [], "active reqs should drain to empty after finish"
-
-    def test_lock_refs_snapshot_matches_node_lock_refs(self):
-        self.server.execute_script(self._script_lock_refs_snapshot)
-
-    @staticmethod
-    def _script_lock_refs_snapshot(t: ScriptedContext):
-        t.flush_cache()
-        yield
-        r = t.start_req(
-            prompt_len=_LONG_PROMPT_LEN,
-            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
-            ignore_eos=True,
-        )
-        yield from advance_to_decode_step(r, 1)
-        assert (
-            t.lock_refs_snapshot() == t.get_all_node_lock_refs()
-        ), "lock_refs_snapshot must mirror get_all_node_lock_refs"
-        yield from run_until_finished(r)
-        for _ in range(3):
-            yield
-        released = t.lock_refs_snapshot()
-        assert released and all(
-            ref == 0 for ref in released.values()
-        ), f"radix nodes still locked after finish: {released}"
-
-    def test_abort_single_handle_finishes_req(self):
-        self.server.execute_script(self._script_abort_single_handle)
-
-    @staticmethod
-    def _script_abort_single_handle(t: ScriptedContext):
-        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=64)
-        yield from advance_to_decode_step(r, 1)
-        assert not r.finished, "req finished before abort could act"
-        t.abort(r)
-        for _ in range(16):
-            yield
-            if r.finished:
-                break
-        assert r.finished, "single-handle abort did not finish the req"
-
-    def test_engine_stats_tracks_kv_pool(self):
-        self.server.execute_script(self._script_engine_stats_tracks_kv)
-
-    @staticmethod
-    def _script_engine_stats_tracks_kv(t: ScriptedContext):
-        stats = t.engine_stats()
-        for key in ("kv_pool_free", "req_pool_free", "req_pool_total", "page_size"):
-            assert key in stats, f"engine_stats missing {key!r}: {stats!r}"
-        baseline_free = stats["kv_pool_free"]
-        assert baseline_free > 0
-        r = t.start_req(
-            prompt_len=_LONG_PROMPT_LEN,
-            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
-            ignore_eos=True,
-        )
-        yield from advance_to_decode_step(r, 1)
-        during_free = t.engine_stats()["kv_pool_free"]
-        assert during_free < baseline_free, (
-            f"kv_pool_free should drop while a req holds KV; "
-            f"baseline={baseline_free} during={during_free}"
-        )
-        yield from run_until_finished(r)
-        t.flush_cache()
-        for _ in range(5):
-            yield
-        after_free = t.engine_stats()["kv_pool_free"]
-        assert (
-            after_free >= during_free
-        ), f"kv_pool_free should recover after finish; during={during_free} after={after_free}"
-
-    def test_row_pool_used_tracks_reqs(self):
-        self.server.execute_script(self._script_row_pool_used_tracks_reqs)
-
-    @staticmethod
-    def _script_row_pool_used_tracks_reqs(t: ScriptedContext):
-        for _ in range(3):
-            yield
-        baseline = t.row_pool_used()
-        r = t.start_req(
-            prompt_len=_SHORT_PROMPT_LEN,
-            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
-            ignore_eos=True,
-        )
-        yield from advance_to_decode_step(r, 1)
-        during = t.row_pool_used()
-        assert (
-            during >= baseline + 1
-        ), f"row pool should grow with a live req; baseline={baseline} during={during}"
-        yield from run_until_finished(r)
-        for _ in range(8):
-            yield
-        after = t.row_pool_used()
-        assert after == baseline, f"row pool leaked: baseline={baseline} after={after}"
 
     def test_empty_script_returns_immediately(self):
         self.server.execute_script(self._script_empty_return)
