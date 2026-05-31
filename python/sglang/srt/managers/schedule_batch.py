@@ -1463,6 +1463,17 @@ def set_mamba_track_indices_from_reqs(batch):
     )
 
 
+def _compute_chunked_req_next_prompt_token(
+    chunked_req: Optional[Req],
+) -> Optional[int]:
+    if chunked_req is None:
+        return None
+    fill_len = len(chunked_req.fill_ids)
+    if fill_len >= len(chunked_req.origin_input_ids):
+        return None
+    return int(chunked_req.origin_input_ids[fill_len])
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1494,6 +1505,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
+    chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
 
     # For DP attention
@@ -1660,6 +1672,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
+                chunked_req
+            ),
             dllm_config=dllm_config,
         )
         return batch
