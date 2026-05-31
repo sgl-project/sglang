@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
@@ -881,6 +884,22 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         self.scheduler = scheduler
         self.pipeline_config = pipeline_config
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        if self.vae is None:
+            return []
+        stage_name = self._component_stage_name(stage_name)
+        pipeline_config = getattr(server_args, "pipeline_config", self.pipeline_config)
+        vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="vae",
+                target_dtype=vae_dtype,
+            )
+        ]
+
     # -----------------------------------------------------------------------
     # Helper: VAE-encode and scale an image tensor
     # -----------------------------------------------------------------------
@@ -914,7 +933,13 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             image = image.unsqueeze(2)
 
         log_sana_wm_tensor_stats("first_frame.pixel_input_normalized", image)
-        z = self._extract_vae_latents(vae.encode(image)).float()
+        with self.use_declared_component(
+            component_name="vae",
+            module=vae,
+            target_dtype=vae_dtype,
+        ) as active_vae:
+            vae = active_vae if active_vae is not None else vae
+            z = self._extract_vae_latents(vae.encode(image)).float()
 
         latents_mean = getattr(vae, "latents_mean", None)
         latents_std = getattr(vae, "latents_std", None)
@@ -1000,9 +1025,62 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         shape: tuple,
         dtype: torch.dtype,
         device: torch.device,
-        generator: torch.Generator,
+        generator: (
+            torch.Generator | list[torch.Generator] | tuple[torch.Generator, ...]
+        ),
     ) -> torch.Tensor:
+        if isinstance(generator, (list, tuple)):
+            if not generator:
+                raise ValueError("SANA-WM generator list must not be empty.")
+            if len(generator) == 1:
+                return randn_tensor(
+                    shape, generator=generator[0], device=device, dtype=dtype
+                )
+            if len(generator) != shape[0]:
+                raise ValueError(
+                    "SANA-WM generator list length must match latent batch size; "
+                    f"got {len(generator)} generators for batch {shape[0]}."
+                )
+            sample_shape = (1, *shape[1:])
+            return torch.cat(
+                [
+                    randn_tensor(
+                        sample_shape,
+                        generator=sample_generator,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    for sample_generator in generator
+                ],
+                dim=0,
+            )
         return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+    @staticmethod
+    def _generator_from_seed(
+        seed: int | list[int] | tuple[int, ...] | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Generator | list[torch.Generator]:
+        if seed is None:
+            seed = 0
+        if isinstance(seed, (list, tuple)):
+            if not seed:
+                raise ValueError("SANA-WM seed list must not be empty.")
+            if len(seed) == 1:
+                seed = seed[0]
+            elif len(seed) == batch_size:
+                return [
+                    torch.Generator(device=device).manual_seed(int(sample_seed))
+                    for sample_seed in seed
+                ]
+            else:
+                raise ValueError(
+                    "SANA-WM seed list length must be 1 or match latent batch "
+                    f"size; got {len(seed)} seeds for batch {batch_size}."
+                )
+        return torch.Generator(device=device).manual_seed(int(seed))
 
     @staticmethod
     def _canonical_condition_image_tensor(image: torch.Tensor) -> torch.Tensor:
@@ -1136,11 +1214,33 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
     @staticmethod
     def _transform_intrinsics_for_condition_image(
         intrinsics_vec4: torch.Tensor,
-        preprocess_info: dict[str, tuple[int, int]] | None,
+        preprocess_info: (
+            dict[str, tuple[int, int]] | list[dict[str, tuple[int, int]]] | None
+        ),
     ) -> torch.Tensor:
         """Map source-image intrinsics into the cropped output pixel grid."""
         if not preprocess_info:
             return intrinsics_vec4
+        if isinstance(preprocess_info, list):
+            transform = (
+                SanaWMBeforeDenoisingStage._transform_intrinsics_for_condition_image
+            )
+            if len(preprocess_info) == 1:
+                return transform(intrinsics_vec4, preprocess_info[0])
+            if len(preprocess_info) != intrinsics_vec4.shape[0]:
+                raise ValueError(
+                    "SANA-WM condition-image preprocess metadata length must "
+                    "match intrinsics batch size; got "
+                    f"{len(preprocess_info)} metadata entries for batch "
+                    f"{intrinsics_vec4.shape[0]}."
+                )
+            return torch.cat(
+                [
+                    transform(intrinsics_vec4[index : index + 1], info)
+                    for index, info in enumerate(preprocess_info)
+                ],
+                dim=0,
+            )
         src_w, src_h = preprocess_info["source_size"]
         resized_w, resized_h = preprocess_info["resized_size"]
         left, top = preprocess_info["crop_offset"]
@@ -1170,33 +1270,72 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         B, _C, _T_lat, H_sp, W_sp = latents.shape
         target_h = H_sp * self.pipeline_config.vae_stride[1]  # 32
         target_w = W_sp * self.pipeline_config.vae_stride[2]  # 32
-        img_tensor, preprocess_info = self._preprocess_condition_image(
-            condition_image,
-            target_h=target_h,
-            target_w=target_w,
-        )
+        condition_images = self._condition_images_for_batch(condition_image, B)
+        first_frame_latents = []
+        preprocess_infos = []
+        for image in condition_images:
+            img_tensor, preprocess_info = self._preprocess_condition_image(
+                image,
+                target_h=target_h,
+                target_w=target_w,
+            )
+            preprocess_infos.append(preprocess_info)
+            first_frame_latents.append(
+                self._vae_encode_image(img_tensor, dtype, device)
+            )
+
         if batch is not None:
             if not hasattr(batch, "extra") or batch.extra is None:
                 batch.extra = {}
-            batch.extra[_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY] = preprocess_info
+            batch.extra[_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY] = (
+                preprocess_infos[0]
+                if len(preprocess_infos) == 1
+                else preprocess_infos
+            )
         self.log_info(
             "First-frame condition image preprocessed: source=%s, resized=%s, "
             "crop_offset=%s, target=%s.",
-            preprocess_info["source_size"],
-            preprocess_info["resized_size"],
-            preprocess_info["crop_offset"],
-            preprocess_info["target_size"],
+            preprocess_infos[0]["source_size"],
+            preprocess_infos[0]["resized_size"],
+            preprocess_infos[0]["crop_offset"],
+            preprocess_infos[0]["target_size"],
         )
+        if len(preprocess_infos) > 1:
+            self.log_info(
+                "Processed %d batched first-frame images.", len(preprocess_infos)
+            )
 
-        first_frame_z = self._vae_encode_image(img_tensor, dtype, device)
-        # first_frame_z: (1, 128, 1, H_sp, W_sp) — expand to batch
-        first_frame_z = first_frame_z.expand(B, -1, -1, -1, -1)
+        first_frame_z = torch.cat(first_frame_latents, dim=0)
+        if first_frame_z.shape[0] == 1 and B > 1:
+            first_frame_z = first_frame_z.expand(B, -1, -1, -1, -1)
+        elif first_frame_z.shape[0] != B:
+            raise ValueError(
+                "SANA-WM first-frame latent batch does not match noise batch: "
+                f"{first_frame_z.shape[0]} vs {B}."
+            )
 
         # Splice: replace the first temporal latent frame
         latents = latents.clone()
         latents[:, :, 0:1] = first_frame_z
         log_sana_wm_tensor_stats("latents.after_first_frame_splice", latents)
         return latents
+
+    @staticmethod
+    def _condition_images_for_batch(condition_image: Any, batch_size: int) -> list[Any]:
+        if isinstance(condition_image, list):
+            if not condition_image:
+                raise ValueError(
+                    "condition_image list is empty; SANA-WM requires a first "
+                    "frame conditioning image."
+                )
+            if len(condition_image) == 1 or len(condition_image) == batch_size:
+                return list(condition_image)
+            raise ValueError(
+                "SANA-WM condition_image list must contain one image or one "
+                f"image per batch item; got {len(condition_image)} images for "
+                f"batch {batch_size}."
+            )
+        return [condition_image]
 
     # -----------------------------------------------------------------------
     # Helper: camera conditioning
@@ -1611,6 +1750,11 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             ).to(device=device, dtype=camera_compute_dtype)
             if camera_conditions.dim() == 2:
                 camera_conditions = camera_conditions.unsqueeze(0)
+            if camera_conditions.dim() != 3:
+                raise ValueError(
+                    "camera_conditions must have shape (T,20) or (B,T,20), "
+                    f"got {tuple(camera_conditions.shape)}"
+                )
             if camera_conditions.shape[0] == 1 and batch_size > 1:
                 camera_conditions = camera_conditions.expand(batch_size, -1, -1)
             if camera_conditions.shape[-1] != 20:
@@ -1850,8 +1994,21 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 if isinstance(chunk_plucker, torch.Tensor)
                 else torch.as_tensor(chunk_plucker)
             ).to(device=device, dtype=dtype)
+            if chunk_plucker.dim() == 4:
+                chunk_plucker = chunk_plucker.unsqueeze(0)
             if chunk_plucker.shape[0] == 1 and batch_size > 1:
                 chunk_plucker = chunk_plucker.expand(batch_size, -1, -1, -1, -1)
+            if chunk_plucker.dim() != 5:
+                raise ValueError(
+                    "chunk_plucker must have shape (48,T,H,W) or "
+                    f"(B,48,T,H,W), got {tuple(chunk_plucker.shape)}"
+                )
+            expected_chunk_shape = (batch_size, 48, T_lat, sp_h, sp_w)
+            if tuple(chunk_plucker.shape) != expected_chunk_shape:
+                raise ValueError(
+                    "chunk_plucker shape mismatch for SANA-WM: expected "
+                    f"{expected_chunk_shape}, got {tuple(chunk_plucker.shape)}."
+                )
 
         if camera_conditions is not None:
             camera_conditions = camera_conditions.to(device=device, dtype=dtype)
@@ -1956,12 +2113,17 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         )
 
         # --- 1. Generator for reproducibility ---
-        seed = batch.seed if hasattr(batch, "seed") and batch.seed is not None else 0
-        generator = torch.Generator(device=device).manual_seed(seed)
-        batch.generator = generator
+        batch_size = batch.batch_size or 1
+        generator = getattr(batch, "generator", None)
+        if not isinstance(generator, (list, tuple, torch.Generator)):
+            generator = self._generator_from_seed(
+                getattr(batch, "seed", None),
+                batch_size=batch_size,
+                device=device,
+            )
+            batch.generator = generator
 
         # --- 2. Compute latent shape and initialize noise ---
-        batch_size = batch.batch_size or 1
         latent_shape = self.pipeline_config.prepare_latent_shape(
             batch, batch_size, num_frames
         )
@@ -1987,8 +2149,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                     "misleading low-quality output."
                 ) from e
         else:
-            self.log_info(
-                "No condition_image provided; using pure noise latents (T2V mode)."
+            raise ValueError(
+                "SANA-WM is a TI2V world model and requires condition_image "
+                "for first-frame conditioning. Provide --image-path, "
+                "--condition-image, or the equivalent API image input."
             )
 
         batch.latents = latents

@@ -27,6 +27,9 @@ from torch import nn
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -39,7 +42,10 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer impor
     unpack_latents,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    PipelineStage,
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMDecodingStage,
     log_sana_wm_tensor_stats,
@@ -134,6 +140,15 @@ def sana_wm_skip_refiner_enabled(batch: Req | None = None) -> bool:
 def default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
     precision = getattr(server_args.pipeline_config, "dit_precision", "bf16")
     return PRECISION_TO_TYPE.get(precision, torch.bfloat16)
+
+
+def _is_current_cfg_main_rank() -> bool:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    try:
+        return get_classifier_free_guidance_rank() == 0
+    except AssertionError:
+        return True
 
 
 def _pack_text_embeds(
@@ -438,10 +453,21 @@ class SanaWMLTX2RefinerStage(PipelineStage):
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
 
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        if getattr(self.server_args, "enable_cfg_parallel", False):
+            return StageParallelismType.MAIN_RANK_ONLY
+        return StageParallelismType.REPLICATED
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         if sana_wm_skip_refiner_enabled():
+            return []
+        if (
+            getattr(server_args, "enable_cfg_parallel", False)
+            and not _is_current_cfg_main_rank()
+        ):
             return []
 
         # Declare every component this stage forwards through so

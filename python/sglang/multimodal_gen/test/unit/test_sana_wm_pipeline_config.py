@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     compute_chunk_plucker,
 )
 from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
+    SanaWMPipeline,
     SanaWMTwoStagePipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -52,6 +53,11 @@ from sglang.multimodal_gen.runtime.utils.model_overlay import (
     resolve_model_overlay_target,
 )
 from sglang.multimodal_gen.test.test_utils import DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST
+
+_SANA_WM_REFINER_STAGE_MODULE = (
+    "sglang.multimodal_gen.runtime.pipelines_core.stages."
+    "model_specific_stages.sana_wm_refiner"
+)
 
 
 class _GlobalStageArgsMixin:
@@ -407,6 +413,20 @@ class TestSanaWMTwoStagePipeline(unittest.TestCase):
         )
 
 
+class TestSanaWMPipeline(unittest.TestCase):
+    def test_validate_parallelism_rejects_tensor_parallelism(self) -> None:
+        with self.assertRaisesRegex(ValueError, "tensor parallelism"):
+            SanaWMPipeline._validate_parallelism_args(
+                SimpleNamespace(tp_size=2, sp_degree=1)
+            )
+
+    def test_validate_parallelism_rejects_sequence_parallelism(self) -> None:
+        with self.assertRaisesRegex(ValueError, "sequence parallelism"):
+            SanaWMPipeline._validate_parallelism_args(
+                SimpleNamespace(tp_size=1, sp_degree=2)
+            )
+
+
 class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
     def test_action_string_rolls_out_camera_to_world(self) -> None:
         self.assertEqual(
@@ -461,6 +481,103 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         expected = torch.tensor([[[[[2.0]]], [[[4.0]]]]])
         self.assertTrue(torch.equal(encoded, expected))
 
+    def test_first_frame_vae_use_is_declared_for_component_residency(self) -> None:
+        pipeline_config = SanaWMPipelineConfig()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=object(),
+            transformer=None,
+            scheduler=None,
+            pipeline_config=pipeline_config,
+        )
+
+        uses = stage.component_uses(
+            SimpleNamespace(pipeline_config=pipeline_config),
+            stage_name="sana_wm_before_denoising",
+        )
+
+        self.assertEqual([use.component_name for use in uses], ["vae"])
+        self.assertEqual(uses[0].target_dtype, torch.bfloat16)
+
+    def test_prepare_noise_latents_accepts_per_sample_generators(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+
+        def make_generators():
+            return [
+                torch.Generator(device="cpu").manual_seed(11),
+                torch.Generator(device="cpu").manual_seed(23),
+            ]
+
+        latents = stage._prepare_noise_latents(
+            (2, 1, 1, 2, 2),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            generator=make_generators(),
+        )
+        latents_again = stage._prepare_noise_latents(
+            (2, 1, 1, 2, 2),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            generator=make_generators(),
+        )
+
+        self.assertEqual(latents.shape, (2, 1, 1, 2, 2))
+        self.assertTrue(torch.equal(latents, latents_again))
+        self.assertFalse(torch.equal(latents[0], latents[1]))
+
+    def test_prepare_noise_latents_rejects_mismatched_generator_count(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "length must match"):
+            stage._prepare_noise_latents(
+                (2, 1, 1, 1, 1),
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                generator=[
+                    torch.Generator(device="cpu").manual_seed(1),
+                    torch.Generator(device="cpu").manual_seed(2),
+                    torch.Generator(device="cpu").manual_seed(3),
+                ],
+            )
+
+    def test_generator_from_seed_accepts_per_sample_seed_list(self) -> None:
+        generators = SanaWMBeforeDenoisingStage._generator_from_seed(
+            [11, 23],
+            batch_size=2,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(len(generators), 2)
+
+        with self.assertRaisesRegex(ValueError, "seed list length"):
+            SanaWMBeforeDenoisingStage._generator_from_seed(
+                [1, 2, 3],
+                batch_size=2,
+                device=torch.device("cpu"),
+            )
+
+    def test_condition_image_batch_helper_accepts_single_or_batch_list(self) -> None:
+        self.assertEqual(
+            SanaWMBeforeDenoisingStage._condition_images_for_batch(["img"], 2),
+            ["img"],
+        )
+        self.assertEqual(
+            SanaWMBeforeDenoisingStage._condition_images_for_batch(["a", "b"], 2),
+            ["a", "b"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "one image or one image per batch"):
+            SanaWMBeforeDenoisingStage._condition_images_for_batch(["a", "b", "c"], 2)
+
     def test_first_frame_preprocess_records_official_crop_geometry(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -490,6 +607,39 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(info["crop_offset"], (0, 288))
         self.assertEqual(info["target_size"], (1280, 704))
         self.assertTrue(torch.equal(out[:, :, :1], torch.ones(1, 128, 1, 22, 40)))
+
+    def test_first_frame_splice_supports_batched_condition_images(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        latents = torch.zeros(2, 128, 7, 22, 40)
+        batch = SimpleNamespace(extra={})
+
+        with patch.object(
+            stage,
+            "_vae_encode_image",
+            side_effect=[
+                torch.ones(1, 128, 1, 22, 40),
+                torch.full((1, 128, 1, 22, 40), 2.0),
+            ],
+        ):
+            out = stage._splice_first_frame(
+                latents,
+                [torch.zeros(3, 100, 100), torch.zeros(3, 200, 100)],
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                batch=batch,
+            )
+
+        info = batch.extra["sana_wm_condition_image_preprocess"]
+        self.assertEqual(len(info), 2)
+        self.assertTrue(torch.equal(out[0, :, :1], torch.ones(128, 1, 22, 40)))
+        self.assertTrue(
+            torch.equal(out[1, :, :1], torch.full((128, 1, 22, 40), 2.0))
+        )
 
     def test_default_static_camera_builds_latent_raymap_and_chunk_plucker(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
@@ -606,6 +756,68 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(camera_conditions.shape, (1, 2, 20))
         self.assertEqual(chunk_plucker.shape, (1, 48, 2, 2, 2))
         self.assertAlmostEqual(float(camera_conditions[0, 1, 11]), 0.4, places=5)
+
+    def test_camera_conditioning_accepts_unbatched_chunk_plucker(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        batch = SimpleNamespace(
+            extra={"chunk_plucker": torch.zeros(48, 3, 12, 20)},
+            height=384,
+            width=640,
+        )
+
+        camera_conditions, chunk_plucker, source = stage._build_camera_conditioning(
+            batch,
+            batch_size=1,
+            num_frames=17,
+            latent_shape=(1, 128, 3, 12, 20),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(source, "default_static")
+        self.assertEqual(camera_conditions.shape, (1, 3, 20))
+        self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
+
+    def test_camera_conditioning_rejects_bad_prepacked_shapes(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "camera_conditions must have shape"):
+            stage._build_camera_conditioning(
+                SimpleNamespace(
+                    extra={"camera_conditions": torch.zeros(1, 1, 3, 20)},
+                    height=384,
+                    width=640,
+                ),
+                batch_size=1,
+                num_frames=17,
+                latent_shape=(1, 128, 3, 12, 20),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+        with self.assertRaisesRegex(ValueError, "chunk_plucker shape mismatch"):
+            stage._build_camera_conditioning(
+                SimpleNamespace(
+                    extra={"chunk_plucker": torch.zeros(48, 2, 12, 20)},
+                    height=384,
+                    width=640,
+                ),
+                batch_size=1,
+                num_frames=17,
+                latent_shape=(1, 128, 3, 12, 20),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
 
     def test_action_and_camera_path_are_mutually_exclusive(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
@@ -820,6 +1032,51 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         ]
 
         self.assertEqual(names, ["text_encoder_2", "connectors", "transformer_2"])
+
+    def test_refiner_parallelism_runs_on_main_rank_when_cfg_parallel(self) -> None:
+        stage = SanaWMLTX2RefinerStage(
+            transformer=torch.nn.Identity(),
+            connectors=torch.nn.Identity(),
+            text_encoder=torch.nn.Identity(),
+            tokenizer=SimpleNamespace(pad_token="<pad>", eos_token="<eos>"),
+            dtype=torch.bfloat16,
+        )
+
+        stage.server_args = SimpleNamespace(enable_cfg_parallel=False)
+        self.assertEqual(stage.parallelism_type, StageParallelismType.REPLICATED)
+
+        stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
+        self.assertEqual(stage.parallelism_type, StageParallelismType.MAIN_RANK_ONLY)
+
+    def test_refiner_component_uses_skip_non_main_cfg_rank(self) -> None:
+        stage = SanaWMLTX2RefinerStage(
+            transformer=torch.nn.Identity(),
+            connectors=torch.nn.Identity(),
+            text_encoder=torch.nn.Identity(),
+            tokenizer=SimpleNamespace(pad_token="<pad>", eos_token="<eos>"),
+            dtype=torch.bfloat16,
+        )
+
+        with (
+            patch(
+                f"{_SANA_WM_REFINER_STAGE_MODULE}.torch.distributed.is_available",
+                return_value=True,
+            ),
+            patch(
+                f"{_SANA_WM_REFINER_STAGE_MODULE}.torch.distributed.is_initialized",
+                return_value=True,
+            ),
+            patch(
+                f"{_SANA_WM_REFINER_STAGE_MODULE}.get_classifier_free_guidance_rank",
+                return_value=1,
+            ),
+        ):
+            uses = stage.component_uses(
+                SimpleNamespace(enable_cfg_parallel=True),
+                stage_name="sana_wm_refiner",
+            )
+
+        self.assertEqual(uses, [])
 
     def test_streaming_diffusers_attention_accepts_ungated_ltx2_attention(self) -> None:
         """Diffusers 0.37 LTX2Attention omits `to_gate_logits` for ungated configs."""

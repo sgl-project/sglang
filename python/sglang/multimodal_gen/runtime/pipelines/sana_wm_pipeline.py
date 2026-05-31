@@ -64,7 +64,28 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     ]
 
+    @staticmethod
+    def _validate_parallelism_args(server_args: ServerArgs) -> None:
+        tp_size = getattr(server_args, "tp_size", 1) or 1
+        if tp_size != 1:
+            raise ValueError(
+                "SANA-WM does not support tensor parallelism yet. "
+                "Use --num-gpus with FSDP/CFG parallelism instead of "
+                f"--tp-size {tp_size}."
+            )
+
+        sp_degree = getattr(server_args, "sp_degree", 1) or 1
+        if sp_degree != 1:
+            raise ValueError(
+                "SANA-WM does not support temporal sequence parallelism yet. "
+                "Stage-1 GDN/GLUMBConvTemp span frames and require halo/state "
+                "exchange before latents can be sharded. Use --num-gpus with "
+                "FSDP/CFG parallelism instead of "
+                f"--sp-degree {sp_degree}."
+            )
+
     def create_pipeline_stages(self, server_args: ServerArgs):
+        self._validate_parallelism_args(server_args)
         self.add_stage(InputValidationStage())
 
         self.add_stage(
