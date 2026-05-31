@@ -636,9 +636,9 @@ class RealtimeConnection:
             dedupe_against = None
             slice_start = 0
 
-        pcm_slice = _slice_pcm_from(self.audio.pcm_buffer, slice_start)
-        audio_samples = await asyncio.to_thread(_pcm_to_float_samples, pcm_slice)
         try:
+            pcm_slice = _slice_pcm_from(self.audio.pcm_buffer, slice_start)
+            audio_samples = await asyncio.to_thread(_pcm_to_float_samples, pcm_slice)
             delta = await process_asr_chunk(
                 tokenizer_manager=self.tokenizer_manager,
                 adapter=self.adapter,
