@@ -38,20 +38,25 @@ def dct_upsample_2d(
     *leading, H, W = x.shape
     H2, W2 = H * 2, W * 2
 
-    # 2-D DCT-II of the source (ortho-normalized, Parseval identity preserved)
-    X_low = dct_2d(x.float(), norm="ortho")  # (..., H, W)
+    # 2-D DCT-II of the source (ortho-normalized, Parseval identity preserved).
+    # All intermediate computation stays in float32 to match the reference
+    # (inference_progressive.py uses scipy float32 throughout).  bfloat16 has
+    # only 7 mantissa bits; quantising the DCT coefficients before IDCT would
+    # introduce mean absolute error ~0.8 against an output range of ±4.
+    X_low = dct_2d(x.float(), norm="ortho")  # (..., H, W) float32
 
-    # Fill 2N×2N grid with white Gaussian noise of variance sigma_t^2 per bin
+    # Fill 2N×2N grid with float32 white Gaussian noise of variance sigma_t²
+    # per DCT bin, matching the reference's float32 noise path.
     gen = torch.Generator(device=x.device)
     gen.manual_seed(seed)
-    big = torch.randn(*leading, H2, W2, generator=gen, dtype=x.dtype, device=x.device)
+    big = torch.randn(*leading, H2, W2, generator=gen, dtype=torch.float32, device=x.device)
     big = big * sigma_t
 
-    # Embed low-res DCT coefficients in the top-left corner
-    big[..., :H, :W] = X_low.to(x.dtype)
+    # Embed low-res DCT coefficients in the top-left corner (no precision loss).
+    big[..., :H, :W] = X_low
 
-    # 2-D IDCT-II → spatial domain
-    result = idct_2d(big.float(), norm="ortho").to(x.dtype)
+    # 2-D IDCT-II → spatial domain, then cast back to original dtype.
+    result = idct_2d(big, norm="ortho").to(x.dtype)
 
     if rewind:
         gamma = 1.0 + sigma_t
