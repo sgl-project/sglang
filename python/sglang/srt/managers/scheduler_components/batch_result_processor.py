@@ -235,7 +235,7 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
                         if self.server_args.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
