@@ -10,22 +10,13 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_finished,
 )
 
-# Single-GPU scripted chunked-prefill core tests. The PP sweep, which
-# needs 4 GPUs, lives in test_scripted_core_4gpu.py.
 register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-small")
 
 
 _CHUNK_SIZE = 64
-# Deliberately a few tokens short of a chunk-size multiple so the last
-# chunk is partial — exercises the off-by-one path instead of clean
-# chunk boundaries.
 _PROMPT_LEN = 4 * _CHUNK_SIZE - 3
 
-# Chunks that keep the req in the chunked_req slot (is_chunking == True):
-# the final extend completes prefill in one shot and is not chunked, so the
-# count is ceil(_PROMPT_LEN / _CHUNK_SIZE) - 1 == (_PROMPT_LEN - 1) // _CHUNK_SIZE.
 _NUM_MIDDLE_CHUNKS = (_PROMPT_LEN - 1) // _CHUNK_SIZE
-# Enough decode steps that first / middle / last decode are distinct points.
 _LIFECYCLE_MAX_NEW_TOKENS = 4
 
 
@@ -84,26 +75,19 @@ class TestScriptedCore(ScriptedTestCase):
         )
         yield from _advance_to_stage(r, stage)
 
-        # Decode tokens so far; retract preserves output_ids, so a correctly
-        # paused engine must not advance this count while paused.
         req = r.req
         assert req is not None, f"stage={stage}: req vanished before pause"
         output_tokens_before_pause = len(req.output_ids)
 
         t.pause_generation(mode="retract")
-        # Retract state is reflected in the scheduler on the next event-loop iter.
         yield
 
-        # _lookup_req_status is pending reimplementation, so check the retract
-        # landing directly against the scheduler: the req must be parked back
-        # in waiting_queue rather than still running or finished.
         req = r.req
         assert req is not None and req in t._scheduler.waiting_queue, (
             f"stage={stage}: pause(retract) should park the req back in "
             f"waiting_queue; found={req!r}"
         )
 
-        # Sit paused for a few iters: the engine must make no forward progress.
         for _ in range(3):
             yield
             req = r.req
@@ -135,8 +119,6 @@ class TestScriptedCore(ScriptedTestCase):
         yield from _advance_to_stage(r, stage)
 
         t.abort_all()
-        # abort_request marks the req FINISH_ABORT but the chunked_req slot
-        # is only cleared on the next normal-cleanup iter; give a few yields.
         for _ in range(8):
             yield
             if r.finished:
@@ -162,16 +144,10 @@ class TestScriptedCore(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_prefill_does_not_inflate_radix_hit_count(t: ScriptedContext):
-        # runtime.run starts every script from a flushed cache (t.flush_cache),
-        # so the radix tree holds only this request's nodes.
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
 
-        # Chunked cache_unfinished_req inserts skip _inc_hit_count; only the
-        # single non-chunked cache_finished_req insert bumps, touching each node
-        # on the committed path exactly once. Without the guard the early prefix
-        # nodes would be re-bumped once per chunk and exceed 1.
         hit_counts = t.get_all_node_hit_counts()
         assert hit_counts, "expected radix nodes after a chunked prefill"
         assert all(count == 1 for count in hit_counts.values()), (

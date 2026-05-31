@@ -52,9 +52,6 @@ def launch_scripted_http_server(
     the watchdog then stops the server). On a fatal scheduler-side exception
     the traceback is written to ``traceback_path`` for the session to surface.
     """
-    # Spawn-mode mp subprocesses don't inherit the parent's ``sys.path``;
-    # forward the scripted-runtime package directory so user sub-scripts can
-    # be imported by qualified name in the scheduler subprocess.
     sys_path_entry = os.path.dirname(os.path.abspath(__file__))
 
     envs.SGLANG_TEST_SCRIPTED_RUNTIME.set(True)

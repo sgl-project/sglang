@@ -17,18 +17,10 @@ from typing import Any, Dict, List
 
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
-# Chosen to force every meaningful prompt into 4+ chunks. The
-# accuracy-flavored suite under test/manual/chunked_prefill/ uses the
-# same value; keeping them aligned makes side-by-side comparisons easy.
 DEFAULT_CHUNK_SIZE: int = 256
 
-# Bound the bare-yield idiom so a stuck scheduler doesn't hang the test
-# process forever. Picked generously — real scripts almost never need
-# more than ~50 steps.
 DEFAULT_MAX_STEPS: int = 400
 
-# Default model — single-GPU tests use the small model; the multi-GPU
-# feature tests override per-fixture.
 SMALL_MODEL: str = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 

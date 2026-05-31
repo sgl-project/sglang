@@ -73,7 +73,6 @@ class SchedulerRequestReceiver:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.scripted_scheduler_hook is not None:
-            # All ranks must call this so the cross-rank broadcast stays balanced.
             self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:

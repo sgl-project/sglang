@@ -61,9 +61,6 @@ class ScriptedContext:
         self._req_handles: dict[str, "ScriptedReqHandle"] = {}
         self._req_counter = 0
 
-    # ============================================================
-    # Request submission.
-    # ============================================================
     def start_req(
         self,
         *,
@@ -78,9 +75,6 @@ class ScriptedContext:
             rid=rid,
         )
 
-    # ============================================================
-    # Lifecycle control.
-    # ============================================================
     def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:
         return lifecycle.pause_generation(self, mode=mode)
 
@@ -93,9 +87,6 @@ class ScriptedContext:
     def flush_cache(self) -> None:
         return lifecycle.flush_cache(self)
 
-    # ============================================================
-    # Radix operations.
-    # ============================================================
     def get_all_node_hit_counts(self) -> Dict[int, int]:
         return radix.get_all_node_hit_counts(self)
 

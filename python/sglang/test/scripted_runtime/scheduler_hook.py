@@ -104,8 +104,6 @@ class ScriptedSchedulerHook:
         ctx_zmq = zmq.Context()
         socket = get_zmq_socket(ctx_zmq, zmq.PAIR, endpoint, bind=False)
         try:
-            # Announce readiness so the server-startup handshake confirms the
-            # scheduler subprocess came up.
             socket.send_pyobj(HookReady())
             while True:
                 msg = socket.recv_pyobj()
@@ -115,11 +113,6 @@ class ScriptedSchedulerHook:
                     case RunScript(fn_path=fn_path, args=args):
                         fn = resolve_fn(fn_path)
                         ctx = self._context
-                        # Start every sub-script from a clean engine: flush so
-                        # radix / pool state from the previous sub-script can't
-                        # leak across runs. Visible on the next yield (same as
-                        # start_req), hence the explicit yield before the
-                        # sub-script observes any state.
                         ctx.flush_cache()
                         yield
                         sub_gen = fn(ctx, *args)
@@ -139,9 +132,6 @@ class ScriptedSchedulerHook:
             ctx_zmq.term()
             self._http_poster.close()
 
-    # ============================================================
-    # Lookups used by ScriptedReqHandle (driver-rank-local view).
-    # ============================================================
     def _find_req_by_rid(self, rid: str) -> Optional["Req"]:
         """Locate the raw ``Req`` by rid across scheduler queues / batches.
 
@@ -175,9 +165,6 @@ class ScriptedSchedulerHook:
         """
         req = self._find_req_by_rid(rid)
         if req is None:
-            # Req has left every scheduler structure → it finished (or was
-            # aborted, which is also a finish). True is the only sensible
-            # answer for a req that's no longer tracked.
             return rid in self._context._req_handles
         return req.finished()
 
@@ -185,10 +172,6 @@ class ScriptedSchedulerHook:
         """True iff this rid is the scheduler's current chunked_req."""
         s = self._scheduler
         return s.chunked_req is not None and s.chunked_req.rid == rid
-
-    # ============================================================
-    # Internal: invoked by SchedulerRequestReceiver at every iter.
-    # ============================================================
 
     def step(self) -> None:
         """Advance the generator one step (driver only) and broadcast
@@ -203,7 +186,6 @@ class ScriptedSchedulerHook:
         if self._is_driver:
             payload: List = list(self._advance_generator())
         else:
-            # ``broadcast_pyobj`` ignores the value on non-source ranks.
             payload = []
 
         payload = broadcast_pyobj(
