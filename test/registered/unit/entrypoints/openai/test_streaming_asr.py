@@ -3,7 +3,7 @@
 Drives the shared ``process_asr_chunk`` entry point with a mocked
 ``TokenizerManager`` (same style as ``test_serving_transcription`` /
 ``test_serving_embedding``) across the real scenarios: the cumulative (M1) and
-sliced (M2) inference paths, output dedupe for Latin and CJK, the no-overlap and
+sliced (M2) inference paths, word-level output dedupe, the no-overlap and
 empty-response edges, last-chunk finalize, and word reconciliation -- plus the
 ``RealtimeConnection`` guard that decides whether slicing turns on.
 """

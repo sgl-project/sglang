@@ -147,7 +147,7 @@ class _AudioState:
 
     After the slicing gate is reached, inference switches from the cumulative
     buffer to a tail slice. The first gated call may still start at offset 0;
-    later calls use ``committed_audio_until_bytes - left_overlap_bytes``."""
+    later calls use ``last_sliced_buffer_end_bytes - left_overlap_bytes``."""
 
     max_buffer_bytes: int
     chunk_size_bytes: int
@@ -159,7 +159,7 @@ class _AudioState:
     slicing_enabled: bool = True
     pcm_buffer: bytearray = field(default_factory=bytearray)
     last_inference_offset: int = 0
-    committed_audio_until_bytes: int = 0
+    last_sliced_buffer_end_bytes: int = 0
 
 
 @dataclass
@@ -629,7 +629,7 @@ class RealtimeConnection:
             dedupe_against: Optional[str] = committed_text
             slice_start = max(
                 0,
-                self.audio.committed_audio_until_bytes - self.audio.left_overlap_bytes,
+                self.audio.last_sliced_buffer_end_bytes - self.audio.left_overlap_bytes,
             )
         else:
             prompt = None
@@ -690,7 +690,7 @@ class RealtimeConnection:
         if use_slicing:
             # Held-back tokens are re-covered only if their audio span fits the
             # left overlap; slower speech can drop the earliest (see known limits).
-            self.audio.committed_audio_until_bytes = len(self.audio.pcm_buffer)
+            self.audio.last_sliced_buffer_end_bytes = len(self.audio.pcm_buffer)
 
         self.audio.last_inference_offset = len(self.audio.pcm_buffer)
         await self._emit_transcription_delta(delta)
@@ -729,7 +729,7 @@ class RealtimeConnection:
         self.audio.pcm_buffer.clear()  # in-place; reuses the buffer's allocation
         self.item.emitted_deltas.clear()
         self.audio.last_inference_offset = 0
-        self.audio.committed_audio_until_bytes = 0
+        self.audio.last_sliced_buffer_end_bytes = 0
 
     def _build_session_info(self) -> TranscriptionSessionConfig:
         # id / object aren't SDK fields; round-trip via extra='allow' so
