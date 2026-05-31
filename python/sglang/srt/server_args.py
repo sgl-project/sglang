@@ -778,6 +778,7 @@ class ServerArgs:
     disable_attn_tp_gather: bool = False
     gc_threshold: Optional[List[int]] = None
     kv_canary: str = "none"
+    kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
     dsa_prefill_cp_mode: str = "round-robin-split"
@@ -6319,6 +6320,12 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--kv-canary-sweep-interval",
+            type=int,
+            default=ServerArgs.kv_canary_sweep_interval,
+            help="Every N forward steps, run a full-pool sweep.",
+        )
+        parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
@@ -7366,6 +7373,11 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
+            raise ValueError(
+                "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

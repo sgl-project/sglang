@@ -88,6 +88,7 @@ def launch_endpoints_per_forward(
         for endpoint in endpoints
         if _endpoint_belongs_to_group(endpoint, group)
         and tag_filter(endpoint.kernel_kind)
+        and not _is_sweep_tag(endpoint.kernel_kind)
         and passes_v_half_gate(endpoint.kernel_kind)
     ]
     assert len(active_endpoints) > 0
@@ -106,12 +107,46 @@ def launch_endpoints_per_forward(
         )
 
 
+def launch_endpoints_sweep(
+    *,
+    endpoints: tuple[CanaryEndpoint, ...],
+    group: CanaryBufferGroup,
+    verify_plan: VerifyPlan,
+    violation_log: ViolationLog,
+) -> None:
+    active_endpoints = [
+        endpoint
+        for endpoint in endpoints
+        if _endpoint_belongs_to_group(endpoint, group)
+        and _is_sweep_tag(endpoint.kernel_kind)
+        and passes_v_half_gate(endpoint.kernel_kind)
+    ]
+    assert len(active_endpoints) > 0
+
+    for endpoint in active_endpoints:
+        endpoint.launch_sweep(
+            verify_plan=verify_plan,
+            violation_log=violation_log,
+        )
+
+
+def _is_sweep_tag(tag: CanaryLaunchTag) -> bool:
+    return tag in (
+        CanaryLaunchTag.SWEEP_K_FULL,
+        CanaryLaunchTag.SWEEP_V_FULL,
+        CanaryLaunchTag.SWEEP_K_SWA,
+        CanaryLaunchTag.SWEEP_V_SWA,
+    )
+
+
 def _is_v_half_tag(tag: CanaryLaunchTag) -> bool:
     return tag in (
         CanaryLaunchTag.HEAD_V_FULL,
         CanaryLaunchTag.TAIL_V_FULL,
+        CanaryLaunchTag.SWEEP_V_FULL,
         CanaryLaunchTag.HEAD_V_SWA,
         CanaryLaunchTag.TAIL_V_SWA,
+        CanaryLaunchTag.SWEEP_V_SWA,
     )
 
 

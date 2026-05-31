@@ -69,6 +69,13 @@ class ViolationReporter:
 
 def _canary_kind_label(tag: CanaryLaunchTag) -> str:
     name_lower = tag.name.lower()
+    if tag in (
+        CanaryLaunchTag.SWEEP_K_FULL,
+        CanaryLaunchTag.SWEEP_V_FULL,
+        CanaryLaunchTag.SWEEP_K_SWA,
+        CanaryLaunchTag.SWEEP_V_SWA,
+    ):
+        return name_lower
     return f"per_forward_{name_lower}"
 
 
