@@ -3,8 +3,8 @@
 Covers the four pieces of ``BackgroundHttpPoster`` that carry real logic: the
 background event-loop/thread lifecycle, cross-thread coroutine dispatch, the
 done-callback that logs and swallows coroutine failures, and the create-or-reuse
-``aiohttp`` session branching. The two ``post_*`` coroutines run against a fake
-session so the post call and body-draining are observable without any network.
+``aiohttp`` session branching. The ``post`` coroutine runs against a fake session
+so the POST call and body read are observable without any network.
 """
 
 from __future__ import annotations
@@ -24,25 +24,14 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _FakeResponse:
-    """Stand-in aiohttp response: tracks whether the body was drained / read."""
+    """Stand-in aiohttp response: tracks whether the body was read."""
 
     def __init__(self) -> None:
         self.read_called = False
-        self.iter_any_consumed = False
-        self._chunks = [b"chunk-1", b"chunk-2"]
 
     async def read(self) -> bytes:
         self.read_called = True
-        return b"".join(self._chunks)
-
-    @property
-    def content(self) -> "_FakeResponse":
-        return self
-
-    async def iter_any(self):
-        for chunk in self._chunks:
-            yield chunk
-        self.iter_any_consumed = True
+        return b"chunk-1chunk-2"
 
 
 class _FakePostCM:
@@ -192,33 +181,21 @@ class TestBackgroundHttpPosterEnsureSession(CustomTestCase):
 
 
 class TestBackgroundHttpPosterPost(CustomTestCase):
-    """post_and_drain / post_no_body POST the json and consume the response body."""
+    """post POSTs the json payload and reads the response body to completion."""
 
     def _run_on_loop(self, poster: BackgroundHttpPoster, coro) -> None:
         asyncio.run_coroutine_threadsafe(coro, poster._loop).result(timeout=5.0)
 
-    def test_post_and_drain_posts_json_and_drains_body(self):
-        """post_and_drain posts the payload and iterates the streamed body to completion."""
+    def test_post_posts_json_and_reads_body(self):
+        """post sends the payload to the URL and drains the response via read()."""
         poster = BackgroundHttpPoster()
         self.addCleanup(poster.close)
         session = _FakeSession()
         poster._ensure_session = lambda: session
 
-        self._run_on_loop(poster, poster.post_and_drain("http://h/flush", {"a": 1}))
+        self._run_on_loop(poster, poster.post("http://h/flush", {"a": 1}))
 
         self.assertEqual(session.calls, [("http://h/flush", {"a": 1})])
-        self.assertTrue(session.response.iter_any_consumed)
-
-    def test_post_no_body_posts_json_and_reads_response(self):
-        """post_no_body posts the payload and reads the whole response body."""
-        poster = BackgroundHttpPoster()
-        self.addCleanup(poster.close)
-        session = _FakeSession()
-        poster._ensure_session = lambda: session
-
-        self._run_on_loop(poster, poster.post_no_body("http://h/abort", {"b": 2}))
-
-        self.assertEqual(session.calls, [("http://h/abort", {"b": 2})])
         self.assertTrue(session.response.read_called)
 
 
