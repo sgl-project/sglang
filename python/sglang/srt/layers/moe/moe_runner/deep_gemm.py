@@ -486,7 +486,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             **gemm_overlap_args_dict,
         )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
-        if meta_overlap_args is not None:
+        if meta_overlap_args is not None and deep_gemm_return_value is not None:
             block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold

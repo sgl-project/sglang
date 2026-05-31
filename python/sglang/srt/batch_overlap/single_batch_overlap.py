@@ -21,7 +21,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.utils import is_sbo_enabled
+from sglang.srt.layers.moe.utils import (
+    is_deep_gemm_moe_runner_backend,
+    is_sbo_enabled,
+)
 from sglang.srt.utils import is_blackwell
 
 
@@ -35,7 +38,8 @@ class SboFlags:
             # currently only cutedsl backend supports it
             and (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
-                or (get_moe_runner_backend().is_deep_gemm() and not is_blackwell())
+                # effective backend so AUTO (the common case) is recognized
+                or (is_deep_gemm_moe_runner_backend() and not is_blackwell())
             )
         )
 
