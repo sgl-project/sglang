@@ -1,0 +1,40 @@
+# DS int8 / mem-0.7 / radix-on / context-length=8192 (client-SLO operating point) + R17 score-fix
+# CLOSED-batch pure decode (ignore_eos, real 512/192-step decode, no prefill interleave), TP=8 node0.
+# per-req decode TPS = median(gen throughput token/s)/#running-req. Source: /tmp/ac5r18/ds_boot_ctx8192.log.
+## #running-req: 1
+gen throughput (token/s): 43.58
+gen throughput (token/s): 43.47
+gen throughput (token/s): 43.54
+gen throughput (token/s): 43.60
+gen throughput (token/s): 43.60
+## #running-req: 8
+gen throughput (token/s): 289.26
+gen throughput (token/s): 287.47
+gen throughput (token/s): 288.44
+gen throughput (token/s): 288.49
+gen throughput (token/s): 287.85
+## #running-req: 16
+gen throughput (token/s): 486.43
+gen throughput (token/s): 486.34
+gen throughput (token/s): 485.23
+gen throughput (token/s): 484.43
+gen throughput (token/s): 484.76
+## #running-req: 32
+gen throughput (token/s): 0.29
+gen throughput (token/s): 876.21
+gen throughput (token/s): 871.16
+gen throughput (token/s): 869.39
+gen throughput (token/s): 861.90
+## #running-req: 64
+gen throughput (token/s): 466.75
+gen throughput (token/s): 1496.69
+gen throughput (token/s): 1461.53
+gen throughput (token/s): 1446.22
+gen throughput (token/s): 1421.96
+
+## per-req decode TPS (median gen / batch):
+  conc 1 : ~43.5 / 1  = 43.5
+  conc 8 : ~288  / 8  = 36.0
+  conc16 : ~485  / 16 = 30.3   >= 30  PASS (strict decode bar)
+  conc32 : ~870  / 32 = 27.2   < 30 (DS<DSA 37; characterized structural decode-batch limit)
+  conc64 : ~1450 / 64 = 22.7   < 30 (DS<DSA 29.4; >=30 at conc-64 unattainable even for DSA)

@@ -1,0 +1,74 @@
+{
+ "_purpose": "AC-5 conc-16 strict-decode evidence: DS int8/mem-0.7/radix-on/context-length=8192 (client-SLO operating point) closed-batch pure-decode gen throughput. per-req TPS = median(gen)/batch. Source: ds_boot_ctx8192.log (gitignored); samples embedded here.",
+ "operating_point": {
+  "signature_dtype": "int8",
+  "mem_fraction_static": 0.7,
+  "disable_radix_cache": false,
+  "context_length": 8192,
+  "max_total_num_tokens": 396224,
+  "tp_size": 8
+ },
+ "strict_decode_tps": 30.0,
+ "batches": {
+  "1": {
+   "gen_tps_samples": [
+    43.54,
+    43.58,
+    43.6,
+    43.6,
+    210.73
+   ],
+   "gen_tps_median": 43.6,
+   "per_req_tps": 43.6,
+   "meets_30": true
+  },
+  "8": {
+   "gen_tps_samples": [
+    287.47,
+    287.85,
+    288.44,
+    288.49,
+    289.26
+   ],
+   "gen_tps_median": 288.44,
+   "per_req_tps": 36.05,
+   "meets_30": true
+  },
+  "16": {
+   "gen_tps_samples": [
+    484.43,
+    484.76,
+    485.23,
+    486.34,
+    486.43
+   ],
+   "gen_tps_median": 485.23,
+   "per_req_tps": 30.33,
+   "meets_30": true
+  },
+  "32": {
+   "gen_tps_samples": [
+    0.29,
+    861.9,
+    869.39,
+    871.16,
+    876.21
+   ],
+   "gen_tps_median": 869.39,
+   "per_req_tps": 27.17,
+   "meets_30": false
+  },
+  "64": {
+   "gen_tps_samples": [
+    466.75,
+    1421.96,
+    1446.22,
+    1461.53,
+    1496.69
+   ],
+   "gen_tps_median": 1446.22,
+   "per_req_tps": 22.6,
+   "meets_30": false
+  }
+ }
+}
