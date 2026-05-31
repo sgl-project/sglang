@@ -78,6 +78,7 @@ class CanaryE2EBase(CapturedServerE2EBase):
     def setUpClass(cls) -> None:
         cls._cfg = _MODE_CONFIGS[cls.model_mode]
         server_env = os.environ.copy()
+        server_env.setdefault("SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT", "1")
         server_env.update(cls.extra_env)
         if cls.model_mode == "swa":
             # SWA mode uses google/gemma-4-E2B-it, whose forward does a

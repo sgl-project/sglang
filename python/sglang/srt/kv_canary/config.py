@@ -43,6 +43,10 @@ class CanaryConfig:
             expected_input_positions[i]; mismatch records a violation. Only useful when something else
             (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders
             per forward — canary itself knows no oracle.
+        enable_verify_token_assert: bool. True = real-model token-id validator: build
+            expected_tokens from each req's ``origin_input_ids + output_ids`` (snapshotted at
+            ForwardBatch.init_new) and compare against the canary's stored tokens at verify time.
+            Independent of ``enable_write_input_assert``.
     """
 
     mode: CanaryMode
@@ -50,6 +54,7 @@ class CanaryConfig:
     sweep_interval: int
     real_kv_hash_mode: RealKvHashMode
     enable_write_input_assert: bool
+    enable_verify_token_assert: bool
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
@@ -67,4 +72,5 @@ class CanaryConfig:
             sweep_interval=server_args.kv_canary_sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             enable_write_input_assert=envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.get(),
+            enable_verify_token_assert=envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get(),
         )
