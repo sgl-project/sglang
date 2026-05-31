@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-import regex
 import soundfile as sf
 from fastapi import Request
 
@@ -74,8 +73,8 @@ class StreamingASRState:
             self.confirmed_text = ""
         self.full_transcript = new_transcript
         self.chunk_index += 1
-        # Token-level common prefix, not char-level startswith: startswith
-        # sliced mid-word when a confirmed token was extended ("world" ->
+        # Word-level common prefix, not char-level startswith: startswith
+        # sliced mid-word when a confirmed word was extended ("world" ->
         # "worldly" emitted "ly").
         old_words = old_confirmed.split()
         new_words = self.confirmed_text.split()
@@ -135,21 +134,19 @@ _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
 _NO_SPACE_AFTER = frozenset("([{（【《「『")
 
 
-# No-inter-word-space characters, for needs_space() output spacing. scx (not
-# Script) so the kana marks ー/・ count; the halfwidth Hangul jamo (U+FFA0-FFDC)
-# the fullwidth block would re-add is subtracted, since Korean is space-delimited.
-_HALFWIDTH_HANGUL = chr(0xFFA0) + "-" + chr(0xFFDC)
-_CJK_NO_SPACE_RE = regex.compile(
-    "(?V1)["
-    r"\p{Han}\p{scx=Hiragana}\p{scx=Katakana}\p{Bopomofo}"
-    r"\p{Block=CJK_Symbols_and_Punctuation}"
-    r"[\p{Block=Halfwidth_and_Fullwidth_Forms}--[" + _HALFWIDTH_HANGUL + "]]]"
-)
-
-
-def _is_cjk_no_space(c: str) -> bool:
-    """No-inter-word-space char (CJK script + fullwidth forms); for spacing."""
-    return bool(_CJK_NO_SPACE_RE.match(c))
+def _is_cjk(c: str) -> bool:
+    """CJK-context character that takes no inter-word space."""
+    cp = ord(c)
+    if 0xFFA0 <= cp <= 0xFFDC:  # halfwidth Hangul jamo -- Korean is space-delimited
+        return False
+    return (
+        0x3000 <= cp <= 0x303F  # CJK Symbols and Punctuation
+        or 0x3040 <= cp <= 0x309F  # Hiragana
+        or 0x30A0 <= cp <= 0x30FF  # Katakana (incl. ー / ・)
+        or 0x3400 <= cp <= 0x4DBF  # CJK Unified Ideographs Ext A
+        or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0xFF00 <= cp <= 0xFFEF  # Halfwidth & Fullwidth Forms
+    )
 
 
 def needs_space(prev: str, cur: str) -> bool:
@@ -164,15 +161,14 @@ def needs_space(prev: str, cur: str) -> bool:
         return False
     if cur[0] in _NO_SPACE_BEFORE or prev[-1] in _NO_SPACE_AFTER:
         return False
-    if _is_cjk_no_space(prev[-1]) and _is_cjk_no_space(cur[0]):
+    if _is_cjk(prev[-1]) and _is_cjk(cur[0]):
         return False
     return True
 
 
 def _dedupe_norm(word: str) -> str:
-    """Lowercase + NFKC-fold + strip edge punctuation (Unicode category P), so
-    "dinner," == "dinner" and exotic marks (《》«» …) need no hand-listed set.
-    Strips P only, not S, so "$5" / "3+4" keep their symbols."""
+    """Normalize a word for overlap matching: NFKC, lowercase, strip edge
+    punctuation (Unicode category P)."""
     word = unicodedata.normalize("NFKC", word)
     lo, hi = 0, len(word)
     while lo < hi and unicodedata.category(word[lo])[0] == "P":
