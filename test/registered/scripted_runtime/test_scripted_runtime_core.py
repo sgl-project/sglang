@@ -2,6 +2,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -10,8 +11,9 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     base_engine_kwargs,
     run_until_finished,
 )
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
 
 
 _CHUNK_SIZE = 64
@@ -19,9 +21,15 @@ _LONG_PROMPT_LEN = 4 * _CHUNK_SIZE - 3
 _SHORT_PROMPT_LEN = 16
 _DECODE_MAX_NEW_TOKENS = 8
 
+_ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
+
+
+def _script_noop(t: ScriptedContext):
+    yield
+
 
 class TestScriptedRuntimeCore(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
+    ENGINE_KWARGS = _ENGINE_KWARGS
 
     def test_start_req_auto_rid_and_finishes(self):
         self.server.execute_script(self._script_start_req_auto_rid_and_finishes)
@@ -283,6 +291,74 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         assert released and all(
             ref == 0 for ref in released.values()
         ), f"radix nodes still locked after the req finished: {released}"
+
+    def test_empty_script_returns_immediately(self):
+        self.server.execute_script(self._script_empty_return)
+
+    @staticmethod
+    def _script_empty_return(t: ScriptedContext):
+        if False:
+            yield
+        return
+
+    def test_failing_script_surfaces_and_session_survives(self):
+        with self.assertRaises(AssertionError) as ctx:
+            self.server.execute_script(self._script_assertion_failure)
+        self.assertIn("boom", str(ctx.exception))
+        self.server.execute_script(self._script_minimal_ok)
+
+    @staticmethod
+    def _script_assertion_failure(t: ScriptedContext):
+        yield
+        assert False, "boom"
+
+    @staticmethod
+    def _script_minimal_ok(t: ScriptedContext):
+        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2)
+        yield
+        yield
+
+    def test_runtime_error_in_script_surfaces_to_caller(self):
+        with self.assertRaises(AssertionError) as ctx:
+            self.server.execute_script(self._script_runtime_error)
+        err_text = str(ctx.exception)
+        self.assertIn("RuntimeError", err_text)
+        self.assertIn("simulated runtime error", err_text)
+
+    @staticmethod
+    def _script_runtime_error(t: ScriptedContext):
+        yield
+        raise RuntimeError("simulated runtime error")
+
+    def test_non_generator_script_rejected(self):
+        with self.assertRaises(AssertionError) as ctx:
+            self.server.execute_script(self._script_not_a_generator)
+        err_text = str(ctx.exception)
+        self.assertIn("TypeError", err_text)
+        self.assertIn("NoneType", err_text)
+
+    @staticmethod
+    def _script_not_a_generator(t: ScriptedContext):
+        return None
+
+
+class TestScriptedRuntimeSession(CustomTestCase):
+
+    def test_shutdown_is_idempotent(self):
+        session = ScriptedHttpServer.start(**_ENGINE_KWARGS)
+        session.shutdown()
+        session.shutdown()
+        assert session._shutdown_done is True
+
+    def test_dirty_session_refuses_to_run(self):
+        session = ScriptedHttpServer.start(**_ENGINE_KWARGS)
+        try:
+            session._dirty = "test dirty"
+            with self.assertRaises(RuntimeError) as ctx:
+                session.execute_script(_script_noop)
+            assert "test dirty" in str(ctx.exception)
+        finally:
+            session.shutdown()
 
 
 if __name__ == "__main__":
