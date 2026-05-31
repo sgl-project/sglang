@@ -17,14 +17,32 @@ class TargetGroupKind(IntEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PerturbConfig:
+    req_to_token_prob: float
+    real_kv_used_prob: float
+    real_kv_unused_cache_prob: float
+    real_kv_post_forward_prob: float
     target_group_kind: TargetGroupKind | None
     warmup_steps: int
 
     @classmethod
     def from_env(cls) -> "PerturbConfig":
+        real_kv_used_prob = envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB.get()
+        real_kv_unused_cache_prob = (
+            envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB.get()
+        )
+        real_kv_post_forward_prob = (
+            envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB.get()
+        )
         return cls(
+            req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get(),
+            real_kv_used_prob=real_kv_used_prob,
+            real_kv_unused_cache_prob=real_kv_unused_cache_prob,
+            real_kv_post_forward_prob=real_kv_post_forward_prob,
             target_group_kind=_parse_target_group_kind_from_env(
                 raw=envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.get(),
+                real_kv_used_prob=real_kv_used_prob,
+                real_kv_unused_cache_prob=real_kv_unused_cache_prob,
+                real_kv_post_forward_prob=real_kv_post_forward_prob,
             ),
             warmup_steps=envs.SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS.get(),
         )
@@ -33,8 +51,17 @@ class PerturbConfig:
 def _parse_target_group_kind_from_env(
     *,
     raw: str | None,
+    real_kv_used_prob: float,
+    real_kv_unused_cache_prob: float,
+    real_kv_post_forward_prob: float,
 ) -> TargetGroupKind | None:
     if raw is not None and raw.strip():
+        return _parse_target_group_kind(raw)
+    if (
+        real_kv_used_prob > 0.0
+        or real_kv_unused_cache_prob > 0.0
+        or real_kv_post_forward_prob > 0.0
+    ):
         return _parse_target_group_kind(raw)
     return None
 
