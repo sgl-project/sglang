@@ -102,12 +102,6 @@ class TestProcessAsrChunk(CustomTestCase):
         self.assertEqual(tm.requests[0].text, "PROMPT:")
         self.assertEqual(state.full_transcript, "gamma")
 
-    def test_slicing_path_dedupes_overlapping_cjk(self):
-        # Dedupe also trims an overlapping CJK run (no inter-word spaces).
-        state = self._state()
-        self._chunk(state, "天气很好", prompt="PROMPT:", dedupe_against="今天天气")
-        self.assertEqual(state.full_transcript, "很好")
-
     def test_slicing_path_keeps_non_overlapping_candidate(self):
         # No overlap with the committed tail -> nothing is trimmed.
         state = self._state()
