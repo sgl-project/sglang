@@ -30,7 +30,7 @@ def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:
 def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
     req = find_req_by_rid(ctx, rid)
     if req is None:
-        return rid in ctx._req_handles
+        return rid in ctx._started_rids
     return req.finished()
 
 

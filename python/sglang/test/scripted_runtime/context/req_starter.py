@@ -41,9 +41,8 @@ class ScriptedContextReqStarter:
             description=f"request with rid {rid!r}",
         )
 
-        handle = ScriptedReqHandle(rid=rid, context=ctx)
-        ctx._req_handles[rid] = handle
-        return handle
+        ctx._started_rids.add(rid)
+        return ScriptedReqHandle(rid=rid, context=ctx)
 
     def _generate_url(self) -> str:
         host = self._ctx._scheduler.server_args.host

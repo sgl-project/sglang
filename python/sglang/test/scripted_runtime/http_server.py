@@ -4,7 +4,7 @@ import multiprocessing as mp
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import zmq
 
@@ -46,63 +46,28 @@ class ScriptedHttpServer:
 
     @classmethod
     def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
-        err_fd, err_path = tempfile.mkstemp(
-            prefix="scripted_runtime_oob_error_", suffix=".json"
-        )
-        os.close(err_fd)
-        out_of_band_error_path = Path(err_path)
+        out_of_band_error_path = _create_oob_error_file()
 
         ctx = zmq.Context()
         dispatch_port, socket = get_zmq_socket_on_host(ctx, zmq.PAIR, host=SERVER_HOST)
-        endpoint = f"tcp://{SERVER_HOST}:{dispatch_port}"
-
-        host = SERVER_HOST
-        port = get_free_port()
-
-        mp_ctx = mp.get_context("spawn")
-        server_process = mp_ctx.Process(
-            target=launch_scripted_http_server,
-            args=(),
-            kwargs=dict(
-                host=host,
-                port=port,
-                **engine_kwargs,
-            ),
-            name="scripted-runtime-http-server",
-            daemon=False,
+        server_process = _spawn_server_process(
+            endpoint=f"tcp://{SERVER_HOST}:{dispatch_port}",
+            out_of_band_error_path=out_of_band_error_path,
+            engine_kwargs=engine_kwargs,
         )
-        sys_path_entry = os.path.dirname(os.path.abspath(__file__))
-        with (
-            envs.SGLANG_TEST_SCRIPTED_RUNTIME.override(True),
-            envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint),
-            envs.SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH.override(
-                str(out_of_band_error_path)
-            ),
-            envs.SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY.override(sys_path_entry),
-        ):
-            server_process.start()
 
-        if not socket.poll(int(LISTENER_ACCEPT_TIMEOUT_S * 1000)):
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.close()
-            ctx.term()
-            cls._terminate_process(server_process)
-            raise TimeoutError(
-                f"ScriptedHttpServer: HTTP server did not connect within "
-                f"{LISTENER_ACCEPT_TIMEOUT_S}s"
-            )
-
-        ready = socket.recv_pyobj()
-        assert isinstance(
-            ready, HookReady
-        ), f"ScriptedHttpServer: expected HookReady handshake, got {ready!r}"
-
-        return cls(
+        self = cls(
             ctx=ctx,
             socket=socket,
             server_process=server_process,
             out_of_band_error_path=out_of_band_error_path,
         )
+        try:
+            self._await_handshake()
+        except BaseException:
+            self._teardown()
+            raise
+        return self
 
     def execute_script(
         self,
@@ -148,22 +113,38 @@ class ScriptedHttpServer:
 
             self._server_process.join(timeout=SHUTDOWN_JOIN_TIMEOUT_S)
             self._terminate_process(self._server_process)
-
             fatal_error = self._read_out_of_band_error()
         finally:
-            try:
-                self._socket.setsockopt(zmq.LINGER, 0)
-                self._socket.close()
-                self._ctx.term()
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
-            self._cleanup_files()
+            self._teardown()
             self._shutdown_done = True
 
         if fatal_error:
             raise AssertionError(
                 f"scripted-runtime server failed:\n{fatal_error.traceback}"
             )
+
+    def _await_handshake(self) -> None:
+        if not self._socket.poll(int(LISTENER_ACCEPT_TIMEOUT_S * 1000)):
+            raise TimeoutError(
+                f"ScriptedHttpServer: HTTP server did not connect within "
+                f"{LISTENER_ACCEPT_TIMEOUT_S}s"
+            )
+
+        ready = self._socket.recv_pyobj()
+        if not isinstance(ready, HookReady):
+            raise RuntimeError(
+                f"ScriptedHttpServer: expected HookReady handshake, got {ready!r}"
+            )
+
+    def _teardown(self) -> None:
+        try:
+            self._socket.setsockopt(zmq.LINGER, 0)
+            self._socket.close()
+            self._ctx.term()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+        self._terminate_process(self._server_process)
+        self._cleanup_files()
 
     def _read_out_of_band_error(self) -> Optional[OutOfBandError]:
         try:
@@ -188,6 +169,46 @@ class ScriptedHttpServer:
         if process.is_alive():
             process.kill()
             process.join(timeout=10.0)
+
+
+def _create_oob_error_file() -> Path:
+    err_fd, err_path = tempfile.mkstemp(
+        prefix="scripted_runtime_oob_error_", suffix=".json"
+    )
+    os.close(err_fd)
+    return Path(err_path)
+
+
+def _spawn_server_process(
+    *,
+    endpoint: str,
+    out_of_band_error_path: Path,
+    engine_kwargs: Dict[str, Any],
+) -> mp.process.BaseProcess:
+    mp_ctx = mp.get_context("spawn")
+    server_process = mp_ctx.Process(
+        target=launch_scripted_http_server,
+        kwargs=dict(
+            host=SERVER_HOST,
+            port=get_free_port(),
+            **engine_kwargs,
+        ),
+        name="scripted-runtime-http-server",
+        daemon=False,
+    )
+
+    sys_path_entry = str(Path(__file__).resolve().parent)
+    with (
+        envs.SGLANG_TEST_SCRIPTED_RUNTIME.override(True),
+        envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint),
+        envs.SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH.override(
+            str(out_of_band_error_path)
+        ),
+        envs.SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY.override(sys_path_entry),
+    ):
+        server_process.start()
+
+    return server_process
 
 
 def launch_scripted_http_server(**engine_kwargs: Any) -> None:
