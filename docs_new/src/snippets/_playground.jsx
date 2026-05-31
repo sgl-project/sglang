@@ -29,8 +29,13 @@
 //     parsers     — items[] (each emits one toggle flag)
 //     speculative — options[] (single-select chip group)
 //     pdDisagg    — modes[] + transferBackends[] (each may carry env +
-//                   envWhen hw-gate) + ibDevices[] (engine handles role
-//                   banner + single-host bootstrap port internally)
+//                   envWhen hw-gate) + ibDevices[] + optional router{port,
+//                   command}. (engine handles role banner + single-host
+//                   bootstrap port internally; when a PD role is active AND
+//                   `router` is set, the engine renders the router launch
+//                   command as a separate "Router (SGLang Model Gateway)"
+//                   companion block and retargets the cURL modal to
+//                   router.port — clients hit the router, not the role server)
 //     hicache     — backends[] + writePolicies[]
 //     hisparse    — requiredFlags[] + config{} + hostRatios[] +
 //                   defaultHostRatio (decode-only: card gated on the live
@@ -1281,12 +1286,18 @@ export const Playground = ({ config }) => {
     }
     if (pdMode === "prefill" || pdMode === "decode") {
       const sibling = pdMode === "prefill" ? "decode" : "prefill";
+      const routerCfg = config.playgroundFeatures
+        && config.playgroundFeatures.pdDisagg
+        && config.playgroundFeatures.pdDisagg.router;
+      const routerPort = (routerCfg && routerCfg.port) || 8000;
+      const routerLine = routerCfg
+        ? `# then front BOTH with the Router (SGLang Model Gateway) shown below.\n`
+          + `# Client traffic (cURL) targets the router (:${routerPort}), not this role server.`
+        : `# then front BOTH with a router; client traffic targets the router, not this role server.`;
       const banner =
-        `# === PD Disaggregation: ${pdMode.toUpperCase()} role only ===\n` +
-        `# This command runs the ${pdMode} server. To complete the topology,\n` +
-        `# also run the ${sibling} role on its peer GPU host, then start the\n` +
-        `# sglang_router with --pd-disaggregation pointing at both. See the\n` +
-        `# §3.2 PD-Disagg notes above for IB device, ulimit, and MNNVL caveats.`;
+        `# === PD Disaggregation: ${pdMode.toUpperCase()} role ===\n` +
+        `# Runs the ${pdMode} server. Also run the ${sibling} role on its peer host,\n` +
+        routerLine;
       cmd = `${banner}\n${cmd}`;
     }
     return cmd;
@@ -1801,6 +1812,9 @@ export const Playground = ({ config }) => {
 
   const [copied, setCopied] = useState(false);
   const [curlCopied, setCurlCopied] = useState(false);
+  // Copy-flash for the PD-Disagg router companion block (own state so only its
+  // button flips to "✓ Copied").
+  const [routerCopied, setRouterCopied] = useState(false);
   const [envDraft, setEnvDraft] = useState(env);
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
   const [runMode, setRunMode] = useState("python");
@@ -1921,7 +1935,24 @@ export const Playground = ({ config }) => {
     submitAttest.ranCommand && submitAttest.reachedReady && submitAttest.outputCorrect
     && submitDraft.sglangVersion.trim().length > 0;
 
-  const curlText = interpolate(config.curl || "", env, modelName);
+  // PD-Disagg router (SGLang Model Gateway), if the cookbook configured one.
+  // When a PD role is active, client traffic must hit the router, not the role
+  // server — so the cURL retargets to the router port and the role command grows
+  // a companion router block below it.
+  const pdRouter = (pdMode !== "off"
+    && config.playgroundFeatures
+    && config.playgroundFeatures.pdDisagg
+    && config.playgroundFeatures.pdDisagg.router) || null;
+  // Smart cURL: target the router port when a PD role is active (else the role
+  // server's CURL_PORT). Same template, only the port differs.
+  const curlEnv = (pdRouter && pdRouter.port != null)
+    ? { ...env, CURL_PORT: String(pdRouter.port) }
+    : env;
+  const curlText = interpolate(config.curl || "", curlEnv, modelName);
+  // The router launch command shown in the companion block (interpolated like
+  // any other command — literals today, so effectively verbatim).
+  const routerText = pdRouter && pdRouter.command
+    ? interpolate(pdRouter.command, env, modelName) : "";
 
   const resetAll = () => setDeltas(initialDeltas());
 
@@ -2038,7 +2069,7 @@ export const Playground = ({ config }) => {
     <div style={s.container} className="not-prose">
       {/* Inherited base summary */}
       <div style={s.baseStrip}>
-        <span style={{ fontWeight: 600 }}>Inherited base from §3.1:</span>
+        <span style={{ fontWeight: 600 }}>Inherited base from Deployment:</span>
         <code style={{ fontFamily: "Menlo, monospace" }}>{baseSummary}</code>
         {/* Scroll back to the Deploy panel. Use scrollIntoView so the URL
             hash — which carries the base cell selection — isn't overwritten.
@@ -2175,6 +2206,37 @@ export const Playground = ({ config }) => {
         </div>
       </div>
 
+      {/* PD-Disagg companion: the SGLang Model Gateway (router) that fronts the
+          prefill + decode roles. Shown only when a PD role is active AND the
+          cookbook configured `pdDisagg.router`. Separate block (own copy) so the
+          role-command diff above stays pure. */}
+      {pdRouter && routerText && (
+        <div style={s.card}>
+          <div style={s.title}>Router (SGLang Model Gateway)</div>
+          <div style={{ fontSize: 11, opacity: 0.7, margin: "0 0 6px" }}>
+            Run after both roles are up. Substitute <code>{"<prefill-host>"}</code> /{" "}
+            <code>{"<decode-host>"}</code> with reachable hosts (both <code>127.0.0.1</code>{" "}
+            on a same-host deployment). Client traffic (cURL) targets this router.
+          </div>
+          <div style={s.commandWrap}>
+            <div style={s.commandHeader}>
+              <div style={{ fontSize: 11, opacity: 0.7 }}>port {pdRouter.port}</div>
+              <button
+                style={s.iconButton}
+                onClick={() => {
+                  navigator.clipboard.writeText(routerText);
+                  setRouterCopied(true);
+                  setTimeout(() => setRouterCopied(false), 1200);
+                }}
+              >
+                {routerCopied ? "✓ Copied" : "⧉ Copy"}
+              </button>
+            </div>
+            <pre style={s.commandPre}>{routerText}</pre>
+          </div>
+        </div>
+      )}
+
       {/* cURL modal — native <dialog> in top layer (escapes @container) */}
       {modal === "curl" && (
         <dialog ref={openDialog} style={s.dialog}
@@ -2194,6 +2256,13 @@ export const Playground = ({ config }) => {
             </div>
             <pre style={s.commandPre}>{curlText}</pre>
           </div>
+          {pdRouter && (
+            <p style={{ fontSize: 11, opacity: 0.85, marginTop: 8 }}>
+              <strong>PD-Disaggregation active</strong> — this targets the router on
+              {" "}<code>:{pdRouter.port}</code>; client traffic must not hit the role
+              servers directly.
+            </p>
+          )}
           <p style={{ fontSize: 11, opacity: 0.7, marginTop: 8 }}>
             Edit <code>CURL_HOST</code> / <code>CURL_PORT</code> in the Env panel.
           </p>

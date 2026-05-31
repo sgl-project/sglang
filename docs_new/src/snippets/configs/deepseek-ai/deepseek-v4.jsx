@@ -371,6 +371,25 @@ sgl-eval run aime25 \\
       // {id,label} object so it displays "Auto" while the engine's
       // `value.ibDevice !== "auto"` checks still see the lowercase id.
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
+      // Router (SGLang Model Gateway) that fronts the prefill + decode roles.
+      // When a PD role is active the playground shows `command` as a separate
+      // companion block AND retargets the cURL modal to `port` (clients hit the
+      // router, NOT the role servers). Command copied verbatim from the upstream
+      // generator (docs_new/src/snippets/autoregressive/deepseek-v4-deployment.jsx
+      // on main). Substitute <prefill-host>/<decode-host> with reachable hosts
+      // (both 127.0.0.1 on a same-host deployment); ports are the canonical
+      // 30000 / 30001 / 8000 topology. Omit `router` to keep per-role-only output.
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:30000 \\
+  --decode http://<decode-host>:30001 \\
+  --host 0.0.0.0 --port 8000 \\
+  --disable-circuit-breaker \\
+  --health-check-interval-secs 999999`,
+      },
     },
 
     // ----- Card 6: "Hierarchical KV Cache" — Enable + Storage + Write Policy -----

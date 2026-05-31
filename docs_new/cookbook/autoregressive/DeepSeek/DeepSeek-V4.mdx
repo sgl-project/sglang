@@ -36,7 +36,7 @@ A single image — `lmsysorg/sglang:latest` — covers every hardware platform s
 docker pull lmsysorg/sglang:latest
 ```
 
-For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the [command generator](#deployment) below produces):
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the command generator below produces):
 
 ```bash Command
 docker run --gpus all \
@@ -220,7 +220,7 @@ sglang serve deepseek-ai/DeepSeek-V4-Flash \
 Two options are available for running DeepSeek-V4 on Hopper:
 
 - **Original FP4 checkpoints** — apply the W4A16 MoE kernels (Marlin) as the command generator picks for Hopper cells. This path works on both H100 and H200 and is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
-- **Converted FP8 checkpoints** (H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
+- **Converted FP8 checkpoints** (H100 and H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
 
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
@@ -254,32 +254,11 @@ fail with `nvlink_transport.cpp:497 Requested address ... not found!`. If
 this happens, prepend `MC_FORCE_MNNVL=1 NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1`
 to both prefill and decode `sglang serve` commands.
 
-## 3. Model Invocation
+## 3. Advanced Usage
 
-### 3.1 Basic Usage
+### 3.1 Reasoning
 
-For basic API usage and request examples, see:
-
-- [Basic API Usage](../../../docs/basic_usage/send_request)
-
-Once the server is running (for example via the command generator above), send a request:
-
-```shell Command
-curl http://localhost:30000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-ai/DeepSeek-V4-Flash",
-    "messages": [{"role": "user", "content": "What is 15% of 240?"}]
-  }'
-```
-
-> **PD-Disagg note**: a full PD-Disagg deployment isn't a single launch command — it runs a prefill server, a decode server, and a router (typically on ports `30000` / `30001` / `8000`). The **PD Disaggregation** axis in the Playground above only emits the per-role command (`--disaggregation-mode prefill|decode`); you launch each role separately and front them with a router. Client traffic then targets the router (`http://localhost:8000`), not the role servers directly.
-
-### 3.2 Advanced Usage
-
-#### 3.2.1 Reasoning Parser
-
-Enable the `deepseek-v4` reasoning parser (check the box in the [command panel above](#deployment)) to separate thinking from the final answer into `reasoning_content` vs `content`.
+Enable the `deepseek-v4` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer into `reasoning_content` vs `content`.
 
 <Accordion title="Streaming with Thinking Process (Python)">
 
@@ -351,9 +330,9 @@ Multiply the decimal form by 240:
 
 </Accordion>
 
-#### 3.2.2 Tool Calling
+### 3.2 Tool Calling
 
-Enable the `deepseekv4` tool-call parser (check the box in the [command panel above](#deployment)) to surface structured tool calls via `message.tool_calls`.
+Enable the `deepseekv4` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`.
 
 <Accordion title="Python Example with Thinking Process">
 
@@ -447,7 +426,7 @@ The user wants to know the weather in Beijing. I'll use the get_weather function
 
 </Accordion>
 
-#### 3.2.3 HiCache (Hierarchical KV Caching)
+### 3.3 HiCache (Hierarchical KV Caching)
 
 HiCache enables multi-tier KV cache offloading (GPU → CPU → Storage), significantly expanding effective context capacity for long-context and multi-turn scenarios. Combined with UnifiedRadixTree, it provides intelligent prefix caching across all tiers.
 
