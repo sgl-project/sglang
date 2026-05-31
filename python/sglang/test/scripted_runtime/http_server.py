@@ -1,21 +1,3 @@
-"""Caller-side resource: long-lived HTTP server + per-test script dispatch.
-
-Owned by :class:`ScriptedTestCase`. Spawns a dedicated subprocess
-that runs :func:`launch_scripted_http_server`, which launches a real sglang
-HTTP server; the caller communicates with the scheduler-side dispatch loop
-(owned by :class:`ScriptedSchedulerHook`) over a ZMQ ``PAIR`` socket bound
-to a loopback ``tcp://`` endpoint — the same transport sglang uses for its
-own inter-process ZMQ channels.
-
-One :class:`ScriptedHttpServer` instance per test class — every
-``test_*`` method shares the same HTTP server / engine and submits a fresh
-``_script_*`` over the socket via :meth:`ScriptedHttpServer.run`.
-
-The HTTP server runs in its own process (not a background thread of the
-test process) so uvicorn can install its signal handlers in that process's
-main thread, and so the topology matches a real deployment.
-"""
-
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -46,7 +28,6 @@ SERVER_HOST: str = "127.0.0.1"
 
 
 class ScriptedHttpServer:
-    """Long-lived HTTP-server process wrapper. One instance per test class."""
 
     def __init__(
         self,
@@ -65,23 +46,6 @@ class ScriptedHttpServer:
 
     @classmethod
     def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
-        """Spawn the HTTP-server process and await the dispatch loop's handshake.
-
-        The PAIR socket binds to a random loopback ``tcp://`` port *before* the
-        server process starts so the dispatch loop's connect call never
-        races. If the server fails to start (slow load, model error, CUDA
-        failure) the first-message poll times out after
-        :data:`LISTENER_ACCEPT_TIMEOUT_S` instead of hanging the test process
-        indefinitely. The dispatch loop sends a :class:`HookReady` as its
-        first message once it connects, which the startup handshake confirms.
-
-        The socket binds to ``127.0.0.1`` only (no authkey), so it is reachable
-        from the spawned server process but not from the network — matching
-        sglang's no-auth, loopback-only ZMQ posture (CVE-2026-3060).
-
-        ``engine_kwargs`` (notably ``model_path`` plus any ServerArgs
-        overrides) are forwarded to :func:`launch_scripted_http_server`.
-        """
         err_fd, err_path = tempfile.mkstemp(
             prefix="scripted_runtime_oob_error_", suffix=".json"
         )
@@ -147,20 +111,6 @@ class ScriptedHttpServer:
         args: Tuple[Any, ...] = (),
         timeout_s: float = DEFAULT_RUN_TIMEOUT_S,
     ) -> None:
-        """Dispatch ``script_fn`` to the scheduler hook and block on its result.
-
-        ``args`` are forwarded positionally to the script after the
-        ``ScriptedContext`` handle (``script_fn(t, *args)``), letting one
-        parameterized script back many ``subTest`` combos. They cross the
-        ipc socket as a pickled :class:`RunScript`, so every element must be
-        picklable.
-
-        Re-raises the captured traceback as :class:`AssertionError` if the
-        sub-script failed; raises :class:`TimeoutError` (and marks the
-        session dirty) if the server did not respond within ``timeout_s``;
-        raises :class:`RuntimeError` if the server process died before
-        responding.
-        """
         if self._dirty:
             raise RuntimeError(f"ScriptedHttpServer is dirty: {self._dirty}")
 
@@ -186,11 +136,6 @@ class ScriptedHttpServer:
                 )
 
     def shutdown(self) -> None:
-        """Tell the dispatch loop to return, join the server process, and clean up.
-
-        Idempotent — calling twice is safe. Surfaces a fatal scheduler-side
-        error (written to the out-of-band error file) as an ``AssertionError``.
-        """
         if self._shutdown_done:
             return
 
@@ -236,7 +181,6 @@ class ScriptedHttpServer:
 
     @staticmethod
     def _terminate_process(process: mp.process.BaseProcess) -> None:
-        """Best-effort terminate + join; escalate to kill if it lingers."""
         if not process.is_alive():
             return
         process.terminate()
@@ -247,25 +191,4 @@ class ScriptedHttpServer:
 
 
 def launch_scripted_http_server(**engine_kwargs: Any) -> None:
-    """Subprocess entry point: run the dispatch loop behind a real HTTP server.
-
-    Runs inside the dedicated ``mp.Process`` spawned by
-    :meth:`ScriptedHttpServer.start`. The ``SGLANG_TEST_SCRIPTED_RUNTIME*`` env
-    vars (seeded by ``start`` via ``override`` before the process starts) make
-    every scheduler subprocess install a :class:`ScriptedSchedulerHook`; the
-    driver rank's hook owns the ZMQ dispatch loop that pulls and runs each
-    caller-requested sub-script.
-
-    Running the HTTP server in its own subprocess (rather than a background
-    thread of the test process) matches a real deployment and sidesteps the
-    ``uvicorn`` "signal only works in main thread" failure — uvicorn installs
-    its signal handlers in this subprocess's main thread.
-
-    Blocks in :func:`launch_server` until the scheduler subprocess(es)
-    terminate (the dispatch loop returning on shutdown triggers a clean
-    scheduler exit; the watchdog then stops the server). On a fatal
-    scheduler-side exception an :class:`OutOfBandError` is written as JSON to
-    the path named by ``SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH``
-    for the session to surface.
-    """
     launch_server(ServerArgs(**engine_kwargs))

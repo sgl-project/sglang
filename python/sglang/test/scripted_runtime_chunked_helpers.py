@@ -1,16 +1,3 @@
-"""Shared constants and helpers for chunked-prefill scripted-runtime tests.
-
-Every test file in this directory imports from here. Constants and
-helpers stay deliberately small — most of the value is in keeping the
-scripts uniform, not in factoring shared logic.
-
-API surface used by these tests:
-
-* :func:`sglang.test.scripted_runtime.http_server.launch_scripted_http_server`
-* :class:`sglang.test.scripted_runtime.ScriptedContext`
-* :class:`sglang.test.scripted_runtime.ScriptedReqHandle`
-"""
-
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -30,13 +17,6 @@ def base_engine_kwargs(
     chunked_prefill_size: int = DEFAULT_CHUNK_SIZE,
     **overrides: Any,
 ) -> Dict[str, Any]:
-    """Common engine kwargs for a single-GPU scripted-runtime chunked test.
-
-    ``disable_overlap_schedule`` and ``disable_cuda_graph`` are off to
-    keep the scheduler event loop deterministic — chunked-state tests
-    care about which iteration a transition happens on, not about
-    throughput.
-    """
     kwargs: Dict[str, Any] = dict(
         model_path=model_path,
         tp_size=1,
@@ -51,12 +31,6 @@ def base_engine_kwargs(
 
 
 def run_until(handle, predicate, *, max_steps: int = DEFAULT_MAX_STEPS):
-    """Generator helper: ``yield`` until ``predicate(handle)`` is true.
-
-    Caps the iteration count so a stuck scheduler turns into an
-    AssertionError instead of a hang. Use ``yield from run_until(...)``
-    inside a script generator.
-    """
     for _ in range(max_steps):
         if predicate(handle):
             return
@@ -68,15 +42,10 @@ def run_until(handle, predicate, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 
 def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
-    """Generator helper: ``yield`` until the handle reports ``finished``.
-
-    Mirrors the most common idiom across the suite.
-    """
     yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
-    """Generator helper: ``yield`` until every handle reports finished."""
     for _ in range(max_steps):
         if all(h.finished for h in handles):
             return
@@ -97,12 +66,6 @@ LIFECYCLE_STAGES = (
 
 
 def advance_to_nth_chunk(r, target_chunk: int, *, max_steps: int = DEFAULT_MAX_STEPS):
-    """Generator helper: ``yield`` until the req is on its ``target_chunk``-th chunked iter.
-
-    Counts iterations where the req holds the scheduler's chunked_req slot
-    (``is_chunking``); the final extend that completes prefill is not chunked
-    and is therefore not counted.
-    """
     seen = 0
     for _ in range(max_steps):
         assert not r.finished, f"req finished before reaching chunk {target_chunk}"
@@ -117,11 +80,6 @@ def advance_to_nth_chunk(r, target_chunk: int, *, max_steps: int = DEFAULT_MAX_S
 def advance_to_decode_step(
     r, target_output_len: int, *, max_steps: int = DEFAULT_MAX_STEPS
 ):
-    """Generator helper: ``yield`` until the req has produced ``target_output_len`` decode tokens.
-
-    Reads ``Req.output_ids`` directly and assumes the req runs to
-    ``max_new_tokens`` by length — the synthetic decode does not stop early.
-    """
     for _ in range(max_steps):
         assert (
             not r.finished
@@ -141,7 +99,6 @@ def advance_to_lifecycle_stage(
     max_new_tokens: int,
     max_steps: int = DEFAULT_MAX_STEPS,
 ):
-    """Generator helper: ``yield`` until the req reaches the named :data:`LIFECYCLE_STAGES` point."""
     if stage == "first_chunk":
         yield from advance_to_nth_chunk(r, 1, max_steps=max_steps)
     elif stage == "last_chunk":

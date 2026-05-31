@@ -1,19 +1,3 @@
-"""ScriptedContext: the object a test script drives.
-
-Passed to the caller-provided script generator as its single argument
-(``def my_script(t: ScriptedContext)``). Exposes the script-facing verbs
-— submit requests, inject pressure, query scheduler state — and reaches
-the live ``Scheduler`` through its :class:`ScriptedSchedulerHook`. The
-hook owns the generator stepping and the scheduler-side lookups; this
-object owns everything the script itself calls.
-
-This class is a thin FACADE: every public method delegates to a free
-function grouped by category in a sibling module (``start_req``,
-``lifecycle``, ``radix``). The flat script-author-facing API is unchanged
-— the logic and docstrings live on the free functions, which take this
-context as their first argument.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -37,13 +21,6 @@ logger = logging.getLogger(__name__)
 
 
 class ScriptedContext:
-    """Script-facing control surface, created by :class:`ScriptedSchedulerHook`.
-
-    Holds a back-reference to the hook (and through it the live
-    ``Scheduler``) plus the script-side request bookkeeping. Every method
-    here is called from the test script on the driver rank and forwards to
-    a free function that holds the real logic.
-    """
 
     def __init__(
         self,
