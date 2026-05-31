@@ -29,13 +29,19 @@ class ScriptedTokenizerRecvProxy:
     """Quacks like a ``zmq.Socket``. NOBLOCK semantics mirror a real PULL
     socket: an empty buffer (after draining the underlying socket) raises
     ``zmq.ZMQError`` with ``EAGAIN``.
+
+    Single-threaded contract: every method is called only from the scheduler
+    thread (``recv_pyobj`` from ``recv_requests``; ``wait_until_arrived`` from
+    the script generator, also driven inside ``recv_requests``). The wrapped
+    zmq socket is never touched from another thread — the background HTTP
+    poster only feeds the *other* end via the tokenizer manager. This is what
+    lets ``wait_until_arrived`` rely on the buffer not being popped while it
+    blocks.
     """
 
     def __init__(self, *, underlying: zmq.Socket) -> None:
         self._underlying = underlying
         self._buffer: deque = deque()
-        self._total_drained = 0
-        self._popped_count = 0
 
     def recv_pyobj(self, flags: int = 0) -> Any:
         """Pop one buffered request, draining the underlying socket first.
@@ -48,7 +54,6 @@ class ScriptedTokenizerRecvProxy:
         self._drain_underlying()
 
         if self._buffer:
-            self._popped_count += 1
             return self._buffer.popleft()
 
         if flags & zmq.NOBLOCK:
@@ -74,13 +79,18 @@ class ScriptedTokenizerRecvProxy:
         stays buffered, so the scheduler still observes it on the next
         ``recv_requests``. ``description`` names the awaited object in the
         timeout error.
+
+        The buffer is never popped while this method blocks (single-threaded
+        contract), so newly drained objects only ever append past the initial
+        length: the prefix ``self._buffer[:start_len]`` is exactly the stale
+        objects and is skipped.
         """
-        start_seq = self._total_drained
+        start_len = len(self._buffer)
         deadline = time.monotonic() + timeout_s
         while True:
             self._drain_underlying()
             for i, obj in enumerate(self._buffer):
-                if self._popped_count + i >= start_seq and predicate(obj):
+                if i >= start_len and predicate(obj):
                     return
             if time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -96,4 +106,3 @@ class ScriptedTokenizerRecvProxy:
             except zmq.ZMQError:
                 break
             self._buffer.append(req)
-            self._total_drained += 1
