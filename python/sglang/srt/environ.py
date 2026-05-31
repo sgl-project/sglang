@@ -323,8 +323,6 @@ class Envs:
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
 
-    # Test: scripted runtime (set programmatically by the scripted-runtime
-    # harness, never via CLI; see sglang.test.scripted_runtime).
     SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
     SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
     SGLANG_TEST_SCRIPTED_RUNTIME_TRACEBACK_PATH = EnvStr(None)
