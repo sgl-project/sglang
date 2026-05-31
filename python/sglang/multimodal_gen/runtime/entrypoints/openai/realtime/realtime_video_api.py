@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 _ACTIVE_SESSION_IDS: set[str] = set()
-_ACTIVE_SESSION_WAIT_SECONDS = 5.0
+_ACTIVE_SESSION_WAIT_SECONDS = 15.0
 _ACTIVE_SESSION_WAIT_INTERVAL_SECONDS = 0.1
 
 

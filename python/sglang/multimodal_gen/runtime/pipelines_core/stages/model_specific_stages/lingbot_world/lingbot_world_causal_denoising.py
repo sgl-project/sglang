@@ -35,8 +35,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_LINGBOT_SEQUENCE_SHARDED_GLOBAL_CACHE_CHUNKS = 24
-
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     """Causal DMD denoising with I2V condition concatenation for LingBot-World.
@@ -65,14 +63,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if self.local_attn_size != -1:
             return self.local_attn_size * self.num_token_per_frame
 
-        cache_num_frames = self.sliding_window_num_frames
-        if sequence_shard_enabled:
-            cache_num_frames = max(
-                cache_num_frames,
-                self.num_frames_per_block
-                * _LINGBOT_SEQUENCE_SHARDED_GLOBAL_CACHE_CHUNKS,
-            )
-        return cache_num_frames * self.num_token_per_frame
+        return self.sliding_window_num_frames * self.num_token_per_frame
 
     def _get_causal_sink_tokens(self) -> int:
         if self.local_attn_size == -1:
