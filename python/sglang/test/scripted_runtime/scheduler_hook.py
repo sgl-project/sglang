@@ -23,7 +23,6 @@ from sglang.test.scripted_runtime.io_struct import (
 from sglang.test.scripted_runtime.utils import ensure_script_importable, resolve_fn
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
@@ -96,38 +95,9 @@ class ScriptedSchedulerHook:
             ctx_zmq.term()
             self._http_poster.close()
 
-    def _find_req_by_rid(self, rid: str) -> Optional["Req"]:
-        s = self._scheduler
-        chunked = s.chunked_req
-        if chunked is not None and chunked.rid == rid:
-            return chunked
-        for r in s.waiting_queue:
-            if r.rid == rid:
-                return r
-        if s.running_batch is not None:
-            for r in s.running_batch.reqs:
-                if r.rid == rid:
-                    return r
-        last_batch = getattr(s, "last_batch", None)
-        if last_batch is not None:
-            for r in last_batch.reqs:
-                if r.rid == rid:
-                    return r
-        return None
-
-    def _lookup_finished(self, rid: str) -> bool:
-        req = self._find_req_by_rid(rid)
-        if req is None:
-            return rid in self._context._req_handles
-        return req.finished()
-
-    def _lookup_is_chunking(self, rid: str) -> bool:
-        s = self._scheduler
-        return s.chunked_req is not None and s.chunked_req.rid == rid
-
     def step(self) -> None:
         if self._is_driver:
-            payload: List = list(self._advance_generator())
+            payload: List = list(_advance_generator(self._script_fn_generator))
         else:
             payload = []
 
@@ -158,11 +128,12 @@ class ScriptedSchedulerHook:
                 "Failed to write scripted_runtime out-of-band error to %s", path
             )
 
-    def _advance_generator(self) -> Tuple[bool, Optional[str]]:
-        try:
-            next(self._script_fn_generator)
-            return (False, None)
-        except StopIteration:
-            return (True, None)
-        except BaseException:  # noqa: BLE001 — capture every kind of failure
-            return (True, traceback.format_exc())
+
+def _advance_generator(generator: Generator) -> Tuple[bool, Optional[str]]:
+    try:
+        next(generator)
+        return (False, None)
+    except StopIteration:
+        return (True, None)
+    except Exception:
+        return (True, traceback.format_exc())
