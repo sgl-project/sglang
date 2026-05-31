@@ -4,12 +4,11 @@ import logging
 import sys
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Generator, Optional, Tuple
 
 import zmq
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import broadcast_pyobj
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.scripted_runtime.context import ScriptedContext
@@ -99,22 +98,14 @@ class ScriptedSchedulerHook:
             self._http_poster.close()
 
     def step(self) -> None:
-        if self._is_driver:
-            payload: List = list(_advance_generator(self._script_fn_generator))
-        else:
-            payload = []
+        if not self._is_driver:
+            return
 
-        payload = broadcast_pyobj(
-            data=payload,
-            rank=self._scheduler.world_group.rank,
-            dist_group=self._scheduler.world_group.cpu_group,
-            src=0,
-        )
-        done, exc_tb = payload[0], payload[1]
+        done, exc_tb = _advance_generator(self._script_fn_generator)
         if not done:
             return
 
-        if exc_tb is not None and self._is_driver:
+        if exc_tb is not None:
             _write_out_of_band_error(exc_tb)
         sys.exit(0 if exc_tb is None else 1)
 
