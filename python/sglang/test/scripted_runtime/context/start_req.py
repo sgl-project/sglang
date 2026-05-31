@@ -21,7 +21,6 @@ def start_req(
     max_new_tokens: int,
     rid: Optional[str],
 ) -> ScriptedReqHandle:
-    assert ctx._is_driver, "start_req is only callable from the driver rank"
     if rid is None:
         rid = f"scripted-{ctx._req_counter}-{uuid.uuid4().hex}"
         ctx._req_counter += 1
