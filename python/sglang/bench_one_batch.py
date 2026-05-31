@@ -71,7 +71,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
+from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -174,7 +174,9 @@ def stop_profile(
     if save_trace:
         if profiler is not None:
             if trace_filename:
-                _save_profile_trace_results(profiler, trace_filename)
+                _save_profile_trace_results(
+                    profiler, profile_activities, trace_filename
+                )
                 stage_desc = f"for {stage}" if stage else ""
                 rank_print(
                     f"torch profiler chrome trace {stage_desc} saved to {trace_filename}"
@@ -384,7 +386,7 @@ def prepare_extend_inputs_for_correctness_test(
         req.fill_ids += input_ids[i][bench_args.cut_len :]
         if model_runner is not None:
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                i, : bench_args.cut_len
+                req.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
             req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
@@ -457,8 +459,7 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -466,11 +467,10 @@ def extend(reqs, model_runner):
 
 @torch.no_grad
 def decode(input_token_ids, batch, model_runner):
-    batch.output_ids = input_token_ids
+    batch.input_ids = input_token_ids.to(torch.int64)
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
@@ -536,7 +536,7 @@ class _MlxBenchRunner:
         if server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = server_args.max_total_tokens
         self.mlx_runner = MlxModelRunner(**init_kwargs)
-        self.mlx_runner.init_kv_pool(req_to_token_pool=None)
+        self.mlx_runner.init_cache_pools(req_to_token_pool=None)
         self.fake_torch_runner = model_runner
 
     def clear(self):
@@ -599,15 +599,17 @@ def _create_torch_profiler_filename(
     return os.path.join(output_dir, filename)
 
 
-def _save_profile_trace_results(profiler, filename):
+def _save_profile_trace_results(profiler, profile_activities, filename):
     parent_dir = os.path.dirname(os.path.abspath(filename))
     os.makedirs(parent_dir, exist_ok=True)
     profiler.export_chrome_trace(filename)
-    print(
-        profiler.key_averages(group_by_input_shape=True).table(
-            sort_by="self_cpu_time_total"
-        )
-    )
+    if "GPU" in profile_activities:
+        sort_by = "self_cuda_time_total"
+    elif "XPU" in profile_activities:
+        sort_by = "self_xpu_time_total"
+    else:
+        sort_by = "self_cpu_time_total"
+    print(profiler.key_averages(group_by_input_shape=True).table(sort_by=sort_by))
 
 
 def correctness_test(

@@ -25,11 +25,10 @@ import os
 import socket
 import threading
 import time
-import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -106,12 +105,15 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.kv_canary.api import install_canary
+from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -122,11 +124,13 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -146,6 +150,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+)
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -205,6 +214,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.common import ceil_align, require_mlp_sync
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
@@ -243,11 +253,13 @@ MLA_ATTENTION_BACKENDS = [
     "fa4",
     "triton",
     "flashmla",
+    "cutedsl_mla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
     "ascend",
-    "nsa",
+    "dsa",
+    "nsa",  # Deprecated alias for "dsa"
     "intel_xpu",
 ]
 
@@ -256,6 +268,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "fa3",
     "fa4",
     "flashmla",
+    "cutedsl_mla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
@@ -288,6 +301,8 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+
+_UNSET: Any = object()
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -417,7 +432,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_draft_num_layers = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
-            draft_model_config = self._build_model_config(
+            draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
@@ -446,7 +461,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
             # Select target layers to capture for building DFlash context features.
-            draft_model_config = self._build_model_config(
+            draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
@@ -531,6 +546,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
 
+        self._linear_attn_registry_cache: Any = _UNSET
+
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
@@ -563,19 +580,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
-
-        if not hasattr(self, "hisparse_coordinator"):
-            self.hisparse_coordinator = None
-
-    def _build_model_config(
-        self, server_args, model_path=None, model_revision=None, is_draft_model=False
-    ):
-        return ModelConfig.from_server_args(
-            server_args,
-            model_path=model_path,
-            model_revision=model_revision,
-            is_draft_model=is_draft_model,
-        )
 
     def init_msprobe(self):
         # Init the msprobe
@@ -645,10 +649,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.expert_location_updater = ExpertLocationUpdater()
 
-        (
+        if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
-            if self.server_args.elastic_ep_backend
-            else None
+        self._token_oracle_manager = install_token_oracle_from_env(
+            server_args=server_args,
+            vocab_size=self.model_config.vocab_size,
         )
         # Load the model
         self.sampler = create_sampler()
@@ -667,6 +672,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            # ModelExpress owns TransferEngine memory registration and metadata
+            # publishing for backend=modelexpress. Re-registering here would
+            # overlap the same weight buffers.
+            and self.server_args.remote_instance_weight_loader_backend
+            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
             and self.remote_instance_transfer_engine is not None
             and self.remote_instance_transfer_engine_weight_info is None
         ):
@@ -748,6 +758,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
+        # Must be called AFTER init_memory_pool so the pool object exists for
+        # canary to monkey-patch, and BEFORE init_device_graphs so warmup
+        # forwards captured into the graph see the patched pool methods.
+        self.canary_manager = install_canary(
+            server_args=server_args,
+            model_runner=self,
+            token_oracle_manager=self._token_oracle_manager,
+        )
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
@@ -763,9 +782,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
-            self.init_attention_backend()
-            self.kernel_warmup()
-            # Init hisparse coordinator (must happen before CUDA graph capture)
             if self.enable_hisparse:
                 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -787,6 +803,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ),
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
+            self.init_attention_backend()
+            self.kernel_warmup()
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
         elif self.device == "cpu":
@@ -825,6 +843,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+        if self.canary_manager is not None and not self.is_draft_worker:
+            self.canary_manager.mark_init_finished()
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -923,7 +944,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
+            local_ip,
+            "P2PHANDSHAKE",
+            envs.MOONCAKE_PROTOCOL.get(),
+            envs.MOONCAKE_DEVICE.get(),
         )
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
@@ -974,155 +998,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(
                 f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
             )
-
-    def _publish_modelexpress_metadata(self):
-        """Publish metadata to ModelExpress server (seed mode).
-
-        Supports two transport backends:
-        - transfer_engine: publishes TransferEngine session_id (Mooncake)
-        - nixl: creates NIXL agent, registers tensors, publishes nixl_metadata
-        """
-        try:
-            from modelexpress import p2p_pb2
-            from modelexpress.client import MxClient
-        except ImportError as exc:
-            raise ImportError(
-                "ModelExpress support requires the 'modelexpress' package. "
-                "Install it with: pip install modelexpress"
-            ) from exc
-
-        model_name = (
-            self.server_args.modelexpress_model_name or self.server_args.model_path
-        )
-        mx_url = self.server_args.modelexpress_url
-        transport = self.server_args.modelexpress_transport
-
-        # Build SourceIdentity for this instance
-        identity = p2p_pb2.SourceIdentity(
-            model_name=model_name,
-            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
-            tensor_parallel_size=self.server_args.tp_size,
-            pipeline_parallel_size=self.server_args.pp_size,
-            expert_parallel_size=self.server_args.ep_size,
-            dtype=self.server_args.dtype or "",
-            quantization=self.server_args.quantization or "",
-        )
-
-        if transport == "nixl":
-            worker, tensor_count = self._build_nixl_worker_metadata(p2p_pb2)
-        else:
-            worker, tensor_count = self._build_transfer_engine_worker_metadata(p2p_pb2)
-            if worker is None:
-                return
-
-        # Generate a unique worker_id for this running instance
-        worker_id = str(uuid.uuid4())
-
-        mx_client = MxClient(server_url=mx_url)
-        try:
-            logger.info(
-                "ModelExpress source [%s]: publishing metadata for model=%s, "
-                "tp_rank=%d, %d tensors, worker_id=%s",
-                transport,
-                model_name,
-                self.tp_rank,
-                tensor_count,
-                worker_id,
-            )
-            mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
-            mx_client.update_status(
-                mx_source_id=mx_source_id,
-                worker_id=worker_id,
-                worker_rank=self.tp_rank,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-            )
-            logger.info(
-                "ModelExpress source: published ready for model=%s, "
-                "tp_rank=%d, mx_source_id=%s",
-                model_name,
-                self.tp_rank,
-                mx_source_id,
-            )
-        finally:
-            mx_client.close()
-
-    def _build_transfer_engine_worker_metadata(self, p2p_pb2):
-        """Build WorkerMetadata using TransferEngine session_id."""
-        session_id = self.remote_instance_transfer_engine_session_id
-        weight_info = self.remote_instance_transfer_engine_weight_info
-
-        if not session_id or weight_info is None:
-            logger.warning(
-                "ModelExpress source: skipping publish -- "
-                "TransferEngine not initialized or no weight info"
-            )
-            return None, 0
-
-        tensors = []
-        for name, (addr, numel, element_size) in weight_info.items():
-            tensors.append(
-                p2p_pb2.TensorDescriptor(
-                    name=name,
-                    addr=addr,
-                    size=numel * element_size,
-                    device_id=self.gpu_id,
-                )
-            )
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=self.tp_rank,
-            transfer_engine_session_id=session_id,
-            tensors=tensors,
-        )
-        return worker, len(tensors)
-
-    def _build_nixl_worker_metadata(self, p2p_pb2):
-        """Build WorkerMetadata using NIXL agent for RDMA transfers."""
-        from modelexpress.nixl_transfer import NixlTransferManager
-
-        agent_name = f"sglang-seed-rank{self.tp_rank}-{uuid.uuid4().hex[:8]}"
-        nixl_mgr = NixlTransferManager(agent_name, self.gpu_id)
-        nixl_mgr.initialize()
-
-        # Collect model tensors for NIXL registration
-        model_tensors = {}
-        for name, param in self.model.named_parameters():
-            t = param.data
-            if t.is_contiguous():
-                model_tensors[name] = t
-            else:
-                # Non-contiguous tensors: register underlying storage as byte view
-                sv = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                    t.untyped_storage()
-                )
-                if sv.data_ptr() not in {v.data_ptr() for v in model_tensors.values()}:
-                    model_tensors[f"{name}.__storage"] = sv
-
-        nixl_metadata = nixl_mgr.register_tensors(model_tensors)
-
-        # Build tensor descriptors from registered tensors
-        tensors = []
-        for td in nixl_mgr.tensor_descriptors:
-            tensors.append(
-                p2p_pb2.TensorDescriptor(
-                    name=td.name,
-                    addr=td.addr,
-                    size=td.size,
-                    device_id=td.device_id,
-                    dtype=td.dtype,
-                )
-            )
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=self.tp_rank,
-            nixl_metadata=nixl_metadata,
-            tensors=tensors,
-        )
-
-        # Keep reference alive so NIXL agent isn't garbage collected
-        self._nixl_manager = nixl_mgr
-
-        return worker, len(tensors)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -1199,7 +1074,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
             if self.server_args.mooncake_ib_device:
-                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    get_ib_devices_for_gpu,
+                )
+
+                ib_device_for_gpu = get_ib_devices_for_gpu(
+                    self.server_args.mooncake_ib_device, self.gpu_id
+                )
+                mooncake_ib_device = (
+                    ib_device_for_gpu.split(",") if ib_device_for_gpu else []
+                )
                 try:
                     from mooncake import ep as mooncake_ep
 
@@ -1288,7 +1172,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Single warmup all_reduce to initialize NCCL/RCCL communicator
                 warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
                 dist.all_reduce(warmup_tensor, group=tp_group_handle)
-                torch.cuda.synchronize()
+                current_platform.synchronize()
 
                 warmup_elapsed = time.perf_counter() - warmup_start
                 logger.info(
@@ -1411,14 +1295,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
             remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
+            remote_instance_weight_loader_transfer_engine_session_id=self.remote_instance_transfer_engine_session_id,
             modelexpress_url=self.server_args.modelexpress_url,
-            modelexpress_model_name=self.server_args.modelexpress_model_name
-            or self.server_args.model_path,
-            modelexpress_tp_size=self.server_args.tp_size,
-            modelexpress_pp_size=self.server_args.pp_size,
-            modelexpress_ep_size=self.server_args.ep_size,
-            modelexpress_dtype=self.server_args.dtype,
-            modelexpress_quantization=self.server_args.quantization or "",
             modelexpress_transport=self.server_args.modelexpress_transport,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
@@ -1476,32 +1354,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
-        # Publish metadata to ModelExpress if running as seed source
-        if self.server_args.modelexpress_source:
-            # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
-            # call register_memory_region(). Do it here so weight_info is populated.
-            if (
-                self.remote_instance_transfer_engine_weight_info is None
-                and self.remote_instance_transfer_engine is not None
-            ):
-                from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-                    register_memory_region,
-                )
-
-                self.remote_instance_transfer_engine_weight_info = (
-                    register_memory_region(
-                        self.model, self.remote_instance_transfer_engine
-                    )
-                )
-            self._publish_modelexpress_metadata()
-
         if not self.is_draft_worker:
             get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
-            self.pyt_hooks = PytHooks()
-            self.pyt_hooks.register_hooks(self.model, module_prefix="model")
+            pyt_hooks = PytHooks()
+            pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -1607,7 +1466,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_prepared = 0
         num_routed_experts = None
         for module in self.model.modules():
-            if not isinstance(module, TopK):
+            if not isinstance(module, (TopK, HashTopK)):
                 continue
             if (
                 not module.enable_deepep_waterfill
@@ -1628,15 +1487,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
                 balancer_cls = DeepEPWaterfillBalancer
+            # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
+            # Redundant experts therefore need to be included in the per-rank
+            # expert count used for Waterfill's shared-expert slot remapping.
+            num_physical_routed_experts = (
+                num_routed_experts + self.server_args.ep_num_redundant_experts
+            )
+            if isinstance(module, TopK):
+                routed_scaling_factor = module.topk_config.routed_scaling_factor
+            else:
+                routed_scaling_factor = module.routed_scaling_factor
             module.deepep_waterfill_balancer = balancer_cls(
-                num_routed_experts=num_routed_experts,
+                num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=self.moe_ep_rank,
                 layer_id=module.layer_id,
                 routed_scaling_factor=(
-                    module.topk_config.routed_scaling_factor
-                    if module.topk_config.routed_scaling_factor is not None
-                    else 1.0
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
             )
             num_prepared += 1
@@ -1847,7 +1714,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         success = False
         message = ""
         try:
@@ -1867,7 +1734,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             message = f"Failed to init group: {e}."
             logger.error(message)
 
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         return success, message
 
     def send_weights_to_remote_instance(
@@ -1895,7 +1762,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(message)
             return False, message
 
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         success = False
         na = NetworkAddress(master_address, group_port)
         message = ""
@@ -1915,7 +1782,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # destroy the process group after sending weights
         del self._weights_send_group[group_name]
         torch.distributed.distributed_c10d.destroy_process_group(send_group)
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         return success, message
 
     def init_weights_update_group(
@@ -2080,8 +1947,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        self.device_module = torch.get_device_module(self.device)
-        infered_device = self.device_module.current_device()
+        device_module = torch.get_device_module(self.device)
+        infered_device = device_module.current_device()
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
@@ -2313,7 +2180,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     def _get_linear_attn_registry_result(self):
-        if not hasattr(self, "_linear_attn_registry_cache"):
+        if self._linear_attn_registry_cache is _UNSET:
             self._linear_attn_registry_cache = get_linear_attn_config(
                 self.model_config.hf_config
             )
@@ -2382,8 +2249,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
-
-        log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
@@ -2547,13 +2412,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from flashinfer.autotuner import autotune
 
         cache_path = self._flashinfer_autotune_cache_path()
-        logger.info("Running FlashInfer autotune with cache: %s", cache_path)
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+            autotune_cache = cache_path
+            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            runs_dir = cache_path.parent / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            autotune_cache = (
+                runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+            )
+            logger.info(
+                "Running FlashInfer autotune (cache reuse DISABLED via "
+                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
+                autotune_cache,
+            )
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
+            with torch.inference_mode(), autotune(True, cache=str(autotune_cache)):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
@@ -2604,20 +2483,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens_per_bs = 1
         if self.spec_algorithm.is_speculative():
             if self.is_draft_worker:
-                if not self.spec_algorithm.is_dflash():
+                if not self.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens, self.is_draft_worker
+                )
+            )
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
 
         num_tokens = batch_size * num_tokens_per_bs
 
-        if require_gathered_buffer(self.server_args):
+        # Keep warmup aligned with scheduler MLP-sync padding.
+        if require_mlp_sync(self.server_args):
             attn_tp_size = get_attention_tp_size()
             if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
-                num_tokens = num_tokens // attn_tp_size * attn_tp_size
+                num_tokens = ceil_align(num_tokens, attn_tp_size)
                 batch_size = num_tokens // num_tokens_per_bs
 
         seq_len_fill_value = self.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -2802,9 +2686,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             seq_lens_cpu=buffers.seq_lens_cpu,
             next_token_logits_buffer=buffers.next_token_logits_buffer,
             orig_seq_lens=buffers.seq_lens,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=self.token_to_kv_pool,
-            attn_backend=self.attn_backend,
             out_cache_loc=buffers.out_cache_loc,
             seq_lens_sum=buffers.seq_lens.sum().item(),
             encoder_lens=buffers.encoder_lens,
@@ -2865,8 +2746,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         torch.get_device_module(self.device).synchronize()
         self.tp_group.barrier()
-        with torch.inference_mode(), run_ctx or empty_context():
-            run_once()
+        with forward_context(ForwardContext(attn_backend=self.attn_backend)):
+            with torch.inference_mode(), run_ctx or empty_context():
+                run_once()
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.model_config.use_ngram_embedding
@@ -2964,7 +2846,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
-    def init_piecewise_cuda_graphs(self):
+    def init_piecewise_cuda_graphs(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
@@ -2974,8 +2856,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Draft models use decode CUDA graphs, not PCG
-        if self.is_draft_worker:
+        # Draft models skip here during __init__; the eagle worker calls
+        # this method explicitly (force_for_draft_worker=True) after
+        # init_lm_head so graphs capture the final embedding weights.
+        if self.is_draft_worker and not force_for_draft_worker:
             return
 
         # Disable piecewise CUDA graph for non-language models
@@ -3010,6 +2894,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
+        self.dsa_indexers = []
         for layer in layer_model.layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
@@ -3062,6 +2947,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
+            # NSA indexers (None for layers without NSA)
+            dsa_indexer = None
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
+                dsa_indexer = layer.self_attn.indexer
+            self.dsa_indexers.append(dsa_indexer)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA
@@ -3141,6 +3031,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         # Set extra arguments
+        pdmux_override = False
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
@@ -3148,7 +3039,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.prepare_forward_batch(forward_batch)
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
-                forward_batch.attn_backend = self.decode_attn_backend
+                # PDmux selects a per-stream backend; publish it to model-layer
+                # readers via the active ForwardContext so RadixAttention etc.
+                # dispatch against the right backend for this forward.
+                pdmux_override = True
             else:
                 self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
@@ -3162,13 +3056,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device_timer
             else contextlib.nullcontext()
         )
-        with ctx:
+
+        def _do_forward():
             return self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
             )
+
+        with ctx:
+            if pdmux_override:
+                with forward_context(
+                    ForwardContext(attn_backend=self.decode_attn_backend)
+                ):
+                    return _do_forward()
+            return _do_forward()
 
     def forward_extend(
         self,
@@ -3241,11 +3144,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
-        # in this case, we need to reinit the forward metadata, otherwise the stale
-        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        # In DP Attention, IDLE batches may be padded (batch_size > 0) for MLP
+        # sync. Reinit metadata for the padded case so attention kernels see
+        # the right batch_size (e.g. DSA Indexer). For the unpadded case
+        # (batch_size == 0) explicitly drop any stale forward_metadata left
+        # over from the previous forward — without this, attention layers
+        # called from the idle path can re-read a prior batch's req_pool
+        # indices and trigger SWA mapping use-after-free.
         if forward_batch.batch_size > 0:
             self.attn_backend.init_forward_metadata(forward_batch)
+        else:
+            self.attn_backend.forward_metadata = None
 
         kwargs = {}
         if self.support_pp:
@@ -3313,7 +3222,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
+
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
+            )
+            if not self.is_draft_worker and ((c := self.canary_manager) is not None)
+            else contextlib.nullcontext()
+        )
+
         with (
+            canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
@@ -3378,93 +3301,105 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        # Check whether can run cuda graph
-        mode_check = (
-            forward_batch.forward_mode.is_cpu_graph
-            if self.device == "cpu"
-            else forward_batch.forward_mode.is_cuda_graph
-        )
-        can_run_graph = bool(
-            mode_check()
-            and self.graph_runner
-            and self.graph_runner.can_run(forward_batch)
-        )
-
-        # Hisparse coordinator
-        if (
-            forward_batch.forward_mode.is_decode()
-            and self.hisparse_coordinator is not None
-        ):
-            forward_batch.hisparse_coordinator = self.hisparse_coordinator
-            self.hisparse_coordinator.wait_for_pending_backup()
-            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
-
-        # Replay cuda graph if applicable
-        if can_run_graph:
-            ret = self.graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
+        # Honor an outer-published context (spec workers wrap each per-step
+        # draft forward with the i-th child backend); otherwise publish this
+        # runner's own attn_backend for the forward.
+        if has_forward_context():
+            ctx_mgr = contextlib.nullcontext()
+        else:
+            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+        with ctx_mgr:
+            mode_check = (
+                forward_batch.forward_mode.is_cpu_graph
+                if self.device == "cpu"
+                else forward_batch.forward_mode.is_cuda_graph
             )
+            can_run_graph = bool(
+                mode_check()
+                and self.graph_runner
+                and self.graph_runner.can_run(forward_batch)
+            )
+
+            # Hisparse coordinator — backends now read it from self.model_runner.
+            if (
+                forward_batch.forward_mode.is_decode()
+                and self.hisparse_coordinator is not None
+            ):
+                self.hisparse_coordinator.wait_for_pending_backup()
+                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool.invalidate_loc_cache()
+
+            # Replay cuda graph if applicable
+            if can_run_graph:
+                ret = self.graph_runner.replay(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+            # For MLP sync
+            if forward_batch.global_num_tokens_cpu is not None:
+                forward_batch.prepare_mlp_sync_batch(self)
+            else:
+                forward_batch.prepare_attn_tp_scatter_input(self)
+
+            # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+            # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
+            # flavors already feed a zigzag-split rank-local layout whose token count
+            # should not be further divided by attn_tp_size. MHA-arch prefill CP
+            # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
+            # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
+            if (
+                forward_batch.num_token_non_padded is not None
+                and forward_batch.global_num_tokens_gpu is not None
+                and require_gathered_buffer(self.server_args)
+                and not is_dsa_enable_prefill_cp()
+                and not is_mla_prefill_cp_enabled()
+            ):
+                forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                    server_args=self.server_args,
+                )
+
+            # Hisparse coordinator — backends now read it from self.model_runner.
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
+            # Forward without cuda graph
+            if forward_batch.forward_mode.is_decode():
+                ret = self.forward_decode(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            elif forward_batch.forward_mode.is_split_prefill():
+                ret = self.forward_split_prefill(
+                    forward_batch,
+                    reinit_attn_backend=reinit_attn_backend,
+                    forward_count=split_forward_count,
+                )
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                ret, can_run_graph = self.forward_extend(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            elif forward_batch.forward_mode.is_idle():
+                ret = self.forward_idle(
+                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                )
+            else:
+                raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+            if (
+                forward_batch.global_num_tokens_cpu is not None
+                and self.pp_group.is_last_rank
+            ):
+                forward_batch.post_forward_mlp_sync_batch(ret)
+
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
-
-        # For MLP sync
-        if forward_batch.global_num_tokens_cpu is not None:
-            forward_batch.prepare_mlp_sync_batch(self)
-        else:
-            forward_batch.prepare_attn_tp_scatter_input(self)
-
-        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-        if (
-            forward_batch.num_token_non_padded is not None
-            and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer(self.server_args)
-            and not is_nsa_enable_prefill_cp()
-        ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp(
-                server_args=self.server_args,
-            )
-
-        # Use precomputed SWA cache location
-        if forward_batch.out_cache_loc_swa is not None:
-            self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
-
-        # Hisparse coordinator
-        forward_batch.hisparse_coordinator = self.hisparse_coordinator
-        if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
-
-        # Forward without cuda graph
-        if forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif forward_batch.forward_mode.is_split_prefill():
-            ret = self.forward_split_prefill(
-                forward_batch,
-                reinit_attn_backend=reinit_attn_backend,
-                forward_count=split_forward_count,
-            )
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            ret, can_run_graph = self.forward_extend(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif forward_batch.forward_mode.is_idle():
-            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
-
-        if (
-            forward_batch.global_num_tokens_cpu is not None
-            and self.pp_group.is_last_rank
-        ):
-            forward_batch.post_forward_mlp_sync_batch(ret)
-
-        return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

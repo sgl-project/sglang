@@ -14,8 +14,8 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
 3. Register for CI at the **top of the file** (after imports, before test classes):
    ```python
    from sglang.test.ci.ci_register import register_cpu_ci
-   register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
-   # or: register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
+   register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+   # or: register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
    ```
    CUDA suites whose names follow `{stage}-test-{runner_config}` use the
    `stage=` + `runner_config=` form. Legacy `suite="..."` is kept for
@@ -44,7 +44,7 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
@@ -81,7 +81,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 from sglang.srt.managers.io_struct import FlushCacheReqInput
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 ```
 
 The same pattern (`sys.meta_path` finder) can be applied to other GPU-only packages.

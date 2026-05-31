@@ -29,7 +29,7 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>SGLANG_NPU_USE_MULTI_STREAM</code></td>
-      <td>Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek NSA Indexer.</td>
+      <td>Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek DSA Indexer.</td>
       <td><code>false</code></td>
     </tr>
     <tr>
@@ -74,11 +74,6 @@ This document provides a list of commonly used environment variables and aims to
     <tr>
       <td><code>MOE_ENABLE_TOPK_NEG_ONE</code></td>
       <td>Needs to be enabled when the expert ID to be processed by <br/> DEEPEP contains -1.</td>
-      <td><code>0</code></td>
-    </tr>
-    <tr>
-      <td><code>DEEP_NORMAL_MODE_USE_INT8_QUANT</code></td>
-      <td>Quantizes x to int8 and returns (tensor, scales) in dispatch operator.</td>
       <td><code>0</code></td>
     </tr>
   </tbody>
