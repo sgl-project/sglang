@@ -11,6 +11,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines.flux_progressive import (
+    FluxProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -85,8 +89,24 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
 
         self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
         self.add_standard_latent_preparation_stage()
-        self.add_standard_denoising_stage()
+        self._add_flux_denoising_stage()
         self.add_standard_decoding_stage()
+
+    def _add_flux_denoising_stage(self, stage_name: str = "denoising_stage") -> None:
+        """Add FluxProgressiveDenoisingStage.
+
+        Routes to DenoisingStage.forward() when progressive_mode == 'fullres'
+        (the default), preserving identical behaviour for non-progressive requests.
+        """
+        def create_stage():
+            return FluxProgressiveDenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+                pipeline=self,
+                vae=self.get_module("vae", None),
+            )
+
+        self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
 
 
 EntryClass = FluxPipeline
