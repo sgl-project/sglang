@@ -559,7 +559,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        ret._compute_derived_fields(batch)
+        ret._maybe_init_prefill_only(batch)
 
         device = model_runner.device
 
@@ -678,8 +678,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         return ret
 
-    def _compute_derived_fields(self, batch: ScheduleBatch):
-        """Derive per-request fields from ``batch.reqs`` (embedding / reward / scoring forwards)."""
+    def _maybe_init_prefill_only(self, batch: ScheduleBatch):
+        """Derive per-request fields from ``batch.reqs`` for non-generation
+        (embedding / reward / scoring) forwards; a no-op otherwise."""
+        if not self.is_prefill_only:
+            return
+
         if batch.model_config.is_matryoshka and any(
             r.dimensions is not None for r in batch.reqs
         ):
