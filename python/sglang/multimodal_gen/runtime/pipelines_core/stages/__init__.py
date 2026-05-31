@@ -85,6 +85,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
     DMDTimestepPreparationStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution import (
+    ProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.upsampling import (
     LTX2HalveResolutionStage,
     LTX2LoRASwitchStage,
@@ -102,6 +105,7 @@ __all__ = [
     "ComfyUILatentPreparationStage",
     "LTX2AVLatentPreparationStage",
     "DenoisingStage",
+    "ProgressiveDenoisingStage",
     "DmdDenoisingStage",
     "LTX2DenoisingStage",
     "LTX2AVDenoisingStage",

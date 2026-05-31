@@ -167,6 +167,20 @@ class SamplingParams:
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
+    # Progressive resolution growing (DCT spectral upsampling)
+    # "fullres" disables progressive mode (default, identical to standard generation).
+    # "dct_rewind" uses DCT-II upsample + scheduler sigma rewind (recommended).
+    # "dct" uses DCT-II upsample without rewind.
+    progressive_mode: str = field(
+        default="fullres", metadata={"batch_sig_exclude": True}
+    )
+    progressive_levels: int = field(
+        default=1, metadata={"batch_sig_exclude": True}
+    )
+    progressive_delta: float = field(
+        default=0.01, metadata={"batch_sig_exclude": True}
+    )
+
     # TeaCache parameters
     enable_teacache: bool = False
     teacache_params: Any = (
@@ -736,6 +750,28 @@ class SamplingParams:
             "--debug",
             action="store_true",
             help="",
+        )
+
+        # Progressive resolution growing (DCT spectral upsampling)
+        add_argument(
+            "--progressive-mode",
+            type=str,
+            dest="progressive_mode",
+            choices=["fullres", "dct", "dct_rewind"],
+            help="Progressive resolution mode. 'fullres' disables (default). "
+                 "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
+        )
+        add_argument(
+            "--progressive-levels",
+            type=int,
+            dest="progressive_levels",
+            help="Number of resolution halvings for progressive generation (default: 1).",
+        )
+        add_argument(
+            "--progressive-delta",
+            type=float,
+            dest="progressive_delta",
+            help="Noise-dominated tolerance δ for stage-transition thresholds (default: 0.01).",
         )
 
         add_argument(
