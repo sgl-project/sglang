@@ -1,13 +1,3 @@
-"""Hybrid SWA × chunked: naive ScriptedContext smoke.
-
-Hybrid sliding-window-attention models exercise an ``add_chunked_req``
-early-return branch under SWA pressure (see audit doc § "Hybrid SWA").
-We pump a prompt longer than the SWA window so the chunk loop has to
-cross the window boundary.
-
-Uses gpt-oss-20b — the same SWA model the existing
-``test_streaming_session_swa.py`` uses. Requires a single 80 GB GPU.
-"""
 
 import unittest
 
@@ -33,42 +23,30 @@ class TestSWABasic(ScriptedTestCase):
     )
 
     def test_naive_swa_chunked(self):
-        """Chunked prompt crosses the SWA window boundary at least once."""
         self.server.execute_script(self._script_naive_swa_chunked)
 
     @staticmethod
     def _script_naive_swa_chunked(t: ScriptedContext):
-        # Length chosen to exceed both DEFAULT_CHUNK_SIZE *and* the SWA
-        # window for gpt-oss-20b (4096) — guarantees the chunk loop has to
-        # cross the SWA boundary at least once.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 4096, max_new_tokens=4)
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
 
     def test_swa_prompt_equals_window(self):
-        """SWA chunked admission with prompt_len == sliding_window aligns to the boundary."""
         self.server.execute_script(self._script_swa_prompt_equals_window)
 
-    # prompt_len == sliding_window — chunked admission must
-    # complete with the window boundary aligned to the prompt end.
     @staticmethod
     def _script_swa_prompt_equals_window(t: ScriptedContext):
         r = t.start_req(prompt_len=_SWA_WINDOW, max_new_tokens=4)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
         assert r.chunks_done >= 2
-        # The exact window boundary should land at prompt end so no
-        # window-bookkeeping page is held past finish.
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
     def test_swa_budget_for_chunked_req_math(self):
-        """SWA _swa_budget_for_req math must not overflow across chunk_size / window combos."""
         self.server.execute_script(self._script_swa_budget_for_chunked_req_math)
 
-    # SWA _swa_budget_for_req — chunk size vs sliding window
-    # combos must not overflow the budget formula or trigger OOM.
     @staticmethod
     def _script_swa_budget_for_chunked_req_math(t: ScriptedContext):
         r = t.start_req(prompt_len=_SWA_WINDOW + 13, max_new_tokens=2)
@@ -79,12 +57,8 @@ class TestSWABasic(ScriptedTestCase):
         ), f"SWA budget overflowed {r.swa_budget_overflow_count} times"
 
     def test_swa_chunked_resume_kv_committed_bound(self):
-        """SWA early-return between chunks: prefix_indices must be bounded by kv_committed_len."""
         self.server.execute_script(self._script_swa_chunked_resume_kv_committed_bound)
 
-    # SWA early-return between two chunks — the next iter
-    # must read prefix_indices only up to kv_committed_len; rows past
-    # kv_committed_len are uninitialized and would corrupt the chunk.
     @staticmethod
     def _script_swa_chunked_resume_kv_committed_bound(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -110,17 +84,13 @@ class TestSWAHalfWindowChunk(ScriptedTestCase):
     )
 
     def test_swa_prompt_2x_window_half_chunks(self):
-        """SWA prompt = 2*window, chunk_size = window/2 — each chunk crosses the boundary."""
         self.server.execute_script(self._script_swa_prompt_2x_window_half_chunks)
 
-    # prompt = 2 * sliding_window, chunk_size = window/2 — every
-    # chunk straddles the window boundary; output must still be correct.
     @staticmethod
     def _script_swa_prompt_2x_window_half_chunks(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * _SWA_WINDOW, max_new_tokens=4)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        # 2*window / (window/2) == 4 chunks.
         assert (
             r.chunks_done >= 4
         ), f"expected >=4 chunks for 2*window / (window/2), got {r.chunks_done}"
@@ -136,19 +106,13 @@ class TestSWAChunkSizeExceedsWindow(ScriptedTestCase):
     )
 
     def test_swa_chunk_size_exceeds_window(self):
-        """SWA chunk_size > sliding_window: engine must accept or reject cleanly and consistently."""
         self.server.execute_script(self._script_swa_chunk_size_exceeds_window)
 
-    # chunk_size > sliding_window — engine must either reject
-    # at startup or accept and complete; behavior must be consistent
-    # across runs (no flaky partial init).
     @staticmethod
     def _script_swa_chunk_size_exceeds_window(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        # If we got here the engine accepted the config; output must
-        # still be valid.
         assert len(r.output_tokens) == 2
 
 
@@ -162,13 +126,10 @@ class TestSWAOverlap(ScriptedTestCase):
     )
 
     def test_swa_chunk_cache_evict_skips_first_two_extends(self):
-        """SWA + overlap + chunked: the first two extend_batch_idx values must skip eviction."""
         self.server.execute_script(
             self._script_swa_chunk_cache_evict_skips_first_two_extends
         )
 
-    # SWA + overlap + chunked — the extend_batch_idx < 2 path must
-    # not evict; verifies skip count >= 2 on the first chunk admission.
     @staticmethod
     def _script_swa_chunk_cache_evict_skips_first_two_extends(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -190,19 +151,13 @@ class TestSWARadix(ScriptedTestCase):
     )
 
     def test_swa_radix_partial_hit_straddles_window(self):
-        """SWA + radix + chunked: prefix hit, window, and chunked admission stay consistent."""
         self.server.execute_script(self._script_swa_radix_partial_hit_straddles_window)
 
-    # SWA + radix + chunked — partial prefix hit that straddles
-    # the SWA window; admission must coordinate prefix_indices with the
-    # window boundary and chunk admission cleanly.
     @staticmethod
     def _script_swa_radix_partial_hit_straddles_window(t: ScriptedContext):
-        # First req populates the radix prefix.
         r1 = t.start_req(prompt_len=_SWA_WINDOW + DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until_finished(r1, max_steps=800)
         assert r1.finished
-        # Second req hits the prefix that straddles the SWA window.
         r2 = t.start_req(
             prompt_len=_SWA_WINDOW + DEFAULT_CHUNK_SIZE * 2, max_new_tokens=2
         )

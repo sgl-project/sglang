@@ -1,16 +1,3 @@
-"""Invariant scripted tests for chunked prefill.
-
-State-query API invariants (A.8 series from the expansion plan). These
-tests are contract-style — they don't drive an interesting trajectory,
-they just hammer on the harness API (status, chunks_done, kv_pages,
-batch_composition, etc.) at every yield step and verify the
-monotone / non-negative / self-consistent invariants hold.
-
-Also covers B.5 series — long-running stability scenarios and stress
-fan-outs. The focus is "no resource leak after many reqs" — every test
-starts and finishes a baseline run, then asserts ``engine_stats``
-returns to (or above) the initial pool counts.
-"""
 
 import unittest
 
@@ -32,12 +19,10 @@ class TestInvariantsBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_status_unknown_before_submit(self):
-        """A bare ScriptedReqHandle whose rid was never submitted reports "unknown"."""
         self.server.execute_script(self._script_status_unknown_before_submit)
 
     @staticmethod
     def _script_status_unknown_before_submit(t: ScriptedContext):
-        # A bare ScriptedReqHandle whose rid was never submitted reports "unknown".
         bogus = ScriptedReqHandle(
             rid="never-submitted", scheduler_hook=t._scheduler_hook
         )
@@ -45,37 +30,28 @@ class TestInvariantsBasic(ScriptedTestCase):
         yield
 
     def test_status_finished_after_done(self):
-        """After finish, r.status == "finished" (not unknown)."""
         self.server.execute_script(self._script_status_finished_after_done)
 
     @staticmethod
     def _script_status_finished_after_done(t: ScriptedContext):
-        # After finish, r.status == "finished" (not unknown).
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.status == "finished"
 
     def test_kv_pages_zero_after_finish(self):
-        """Kv_pages drops to 0 after the req finishes."""
         self.server.execute_script(self._script_kv_pages_zero_after_finish)
 
     @staticmethod
     def _script_kv_pages_zero_after_finish(t: ScriptedContext):
-        # kv_pages drops to 0 after the req finishes.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.kv_pages == 0
 
     def test_kv_pages_positive_continuously_mid_chunk(self):
-        """While the chunked req is mid-chunk, kv_pages > 0 on every yield."""
         self.server.execute_script(
             self._script_kv_pages_positive_continuously_mid_chunk
         )
 
-    # docstring-claim fix: the older single-point variant only sampled
-    # once after run_until(is_chunking). The real invariant is that
-    # kv_pages stays > 0 across the entire chunked lifetime — verify
-    # that continuously.
     @staticmethod
     def _script_kv_pages_positive_continuously_mid_chunk(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -94,14 +70,12 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert r.finished
 
     def test_batch_composition_consistent_with_status(self):
-        """If r.status == "running" then r.rid appears in batch_composition."""
         self.server.execute_script(
             self._script_batch_composition_consistent_with_status
         )
 
     @staticmethod
     def _script_batch_composition_consistent_with_status(t: ScriptedContext):
-        # If r.status == "running" then r.rid appears in batch_composition.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
             if r.status == "running":
@@ -120,12 +94,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_is_idle_excludes_chunked_in_flight(self):
-        """T.is_idle and chunked_in_flight_count > 0 are mutually exclusive."""
         self.server.execute_script(self._script_is_idle_excludes_chunked_in_flight)
 
     @staticmethod
     def _script_is_idle_excludes_chunked_in_flight(t: ScriptedContext):
-        # t.is_idle and chunked_in_flight_count > 0 are mutually exclusive.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
             if t.chunked_in_flight_count() > 0:
@@ -136,23 +108,19 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_finish_event_count_exactly_one(self):
-        """Every normally-completed req emits exactly one finish event."""
         self.server.execute_script(self._script_finish_event_count_exactly_one)
 
     @staticmethod
     def _script_finish_event_count_exactly_one(t: ScriptedContext):
-        # Every normally-completed req emits exactly one finish event.
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finish_event_count == 1
 
     def test_kv_pages_non_negative(self):
-        """Kv_pages never negative across the chunked lifecycle."""
         self.server.execute_script(self._script_kv_pages_non_negative)
 
     @staticmethod
     def _script_kv_pages_non_negative(t: ScriptedContext):
-        # kv_pages never negative across the chunked lifecycle.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
             assert r.kv_pages >= 0
@@ -162,13 +130,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_pending_middle_outputs_non_negative(self):
-        """Pending_middle_outputs non-negative across the chunked lifecycle."""
         self.server.execute_script(self._script_pending_middle_outputs_non_negative)
 
     @staticmethod
     def _script_pending_middle_outputs_non_negative(t: ScriptedContext):
-        # pending_middle_outputs non-negative across the chunked
-        # lifecycle.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
             assert r.pending_middle_outputs >= 0
@@ -178,14 +143,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_inflight_middle_chunks_non_negative(self):
-        """Inflight_middle_chunks counter stays non-negative across all yields."""
         self.server.execute_script(self._script_inflight_middle_chunks_non_negative)
 
     @staticmethod
     def _script_inflight_middle_chunks_non_negative(t: ScriptedContext):
-        # The non-negative bound on inflight_middle_chunks is enforced
-        # by the invariant that decrement must only happen on the final
-        # chunk. Verify the counter floor at every yield.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
             assert r.inflight_middle_chunks >= 0
@@ -195,7 +156,6 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_lock_refs_non_negative(self):
-        """Lock_refs counter stays non-negative across all yields."""
         self.server.execute_script(self._script_lock_refs_non_negative)
 
     @staticmethod
@@ -209,12 +169,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_chunked_in_flight_count_le_one(self):
-        """Main-upstream invariant: at most one chunked req in flight."""
         self.server.execute_script(self._script_chunked_in_flight_count_le_one)
 
     @staticmethod
     def _script_chunked_in_flight_count_le_one(t: ScriptedContext):
-        # main-upstream invariant: at most one chunked req in flight.
         reqs = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
             for _ in range(3)
@@ -227,13 +185,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("not all reqs finished")
 
     def test_active_reqs_listing(self):
-        """NEW API NEEDED: t.list_active_reqs() returns the currently-running set of ScriptedReqHandle objects."""
         self.server.execute_script(self._script_active_reqs_listing)
 
     @staticmethod
     def _script_active_reqs_listing(t: ScriptedContext):
-        # NEW API NEEDED: t.list_active_reqs() returns the currently-running
-        # set of ScriptedReqHandle objects.
         r1 = t.start_req(prompt_len=16, max_new_tokens=4)
         r2 = t.start_req(prompt_len=16, max_new_tokens=4)
         yield
@@ -245,12 +200,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert all(h.rid not in (r1.rid, r2.rid) for h in actives_after)
 
     def test_batch_composition_disjoint_subsets(self):
-        """Prefill / decode / chunked subsets must be disjoint."""
         self.server.execute_script(self._script_batch_composition_disjoint_subsets)
 
     @staticmethod
     def _script_batch_composition_disjoint_subsets(t: ScriptedContext):
-        # prefill / decode / chunked subsets must be disjoint.
         r1 = t.start_req(prompt_len=16, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(DEFAULT_MAX_STEPS):
@@ -266,12 +219,10 @@ class TestInvariantsBasic(ScriptedTestCase):
             yield
 
     def test_finished_means_chunks_done_stable(self):
-        """Once finished, chunks_done value should not change."""
         self.server.execute_script(self._script_finished_means_chunks_done_stable)
 
     @staticmethod
     def _script_finished_means_chunks_done_stable(t: ScriptedContext):
-        # Once finished, chunks_done value should not change.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         snap = r.chunks_done
@@ -280,7 +231,6 @@ class TestInvariantsBasic(ScriptedTestCase):
             assert r.chunks_done == snap
 
     def test_finished_means_kv_pages_stays_zero(self):
-        """After finish, kv_pages remains 0 across subsequent yields."""
         self.server.execute_script(self._script_finished_means_kv_pages_stays_zero)
 
     @staticmethod
@@ -292,12 +242,10 @@ class TestInvariantsBasic(ScriptedTestCase):
             assert r.kv_pages == 0
 
     def test_engine_stats_keys_present(self):
-        """Engine_stats returns a dict with expected keys."""
         self.server.execute_script(self._script_engine_stats_keys_present)
 
     @staticmethod
     def _script_engine_stats_keys_present(t: ScriptedContext):
-        # engine_stats returns a dict with expected keys.
         stats = t.engine_stats()
         assert isinstance(stats, dict)
         assert "kv_pool_free" in stats
@@ -305,12 +253,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         yield
 
     def test_kv_pool_recovers_to_baseline(self):
-        """Full lifecycle: pool counts return to baseline after all done."""
         self.server.execute_script(self._script_kv_pool_recovers_to_baseline)
 
     @staticmethod
     def _script_kv_pool_recovers_to_baseline(t: ScriptedContext):
-        # Full lifecycle: pool counts return to baseline after all done.
         before = t.engine_stats()["kv_pool_free"]
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
         yield from run_until_all_finished(reqs)
@@ -318,12 +264,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert after >= before
 
     def test_hundred_reqs_no_leak(self):
-        """100 reqs end-to-end: KV/row/lock_ref pool counts return to baseline."""
         self.server.execute_script(self._script_hundred_reqs_no_leak)
 
     @staticmethod
     def _script_hundred_reqs_no_leak(t: ScriptedContext):
-        # 100 reqs end-to-end: KV/row/lock_ref pool counts return to baseline.
         baseline = t.engine_stats()
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(100)]
         yield from run_until_all_finished(reqs, max_steps=4000)
@@ -334,7 +278,6 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert final["row_pool_free"] >= baseline["row_pool_free"]
 
     def test_two_hundred_reqs_no_leak(self):
-        """200 short reqs end-to-end leave KV pool >= baseline."""
         self.server.execute_script(self._script_two_hundred_reqs_no_leak)
 
     @staticmethod
@@ -346,7 +289,6 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_five_hundred_reqs_no_leak(self):
-        """500 short reqs end-to-end leave KV pool >= baseline."""
         self.server.execute_script(self._script_five_hundred_reqs_no_leak)
 
     @staticmethod
@@ -358,13 +300,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_long_lived_engine_reps_chunked(self):
-        """20 rounds × 5 reqs each; KV pool returns to baseline."""
         self.server.execute_script(self._script_long_lived_engine_reps_chunked)
 
     @staticmethod
     def _script_long_lived_engine_reps_chunked(t: ScriptedContext):
-        # 20 rounds × 5 reqs each. Each round drives a fresh chunked
-        # batch and the KV pool must not leak across the whole run.
         baseline = t.engine_stats()
         for _ in range(20):
             reqs = [
@@ -378,13 +317,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_sustained_long_chunked_load(self):
-        """Sustained: 30 long chunked reqs; chunked-in-flight stays <= 1."""
         self.server.execute_script(self._script_sustained_long_chunked_load)
 
     @staticmethod
     def _script_sustained_long_chunked_load(t: ScriptedContext):
-        # Sustained: 30 long chunked reqs. Verify the single-in-flight
-        # invariant at every yield.
         reqs = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
             for _ in range(30)
@@ -398,13 +334,10 @@ class TestInvariantsBasic(ScriptedTestCase):
             assert r.finished
 
     def test_round_robin_short_and_chunked(self):
-        """50 short followed by 5 chunked, 5 rounds; KV recovers."""
         self.server.execute_script(self._script_round_robin_short_and_chunked)
 
     @staticmethod
     def _script_round_robin_short_and_chunked(t: ScriptedContext):
-        # 50 short followed by 5 chunked, 5 rounds. KV must recover and
-        # every req must finish.
         baseline = t.engine_stats()
         for _ in range(5):
             shorts = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
@@ -419,14 +352,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_long_decode_then_many_short(self):
-        """One very long decode + many short; chunked slot must stay empty."""
         self.server.execute_script(self._script_long_decode_then_many_short)
 
     @staticmethod
     def _script_long_decode_then_many_short(t: ScriptedContext):
-        # One very long decode + many short. No req should ever chunk
-        # (prompt_len=16 fits in one chunk), so the chunked slot must
-        # remain None throughout.
         long_decode = t.start_req(prompt_len=16, max_new_tokens=256)
         shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(50)]
         all_reqs = [long_decode] + shorts
@@ -438,17 +367,12 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("not all reqs finished")
 
     def test_chunked_in_flight_count_never_above_one_long_run(self):
-        """50 chunked reqs over many yields; verify invariant at every step."""
         self.server.execute_script(
             self._script_chunked_in_flight_count_never_above_one_long_run
         )
 
     @staticmethod
     def _script_chunked_in_flight_count_never_above_one_long_run(t: ScriptedContext):
-        # 50 chunked reqs over many yields; verify invariant at every step.
-        # Step budget bumped to DEFAULT_MAX_STEPS * 60 because 50 chunked
-        # reqs with VERY_LONG_PROMPT_LEN each can take many chunk
-        # iterations and the original *30 budget was borderline-tight.
         reqs = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
             for _ in range(50)
@@ -461,12 +385,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("not all reqs finished")
 
     def test_engine_stats_monotone_after_each_batch(self):
-        """After each batch finishes, kv_pool_free non-decreasing vs end-of-prev-batch."""
         self.server.execute_script(self._script_engine_stats_monotone_after_each_batch)
 
     @staticmethod
     def _script_engine_stats_monotone_after_each_batch(t: ScriptedContext):
-        # After each batch finishes, kv_pool_free non-decreasing vs end-of-prev-batch.
         last = None
         for _ in range(10):
             reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(8)]
@@ -477,13 +399,8 @@ class TestInvariantsBasic(ScriptedTestCase):
             last = cur
 
     def test_chunked_status_never_mid_chunk_running(self):
-        """Long chunked req's status only ever takes legal values across the chunked lifecycle."""
         self.server.execute_script(self._script_chunked_status_never_mid_chunk_running)
 
-    # chunked status legal-set — during chunked admission a
-    # req's externally observable status must remain in {waiting, running}
-    # while chunking, never a synthetic "mid-chunk" leak; once chunked
-    # completes it transitions to finished and never re-enters waiting.
     @staticmethod
     def _script_chunked_status_never_mid_chunk_running(t: ScriptedContext):
         legal_pre_finish = {"waiting", "running", "unknown"}
@@ -503,20 +420,11 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_pending_middle_outputs_caps_at_one(self):
-        """Long chunked req's pending_middle_outputs is capped at 1 across its lifetime."""
         self.server.execute_script(self._script_pending_middle_outputs_caps_at_one)
 
-    # pending_middle_outputs cap — at any
-    # iteration there must be at most one pending middle output; the
-    # revert of e875cd36e4 re-established this invariant.
     @staticmethod
     def _script_pending_middle_outputs_caps_at_one(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        # Sample BEFORE the first yield, AFTER every yield (including the
-        # finish iter), and for several yields AFTER r.finished to verify
-        # the counter is reset and stays at 0. The lifetime maximum must
-        # be exactly 1 — proves chunking happened (>=1) and the cap held
-        # (<=1).
         running_max = r.pending_middle_outputs
         running_max_post_finish = 0
         post_finish_samples = 0
@@ -540,12 +448,8 @@ class TestInvariantsBasic(ScriptedTestCase):
         )
 
     def test_status_never_finished_to_waiting(self):
-        """After finish, status never rolls back to waiting / running / unknown."""
         self.server.execute_script(self._script_status_never_finished_to_waiting)
 
-    # finished is terminal — once a req has finished, its
-    # observable status must never roll back to waiting / running /
-    # unknown across subsequent yields.
     @staticmethod
     def _script_status_never_finished_to_waiting(t: ScriptedContext):
         r = t.start_req(prompt_len=16, max_new_tokens=2)
@@ -558,22 +462,13 @@ class TestInvariantsBasic(ScriptedTestCase):
             ), f"status rolled back from finished to {r.status!r}"
 
     def test_chunks_done_strictly_increases_no_plateaus(self):
-        """Across consecutive non-finished yields while chunking, chunks_done is strictly increasing (no plateaus); subsumes the simpler non-decreasing invariant."""
         self.server.execute_script(
             self._script_chunks_done_strictly_increases_no_plateaus
         )
 
-    # chunks_done should make forward progress on every iter
-    # the chunked req is actively chunking — a plateau (two consecutive
-    # mid-chunk yields with the same chunks_done) would indicate the
-    # scheduler stalled or wasted an iter on an in-flight chunked req.
-    # This subsumes the simpler "non-decreasing" invariant: a strictly
-    # increasing sequence is by definition non-decreasing.
     @staticmethod
     def _script_chunks_done_strictly_increases_no_plateaus(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        # Wait until the req actually enters chunked admission so the
-        # first sample is meaningful.
         yield from run_until(r, lambda h: h.is_chunking)
         prev_chunks_done = r.chunks_done
         prev_was_chunking = r.is_chunking
@@ -583,9 +478,6 @@ class TestInvariantsBasic(ScriptedTestCase):
                 return
             cur_chunks_done = r.chunks_done
             cur_is_chunking = r.is_chunking
-            # Between two consecutive iterations where the req is
-            # actively chunking (not just sitting in waiting awaiting
-            # admission), chunks_done must strictly advance.
             if prev_was_chunking and cur_is_chunking:
                 assert cur_chunks_done > prev_chunks_done, (
                     f"chunks_done plateau between consecutive mid-chunk "
@@ -596,20 +488,13 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_output_tokens_len_equals_max_new_tokens_chunked(self):
-        """Ignore_eos + chunked: len(output_tokens) == max_new_tokens after finish."""
         self.server.execute_script(
             self._script_output_tokens_len_equals_max_new_tokens_chunked
         )
 
-    # output-state contract: when ignore_eos=True forces decode
-    # to run to completion across max_new_tokens iters, the recorded
-    # output_tokens list must contain exactly N tokens regardless of
-    # how many chunks the prefill spanned.
     @staticmethod
     def _script_output_tokens_len_equals_max_new_tokens_chunked(t: ScriptedContext):
         n: int = 8
-        # NEW API NEEDED: start_req(..., ignore_eos=True) — sampling kwarg
-        # passthrough so decode runs to max_new_tokens.
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=n,
@@ -620,45 +505,32 @@ class TestInvariantsBasic(ScriptedTestCase):
         assert (
             r.chunks_done >= 2
         ), f"VERY_LONG_PROMPT_LEN should chunk; got chunks_done={r.chunks_done}"
-        # NEW API NEEDED: r.output_tokens — list[int] of decoded tokens.
         assert len(r.output_tokens) == n, (
             f"ignore_eos=True + max_new_tokens={n} must produce exactly "
             f"{n} output tokens; got len(output_tokens)={len(r.output_tokens)}"
         )
 
     def test_num_input_tokens_equals_prompt_len_for_chunked(self):
-        """Chunked req's num_input_tokens equals prompt_len even after multi-chunk admission."""
         self.server.execute_script(
             self._script_num_input_tokens_equals_prompt_len_for_chunked
         )
 
-    # output-state contract: r.num_input_tokens must reflect the
-    # original prompt length regardless of how many chunks the prefill
-    # took. Pre-fix bugs in some refactor branches accidentally reported
-    # the size of the *last* chunk, not the whole prompt.
     @staticmethod
     def _script_num_input_tokens_equals_prompt_len_for_chunked(t: ScriptedContext):
         prompt_len: int = VERY_LONG_PROMPT_LEN
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        # NEW API NEEDED: r.num_input_tokens — total prompt token count
-        # observable on the handle after finish.
         assert r.num_input_tokens == prompt_len, (
             f"num_input_tokens must equal prompt_len after chunked finish; "
             f"expected {prompt_len}, got {r.num_input_tokens}"
         )
 
     def test_chunked_in_flight_count_exactly_zero_after_finish(self):
-        """After finish, chunked_in_flight_count() stays exactly 0 for several idle yields."""
         self.server.execute_script(
             self._script_chunked_in_flight_count_exactly_zero_after_finish
         )
 
-    # post-finish invariant: a long chunked req must observe
-    # chunked_in_flight_count() == 1 while in flight, then == 0 for at
-    # least 3 idle yields after finish. Guards against stale chunked_req
-    # pointers leaking into the in-flight counter.
     @staticmethod
     def _script_chunked_in_flight_count_exactly_zero_after_finish(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -676,15 +548,10 @@ class TestInvariantsBasic(ScriptedTestCase):
             )
 
     def test_pending_middle_outputs_zero_at_idle_yields(self):
-        """After finish + 5 idle yields, pending_middle_outputs is 0."""
         self.server.execute_script(
             self._script_pending_middle_outputs_zero_at_idle_yields
         )
 
-    # post-finish invariant: once a chunked req finishes, the
-    # pending_middle_outputs counter on the handle must drain to 0 and
-    # stay there across idle yields. Guards against the e875cd36e4-style
-    # bump leaking past finish.
     @staticmethod
     def _script_pending_middle_outputs_zero_at_idle_yields(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -697,32 +564,20 @@ class TestInvariantsBasic(ScriptedTestCase):
             )
 
     def test_extend_batch_idx_monotonic_invariant(self):
-        """Invariant B6: req.extend_batch_idx is monotonic non-decreasing, except across retract resets.
-
-        Direct access to ``_scheduler`` internals is intentional; this is an
-        invariant-tier test (see direct-internals-access plan).
-        """
         self.server.execute_script(self._script_extend_batch_idx_monotonic_invariant)
 
-    # B6 — extend_batch_idx monotonic across consecutive iters for the
-    # same Req object; a regression is only allowed if the req was just
-    # retracted (is_retracted flipped from False to True).
     @staticmethod
     def _script_extend_batch_idx_monotonic_invariant(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         prev_extend_batch_idx: int = -1
         prev_is_retracted: bool = False
         for _ in range(DEFAULT_MAX_STEPS):
-            # Walk every scheduler structure to locate the raw Req — the
-            # ScriptedContext helper already covers chunked_req,
-            # waiting_queue, running_batch, and last_batch.
             req = t._find_req_by_rid(r.rid)
             if req is not None:
                 cur_extend_batch_idx = req.extend_batch_idx
                 cur_is_retracted = req.is_retracted
                 if prev_extend_batch_idx >= 0:
                     if cur_extend_batch_idx < prev_extend_batch_idx:
-                        # Regression only allowed if retract just flipped.
                         assert cur_is_retracted and not prev_is_retracted, (
                             f"extend_batch_idx regressed without retract: "
                             f"{prev_extend_batch_idx} -> {cur_extend_batch_idx}, "
@@ -737,19 +592,10 @@ class TestInvariantsBasic(ScriptedTestCase):
         raise AssertionError("req never finished")
 
     def test_inflight_decrement_only_on_final_invariant(self):
-        """Invariant R1: req.inflight_middle_chunks decreases only when chunked_req slot is released or req finishes.
-
-        Direct access to ``_scheduler`` internals is intentional; this is an
-        invariant-tier test (see direct-internals-access plan).
-        """
         self.server.execute_script(
             self._script_inflight_decrement_only_on_final_invariant
         )
 
-    # R1 — every time inflight_middle_chunks drops between two
-    # consecutive observations, the chunked_req slot must have been
-    # released (no longer pointing at this req) or the req must have
-    # entered the finished state in the same iter.
     @staticmethod
     def _script_inflight_decrement_only_on_final_invariant(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
@@ -767,10 +613,6 @@ class TestInvariantsBasic(ScriptedTestCase):
             cur_finished = req.finished() if req is not None else True
             if cur_inflight < prev_inflight:
                 observed_decrement = True
-                # Decrement legal iff: the chunked_req slot just released
-                # this req (prev was slot, cur is not) OR the req just
-                # entered finished state OR the req disappeared (req is
-                # None implies left every scheduler structure ~ finished).
                 slot_just_released = prev_was_chunked_slot and not cur_is_chunked_slot
                 finish_just_happened = (not prev_finished) and cur_finished
                 assert slot_just_released or finish_just_happened, (
@@ -787,31 +629,18 @@ class TestInvariantsBasic(ScriptedTestCase):
                 break
             yield
         assert r.finished
-        # Sanity: a multi-chunk req must have triggered at least one
-        # decrement of inflight_middle_chunks across its lifecycle —
-        # otherwise the invariant is vacuously true.
         assert observed_decrement, (
             "test must observe at least one inflight_middle_chunks decrement "
             "across the chunked lifecycle"
         )
 
     def test_decode_side_chunked_req_always_none(self):
-        """Pure decode workload: get_chunked_req_rid() is always None."""
         self.server.execute_script(self._script_decode_side_chunked_req_always_none)
 
-    # scheduler.py decode-side branch: when the workload
-    # is pure decode (no req with a chunked prefill), the scheduler's
-    # chunked_req slot must remain None across the entire lifetime.
-    # Negative control for the chunked admission paths — proves the
-    # chunked slot is not accidentally populated by short-prompt reqs.
     @staticmethod
     def _script_decode_side_chunked_req_always_none(t: ScriptedContext):
-        # Submit several short reqs so the engine is not idle — the
-        # scheduler is actively decoding, but no req triggers chunking.
         reqs = [t.start_req(prompt_len=8, max_new_tokens=16) for _ in range(4)]
         for _ in range(50):
-            # NEW API NEEDED: t.get_chunked_req_rid() — current
-            # scheduler.chunked_req rid (or None).
             assert t.get_chunked_req_rid() is None, (
                 f"pure decode workload must keep chunked_req None; got "
                 f"{t.get_chunked_req_rid()!r}"

@@ -9,8 +9,6 @@ class TestChunkedFeaturePriority(ChunkedTestBase):
     gsm8k_threshold = 0.50
     feature_args = [
         "--enable-priority-scheduling",
-        # Keep concurrency moderate so the priority queue actually fills and
-        # the early-exit-with-chunked-resume branches trigger.
         "--max-running-requests",
         "8",
         "--max-queued-requests",

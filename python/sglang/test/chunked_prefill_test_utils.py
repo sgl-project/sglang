@@ -107,8 +107,6 @@ class ChunkedTestBase(CustomTestCase):
     num_examples: ClassVar[int] = DEFAULT_NUM_EXAMPLES
     num_threads: ClassVar[int] = DEFAULT_NUM_THREADS
     max_tokens: ClassVar[int] = DEFAULT_MAX_TOKENS
-    # No default: every concrete subclass must set gsm8k_threshold explicitly
-    # so the expected accuracy floor is visible per fixture.
     gsm8k_threshold: ClassVar[float]
     seed: ClassVar[int] = DEFAULT_SEED
 
@@ -134,7 +132,6 @@ class ChunkedTestBase(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def test_mixed_prefix_gsm8k_chunked(self):
-        """Mixed-prefix GSM8K accuracy stays above threshold under chunked prefill."""
         fixture_name = type(self).__name__
         metrics = self._simple_tester.run_eval(self.base_url, self.model, fixture_name)
         self._simple_tester.assert_score(self, metrics, fixture_name)
@@ -149,8 +146,6 @@ class ChunkedTestPDBase(PDDisaggregationServerBase):
     num_examples: ClassVar[int] = DEFAULT_NUM_EXAMPLES
     num_threads: ClassVar[int] = DEFAULT_NUM_THREADS
     max_tokens: ClassVar[int] = DEFAULT_MAX_TOKENS
-    # No default: every concrete subclass must set gsm8k_threshold explicitly
-    # so the expected accuracy floor is visible per fixture.
     gsm8k_threshold: ClassVar[float]
     seed: ClassVar[int] = DEFAULT_SEED
 
@@ -170,7 +165,6 @@ class ChunkedTestPDBase(PDDisaggregationServerBase):
         PDDisaggregationServerBase.tearDownClass()
 
     def test_mixed_prefix_gsm8k_chunked(self):
-        """Mixed-prefix GSM8K accuracy stays above threshold under chunked prefill."""
         fixture_name = type(self).__name__
         metrics = self._simple_tester.run_eval(self.base_url, self.model, fixture_name)
         self._simple_tester.assert_score(self, metrics, fixture_name)

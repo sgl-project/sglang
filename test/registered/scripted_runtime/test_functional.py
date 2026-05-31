@@ -1,8 +1,3 @@
-"""Functional tests for ScriptedContext.
-
-Script functions are top-level (spawn-mode mp imports them by name)
-and underscore-prefixed (so unittest discovery skips them).
-"""
 
 import unittest
 
@@ -26,19 +21,15 @@ class TestFunctional(ScriptedTestCase):
     )
 
     def test_empty_script_returns_immediately(self):
-        """Generator script that never yields returns without error."""
         self.server.execute_script(self._script_empty_return)
 
     @staticmethod
     def _script_empty_return(t: ScriptedContext):
-        # Unreachable yield keeps this a generator function, but the body
-        # returns without ever yielding.
         if False:
             yield
         return
 
     def test_script_raises_assertion_surfaces_to_caller(self):
-        """AssertionError from script body surfaces back to the caller."""
         with self.assertRaises(AssertionError) as ctx:
             self.server.execute_script(self._script_assertion_failure)
         self.assertIn("boom", str(ctx.exception))
@@ -49,7 +40,6 @@ class TestFunctional(ScriptedTestCase):
         assert False, "boom"
 
     def test_script_raises_runtime_error_surfaces_to_caller(self):
-        """RuntimeError from script body surfaces back to the caller as AssertionError."""
         with self.assertRaises(AssertionError) as ctx:
             self.server.execute_script(self._script_runtime_error)
         err_text = str(ctx.exception)
@@ -62,22 +52,17 @@ class TestFunctional(ScriptedTestCase):
         raise RuntimeError("simulated runtime error")
 
     def test_non_generator_script_function_errors_cleanly(self):
-        """Non-generator script function is rejected with a clear error."""
         with self.assertRaises(AssertionError) as ctx:
             self.server.execute_script(self._script_not_a_generator)
         err_text = str(ctx.exception)
-        # The router does ``yield from sub_gen`` where ``sub_gen`` is None,
-        # which raises TypeError caught by the router and surfaced here.
         self.assertIn("TypeError", err_text)
         self.assertIn("NoneType", err_text)
 
     @staticmethod
     def _script_not_a_generator(t: ScriptedContext):
-        # No yield => regular function => calling returns None, not a generator.
         return None
 
     def test_api_smoke_r_finished(self):
-        """ScriptedReqHandle.finished returns True once the req completes."""
         self.server.execute_script(self._script_api_smoke_r_finished)
 
     @staticmethod
@@ -89,7 +74,6 @@ class TestFunctional(ScriptedTestCase):
             yield
 
     def test_api_smoke_start_req_explicit_rid(self):
-        """start_req accepts an explicit rid kwarg and uses it."""
         self.server.execute_script(self._script_api_smoke_start_req_explicit_rid)
 
     @staticmethod

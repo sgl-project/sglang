@@ -1,11 +1,3 @@
-"""Unit tests for scripted_runtime/background_http_poster — no real HTTP server.
-
-Covers the four pieces of ``BackgroundHttpPoster`` that carry real logic: the
-background event-loop/thread lifecycle, cross-thread coroutine dispatch, the
-done-callback that logs and swallows coroutine failures, and the create-or-reuse
-``aiohttp`` session branching. The ``post`` coroutine runs against a fake session
-so the POST call and body read are observable without any network.
-"""
 
 from __future__ import annotations
 
@@ -24,7 +16,6 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _FakeResponse:
-    """Stand-in aiohttp response: tracks whether the body was read."""
 
     def __init__(self) -> None:
         self.read_called = False
@@ -35,7 +26,6 @@ class _FakeResponse:
 
 
 class _FakePostCM:
-    """Async context manager returned by a fake ``session.post(...)``."""
 
     def __init__(self, response: _FakeResponse) -> None:
         self._response = response
@@ -48,7 +38,6 @@ class _FakePostCM:
 
 
 class _FakeSession:
-    """Records every ``post`` call and hands back one shared fake response."""
 
     def __init__(self) -> None:
         self.closed = False
@@ -64,10 +53,8 @@ class _FakeSession:
 
 
 class TestBackgroundHttpPosterLifecycle(CustomTestCase):
-    """__init__ spins up a running loop on a daemon thread; close tears it down."""
 
     def test_init_starts_running_loop_on_daemon_thread(self):
-        """After construction the background loop is running on a live daemon thread."""
         poster = BackgroundHttpPoster()
         self.addCleanup(poster.close)
 
@@ -77,7 +64,6 @@ class TestBackgroundHttpPosterLifecycle(CustomTestCase):
         self.assertTrue(poster._thread.daemon)
 
     def test_close_stops_loop_and_joins_thread(self):
-        """close() stops the event loop and joins the background thread."""
         poster = BackgroundHttpPoster()
 
         poster.close()
@@ -86,20 +72,17 @@ class TestBackgroundHttpPosterLifecycle(CustomTestCase):
         self.assertFalse(poster._thread.is_alive())
 
     def test_close_is_safe_when_loop_never_started(self):
-        """close() returns early (no raise) when the loop was never created."""
         poster = BackgroundHttpPoster.__new__(BackgroundHttpPoster)
         poster._loop = None
         poster._thread = None
         poster._session = None
 
-        poster.close()  # must not raise
+        poster.close()
 
 
 class TestBackgroundHttpPosterSubmitCoro(CustomTestCase):
-    """submit_coro dispatches onto the background loop and never lets it crash."""
 
     def test_submit_coro_runs_on_background_loop_thread(self):
-        """The submitted coroutine executes on the named background loop thread."""
         poster = BackgroundHttpPoster()
         self.addCleanup(poster.close)
         done = threading.Event()
@@ -115,7 +98,6 @@ class TestBackgroundHttpPosterSubmitCoro(CustomTestCase):
         self.assertEqual(recorded["thread_name"], "scripted-runtime-async")
 
     def test_log_coro_exception_logs_real_failure(self):
-        """A coroutine that raises is reported via logger.exception, not propagated."""
         future: Future = Future()
         future.set_exception(RuntimeError("boom"))
 
@@ -128,7 +110,6 @@ class TestBackgroundHttpPosterSubmitCoro(CustomTestCase):
             bg_poster.logger.exception = original
 
     def test_log_coro_exception_swallows_cancellation_silently(self):
-        """A cancelled coroutine is swallowed without logging."""
         future: Future = Future()
         future.set_exception(asyncio.CancelledError())
 
@@ -141,7 +122,6 @@ class TestBackgroundHttpPosterSubmitCoro(CustomTestCase):
             bg_poster.logger.exception = original
 
     def test_log_coro_exception_quiet_on_success(self):
-        """A coroutine that completes cleanly logs nothing."""
         future: Future = Future()
         future.set_result(None)
 
@@ -155,10 +135,8 @@ class TestBackgroundHttpPosterSubmitCoro(CustomTestCase):
 
 
 class TestBackgroundHttpPosterEnsureSession(CustomTestCase):
-    """_ensure_session lazily creates a session and recreates it once closed."""
 
     def test_ensure_session_creates_reuses_then_recreates_when_closed(self):
-        """First call creates a session, second reuses it, a closed one is replaced."""
         poster = BackgroundHttpPoster()
         self.addCleanup(poster.close)
         sessions = [MagicMock(closed=False), MagicMock(closed=False)]
@@ -176,18 +154,15 @@ class TestBackgroundHttpPosterEnsureSession(CustomTestCase):
             self.assertIs(recreated, sessions[1])
         finally:
             bg_poster.aiohttp.ClientSession = original
-            # Drop the mock session so close() doesn't try to await a MagicMock.
             poster._session = None
 
 
 class TestBackgroundHttpPosterPost(CustomTestCase):
-    """post POSTs the json payload and reads the response body to completion."""
 
     def _run_on_loop(self, poster: BackgroundHttpPoster, coro) -> None:
         asyncio.run_coroutine_threadsafe(coro, poster._loop).result(timeout=5.0)
 
     def test_post_posts_json_and_reads_body(self):
-        """post sends the payload to the URL and drains the response via read()."""
         poster = BackgroundHttpPoster()
         self.addCleanup(poster.close)
         session = _FakeSession()

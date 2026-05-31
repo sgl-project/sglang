@@ -21,7 +21,6 @@ _LIFECYCLE_MAX_NEW_TOKENS = 4
 
 
 def _advance_to_stage(r, stage: str):
-    """Yield until the req reaches ``stage``, wired to this file's prompt config."""
     yield from advance_to_lifecycle_stage(
         r,
         stage,
@@ -34,7 +33,6 @@ class TestScriptedCore(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
 
     def test_chunked_prefill_smoke(self):
-        """Engine boots with small chunk_size and a multi-chunk req finishes cleanly."""
         self.server.execute_script(self._script_chunked_prefill_smoke)
 
     @staticmethod
@@ -44,7 +42,6 @@ class TestScriptedCore(ScriptedTestCase):
         assert r.finished, "req did not finish"
 
     def test_chunked_prefill_smoke_at_chunk_boundary_offsets(self):
-        """Prompt lengths just off a chunk-size multiple (+/-1, +/-2) still finish cleanly."""
         for offset in (-2, -1, 1, 2):
             prompt_len = 2 * _CHUNK_SIZE + offset
             with self.subTest(offset=offset, prompt_len=prompt_len):
@@ -60,7 +57,6 @@ class TestScriptedCore(ScriptedTestCase):
         assert r.finished, f"req with prompt_len={prompt_len} did not finish"
 
     def test_pause_retract_at_lifecycle_points_then_resume(self):
-        """Pause(retract) at each lifecycle stage, sit paused, continue, and the req still finishes."""
         for stage in LIFECYCLE_STAGES:
             with self.subTest(stage=stage):
                 self.server.execute_script(
@@ -104,7 +100,6 @@ class TestScriptedCore(ScriptedTestCase):
         assert r.finished, f"stage={stage}: req did not finish after pause/continue"
 
     def test_abort_all_at_lifecycle_points(self):
-        """abort_all() at each lifecycle stage terminates the req within a few yields."""
         for stage in LIFECYCLE_STAGES:
             with self.subTest(stage=stage):
                 self.server.execute_script(
@@ -127,7 +122,6 @@ class TestScriptedCore(ScriptedTestCase):
         assert r.finished, f"stage={stage}: req did not finish after abort_all"
 
     def test_chunked_req_single_decode_finishes(self):
-        """A chunked-prefill req with max_new_tokens=1 finishes cleanly after its single decode step."""
         self.server.execute_script(self._script_chunked_req_single_decode_finishes)
 
     @staticmethod
@@ -137,7 +131,6 @@ class TestScriptedCore(ScriptedTestCase):
         assert r.finished, "single-decode chunked req did not finish"
 
     def test_chunked_prefill_does_not_inflate_radix_hit_count(self):
-        """Chunked inserts skip hit_count, so every radix node is bumped exactly once (==1), never per-chunk inflated."""
         self.server.execute_script(
             self._script_chunked_prefill_does_not_inflate_radix_hit_count
         )

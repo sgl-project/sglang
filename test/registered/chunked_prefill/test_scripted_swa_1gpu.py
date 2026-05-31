@@ -33,7 +33,6 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
     )
 
     def test_swa_chunked_req_early_return_no_double_free(self):
-        """KV-cache starvation makes add_chunked_req early-return; the stash gate keeps the un-scheduled chunked req's partial KV out of the tree."""
         self.server.execute_script(
             self._script_swa_chunked_req_early_return_no_double_free
         )

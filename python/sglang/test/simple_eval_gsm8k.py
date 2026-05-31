@@ -68,10 +68,6 @@ class GSM8KEval(Eval):
             self._lines = self._lines[:num_examples]
 
     def _setup_prefix_pool(self, all_lines: list, num_shots: int) -> int:
-        """Build prefix structures from the head of ``all_lines``.
-
-        Returns the number of lines consumed; subclasses can reserve more.
-        """
         self._few_shot_prompt = get_few_shot_examples(all_lines, num_shots)
         return num_shots
 

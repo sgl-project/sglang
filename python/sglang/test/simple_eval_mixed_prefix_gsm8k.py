@@ -5,18 +5,6 @@ from sglang.test.simple_eval_gsm8k import GSM8KEval, get_one_example
 
 
 class MixedPrefixGSM8KEval(GSM8KEval):
-    """GSM8K with a per-question variable-length primary + random secondary prefix.
-
-    Each query's prefix =
-        primary_shots[:k]
-      + random_subset(secondary_pool)
-
-    where k ~ Uniform{0..num_shots} and the secondary subset is itself a
-    random sample of random size in {0..secondary_pool_size}. The primary
-    portion is order-stable across queries, so two queries picking k1 <= k2
-    primary shots share the first k1 examples as a radix-cacheable prefix.
-    The secondary tail makes each full prefix unique.
-    """
 
     def __init__(
         self,
@@ -57,8 +45,6 @@ class MixedPrefixGSM8KEval(GSM8KEval):
         primary = self._primary_shots[:num_primary]
         secondary = [self._secondary_pool[i] for i in secondary_indices]
         combined = primary + secondary
-        # Print the per-query example indices (absolute into all_lines: primary
-        # lives at [0, num_shots), secondary at [num_shots, overall_pool_size)).
         combined_indices = list(range(num_primary)) + [
             self._num_shots + i for i in secondary_indices
         ]

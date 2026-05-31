@@ -33,7 +33,6 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
     _NUM_CONC_REQS_VALUES = (1, 2, 4)
 
     def test_pp_chunk_sweep(self):
-        """Every (num_chunks, num_conc_reqs) combo under PP=4 drains to finished."""
         for num_chunks in self._NUM_CHUNKS_VALUES:
             for num_conc_reqs in self._NUM_CONC_REQS_VALUES:
                 with self.subTest(num_chunks=num_chunks, num_conc_reqs=num_conc_reqs):

@@ -1,11 +1,3 @@
-"""HTTP-path smoke test for the ScriptedContext harness.
-
-Exercises only the implemented ScriptedContext surface (``start_req``,
-``ScriptedReqHandle.finished``, ``ScriptedReqHandle.is_chunking``, ``ScriptedReqHandle.req``) so it
-can run end-to-end on the small CI model. The point is to verify the new
-real-HTTP-server launch path and the ``start_req`` -> ``/generate`` ->
-``wait_until_arrived`` round-trip, not any wishlist observability.
-"""
 
 import unittest
 
@@ -22,7 +14,6 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_single_short_req_finishes(self):
-        """A short prompt submitted over HTTP runs to finish."""
         self.server.execute_script(self._script_single_short_req_finishes)
 
     @staticmethod
@@ -32,7 +23,6 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
         assert r.finished
 
     def test_chunked_req_is_chunking_then_finishes(self):
-        """A prompt several chunks long is chunking mid-flight, then finishes."""
         self.server.execute_script(self._script_chunked_req_is_chunking_then_finishes)
 
     @staticmethod
@@ -51,7 +41,6 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
         ), "expected the req to hold the chunked_req slot at least once"
 
     def test_two_reqs_finish(self):
-        """Two requests submitted over HTTP both run to finish."""
         self.server.execute_script(self._script_two_reqs_finish)
 
     @staticmethod

@@ -1,10 +1,3 @@
-"""Speculative decoding × chunked: naive ScriptedContext smoke.
-
-EAGLE-style spec decoding adds a verify pass between prefill chunks
-and decode. We want a long chunked prompt to be admitted, complete
-its chunk loop, and then transition to spec-decoded output without
-any state-machine surprises.
-"""
 
 import unittest
 
@@ -39,7 +32,6 @@ class TestSpecBasic(ScriptedTestCase):
     ENGINE_KWARGS = _spec_engine_kwargs()
 
     def test_naive_spec_chunked(self):
-        """Speculative decoding × chunked: naive ScriptedContext smoke."""
         self.server.execute_script(self._script_naive_spec_chunked)
 
     @staticmethod
@@ -50,12 +42,8 @@ class TestSpecBasic(ScriptedTestCase):
         assert r.chunks_done >= 2
 
     def test_spec_chunked_handoff_first_verify(self):
-        """First spec verify after chunked prefill must include all chunked tokens with right prefix length."""
         self.server.execute_script(self._script_spec_chunked_handoff_first_verify)
 
-    # Spec handoff from chunked prefill — the first verify pass
-    # after the last chunk must see prefix_len == prompt_len and include
-    # the spec draft tokens for the freshly-finished prefill.
     @staticmethod
     def _script_spec_chunked_handoff_first_verify(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16)
@@ -72,24 +60,17 @@ class TestSpecBasic(ScriptedTestCase):
         )
 
     def test_spec_acceptance_chunked_matches_baseline(self):
-        """Chunked vs non-chunked spec acceptance rate must be approximately equal."""
         self.server.execute_script(
             self._script_spec_acceptance_chunked_matches_baseline
         )
 
-    # Spec acceptance — chunked vs non-chunked on the same
-    # prompt should yield approximately the same accept rate (chunked must
-    # not pollute spec state).
     @staticmethod
     def _script_spec_acceptance_chunked_matches_baseline(t: ScriptedContext):
-        # Run a long chunked prompt and a short non-chunked baseline.
         r_chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=32)
         yield from run_until_finished(r_chunked, max_steps=800)
         r_baseline = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE // 2, max_new_tokens=32)
         yield from run_until_finished(r_baseline, max_steps=400)
         assert r_chunked.finished and r_baseline.finished
-        # Accept rates must be within 25% absolute; chunked path must not
-        # leak draft state.
         delta = abs(r_chunked.spec_accept_rate - r_baseline.spec_accept_rate)
         assert delta < 0.25, (
             f"chunked vs baseline spec accept rate diverge by {delta:.3f} "
@@ -98,12 +79,8 @@ class TestSpecBasic(ScriptedTestCase):
         )
 
     def test_spec_abort_during_chunked_prepare(self):
-        """Spec draft prepare + chunked abort must reset draft state cleanly."""
         self.server.execute_script(self._script_spec_abort_during_chunked_prepare)
 
-    # Spec draft preparation racing with chunked abort —
-    # cancellation must clean up partial draft state; no orphaned spec
-    # buffers.
     @staticmethod
     def _script_spec_abort_during_chunked_prepare(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=16)
@@ -121,12 +98,8 @@ class TestSpecDisagg(ScriptedTestCase):
     ENGINE_KWARGS = _spec_engine_kwargs(disaggregation_mode="prefill")
 
     def test_spec_eagle_disagg_chunked(self):
-        """EAGLE + disagg + chunked last chunk must land topk_p, topk_index, hidden_states."""
         self.server.execute_script(self._script_spec_eagle_disagg_chunked)
 
-    # EAGLE + disagg + chunked — last chunk must capture all three
-    # spec tensors (topk_p, topk_index, hidden_states) for the decode side
-    # to verify against.
     @staticmethod
     def _script_spec_eagle_disagg_chunked(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8)
