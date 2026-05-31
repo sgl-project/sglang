@@ -250,13 +250,7 @@ class ScriptedHttpServer:
             process.join(timeout=10.0)
 
 
-def launch_scripted_http_server(
-    *,
-    model_path: str,
-    host: str,
-    port: int,
-    **engine_overrides: Any,
-) -> None:
+def launch_scripted_http_server(**engine_kwargs: Any) -> None:
     """Subprocess entry point: run the dispatch loop behind a real HTTP server.
 
     Runs inside the dedicated ``mp.Process`` spawned by
@@ -277,11 +271,4 @@ def launch_scripted_http_server(
     scheduler-side exception the traceback is written to the path named by
     ``SGLANG_TEST_SCRIPTED_RUNTIME_TRACEBACK_PATH`` for the session to surface.
     """
-    server_args = ServerArgs(
-        model_path=model_path,
-        host=host,
-        port=port,
-        **engine_overrides,
-    )
-
-    launch_server(server_args)
+    launch_server(ServerArgs(**engine_kwargs))
