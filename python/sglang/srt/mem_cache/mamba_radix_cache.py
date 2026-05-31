@@ -493,7 +493,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_node=self.root_node,
             )
 
-        value, last_node, best_value_len = self._match_prefix_helper(key)
+        value, last_node, best_value_len = self._match_prefix_helper(
+            key, skip_mamba_match=params.skip_mamba_match
+        )
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -515,6 +517,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
+        logger.info(
+            "[MAMBADBG] cache_finished rid=%s is_insert=%s extra_buf=%s last_track_seqlen=%s kv_committed=%s mamba_evict=%d full_evict=%d",
+            req.rid,
+            is_insert,
+            self.enable_mamba_extra_buffer,
+            req.mamba_last_track_seqlen,
+            kv_committed_len,
+            self.mamba_evictable_size(),
+            self.full_evictable_size(),
+        )
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -617,6 +629,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
             else len(token_ids)
+        )
+        logger.info(
+            "[MAMBADBG] cache_unfinished rid=%s extra_buf=%s last_track_seqlen=%s fill=%d cache_len=%s decision=%s mamba_evict=%d full_evict=%d",
+            req.rid,
+            self.enable_mamba_extra_buffer,
+            req.mamba_last_track_seqlen,
+            len(token_ids),
+            cache_len,
+            "SKIP_EMPTY" if (self.disable or cache_len is None) else "INSERT",
+            self.mamba_evictable_size(),
+            self.full_evictable_size(),
         )
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
@@ -962,13 +985,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         return slot
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, skip_mamba_match: bool = False
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
         """
         Mamba prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
         or 2. the number of matching tokens from the matched node to the last mamba tombstone
         node is greater than or equal to the sliding window size.
+
+        When skip_mamba_match is True, every node is treated as having a valid mamba
+        checkpoint (KV-only matching). Used by PD decode where the mamba state is
+        always transferred from prefill, so the cached mamba_value is irrelevant.
         """
         node = self.root_node
         child_key = key.child_key(self.page_size)
@@ -978,8 +1005,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_last_node = node
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            # update best_value_len and best_last_node if needed
-            if node.mamba_value is not None:
+            if skip_mamba_match or node.mamba_value is not None:
                 best_value_len = len(value)
                 best_last_node = node
 
@@ -996,8 +1022,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 if len(key):
                     child_key = key.child_key(self.page_size)
-        # handle best_value_len and best_last_node, for the case that last node is fully matched
-        if node.mamba_value is not None:
+        if skip_mamba_match or node.mamba_value is not None:
             best_value_len = len(value)
             best_last_node = node
 

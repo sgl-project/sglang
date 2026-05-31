@@ -349,6 +349,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    def _allocatable_mamba_budgets(
+        self,
+        count_retracted: bool = True,
+    ) -> int:
+        allocatable_states = (
+            self.req_to_token_pool.mamba_pool.available_size()
+            + self.tree_cache.mamba_evictable_size()
+        )
+
+        if count_retracted:
+            for req in self.retracted_queue:
+                # Mamba states take constant space
+                allocatable_states -= self._required_alloc_mamba_states(req)
+
+        return allocatable_states
+
+    def _required_alloc_mamba_states(self, req: Req) -> int:
+        needed = 0
+        if req.mamba_pool_idx is None:
+            needed += 1
+
+        if (
+            self.req_to_token_pool.enable_mamba_extra_buffer
+            and req.mamba_ping_pong_track_buffer is None
+        ):
+            needed += self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+
+        return needed
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -484,8 +513,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.tree_cache,
             req,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            cow_mamba=False,
             include_req=True,
+            skip_mamba_match=self.tree_cache.supports_mamba(),
         )
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
@@ -856,6 +886,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(preallocated_reqs),
                     hicache_reserved_tokens=reserved_restore_tokens,
                 )
+                logger.info(
+                    "Decode radix cache before send_metadata: req=%s, prefix_len=%s",
+                    decode_req.req.rid,
+                    prefix_len,
+                )
             else:
                 prefix_indices = None
                 prefix_len = 0
@@ -886,6 +921,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
+
+            if self.tree_cache.supports_mamba():
+                required_alloc_states = self._required_alloc_mamba_states(
+                    decode_req.req
+                )
+                full_allocatable_states = self._allocatable_mamba_budgets(
+                    count_retracted=True
+                )
+                if required_alloc_states > full_allocatable_states:
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    break
 
             if uses_swa_tail_prealloc:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
@@ -1114,6 +1161,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 available_size += self.tree_cache.evictable_size()
+        elif self.tree_cache.supports_mamba():
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                available_size += self.tree_cache.full_evictable_size()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
@@ -1237,6 +1288,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
+        if self.tree_cache.supports_mamba():
+            required_alloc_states = self._required_alloc_mamba_states(req)
+            available_states = self.req_to_token_pool.mamba_pool.available_size()
+            if available_states < required_alloc_states:
+                mamba_num_to_evict = required_alloc_states - available_states
+                result = self.tree_cache.evict(
+                    EvictParams(num_tokens=0, mamba_num=mamba_num_to_evict)
+                )
+                available_states = self.req_to_token_pool.mamba_pool.available_size()
+                if available_states < required_alloc_states:
+                    logger.warning(
+                        f"Mamba eviction insufficient: needed {required_alloc_states} states, "
+                        f"available {available_states} "
+                        f"after evicting {result.mamba_num_evicted}/{mamba_num_to_evict} states. "
+                        f"mamba_evictable_size={self.tree_cache.mamba_evictable_size()}, "
+                        f"mamba_protected_size={self.tree_cache.mamba_protected_size()}, "
+                        f"fill_len={len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)}, "
+                        f"prefix_len={prefix_len}, req={req.rid}"
+                    )
+
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
@@ -1274,8 +1345,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
                     f"available {self.token_to_kv_pool_allocator.available_size()} "
                     f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
-                    f"evictable_size={self.tree_cache.evictable_size()}, "
-                    f"protected_size={self.tree_cache.protected_size()}, "
+                    f"evictable_size={self.tree_cache.evictable_size() if not uses_mamba_cache else self.tree_cache.full_evictable_size()}, "
+                    f"protected_size={self.tree_cache.protected_size() if not uses_mamba_cache else self.tree_cache.full_protected_size()}, "
                     f"fill_len={fill_len}, prefix_len={prefix_len}, "
                     f"total_prefix_len={total_prefix_len}, delta_len={delta_len}, "
                     f"page_size={self.token_to_kv_pool_allocator.page_size}, "
@@ -1345,8 +1416,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         assert kv_loc is not None, (
             f"KV cache is full! Bug in memory estimation. "
             f"available={self.token_to_kv_pool_allocator.available_size()}, "
-            f"evictable={self.tree_cache.evictable_size()}, "
-            f"protected={self.tree_cache.protected_size()}, "
+            f"evictable_size={self.tree_cache.evictable_size() if not uses_mamba_cache else self.tree_cache.full_evictable_size()}, "
+            f"protected_size={self.tree_cache.protected_size() if not uses_mamba_cache else self.tree_cache.full_protected_size()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
             f"page_size={self.token_to_kv_pool_allocator.page_size}, "
