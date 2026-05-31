@@ -425,6 +425,27 @@ def all_reduce_token_scores(
     return token_scores
 
 
+def _topk_by_score_then_pos(
+    vals: torch.Tensor,
+    pos: torch.Tensor,
+    k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Top-``k`` candidates by (value DESCENDING, then position ASCENDING) — the one
+    deterministic tie-break all DS top-k selectors share.
+
+    ``vals``/``pos`` are ``[bs, m]`` (``pos`` are the distinct logical positions of the
+    candidates). Done as two stable passes: (1) order candidates by position ascending,
+    then (2) stable argsort by value descending — so equal values resolve toward the
+    lower position. Returns ``(top_positions [bs, k] int64, top_vals [bs, k])``. Uses
+    fresh argsort outputs (no in/out aliasing — BL-20260527-torch-topk-aliasing).
+    """
+    pos_order = torch.argsort(pos, dim=-1, stable=True)            # ascending position
+    pos_a = torch.gather(pos, 1, pos_order)
+    vals_a = torch.gather(vals, 1, pos_order)
+    val_order = torch.argsort(vals_a, dim=-1, descending=True, stable=True)[:, :k]
+    return torch.gather(pos_a, 1, val_order), torch.gather(vals_a, 1, val_order)
+
+
 def select_topk_sequence_order(
     token_scores: torch.Tensor,
     max_top_k: int,
@@ -449,11 +470,13 @@ def select_topk_sequence_order(
     device = token_scores.device
 
     effective_top_k = min(max_top_k, max_tokens)
-    topk = torch.topk(
-        token_scores, k=effective_top_k, dim=-1, largest=True, sorted=False
-    )
-    topk_indices = topk.indices  # [bs, effective_top_k]
-    topk_scores = topk.values    # [bs, effective_top_k]
+    # Deterministic tie-break: select by (score DESCENDING, then logical position
+    # ASCENDING). token_scores columns are already in position order, so the shared
+    # helper's stable score-descending argsort breaks score ties toward the lower
+    # position -- the single ordering all DS top-k selectors honor (see
+    # _topk_by_score_then_pos / blocked_topk_sequence_order).
+    positions = torch.arange(max_tokens, device=device, dtype=torch.int64).unsqueeze(0).expand(bs, -1)
+    topk_indices, topk_scores = _topk_by_score_then_pos(token_scores, positions, effective_top_k)
 
     invalid_entries = torch.isneginf(topk_scores)
     topk_indices = torch.where(
@@ -500,9 +523,11 @@ def blocked_topk_sequence_order(
 
     Exactness: a token in the global top-K has within-block rank <= its global
     rank <= K, so it is in its block's top-min(K, block_width); the union of the
-    per-block candidates therefore contains the global top-K, and merging them and
-    taking the global top-K reproduces the monolithic selection (tie-broken
-    arbitrarily, as ``torch.topk`` does). This is the exactness ORACLE and the
+    per-block candidates therefore contains the global top-K, and merging them under
+    the SHARED deterministic tie-break (score descending, then logical position
+    ascending) reproduces ``select_topk_sequence_order`` EXACTLY -- including on
+    finite ties (equal scores resolve to the lower position in both). This is the
+    exactness ORACLE and the
     eager fallback for the graph-safe blocked top-k, whose value is that it can
     SKIP blocks entirely past each request's ``seq_len`` (every such block is all
     ``-inf`` and contributes no candidate), shrinking the per-decode-step work
@@ -530,17 +555,16 @@ def blocked_topk_sequence_order(
         sc = token_scores
     blk = sc.view(bs, nb, bw)
     kb = min(K, bw)
-    # per-block top-kb candidates (fresh outputs — never alias topk in/out, see
-    # BL-20260527-torch-topk-aliasing-corrupts-input).
-    block_vals, block_local = torch.topk(blk, k=kb, dim=-1, largest=True, sorted=False)
+    # per-block top-kb candidate LOCAL positions by (score desc, local-pos asc) -- the
+    # argsort indices ARE the local positions; stable keeps ascending pos on ties.
+    blk_order = torch.argsort(blk, dim=-1, descending=True, stable=True)[:, :, :kb]
     block_base = (torch.arange(nb, device=device, dtype=torch.int64) * bw).view(1, nb, 1)
-    cand_pos = (block_base + block_local).reshape(bs, nb * kb)
-    cand_vals = block_vals.reshape(bs, nb * kb)
-    # global top-K over the union of per-block candidates
+    cand_pos = (block_base + blk_order).reshape(bs, nb * kb)
+    cand_vals = torch.gather(blk, 2, blk_order).reshape(bs, nb * kb)
+    # global top-K over the union, by the SHARED (score desc, position asc) contract
+    # -- identical to select_topk_sequence_order, including on finite ties.
     eff = min(K, nb * kb)
-    merge_vals, merge_idx = torch.topk(cand_vals, k=eff, dim=-1, largest=True, sorted=False)
-    sel_pos = torch.gather(cand_pos, 1, merge_idx)
-    # invalid (-inf) candidates -> sentinel max_tokens (sort last, not counted)
+    sel_pos, merge_vals = _topk_by_score_then_pos(cand_vals, cand_pos, eff)
     invalid = torch.isneginf(merge_vals)
     sel_pos = torch.where(invalid, torch.full_like(sel_pos, max_tokens), sel_pos)
     sorted_pos, _ = torch.sort(sel_pos, dim=-1)

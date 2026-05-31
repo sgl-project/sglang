@@ -9635,10 +9635,6 @@ class TestServeDoubleSparsityLauncherSignatureDtype(unittest.TestCase):
         self.assertEqual(parse_double_sparsity_config(json.dumps(cfg)).signature_dtype, "int8")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestBlockedTopKExactness(unittest.TestCase):
     """Loop-6 R22: `blocked_topk_sequence_order` must return the IDENTICAL ascending
     logical positions + valid_lengths as the monolithic `select_topk_sequence_order`,
@@ -9699,6 +9695,38 @@ class TestBlockedTopKExactness(unittest.TestCase):
         sc = self._distinct(bs, n, seed=8) + 50.0
         sc[0, 2048:] = float("-inf")  # exactly K valid, at a block edge (2048 = 4*512)
         sc[1, 1536:] = float("-inf")  # 1536 = 3*512 block edge, < K
+        self._assert_eq(sc, K, bw)
+
+    # --- finite-tie regressions (R23): blocked == monolithic under the shared
+    # deterministic (score desc, position asc) tie-break. These FAIL under the R22
+    # arbitrary-tie code (Codex counterexample: all-ones K=3 bw=4 -> [4,5,6] vs [4,6,7]).
+    def test_all_equal_scores(self):
+        for (n, K, bw) in [(8, 3, 4), (4096, 2048, 512), (5000, 2048, 700)]:
+            with self.subTest(n=n, K=K, bw=bw):
+                self._assert_eq(torch.ones(2, n), K, bw)
+
+    def test_ties_crossing_block_boundary(self):
+        # a high plateau spanning multiple blocks; K selects a prefix of it -> the
+        # tie-break must pick the lowest positions, identically in both.
+        bs, n, K, bw = 2, 4096, 2048, 512
+        sc = torch.zeros(bs, n)
+        sc[:, :3000] = 7.0   # tied-high plateau across ~6 blocks, > K
+        sc[:, 3000:] = -3.0
+        self._assert_eq(sc, K, bw)
+
+    def test_ties_at_k_boundary(self):
+        # exactly the K-th and (K+1)-th have equal score -> deterministic pick.
+        bs, n, K, bw = 2, 4096, 2048, 512
+        sc = self._distinct(bs, n, seed=11)
+        sc[:, 2040:2060] = 99999.0  # a tied cluster straddling K=2048
+        self._assert_eq(sc, K, bw)
+
+    def test_ties_mixed_with_neg_inf(self):
+        bs, n, K, bw = 3, 4096, 2048, 512
+        sc = torch.full((bs, n), 4.0)
+        sc[0, 2048:] = float("-inf")              # tie up to a block edge
+        sc[1, 1000:] = float("-inf")              # tie below K, off a block edge
+        sc[2, ::2] = float("-inf")                # interleaved -inf among ties
         self._assert_eq(sc, K, bw)
 
 

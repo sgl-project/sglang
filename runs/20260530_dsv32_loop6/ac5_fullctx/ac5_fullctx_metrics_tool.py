@@ -24,6 +24,17 @@ TOL = 0.005  # arrays recompute exactly; allow rounding only
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 SIDECARS = {16: "meta_c16.json", 32: "meta_c32.json", 64: "meta_c64.json"}
 
+# CODE-OWNED AC-5 workload identity (owner-approved np64 steady-state methodology).
+# The arrays JSON carries a COPY for documentation only; --verify asserts the JSON copy
+# == this code constant, and asserts each sidecar + artifact against THIS, so a tampered
+# JSON expected_workload or a degenerate (reduced-completed / short-duration) artifact fails.
+EXPECTED_WORKLOAD = {
+    "mode": "double_sparsity", "isl_total_tokens": 4096, "osl_tokens": 512,
+    "num_prompts": 64, "warmup_seconds": 120.0, "measurement_window_seconds": 300.0,
+    "chunked_prefill_size": 8192, "max_total_num_tokens": 396096,
+    "completed": 192,  # the measured np64/window300 count per conc in the committed run
+}
+
 
 def _pct(vals, p):
     s = sorted(vals)
@@ -42,9 +53,7 @@ def build():
            # The AC-5 workload identity the verifier asserts on EVERY sidecar (fail-closed). num_prompts/
            # warmup/window record the np64-steady-state methodology (pending owner approval); they are
            # asserted for consistency so a sidecar tampered to NUM_PROMPTS=320 fails.
-           "expected_workload": {"mode": "double_sparsity", "isl_total_tokens": 4096, "osl_tokens": 512,
-                                 "num_prompts": 64, "warmup_seconds": 120.0, "measurement_window_seconds": 300.0,
-                                 "chunked_prefill_size": 8192, "max_total_num_tokens": 396096},
+           "expected_workload": dict(EXPECTED_WORKLOAD),  # documentation copy; --verify asserts == code constant
            "conc": {}}
     for c in CONCS:
         f = sorted(glob.glob(SRC_GLOB.format(c=c)))[0]
@@ -92,6 +101,10 @@ def verify():
             fails.append(msg); print("  FAIL:", msg)
 
     print("# AC-5 full-context recomputed from committed exact arrays + sidecars (fail-closed)")
+    # the JSON expected_workload is documentation only — it must equal the CODE-OWNED
+    # constant, so a tampered JSON copy cannot redefine the accepted workload.
+    chk(d.get("expected_workload") == EXPECTED_WORKLOAD,
+        "arrays expected_workload != code-owned EXPECTED_WORKLOAD")
     for c in CONCS:
         e = d["conc"].get(str(c))
         chk(e is not None, f"c{c}: missing")
@@ -102,7 +115,11 @@ def verify():
         chk(isinstance(e.get("sha256"), str) and bool(_SHA_RE.match(e["sha256"])), f"{tag}: sha not 64-hex")
         for k in ("ttfts_s", "itl_sum_s", "output_lens", "input_lens", "errors_empty"):
             chk(len(e[k]) == n, f"{tag}: len({k})={len(e[k])} != completed {n}")
-        chk(n > 0, f"{tag}: completed not > 0")
+        # workload VOLUME (Codex R22): reject a degenerate reduced-completed / short-duration
+        # artifact -- assert the approved completed count and a measured duration >= the window.
+        chk(n == EXPECTED_WORKLOAD["completed"], f"{tag}: completed {n} != approved {EXPECTED_WORKLOAD['completed']}")
+        chk(e.get("duration_s", 0) >= EXPECTED_WORKLOAD["measurement_window_seconds"],
+            f"{tag}: duration_s {e.get('duration_s')} < window {EXPECTED_WORKLOAD['measurement_window_seconds']}")
         chk(all(o == 512 for o in e["output_lens"]), f"{tag}: an output_len != 512")
         chk(all(e["errors_empty"]), f"{tag}: a non-empty error present")
         chk(all(t > 0 for t in e["ttfts_s"]), f"{tag}: a ttft <= 0 (empty-latency row)")
@@ -130,7 +147,8 @@ def verify():
         if os.path.exists(sc):
             meta = json.load(open(sc))
             a = meta.get("server_args", meta)
-            ew = d["expected_workload"]
+            ew = EXPECTED_WORKLOAD  # code-owned (not the JSON copy)
+            chk(meta.get("trial_id") is not None, f"{tag}: sidecar trial_id missing")
             # workload identity (top-level sidecar fields) — fail-closed so a sidecar tampered to a
             # different mode / conc / ISL / OSL / num_prompts is rejected (Codex R21 fail-open gap).
             chk(meta.get("mode") == ew["mode"], f"{tag}: sidecar mode {meta.get('mode')} != {ew['mode']}")
