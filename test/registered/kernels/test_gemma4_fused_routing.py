@@ -4,7 +4,7 @@ Compares the Triton-fused routing kernel against the original SGLang
 ``Gemma4MoE.routing_function`` reference (softmax-of-topk * per_expert_scale).
 Run with::
 
-    pytest test/srt/layers/test_gemma4_fused_routing.py -v
+    pytest test/registered/kernels/test_gemma4_fused_routing.py -v
 
 Requires a CUDA-capable GPU; skips otherwise.
 """
@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
