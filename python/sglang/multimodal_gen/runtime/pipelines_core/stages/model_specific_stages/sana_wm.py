@@ -11,7 +11,7 @@
 #      consumed by the UCPE camera branch.
 #   5. Compute the 48-channel packed Plücker raymap consumed by the
 #      ``plucker_embedder`` (one chunk = vae_temporal_stride original frames).
-#   6. Prepare FlowMatch timesteps and sigmas (uses flow_shift=9.95).
+#   6. Prepare FlowMatch timesteps and sigmas (uses inference_flow_shift=9.8).
 #
 # Text encoding is handled by SanaWMTextEncodingStage so it can mirror the
 # official chi-prompt token window without changing the shared text stage.
@@ -26,12 +26,22 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    cfg_model_parallel_all_reduce,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    PipelineStage,
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
@@ -56,6 +66,7 @@ _SANA_WM_DEFAULT_TRANSLATION_SPEED = 0.05
 _SANA_WM_DEFAULT_ROTATION_SPEED_DEG = 1.2
 _SANA_WM_DEFAULT_PITCH_LIMIT_DEG = 85.0
 _SANA_WM_ALLOWED_ACTION_KEYS: frozenset[str] = frozenset("wasdijkl")
+_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY = "sana_wm_condition_image_preprocess"
 
 
 def _sana_wm_rot_x(angle_rad: float) -> torch.Tensor:
@@ -612,6 +623,26 @@ class SanaWMDenoisingStage(DenoisingStage):
     while the remaining latent frames denoise normally.
     """
 
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        if self.server_args.enable_cfg_parallel:
+            return StageParallelismType.CFG_PARALLEL
+        return StageParallelismType.REPLICATED
+
+    @staticmethod
+    def _combine_cfg_parallel_noise(
+        noise_pred: torch.Tensor,
+        guidance_scale: float,
+        cfg_rank: int,
+    ) -> torch.Tensor:
+        if cfg_rank == 0:
+            partial = guidance_scale * noise_pred
+        elif cfg_rank == 1:
+            partial = (1.0 - guidance_scale) * noise_pred
+        else:
+            partial = torch.zeros_like(noise_pred)
+        return cfg_model_parallel_all_reduce(partial)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.latents is None:
@@ -679,12 +710,21 @@ class SanaWMDenoisingStage(DenoisingStage):
             extra.get("chunk_plucker"), device=device, dtype=target_dtype
         )
 
+        cfg_parallel = bool(server_args.enable_cfg_parallel and do_cfg)
+        cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel else 0
+        if cfg_parallel and get_classifier_free_guidance_world_size() > 2:
+            logger.warning_once(
+                "SANA-WM CFG parallel uses two guidance branches; extra CFG ranks "
+                "run dummy forwards and contribute zeros."
+            )
+
         self.log_info(
             "SANA-WM flow_euler_ltx denoising: latent=%s, steps=%d, cfg=%s, "
-            "guidance_scale=%.4f, first_frame_locked=yes",
+            "cfg_parallel=%s, guidance_scale=%.4f, first_frame_locked=yes",
             tuple(latents.shape),
             len(timesteps),
             do_cfg,
+            cfg_parallel,
             float(getattr(batch, "guidance_scale", 1.0) or 1.0),
         )
         log_sana_wm_tensor_stats("denoise.input_latents", latents)
@@ -697,14 +737,18 @@ class SanaWMDenoisingStage(DenoisingStage):
             self.transformer = transformer
 
             for step_idx, t in enumerate(self.progress_bar(timesteps)):
-                latent_model_input = (
-                    torch.cat([latents, latents], dim=0) if do_cfg else latents
-                )
-                condition_mask_input = (
-                    torch.cat([condition_mask, condition_mask], dim=0)
-                    if do_cfg
-                    else condition_mask
-                )
+                if cfg_parallel:
+                    latent_model_input = latents
+                    condition_mask_input = condition_mask
+                else:
+                    latent_model_input = (
+                        torch.cat([latents, latents], dim=0) if do_cfg else latents
+                    )
+                    condition_mask_input = (
+                        torch.cat([condition_mask, condition_mask], dim=0)
+                        if do_cfg
+                        else condition_mask
+                    )
 
                 timestep = t.expand(condition_mask_input.shape).float()
                 timestep = torch.minimum(
@@ -713,28 +757,42 @@ class SanaWMDenoisingStage(DenoisingStage):
                 )
                 model_timestep = timestep[:, :1, :, 0, 0]
 
-                model_kwargs = {
-                    "encoder_hidden_states": (
-                        torch.cat([neg_embeds, pos_embeds], dim=0)
-                        if do_cfg
-                        else pos_embeds
-                    ),
-                    "encoder_attention_mask": (
-                        _cat_optional_tensors(neg_mask, pos_mask)
-                        if do_cfg
-                        else pos_mask
-                    ),
-                    "camera_conditions": (
-                        torch.cat([camera_conditions, camera_conditions], dim=0)
-                        if do_cfg and camera_conditions is not None
-                        else camera_conditions
-                    ),
-                    "chunk_plucker": (
-                        torch.cat([chunk_plucker, chunk_plucker], dim=0)
-                        if do_cfg and chunk_plucker is not None
-                        else chunk_plucker
-                    ),
-                }
+                if cfg_parallel:
+                    if cfg_rank == 1:
+                        branch_embeds = neg_embeds
+                        branch_mask = neg_mask
+                    else:
+                        branch_embeds = pos_embeds
+                        branch_mask = pos_mask
+                    model_kwargs = {
+                        "encoder_hidden_states": branch_embeds,
+                        "encoder_attention_mask": branch_mask,
+                        "camera_conditions": camera_conditions,
+                        "chunk_plucker": chunk_plucker,
+                    }
+                else:
+                    model_kwargs = {
+                        "encoder_hidden_states": (
+                            torch.cat([neg_embeds, pos_embeds], dim=0)
+                            if do_cfg
+                            else pos_embeds
+                        ),
+                        "encoder_attention_mask": (
+                            _cat_optional_tensors(neg_mask, pos_mask)
+                            if do_cfg
+                            else pos_mask
+                        ),
+                        "camera_conditions": (
+                            torch.cat([camera_conditions, camera_conditions], dim=0)
+                            if do_cfg and camera_conditions is not None
+                            else camera_conditions
+                        ),
+                        "chunk_plucker": (
+                            torch.cat([chunk_plucker, chunk_plucker], dim=0)
+                            if do_cfg and chunk_plucker is not None
+                            else chunk_plucker
+                        ),
+                    }
 
                 with set_forward_context(
                     current_timestep=step_idx,
@@ -748,12 +806,17 @@ class SanaWMDenoisingStage(DenoisingStage):
                     )
 
                 if do_cfg:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     guidance_scale = float(getattr(batch, "guidance_scale", 1.0) or 1.0)
-                    noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_text - noise_pred_uncond
-                    )
-                    timestep = timestep.chunk(2)[0]
+                    if cfg_parallel:
+                        noise_pred = self._combine_cfg_parallel_noise(
+                            noise_pred, guidance_scale, cfg_rank
+                        )
+                    else:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (
+                            noise_pred_text - noise_pred_uncond
+                        )
+                        timestep = timestep.chunk(2)[0]
 
                 latents_dtype = latents.dtype
                 latents_shape = latents.shape
@@ -941,6 +1004,155 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
     ) -> torch.Tensor:
         return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
+    @staticmethod
+    def _canonical_condition_image_tensor(image: torch.Tensor) -> torch.Tensor:
+        """Return image as NCHW RGB float tensor without changing its value range."""
+        image = image.float()
+        if image.dim() == 5 and image.shape[2] == 1:
+            image = image.squeeze(2)
+        if image.dim() == 3:
+            if image.shape[0] in (1, 3, 4):
+                image = image.unsqueeze(0)
+            elif image.shape[-1] in (1, 3, 4):
+                image = image.permute(2, 0, 1).unsqueeze(0)
+            else:
+                raise ValueError(
+                    "condition_image tensor must be CHW or HWC with 1, 3, "
+                    f"or 4 channels; got {tuple(image.shape)}."
+                )
+        elif image.dim() == 4:
+            if image.shape[1] in (1, 3, 4):
+                pass
+            elif image.shape[-1] in (1, 3, 4):
+                image = image.permute(0, 3, 1, 2)
+            else:
+                raise ValueError(
+                    "condition_image tensor must be NCHW or NHWC with 1, 3, "
+                    f"or 4 channels; got {tuple(image.shape)}."
+                )
+        else:
+            raise ValueError(
+                "condition_image tensor must have shape CHW, HWC, NCHW, NHWC, "
+                f"or NCHW singleton-video; got {tuple(image.shape)}."
+            )
+
+        if image.shape[1] == 1:
+            image = image.expand(-1, 3, -1, -1)
+        elif image.shape[1] == 4:
+            image = image[:, :3]
+        elif image.shape[1] != 3:
+            raise ValueError(
+                f"condition_image must have 1, 3, or 4 channels; got {image.shape[1]}."
+            )
+        return image.contiguous()
+
+    @staticmethod
+    def _resize_center_crop_tensor(
+        image: torch.Tensor,
+        *,
+        target_h: int,
+        target_w: int,
+    ) -> tuple[torch.Tensor, dict[str, tuple[int, int]]]:
+        """Match official SANA-WM resize-then-center-crop preprocessing."""
+        image = SanaWMBeforeDenoisingStage._canonical_condition_image_tensor(image)
+        src_h, src_w = int(image.shape[-2]), int(image.shape[-1])
+        scale = max(target_h / float(src_h), target_w / float(src_w))
+        resized_w = max(target_w, int(round(src_w * scale)))
+        resized_h = max(target_h, int(round(src_h * scale)))
+        if resized_h != src_h or resized_w != src_w:
+            import torch.nn.functional as F
+
+            image = F.interpolate(
+                image,
+                size=(resized_h, resized_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        left = (resized_w - target_w) // 2
+        top = (resized_h - target_h) // 2
+        image = image[..., top : top + target_h, left : left + target_w].contiguous()
+        return image, {
+            "source_size": (src_w, src_h),
+            "resized_size": (resized_w, resized_h),
+            "crop_offset": (left, top),
+            "target_size": (target_w, target_h),
+        }
+
+    @staticmethod
+    def _preprocess_condition_image(
+        condition_image: Any,
+        *,
+        target_h: int,
+        target_w: int,
+    ) -> tuple[torch.Tensor, dict[str, tuple[int, int]]]:
+        """Aspect-preserving resize + center crop, mirroring NVlabs/Sana."""
+        import PIL.Image
+
+        if isinstance(condition_image, list):
+            if len(condition_image) == 0:
+                raise ValueError(
+                    "condition_image list is empty; SANA-WM requires a first "
+                    "frame conditioning image."
+                )
+            condition_image = condition_image[0]
+
+        if isinstance(condition_image, PIL.Image.Image):
+            import torchvision.transforms.functional as TF
+
+            image = condition_image.convert("RGB")
+            src_w, src_h = image.size
+            scale = max(target_h / float(src_h), target_w / float(src_w))
+            resized_w = max(target_w, int(round(src_w * scale)))
+            resized_h = max(target_h, int(round(src_h * scale)))
+            resampling_enum = getattr(PIL.Image, "Resampling", None)
+            resampling = (
+                resampling_enum.LANCZOS
+                if resampling_enum is not None
+                else PIL.Image.LANCZOS
+            )
+            image = image.resize((resized_w, resized_h), resampling)
+            left = (resized_w - target_w) // 2
+            top = (resized_h - target_h) // 2
+            image = image.crop((left, top, left + target_w, top + target_h))
+            return TF.to_tensor(image).unsqueeze(0), {
+                "source_size": (src_w, src_h),
+                "resized_size": (resized_w, resized_h),
+                "crop_offset": (left, top),
+                "target_size": (target_w, target_h),
+            }
+
+        if isinstance(condition_image, torch.Tensor):
+            return SanaWMBeforeDenoisingStage._resize_center_crop_tensor(
+                condition_image,
+                target_h=target_h,
+                target_w=target_w,
+            )
+
+        raise TypeError(
+            "condition_image must be a PIL image, tensor, or non-empty list; "
+            f"got {type(condition_image).__name__}."
+        )
+
+    @staticmethod
+    def _transform_intrinsics_for_condition_image(
+        intrinsics_vec4: torch.Tensor,
+        preprocess_info: dict[str, tuple[int, int]] | None,
+    ) -> torch.Tensor:
+        """Map source-image intrinsics into the cropped output pixel grid."""
+        if not preprocess_info:
+            return intrinsics_vec4
+        src_w, src_h = preprocess_info["source_size"]
+        resized_w, resized_h = preprocess_info["resized_size"]
+        left, top = preprocess_info["crop_offset"]
+        sx = resized_w / float(src_w)
+        sy = resized_h / float(src_h)
+        out = intrinsics_vec4.clone()
+        out[..., 0] *= sx
+        out[..., 2] = out[..., 2] * sx - left
+        out[..., 1] *= sy
+        out[..., 3] = out[..., 3] * sy - top
+        return out
+
     # -----------------------------------------------------------------------
     # Helper: splice first-frame image latent into noise latents
     # -----------------------------------------------------------------------
@@ -952,53 +1164,29 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         condition_image,  # PIL Image or torch.Tensor
         dtype: torch.dtype,
         device: torch.device,
+        batch: Req | None = None,
     ) -> torch.Tensor:
         """Replace latents[:, :, 0] with VAE-encoded first frame."""
-        import PIL.Image
-
-        if isinstance(condition_image, list):
-            if len(condition_image) == 0:
-                raise ValueError(
-                    "condition_image list is empty; SANA-WM requires a first "
-                    "frame conditioning image."
-                )
-            condition_image = condition_image[0]
-
-        # Convert PIL to tensor if needed
-        if isinstance(condition_image, PIL.Image.Image):
-            import torchvision.transforms.functional as TF
-
-            img_tensor = TF.to_tensor(condition_image.convert("RGB")).unsqueeze(0)
-        elif isinstance(condition_image, torch.Tensor):
-            img_tensor = condition_image.float()
-            if img_tensor.dim() == 3:
-                img_tensor = img_tensor.unsqueeze(0)
-            elif img_tensor.dim() == 5 and img_tensor.shape[2] == 1:
-                img_tensor = img_tensor.squeeze(2)
-        else:
-            raise TypeError(
-                "condition_image must be a PIL image, tensor, or non-empty list; "
-                f"got {type(condition_image).__name__}."
-            )
-
-        # Resize if needed to match latent spatial dims
-        B, C, T_lat, H_sp, W_sp = latents.shape
+        B, _C, _T_lat, H_sp, W_sp = latents.shape
         target_h = H_sp * self.pipeline_config.vae_stride[1]  # 32
         target_w = W_sp * self.pipeline_config.vae_stride[2]  # 32
-        if img_tensor.shape[-2] != target_h or img_tensor.shape[-1] != target_w:
-            import torch.nn.functional as F
-
-            img_tensor = F.interpolate(
-                img_tensor,
-                size=(target_h, target_w),
-                mode="bilinear",
-                align_corners=False,
-            )
-            self.log_info(
-                "First-frame condition image resized to %dx%d for VAE encode.",
-                target_w,
-                target_h,
-            )
+        img_tensor, preprocess_info = self._preprocess_condition_image(
+            condition_image,
+            target_h=target_h,
+            target_w=target_w,
+        )
+        if batch is not None:
+            if not hasattr(batch, "extra") or batch.extra is None:
+                batch.extra = {}
+            batch.extra[_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY] = preprocess_info
+        self.log_info(
+            "First-frame condition image preprocessed: source=%s, resized=%s, "
+            "crop_offset=%s, target=%s.",
+            preprocess_info["source_size"],
+            preprocess_info["resized_size"],
+            preprocess_info["crop_offset"],
+            preprocess_info["target_size"],
+        )
 
         first_frame_z = self._vae_encode_image(img_tensor, dtype, device)
         # first_frame_z: (1, 128, 1, H_sp, W_sp) — expand to batch
@@ -1406,6 +1594,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         diffusers_kwargs = extra.get("diffusers_kwargs", {})
         if not isinstance(diffusers_kwargs, dict):
             diffusers_kwargs = {}
+        preprocess_info = extra.get(_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY)
         action = self._request_action_value(extra, diffusers_kwargs)
         if action is not None and (
             camera_conditions is not None or chunk_plucker is not None
@@ -1543,6 +1732,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                         device=device,
                         dtype=camera_compute_dtype,
                     )
+                    intrinsics_vec4 = self._transform_intrinsics_for_condition_image(
+                        intrinsics_vec4,
+                        preprocess_info,
+                    )
             elif camera_to_world is not None:
                 source = (
                     "request"
@@ -1577,6 +1770,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                         device=device,
                         dtype=camera_compute_dtype,
                     )
+                    intrinsics_vec4 = self._transform_intrinsics_for_condition_image(
+                        intrinsics_vec4,
+                        preprocess_info,
+                    )
             elif intrinsics is not None:
                 source = "default_static_request_intrinsics"
                 camera_to_world, _ = self._default_static_camera(
@@ -1593,6 +1790,10 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                     num_frames=num_frames,
                     device=device,
                     dtype=camera_compute_dtype,
+                )
+                intrinsics_vec4 = self._transform_intrinsics_for_condition_image(
+                    intrinsics_vec4,
+                    preprocess_info,
                 )
                 self.log_info(
                     "No camera trajectory provided; using static identity "
@@ -1671,8 +1872,13 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         num_inference_steps = batch.num_inference_steps
 
-        # Use flow_shift from pipeline config
-        flow_shift = getattr(self.pipeline_config, "flow_shift", 9.95)
+        flow_shift = getattr(
+            self.pipeline_config,
+            "inference_flow_shift",
+            None,
+        )
+        if flow_shift is None:
+            flow_shift = getattr(self.pipeline_config, "flow_shift", 9.95)
         kwargs = {}
 
         # diffusers FlowMatchEulerDiscreteScheduler supports mu/shift
@@ -1717,7 +1923,12 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         Expects batch to already have prompt_embeds set by SanaWMTextEncodingStage.
         """
         device = get_local_torch_device()
-        dtype = torch.bfloat16  # SANA-WM runs in bf16
+        dtype = PRECISION_TO_TYPE.get(
+            getattr(self.pipeline_config, "dit_precision", "bf16"),
+            torch.bfloat16,
+        )
+        if not hasattr(batch, "extra") or batch.extra is None:
+            batch.extra = {}
 
         # --- 0. Adjust num_frames to be compatible with VAE temporal stride ---
         requested_num_frames = batch.num_frames or 49
@@ -1766,7 +1977,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         if condition_image is not None:
             try:
                 latents = self._splice_first_frame(
-                    latents, condition_image, dtype, device
+                    latents, condition_image, dtype, device, batch=batch
                 )
                 self.log_info("First-frame spliced into noise latents.")
             except Exception as e:

@@ -6,7 +6,8 @@
 #   - task_type = TI2V: requires first-frame image input
 #   - 5D latent (B, C, T, H, W) via LTX-2 VAE (8× temporal, 32× spatial, 128 ch)
 #   - Camera trajectory conditioning (optional): camera_to_world + intrinsics
-#   - flow_shift = 9.95 (linear_flow schedule, from config.yaml)
+#   - flow_shift = 9.95 (linear_flow training schedule, from config.yaml)
+#   - inference_flow_shift = 9.8 (official inference schedule)
 #   - Two-stage optional: Stage-1 (SANA-WM) + Stage-2 (LTX-2 Refiner)
 #
 # The SANA-WM pre-denoising stage converts camera_to_world + intrinsics into
@@ -14,7 +15,6 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Optional
 
 import torch
 
@@ -99,7 +99,7 @@ class SanaWMPipelineConfig(PipelineConfig):
     # Match NVlabs SANA-WM inference: long videos must use LTX-2 spatial
     # tiling plus framewise temporal decode to avoid oversized Conv3d pads.
     vae_tiling: bool = True
-    vae_sp: bool = False        # no VAE SP for now
+    vae_sp: bool = False  # no VAE SP for now
     vae_framewise_encoding: bool = True
     vae_framewise_decoding: bool = True
     vae_tile_sample_min_num_frames: int = 96
@@ -111,15 +111,12 @@ class SanaWMPipelineConfig(PipelineConfig):
         self.vae_config.load_decoder = True
         self.vae_config.use_tiling = self.vae_tiling
         self.vae_config.use_temporal_tiling = self.vae_framewise_decoding
-        self.vae_config.tile_sample_min_num_frames = (
-            self.vae_tile_sample_min_num_frames
-        )
+        self.vae_config.tile_sample_min_num_frames = self.vae_tile_sample_min_num_frames
         self.vae_config.tile_sample_stride_num_frames = (
             self.vae_tile_sample_stride_num_frames
         )
         self.vae_config.blend_num_frames = (
-            self.vae_tile_sample_min_num_frames
-            - self.vae_tile_sample_stride_num_frames
+            self.vae_tile_sample_min_num_frames - self.vae_tile_sample_stride_num_frames
         )
 
     # --- Text encoder: Gemma-2-2b-it (single encoder, same as SANA T2I) ---
@@ -146,12 +143,15 @@ class SanaWMPipelineConfig(PipelineConfig):
     )
 
     # --- Scheduler ---
-    # linear_flow matching with flow_shift=9.95 (from config.yaml)
+    # linear_flow training schedule from the released config.yaml.
     flow_shift: float = 9.95
+    # Official NVlabs/Sana inference resolves inference_flow_shift first and
+    # falls back to flow_shift only when it is absent.
+    inference_flow_shift: float | None = 9.8
 
     # --- Video shape ---
     # VAE strides: (temporal, spatial_h, spatial_w)
-    vae_stride: tuple = (8, 32, 32)   # LTX-2 VAE temporal=8, spatial=32
+    vae_stride: tuple = (8, 32, 32)  # LTX-2 VAE temporal=8, spatial=32
 
     # --- Camera conditioning ---
     camera_conditioning: bool = True  # set False to disable camera branch
@@ -160,6 +160,9 @@ class SanaWMPipelineConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
+            # Conservative auto-FSDP gate for the 720p world-model path. Users
+            # can still force FSDP explicitly on smaller cards.
+            fsdp_auto_min_available_memory_gb=60,
         )
 
     # --- Latent shape ---

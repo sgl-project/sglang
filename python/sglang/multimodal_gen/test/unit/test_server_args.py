@@ -445,8 +445,21 @@ class TestOffloadDefaults(unittest.TestCase):
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
 
-        self.assertIsNone(sana_wm_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
+
+    def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(

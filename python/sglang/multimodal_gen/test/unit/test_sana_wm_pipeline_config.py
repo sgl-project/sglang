@@ -24,9 +24,13 @@ from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
     SanaWMTwoStagePipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
+    SanaWMDenoisingStage,
     SanaWMTextEncodingStage,
     _align_sana_wm_cfg_text_conditions,
     configure_sana_wm_ltx2_vae_for_long_video,
@@ -121,6 +125,7 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
     def test_get_model_deployment_config_enables_dit_layerwise_offload(self) -> None:
         deployment = self.config.get_model_deployment_config()
         self.assertTrue(deployment.auto_dit_layerwise_offload)
+        self.assertEqual(deployment.fsdp_auto_min_available_memory_gb, 60)
 
     def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
         self.assertEqual(
@@ -128,6 +133,10 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         )
         self.assertTrue(self.config.text_encoder_extra_args[0]["return_attention_mask"])
         self.assertTrue(self.config.chi_prompt)
+
+    def test_inference_flow_shift_matches_official_reference(self) -> None:
+        self.assertEqual(self.config.flow_shift, 9.95)
+        self.assertEqual(self.config.inference_flow_shift, 9.8)
 
     def test_dit_arch_text_norm_defaults_match_upstream(self) -> None:
         arch = SanaWMConfig().arch_config
@@ -452,6 +461,36 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         expected = torch.tensor([[[[[2.0]]], [[[4.0]]]]])
         self.assertTrue(torch.equal(encoded, expected))
 
+    def test_first_frame_preprocess_records_official_crop_geometry(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        latents = torch.zeros(1, 128, 7, 22, 40)
+        batch = SimpleNamespace(extra={})
+
+        with patch.object(
+            stage,
+            "_vae_encode_image",
+            return_value=torch.ones(1, 128, 1, 22, 40),
+        ):
+            out = stage._splice_first_frame(
+                latents,
+                torch.zeros(3, 100, 100),
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                batch=batch,
+            )
+
+        info = batch.extra["sana_wm_condition_image_preprocess"]
+        self.assertEqual(info["source_size"], (100, 100))
+        self.assertEqual(info["resized_size"], (1280, 1280))
+        self.assertEqual(info["crop_offset"], (0, 288))
+        self.assertEqual(info["target_size"], (1280, 704))
+        self.assertTrue(torch.equal(out[:, :, :1], torch.ones(1, 128, 1, 22, 40)))
+
     def test_default_static_camera_builds_latent_raymap_and_chunk_plucker(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -480,6 +519,47 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
             torch.allclose(
                 camera_conditions[0, 0, 16:],
                 torch.tensor([16.0, 16.0, 10.0, 6.0]),
+            )
+        )
+
+    def test_request_intrinsics_are_transformed_for_condition_image_crop(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        batch = SimpleNamespace(
+            extra={
+                "diffusers_kwargs": {
+                    "intrinsics": [50.0, 50.0, 50.0, 50.0],
+                },
+                "sana_wm_condition_image_preprocess": {
+                    "source_size": (100, 100),
+                    "resized_size": (1280, 1280),
+                    "crop_offset": (0, 288),
+                    "target_size": (1280, 704),
+                },
+            },
+            height=704,
+            width=1280,
+        )
+
+        camera_conditions, chunk_plucker, source = stage._build_camera_conditioning(
+            batch,
+            batch_size=1,
+            num_frames=49,
+            latent_shape=(1, 128, 7, 22, 40),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(source, "default_static_request_intrinsics")
+        self.assertEqual(chunk_plucker.shape, (1, 48, 7, 22, 40))
+        self.assertTrue(
+            torch.allclose(
+                camera_conditions[0, 0, 16:],
+                torch.tensor([20.0, 20.0, 20.0, 11.0]),
             )
         )
 
@@ -619,6 +699,32 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         norm = _RMSNorm(4, scale_factor=0.01)
         self.assertTrue(torch.allclose(norm.weight, torch.full((4,), 0.01)))
 
+    def test_prepare_timesteps_uses_inference_flow_shift(self) -> None:
+        class FakeScheduler:
+            def __init__(self):
+                self.shift = None
+                self.timesteps = None
+                self.sigmas = None
+
+            def set_timesteps(self, num_inference_steps, device, shift=None):
+                self.shift = shift
+                self.timesteps = torch.arange(num_inference_steps, device=device)
+                self.sigmas = torch.tensor([float(shift), 0.0], device=device)
+
+        scheduler = FakeScheduler()
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=scheduler,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        batch = SimpleNamespace(num_inference_steps=3, scheduler=None)
+
+        stage._prepare_timesteps(batch, SimpleNamespace(), torch.device("cpu"))
+
+        self.assertEqual(scheduler.shift, 9.8)
+        self.assertTrue(torch.equal(batch.timesteps, torch.arange(3)))
+
 
 class TestSanaWMTextEncodingStage(unittest.TestCase):
     def test_official_prompt_window_keeps_bos_and_tail(self) -> None:
@@ -629,6 +735,42 @@ class TestSanaWMTextEncodingStage(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(selected.squeeze(-1), torch.tensor([[0, 3, 4]])))
+
+
+class TestSanaWMDenoisingStage(unittest.TestCase):
+    def test_parallelism_type_follows_cfg_parallel_flag(self) -> None:
+        stage = object.__new__(SanaWMDenoisingStage)
+
+        stage.server_args = SimpleNamespace(enable_cfg_parallel=False)
+        self.assertEqual(stage.parallelism_type, StageParallelismType.REPLICATED)
+
+        stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
+        self.assertEqual(stage.parallelism_type, StageParallelismType.CFG_PARALLEL)
+
+    def test_cfg_parallel_formula_matches_serial_cfg(self) -> None:
+        pos = torch.tensor([2.0])
+        neg = torch.tensor([-1.0])
+        guidance_scale = 4.5
+        serial = neg + guidance_scale * (pos - neg)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.cfg_model_parallel_all_reduce",
+            side_effect=lambda partial: partial + (1.0 - guidance_scale) * neg,
+        ):
+            combined_from_pos_rank = SanaWMDenoisingStage._combine_cfg_parallel_noise(
+                pos, guidance_scale, cfg_rank=0
+            )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.cfg_model_parallel_all_reduce",
+            side_effect=lambda partial: partial + guidance_scale * pos,
+        ):
+            combined_from_neg_rank = SanaWMDenoisingStage._combine_cfg_parallel_noise(
+                neg, guidance_scale, cfg_rank=1
+            )
+
+        self.assertTrue(torch.allclose(combined_from_pos_rank, serial))
+        self.assertTrue(torch.allclose(combined_from_neg_rank, serial))
 
 
 class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):

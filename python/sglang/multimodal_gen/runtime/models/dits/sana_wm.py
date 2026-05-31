@@ -182,8 +182,11 @@ class WanRotaryPosEmbed(nn.Module):
         freqs = []
         for dim in [t_dim, h_dim, w_dim]:
             freq = get_1d_rotary_pos_embed(
-                dim, self.max_seq_len, self.theta,
-                use_real=False, repeat_interleave_real=False,
+                dim,
+                self.max_seq_len,
+                self.theta,
+                use_real=False,
+                repeat_interleave_real=False,
                 freqs_dtype=torch.float64,
             )
             freqs.append(freq)
@@ -205,7 +208,9 @@ class WanRotaryPosEmbed(nn.Module):
         return out.reshape(1, 1, ppf * pph * ppw, -1)
 
 
-def _apply_rotary_emb_dn(hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def _apply_rotary_emb_dn(
+    hidden_states: torch.Tensor, freqs: torch.Tensor
+) -> torch.Tensor:
     """Apply complex RoPE to a tensor of shape ``(B, H, D, N)`` (GDN layout).
 
     ``freqs`` is complex with shape ``(1, 1, N, D/2)``.
@@ -217,7 +222,9 @@ def _apply_rotary_emb_dn(hidden_states: torch.Tensor, freqs: torch.Tensor) -> to
     return y.permute(0, 1, 3, 2).type_as(hidden_states)
 
 
-def _apply_rotary_emb_bhnd(hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def _apply_rotary_emb_bhnd(
+    hidden_states: torch.Tensor, freqs: torch.Tensor
+) -> torch.Tensor:
     """Apply complex RoPE to ``(B, H, N, D)`` (softmax attention layout)."""
     x = hidden_states.to(torch.float64).contiguous()
     x_c = torch.view_as_complex(x.unflatten(-1, (-1, 2)))
@@ -244,7 +251,9 @@ def _apply_ray_projmat(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tenso
     ).reshape(feats.shape)
 
 
-def _apply_complex_rope(hidden_states: torch.Tensor, freqs: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+def _apply_complex_rope(
+    hidden_states: torch.Tensor, freqs: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
     if inverse:
         freqs = freqs.conj()
     x_real = hidden_states.to(torch.float64)
@@ -287,14 +296,16 @@ def _slice_rope_for_cam(
     new_h_size = rope_dim // 6
     new_w_size = rope_dim // 6
     t_part = rotary_emb[..., :new_t_size]
-    h_part = rotary_emb[..., orig_t_size:orig_t_size + new_h_size]
-    w_part = rotary_emb[..., orig_t_size + orig_h_size:orig_t_size + orig_h_size + new_w_size]
+    h_part = rotary_emb[..., orig_t_size : orig_t_size + new_h_size]
+    w_part = rotary_emb[
+        ..., orig_t_size + orig_h_size : orig_t_size + orig_h_size + new_w_size
+    ]
     return torch.cat([t_part, h_part, w_part], dim=-1)
 
 
 def _build_ucpe_apply_fns(
     head_dim: int,
-    raymats: torch.Tensor,           # (B, N, 4, 4) -- ray<-world
+    raymats: torch.Tensor,  # (B, N, 4, 4) -- ray<-world
     rotary_emb: Optional[torch.Tensor],
 ) -> Tuple[Callable, Callable, Callable]:
     """Build the (apply_q, apply_kv, apply_o) callables used in the camera
@@ -307,22 +318,41 @@ def _build_ucpe_apply_fns(
 
     rotary_emb_cam = _slice_rope_for_cam(rotary_emb, head_dim, head_dim // 2)
     if rotary_emb_cam is not None:
-        rope_fn = lambda x: _apply_complex_rope(x, rotary_emb_cam, inverse=False)
-        rope_fn_inv = lambda x: _apply_complex_rope(x, rotary_emb_cam, inverse=True)
+
+        def rope_fn(x: torch.Tensor) -> torch.Tensor:
+            return _apply_complex_rope(x, rotary_emb_cam, inverse=False)
+
+        def rope_fn_inv(x: torch.Tensor) -> torch.Tensor:
+            return _apply_complex_rope(x, rotary_emb_cam, inverse=True)
+
     else:
-        rope_fn = lambda x: x
-        rope_fn_inv = lambda x: x
+
+        def rope_fn(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        def rope_fn_inv(x: torch.Tensor) -> torch.Tensor:
+            return x
 
     half = head_dim // 2
-    apply_q = lambda x: _apply_block_diagonal(
-        x, [(lambda y: _apply_ray_projmat(y, P_T), half), (rope_fn, half)]
-    )
-    apply_kv = lambda x: _apply_block_diagonal(
-        x, [(lambda y: _apply_ray_projmat(y, P_inv), half), (rope_fn, half)]
-    )
-    apply_o = lambda x: _apply_block_diagonal(
-        x, [(lambda y: _apply_ray_projmat(y, P), half), (rope_fn_inv, half)]
-    )
+
+    def ray_proj_t(y: torch.Tensor) -> torch.Tensor:
+        return _apply_ray_projmat(y, P_T)
+
+    def ray_proj_inv(y: torch.Tensor) -> torch.Tensor:
+        return _apply_ray_projmat(y, P_inv)
+
+    def ray_proj(y: torch.Tensor) -> torch.Tensor:
+        return _apply_ray_projmat(y, P)
+
+    def apply_q(x: torch.Tensor) -> torch.Tensor:
+        return _apply_block_diagonal(x, [(ray_proj_t, half), (rope_fn, half)])
+
+    def apply_kv(x: torch.Tensor) -> torch.Tensor:
+        return _apply_block_diagonal(x, [(ray_proj_inv, half), (rope_fn, half)])
+
+    def apply_o(x: torch.Tensor) -> torch.Tensor:
+        return _apply_block_diagonal(x, [(ray_proj, half), (rope_fn_inv, half)])
+
     return apply_q, apply_kv, apply_o
 
 
@@ -332,9 +362,14 @@ def _compute_fov_from_focal(focal: torch.Tensor, image_size: int) -> torch.Tenso
 
 
 def _unproject_grid(
-    x_fov: torch.Tensor, y_fov: torch.Tensor,
-    H: int, W: int, cx: torch.Tensor, cy: torch.Tensor,
-    device: torch.device, dtype: torch.dtype,
+    x_fov: torch.Tensor,
+    y_fov: torch.Tensor,
+    H: int,
+    W: int,
+    cx: torch.Tensor,
+    cy: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     """Compute camera-space unit ray directions for each latent token.
 
@@ -360,7 +395,7 @@ def _unproject_grid(
 
 
 def process_camera_conditions_ucpe(
-    camera_conditions: torch.Tensor,   # (B, F, 20)
+    camera_conditions: torch.Tensor,  # (B, F, 20)
     HW: Tuple[int, int, int],
     patch_size: Tuple[int, int, int] = (1, 1, 1),
 ) -> torch.Tensor:
@@ -392,11 +427,13 @@ def process_camera_conditions_ucpe(
     cx_lat = cx / float(patch_size[2])
     cy_lat = cy / float(patch_size[1])
 
-    d_cam = _unproject_grid(x_fov, y_fov, H, W, cx_lat, cy_lat, device, dtype)  # (B,F,H,W,3)
+    d_cam = _unproject_grid(
+        x_fov, y_fov, H, W, cx_lat, cy_lat, device, dtype
+    )  # (B,F,H,W,3)
 
     # Build per-token "ray<-world" 4x4 following upstream `world_to_ray_mats`.
-    R_c2w = C_to_W[..., :3, :3]                 # (B, F, 3, 3)
-    t_c2w = C_to_W[..., :3, 3]                  # (B, F, 3)
+    R_c2w = C_to_W[..., :3, :3]  # (B, F, 3, 3)
+    t_c2w = C_to_W[..., :3, 3]  # (B, F, 3)
     d_world = torch.einsum("bfij,bfhwj->bfhwi", R_c2w, d_cam)
     z_ray = F.normalize(d_world, dim=-1, eps=1e-6)
     cam_y = R_c2w[..., :, 1].view(B, F_dim, 1, 1, 3).expand(B, F_dim, H, W, 3)
@@ -407,7 +444,8 @@ def process_camera_conditions_ucpe(
     # P = ray<-world = inverse of [R_ray_to_world | t_c2w]
     R_w_to_ray = R_ray_to_world.transpose(-1, -2)
     t_w_to_ray = -torch.einsum(
-        "bfhwij,bfj->bfhwi", R_w_to_ray,
+        "bfhwij,bfj->bfhwi",
+        R_w_to_ray,
         t_c2w,
     )
     raymats = torch.zeros(B, F_dim, H, W, 4, 4, device=device, dtype=dtype)
@@ -422,8 +460,8 @@ def process_camera_conditions_ucpe(
 
 
 def compute_chunk_plucker(
-    camera_conditions: torch.Tensor,   # (B, F_orig, 20)
-    HW: Tuple[int, int, int],          # latent (T, H, W)
+    camera_conditions: torch.Tensor,  # (B, F_orig, 20)
+    HW: Tuple[int, int, int],  # latent (T, H, W)
     vae_temporal_stride: int = 8,
     patch_size: Tuple[int, int, int] = (1, 1, 1),
 ) -> torch.Tensor:
@@ -457,13 +495,18 @@ def compute_chunk_plucker(
     y_fov = _compute_fov_from_focal(fy, image_h)
 
     d_cam = _unproject_grid(
-        x_fov, y_fov, H, W,
-        cx / float(patch_size[2]), cy / float(patch_size[1]),
-        device, dtype,
+        x_fov,
+        y_fov,
+        H,
+        W,
+        cx / float(patch_size[2]),
+        cy / float(patch_size[1]),
+        device,
+        dtype,
     )  # (B, F_orig, H, W, 3)
 
     R = c2w[..., :3, :3]
-    o = c2w[..., :3, 3]                          # (B, F_orig, 3)
+    o = c2w[..., :3, 3]  # (B, F_orig, 3)
     d_world = F.normalize(torch.einsum("bfij,bfhwj->bfhwi", R, d_cam), dim=-1)
     o_exp = o.view(B, F_orig, 1, 1, 3).expand_as(d_world)
     moment = torch.cross(o_exp, d_world, dim=-1)
@@ -474,8 +517,10 @@ def compute_chunk_plucker(
     )
     if time_indices.numel() < T:
         pad = T - int(time_indices.numel())
-        last = time_indices[-1:] if time_indices.numel() else torch.zeros(
-            1, device=device, dtype=torch.long
+        last = (
+            time_indices[-1:]
+            if time_indices.numel()
+            else torch.zeros(1, device=device, dtype=torch.long)
         )
         time_indices = torch.cat([time_indices, last.repeat(pad)], dim=0)
     time_indices = time_indices[:T]
@@ -524,17 +569,21 @@ class PatchEmbedMS3D(nn.Module):
         kernel_size = kernel_size or patch_size
         assert patch_size[0] == 1, "Temporal patch must be 1 for SANA-WM."
         self.patch_size = patch_size
-        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=kernel_size, stride=patch_size, bias=bias)
+        self.proj = nn.Conv3d(
+            in_chans, embed_dim, kernel_size=kernel_size, stride=patch_size, bias=bias
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)              # (B, D, T, H, W)
+        x = self.proj(x)  # (B, D, T, H, W)
         return x.flatten(2).transpose(1, 2)  # (B, T*H*W, D)
 
 
 class _UpstreamMlp(nn.Module):
     """timm-style Mlp used by ``y_embedder.y_proj`` (fc1/fc2 with bias=True)."""
 
-    def __init__(self, in_features: int, hidden_features: int, out_features: int) -> None:
+    def __init__(
+        self, in_features: int, hidden_features: int, out_features: int
+    ) -> None:
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
         self.act = nn.GELU(approximate="tanh")
@@ -553,7 +602,9 @@ class CaptionEmbedder(nn.Module):
     inference time).  Returns ``(B, 1, L, hidden_size)``.
     """
 
-    def __init__(self, in_channels: int, hidden_size: int, token_num: int = 300) -> None:
+    def __init__(
+        self, in_channels: int, hidden_size: int, token_num: int = 300
+    ) -> None:
         super().__init__()
         self.y_proj = _UpstreamMlp(in_channels, hidden_size, hidden_size)
         # buffer in upstream -- registered with nn.Parameter wrapper but as buffer.
@@ -574,11 +625,17 @@ class T2IFinalLayer(nn.Module):
     module (upstream stores it as ``final_layer.scale_shift_table``).
     """
 
-    def __init__(self, hidden_size: int, patch_size: Tuple[int, int, int], out_channels: int) -> None:
+    def __init__(
+        self, hidden_size: int, patch_size: Tuple[int, int, int], out_channels: int
+    ) -> None:
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, math.prod(patch_size) * out_channels, bias=True)
-        self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size**0.5)
+        self.linear = nn.Linear(
+            hidden_size, math.prod(patch_size) * out_channels, bias=True
+        )
+        self.scale_shift_table = nn.Parameter(
+            torch.randn(2, hidden_size) / hidden_size**0.5
+        )
         self.out_channels = out_channels
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -607,10 +664,14 @@ class T2IFinalLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _sinusoidal_timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
+def _sinusoidal_timestep_embedding(
+    t: torch.Tensor, dim: int, max_period: float = 10000.0
+) -> torch.Tensor:
     half = dim // 2
     freqs = torch.exp(
-        -math.log(max_period) * torch.arange(half, dtype=torch.float32, device=t.device) / half
+        -math.log(max_period)
+        * torch.arange(half, dtype=torch.float32, device=t.device)
+        / half
     )
     args = t.float()[:, None] * freqs[None]
     emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
@@ -651,6 +712,8 @@ class TimestepEmbedder(nn.Module):
 # ``.conv``; that's why the key has the extra ``.conv`` segment.
 # ---------------------------------------------------------------------------
 
+_INT32_SAFE_CONV_ELEMENTS = 1 << 30
+
 
 class _ConvLayer(nn.Module):
     """Thin wrapper -- has a single ``conv`` member to match upstream
@@ -677,7 +740,9 @@ class GLUMBConvTemp(nn.Module):
     conv), residually added.
     """
 
-    def __init__(self, in_features: int, hidden_features: int, t_kernel_size: int = 3) -> None:
+    def __init__(
+        self, in_features: int, hidden_features: int, t_kernel_size: int = 3
+    ) -> None:
         super().__init__()
         self.inverted_conv = _ConvLayer(
             nn.Conv2d(in_features, hidden_features * 2, 1, 1, 0, bias=True),
@@ -685,9 +750,13 @@ class GLUMBConvTemp(nn.Module):
         )
         self.depth_conv = _ConvLayer(
             nn.Conv2d(
-                hidden_features * 2, hidden_features * 2,
-                3, 1, 1,
-                groups=hidden_features * 2, bias=True,
+                hidden_features * 2,
+                hidden_features * 2,
+                3,
+                1,
+                1,
+                groups=hidden_features * 2,
+                bias=True,
             ),
             act=None,
         )
@@ -699,13 +768,35 @@ class GLUMBConvTemp(nn.Module):
 
         t_padding = t_kernel_size // 2
         self.t_conv = nn.Conv2d(
-            in_features, in_features,
+            in_features,
+            in_features,
             kernel_size=(t_kernel_size, 1),
             stride=1,
             padding=(t_padding, 0),
             bias=False,
         )
         nn.init.zeros_(self.t_conv.weight)
+
+    def _apply_spatial(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.inverted_conv(x)
+        x = self.depth_conv(x)
+        a, g = x.chunk(2, dim=1)
+        return self.point_conv(a * self.glu_act(g))
+
+    def _apply_spatial_autochunked(self, x: torch.Tensor) -> torch.Tensor:
+        """Avoid oversized Conv2d calls on long videos while keeping short path fused."""
+        BT, _, H, W = x.shape
+        elements_per_bt = self.inverted_conv.conv.out_channels * H * W
+        max_bt = max(1, _INT32_SAFE_CONV_ELEMENTS // elements_per_bt)
+        if BT <= max_bt:
+            return self._apply_spatial(x)
+        return torch.cat(
+            [
+                self._apply_spatial(x[start : start + max_bt])
+                for start in range(0, BT, max_bt)
+            ],
+            dim=0,
+        )
 
     def forward(self, x: torch.Tensor, HW: Tuple[int, int, int]) -> torch.Tensor:
         B, N, C = x.shape
@@ -714,11 +805,7 @@ class GLUMBConvTemp(nn.Module):
 
         # Spatial path -- (B*T, C, H, W)
         x_sp = x.reshape(B * T, H, W, C).permute(0, 3, 1, 2).contiguous()
-        x_sp = self.inverted_conv(x_sp)
-        x_sp = self.depth_conv(x_sp)
-        a, g = x_sp.chunk(2, dim=1)
-        x_sp = a * self.glu_act(g)
-        x_sp = self.point_conv(x_sp)   # (B*T, C, H, W)
+        x_sp = self._apply_spatial_autochunked(x_sp)  # (B*T, C, H, W)
 
         # Temporal additive path -- (B, C, T, S=H*W)
         x_t = x_sp.view(B, T, C, H * W).permute(0, 2, 1, 3).contiguous()
@@ -737,7 +824,7 @@ class GLUMBConvTemp(nn.Module):
 
 
 def _compute_frame_gates(
-    x: torch.Tensor,                 # (B, N, C)
+    x: torch.Tensor,  # (B, N, C)
     HW: Tuple[int, int, int],
     heads: int,
     beta_proj: nn.Linear,
@@ -764,9 +851,13 @@ def _compute_frame_gates(
 
 
 def _gdn_scan_forward(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    q_rot: torch.Tensor, k_rot: torch.Tensor,
-    beta: torch.Tensor, decay: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
     eps: float = 1e-6,
     return_components: bool = False,
 ) -> torch.Tensor:
@@ -783,7 +874,7 @@ def _gdn_scan_forward(
     q, k, v = fold(q), fold(k), fold(v)
     q_rot, k_rot = fold(q_rot), fold(k_rot)
     if beta.ndim == 4:
-        beta_e = beta.unsqueeze(3)        # (B, H, T, 1, S)
+        beta_e = beta.unsqueeze(3)  # (B, H, T, 1, S)
     else:
         beta_e = beta.view(B, H, T, 1, 1)
     decay_e = decay.view(B, H, T, 1, 1)
@@ -808,7 +899,7 @@ def _gdn_scan_forward(
         delta_z = (target_z - z_pred) * bt
         state_z = state_z + torch.matmul(kt, delta_z.transpose(-1, -2))
         # output components
-        num_list.append(torch.matmul(state_kv, qrt))               # (B, H, D, S)
+        num_list.append(torch.matmul(state_kv, qrt))  # (B, H, D, S)
         den_list.append(torch.matmul(state_z.transpose(-1, -2), qt))  # (B, H, 1, S)
 
     num_stacked = torch.stack(num_list, dim=2)  # (B, H, T, D, S)
@@ -837,9 +928,13 @@ def _flip_and_shift(x: torch.Tensor, dim: int, shift_val: float = 0.0) -> torch.
 
 
 def _gdn_scan_bidirectional(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    q_rot: torch.Tensor, k_rot: torch.Tensor,
-    beta: torch.Tensor, decay: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
     HW: Tuple[int, int, int],
     eps: float = 1e-6,
 ) -> torch.Tensor:
@@ -847,7 +942,9 @@ def _gdn_scan_bidirectional(
     summed in numerator/denominator space (mirrors upstream
     ``BidirectionalGDN.forward``).
     """
-    num_fwd, den_fwd = _gdn_scan_forward(q, k, v, q_rot, k_rot, beta, decay, eps=eps, return_components=True)
+    num_fwd, den_fwd = _gdn_scan_forward(
+        q, k, v, q_rot, k_rot, beta, decay, eps=eps, return_components=True
+    )
 
     # Backward pass: flip Q, flip+shift K/V/k_rot/beta and shift decay-by-1.
     B, H, D, N = q.shape
@@ -860,8 +957,11 @@ def _gdn_scan_bidirectional(
     def from_time(x, d):
         return x.permute(0, 1, 3, 2, 4).reshape(B, H, d, N)
 
-    q_t = to_time(q, D); k_t = to_time(k, D); v_t = to_time(v, D)
-    q_rot_t = to_time(q_rot, D); k_rot_t = to_time(k_rot, D)
+    q_t = to_time(q, D)
+    k_t = to_time(k, D)
+    v_t = to_time(v, D)
+    q_rot_t = to_time(q_rot, D)
+    k_rot_t = to_time(k_rot, D)
 
     q_bwd = torch.flip(q_t, dims=[2])
     q_rot_bwd = torch.flip(q_rot_t, dims=[2])
@@ -871,12 +971,22 @@ def _gdn_scan_bidirectional(
     beta_bwd = _flip_and_shift(beta, dim=2, shift_val=0.0)
     decay_bwd = _flip_and_shift(decay, dim=2, shift_val=1.0)
 
-    q_bwd_f = from_time(q_bwd, D); k_bwd_f = from_time(k_bwd, D); v_bwd_f = from_time(v_bwd, D)
-    q_rot_bwd_f = from_time(q_rot_bwd, D); k_rot_bwd_f = from_time(k_rot_bwd, D)
+    q_bwd_f = from_time(q_bwd, D)
+    k_bwd_f = from_time(k_bwd, D)
+    v_bwd_f = from_time(v_bwd, D)
+    q_rot_bwd_f = from_time(q_rot_bwd, D)
+    k_rot_bwd_f = from_time(k_rot_bwd, D)
 
     num_bwd_flipped, den_bwd_flipped = _gdn_scan_forward(
-        q_bwd_f, k_bwd_f, v_bwd_f, q_rot_bwd_f, k_rot_bwd_f,
-        beta_bwd, decay_bwd, eps=eps, return_components=True,
+        q_bwd_f,
+        k_bwd_f,
+        v_bwd_f,
+        q_rot_bwd_f,
+        k_rot_bwd_f,
+        beta_bwd,
+        decay_bwd,
+        eps=eps,
+        return_components=True,
     )
 
     def flip_back(tensor):
@@ -1036,7 +1146,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     ) -> None:
         super().__init__()
         out_dim = heads * head_dim
-        assert out_dim == in_dim, f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
+        assert (
+            out_dim == in_dim
+        ), f"in_dim ({in_dim}) must equal heads*head_dim ({out_dim})"
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.heads = heads
@@ -1120,7 +1232,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
     @staticmethod
     def _temporal_short_conv(
-        x: torch.Tensor,                 # (B, N, C)
+        x: torch.Tensor,  # (B, N, C)
         conv: _ShortConvolution,
         HW: Tuple[int, int, int],
         bidirectional: bool = True,
@@ -1157,7 +1269,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         # Short conv on K only.
         if self.conv_k is not None:
-            k = self._temporal_short_conv(k.reshape(B, N, C), self.conv_k, HW, bidirectional=True)
+            k = self._temporal_short_conv(
+                k.reshape(B, N, C), self.conv_k, HW, bidirectional=True
+            )
             k = k.reshape(B, N, self.heads, self.dim)
 
         # Q/K norm on the flattened channel dim (B, N, C)
@@ -1167,7 +1281,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         # ReLU kernel + key scale
         q = F.relu(q)
         k = F.relu(k)
-        k_scale = (self.dim ** -0.5) * (S ** -0.5)
+        k_scale = (self.dim**-0.5) * (S**-0.5)
         k = k * k_scale
 
         # Move to (B, H, D, N)
@@ -1183,16 +1297,27 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             k_rot = k
 
         beta, decay = _compute_frame_gates(
-            x, HW, self.heads, self.beta_proj, self.gate_proj, self.dt_bias, self.A_log,
+            x,
+            HW,
+            self.heads,
+            self.beta_proj,
+            self.gate_proj,
+            self.dt_bias,
+            self.A_log,
         )
 
         # fp32 scan for stability
         dtype = q.dtype
         out = _gdn_scan_bidirectional(
-            q.float(), k.float(), v.float(),
-            q_rot.float(), k_rot.float(),
-            beta.float(), decay.float(),
-            HW=HW, eps=self.eps,
+            q.float(),
+            k.float(),
+            v.float(),
+            q_rot.float(),
+            k_rot.float(),
+            beta.float(),
+            decay.float(),
+            HW=HW,
+            eps=self.eps,
         ).to(dtype)
 
         out = out.permute(0, 3, 1, 2).reshape(B, N, C)
@@ -1215,7 +1340,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
         q, k, v = qkv.unbind(2)
         if self.conv_k is not None:
-            k = self._temporal_short_conv(k.reshape(B, N, C), self.conv_k, HW, bidirectional=True)
+            k = self._temporal_short_conv(
+                k.reshape(B, N, C), self.conv_k, HW, bidirectional=True
+            )
             k = k.reshape(B, N, self.heads, self.dim)
         q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
         k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
@@ -1237,7 +1364,13 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         # Compute the gates anyway -- they are needed by the cam branch and
         # also exist in the softmax variant's state dict.
         beta, decay = _compute_frame_gates(
-            x, HW, self.heads, self.beta_proj, self.gate_proj, self.dt_bias, self.A_log,
+            x,
+            HW,
+            self.heads,
+            self.beta_proj,
+            self.gate_proj,
+            self.dt_bias,
+            self.A_log,
         )
         return out, beta, decay
 
@@ -1263,7 +1396,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         # Short conv on K only (k_conv_only)
         if self.conv_k_cam is not None:
-            k = self._temporal_short_conv(k.reshape(B, N, C), self.conv_k_cam, HW, bidirectional=True)
+            k = self._temporal_short_conv(
+                k.reshape(B, N, C), self.conv_k_cam, HW, bidirectional=True
+            )
             k = k.reshape(B, N, self.heads, self.dim)
 
         q = self.q_norm_cam(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
@@ -1271,7 +1406,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         q = F.relu(q)
         k = F.relu(k)
-        k_scale = (self.dim ** -0.5) * (S ** -0.5)
+        k_scale = (self.dim**-0.5) * (S**-0.5)
         k = k * k_scale
 
         # Move to (B, H, N, D) for UCPE application then back to (B, H, D, N)
@@ -1355,15 +1490,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
         v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
-        q_dn = _downscale_to_reference_rms(
-            q_pre_dn, q_proj.permute(0, 1, 3, 2)
-        )
-        k_dn = _downscale_to_reference_rms(
-            k_pre_dn, k_proj.permute(0, 1, 3, 2)
-        )
-        v_dn = _downscale_to_reference_rms(
-            v_pre_dn, v_proj.permute(0, 1, 3, 2)
-        )
+        q_dn = _downscale_to_reference_rms(q_pre_dn, q_proj.permute(0, 1, 3, 2))
+        k_dn = _downscale_to_reference_rms(k_pre_dn, k_proj.permute(0, 1, 3, 2))
+        v_dn = _downscale_to_reference_rms(v_pre_dn, v_proj.permute(0, 1, 3, 2))
 
         q_in = q_dn.permute(0, 3, 1, 2).contiguous()
         k_in = k_dn.permute(0, 3, 1, 2).contiguous()
@@ -1391,9 +1520,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if prope_fns is not None:
             apply_q, apply_kv, apply_o = prope_fns
             if self.softmax_main:
-                cam_raw = self._cam_branch_softmax(
-                    x, HW, apply_q, apply_kv, apply_o
-                )
+                cam_raw = self._cam_branch_softmax(x, HW, apply_q, apply_kv, apply_o)
             else:
                 cam_raw = self._cam_branch(
                     x, HW, apply_q, apply_kv, apply_o, beta, decay
@@ -1442,8 +1569,8 @@ class MultiHeadCrossAttention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                       # (B, N, D)
-        cond: torch.Tensor,                    # (B, L, D)
+        x: torch.Tensor,  # (B, N, D)
+        cond: torch.Tensor,  # (B, L, D)
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, D = x.shape
@@ -1512,7 +1639,9 @@ class SanaWMBlock(nn.Module):
             t_kernel_size=t_kernel_size,
         )
 
-        self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size**0.5)
+        self.scale_shift_table = nn.Parameter(
+            torch.randn(6, hidden_size) / hidden_size**0.5
+        )
 
         if use_chunk_plucker_post_attn:
             self.plucker_proj = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -1522,7 +1651,9 @@ class SanaWMBlock(nn.Module):
             self.plucker_proj = None
 
     @staticmethod
-    def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    def _modulate(
+        x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
         return x * (1 + scale) + shift
 
     @staticmethod
@@ -1536,9 +1667,9 @@ class SanaWMBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                          # (B, N, D)
-        y: torch.Tensor,                          # (B, L, D) text embeds
-        t: torch.Tensor,                          # (B, 6*D) AdaLN-single
+        x: torch.Tensor,  # (B, N, D)
+        y: torch.Tensor,  # (B, L, D) text embeds
+        t: torch.Tensor,  # (B, 6*D) AdaLN-single
         HW: Tuple[int, int, int],
         rotary_emb: Optional[torch.Tensor],
         prope_fns: Optional[Tuple[Callable, Callable, Callable]],
@@ -1589,9 +1720,7 @@ class SanaWMBlock(nn.Module):
                 self.norm2(x), num_frames
             )
             x_in = self._modulate(x_norm, shift_mlp, scale_mlp).reshape_as(x)
-            mlp_out = self.mlp(x_in, HW=HW).reshape(
-                B, num_frames, tokens_per_frame, -1
-            )
+            mlp_out = self.mlp(x_in, HW=HW).reshape(B, num_frames, tokens_per_frame, -1)
             x = x + (gate_mlp * mlp_out).reshape_as(x)
         return x
 
@@ -1644,7 +1773,10 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # --- Embedders (upstream names: x_embedder, t_embedder, t_block,
         # y_embedder, attention_y_norm, raymap_embedder, plucker_embedder) ---
         self.x_embedder = PatchEmbedMS3D(
-            self.patch_size, arch.in_channels, self.inner_dim, bias=True,
+            self.patch_size,
+            arch.in_channels,
+            self.inner_dim,
+            bias=True,
         )
 
         self.t_embedder = TimestepEmbedder(self.inner_dim, frequency_embedding_size=256)
@@ -1670,12 +1802,18 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # When ``True`` (the case for the released checkpoint) the absmap
         # path is skipped entirely.
         self.raymap_embedder = PatchEmbedMS3D(
-            self.patch_size, 3, self.inner_dim, bias=True,
+            self.patch_size,
+            3,
+            self.inner_dim,
+            bias=True,
         )
         # 48-channel plucker embedder (chunk-packed)
         if arch.use_chunk_plucker_post_attn or arch.use_chunk_plucker_input:
             self.plucker_embedder = PatchEmbedMS3D(
-                self.patch_size, arch.chunk_plucker_channels, self.inner_dim, bias=True,
+                self.patch_size,
+                arch.chunk_plucker_channels,
+                self.inner_dim,
+                bias=True,
             )
             nn.init.zeros_(self.plucker_embedder.proj.weight)
             nn.init.zeros_(self.plucker_embedder.proj.bias)
@@ -1695,32 +1833,40 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         depth = arch.num_layers
         self.softmax_every_n = arch.softmax_every_n
         softmax_idx = set(
-            i for i in range(depth) if arch.softmax_every_n > 0 and (i + 1) % arch.softmax_every_n == 0
+            i
+            for i in range(depth)
+            if arch.softmax_every_n > 0 and (i + 1) % arch.softmax_every_n == 0
         )
         self.softmax_block_indices = tuple(sorted(softmax_idx))
 
-        self.blocks = nn.ModuleList([
-            SanaWMBlock(
-                hidden_size=self.inner_dim,
-                num_heads=arch.num_attention_heads,
-                head_dim=arch.linear_head_dim,
-                mlp_ratio=arch.mlp_ratio,
-                t_kernel_size=arch.t_kernel_size,
-                qk_norm=arch.qk_norm,
-                cross_norm=arch.cross_norm,
-                conv_kernel_size=arch.conv_kernel_size,
-                k_conv_only=arch.k_conv_only,
-                softmax_main=(i in softmax_idx),
-                use_chunk_plucker_post_attn=(
-                    arch.use_chunk_plucker_post_attn
-                    and (arch.chunk_plucker_post_attn_blocks < 0
-                         or i < arch.chunk_plucker_post_attn_blocks)
-                ),
-            )
-            for i in range(depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                SanaWMBlock(
+                    hidden_size=self.inner_dim,
+                    num_heads=arch.num_attention_heads,
+                    head_dim=arch.linear_head_dim,
+                    mlp_ratio=arch.mlp_ratio,
+                    t_kernel_size=arch.t_kernel_size,
+                    qk_norm=arch.qk_norm,
+                    cross_norm=arch.cross_norm,
+                    conv_kernel_size=arch.conv_kernel_size,
+                    k_conv_only=arch.k_conv_only,
+                    softmax_main=(i in softmax_idx),
+                    use_chunk_plucker_post_attn=(
+                        arch.use_chunk_plucker_post_attn
+                        and (
+                            arch.chunk_plucker_post_attn_blocks < 0
+                            or i < arch.chunk_plucker_post_attn_blocks
+                        )
+                    ),
+                )
+                for i in range(depth)
+            ]
+        )
 
-        self.final_layer = T2IFinalLayer(self.inner_dim, self.patch_size, self.out_channels)
+        self.final_layer = T2IFinalLayer(
+            self.inner_dim, self.patch_size, self.out_channels
+        )
 
         # Cache RoPE freqs per shape -- avoids recomputation across denoising
         # steps with constant latent shapes.
@@ -1787,7 +1933,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         if timestep_for_embed.dim() == 1:
             t_emb = self.t_embedder(timestep_for_embed)  # (B, D)
-            t6 = self.t_block(t_emb)                   # (B, 6D)
+            t6 = self.t_block(t_emb)  # (B, 6D)
         else:
             timestep_shape = tuple(timestep_for_embed.shape)
             t_flat = self.t_embedder(timestep_for_embed.flatten())
@@ -1801,7 +1947,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         y = encoder_hidden_states
         if y.dim() == 3:
             y = y.unsqueeze(1)
-        y = self.y_embedder(y).squeeze(1)              # (B, L, D)
+        y = self.y_embedder(y).squeeze(1)  # (B, L, D)
         if y.shape[0] != B:
             y = y.expand(B, -1, -1).contiguous()
         if self.y_norm:
@@ -1823,7 +1969,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 )
             head_dim = self.attention_head_dim
             raymats = process_camera_conditions_ucpe(
-                camera_conditions, HW=(T, H, W), patch_size=self.patch_size,
+                camera_conditions,
+                HW=(T, H, W),
+                patch_size=self.patch_size,
             )
             raymats_flat = raymats.reshape(B, -1, 4, 4)
             prope_fns = _build_ucpe_apply_fns(head_dim, raymats_flat, freqs)
@@ -1868,7 +2016,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         # --- 7. Final layer ---
-        x = self.final_layer(x, t_emb)                 # (B, N, p_t*p_h*p_w*C_out)
+        x = self.final_layer(x, t_emb)  # (B, N, p_t*p_h*p_w*C_out)
 
         # --- 8. Un-patch ---
         x = x.reshape(B, T, H, W, p_t, p_h, p_w, self.out_channels)

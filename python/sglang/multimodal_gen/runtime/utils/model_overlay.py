@@ -31,7 +31,7 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "Efficient-Large-Model/SANA-WM_bidirectional": {
         "overlay_repo_id": "sjmshsh/SANA-WM_bidirectional-overlay",
-        "overlay_revision": "main",
+        "overlay_revision": "e611beacbcc0cf33c676306ae0eb89f149e044ad",
     },
 }
 
@@ -154,8 +154,8 @@ def resolve_model_overlay_target(
     if os.path.exists(model_name_or_path):
         # Local source dirs do not have a repo id, so match them by basename.
         base_name = os.path.basename(os.path.normpath(model_name_or_path))
-        normalized_path = os.path.normpath(model_name_or_path).lower().replace(
-            os.sep, "/"
+        normalized_path = (
+            os.path.normpath(model_name_or_path).lower().replace(os.sep, "/")
         )
         for source_model_id, spec in registry.items():
             if base_name == source_model_id.rsplit("/", 1)[-1]:
