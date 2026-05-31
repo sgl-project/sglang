@@ -122,7 +122,11 @@ class AutoRoundConfig(QuantizationConfig):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         # TODO enable CPU quant method later
         if "gptq" in self.packing_format or "gptq" in self.backend:
-            return routing.apply_gptq_quant_layer(self, layer, prefix)
+            return routing.apply_gptq_quant_layer(
+                self, layer, prefix, backend=self.backend
+            )
         if "awq" in self.packing_format or "awq" in self.backend:
-            return routing.apply_awq_quant_layer(self, layer, prefix)
+            return routing.apply_awq_quant_layer(
+                self, layer, prefix, backend=self.backend
+            )
         return None
