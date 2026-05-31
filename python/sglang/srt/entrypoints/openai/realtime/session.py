@@ -107,7 +107,7 @@ def _resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> byt
 def _pcm_to_float_samples(pcm: bytes) -> np.ndarray:
     # /32768.0 matches soundfile.read's default int16 normalization so the
     # samples are bit-equal to the prior PCM→WAV→sf.read path.
-    return np.frombuffer(pcm, dtype=np.int16).astype(np.float64) / 32768.0
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 _CLIENT_EVENT_TYPES: Dict[str, type] = {
