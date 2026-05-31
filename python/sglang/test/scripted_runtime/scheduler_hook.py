@@ -34,6 +34,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+RESET_DRAIN_MAX_STEPS: int = 200
+
+
+def _reset_engine_state(ctx: ScriptedContext) -> Generator:
+    scheduler = ctx._scheduler
+
+    ctx.abort_all()
+    for _ in range(RESET_DRAIN_MAX_STEPS):
+        yield
+        if (
+            scheduler.chunked_req is None
+            and len(scheduler.waiting_queue) == 0
+            and scheduler.running_batch.is_empty()
+        ):
+            break
+
+    ctx.flush_cache()
+    yield
+
 
 class ScriptedSchedulerHook:
 
@@ -80,8 +99,7 @@ class ScriptedSchedulerHook:
                     case RunScript(fn_path=fn_path, args=args):
                         fn = resolve_fn(fn_path)
                         ctx = self._context
-                        ctx.flush_cache()
-                        yield
+                        yield from _reset_engine_state(ctx)
                         sub_gen = fn(ctx, *args)
                         try:
                             yield from sub_gen
