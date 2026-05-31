@@ -777,6 +777,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     disable_attn_tp_gather: bool = False
     gc_threshold: Optional[List[int]] = None
+    kv_canary: str = "none"
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
     dsa_prefill_cp_mode: str = "round-robin-split"
@@ -6304,6 +6305,18 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--kv-canary",
+            type=str,
+            default=ServerArgs.kv_canary,
+            choices=["none", "log", "raise"],
+            help=(
+                "KV cache canary mode. "
+                "'none' disables the canary (default). "
+                "'log' prints them while the server keeps running (production-safe). "
+                "'raise' fails the server on the first detected mismatch (CI lane)."
+            ),
         )
         parser.add_argument(
             "--cuda-graph-max-bs",

@@ -749,6 +749,12 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # ===================================================================
+    # KV-Canary (testing-only)
+    # ===================================================================
+    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
