@@ -16,6 +16,7 @@ import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
     DumperConfig,
+    _collect_parallel_rank_tags,
     _collective_with_timeout,
     _compare_tensors_quick,
     _deepcopy_or_clone,
@@ -1124,6 +1125,93 @@ class TestDumpModel:
 
         filenames = _get_filenames(tmp_path)
         assert all("grad" in f for f in filenames)
+
+
+class TestParallelRankInFilename:
+    def test_config_default_false(self):
+        """include_parallel_rank_in_filename defaults to False."""
+        assert DumperConfig().include_parallel_rank_in_filename is False
+
+    def test_config_from_kv_pairs(self):
+        """include_parallel_rank_in_filename is parsed as a bool from kv pairs."""
+        cfg = DumperConfig.from_kv_pairs(["include_parallel_rank_in_filename=true"])
+        assert cfg.include_parallel_rank_in_filename is True
+
+    def test_collect_tags_merges_keys_across_plugins(self, monkeypatch):
+        """_collect_parallel_rank_tags keeps only rank keys, merging across plugins."""
+        plugin_a = type(
+            "PluginA",
+            (),
+            {"collect_parallel_info": lambda self: {"pp_rank": 1, "ignored": 9}},
+        )()
+        plugin_b = type(
+            "PluginB",
+            (),
+            {"collect_parallel_info": lambda self: {"tp_rank": 2, "cp_rank": 3}},
+        )()
+        monkeypatch.setattr(
+            "sglang.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
+        )
+
+        tags = _collect_parallel_rank_tags()
+        assert tags == {"pp_rank": 1, "tp_rank": 2, "cp_rank": 3}
+
+    def test_collect_tags_first_plugin_wins_on_conflict(self, monkeypatch):
+        """When two plugins report the same rank key, the first plugin wins."""
+        plugin_a = type(
+            "PluginA", (), {"collect_parallel_info": lambda self: {"pp_rank": 1}}
+        )()
+        plugin_b = type(
+            "PluginB", (), {"collect_parallel_info": lambda self: {"pp_rank": 7}}
+        )()
+        monkeypatch.setattr(
+            "sglang.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
+        )
+
+        assert _collect_parallel_rank_tags() == {"pp_rank": 1}
+
+    def test_collect_tags_skips_empty_plugin_info(self, monkeypatch):
+        """Plugins that report no parallel info are skipped without error."""
+        plugin_empty = type(
+            "PluginEmpty", (), {"collect_parallel_info": lambda self: {}}
+        )()
+        plugin_real = type(
+            "PluginReal", (), {"collect_parallel_info": lambda self: {"tp_rank": 4}}
+        )()
+        monkeypatch.setattr(
+            "sglang.srt.debug_utils.dumper._plugins", [plugin_empty, plugin_real]
+        )
+
+        assert _collect_parallel_rank_tags() == {"tp_rank": 4}
+
+    def test_disabled_filename_has_no_rank_tags(self, tmp_path, monkeypatch):
+        """When disabled, dump filenames do not include parallel-rank tags."""
+        monkeypatch.setattr(
+            _SGLangPlugin,
+            "collect_parallel_info",
+            lambda self: {"pp_rank": 2, "tp_rank": 3},
+        )
+
+        d = _make_test_dumper(tmp_path, include_parallel_rank_in_filename=False)
+        d.dump("hidden", torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        assert filenames
+        assert all("pp_rank=" not in f and "tp_rank=" not in f for f in filenames)
+
+    def test_enabled_filename_includes_rank_tags(self, tmp_path, monkeypatch):
+        """When enabled, dump filenames include the collected parallel-rank tags."""
+        monkeypatch.setattr(
+            _SGLangPlugin,
+            "collect_parallel_info",
+            lambda self: {"pp_rank": 2, "tp_rank": 3},
+        )
+
+        d = _make_test_dumper(tmp_path, include_parallel_rank_in_filename=True)
+        d.dump("hidden", torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        assert any("pp_rank=2" in f and "tp_rank=3" in f for f in filenames)
 
 
 class TestCleanup:

@@ -155,6 +155,9 @@ class DumperConfig(_BaseConfig):
     # Fully-qualified Python path "pkg.subpkg.module.fn_name"
     # None -> use the default identity-by-rank fallback in _Grafter._default_transform.
     grafter_transform_path: Optional[str] = None
+    # When True, append parallel-rank tags (pp_rank/tp_rank/...) to dump filenames so
+    # tensors from different ranks do not collide when dumped into a shared directory.
+    include_parallel_rank_in_filename: bool = False
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -567,6 +570,8 @@ class _Dumper:
             dump_index=self._state.dump_index,
             **tags,
         )
+        if self._config.include_parallel_rank_in_filename:
+            full_kwargs.update(_collect_parallel_rank_tags())
         full_filename = _format_tags(full_kwargs) + ".pt"
         path = Path(self._config.dir) / self._config.exp_name / full_filename
 
@@ -1246,6 +1251,26 @@ def _materialize_value(value):
     if callable(value):
         value = value()
     return value
+
+
+_PARALLEL_RANK_KEYS = ("pp_rank", "tp_rank", "cp_rank", "ep_rank", "etp_rank")
+
+
+def _collect_parallel_rank_tags() -> dict[str, int]:
+    """Collect parallel-rank tags from framework plugins for use in dump filenames.
+
+    Merges the ``_PARALLEL_RANK_KEYS`` reported by each plugin's
+    ``collect_parallel_info()``; the first plugin to report a given key wins.
+    """
+    result: dict[str, int] = {}
+    for plugin in _plugins:
+        info = plugin.collect_parallel_info()
+        if not info:
+            continue
+        for key in _PARALLEL_RANK_KEYS:
+            if key in info and key not in result:
+                result[key] = info[key]
+    return result
 
 
 def _format_tags(kwargs: dict) -> str:
