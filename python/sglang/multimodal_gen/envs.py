@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
+    SGLANG_DIFFUSION_COMPILE_VAE_DECODE: str = "auto"
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -258,6 +259,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
+    ),
+    # Compile the (video) VAE decode for compile-enabled runs.
+    #   "auto" (default): compile + disable tiling only when a free-memory
+    #     estimate says an untiled fixed-shape decode fits; else tiled eager.
+    #   "on"/"1": force compiled untiled decode (OOM falls back to tiled eager).
+    #   "off"/"0": never compile the VAE decode.
+    "SGLANG_DIFFUSION_COMPILE_VAE_DECODE": _lazy_str(
+        "SGLANG_DIFFUSION_COMPILE_VAE_DECODE", "auto"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference

@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -27,6 +28,9 @@ class LTX2AVDecodingStage(DecodingStage):
         from diffusers.video_processor import VideoProcessor
 
         self.video_processor = VideoProcessor(vae_scale_factor=32)
+        # Lazily-compiled untiled VAE decode (see _decode_video_latents).
+        self._vae_decode_fn = None
+        self._vae_decode_compile_failed = False
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -42,6 +46,99 @@ class LTX2AVDecodingStage(DecodingStage):
     def _ltx2_should_externally_denorm_video_latents(server_args: ServerArgs) -> bool:
         arch_config = server_args.pipeline_config.vae_config.arch_config
         return str(getattr(arch_config, "video_decoder_variant", "ltx_2")) != "ltx_2_3"
+
+    def _vae_decode_compile_mode(self, server_args: ServerArgs) -> str:
+        """Resolve VAE-decode compile policy: "off" | "auto" | "force"."""
+        if not server_args.enable_torch_compile:
+            return "off"
+        mode = str(envs.SGLANG_DIFFUSION_COMPILE_VAE_DECODE).strip().lower()
+        if mode in ("0", "off", "false", "no", "disable", "disabled", ""):
+            return "off"
+        if mode in ("1", "on", "true", "yes", "force", "always"):
+            return "force"
+        return "auto"
+
+    @staticmethod
+    def _untiled_decode_fits(latents: torch.Tensor) -> bool:
+        """Best-effort memory gate for an untiled VAE decode.
+
+        Tiling bounds VAE peak memory; only skip it (to obtain a
+        compile-friendly fixed-shape graph) when there is clearly enough free
+        GPU memory. This only needs to be roughly right because the caller has
+        an OOM fallback to tiled eager decode. The decoded volume is estimated
+        from the latent volume using LTX spatial(32x)/temporal(8x) upscales and
+        a conservative peak multiplier.
+        """
+        try:
+            free, total = torch.cuda.mem_get_info()
+            channels = int(latents.shape[1]) if latents.dim() >= 2 else 1
+            decoded_numel = latents.numel() / max(channels, 1) * 3
+            decoded_numel *= 32 * 32 * 8  # H*W*T expansion vs latent grid
+            peak_bytes = decoded_numel * 2 * 8  # bf16 working dtype, ~8x peak
+            return free > peak_bytes * 1.3 and (free / max(total, 1)) > 0.3
+        except Exception:
+            return False
+
+    def _compiled_untiled_decode(self, latents: torch.Tensor):
+        try:
+            if hasattr(self.vae, "disable_tiling"):
+                self.vae.disable_tiling()
+        except Exception:
+            pass
+        if self._vae_decode_fn is None:
+            import os
+
+            mode = os.environ.get(
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            )
+            logger.info("Compiling LTX-2 VAE decode with mode: %s", mode)
+            self._vae_decode_fn = torch.compile(
+                self.vae.decode, mode=mode, fullgraph=False, dynamic=None
+            )
+        return self._vae_decode_fn(latents)
+
+    def _decode_video_latents(self, latents: torch.Tensor, server_args: ServerArgs):
+        """Decode video latents (tiled eager by default).
+
+        When torch.compile is enabled and SGLANG_DIFFUSION_COMPILE_VAE_DECODE
+        allows it, run an untiled fixed-shape decode wrapped in torch.compile
+        (aligns with FastVideo's compiled VAE path). Always falls back to the
+        tiled eager decode on OOM or any compile/runtime failure, so the
+        default and high-resolution behavior never regresses.
+        """
+        mode = self._vae_decode_compile_mode(server_args)
+        use_compiled = (
+            mode != "off"
+            and not self._vae_decode_compile_failed
+            and (mode == "force" or self._untiled_decode_fits(latents))
+        )
+        if use_compiled:
+            try:
+                return self._compiled_untiled_decode(latents)
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(
+                    "Compiled untiled VAE decode hit OOM; falling back to "
+                    "tiled eager decode for the rest of this run."
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Compiled untiled VAE decode failed (%s); falling back to "
+                    "tiled eager decode.",
+                    type(exc).__name__,
+                )
+            self._vae_decode_compile_failed = True
+            self._vae_decode_fn = None
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        # Default / fallback: tiled eager decode.
+        try:
+            if server_args.pipeline_config.vae_tiling:
+                self.vae.enable_tiling()
+        except Exception:
+            pass
+        return self.vae.decode(latents)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
@@ -70,12 +167,7 @@ class LTX2AVDecodingStage(DecodingStage):
                 dtype=vae_dtype,
                 enabled=vae_autocast_enabled,
             ):
-                try:
-                    if server_args.pipeline_config.vae_tiling:
-                        self.vae.enable_tiling()
-                except Exception:
-                    pass
-                decode_output = self.vae.decode(latents)
+                decode_output = self._decode_video_latents(latents, server_args)
                 if isinstance(decode_output, tuple):
                     video = decode_output[0]
                 elif hasattr(decode_output, "sample"):
