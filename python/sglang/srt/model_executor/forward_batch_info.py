@@ -60,7 +60,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -534,7 +534,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_embeds=batch.input_embeds,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
-            token_type_ids=batch.token_type_ids,
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
@@ -562,6 +561,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_prefill_only(batch)
 
         device = model_runner.device
+
+        # Cross-encoder token_type_ids: gather from reqs and H2D on the forward
+        # stream. Built here (not in ScheduleBatch) so SB carries no
+        # forward-only device tensor; consumed by bert/roberta/transformers.
+        token_type_ids = [
+            r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
+        ]
+        if token_type_ids:
+            ret.token_type_ids = torch.tensor(
+                sum(token_type_ids, []),
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(device),
+            ).to(device, non_blocking=True)
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
