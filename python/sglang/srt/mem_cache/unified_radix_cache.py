@@ -2168,7 +2168,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         last_best_match_device_node,
                     )
 
-                logger.debug(
+                logger.info(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(new_indices),
                     best_match_node.id,

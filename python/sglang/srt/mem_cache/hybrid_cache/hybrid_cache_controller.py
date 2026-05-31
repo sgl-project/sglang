@@ -666,6 +666,7 @@ class HybridCacheController(BaseHiCacheController):
                 transfer.host_indices = source.host_indices
                 if transfer.keys is None:
                     transfer.keys = source.keys
+                logger.info(f"Resolved {transfer.name} from {source.name}, keys: {transfer.keys}")
             else:
                 transfer.host_indices = operation.host_indices
                 if transfer.keys is None:
