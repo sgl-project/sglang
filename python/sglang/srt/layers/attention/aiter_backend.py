@@ -1948,6 +1948,29 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                elif self.kv_cache_dtype == fp8_dtype:
+                    # FP8 non-SWA, non-MLA: fuse bf16->fp8 cast + paged write in one
+                    # Triton kernel (same kernel as the SWA path), replacing the
+                    # separate div/cast + store_kvcache that set_kv_buffer would do.
+                    # Produces identical fp8 cache contents consumed by
+                    # mha_batch_prefill_func; k_scale/v_scale keep it correct for
+                    # non-unit KV descales.
+                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    launch_reshape_and_cache_flash(
+                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        cache_loc,
+                        k_scale=k_descale,
+                        v_scale=v_descale,
+                    )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
@@ -2415,10 +2438,15 @@ class AiterAttnBackend(AttentionBackend):
                     k_scale=k_descale,
                     v_scale=v_descale,
                 )
-            elif self.use_triton_unified_attention and self.kv_cache_dtype == fp8_dtype:
-                # [PATCH] FP8 non-SWA: use launch_reshape_and_cache_flash to
-                # fuse bf16→fp8 cast + paged write in one Triton kernel,
-                # eliminating separate float8_copy + store_kvcache overhead.
+            elif self.kv_cache_dtype == fp8_dtype and not self.use_mla:
+                # FP8 non-SWA, non-MLA: fuse bf16->fp8 cast + paged write in one
+                # Triton kernel, eliminating the separate div/cast + store_kvcache
+                # used by set_kv_buffer. The gating is intentionally not tied to
+                # use_triton_unified_attention: the fused write only produces the
+                # fp8 cache and is independent of the read path, so the standard
+                # aiter (paged_attention_ragged) read consumes the same physical
+                # layout. k_scale/v_scale are passed so it stays correct for
+                # non-unit KV descales.
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 launch_reshape_and_cache_flash(
@@ -2431,6 +2459,8 @@ class AiterAttnBackend(AttentionBackend):
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     ),
                     forward_batch.out_cache_loc,
+                    k_scale=k_descale,
+                    v_scale=v_descale,
                 )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
