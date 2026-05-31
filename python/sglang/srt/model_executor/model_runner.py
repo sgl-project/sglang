@@ -105,6 +105,9 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.kv_canary.api import install_canary
+from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -648,6 +651,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
+        self._token_oracle_manager = install_token_oracle_from_env(
+            server_args=server_args,
+            vocab_size=self.model_config.vocab_size,
+        )
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -751,6 +758,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
+        # Must be called AFTER init_memory_pool so the pool object exists for
+        # canary to monkey-patch, and BEFORE init_device_graphs so warmup
+        # forwards captured into the graph see the patched pool methods.
+        self.canary_manager = install_canary(
+            server_args=server_args,
+            model_runner=self,
+            token_oracle_manager=self._token_oracle_manager,
+        )
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
@@ -827,6 +843,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+        if self.canary_manager is not None and not self.is_draft_worker:
+            self.canary_manager.mark_init_finished()
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -3203,7 +3222,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
+
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
+            )
+            if not self.is_draft_worker and ((c := self.canary_manager) is not None)
+            else contextlib.nullcontext()
+        )
+
         with (
+            canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
