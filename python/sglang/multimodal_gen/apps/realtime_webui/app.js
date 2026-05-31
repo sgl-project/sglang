@@ -23,6 +23,16 @@ const CONTROL_KEY_ACTIONS = new Map([
   ["arrowdown", "k"],
   ["arrowright", "l"],
 ]);
+const CONTROL_ACTION_META = {
+  w: { label: "Forward", type: "move/position" },
+  a: { label: "Left", type: "move/position" },
+  s: { label: "Back", type: "move/position" },
+  d: { label: "Right", type: "move/position" },
+  i: { label: "Pitch +", type: "look/rotation" },
+  j: { label: "Yaw -", type: "look/rotation" },
+  k: { label: "Pitch -", type: "look/rotation" },
+  l: { label: "Yaw +", type: "look/rotation" },
+};
 
 const presets = [
   { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth first-person dolly toward the castle, natural parallax, stable fantasy scene detail.", actions: [["w"], ["w"], ["w"], ["w"], ["w"], ["w"], [], []], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
@@ -64,6 +74,7 @@ let streamEpoch = 0;
 let lastDecodeMs = 0;
 let lastDisplayLagMs = 0;
 let lastControlKeySentAt = 0;
+let socketHadError = false;
 const decodeRequests = new Map();
 const activeControlActions = new Set();
 
@@ -507,6 +518,7 @@ async function connect() {
     });
     ws = new WebSocket($("serverUrl").value);
     ws.binaryType = "arraybuffer";
+    socketHadError = false;
     ws.onopen = () => {
       if (epoch !== streamEpoch) return;
       chunkWaitStartedAt = performance.now();
@@ -516,7 +528,7 @@ async function connect() {
         `session started with ${selectedReferenceLabel || "uploaded reference"}`
       );
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (epoch !== streamEpoch) return;
       ws = null;
       $("connectBtn").disabled = false;
@@ -525,12 +537,15 @@ async function connect() {
         updateStats();
       }
       clearQueueOnClose = false;
-      setStatus("Closed");
-      addHistory("session closed");
+      const reason = event.reason ? ` · ${event.reason}` : "";
+      const closeText = `socket closed code=${event.code}${reason}`;
+      setStatus(socketHadError ? "Socket closed" : "Closed");
+      addHistory(closeText);
     };
     ws.onerror = () => {
       if (epoch !== streamEpoch) return;
-      $("connectBtn").disabled = false; setStatus("Socket error", "error"); addHistory("socket error");
+      socketHadError = true;
+      $("connectBtn").disabled = false; setStatus("Socket error", "error"); addHistory("socket transport error");
     };
     ws.onmessage = (event) => {
       receiveChain = receiveChain
@@ -557,7 +572,7 @@ async function receive(data) {
     pendingHeader.__received_at = performance.now();
     if (pendingHeader.type === "error") {
       setStatus(pendingHeader.content || "Server error", "error");
-      addHistory(pendingHeader.content || "server error");
+      addHistory(`server error: ${pendingHeader.content || "unknown"}`);
       pendingHeader = null;
     }
     if (pendingHeader) setStatus("Receiving", "live");
@@ -625,7 +640,7 @@ function updatePlaybackPace(header, now, frameCount) {
   currentReceiveChunkFrames = 0;
 }
 
-function sendEvent(kind, payload) {
+function sendEvent(kind, payload, historyText = null) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const eventId = nextEventId++;
   ws.send(pack({ type: "event", kind, payload, event_id: eventId }));
@@ -636,11 +651,12 @@ function sendEvent(kind, payload) {
     updateStats();
     setStatus("Updating", "live");
   }
-  addHistory(`${kind} event sent`);
+  addHistory(historyText || `${kind} event sent`);
 }
 
 function sendCameraControl(actions) {
-  sendEvent("camera_actions", repeatActions([actions]));
+  const payload = repeatActions([actions]);
+  sendEvent("camera_actions", payload, describeCameraEvent(actions, payload.length));
 }
 
 function repeatActions(actions, frameCount) {
@@ -657,10 +673,31 @@ async function applyPreset(preset, options = {}) {
   $("fps").value = preset.fps;
   await setPresetReference(preset);
   if (sendRuntimeEvents) {
-    sendEvent("prompt", preset.prompt);
-    sendEvent("camera_actions", repeatActions(preset.actions, 24));
+    sendEvent("prompt", preset.prompt, `prompt update · ${preset.name}`);
+    const payload = repeatActions(preset.actions, 24);
+    sendEvent(
+      "camera_actions",
+      payload,
+      describeCameraScript(preset.name, preset.actions, payload.length),
+    );
   }
   addHistory(`preset ${preset.name}`);
+}
+
+function describeCameraEvent(actions, samples) {
+  const parts = actions.map(describeControlAction).join(" + ") || "No-op";
+  return `camera · ${parts} · samples=${samples}`;
+}
+
+function describeCameraScript(name, script, samples) {
+  const uniqueActions = Array.from(new Set(script.flat()));
+  const parts = uniqueActions.map(describeControlAction).join(" + ") || "No-op";
+  return `camera preset · ${name} · ${parts} · samples=${samples}`;
+}
+
+function describeControlAction(action) {
+  const meta = CONTROL_ACTION_META[action];
+  return meta ? `${meta.label} [${meta.type}]` : `${action} [custom]`;
 }
 
 function enhancePrompt() {
@@ -793,7 +830,9 @@ function sendActiveKeyboardActions(force = false) {
   const now = performance.now();
   if (!force && now - lastControlKeySentAt < KEYBOARD_EVENT_INTERVAL_MS) return;
   lastControlKeySentAt = now;
-  sendCameraControl(Array.from(activeControlActions));
+  if (activeControlActions.size || force) {
+    sendCameraControl(Array.from(activeControlActions));
+  }
 }
 
 function setControlButtonActive(action, active) {
