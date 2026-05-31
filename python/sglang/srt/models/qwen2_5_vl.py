@@ -24,6 +24,7 @@
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 
 import logging
+import os
 import re
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
@@ -624,12 +625,14 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
+        _skip_visual_quant = int(os.environ.get("SGLANG_VL_SKIP_VISUAL_QUANT", "1"))
+        _visual_quant_config = None if _skip_visual_quant else quant_config
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
+            quant_config=_visual_quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
             max_context_len=self.config.max_position_embeddings,
@@ -802,7 +805,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-
+            if "language_model" in name:
+                name = name.replace(r"model.language_model.", r"model.")
+            if "visual" in name:
+                name = name.replace(r"model.visual.", r"visual.")
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
