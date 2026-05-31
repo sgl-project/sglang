@@ -135,6 +135,7 @@ def make_base_config() -> CanaryConfig:
     return CanaryConfig(
         mode=CanaryMode.RAISE,
         ring_capacity=1024,
+        sweep_interval=0,
     )
 
 

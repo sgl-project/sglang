@@ -17,16 +17,20 @@ CANARY_SLOT_BYTES: Final[int] = consts.CANARY_FIELDS_PER_SLOT * 8
 
 
 class CanaryLaunchTag(IntEnum):
-    """Unique tag per (head | tail) × (K | V) × (FULL | SWA) launch."""
+    """Unique tag per (head | tail | sweep) × (K | V) × (FULL | SWA) launch."""
 
     HEAD_K_FULL = 0
     HEAD_V_FULL = 1
     TAIL_K_FULL = 2
     TAIL_V_FULL = 3
-    HEAD_K_SWA = 4
-    HEAD_V_SWA = 5
-    TAIL_K_SWA = 6
-    TAIL_V_SWA = 7
+    SWEEP_K_FULL = 4
+    SWEEP_V_FULL = 5
+    HEAD_K_SWA = 6
+    HEAD_V_SWA = 7
+    TAIL_K_SWA = 8
+    TAIL_V_SWA = 9
+    SWEEP_K_SWA = 10
+    SWEEP_V_SWA = 11
 
 
 def _assert_contiguous(tensor: torch.Tensor, name: str) -> None:
@@ -68,7 +72,8 @@ class VerifyPlan:
     """Flat verify entries consumed by launch_canary_verify_kernel.
 
     Each row is a self-contained (slot_idx, position, prev_slot_idx) triple, so the verify kernel makes no
-    assumption about the entry's source. prev_slot_idx == -1 flags a chain-seed entry (kernel
+    assumption about the entry's source — per-forward derivation, sweep over running reqs, and sweep over
+    radix-cache orphan slots all populate the same schema. prev_slot_idx == -1 flags a chain-seed entry (kernel
     anchors on the hardcoded CANARY_CHAIN_ANCHOR constant instead of reading a predecessor).
 
     Sized to a cuda-graph-captured capacity; active prefix is verify_num_valid[0]. Padding tail entries are
