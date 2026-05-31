@@ -152,7 +152,7 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: $${{ needs.set-image-config.outputs.CANN_image_910b }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
