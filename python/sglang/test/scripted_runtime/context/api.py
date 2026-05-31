@@ -11,6 +11,7 @@ from sglang.test.scripted_runtime.context import (
 from sglang.test.scripted_runtime.context.req_starter import ScriptedContextReqStarter
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
     from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook

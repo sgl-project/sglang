@@ -1,30 +1,26 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
-def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:
+def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
     s = ctx._scheduler
-    chunked = s.chunked_req
-    if chunked is not None and chunked.rid == rid:
-        return chunked
-    for r in s.waiting_queue:
-        if r.rid == rid:
-            return r
+    if s.chunked_req is not None:
+        yield s.chunked_req
+    yield from s.waiting_queue
     if s.running_batch is not None:
-        for r in s.running_batch.reqs:
-            if r.rid == rid:
-                return r
+        yield from s.running_batch.reqs
     last_batch = getattr(s, "last_batch", None)
     if last_batch is not None:
-        for r in last_batch.reqs:
-            if r.rid == rid:
-                return r
-    return None
+        yield from last_batch.reqs
+
+
+def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:
+    return next((r for r in _get_all_reqs(ctx) if r.rid == rid), None)
 
 
 def is_finished(ctx: "ScriptedContext", rid: str) -> bool:

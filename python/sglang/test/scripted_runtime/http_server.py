@@ -20,6 +20,7 @@ from sglang.test.scripted_runtime.io_struct import (
     ScriptSucceeded,
     Shutdown,
 )
+from test.manual.dsv4 import _common
 
 DEFAULT_RUN_TIMEOUT_S: float = 120.0
 SHUTDOWN_JOIN_TIMEOUT_S: float = 60.0
@@ -187,7 +188,7 @@ def _spawn_server_process(
 ) -> mp.process.BaseProcess:
     mp_ctx = mp.get_context("spawn")
     server_process = mp_ctx.Process(
-        target=launch_scripted_http_server,
+        target=_launch_scripted_http_server,
         kwargs=dict(
             host=SERVER_HOST,
             port=get_free_port(),
@@ -211,5 +212,5 @@ def _spawn_server_process(
     return server_process
 
 
-def launch_scripted_http_server(**engine_kwargs: Any) -> None:
+def _launch_scripted_http_server(**engine_kwargs: Any) -> None:
     launch_server(ServerArgs(**engine_kwargs))

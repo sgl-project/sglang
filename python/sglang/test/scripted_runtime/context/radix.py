@@ -1,26 +1,26 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Callable, Dict
 
 if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
 def get_all_node_hit_counts(ctx: "ScriptedContext") -> Dict[int, int]:
-    hit_counts: Dict[int, int] = {}
-    stack = list(ctx._scheduler.tree_cache.root_node.children.values())
-    while stack:
-        node = stack.pop()
-        hit_counts[node.id] = node.hit_count
-        stack.extend(node.children.values())
-    return hit_counts
+    return _collect_node_attr(ctx, lambda node: node.hit_count)
 
 
 def get_all_node_lock_refs(ctx: "ScriptedContext") -> Dict[int, int]:
-    lock_refs: Dict[int, int] = {}
+    return _collect_node_attr(ctx, lambda node: node.lock_ref)
+
+
+def _collect_node_attr(
+    ctx: "ScriptedContext", get_value: Callable[[Any], int]
+) -> Dict[int, int]:
+    values: Dict[int, int] = {}
     stack = list(ctx._scheduler.tree_cache.root_node.children.values())
     while stack:
         node = stack.pop()
-        lock_refs[node.id] = node.lock_ref
+        values[node.id] = get_value(node)
         stack.extend(node.children.values())
-    return lock_refs
+    return values
