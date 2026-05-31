@@ -32,6 +32,7 @@ from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPo
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
+    OutOfBandError,
     RunScript,
     ScriptFailed,
     ScriptSucceeded,
@@ -199,19 +200,22 @@ class ScriptedSchedulerHook:
             return
 
         if exc_tb is not None and self._is_driver:
-            self._write_traceback(exc_tb)
+            self._write_out_of_band_error(exc_tb)
         sys.exit(0 if exc_tb is None else 1)
 
-    def _write_traceback(self, exc_tb: str) -> None:
-        """Persist a failed script's traceback for the caller to surface."""
-        path = envs.SGLANG_TEST_SCRIPTED_RUNTIME_TRACEBACK_PATH.get()
+    def _write_out_of_band_error(self, exc_tb: str) -> None:
+        """Persist a fatal scheduler-side error as JSON for the caller to surface."""
+        path = envs.SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH.get()
         if not path:
             return
+        error = OutOfBandError(traceback=exc_tb or "<no traceback>")
         try:
             with open(path, "w") as f:
-                f.write(exc_tb or "<no traceback>")
+                f.write(error.to_json())
         except OSError:
-            logger.exception("Failed to write scripted_runtime traceback to %s", path)
+            logger.exception(
+                "Failed to write scripted_runtime out-of-band error to %s", path
+            )
 
     def _advance_generator(self) -> Tuple[bool, Optional[str]]:
         try:
