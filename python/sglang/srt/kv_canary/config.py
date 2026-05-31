@@ -20,7 +20,7 @@ class CanaryMode(str, Enum):
 class CanaryConfig:
     """Top-level canary configuration. All knobs live here; nothing reads env vars deeper in the stack.
 
-    Constructed once inside install_canary(server_args, model_runner) via
+    Constructed once inside install_canary(server_args, model_runner, token_oracle_manager) via
     CanaryConfig.from_env(server_args), then frozen and threaded through the canary stack.
     Subsequent runtime never mutates it.
 
@@ -33,11 +33,17 @@ class CanaryConfig:
         sweep_interval: 0 disables sweep entirely; positive N means every N-th forward step the runner
             additionally walks all radix-tree-held slots (overlap with per-forward HEAD/TAIL is harmless
             redundancy) and verifies them.
+        enable_write_input_assert: bool. True = launch_canary_write_kernel additionally compares
+            forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
+            expected_input_positions[i]; mismatch records a violation. Only useful when something else
+            (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders
+            per forward — canary itself knows no oracle.
     """
 
     mode: CanaryMode
     ring_capacity: int
     sweep_interval: int
+    enable_write_input_assert: bool
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
@@ -51,4 +57,5 @@ class CanaryConfig:
             mode=CanaryMode(mode_raw),
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
             sweep_interval=server_args.kv_canary_sweep_interval,
+            enable_write_input_assert=envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.get(),
         )

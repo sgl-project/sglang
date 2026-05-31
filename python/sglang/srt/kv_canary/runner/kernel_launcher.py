@@ -64,8 +64,8 @@ def launch_endpoints_per_forward(
     forward_batch: "ForwardBatch",
     expected_inputs: ExpectedInputs,
     violation_log: ViolationLog,
-    enable_write_input_assert: bool = False,
-    enable_verify_token_assert: bool = False,
+    enable_write_input_assert: bool,
+    enable_verify_token_assert: bool,
 ) -> None:
     positions = _canonicalize_boundary_int64(forward_batch.positions, _POSITIONS)
     out_cache_loc = _canonicalize_boundary_int64(forward_batch.out_cache_loc, _OUT_LOC)
