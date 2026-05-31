@@ -673,6 +673,47 @@ def test_lingbot_global_attention_cache_uses_model_window_and_disables_sink():
     )
 
 
+def test_lingbot_global_attention_cache_can_grow_past_initial_window():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.num_transformer_blocks = 1
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.num_token_per_frame = 1
+    stage.num_frames_per_block = 3
+    stage.sliding_window_num_frames = 2
+    stage.transformer = SimpleNamespace(
+        num_attention_heads=1,
+        attention_head_dim=1,
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                sink_size=9,
+            )
+        ),
+    )
+
+    stage._initialize_kv_cache(
+        batch_size=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    assert stage.causal_kv_cache is not None
+    cache = stage.causal_kv_cache[0]
+    assert cache.allow_growth is True
+    assert cache.cache_size == 2
+
+    cache.update_and_get_attention_kv(
+        key=torch.ones(1, 3, 1, 1),
+        value=torch.ones(1, 3, 1, 1),
+        current_chunk_start=0,
+    )
+
+    assert cache.cache_size >= 3
+    assert cache.local_end_index_int == 3
+    assert cache.global_end_index_int == 3
+
+
 def test_lingbot_i2v_model_input_writer_reuses_buffer():
     latents = torch.ones(1, 16, 3, 2, 2)
     condition = torch.full((1, 20, 3, 2, 2), 2.0)

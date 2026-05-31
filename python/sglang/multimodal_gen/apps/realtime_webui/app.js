@@ -762,21 +762,39 @@ async function applyPreset(preset, options = {}) {
 }
 
 function describeCameraEvent(actions, samples) {
-  const parts = actions.map(describeControlAction).join(" + ") || "No-op";
+  const parts =
+    actions.map((action) => describeControlAction(action, samples)).join(" + ") ||
+    "No-op";
   return `camera · ${parts} · duration=${samples} frames`;
 }
 
 function describeCameraScript(name, script, samples) {
   const uniqueActions = Array.from(new Set(script.flat()));
-  const parts = uniqueActions.map(describeControlAction).join(" + ") || "No-op";
+  const parts =
+    uniqueActions.map((action) => describeControlAction(action, samples)).join(" + ") ||
+    "No-op";
   return `camera preset · ${name} · ${parts} · duration=${samples} frames`;
 }
 
-function describeControlAction(action) {
+function describeControlAction(action, samples = 1) {
   const meta = CONTROL_ACTION_META[action];
-  return meta
-    ? `${meta.label} (${meta.type} ${meta.axis}, ${meta.amount})`
-    : `${action} (custom)`;
+  if (!meta) return `${action} (custom)`;
+  const distance = describeControlDistance(meta.amount, samples);
+  return `${meta.label} [${meta.type} ${meta.axis}, ${distance}]`;
+}
+
+function describeControlDistance(amount, samples) {
+  const match = /^([0-9.]+)(deg)?\/frame$/.exec(amount);
+  if (!match) return amount;
+  const perFrame = Number(match[1]);
+  const unit = match[2] || "";
+  const total = perFrame * Math.max(1, Number(samples || 1));
+  return `${amount} x ${samples} = ${formatControlDistance(total, unit)}`;
+}
+
+function formatControlDistance(value, unit) {
+  if (unit === "deg") return `${value.toFixed(0)}deg`;
+  return value.toFixed(2);
 }
 
 function enhancePrompt() {

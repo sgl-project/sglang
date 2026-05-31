@@ -153,6 +153,14 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 await _await_realtime_task(pending_send_task)
             logger.info("generation completed, session_id=%s", session.id)
             break
+        except WebSocketDisconnect:
+            if pending_send_task is not None:
+                pending_send_task.cancel()
+                await _await_realtime_task(pending_send_task)
+            logger.info(
+                "client disconnected during generation, session_id=%s", session.id
+            )
+            break
         except Exception as e:
             if pending_send_task is not None:
                 pending_send_task.cancel()
@@ -298,6 +306,18 @@ async def _cleanup_realtime_session(
     session.dispose()
 
 
+async def _close_realtime_websocket(
+    websocket: WebSocket,
+    *,
+    code: int,
+    reason: str,
+) -> None:
+    try:
+        await websocket.close(code=code, reason=reason)
+    except (RuntimeError, WebSocketDisconnect):
+        pass
+
+
 @router.websocket("/generate")
 async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
@@ -330,6 +350,12 @@ async def generate(websocket: WebSocket):
 
         wait_tasks = [generate_task, listen_task]
         await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+        if generate_task.done() and session.reached_max_chunks():
+            await _close_realtime_websocket(
+                websocket,
+                code=1000,
+                reason="generation complete",
+            )
 
     except WebSocketDisconnect:
         logger.info("client disconnected, session_id=%s", session.id)

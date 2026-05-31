@@ -32,6 +32,7 @@ class CausalSelfAttentionKVCache:
     cache_size: int = 0
     sink_tokens: int = 0
     attention_window_size: int = 0
+    allow_growth: bool = False
 
     _FIELD_NAMES: ClassVar[frozenset[str]] = frozenset(
         {
@@ -44,6 +45,7 @@ class CausalSelfAttentionKVCache:
             "cache_size",
             "sink_tokens",
             "attention_window_size",
+            "allow_growth",
         }
     )
 
@@ -105,6 +107,32 @@ class CausalSelfAttentionKVCache:
         self.global_end_index.fill_(global_end_index)
         self.local_end_index.fill_(local_end_index)
 
+    def _grow_to_fit(self, required_tokens: int) -> None:
+        if required_tokens <= self.cache_size:
+            return
+        old_cache_size = self.cache_size
+        new_cache_size = max(required_tokens, old_cache_size * 2)
+
+        new_k = self.k.new_zeros(
+            self.k.shape[0],
+            new_cache_size,
+            self.k.shape[2],
+            self.k.shape[3],
+        )
+        new_v = self.v.new_zeros(
+            self.v.shape[0],
+            new_cache_size,
+            self.v.shape[2],
+            self.v.shape[3],
+        )
+        new_k[:, :old_cache_size] = self.k
+        new_v[:, :old_cache_size] = self.v
+        self.k = new_k
+        self.v = new_v
+        self.cache_size = new_cache_size
+        if self.attention_window_size == old_cache_size:
+            self.attention_window_size = new_cache_size
+
     def update_and_get_attention_kv(
         self,
         *,
@@ -145,6 +173,9 @@ class CausalSelfAttentionKVCache:
         else:
             # the chunk window has proceed, append new tokens, and evict earliest (if have to)
             appended_tokens = current_chunk_end - global_end_index
+            if self.allow_growth:
+                self._grow_to_fit(local_end_index_prev + appended_tokens)
+                kv_cache_size = self.cache_size
             if local_end_index_prev + appended_tokens > kv_cache_size:
                 # the new tokens can't fit in the remaining space (after local_end_index_prev), start evicting:
                 # before:
