@@ -512,6 +512,18 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.extra_key, ["tenant-shared"] * 4)
 
+        # List extra_key expands with parallel sampling, matching text/lora_path
+        # ([a, b] * n), so extra_key[i] lines up with text[i].
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(
+            req.extra_key, ["tenant-A", "tenant-B", "tenant-A", "tenant-B"]
+        )
+
         # A single (non-batch) request keeps its scalar extra_key untouched
         req = GenerateReqInput(text="Hello", extra_key="tenant-A")
         req.normalize_batch_and_arguments()
@@ -519,15 +531,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
     def test_extra_key_error_cases(self):
         """Test invalid extra_key configurations raise a clear error."""
-        # List extra_key with parallel sampling is ambiguous -> ValueError
-        with self.assertRaises(ValueError):
-            req = GenerateReqInput(
-                text=["Hello", "World"],
-                extra_key=["tenant-A", "tenant-B"],
-                sampling_params={"n": 2},
-            )
-            req.normalize_batch_and_arguments()
-
         # List extra_key length must match the batch size
         with self.assertRaises(ValueError):
             req = GenerateReqInput(text=["Hello", "World"], extra_key=["only-one"])

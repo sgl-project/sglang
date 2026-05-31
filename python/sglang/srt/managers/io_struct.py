@@ -599,12 +599,14 @@ class GenerateReqInput(BaseReq):
         elif not isinstance(self.extra_key, list):
             # Single extra_key shared by every request in the batch.
             self.extra_key = [self.extra_key] * num
-        elif self.parallel_sample_num > 1:
-            raise ValueError("Cannot use list extra_key with parallel_sample_num > 1")
-        elif len(self.extra_key) != self.batch_size:
-            raise ValueError(
-                "The length of extra_key should be equal to the batch size."
-            )
+        else:
+            if len(self.extra_key) != self.batch_size:
+                raise ValueError(
+                    "The length of extra_key should be equal to the batch size."
+                )
+            # Expand for parallel sampling, matching text/lora_path: each parallel
+            # sample of a request shares that request's extra_key.
+            self.extra_key = self.extra_key * self.parallel_sample_num
 
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
