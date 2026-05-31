@@ -4,7 +4,7 @@ const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
 const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
-const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v2";
+const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v3";
 const PREVIEW_OUTPUT_FORMAT = "";
 const PREVIEW_OUTPUT_QUALITY = null;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
@@ -195,7 +195,7 @@ function resetDecoderState() {
 
 async function decodeFrameBatch(header, data) {
   const decodeStartedAt = performance.now();
-  if (header.content_type !== RAW_RGB_CONTENT_TYPE) {
+  if (!isWorkerDecodableRawContentType(header.content_type)) {
     const items = await framePayloadToImageData(header, data);
     const decodedAt = performance.now();
     lastDecodeMs = decodedAt - decodeStartedAt;
@@ -248,6 +248,14 @@ async function decodeFrameBatch(header, data) {
       reject(error);
     }
   });
+}
+
+function isWorkerDecodableRawContentType(contentType) {
+  return (
+    contentType === RAW_RGB_CONTENT_TYPE ||
+    contentType === RAW_RGB_DELTA_GZIP_CONTENT_TYPE ||
+    contentType === RAW_RGBA_DELTA_GZIP_CONTENT_TYPE
+  );
 }
 
 function updateStats(header) {
