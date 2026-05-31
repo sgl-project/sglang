@@ -597,6 +597,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        if self.mem_pool_host.kv_buffer is None:
+            self.gb_per_page = 0
+            return
+
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -631,7 +635,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
             return keys
-        return [f"{ self.extra_backend_tag}_{key}" for key in keys]
+        return [f"{self.extra_backend_tag}_{key}" for key in keys]
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
@@ -652,6 +656,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name in {
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        }:
+            host_pool = getattr(self, "registered_pools", {}).get(name)
+            base_suffix = f"_{self.mha_suffix}_{name}"
+            if getattr(host_pool, "layout", None) == "layer_first":
+                layer_num = getattr(host_pool, "layer_num", 1)
+                suffixes = [f"{base_suffix}_layer_{i}" for i in range(layer_num)]
+            else:
+                suffixes = [base_suffix]
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
@@ -665,7 +685,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
         qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(qkeys, extra_info)
+        if self.mem_pool_host.kv_buffer is None:
+            kv_pages = len(keys) if pool_transfers else 0
+        else:
+            kv_pages = self.batch_exists(qkeys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -725,6 +748,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
+            if key_multiplier == 0:
+                raise ValueError(f"Unsupported Mooncake hybrid pool: {transfer.name}")
+            if len(key_strs) != len(ptr_list):
+                raise ValueError(
+                    f"Mooncake hybrid pool {transfer.name} generated "
+                    f"{len(key_strs)} keys but {len(ptr_list)} buffers."
+                )
 
             if is_set:
                 exist_result = self._batch_exist(key_strs)

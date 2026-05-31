@@ -13,7 +13,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -483,6 +487,53 @@ class SWAComponent(TreeComponent):
                 )
             ]
 
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None or not node.hash_value:
+                return None
+
+            page_size = self.cache.page_size
+            num_pages = len(cd.host_value) // page_size
+            if num_pages == 0:
+                return None
+
+            num_tokens = num_pages * page_size
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=cd.host_value[-num_tokens:],
+                    keys=node.hash_value[-num_pages:],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            prefetch_tokens = kw.get("prefetch_tokens", 0)
+            if prefetch_tokens <= 0:
+                return None
+
+            page_size = self.cache.page_size
+            max_pages = max(1, (self.sliding_window_size + page_size - 1) // page_size)
+            prefetch_pages = max(1, prefetch_tokens // page_size)
+            num_pages = min(max_pages, prefetch_pages)
+            num_tokens = num_pages * page_size
+
+            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+            if host_indices is None:
+                self.cache.evict_host(num_tokens, ComponentType.SWA)
+                host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+            if host_indices is None:
+                return []
+
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=host_indices,
+                    keys=["__placeholder__"] * num_pages,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+
         return None
 
     def commit_hicache_transfer(
@@ -519,6 +570,72 @@ class SWAComponent(TreeComponent):
                 allocator.set_full_to_swa_mapping(cd_full_n.value, swa_chunk)
                 offset += n_tokens
             assert offset == len(xfer.host_indices)
+            return
+
+        if phase == CacheTransferPhase.PREFETCH:
+            if not transfers:
+                return
+
+            transfer = transfers[0]
+            host_indices = transfer.host_indices
+            insert_result = kw.get("insert_result")
+            pool_storage_result = kw.get("pool_storage_result")
+            loaded_pages = (
+                pool_storage_result.extra_pool_hit_pages.get(PoolName.SWA, 0)
+                if pool_storage_result is not None
+                else 0
+            )
+            target_node = (
+                insert_result.inserted_host_node if insert_result is not None else None
+            )
+            if (
+                host_indices is None
+                or loaded_pages <= 0
+                or target_node is None
+                or target_node.component_data[ct].host_value is not None
+            ):
+                self.cache.cache_controller.append_host_mem_release(
+                    extra_pools=[transfer]
+                )
+                return
+
+            loaded_tokens = min(
+                len(host_indices),
+                loaded_pages * self.cache.page_size,
+                len(target_node.key),
+            )
+            if loaded_tokens <= 0:
+                self.cache.cache_controller.append_host_mem_release(
+                    extra_pools=[transfer]
+                )
+                return
+
+            if len(host_indices) > loaded_tokens:
+                self.cache.cache_controller.append_host_mem_release(
+                    extra_pools=[
+                        PoolTransfer(
+                            name=PoolName.SWA,
+                            host_indices=host_indices[
+                                : len(host_indices) - loaded_tokens
+                            ],
+                        )
+                    ]
+                )
+                host_indices = host_indices[-loaded_tokens:]
+            else:
+                host_indices = host_indices[-loaded_tokens:]
+
+            if loaded_tokens < len(target_node.key):
+                self.cache._split_node(
+                    target_node.key, target_node, len(target_node.key) - loaded_tokens
+                )
+
+            target_node.component_data[ct].host_value = host_indices.clone()
+            if target_node.component_data[ct].value is None:
+                host_lru = self.cache.host_lru_lists[ct]
+                if not host_lru.in_list(target_node):
+                    host_lru.insert_mru(target_node)
+            self.cache._update_evictable_leaf_sets(target_node)
             return
 
     def drive_host_eviction(

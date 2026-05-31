@@ -619,37 +619,83 @@ class HybridCacheController(BaseHiCacheController):
 
     def _page_transfer(self, operation):
         # Transfer extra pools
+        results = {}
         if operation.pool_transfers and not operation.is_terminated():
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+
+        if self.mem_pool_host.kv_buffer is None:
+            # DeepSeek-V4 style hybrid pools do not have a physical KV anchor.
+            # The ALL_PAGES sidecars are the storage completion boundary.
+            operation.increment(
+                self._completed_pages_from_v2_results(
+                    results, operation.pool_transfers, len(operation.hash_value)
+                )
+                * self.page_size
+            )
+            return
 
         # Transfer kv pools
         super()._page_transfer(operation)
 
     def _page_backup(self, operation):
         # Backup extra pools
+        results = {}
         if operation.pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
+        if self.mem_pool_host.kv_buffer is None:
+            operation.completed_tokens += (
+                self._completed_pages_from_v2_results(
+                    results, operation.pool_transfers, len(operation.hash_value)
+                )
+                * self.page_size
+            )
+            return
+
         # Backup kv pools
         super()._page_backup(operation)
 
+    def _completed_pages_from_v2_results(
+        self,
+        results: dict,
+        pool_transfers: Optional[list[PoolTransfer]],
+        max_pages: int,
+    ) -> int:
+        all_page_hits = [
+            sum(results.get(transfer.name, ()))
+            for transfer in pool_transfers or []
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+        ]
+        return min(max_pages, *all_page_hits) if all_page_hits else 0
+
     def _resolve_sidecar_derived_pool_transfers(self, operation):
+        source_transfers = {
+            transfer.name: transfer
+            for transfer in operation.pool_transfers
+            if transfer.indices_from_pool is None
+        }
         for transfer in operation.pool_transfers:
             if transfer.indices_from_pool is None:
                 continue
-            if transfer.indices_from_pool != PoolName.KV:
-                # TODO(hzh): Support storage sidecar derived pools from other sources
+            if transfer.indices_from_pool == PoolName.KV:
+                transfer.host_indices = operation.host_indices
+                if transfer.keys is None:
+                    transfer.keys = operation.hash_value
+                continue
+
+            source = source_transfers.get(transfer.indices_from_pool)
+            if source is None:
                 raise AssertionError(
-                    "Storage sidecar derived pool currently only supports KV-shared "
-                    f"indices, got {transfer.name} from {transfer.indices_from_pool}."
+                    "Storage sidecar derived pool has no source transfer: "
+                    f"{transfer.name} from {transfer.indices_from_pool}."
                 )
-            transfer.host_indices = operation.host_indices
+            transfer.host_indices = source.host_indices
             if transfer.keys is None:
-                transfer.keys = operation.hash_value
+                transfer.keys = source.keys
 
     def _sync_trailing_keys(
         self,
@@ -670,6 +716,22 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
+            if transfer.host_indices is None:
+                continue
+
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            page_size = getattr(entry.host_pool, "page_size", 1) if entry else 1
+            keep_tokens = len(transfer.keys) * page_size
+            if keep_tokens and transfer.host_indices.numel() > keep_tokens:
+                self.append_host_mem_release(
+                    extra_pools=[
+                        PoolTransfer(
+                            name=transfer.name,
+                            host_indices=transfer.host_indices[:-keep_tokens],
+                        )
+                    ]
+                )
+                transfer.host_indices = transfer.host_indices[-keep_tokens:]
 
     def _resolve_pool_transfers_allocation(
         self,
