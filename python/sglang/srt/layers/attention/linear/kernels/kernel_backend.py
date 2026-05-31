@@ -10,6 +10,11 @@ class LinearAttnKernelBase(ABC):
     and provides decode/extend/target_verify methods with a unified interface.
     """
 
+    # How target_verify lays out cached intermediate states:
+    # "batch" -> intermediate_state[batch_idx, step]
+    # "cache" -> intermediate_state[cache_indices[batch_idx], step]
+    target_verify_intermediate_state_indexing: str = "batch"
+
     @abstractmethod
     def decode(
         self,

@@ -1078,6 +1078,20 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
+        verify_kernel = self.linear_attn_backend.kernel_dispatcher.verify_kernel
+        intermediate_state_indexing = (
+            verify_kernel.target_verify_intermediate_state_indexing
+        )
+        if intermediate_state_indexing == "batch":
+            intermediate_state_src_indices = None
+        elif intermediate_state_indexing == "cache":
+            intermediate_state_src_indices = state_indices_tensor
+        else:
+            raise RuntimeError(
+                "Unsupported target verify intermediate state indexing: "
+                f"{intermediate_state_indexing}"
+            )
+
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls
         fused_mamba_state_scatter_with_mask(
@@ -1085,6 +1099,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_state_cache,
             state_indices_tensor,
             last_correct_step_indices,
+            src_indices_raw=intermediate_state_src_indices,
         )
         fused_mamba_state_scatter_with_mask(
             conv_states,
@@ -1102,6 +1117,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 intermediate_state_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
+                src_indices_raw=intermediate_state_src_indices,
             )
             fused_mamba_state_scatter_with_mask(
                 conv_states,
