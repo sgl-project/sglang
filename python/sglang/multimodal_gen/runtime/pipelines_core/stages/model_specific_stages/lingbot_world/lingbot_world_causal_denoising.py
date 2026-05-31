@@ -66,8 +66,6 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         return self.sliding_window_num_frames * self.num_token_per_frame
 
     def _get_causal_sink_tokens(self) -> int:
-        if self.local_attn_size == -1:
-            return 0
         return super()._get_causal_sink_tokens()
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -141,7 +139,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             attention_window_size=self._get_causal_attention_window_size(
                 kv_cache_size
             ),
-            allow_growth=self.local_attn_size == -1,
+            allow_growth=False,
         )
 
     def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
