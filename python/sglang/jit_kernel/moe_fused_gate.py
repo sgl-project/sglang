@@ -126,7 +126,7 @@ def _router_triton_kernel(
 
     if SCORING_FUNC == 0:
         # sigmoid(x) = 1 / (1 + exp(-x))
-        activated = 1.0 / (1.0 + tl.exp(-scores))
+        activated = tl.sigmoid(scores)
     else:
         # sqrt(softplus(x)) = sqrt(log1p(exp(x))); guard against overflow when x is large
         sp = tl.where(
