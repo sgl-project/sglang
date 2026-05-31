@@ -185,16 +185,18 @@ def _spawn_server_process(
     engine_kwargs: Dict[str, Any],
 ) -> mp.process.BaseProcess:
     mp_ctx = mp.get_context("spawn")
+    launch_kwargs: Dict[str, Any] = dict(
+        host=SERVER_HOST,
+        port=get_free_port(),
+        kv_canary="raise",
+        kv_canary_real_data="partial",
+        kv_canary_sweep_interval=100,
+        disable_piecewise_cuda_graph=True,
+    )
+    launch_kwargs.update(engine_kwargs)
     server_process = mp_ctx.Process(
         target=_launch_scripted_http_server,
-        kwargs=dict(
-            host=SERVER_HOST,
-            port=get_free_port(),
-            kv_canary="raise",
-            kv_canary_real_data="partial",
-            kv_canary_sweep_interval=100,
-            **engine_kwargs,
-        ),
+        kwargs=launch_kwargs,
         name="scripted-runtime-http-server",
         daemon=False,
     )
