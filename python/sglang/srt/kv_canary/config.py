@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from sglang.jit_kernel.kv_canary.consts import (
+    RealKvHashMode,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -33,6 +36,8 @@ class CanaryConfig:
         sweep_interval: 0 disables sweep entirely; positive N means every N-th forward step the runner
             additionally walks all radix-tree-held slots (overlap with per-forward HEAD/TAIL is harmless
             redundancy) and verifies them.
+        real_kv_hash_mode: RealKvHashMode (NONE / PARTIAL / ALL). Uniform across head/tail/sweep launches;
+            PARTIAL (first 16B, hard cap) is cheap enough for production defaults.
         enable_write_input_assert: bool. True = launch_canary_write_kernel additionally compares
             forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
             expected_input_positions[i]; mismatch records a violation. Only useful when something else
@@ -43,6 +48,7 @@ class CanaryConfig:
     mode: CanaryMode
     ring_capacity: int
     sweep_interval: int
+    real_kv_hash_mode: RealKvHashMode
     enable_write_input_assert: bool
 
     @classmethod
@@ -53,9 +59,12 @@ class CanaryConfig:
                 f"kv-canary: kv_canary must be one of none/log/raise, got {mode_raw!r}"
             )
 
+        real_kv_raw = server_args.kv_canary_real_data.strip().upper()
+
         return cls(
             mode=CanaryMode(mode_raw),
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
             sweep_interval=server_args.kv_canary_sweep_interval,
+            real_kv_hash_mode=RealKvHashMode[real_kv_raw],
             enable_write_input_assert=envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.get(),
         )

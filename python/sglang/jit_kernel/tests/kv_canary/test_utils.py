@@ -50,6 +50,8 @@ def test_cases_to_x_vals_includes_scenario_axis() -> None:
             case.mode,
             case.extend_len,
             case.pool_kind,
+            case.real_kv_kind,
+            case.hash_mode,
         )
     ]
 

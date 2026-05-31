@@ -5,12 +5,14 @@ from typing import Any, Callable, Iterator, Optional
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.plan_ref import (
     launch_canary_plan_kernels_torch_reference,
 )
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
+    RealKvSource,
     VerifyOrWriteContext,
     VerifyPlan,
     launch_canary_verify_kernel,
@@ -186,6 +188,9 @@ def _run_both_verify(
     plan_ref,
     cuda_log: FakeViolationLog,
     ref_log: FakeViolationLog,
+    real_kv_sources_cuda: tuple[RealKvSource, ...],
+    real_kv_sources_ref: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     assert_equal: bool = True,
     check_verify_expected_token: bool = True,
@@ -199,6 +204,8 @@ def _run_both_verify(
             slot_run_counter=cuda_log.slot_run_counter,
             kernel_run_counter=cuda_log.kernel_run_counter,
             enable_chain_position_assert=cuda_log.enable_chain_position_assert,
+            real_kv_sources=real_kv_sources_cuda,
+            real_kv_hash_mode=real_kv_hash_mode,
         ),
         plan=plan_cuda,
         check_verify_expected_token=check_verify_expected_token,
@@ -212,6 +219,8 @@ def _run_both_verify(
             slot_run_counter=ref_log.slot_run_counter,
             kernel_run_counter=ref_log.kernel_run_counter,
             enable_chain_position_assert=ref_log.enable_chain_position_assert,
+            real_kv_sources=real_kv_sources_ref,
+            real_kv_hash_mode=real_kv_hash_mode,
         ),
         plan=plan_ref,
         check_verify_expected_token=check_verify_expected_token,
@@ -236,6 +245,9 @@ def _run_both_write(
     expected_input_positions: torch.Tensor,
     cuda_log: FakeViolationLog,
     ref_log: FakeViolationLog,
+    real_kv_sources_cuda: tuple[RealKvSource, ...],
+    real_kv_sources_ref: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     assert_equal: bool = True,
 ) -> None:
@@ -254,6 +266,8 @@ def _run_both_write(
             slot_run_counter=cuda_log.slot_run_counter,
             kernel_run_counter=cuda_log.kernel_run_counter,
             enable_chain_position_assert=cuda_log.enable_chain_position_assert,
+            real_kv_sources=real_kv_sources_cuda,
+            real_kv_hash_mode=real_kv_hash_mode,
         ),
         plan=plan_cuda,
         input_ids=input_ids,
@@ -272,6 +286,8 @@ def _run_both_write(
             slot_run_counter=ref_log.slot_run_counter,
             kernel_run_counter=ref_log.kernel_run_counter,
             enable_chain_position_assert=ref_log.enable_chain_position_assert,
+            real_kv_sources=real_kv_sources_ref,
+            real_kv_hash_mode=real_kv_hash_mode,
         ),
         plan=plan_ref,
         input_ids=input_ids,
@@ -381,6 +397,20 @@ def _yield_simpler(inputs: Any) -> Iterator[tuple[str, Any]]:
         if fields["extras_count"] > 0:
             yield from emit("extras_zero", extras_count=0)
 
+    if "real_kv_hash_mode" in fields:
+        cur = fields["real_kv_hash_mode"]
+        if hasattr(cur, "value"):
+            cls = cur.__class__
+            if int(cur) == 2:
+                yield from emit("hash_mode_bit", real_kv_hash_mode=cls(1))
+            elif int(cur) == 1:
+                yield from emit("hash_mode_off", real_kv_hash_mode=cls(0))
+
+    if "real_kv_sources" in fields:
+        srcs = fields["real_kv_sources"]
+        if isinstance(srcs, tuple) and len(srcs) > 1:
+            yield from emit("sources_to_one", real_kv_sources=srcs[:1])
+
     if "enable_write_verify_inputs" in fields:
         cur = fields["enable_write_verify_inputs"]
         if hasattr(cur, "value") and int(cur) != 0:
@@ -398,13 +428,18 @@ def run_verify_diff(
     *,
     buf_pair: tuple[torch.Tensor, torch.Tensor],
     plan_pair: tuple[VerifyPlan, VerifyPlan],
+    real_kv_sources_pair: tuple[tuple[RealKvSource, ...], tuple[RealKvSource, ...]] = (
+        (),
+        (),
+    ),
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.NONE,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     device: torch.device = _DEVICE,
     assert_equal: bool = True,
     check_verify_expected_token: bool = True,
 ) -> tuple[FakeViolationLog, FakeViolationLog]:
     """Thin wrapper around ``_run_both_verify`` that creates a fresh log pair and packs (cuda, ref)
-    buf/plan arguments into 2-tuples to drop ~8 lines of boilerplate per call site.
+    buf/plan/source arguments into 2-tuples to drop ~8 lines of boilerplate per call site.
     """
     cuda_log, ref_log = make_log_pair(device=device)
     _run_both_verify(
@@ -414,6 +449,9 @@ def run_verify_diff(
         plan_ref=plan_pair[1],
         cuda_log=cuda_log,
         ref_log=ref_log,
+        real_kv_sources_cuda=real_kv_sources_pair[0],
+        real_kv_sources_ref=real_kv_sources_pair[1],
+        real_kv_hash_mode=real_kv_hash_mode,
         kernel_kind=kernel_kind,
         assert_equal=assert_equal,
         check_verify_expected_token=check_verify_expected_token,
@@ -431,12 +469,17 @@ def run_write_diff(
     expected_input_tokens: torch.Tensor,
     expected_input_positions: torch.Tensor,
     enable_write_verify_inputs: bool = False,
+    real_kv_sources_pair: tuple[tuple[RealKvSource, ...], tuple[RealKvSource, ...]] = (
+        (),
+        (),
+    ),
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.NONE,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     device: torch.device = _DEVICE,
     assert_equal: bool = True,
 ) -> tuple[FakeViolationLog, FakeViolationLog]:
     """Thin wrapper around ``_run_both_write`` that creates a fresh log pair and packs (cuda, ref)
-    buf/plan arguments into 2-tuples to drop ~10 lines of boilerplate per call site.
+    buf/plan/source arguments into 2-tuples to drop ~10 lines of boilerplate per call site.
     """
     cuda_log, ref_log = make_log_pair(device=device)
     _run_both_write(
@@ -452,6 +495,9 @@ def run_write_diff(
         expected_input_positions=expected_input_positions,
         cuda_log=cuda_log,
         ref_log=ref_log,
+        real_kv_sources_cuda=real_kv_sources_pair[0],
+        real_kv_sources_ref=real_kv_sources_pair[1],
+        real_kv_hash_mode=real_kv_hash_mode,
         kernel_kind=kernel_kind,
         assert_equal=assert_equal,
     )

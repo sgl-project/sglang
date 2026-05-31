@@ -10,6 +10,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patcher.adapters.dsv4 import attach_dsv4
 from sglang.srt.kv_canary.pool_patcher.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
+from sglang.srt.kv_canary.pool_patcher.buffer_alloc import resolve_real_kv_read_bytes
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -53,16 +54,19 @@ def attach_canary_buffers(
             f"supported: {sorted(cls.__name__ for cls in _POOL_ATTACHERS)}"
         )
 
+    read_bytes = resolve_real_kv_read_bytes(config)
     groups = attacher(
         pool=pool,
         device=device,
+        read_bytes=read_bytes,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     logger.info(
-        "attach_canary_buffers: pool=%s attacher=%s n_groups=%d kinds=%s "
+        "attach_canary_buffers: pool=%s attacher=%s read_bytes=%d n_groups=%d kinds=%s "
         "kv_token_id_vs_position_offset=%d",
         type(pool).__name__,
         attacher.__name__,
+        read_bytes,
         len(groups),
         [g.kind.name for g in groups],
         kv_token_id_vs_position_offset,

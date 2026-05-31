@@ -29,6 +29,7 @@ import uuid
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -780,6 +781,7 @@ class ServerArgs:
     disable_attn_tp_gather: bool = False
     gc_threshold: Optional[List[int]] = None
     kv_canary: str = "none"
+    kv_canary_real_data: str = "none"
     kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
@@ -6319,6 +6321,18 @@ class ServerArgs:
                 "'none' disables the canary (default). "
                 "'log' prints them while the server keeps running (production-safe). "
                 "'raise' fails the server on the first detected mismatch (CI lane)."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-real-data",
+            type=str,
+            default=ServerArgs.kv_canary_real_data,
+            choices=[m.name.lower() for m in RealKvHashMode],
+            help=(
+                "Check the real KV-cache in the canary. "
+                "'none' (default) disables the feature. "
+                "'partial' checks the first 16 bytes of each real-KV slot. "
+                "'all' checks the full real-KV slot."
             ),
         )
         parser.add_argument(

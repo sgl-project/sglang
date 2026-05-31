@@ -11,13 +11,19 @@ def attach_dsv4(
     *,
     pool: object,
     device: torch.device,
+    read_bytes: int,
     kv_token_id_vs_position_offset: int,
 ) -> tuple[CanaryBufferGroup, ...]:
     """Attach canary buffers to a DeepSeekV4TokenToKVPool.
 
     TODO: only the swa_kv_pool sub-pool is wired; c4_kv_pool / c128_kv_pool /
     c4_indexer_kv_pool / compress state pools are left uncovered.
+    TODO: even on swa_kv_pool, real-KV fingerprint is disabled (read_bytes is
+    ignored). DSV4 stores 584 B/token which is not 16-aligned (584 % 16 == 8),
+    so num_bytes_per_token cannot satisfy the 128-bit load alignment precondition.
     """
+    del read_bytes
+
     sub_pool = pool.swa_kv_pool
     num_slots = int(sub_pool.size)
 
@@ -30,6 +36,8 @@ def attach_dsv4(
         k_tail=k_tail,
         v_head=None,
         v_tail=None,
+        real_kv_sources_k=(),
+        real_kv_sources_v=(),
         swa_index_lut=pool.full_to_swa_index_mapping,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
