@@ -2588,6 +2588,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
             global_dp_buffer_len = num_tokens * self.server_args.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.server_args.dp_size
         elif require_attn_tp_gather(self.server_args):
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -2604,8 +2605,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
             global_dp_buffer_len = num_tokens
+            global_num_tokens_cpu = [num_tokens]
         else:
             global_dp_buffer_len = None
+            global_num_tokens_cpu = None
 
         def get_spec_info():
             spec_info = None
@@ -2694,6 +2697,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
