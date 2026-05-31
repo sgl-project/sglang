@@ -1,0 +1,17 @@
+# AC-7 DS decode-batch evidence (from the 3-trial 64-prompt/120/600 sweep DS server log /tmp/ac7/ds_int8.log)
+# per-request decode TPS = gen_throughput(aggregate) / #running-req. Decode batch settles near the achieved
+# concurrency (16 / ~32 / ~47); aggregate gen ~constant => per-req TPS falls as batch grows, reconciling the
+# comparator per-req TPS FAIL (17.7 / 11.5 / 9.8 tok/s at conc 16/32/64).
+
+#running-req  n_lines  gen tok/s (med)  per-req tok/s
+           1        5             34.8          34.82
+          16      766            282.6          17.66
+          26      180            297.1          11.43
+          27       51            309.2          11.45
+          32      459            369.1          11.53
+          37       49            359.9           9.73
+          38      179            371.2           9.77
+
+# anchors (decode batch each conc settles into):
+#   conc~16: #running-req=16 gen 282.6 tok/s => 17.7 tok/s/req
+#   conc~32: #running-req=32 gen 369.1 tok/s => 11.5 tok/s/req

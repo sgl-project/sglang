@@ -35,17 +35,29 @@ This is the **known, expected DS-vs-DSA gap**, not a regression and not a footpr
 1. **DSA wins per-request** because V3.2's *trained* DSA indexer + the shared kernel are faster
    and lower-latency than DS's offline channel-mask selection at the same 2048 budget (the AC-1
    strategic-gate premise; DEC-7 directional).
-2. **DS per-req TPS fell once admission was restored** — the AC-5 latency/throughput tradeoff
-   (bigger decode batch → lower per-req decode TPS; `BL-admission-restore-tps-tradeoff`).
-3. **DS TTFT at conc-32/64 is queue/throughput-bound under the flood** — the AC-5 measured
-   attribution (queue_duration dominates; NOT KV-pool-admission, since 64×4608 < the 396K pool).
+2. **DS per-req TPS fell once admission was restored** — bigger decode batch → lower per-req decode
+   TPS (`BL-admission-restore-tps-tradeoff`).
+3. **DS TTFT is admission-queue-dominated under the request_rate=inf flood** — DS's lower throughput
+   drains the flood-queue slower than DSA.
 
-Per **DEC-7 / DEC-9**, a DS-vs-DSA TPS/TTFT miss at the lifted point is a **recorded directional
-follow-up**, not a build-break; AC-7 is **soft** (may be characterized). The comparator's
-profiling obligation for the failing rows is **already discharged** by the AC-5 measured
-admission-wait-vs-prefill attribution + the decode-batch TPS root cause (`client_slo_report.md`,
-`attribution_per_conc.txt`, `decode_batch_excerpt.txt`) at the identical workload/operating point —
-no new profile adds information beyond that attribution.
+## Profiling obligation — discharged at AC-7 methodology (the failing rows)
+Captured at the **AC-7 methodology** (DS int8/mem0.7/radix-on, `num_prompts=64`, warmup 120 s /
+window 600 s, `--enable-request-time-stats-logging`; this profiling run reproduces the AC-7
+sweep — TTFT 12.8/25.4/100.8 s, TPS 17.2/11.5/9.8, achieved 16/32/47 — so it is the same regime,
+not the AC-5 WARMUP=0/320/60 directional run, which is now only background):
+- **`decode_batch_ac7.txt`** (from the AC-7 3-trial sweep DS server log) — per-request decode TPS =
+  gen/`#running-req`: **17.7 / 11.5 / 9.8 tok/s** at decode batch 16 / 32 / ~38, reconciling the
+  comparator's per-req **TPS-gate FAIL** exactly.
+- **`queue_attribution.txt`** (request-time stats, bucketed per conc by `.meta.json` run windows,
+  1082 valid benchmark rows) — `queue_duration` p99 = **10.5 / 22.6 / 96.7 s** vs client P99 TTFT
+  12.8/25.4/100.8 s (post-admission residual ~2–4 s). DS **TTFT is admission-queue-dominated** at
+  every conc: the request_rate=inf flood holds requests in the scheduler queue, and DS drains it
+  slower than DSA (lower throughput) → the **TTFT-gate FAIL**. At conc-64 the queue is largest,
+  consistent with the achieved-concurrency deficit (47/64).
+
+Per **DEC-7 / DEC-9**, the DS-vs-DSA TPS/TTFT miss is a **recorded directional follow-up** with
+measured AC-7-methodology attribution (decode batch + request-time queue), **not** a build-break or
+a footprint regression; AC-7 is **soft** (characterized).
 
 ## AC-7 verdict (characterized, DEC-9)
 **Admission restored** (DS achieved 100% at conc 16/32, 73% at conc-64, up from Loop-5's
@@ -68,5 +80,7 @@ cross-node use (R11 also proved `bench_serving --host node1` targets node 1).
 
 ## Artifacts
 - `ac11_resweep.md` — `benchmark_compare.py --ac11` report (gates, ratios, effective concurrency).
-- `ac7_resweep_metrics.json` — per-conc/per-trial DS+DSA achieved/TTFT/TPS + medians + source JSONL SHA256 (recomputable; raw `.jsonl` gitignored).
-- `*.meta.json` — 18 per-run sidecars (radix-on, per-side mem, commit SHA, operating point).
+- `ac7_resweep_metrics.json` + `ac7_metrics_tool.py` — exact per-trial DS+DSA arrays (effective `concurrency`, `ttfts_s`, `per_req_gen_tps`) + full SHA256; `--verify` recomputes the `ac11_resweep.md` rows from committed data, fail-closed.
+- `decode_batch_ac7.txt` — AC-7-methodology decode-batch evidence (per-req TPS = gen/#running-req) reconciling the TPS-gate FAIL.
+- `queue_attribution.txt` — AC-7-methodology DS request-time stats (per-conc `queue_duration`) reconciling the TTFT-gate FAIL (admission-queue-dominated).
+- `*.meta.json` — per-run sidecars (radix-on, per-side mem, commit SHA, operating point).
