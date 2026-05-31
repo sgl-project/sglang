@@ -273,7 +273,7 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
     <tr>
       <td><code>flashinfer_cudnn</code></td>
       <td>SM100/120 (CUDA 13+, cuDNN 9.15+)</td>
-      <td>FlashInfer cuDNN backend; used on SM120 for performance</td>
+      <td>FlashInfer cuDNN backend; preferred on SM120 because the CUTLASS path has produced NaNs in dense MLP layers with heterogeneous batches</td>
     </tr>
     <tr>
       <td><code>flashinfer_trtllm</code></td>
