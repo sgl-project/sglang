@@ -154,10 +154,8 @@ class _AudioState:
     left_overlap_bytes: int
     slicing_min_chunk_index: int
     state: StreamingASRState
-    # False when left_overlap covers the whole unfixed-chunk window, which
-    # leaves the K-unfixed dedupe target unreachable; flipped at session
-    # construction. When False, _run_inference always takes the cumulative
-    # path even after emitted_text becomes non-empty.
+    # False when the left overlap covers the whole unfixed-chunk window (the
+    # K-unfixed dedupe target would be unreachable); set at construction.
     slicing_enabled: bool = True
     pcm_buffer: bytearray = field(default_factory=bytearray)
     last_inference_offset: int = 0
@@ -578,10 +576,8 @@ class RealtimeConnection:
             tail = self.audio.state.finalize()
             await self._emit_transcription_delta(tail)
 
-        # Build from emitted_deltas, not state.full_transcript: both paths leave
-        # full_transcript a partial — prefix injection (cumulative path) leaves
-        # only the continuation tail, dedupe (slicing path) leaves only the
-        # deduped tail. emitted_deltas reconstructs the full transcript verbatim.
+        # Rebuild from emitted_deltas: both paths leave full_transcript only a
+        # partial tail, while the deltas together are the whole transcript.
         transcript = normalize_whitespace("".join(self.item.emitted_deltas))
 
         await self._send(
@@ -616,16 +612,12 @@ class RealtimeConnection:
         )
 
     async def _run_inference(self, is_last: bool) -> bool:
-        """Run ASR on the current audio window.
-
-        The cumulative path uses the whole PCM buffer. The slicing path uses a
-        tail slice with left overlap and trims duplicated text before
-        ``StreamingASRState`` ingests it. Returns False on failure: commit-time
-        emits transcription.failed and rolls the item; append-time emits a
-        generic error envelope and closes the WebSocket."""
-        # Bare prompt under slicing: emitted_text is not injected as a
-        # continuation prefix; the retained overlap + output dedupe
-        # takes its place.
+        """Run ASR on the current audio window: the whole PCM buffer
+        (cumulative) or a tail slice with left overlap + output dedupe
+        (slicing). Returns False on failure -- commit-time emits
+        transcription.failed and rolls the item; append-time closes the WS."""
+        # Slicing uses a bare prompt: the retained overlap + dedupe replace
+        # injecting emitted_text as a continuation prefix.
         committed_text = self.audio.state.get_prefix_text()
         use_slicing = (
             self.audio.slicing_enabled

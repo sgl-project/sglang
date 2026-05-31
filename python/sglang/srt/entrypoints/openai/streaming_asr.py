@@ -135,9 +135,8 @@ _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
 _NO_SPACE_AFTER = frozenset("([{（【《「『")
 
 
-# Two predicates: dedup = genuine CJK script only; spacing also includes the
-# fullwidth forms. scx (not Script) so the kana marks ー/・ count; Hangul excluded
-# (Korean uses spaces).
+# Two predicates: dedup = CJK script only; spacing also includes fullwidth forms.
+# scx (not Script) so kana marks ー/・ count; Hangul excluded (Korean uses spaces).
 _HALFWIDTH_HANGUL = chr(0xFFA0) + "-" + chr(0xFFDC)
 
 # Dedup set: &&\p{P} adds fullwidth punctuation but not fullwidth ASCII/digits.
