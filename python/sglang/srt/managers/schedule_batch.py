@@ -1524,7 +1524,7 @@ def _compute_chunked_req_next_prompt_token(
 ) -> Optional[int]:
     if chunked_req is None:
         return None
-    fill_len = len(chunked_req.fill_ids)
+    fill_len = chunked_req.fill_len
     if fill_len >= len(chunked_req.origin_input_ids):
         return None
     return int(chunked_req.origin_input_ids[fill_len])
