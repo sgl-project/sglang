@@ -495,7 +495,14 @@ class LlamaForCausalLM(nn.Module):
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
-        if self.config.tie_word_embeddings:
+        # Tying to the input embedding only works when the embedding and the
+        # head live on the same pp rank. Under pipeline parallelism the embedding
+        # is on the first rank while the head is computed on the last rank, so the
+        # last rank needs its own ParallelLMHead (its weight is copied from the
+        # embedding in load_weights).
+        if self.config.tie_word_embeddings and (
+            self.pp_group.world_size == 1 or not self.pp_group.is_last_rank
+        ):
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
@@ -662,6 +669,19 @@ class LlamaForCausalLM(nn.Module):
                 # the checkpoint. Skip them.
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
+                continue
+            if (
+                name == "model.embed_tokens.weight"
+                and self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and self.pp_group.world_size > 1
+                and "lm_head.weight" in params_dict
+            ):
+                # Under pipeline parallelism the last rank holds its own head
+                # (not the embedding); load the tied weight into it.
+                param = params_dict["lm_head.weight"]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
