@@ -1,0 +1,102 @@
+{
+ "tag": "DSpatched_b8",
+ "batch": 8,
+ "max_new_tokens": 256,
+ "wall_s": 8.51,
+ "completed": 8,
+ "prompt_tokens": 4072,
+ "completion_tokens_each": [
+  256,
+  256,
+  256,
+  256,
+  256,
+  256,
+  256,
+  256
+ ],
+ "client_latency_s_median": 8.508,
+ "note": "PURE per-request decode TPS = server 'Decode batch #running-req:8 gen throughput'/8 (read from the server log over the steady window); client latency includes prefill.",
+ "per_request": [
+  {
+   "ok": true,
+   "latency_s": 8.509119510650635,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  },
+  {
+   "ok": true,
+   "latency_s": 8.50884461402893,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  },
+  {
+   "ok": true,
+   "latency_s": 8.50833535194397,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  },
+  {
+   "ok": true,
+   "latency_s": 8.507737874984741,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  },
+  {
+   "ok": true,
+   "latency_s": 8.506689071655273,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  },
+  {
+   "ok": true,
+   "latency_s": 8.507330417633057,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  },
+  {
+   "ok": true,
+   "latency_s": 8.506854772567749,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  },
+  {
+   "ok": true,
+   "latency_s": 8.505925178527832,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  }
+ ]
+}

@@ -1,0 +1,36 @@
+# DS int8 / mem-0.7 / radix-on — CLOSED-batch pure-decode (no prefill interleave), TP=8 node0
+# Source: /tmp/ac5r17/ds_boot.log decode-batch lines, waves at 01:19:12-01:19:48 UTC.
+# 4096-token prompt (prompt_tokens=4072), ignore_eos, max_new_tokens=256; #queue-req:0 steady.
+# per-request decode TPS = (gen throughput token/s) / #running-req ; decode step time = #running-req / gen_throughput.
+
+## batch=16 (steady gen throughput lines, dropping the first ramp line):
+gen throughput (token/s): 11.38
+gen throughput (token/s): 279.66
+gen throughput (token/s): 278.87
+gen throughput (token/s): 278.60
+gen throughput (token/s): 278.13
+gen throughput (token/s): 277.06
+  -> median gen ~278 tok/s ; per-req = 278/16 = 17.4 TPS/req ; step = 57.6 ms
+
+## batch=8:
+gen throughput (token/s): 181.04
+gen throughput (token/s): 198.33
+gen throughput (token/s): 197.73
+gen throughput (token/s): 197.08
+gen throughput (token/s): 194.99
+gen throughput (token/s): 194.37
+  -> median gen ~197 tok/s ; per-req = 197/8 = 24.6 TPS/req ; step = 40.6 ms
+
+## batch=1:
+gen throughput (token/s): 155.59
+gen throughput (token/s): 39.62
+gen throughput (token/s): 39.68
+gen throughput (token/s): 39.66
+gen throughput (token/s): 39.63
+gen throughput (token/s): 39.66
+gen throughput (token/s): 39.66
+  -> median gen ~39.66 tok/s ; per-req = 39.7 TPS/req ; step = 25.2 ms
+
+## Finding: per-req TPS = 1/step_time. DS step ~= 23ms fixed + ~2.15ms/request (selection scales with batch).
+## conc-16 PURE decode = 17.4 TPS/req (clean closed batch, 0 prefill interleave) ~= AC-5 cold-flood 17.6
+## => NOT a cold-flood artifact; a genuine DS decode-throughput deficit. Need step <= 33.3ms for 30 TPS/req.

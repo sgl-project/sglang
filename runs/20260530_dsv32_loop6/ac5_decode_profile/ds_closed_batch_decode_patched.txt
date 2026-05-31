@@ -1,0 +1,38 @@
+# DS int8 / mem-0.7 / radix-on, PATCHED (score-kernel early-exit) — CLOSED-batch pure decode, TP=8 node0
+# Source: /tmp/ac5r17/ds_boot_patched.log decode lines, waves 01:37:33-01:38:01 UTC; 4096-tok prompt, ignore_eos.
+# Same operating point as the pre-patch run (max_total_num_tokens=396096, signature_dtype=int8, radix-on).
+
+## batch=16 steady gen throughput (patched):
+gen throughput (token/s): 20.94
+gen throughput (token/s): 435.83
+gen throughput (token/s): 434.22
+gen throughput (token/s): 432.96
+gen throughput (token/s): 432.02
+gen throughput (token/s): 430.83
+  -> median ~433 tok/s ; per-req = 433/16 = 27.1 TPS/req ; step = 36.9 ms   (was 278/17.4/57.6)
+
+## batch=8 (patched):
+gen throughput (token/s): 235.86
+gen throughput (token/s): 263.53
+gen throughput (token/s): 263.01
+gen throughput (token/s): 260.85
+gen throughput (token/s): 258.11
+gen throughput (token/s): 257.13
+  -> median ~260 tok/s ; per-req = 260/8 = 32.6 TPS/req ; step = 30.8 ms   (was 197/24.6/40.6) -- PASSES >=30
+
+## batch=1 (patched):
+gen throughput (token/s): 40.76
+gen throughput (token/s): 40.81
+gen throughput (token/s): 40.86
+gen throughput (token/s): 40.79
+gen throughput (token/s): 40.85
+gen throughput (token/s): 40.87
+  -> median ~40.85 tok/s ; per-req = 40.9 TPS/req ; step = 24.5 ms   (was 39.66/39.7/25.2)
+
+## Before -> After (score-kernel early-exit; bit-identical selection):
+  conc 1 : 39.7 -> 40.9 TPS/req
+  conc 8 : 24.6 -> 32.6 TPS/req  (now >=30)
+  conc16 : 17.4 -> 27.1 TPS/req  (+56%; step 57.6 -> 36.9 ms; -20.7 ms == microbench over-scan savings 19.6 ms)
+## Remaining to clear 30 at conc-16: step <=33.3 ms (need ~3.6 ms more) = the residual torch.topk over-scan
+## (topk over 163840 vs 4608 = ~3.6 ms; capture-width-bound, the next lever).
+## Coherence smoke (decode not degenerated): 'The capital of France is' -> ' Paris. The capital of the United States'

@@ -1,0 +1,55 @@
+{
+ "_purpose": "DS decode-selection cost (61-layer, bs=16, seq_len=4096) vs scanned max_seq_len. The lifted-point real width is 163840 (=context_len=req_to_token.shape[1]); the actual sequence is ~4096, so tightening the scan to ~4608 is the candidate lever.",
+ "bs": 16,
+ "layers": 61,
+ "seq_len": 4096,
+ "max_top_k": 2048,
+ "H_local": 16,
+ "label_dim": 16,
+ "iters": 30,
+ "note": "selection_ms_per_step = full retrieve_topk_graph_safe x61; per-step is added to every decode step. DS closed-batch-16 measured step ~57.6 ms (17.4 TPS/req); target <=33.3 ms (30 TPS/req).",
+ "rows": [
+  {
+   "max_seq_len": 4608,
+   "selection_ms_per_step": 8.563,
+   "topk_only_ms_per_step": 6.147,
+   "score_etc_ms_per_step": 2.416
+  },
+  {
+   "max_seq_len": 8192,
+   "selection_ms_per_step": 9.838,
+   "topk_only_ms_per_step": 7.042,
+   "score_etc_ms_per_step": 2.796
+  },
+  {
+   "max_seq_len": 16384,
+   "selection_ms_per_step": 12.839,
+   "topk_only_ms_per_step": 9.209,
+   "score_etc_ms_per_step": 3.629
+  },
+  {
+   "max_seq_len": 32768,
+   "selection_ms_per_step": 14.287,
+   "topk_only_ms_per_step": 8.0,
+   "score_etc_ms_per_step": 6.287
+  },
+  {
+   "max_seq_len": 65536,
+   "selection_ms_per_step": 19.058,
+   "topk_only_ms_per_step": 8.804,
+   "score_etc_ms_per_step": 10.253
+  },
+  {
+   "max_seq_len": 131072,
+   "selection_ms_per_step": 27.796,
+   "topk_only_ms_per_step": 9.51,
+   "score_etc_ms_per_step": 18.286
+  },
+  {
+   "max_seq_len": 163840,
+   "selection_ms_per_step": 32.077,
+   "topk_only_ms_per_step": 9.801,
+   "score_etc_ms_per_step": 22.276
+  }
+ ]
+}

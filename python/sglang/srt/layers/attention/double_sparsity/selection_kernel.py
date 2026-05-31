@@ -91,6 +91,22 @@ if _TRITON_AVAILABLE:
         in_range = tok_offs < max_seq_len
 
         seq_len_i = tl.load(sl_ptr + batch_id).to(tl.int32)
+        # Skip token-blocks entirely past this request's sequence length: every
+        # position would be masked to -inf anyway, so store -inf and return
+        # instead of running the per-head signature loads + dot products for the
+        # unused tail. The score scratch / topk operate over the full KV-index
+        # width (req_to_token width == model context length), so without this a
+        # short request scores the entire context every layer every decode step.
+        # Output is bit-identical to the masked full scan; the launch grid is
+        # unchanged so it stays CUDA-graph capture/replay safe (no host sync,
+        # no dynamic shape).
+        if tok_blk * TOKEN_BLOCK >= seq_len_i:
+            tl.store(
+                out_ptr + batch_id * out_stride_b + tok_offs,
+                tl.full((TOKEN_BLOCK,), float("-inf"), dtype=tl.float32),
+                mask=in_range,
+            )
+            return
         pos_valid = in_range & (tok_offs < seq_len_i)
 
         pool_idx = tl.load(rpi_ptr + batch_id).to(tl.int64)

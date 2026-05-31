@@ -1,0 +1,25 @@
+{
+ "tag": "DSpatched_b1",
+ "batch": 1,
+ "max_new_tokens": 256,
+ "wall_s": 6.504,
+ "completed": 1,
+ "prompt_tokens": 4072,
+ "completion_tokens_each": [
+  256
+ ],
+ "client_latency_s_median": 6.503,
+ "note": "PURE per-request decode TPS = server 'Decode batch #running-req:1 gen throughput'/1 (read from the server log over the steady window); client latency includes prefill.",
+ "per_request": [
+  {
+   "ok": true,
+   "latency_s": 6.503125190734863,
+   "prompt_tokens": 4072,
+   "completion_tokens": 256,
+   "finish_reason": {
+    "type": "length",
+    "length": 256
+   }
+  }
+ ]
+}
