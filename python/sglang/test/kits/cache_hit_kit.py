@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 
 import aiohttp
@@ -10,6 +11,11 @@ from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+
+
+def _openai_auth_headers():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
 async def async_request_sglang_generate(
@@ -108,7 +114,9 @@ async def async_request_openai_chat_completions(
         output = RequestFuncOutput()
 
         try:
-            async with session.post(url=url, json=payload) as response:
+            async with session.post(
+                url=url, json=payload, headers=_openai_auth_headers()
+            ) as response:
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0
