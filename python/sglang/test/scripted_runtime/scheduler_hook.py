@@ -50,6 +50,13 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
         ):
             break
 
+    # Pipeline parallelism keeps micro-batches in flight after the running batch
+    # already looks empty; let them finish (and release their radix nodes) before
+    # flushing the cache they still reference.
+    server_args = scheduler.server_args
+    for _ in range(2 * (server_args.pp_size + server_args.pp_async_batch_depth)):
+        yield
+
     ctx.flush_cache()
     yield
 
