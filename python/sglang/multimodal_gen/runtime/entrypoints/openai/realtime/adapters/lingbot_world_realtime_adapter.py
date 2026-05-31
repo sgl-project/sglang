@@ -97,6 +97,8 @@ class LingBotWorldRealtimeState:
             Args:
                 chunk_size: number of frames
         """
+        if not self.events.has_events("camera_actions"):
+            return None
         action_list = self.events.sample_chunk(
             "camera_actions",
             ConditionSamplingParams(chunk_size=chunk_size, default_item=[]),
