@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 import traceback
-from typing import TYPE_CHECKING, Any, Generator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
 
@@ -40,6 +40,7 @@ from sglang.test.scripted_runtime.io_struct import (
 from sglang.test.scripted_runtime.utils import ensure_script_importable, resolve_fn
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
@@ -141,7 +142,7 @@ class ScriptedSchedulerHook:
     # ============================================================
     # Lookups used by ScriptedReqHandle (driver-rank-local view).
     # ============================================================
-    def _find_req_by_rid(self, rid: str) -> Optional[Any]:
+    def _find_req_by_rid(self, rid: str) -> Optional["Req"]:
         """Locate the raw ``Req`` by rid across scheduler queues / batches.
 
         Returns ``None`` if the rid is not currently held by the scheduler.
