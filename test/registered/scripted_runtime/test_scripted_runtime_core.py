@@ -394,6 +394,51 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             t.list_active_reqs() == []
         ), "active reqs should drain to empty after finish"
 
+    def test_kv_pages_held_during_run_released_after(self):
+        self.server.execute_script(self._script_kv_pages_set_then_released)
+
+    @staticmethod
+    def _script_kv_pages_set_then_released(t: ScriptedContext):
+        r = t.start_req(
+            prompt_len=_LONG_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        assert r.kv_pages > 0, f"expected kv_pages>0 mid-run; got {r.kv_pages}"
+        yield from run_until_finished(r)
+        assert r.kv_pages == 0, f"kv_pages should be 0 after finish; got {r.kv_pages}"
+
+    def test_engine_stats_tracks_kv_pool(self):
+        self.server.execute_script(self._script_engine_stats_tracks_kv)
+
+    @staticmethod
+    def _script_engine_stats_tracks_kv(t: ScriptedContext):
+        stats = t.engine_stats()
+        for key in ("kv_pool_free", "req_pool_free", "req_pool_total", "page_size"):
+            assert key in stats, f"engine_stats missing {key!r}: {stats!r}"
+        baseline_free = stats["kv_pool_free"]
+        assert baseline_free > 0
+        r = t.start_req(
+            prompt_len=_LONG_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        during_free = t.engine_stats()["kv_pool_free"]
+        assert during_free < baseline_free, (
+            f"kv_pool_free should drop while a req holds KV; "
+            f"baseline={baseline_free} during={during_free}"
+        )
+        yield from run_until_finished(r)
+        t.flush_cache()
+        for _ in range(5):
+            yield
+        after_free = t.engine_stats()["kv_pool_free"]
+        assert (
+            after_free >= during_free
+        ), f"kv_pool_free should recover after finish; during={during_free} after={after_free}"
+
     def test_empty_script_returns_immediately(self):
         self.server.execute_script(self._script_empty_return)
 

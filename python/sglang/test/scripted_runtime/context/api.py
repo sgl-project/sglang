@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 from sglang.test.scripted_runtime.context import (
+    engine,
     lifecycle,
     queries,
     radix,
@@ -92,3 +93,6 @@ class ScriptedContext:
 
     def list_active_reqs(self) -> List["Req"]:
         return queries.list_active_reqs(self)
+
+    def engine_stats(self) -> Dict[str, int]:
+        return engine.engine_stats(self)
