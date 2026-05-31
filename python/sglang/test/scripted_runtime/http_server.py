@@ -215,12 +215,6 @@ class ScriptedHttpServer:
         if fatal_tb:
             raise AssertionError(f"scripted-runtime server failed:\n{fatal_tb}")
 
-    def __enter__(self) -> "ScriptedHttpServer":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.shutdown()
-
     def _read_traceback(self) -> Optional[str]:
         try:
             text = self._traceback_path.read_text()
