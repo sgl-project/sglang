@@ -7,6 +7,7 @@ const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker";
 const PREVIEW_OUTPUT_FORMAT = "jpeg";
 const PREVIEW_OUTPUT_QUALITY = 95;
+const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
 const LOW_LATENCY_QUEUE_SECONDS = 0.35;
@@ -82,6 +83,8 @@ const activeControlActions = new Set();
 
 const canvas = $("viewport");
 const ctx = canvas.getContext("2d", { alpha: false });
+const scratchCanvas = document.createElement("canvas");
+const scratchCtx = scratchCanvas.getContext("2d", { alpha: false });
 
 function setStatus(text, kind = "") {
   $("statusText").textContent = text;
@@ -381,6 +384,29 @@ async function encodedImageToImageData(header, payload) {
   return [{ image, chunk: header.chunk_index }];
 }
 
+function drawFrame(image) {
+  if (scratchCanvas.width !== image.width || scratchCanvas.height !== image.height) {
+    scratchCanvas.width = image.width;
+    scratchCanvas.height = image.height;
+  }
+  scratchCtx.putImageData(image, 0, 0);
+
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+  const targetWidth = Math.max(1, Math.round(rect.width * dpr));
+  const targetHeight = Math.max(
+    1,
+    Math.round((targetWidth * image.height) / image.width),
+  );
+  if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+  }
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(scratchCanvas, 0, 0, canvas.width, canvas.height);
+}
+
 function renderLoop(now) {
   const targetFps = playbackFps || Number($("fps").value || 16);
   const queueSeconds = queue.length / Math.max(1, targetFps);
@@ -390,11 +416,7 @@ function renderLoop(now) {
   const targetMs = 1000 / Math.max(1, catchupFps);
   if (queue.length && now - lastFrameAt >= targetMs) {
     const item = queue.shift();
-    if (canvas.width !== item.image.width || canvas.height !== item.image.height) {
-      canvas.width = item.image.width;
-      canvas.height = item.image.height;
-    }
-    ctx.putImageData(item.image, 0, 0);
+    drawFrame(item.image);
     lastFrameAt = now;
     fpsSamples.push(now);
     fpsSamples = fpsSamples.filter((t) => now - t < 1000);
@@ -486,7 +508,7 @@ function closeSession(reason = "session closed by client", clearFrames = true) {
   ws.close(1000, "client close");
 }
 
-function waitForSocketClose(socket, timeoutMs = 1800) {
+function waitForSocketClose(socket, timeoutMs = RECONNECT_CLOSE_TIMEOUT_MS) {
   return new Promise((resolve) => {
     if (!socket || socket.readyState === WebSocket.CLOSED) {
       resolve();
