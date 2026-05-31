@@ -1,7 +1,7 @@
 """ScriptedSchedulerHook: the scheduler-side half of the scripted runtime.
 
-Constructed by ``Scheduler.__init__`` when ``enable_scripted_runtime`` is
-set and held as a scheduler field. ``SchedulerRequestReceiver.recv_requests``
+Constructed by ``Scheduler.__init__`` when ``SGLANG_TEST_SCRIPTED_RUNTIME``
+is set and held as a scheduler field. ``SchedulerRequestReceiver.recv_requests``
 calls :meth:`step` once per event-loop iteration. On the driver rank
 (``pp_rank == tp_rank == attn_cp_rank == 0``) the hook owns the dispatch-loop
 generator and the :class:`ScriptedContext` handed to it, advancing the
@@ -19,13 +19,13 @@ generator stepping, cross-rank broadcast, and per-req lookups for
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import traceback
 from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import broadcast_pyobj
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
@@ -73,7 +73,7 @@ class ScriptedSchedulerHook:
 
         if self._is_driver:
             ensure_script_importable(
-                scheduler.server_args.scripted_runtime_sys_path_entry
+                envs.SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY.get()
             )
             self._http_poster: Optional[BackgroundHttpPoster] = BackgroundHttpPoster()
             self._context: Optional[ScriptedContext] = ScriptedContext(
@@ -100,7 +100,7 @@ class ScriptedSchedulerHook:
         (the hook ``sys.exit``s the scheduler subprocess), voiding every
         remaining test in the class.
         """
-        endpoint = os.environ["SGLANG_SCRIPTED_RUNTIME_IPC_ADDR"]
+        endpoint = envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.get()
         ctx_zmq = zmq.Context()
         socket = get_zmq_socket(ctx_zmq, zmq.PAIR, endpoint, bind=False)
         try:
@@ -222,7 +222,7 @@ class ScriptedSchedulerHook:
 
     def _write_traceback(self, exc_tb: str) -> None:
         """Persist a failed script's traceback for the caller to surface."""
-        path = self._scheduler.server_args.scripted_runtime_traceback_path
+        path = envs.SGLANG_TEST_SCRIPTED_RUNTIME_TRACEBACK_PATH.get()
         if not path:
             return
         try:

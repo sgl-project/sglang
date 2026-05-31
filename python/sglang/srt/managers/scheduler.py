@@ -609,7 +609,7 @@ class Scheduler(
                 self.ps.attn_tp_rank == 0
                 or self.server_args.enable_metrics_for_all_schedulers
             ),
-            enable_scripted_runtime=self.server_args.enable_scripted_runtime,
+            enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
 
         self.load_snapshot_writer = None
@@ -1600,7 +1600,7 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
     def maybe_init_scripted_scheduler_hook(self) -> None:
-        if self.server_args.enable_scripted_runtime:
+        if envs.SGLANG_TEST_SCRIPTED_RUNTIME.get():
             from sglang.test.scripted_runtime.scheduler_hook import (
                 ScriptedSchedulerHook,
             )

@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional, Tuple
 
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_free_port, get_zmq_socket
 from sglang.test.scripted_runtime.http_server_subprocess import (
     launch_scripted_http_server,
@@ -92,10 +93,6 @@ class ScriptedHttpServer:
         ctx = zmq.Context()
         socket = get_zmq_socket(ctx, zmq.PAIR, endpoint, bind=True)
 
-        # Spawn-mode children snapshot os.environ at start(); set the IPC
-        # coordinates before launching so the dispatch loop can connect.
-        os.environ["SGLANG_SCRIPTED_RUNTIME_IPC_ADDR"] = endpoint
-
         host = SERVER_HOST
         port = get_free_port()
 
@@ -112,7 +109,11 @@ class ScriptedHttpServer:
             name="scripted-runtime-http-server",
             daemon=False,
         )
-        server_process.start()
+        # Spawn-mode children snapshot os.environ at start(); seed the IPC
+        # endpoint via override so the spawned process (and the scheduler it
+        # launches) inherit it, then restore the caller's env.
+        with envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint):
+            server_process.start()
 
         # Poll for the dispatch loop's HookReady; a stuck server startup
         # surfaces as TimeoutError instead of blocking forever (poll takes

@@ -867,11 +867,6 @@ class ServerArgs:
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
-    # Scripted runtime (testing only; set programmatically, not via CLI).
-    enable_scripted_runtime: bool = False
-    scripted_runtime_traceback_path: Optional[str] = None
-    scripted_runtime_sys_path_entry: Optional[str] = None
-
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
