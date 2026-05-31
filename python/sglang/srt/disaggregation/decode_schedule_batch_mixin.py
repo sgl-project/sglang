@@ -151,7 +151,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         if spec_info is not None:
             self.spec_info = spec_info
         else:
-            # Non-spec: positive last token feeds decode directly. No FutureMap
-            # bootstrap needed (SB self-maintains seq_lens; resolve_future is
-            # a no-op on positive input_ids).
-            self.input_ids = last_tokens_tensor
+            # Non-spec: stash last token into the relay so the first DECODE's
+            # resolve_forward_inputs gathers it like any other decode iter.
+            future_map.stash(self.req_pool_indices, last_tokens_tensor)
+            self.input_ids = None
