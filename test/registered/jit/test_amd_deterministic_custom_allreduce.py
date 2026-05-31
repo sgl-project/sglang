@@ -115,7 +115,7 @@ def worker(world_size, rank, port):
         # Clone the same input
         inp = base_input.clone()
 
-        result = custom_ar.custom_all_reduce(inp)
+        result = custom_ar.all_reduce(inp)
         torch.cuda.synchronize()
 
         # Store checksum
@@ -168,7 +168,7 @@ def worker(world_size, rank, port):
             # Flatten for all-reduce: (bs * hidden_dim,)
             batch_flat = batch.view(-1)
 
-            result_flat = custom_ar.custom_all_reduce(batch_flat)
+            result_flat = custom_ar.all_reduce(batch_flat)
             torch.cuda.synchronize()
 
             # Reshape back to (bs, hidden_dim)

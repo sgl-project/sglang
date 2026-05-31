@@ -1,11 +1,10 @@
 import importlib
 import logging
-from contextlib import contextmanager
 from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup, ReduceOp
+from torch.distributed import ProcessGroup
 
 from sglang.srt.compilation.compile_phase import (
     get_pcg_capture_stream,
@@ -16,10 +15,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import get_server_args
 
+from .base import AllReduceMode, BaseCommunicator
+
 logger = logging.getLogger(__name__)
 
 
-class PyMscclppCommunicator:
+class PyMscclppCommunicator(BaseCommunicator):
+    name = "pymscclpp"
     _SUPPORTED_WORLD_SIZES = [8, 16, 32]
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
 
@@ -252,52 +254,47 @@ class PyMscclppCommunicator:
         is bind to a unique device, and all communicators in this group
         are in the same node.
         """
-        self._IS_CAPTURING = False
-        self.disabled = True
 
         try:
             self.mscclpp = importlib.import_module("mscclpp")
             self.mscclpp_ext = importlib.import_module("mscclpp.ext")
             self.def_algo = importlib.import_module("mscclpp.default_algos")
-        except ImportError:
-            self.available = False
-            self.mscclpp = None
-            return
+        except ImportError as e:
+            # e.g. mscclpp is not installed or in a non-cuda environment
+            raise RuntimeError(
+                "PyMscclpp is disabled because the mscclpp library is not found. "
+                "To silence this warning, specify disable_mscclpp=True explicitly."
+            ) from e
 
-        self.available = True
         self.group = group
 
         assert (
             dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        ), "PyMscclppCommunicator should be attached to a non-NCCL group."
 
         rank = dist.get_rank(group=self.group)
         world_size = dist.get_world_size(group=self.group)
-        if world_size == 1:
-            # No need to initialize mscclpp for single GPU case.
-            return
+        assert world_size > 1
+        # PyMscclpp is enabled only in cuda graph
+        super().__init__(world_size=world_size, disabled=True)
 
         if world_size not in PyMscclppCommunicator._SUPPORTED_WORLD_SIZES:
-            logger.warning(
-                "PyMscclpp is disabled due to an unsupported world"
-                " size: %d. Supported world sizes: %s. To silence this "
-                "warning, specify disable_mscclpp=True explicitly.",
-                world_size,
-                str(PyMscclppCommunicator._SUPPORTED_WORLD_SIZES),
+            raise ValueError(
+                "PyMscclpp is disabled due to an unsupported world size: "
+                f"{world_size}. Supported world sizes: "
+                f"{PyMscclppCommunicator._SUPPORTED_WORLD_SIZES}. To silence "
+                "this warning, specify disable_mscclpp=True explicitly."
             )
-            return
 
         self.ranks = torch.distributed.get_process_group_ranks(group)
         self.nranks_per_node = torch.cuda.device_count()
         # for now mscclpp with stride in the communicator is not tested
         if not (abs(self.ranks[-1] - self.ranks[0]) == world_size - 1):
-            logger.warning(
-                "PyMscclpp is disabled due to an unsupported group %s."
-                "Please ensure all ranks in the group are consecutive."
-                "To silence this warning, specify disable_mscclpp=True explicitly.",
-                str(self.ranks),
+            raise ValueError(
+                f"PyMscclpp is disabled due to an unsupported group {self.ranks}. "
+                "Please ensure all ranks in the group are consecutive. "
+                "To silence this warning, specify disable_mscclpp=True explicitly."
             )
-            return
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -325,22 +322,21 @@ class PyMscclppCommunicator:
         self.flag_buffer = None
         self.comm = None
 
-    def should_mscclpp_allreduce(
-        self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
-    ) -> bool:
-        if (
-            self.disabled
-            or self.world_size not in PyMscclppCommunicator._SUPPORTED_WORLD_SIZES
-        ):
-            return False
-        if inp.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
-            return False
-        if not self._is_weak_contiguous(inp):
-            return False
-        if op is not ReduceOp.SUM:
-            return False
-        if self._get_tuned_config(inp.numel() * inp.element_size()) is None:
-            return False
+    def graph_capture_context(self):
+        return self.change_state(enable=True)
+
+    def should_use_custom_op(self) -> bool:
+        return True
+
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+        if self.disabled:
+            return None
+        if input_.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
+            return None
+        if not self._is_weak_contiguous(input_):
+            return None
+        if self._get_tuned_config(input_.numel() * input_.element_size()) is None:
+            return None
         # mscclpp must not be used during any piecewise CUDA graph phase
         # (compile, capture, or replay) as it changes the allreduce dispatch
         # path and triggers recompilation.
@@ -349,8 +345,9 @@ class PyMscclppCommunicator:
             or is_in_torch_compile_warmup()
             or get_pcg_capture_stream() is not None
         ):
-            return False
-        return True
+            return None
+        # the mscclpp kernel reduces into the input buffer
+        return AllReduceMode.INPLACE
 
     def dtype_to_mscclpp_dtype(self, dtype: torch.dtype):
         if dtype == torch.float16:
@@ -364,31 +361,15 @@ class PyMscclppCommunicator:
         else:
             raise ValueError(f"Unknown data type: {dtype}")
 
+    @BaseCommunicator.validate
     def all_reduce(
         self,
-        tensor: torch.Tensor,
-        op: ReduceOp = ReduceOp.SUM,
-        stream: torch.cuda.Stream = None,
-    ):
-        assert op == torch.distributed.ReduceOp.SUM
-        nbytes = tensor.numel() * tensor.element_size()
+        input_: torch.Tensor,
+        *,
+        inplace: Optional[bool] = None,
+    ) -> torch.Tensor:
+        self.assert_inplace("all_reduce", inplace)
+        nbytes = input_.numel() * input_.element_size()
         algo, nblocks, nthreads = self._get_tuned_config(nbytes)
-        self._run_algo(algo, tensor, nbytes, nblocks, nthreads, self.symm_mem_enabled)
-        return tensor
-
-    @contextmanager
-    def change_state(
-        self,
-        enable: Optional[bool] = None,
-    ):
-        if enable is None or self.available is False:
-            # guess a default value when not specified
-            # DO: Decided if raise an exception here or not
-            enable = self.available
-
-        old_disable = self.disabled
-        self.disabled = not enable
-
-        yield
-
-        self.disabled = old_disable
+        self._run_algo(algo, input_, nbytes, nblocks, nthreads, self.symm_mem_enabled)
+        return input_

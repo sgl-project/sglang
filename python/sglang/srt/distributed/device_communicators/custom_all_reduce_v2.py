@@ -8,10 +8,6 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.jit_kernel.all_reduce import AllReduceAlgo, get_custom_all_reduce_cls
-from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-    can_use_custom_all_reduce_with_nvlink,
-    is_weak_contiguous,
-)
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     VmmGraphInputManager,
     is_vmm_pointer,
@@ -20,7 +16,13 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
+
+from .base import AllReduceMode, BaseCommunicator
+from .custom_all_reduce_utils import (
+    can_use_custom_all_reduce_with_nvlink,
+    is_weak_contiguous,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +37,9 @@ class ModeConfig:
     one_shot_pull_threshold: int  # below this, use one-shot pull
 
 
-class CustomAllReduceV2:
+class CustomAllReduceV2(BaseCommunicator):
+    name = "custom_all_reduce_v2"
+
     def __init__(
         self,
         group: ProcessGroup,
@@ -45,14 +49,21 @@ class CustomAllReduceV2:
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
     ) -> None:
+        # Set unconditionally so that close() (reached via __del__ even on the
+        # disabled/failed-init paths) can read them without defensive getattr.
+        self._disabled = True
+        self.obj = None
+        self._vmm_graph_input_manager = None
+
         _maybe_init_config()
-        self.disabled = True
         if not can_use_custom_all_reduce_v2(group=group, device=device):
+            super().__init__(world_size=dist.get_world_size(group=group), disabled=True)
             return
 
         self.group = group
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
+        super().__init__(world_size=self.world_size)
         if max_pull_size is None:  # default to 16MB
             max_pull_size = 16 * 1024 * 1024
         if max_push_size is None:  # default to recommended size
@@ -80,7 +91,13 @@ class CustomAllReduceV2:
             world_size=self.world_size,
         )
         self._post_init_obj()
-        self.disabled = False
+        log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
+
+    def graph_capture_context(self):
+        return self.capture()
+
+    def should_use_custom_op(self) -> bool:
+        return True
 
     def override_shot(self, shot: int | None):
         if shot is None:
@@ -131,31 +148,38 @@ class CustomAllReduceV2:
         result = [list(zip(o, h)) for o, h in zip(offsets_all, handles_all)]
         self.obj.register_inputs(result)
 
-    def should_custom_ar(self, inp: torch.Tensor) -> bool:
-        """Check if the input tensor is suitable for custom all-reduce."""
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         if self.disabled:
-            return False
-        inp_size = inp.numel() * inp.element_size()
+            return None
+        inp_size = input_.numel() * input_.element_size()
         # custom allreduce requires input byte size to be multiples of 16
-        if inp_size % 16 != 0:
-            return False
-        if not is_weak_contiguous(inp):
-            return False
-        return inp_size <= self.max_size
+        if inp_size % 16 != 0 or inp_size > self.max_size:
+            return None
+        if not is_weak_contiguous(input_):
+            return None
+        return AllReduceMode.OUTPLACE
 
-    def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
+    @BaseCommunicator.validate
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        *,
+        inplace: Optional[bool] = None,
+    ) -> torch.Tensor:
+        self.assert_outplace("all_reduce", inplace)
         if is_in_tc_piecewise_cuda_graph():  # disable inplace optimization
             try:
                 self.obj.set_cuda_graph_capture(False)
-                return self._all_reduce(input)
+                return self._all_reduce(input_)
             finally:
                 self.obj.set_cuda_graph_capture(not self.tms_cudagraph)
-        return self._all_reduce(input)
+        return self._all_reduce(input_)
 
     def close(self):
-        if not self.disabled and hasattr(self, "obj"):
+        if not self._disabled and self.obj is not None:
             self.obj.free(self.group)
-        if hasattr(self, "_vmm_graph_input_manager"):
+            self._disabled = True
+        if self._vmm_graph_input_manager is not None:
             self._vmm_graph_input_manager.close()
 
     def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:

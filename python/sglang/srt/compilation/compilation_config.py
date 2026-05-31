@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/compilation_config.py
 
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 SPLIT_OPS = []
 
 
 def register_split_op(op_name: Optional[str] = None):
-    def decorator(op_func: Callable):
+    def decorator(op_func):
         name = op_name or op_func.__name__
         SPLIT_OPS.append(f"sglang.{name}")
         return op_func
