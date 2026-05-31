@@ -676,11 +676,11 @@ def test_lingbot_realtime_attention_cache_uses_bounded_sink_window():
     assert stage._get_causal_sink_tokens() == 9 * 10
     assert (
         stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=False)
-        == 18 * 10
+        == (9 + 18) * 10
     )
     assert (
         stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=True)
-        == 18 * 10
+        == (9 + 18) * 10
     )
 
 
@@ -712,7 +712,7 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
     assert stage.causal_kv_cache is not None
     cache = stage.causal_kv_cache[0]
     assert cache.allow_growth is False
-    assert cache.cache_size == 6
+    assert cache.cache_size == 8
     assert cache.sink_tokens == 2
 
     cache.update_and_get_attention_kv(
@@ -735,11 +735,24 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
         current_chunk_start=6,
     )
 
-    assert cache.cache_size == 6
-    assert cache.local_end_index_int == 6
+    assert cache.cache_size == 8
+    assert cache.local_end_index_int == 8
     assert cache.global_end_index_int == 9
     assert torch.equal(cache.k[:, :2], torch.ones(1, 2, 1, 1))
-    assert torch.equal(cache.k[:, 3:6], torch.full((1, 3, 1, 1), 3.0))
+    assert torch.equal(cache.k[:, 2:5], torch.full((1, 3, 1, 1), 2.0))
+    assert torch.equal(cache.k[:, 5:8], torch.full((1, 3, 1, 1), 3.0))
+
+    cache.update_and_get_attention_kv(
+        key=torch.full((1, 3, 1, 1), 4.0),
+        value=torch.full((1, 3, 1, 1), 4.0),
+        current_chunk_start=9,
+    )
+
+    assert cache.local_end_index_int == 8
+    assert cache.global_end_index_int == 12
+    assert torch.equal(cache.k[:, :2], torch.ones(1, 2, 1, 1))
+    assert torch.equal(cache.k[:, 2:5], torch.full((1, 3, 1, 1), 3.0))
+    assert torch.equal(cache.k[:, 5:8], torch.full((1, 3, 1, 1), 4.0))
 
 
 def test_lingbot_i2v_model_input_writer_reuses_buffer():

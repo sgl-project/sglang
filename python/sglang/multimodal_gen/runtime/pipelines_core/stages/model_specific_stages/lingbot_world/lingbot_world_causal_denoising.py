@@ -63,7 +63,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if self.local_attn_size != -1:
             return self.local_attn_size * self.num_token_per_frame
 
-        return self.sliding_window_num_frames * self.num_token_per_frame
+        return (
+            self.sink_size + self.sliding_window_num_frames
+        ) * self.num_token_per_frame
 
     def _get_causal_sink_tokens(self) -> int:
         return super()._get_causal_sink_tokens()
