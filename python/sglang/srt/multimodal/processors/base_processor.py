@@ -1239,21 +1239,21 @@ class BaseMultimodalProcessor(ABC):
     def _expand_input_ids(
         original_ids: List[int],
         counts: List[int],
-        image_token_id: Optional[int],
+        placeholder_token_id: Optional[int],
     ) -> List[int]:
         """Rebuild final input_ids for a pre-tokenized (list[int]) prompt.
 
         Keep the user's ORIGINAL tokens verbatim and expand the i-th image
-        placeholder into ``counts[i]`` copies of ``image_token_id``. The HF
+        placeholder into ``counts[i]`` copies of ``placeholder_token_id``. The HF
         processor's re-tokenization is discarded, so non-media tokens cannot
         drift.
 
         """
-        if image_token_id is None:
-            raise ValueError("image_token_id is not set for this processor")
+        if placeholder_token_id is None:
+            raise ValueError("placeholder_token_id is not set for this processor")
 
         num_placeholders = sum(
-            1 for token_id in original_ids if token_id == image_token_id
+            1 for token_id in original_ids if token_id == placeholder_token_id
         )
         if num_placeholders != len(counts):
             raise ValueError(
@@ -1264,8 +1264,8 @@ class BaseMultimodalProcessor(ABC):
         rebuilt: List[int] = []
         next_image_idx = 0
         for token_id in original_ids:
-            if token_id == image_token_id:
-                rebuilt.extend([image_token_id] * counts[next_image_idx])
+            if token_id == placeholder_token_id:
+                rebuilt.extend([placeholder_token_id] * counts[next_image_idx])
                 next_image_idx += 1
             else:
                 rebuilt.append(token_id)
@@ -1328,17 +1328,33 @@ class BaseMultimodalProcessor(ABC):
                 and base_output.input_ids is not None
                 and input_ids is not None
                 and raw_images
+                and not raw_audios
+                and not raw_videos
             ):
                 assert isinstance(
                     base_output.input_ids, list
                 ), f"expected list[int] input_ids, got {type(base_output.input_ids)}"
                 try:
                     counts = self.resolve_image_token_counts(raw_images)
+                    image_placeholder_token_id = mm_tokens.image_token_id
+                    if image_placeholder_token_id is None:
+                        raise ValueError(
+                            "image placeholder token id is not set for this processor"
+                        )
+                    processor_placeholder_count = int(
+                        (input_ids == image_placeholder_token_id).sum().item()
+                    )
+                    if processor_placeholder_count != sum(counts):
+                        raise ValueError(
+                            "processor image placeholder count mismatch: "
+                            f"processor={processor_placeholder_count}, "
+                            f"resolved={sum(counts)}"
+                        )
                     input_ids = torch.tensor(
                         self._expand_input_ids(
                             base_output.input_ids,
                             counts,
-                            mm_tokens.image_token_id,
+                            image_placeholder_token_id,
                         ),
                         dtype=input_ids.dtype,
                     )
