@@ -54,6 +54,36 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
 
+    from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
+
+    # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
+    # When num_heads is large (e.g. with DP attention where attention_tp_size=1), the
+    # total threads per block can exceed CUDA's limit of 1024 and the kernel launch fails
+    # with `invalid configuration argument`. Fall back to the in-tree Triton implementation,
+    # which uses (token, head) as the launch grid and is therefore unaffected.
+    _MERGE_STATE_CUDA_MAX_THREADS_PER_BLOCK = 1024
+
+    def _merge_state_max_safe_num_heads(head_dim: int, element_size: int) -> int:
+        # Mirrors flashinfer's vec_size selection in include/flashinfer/attention/cascade.cuh.
+        vec_size = max(16 // element_size, head_dim // 32)
+        bdx = head_dim // vec_size
+        if bdx <= 0:
+            return _MERGE_STATE_CUDA_MAX_THREADS_PER_BLOCK
+        return _MERGE_STATE_CUDA_MAX_THREADS_PER_BLOCK // bdx
+
+    def _safe_merge_state(
+        v_a: torch.Tensor,
+        s_a: torch.Tensor,
+        v_b: torch.Tensor,
+        s_b: torch.Tensor,
+    ):
+        num_heads = v_a.shape[1]
+        head_dim = v_a.shape[2]
+        max_heads = _merge_state_max_safe_num_heads(head_dim, v_a.element_size())
+        if num_heads <= max_heads:
+            return merge_state(v_a, s_a, v_b, s_b)
+        return merge_state_triton(v_a, s_a, v_b, s_b)
+
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -829,7 +859,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                 )
 
-                o, _ = merge_state(o1, s1, o2, s2)
+                o, _ = _safe_merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
