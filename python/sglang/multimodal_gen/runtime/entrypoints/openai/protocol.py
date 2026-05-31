@@ -150,7 +150,7 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     profile: Optional[bool] = False
     num_profiled_timesteps: Optional[int] = None
     profile_all_stages: Optional[bool] = False
-    realtime_output_format: Optional[Literal["webp", "jpeg"]] = None
+    realtime_output_format: Optional[Literal["raw", "webp", "jpeg"]] = None
 
 
 class RealtimeEvent(BaseModel):

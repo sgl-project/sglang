@@ -5,7 +5,7 @@ const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v3";
-const PREVIEW_OUTPUT_FORMAT = "";
+const PREVIEW_OUTPUT_FORMAT = "raw";
 const PREVIEW_OUTPUT_QUALITY = null;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
@@ -824,7 +824,9 @@ function enhancePrompt() {
 }
 
 function compact(obj) {
-  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== ""));
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, v]) => v !== undefined && v !== "" && v !== null)
+  );
 }
 
 function renderPresets() {
