@@ -262,9 +262,8 @@ class TRTLLMMLADecodeMetadata:
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     """TRTLLM MLA attention kernel from flashinfer."""
 
-    # trtllm-gen verify/decode kernels rebuild metadata from preallocated
-    # buffers and tree-mask scratch (see get_verify_buffers_to_fill_after_draft);
-    # they never read seq_lens_cpu / seq_lens_sum. Opt out of the D2H sync.
+    # trtllm-gen kernels rebuild metadata from preallocated buffers and never
+    # read seq_lens_cpu / seq_lens_sum; opt out of the D2H sync.
     needs_cpu_seq_lens: bool = False
 
     def __init__(
@@ -340,9 +339,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        # Preallocated FULL_MASK tree-mask scratch (built after draft); lets
-        # build_tree_kernel_efficient skip sizing from seq_lens_sum, so the
-        # gpu_only path needs no seq_lens_sum D2H. Allocated in cuda-graph init.
         self.cuda_graph_custom_mask = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -452,8 +448,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         if self.num_draft_tokens and not self.skip_prefill:
-            # FULL_MASK tree mask is bool (see build_tree_kernel_efficient); size
-            # for the verify worst case so build_tree can write in-place.
+            # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
+            # in-place so the gpu_only path needs no seq_lens_sum.
             self.cuda_graph_custom_mask = torch.zeros(
                 max_num_tokens * (self.max_context_len + self.num_draft_tokens),
                 dtype=torch.bool,
@@ -463,8 +459,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
     def get_verify_buffers_to_fill_after_draft(self):
-        # [tree_mask_buf, position_buf]; non-None tree_mask_buf signals the
-        # worker to write the tree mask in-place and skip the seq_lens_sum D2H.
         return [self.cuda_graph_custom_mask, None]
 
     def _init_cuda_graph_metadata(
@@ -1264,9 +1258,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
 
-    # Per-step draft decode rebuilds metadata from preallocated buffers and
-    # never reads seq_lens_cpu / seq_lens_sum; opt out of the D2H sync so the
-    # decide_needs_cpu_seq_lens OR over (target, draft, draft_extend) stays False.
+    # Per-step draft decode never reads seq_lens_cpu / seq_lens_sum; opt out so
+    # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
 
     def __init__(
