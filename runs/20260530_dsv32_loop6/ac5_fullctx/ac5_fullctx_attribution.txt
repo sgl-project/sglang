@@ -1,0 +1,18 @@
+# AC-5 FULL-CONTEXT (DS int8 / mem-0.7 / radix-on / context_len=163840 / TP=8) -- measured, steady-state
+# warmup 120s / window 300s, conc 16/32/64, GSP 4096 ISL / 512 OSL, request-time-stats ON. Run 06:14-06:40 UTC.
+# Per-request arrays + fail-closed verifier: ac5_fullctx_arrays.json + ac5_fullctx_metrics_tool.py --verify.
+
+## Measured per-conc (verifier PASS, no empty-latency rows):
+  conc 16: achieved 16.00  P99 TTFT 13.13 s (<22 PASS)  per-req TPS 24.9 (<30)
+  conc 32: achieved 31.99  P99 TTFT 25.33 s (>22)       per-req TPS 19.5 (<30)
+  conc 64: achieved 47.03  P99 TTFT 77.90 s (>22)       per-req TPS 17.3 (<30)
+
+## Admission-wait attribution (MEASURED queue_duration from ReqTimeStats, benchmark rows output_len=512,
+## bucketed per-conc by print-time gaps; n=256/320/315):
+  conc 16: queue p99 = 10.5 s  (p50 4.9 s) ; client P99 TTFT 13.13 s -> residual ~2.6 s (prefill compute)
+  conc 32: queue p99 = 22.6 s  (p50 10.7 s); client P99 TTFT 25.33 s -> residual ~2.7 s
+  conc 64: queue p99 = 74.0 s  (p50 21.4 s); client P99 TTFT 77.90 s -> residual ~3.9 s
+  => P99 TTFT is ADMISSION-QUEUE-DOMINATED at every conc (queue p99 ~= TTFT; prefill floor ~min TTFT).
+  forward_duration is completion-time (prefill + all 512 decode steps), context only -- NOT first-token.
+
+## Decode component (per-req TPS = gen throughput / #running-req), steady decode lines:
