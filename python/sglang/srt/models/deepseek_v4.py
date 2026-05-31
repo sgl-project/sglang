@@ -946,6 +946,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.self_attn = MQALayer(
             config=config,
             layer_id=layer_id,
@@ -1272,7 +1273,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
-        use_fused = self.use_fused_mhc_post_pre
+        use_fused = self.use_fused_mhc_post_pre and not self.is_nextn
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = mhc_fused_post_pre(
