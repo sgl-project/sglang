@@ -39,6 +39,12 @@ def build():
                        "Verifier recomputes P99 TTFT + per-req TPS p50 from raw arrays (no stored derived metric); "
                        "raw *.jsonl gitignored (64-hex sha below). Methodology: np64 steady-state warmup120/window300 "
                        "(cold-flood lesson) -- pending owner approval vs the literal NUM_PROMPTS=320.",
+           # The AC-5 workload identity the verifier asserts on EVERY sidecar (fail-closed). num_prompts/
+           # warmup/window record the np64-steady-state methodology (pending owner approval); they are
+           # asserted for consistency so a sidecar tampered to NUM_PROMPTS=320 fails.
+           "expected_workload": {"mode": "double_sparsity", "isl_total_tokens": 4096, "osl_tokens": 512,
+                                 "num_prompts": 64, "warmup_seconds": 120.0, "measurement_window_seconds": 300.0,
+                                 "chunked_prefill_size": 8192, "max_total_num_tokens": 396096},
            "conc": {}}
     for c in CONCS:
         f = sorted(glob.glob(SRC_GLOB.format(c=c)))[0]
@@ -122,7 +128,20 @@ def verify():
         sc = os.path.join(HERE, e["sidecar"])
         chk(os.path.exists(sc), f"{tag}: sidecar {e['sidecar']} missing")
         if os.path.exists(sc):
-            a = _sidecar_args(sc)
+            meta = json.load(open(sc))
+            a = meta.get("server_args", meta)
+            ew = d["expected_workload"]
+            # workload identity (top-level sidecar fields) — fail-closed so a sidecar tampered to a
+            # different mode / conc / ISL / OSL / num_prompts is rejected (Codex R21 fail-open gap).
+            chk(meta.get("mode") == ew["mode"], f"{tag}: sidecar mode {meta.get('mode')} != {ew['mode']}")
+            chk(meta.get("concurrency") == c, f"{tag}: sidecar concurrency {meta.get('concurrency')} != key {c}")
+            chk(meta.get("isl_total_tokens") == ew["isl_total_tokens"], f"{tag}: sidecar ISL != 4096")
+            chk(meta.get("osl_tokens") == ew["osl_tokens"], f"{tag}: sidecar OSL != 512")
+            chk(meta.get("num_prompts") == ew["num_prompts"], f"{tag}: sidecar num_prompts {meta.get('num_prompts')} != recorded {ew['num_prompts']} (methodology)")
+            chk(meta.get("warmup_seconds") == ew["warmup_seconds"], f"{tag}: sidecar warmup_seconds != {ew['warmup_seconds']}")
+            chk(meta.get("measurement_window_seconds") == ew["measurement_window_seconds"], f"{tag}: sidecar window != {ew['measurement_window_seconds']}")
+            chk(a.get("max_total_num_tokens") == ew["max_total_num_tokens"], f"{tag}: server_args max_total_num_tokens {a.get('max_total_num_tokens')} != {ew['max_total_num_tokens']}")
+            chk(a.get("chunked_prefill_size") == ew["chunked_prefill_size"], f"{tag}: server_args chunked_prefill_size != {ew['chunked_prefill_size']}")
             chk(a.get("enable_double_sparsity") is True, f"{tag}: sidecar enable_double_sparsity != True")
             chk('"signature_dtype": "int8"' in json.dumps(a.get("double_sparsity_config", "")) or
                 a.get("double_sparsity_config", {}).get("signature_dtype") == "int8" if isinstance(a.get("double_sparsity_config"), dict) else
