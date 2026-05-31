@@ -876,6 +876,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+        # Side stream for overlapping mamba verify update with draft extend
+        self._mamba_side_stream = None
+        self._mamba_side_stream_active = False
+
         # Build adaptive runtime states (must be after draft worker is fully initialized)
         if self.adaptive_controller is not None:
             with (
@@ -1003,6 +1007,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            # Wait for mamba side stream to finish before returning
+            if self._mamba_side_stream_active:
+                torch.cuda.current_stream().wait_stream(self._mamba_side_stream)
 
             return batch_output
 
@@ -1285,14 +1293,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
-        # Update mamba state for hybrid GDN models after verification
-        commit_mamba_states_after_verify(
-            self.target_worker,
-            batch,
-            accept_lens,
-            accept_index,
-            self.speculative_num_draft_tokens,
-        )
+        # Update mamba state for hybrid GDN models after verification.
+        # Launch on side stream so it overlaps with draft_extend CUDA graph.
+        self._mamba_side_stream_active = False
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.mamba2_config is not None
+            or self.target_worker.model_runner.hybrid_lightning_config is not None
+        ):
+            if self._mamba_side_stream is None:
+                self._mamba_side_stream = torch.cuda.Stream()
+            main_stream = torch.cuda.current_stream()
+            self._mamba_side_stream.wait_stream(main_stream)
+            with torch.cuda.stream(self._mamba_side_stream):
+                self._mamba_verify_update(
+                    batch, accept_lens, accept_index, bs
+                )
+            self._mamba_side_stream_active = True
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
