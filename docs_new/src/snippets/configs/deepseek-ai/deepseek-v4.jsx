@@ -151,7 +151,7 @@ sgl-eval run aime25 \\
           4,
           8,
           { value: 16, disable: { nodes: ["single"] },
-            disableReason: "TP=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
+            disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
         ]},
         { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
         { id: "dpAttn", label: "DP-Attention",
@@ -163,7 +163,7 @@ sgl-eval run aime25 \\
             4,
             8,
             { value: 16, disable: { nodes: ["single"] },
-              disableReason: "DP-Attention=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
+              disableReason: "DP-Attention=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
           ],
           labels: { "auto": "Auto", "false": "Off" } },
       ],
@@ -191,7 +191,7 @@ sgl-eval run aime25 \\
         4,
         8,
         { value: 16, disable: { nodes: ["single"] },
-          disableReason: "EP=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
+          disableReason: "EP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
       ]},
     },
 
@@ -667,6 +667,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",

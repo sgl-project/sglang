@@ -1358,7 +1358,7 @@ export const Playground = ({ config }) => {
     try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
   };
 
-  // Base selection — live-linked to §3 via URL hash + custom event
+  // Base selection — live-linked to the Deployment panel via URL hash + custom event
   // (history.replaceState doesn't fire hashchange, hence the event too).
   const initialBaseFromHash = () => {
     const fallback = config.cells[0].match;
@@ -1579,7 +1579,7 @@ export const Playground = ({ config }) => {
 
   const baseSummary = baseCell
     ? `${base.hw.toUpperCase()} · ${base.variant} · ${base.quant.toUpperCase()} · ${base.strategy} · ${base.nodes}`
-    : "(no verified cell at current §3 selection — showing playground only)";
+    : "(no verified cell at the current Deploy selection — showing playground only)";
 
   // ==========================================================================
   // 11. Render helpers
@@ -1694,7 +1694,7 @@ export const Playground = ({ config }) => {
                 <span style={s.badgeDot(playgroundVerified)} />
                 {playgroundVerified ? "Verified" : "Not Verified"}
               </div>
-              {/* Sibling-cell match: offer to switch §3.1's base to it. */}
+              {/* Sibling-cell match: offer to switch the Deployment panel's base to it. */}
               {matchedSiblingCell && (
                 <span style={s.matchedHint}>
                   matches <code style={{ fontFamily: "Menlo, monospace" }}>
@@ -1767,7 +1767,7 @@ export const Playground = ({ config }) => {
                 {d.kind === "added" ? "+ " : d.kind === "removed" ? "- " : "  "}
                 {d.line}{"\n"}
               </span>
-            )) : "# No verified base cell at the current §3 selection.\n# Pick a supported hardware/variant in §3 to populate the playground base."}
+            )) : "# No verified base cell at the current Deployment selection.\n# Pick a supported hardware/variant in the Deployment panel to populate the playground base."}
           </pre>
         </div>
       </div>
@@ -1879,7 +1879,7 @@ export const Playground = ({ config }) => {
               <button style={s.primaryBtn} onClick={() => { saveEnv(envDraft); setModal(null); }}>Save</button>
             </div>
           <p style={{ fontSize: 11, opacity: 0.7, marginTop: 10 }}>
-            Values persist in localStorage and are shared with §3.
+            Values persist in localStorage and are shared with the Deployment panel.
           </p>
         </dialog>
       )}
