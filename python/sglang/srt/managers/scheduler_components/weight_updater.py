@@ -217,9 +217,7 @@ class SchedulerWeightUpdaterManager:
             if self.draft_worker is not None:
                 draft_runner = _get_draft_model_runner(self.draft_worker)
                 if draft_runner is not None:
-                    draft_payload = draft_runner.check_weights(
-                        action=recv_req.action
-                    )
+                    draft_payload = draft_runner.check_weights(action=recv_req.action)
                     if payload is not None and draft_payload is not None:
                         payload = _merge_checksum_payloads(payload, draft_payload)
 
