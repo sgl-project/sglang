@@ -77,9 +77,7 @@ if is_flashinfer_available():
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
     from flashinfer.fused_moe.core import (
-        ActivationType,
         get_w2_permute_indices_with_cache,
     )
 
@@ -1057,77 +1055,46 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_marlin()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif (
+            moe_runner_backend.is_flashinfer_mxfp4()
+            and self._fi_kernel == "cutlass_sm90"
+        ):
+            # Register the fused func at runner construction so the FusedOpPool
+            # lookup at `MoeRunner.__init__` finds it.
+            import sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4  # noqa: F401
+
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # TODO(cwan): refactor other backends
+            # Legacy bypass path (e.g. SM100 trtllm-gen under flashinfer_mxfp4)
+            # routes through `apply` without a MoeRunner. TODO(cwan): migrate.
             pass
 
-    def _apply_sm90_cutlass(self, layer, x, topk_output):
+    def _apply_sm90_cutlass(self, layer, dispatch_output):
         """SM90 (Hopper) MXFP4 x BF16 MoE via FlashInfer's cutlass mixed-input
-        path (PR #3084). The fused kernel does GEMM1 + SwiGLU + GEMM2 in one
-        call; weights/scales were pre-interleaved at load time."""
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
+        path (PR #3084). Routed through the unified ``MoeRunner`` -- this
+        helper only builds the quant_info; the actual kernel call lives in
+        :mod:`sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4`."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4 import (
+            FlashInferMxfp4CutlassMoeQuantInfo,
+        )
 
-        # Under ``--moe-runner-backend flashinfer_mxfp4`` the SGLang TopK layer
-        # emits BypassedTopKOutput by default (the SM100 trtllm-gen kernel does
-        # routing internally). The cutlass kernel needs explicit topk_ids /
-        # topk_weights, so materialize them here when bypassed.
-        if TopKOutputChecker.format_is_bypassed(topk_output):
-            topk_output = topk_output.to_standard()
-        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-
-        # Pad input hidden dim to the (already-padded) loaded weight width.
-        origin_hidden = x.shape[-1]
-        padded_hidden = self._padded_hidden
-        if padded_hidden != origin_hidden:
-            x = torch.nn.functional.pad(
-                x,
-                (0, padded_hidden - origin_hidden),
-                mode="constant",
-                value=0.0,
-            )
-
-        output_dtype = torch.bfloat16
-        # Output is allocated at padded width (kernel writes padded_hidden
-        # columns), then trimmed back to origin_hidden before returning.
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            out_padded = torch.empty(
-                x.shape[0], padded_hidden, dtype=output_dtype, device=x.device
-            )
-
-        flashinfer_cutlass_fused_moe(
-            input=x,
-            token_selected_experts=topk_ids.to(torch.int),
-            token_final_scales=topk_weights,
-            fc1_expert_weights=layer.w13_weight,  # uint8 [E, 2*N, K/2] interleaved
-            fc2_expert_weights=layer.w2_weight,  # uint8 [E, K, N/2] interleaved
-            output_dtype=output_dtype,
-            quant_scales=[
-                layer.w13_weight_scale.view(torch.int32),
-                layer.w2_weight_scale.view(torch.int32),
-            ],
-            fc1_expert_biases=layer.w13_weight_bias,  # bf16 [E, 2*N]
-            fc2_expert_biases=layer.w2_weight_bias,  # bf16 [E, K]
+        quant_info = FlashInferMxfp4CutlassMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_scale=layer.w13_weight_scale,
+            w2_weight_scale=layer.w2_weight_scale,
+            w13_bias=layer.w13_weight_bias,
+            w2_bias=layer.w2_weight_bias,
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            tp_size=layer.moe_tp_size,
-            tp_rank=layer.moe_tp_rank,
-            ep_size=layer.moe_ep_size,
-            ep_rank=layer.moe_ep_rank,
-            use_w4_group_scaling=True,
-            activation_type=ActivationType.Swiglu,
-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
-            output=out_padded,
+            moe_tp_size=layer.moe_tp_size,
+            moe_tp_rank=layer.moe_tp_rank,
+            moe_ep_size=layer.moe_ep_size,
+            moe_ep_rank=layer.moe_ep_rank,
+            padded_hidden=self._padded_hidden,
         )
-
-        if padded_hidden != origin_hidden:
-            out = out_padded[:, :origin_hidden].contiguous()
-        else:
-            out = out_padded
-        return StandardCombineInput(hidden_states=out)
+        return self.runner.run(dispatch_output, quant_info)
 
     def apply(
         self,
@@ -1183,7 +1150,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self.runner.run(dispatch_output, quant_info)
 
         if self._fi_kernel == "cutlass_sm90":
-            return self._apply_sm90_cutlass(layer, x, topk_output)
+            return self._apply_sm90_cutlass(layer, dispatch_output)
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
