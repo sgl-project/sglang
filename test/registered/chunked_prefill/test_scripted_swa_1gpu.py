@@ -13,11 +13,19 @@ register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 
 _SWA_MODEL = "openai/gpt-oss-20b"
 
+# To reach add_chunked_req's early-return the full KV pool must run out while the
+# chunked req r is mid-prefill. The admission gate already reserves the resident
+# competitor's future decode tokens, so r is only admitted when competitor +
+# r_prompt fits the pool; the pool can therefore only overflow via the resident
+# req decoding *more* than its (0.7x) reservation. enable_mixed_chunk lets the
+# competitor decode alongside r's prefill chunks, and the prompt/decode sizes are
+# tuned so that extra growth pushes the pool to 1.00 on r's final chunk while the
+# competitor (ignore_eos) is still resident -- parking r until it frees its KV.
 _MAX_TOTAL_TOKENS = 8192
-_SWA_FULL_TOKENS_RATIO = 0.1
-_CHUNK_SIZE = 512
-_RESIDENT_PROMPT = 6144
-_RESIDENT_DECODE = 64
+_SWA_FULL_TOKENS_RATIO = 0.8
+_CHUNK_SIZE = 64
+_RESIDENT_PROMPT = 4032
+_RESIDENT_DECODE = 82
 _CHUNKED_PROMPT = 4096
 
 
@@ -30,6 +38,7 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
         page_size=1,
         mem_fraction_static=0.70,
         disable_piecewise_cuda_graph=True,
+        enable_mixed_chunk=True,
     )
 
     def test_swa_chunked_req_early_return_no_double_free(self):
@@ -42,12 +51,14 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
         s = t._scheduler
 
         competitor = t.start_req(
-            prompt_len=_RESIDENT_PROMPT, max_new_tokens=_RESIDENT_DECODE
+            prompt_len=_RESIDENT_PROMPT,
+            max_new_tokens=_RESIDENT_DECODE,
+            ignore_eos=True,
         )
         yield from run_until(competitor, lambda h: h.is_chunking)
         yield from run_until(competitor, lambda h: not h.is_chunking)
 
-        r = t.start_req(prompt_len=_CHUNKED_PROMPT, max_new_tokens=2)
+        r = t.start_req(prompt_len=_CHUNKED_PROMPT, max_new_tokens=2, prompt_token=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
         observed_early_return = False
