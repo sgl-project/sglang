@@ -18,6 +18,8 @@ from sglang.srt.kv_canary.endpoint import (
 )
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
+from sglang.srt.kv_canary.runner.health_checker import KernelRunCounterHealthChecker
+from sglang.srt.kv_canary.runner.stats_logger import PeriodicCanaryStatsLogger
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReporter
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
@@ -127,6 +129,22 @@ class CanaryManager:
             swa_window_size=self._swa_window_size,
             sweep_interval=config.sweep_interval,
         )
+        self._health_checker = KernelRunCounterHealthChecker(
+            config=config,
+            device_state=self._device_state,
+            active_tags=self._active_tags,
+            outer_step_counter_getter=self._get_outer_step_counter,
+            d2h_stream=self._d2h_stream,
+        )
+        self._stats_logger = PeriodicCanaryStatsLogger(
+            config=config,
+            device_state=self._device_state,
+            active_tags=self._active_tags,
+            outer_step_counter_getter=self._get_outer_step_counter,
+            sweep_orchestrator=self._sweep_orchestrator,
+            d2h_stream=self._d2h_stream,
+        )
+
         num_sfms = max(1, speculative_num_steps - 1)
         self._single_forward_managers: tuple[SingleForwardManager, ...] = tuple(
             SingleForwardManager(
@@ -233,6 +251,8 @@ class CanaryManager:
         self._sweep_orchestrator.maybe_run_sweep()
         self._outer_step_counter += 1
         self._violation_manager.step()
+        self._health_checker.step()
+        self._stats_logger.step()
         if self._swa_divergence_report is not None:
             self._swa_divergence_report.step(
                 outer_step_counter=self._outer_step_counter,
