@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     VerifyOrWriteContext,
@@ -119,6 +120,9 @@ def test_verify_byte_equal_across_repeated_launches_10x() -> None:
             plan_ref=plan_ref,
             cuda_log=cuda_log,
             ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         )
 
@@ -171,6 +175,9 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
             expected_input_positions=pseudo_pos,
             cuda_log=cuda_log,
             ref_log=ref_log,
+            real_kv_sources_cuda=(),
+            real_kv_sources_ref=(),
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         )
 
@@ -284,6 +291,8 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
                 slot_run_counter=cuda_log.slot_run_counter,
                 kernel_run_counter=cuda_log.kernel_run_counter,
                 enable_chain_position_assert=cuda_log.enable_chain_position_assert,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan_cuda,
             check_verify_expected_token=True,
@@ -339,6 +348,9 @@ def test_verify_check_disabled_byte_equal() -> None:
         plan_ref=plan_true_ref,
         cuda_log=cuda_log_true,
         ref_log=ref_log_true,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=consts.RealKvHashMode.NONE,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         check_verify_expected_token=True,
     )
@@ -349,6 +361,9 @@ def test_verify_check_disabled_byte_equal() -> None:
         plan_ref=plan_false_ref,
         cuda_log=cuda_log_false,
         ref_log=ref_log_false,
+        real_kv_sources_cuda=(),
+        real_kv_sources_ref=(),
+        real_kv_hash_mode=consts.RealKvHashMode.NONE,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         check_verify_expected_token=False,
     )

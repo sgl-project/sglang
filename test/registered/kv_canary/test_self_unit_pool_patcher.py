@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES
+import torch
+
+from sglang.jit_kernel.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
+from sglang.jit_kernel.kv_canary.verify import (
+    CANARY_SLOT_BYTES,
+    CanaryLaunchTag,
+    RealKvSource,
+    VerifyOrWriteContext,
+    VerifyPlan,
+    launch_canary_verify_kernel,
+)
 from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -57,6 +67,47 @@ class TestAttachCanaryBuffers(PoolPatcherHelper, CustomTestCase):
         self.assertEqual(groups[PoolKind.SWA].k_head.shape[0], 8)
         self.assertIsNotNone(groups[PoolKind.SWA].swa_index_lut)
         self.assertIsNone(groups[PoolKind.FULL].swa_index_lut)
+
+
+class TestRealKvSources(PoolPatcherHelper, CustomTestCase):
+    def test_real_kv_sources_above_4_raises(self):
+        """Verify too many real KV sources are rejected."""
+        tensor = torch.zeros(4, 16, dtype=torch.uint8, device=self.device)
+        sources = tuple(
+            RealKvSource(
+                tensor=tensor, page_size=1, num_bytes_per_token=16, read_bytes=16
+            )
+            for _ in range(MAX_REAL_KV_SOURCES + 1)
+        )
+        canary_buf = torch.zeros(
+            4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=self.device
+        )
+        plan = VerifyPlan.allocate(verify_capacity=1, device=self.device)
+        violation_ring = torch.zeros(2, 8, dtype=torch.int64, device=self.device)
+        violation_write_index = torch.zeros(1, dtype=torch.int32, device=self.device)
+        slot_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
+        kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
+
+        enable_chain_position_assert = torch.ones(
+            1, dtype=torch.int32, device=self.device
+        )
+
+        with self.assertRaises(ValueError):
+            launch_canary_verify_kernel(
+                context=VerifyOrWriteContext(
+                    canary_buf=canary_buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=violation_ring,
+                    violation_write_index=violation_write_index,
+                    slot_run_counter=slot_run_counter,
+                    kernel_run_counter=kernel_run_counter,
+                    real_kv_sources=sources,
+                    real_kv_hash_mode=RealKvHashMode.NONE,
+                    enable_chain_position_assert=enable_chain_position_assert,
+                ),
+                plan=plan,
+                check_verify_expected_token=True,
+            )
 
 
 class TestPoolPatcherBufferInfos(PoolPatcherHelper, CustomTestCase):

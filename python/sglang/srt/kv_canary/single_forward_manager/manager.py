@@ -201,6 +201,7 @@ class SingleForwardManager:
                 forward_batch=forward_batch,
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
+                real_kv_hash_mode=self._config.real_kv_hash_mode,
                 enable_write_input_assert=enable_write_input_assert,
                 enable_verify_token_assert=False,
             )
@@ -238,6 +239,7 @@ class SingleForwardManager:
                 forward_batch=forward_batch,
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
+                real_kv_hash_mode=self._config.real_kv_hash_mode,
                 enable_write_input_assert=enable_write_input_assert,
                 enable_verify_token_assert=False,
             )

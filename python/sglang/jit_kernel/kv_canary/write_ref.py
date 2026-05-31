@@ -7,6 +7,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     VerifyOrWriteContext,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
+    _compute_real_kv_hash_scalar,
     _to_signed_int64,
     compute_slot_hash,
     splitmix64_mix3,
@@ -31,6 +32,8 @@ def launch_canary_write_kernel_torch_reference(
     violation_write_index = context.violation_write_index
     slot_run_counter = context.slot_run_counter
     kernel_run_counter = context.kernel_run_counter
+    real_kv_sources = context.real_kv_sources
+    real_kv_hash_mode = context.real_kv_hash_mode
     enable_chain_position_assert_value = int(
         context.enable_chain_position_assert.detach().to("cpu").item()
     )
@@ -124,6 +127,13 @@ def launch_canary_write_kernel_torch_reference(
             token = int(input_ids_host[entry_idx].item())
             position = int(positions_host[entry_idx].item())
 
+            real_kv_hash_u64 = _compute_real_kv_hash_scalar(
+                slot_idx=slot,
+                real_kv_sources=real_kv_sources,
+                real_kv_hash_mode=real_kv_hash_mode,
+                work_device=work_device,
+            )
+
             if enable_write_input_assert:
                 assert expected_input_tokens_host is not None
                 assert expected_input_positions_host is not None
@@ -172,7 +182,9 @@ def launch_canary_write_kernel_torch_reference(
             buf_i64[slot, consts.CANARY_FIELD_PREV_HASH] = _to_signed_int64(
                 running_prev_hash
             )
-            buf_i64[slot, consts.CANARY_FIELD_REAL_KV_HASH] = 0
+            buf_i64[slot, consts.CANARY_FIELD_REAL_KV_HASH] = _to_signed_int64(
+                real_kv_hash_u64
+            )
 
             running_prev_hash = splitmix64_mix3(running_prev_hash, token, position)
 

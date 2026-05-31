@@ -9,6 +9,7 @@ import torch
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
+    RealKvSource,
     VerifyPlan,
 )
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
@@ -19,6 +20,10 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     stamp_clean_chain,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import _run_both_verify
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    clone_real_kv_sources,
+    make_real_kv_sources,
+)
 from sglang.jit_kernel.tests.kv_canary._fuzz_driver import (
     FUZZ_SEEDS_PR,
     run_fuzz_combo,
@@ -41,15 +46,38 @@ class VerifyFuzzInputs:
     plan_cuda: VerifyPlan
     plan_ref: VerifyPlan
     kernel_kind: CanaryLaunchTag
+    real_kv_sources_cuda: tuple[RealKvSource, ...]
+    real_kv_sources_ref: tuple[RealKvSource, ...]
+    real_kv_hash_mode: consts.RealKvHashMode
     ring_capacity: int
     check_verify_expected_token: bool
 
 
 def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
+    hash_mode = rng.choice(
+        [
+            consts.RealKvHashMode.NONE,
+            consts.RealKvHashMode.PARTIAL,
+            consts.RealKvHashMode.ALL,
+        ]
+    )
+    src_count = rng.choice([1, 2, 4])
+    page_size = rng.choice([1, 16])
+    bytes_per = rng.choice([16, 64, 128])
     kernel_kind = rng.choice(list(CanaryLaunchTag))
     plan_size = rng.randint(0, 32)
     num_slots = max(plan_size + 8, 16)
     ring_capacity = rng.choice([16, 64, 256])
+
+    sources_cuda = make_real_kv_sources(
+        count=src_count,
+        num_bytes_per_token=bytes_per,
+        page_size=page_size,
+        num_slots=num_slots,
+        device=_DEVICE,
+        rng=rng,
+    )
+    sources_ref = clone_real_kv_sources(sources_cuda)
 
     cuda_buf = make_canary_buf(
         num_slots=num_slots, slot_stride_bytes=32, device=_DEVICE
@@ -68,7 +96,7 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
         else:
             prev_slot_indices.append(slot_indices[i - 1])
 
-    if plan_size > 0:
+    if hash_mode == consts.RealKvHashMode.NONE and plan_size > 0:
         stamp_clean_chain(
             cuda_buf=cuda_buf,
             ref_buf=ref_buf,
@@ -112,6 +140,9 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
         plan_cuda=plan_cuda,
         plan_ref=plan_ref,
         kernel_kind=kernel_kind,
+        real_kv_sources_cuda=sources_cuda,
+        real_kv_sources_ref=sources_ref,
+        real_kv_hash_mode=hash_mode,
         ring_capacity=ring_capacity,
         check_verify_expected_token=check_verify_expected_token,
     )
@@ -130,6 +161,9 @@ def _run_one(inputs: VerifyFuzzInputs) -> None:
         plan_ref=inputs.plan_ref,
         cuda_log=cuda_log,
         ref_log=ref_log,
+        real_kv_sources_cuda=inputs.real_kv_sources_cuda,
+        real_kv_sources_ref=inputs.real_kv_sources_ref,
+        real_kv_hash_mode=inputs.real_kv_hash_mode,
         kernel_kind=inputs.kernel_kind,
         assert_equal=False,
         check_verify_expected_token=inputs.check_verify_expected_token,
@@ -155,6 +189,8 @@ def _summarize(inputs: VerifyFuzzInputs) -> str:
     n_active = int(inputs.plan_cuda.verify_num_valid[0].item())
     return (
         f"plan_size={n_active} kind={inputs.kernel_kind.name} "
+        f"hash_mode={inputs.real_kv_hash_mode.name} "
+        f"sources={len(inputs.real_kv_sources_cuda)} "
         f"ring={inputs.ring_capacity} "
         f"check_token={inputs.check_verify_expected_token}"
     )
@@ -162,7 +198,7 @@ def _summarize(inputs: VerifyFuzzInputs) -> str:
 
 @pytest.mark.parametrize("seed", FUZZ_SEEDS_PR)
 def test_verify_fuzz_full_combo(seed: int) -> None:
-    """Multi-dim verify fuzzer: random kernel kind × plan size × ring capacity × N iters, byte-equal."""
+    """Multi-dim verify fuzzer: random hash mode × kernel kind × page × bytes × N iters, byte-equal."""
     run_fuzz_combo(
         seed,
         draw_fn=_draw_random_verify_inputs,

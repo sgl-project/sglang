@@ -16,6 +16,10 @@ from sglang.jit_kernel.tests.kv_canary._constants import (
     DEFAULT_RING_CAPACITY,
     DEFAULT_SLOT_STRIDE_BYTES,
 )
+from sglang.jit_kernel.tests.kv_canary._fixtures import (
+    make_real_kv_source,
+    make_real_kv_sources,
+)
 
 __all__ = [
     "FakeViolationLog",
@@ -26,6 +30,8 @@ __all__ = [
     "make_canary_buf",
     "make_canary_buf_pair",
     "make_log_pair",
+    "make_real_kv_source",
+    "make_real_kv_sources",
     "make_verify_plan",
     "make_verify_plan_pair",
     "make_write_plan",
@@ -111,7 +117,7 @@ def make_verify_plan(
 
     ``expected_input_ids`` defaults to ``[-1] * n_active`` (the verify-kernel
     "skip token check" sentinel) so existing tests that only exercise the
-    chain / position paths keep working unchanged.
+    chain / position / real-kv-hash paths keep working unchanged.
     """
     n_active = len(slot_indices)
     if not (len(positions) == n_active and len(prev_slot_indices) == n_active):
@@ -246,13 +252,13 @@ def write_slot_fields(
     token: int,
     position: int,
     prev_hash: int,
+    real_kv_hash: int,
 ) -> None:
     view = canary_buf.view(torch.int64)
     view[slot_idx, 0] = token
     view[slot_idx, 1] = position
     view[slot_idx, 2] = prev_hash
-    # field[3] (real_kv_hash) is always 0 in the naive canary.
-    view[slot_idx, 3] = 0
+    view[slot_idx, 3] = real_kv_hash
 
 
 def stamp_pair(
@@ -262,6 +268,7 @@ def stamp_pair(
     token: int,
     position: int,
     prev_hash: int,
+    real_kv_hash: int = 0,
 ) -> None:
     """Stamp the same slot fields into both (cuda, ref) canary buffers."""
     for buf in buf_pair:
@@ -271,6 +278,7 @@ def stamp_pair(
             token=token,
             position=position,
             prev_hash=prev_hash,
+            real_kv_hash=real_kv_hash,
         )
 
 
@@ -288,10 +296,15 @@ def stamp_clean_chain(
     slot_indices: list[int],
     tokens: list[int],
     positions: list[int],
+    real_kv_hashes: Optional[list[int]] = None,
 ) -> list[int]:
+    n = len(tokens)
+    real_kv_hashes = real_kv_hashes if real_kv_hashes is not None else [0] * n
     running_prev_hash = splitmix64(consts.CANARY_CHAIN_ANCHOR)
     stored_prev_hashes: list[int] = []
-    for slot_idx, token, position in zip(slot_indices, tokens, positions):
+    for slot_idx, token, position, real_kv_hash in zip(
+        slot_indices, tokens, positions, real_kv_hashes
+    ):
         signed_prev = to_signed_int64(running_prev_hash)
         for buf in (cuda_buf, ref_buf):
             write_slot_fields(
@@ -300,6 +313,7 @@ def stamp_clean_chain(
                 token=token,
                 position=position,
                 prev_hash=signed_prev,
+                real_kv_hash=to_signed_int64(real_kv_hash),
             )
         stored_prev_hashes.append(signed_prev)
         running_prev_hash = splitmix64_mix3(running_prev_hash, token, position)

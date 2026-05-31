@@ -5,6 +5,7 @@ import torch
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
 from sglang.jit_kernel.kv_canary.verify import (
+    RealKvSource,
     VerifyOrWriteContext,
     VerifyPlan,
 )
@@ -25,6 +26,8 @@ def launch_canary_verify_kernel_torch_reference(
     violation_write_index = context.violation_write_index
     slot_run_counter = context.slot_run_counter
     kernel_run_counter = context.kernel_run_counter
+    real_kv_sources = context.real_kv_sources
+    real_kv_hash_mode = context.real_kv_hash_mode
 
     work_device = torch.device("cpu")
 
@@ -113,8 +116,13 @@ def launch_canary_verify_kernel_torch_reference(
         else:
             expected_chain_hash = stored_chain_hash
 
-        # real_kv_hash is always 0 in the naive canary; field[3] is stored as 0 by write.
-        expected_real_kv_hash = 0
+        expected_real_kv_hash_u64 = _compute_real_kv_hash_scalar(
+            slot_idx=slot_idx,
+            real_kv_sources=real_kv_sources,
+            real_kv_hash_mode=real_kv_hash_mode,
+            work_device=work_device,
+        )
+        expected_real_kv_hash = _to_signed_int64(expected_real_kv_hash_u64)
 
         fail_reason = consts.FailReason(0)
         if prev_reachable and stored_chain_hash != expected_chain_hash:
@@ -180,3 +188,60 @@ def compute_slot_hash(buf_i64: torch.Tensor, source_slot_idx: int) -> int:
     position = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_POSITION].item())
     prev_hash = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_PREV_HASH].item())
     return splitmix64_mix3(prev_hash, token, position)
+
+
+def _compute_real_kv_hash_scalar(
+    *,
+    slot_idx: int,
+    real_kv_sources: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
+    work_device: torch.device,
+) -> int:
+    mode = int(real_kv_hash_mode)
+    if mode == int(consts.RealKvHashMode.NONE) or len(real_kv_sources) == 0:
+        return 0
+
+    acc: int = 0
+
+    for source in real_kv_sources:
+        page_size = source.page_size
+        num_bytes_per_token = source.num_bytes_per_token
+        read_bytes = source.read_bytes
+        tensor_u8 = (
+            source.tensor.detach().to(device=work_device).contiguous().view(torch.uint8)
+        )
+
+        row = slot_idx // page_size
+        col_within_page = slot_idx % page_size
+        col_start = col_within_page * num_bytes_per_token
+
+        effective_read_bytes = (
+            16 if mode == int(consts.RealKvHashMode.PARTIAL) else read_bytes
+        )
+        raw_bytes: list[int] = []
+        for b in range(effective_read_bytes):
+            raw_bytes.append(int(tensor_u8[row, col_start + b].item()))
+
+        source_hash = _splitmix64_fold_bytes_scalar(raw_bytes=raw_bytes)
+
+        combined = acc ^ source_hash
+        acc = splitmix64(combined)
+
+    return acc
+
+
+def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
+    read_bytes = len(raw_bytes)
+    pad = (8 - read_bytes % 8) % 8
+    padded = raw_bytes + [0] * pad
+    num_words = len(padded) // 8
+
+    acc: int = 0
+    for w in range(num_words):
+        word: int = 0
+        for k in range(8):
+            word |= padded[w * 8 + k] << (8 * k)
+        word &= _U64_MASK
+        acc = splitmix64(acc ^ word)
+
+    return acc
