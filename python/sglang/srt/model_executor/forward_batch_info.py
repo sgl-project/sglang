@@ -27,6 +27,7 @@ ScheduleBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -449,6 +450,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
+    # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
+    rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
+
     # kv-canary token-id validator snapshot
     req_all_ids_flat: Optional[torch.Tensor] = None
     req_all_ids_lens: Optional[torch.Tensor] = None
@@ -567,6 +572,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_prefill_only(batch)
 
         device = model_runner.device
+
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            hashed = _hash_rids_to_tensor(
+                rids=[req.rid for req in batch.reqs],
+                device=device,
+            )
+            bootstrap_room_ids = _bootstrap_rooms_to_tensor(
+                bootstrap_rooms=[req.bootstrap_room for req in batch.reqs],
+                device=device,
+            )
+            batch.sampling_info.rids_int = hashed
+            batch.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
+            ret.rids_int = hashed
+            ret.bootstrap_room_ids_int = bootstrap_room_ids
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -1086,6 +1105,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
+        if self.rids_int is not None:
+            self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)
+            if self.sampling_info is not None:
+                self.sampling_info.rids_int = self.rids_int
+        if self.bootstrap_room_ids_int is not None:
+            self.bootstrap_room_ids_int = self._pad_tensor_to_size(
+                self.bootstrap_room_ids_int, bs, value=-1
+            )
+            if self.sampling_info is not None:
+                self.sampling_info.bootstrap_room_ids_int = self.bootstrap_room_ids_int
+
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
@@ -1321,3 +1351,18 @@ else:
     clamp_position = _clamp_position_native
 
 
+def _hash_rids_to_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
+    values: List[int] = [_stable_hash_str_to_i64(rid) for rid in rids]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _bootstrap_rooms_to_tensor(
+    *, bootstrap_rooms: List[Optional[int]], device: torch.device
+) -> torch.Tensor:
+    values: List[int] = [room if room is not None else -1 for room in bootstrap_rooms]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _stable_hash_str_to_i64(rid: str) -> int:
+    digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little", signed=True)
