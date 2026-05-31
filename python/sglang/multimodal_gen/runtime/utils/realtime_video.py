@@ -46,20 +46,21 @@ def build_delta_gzip_raw_rgb_payload(
         if reference_frame is not None
         else None
     )
-    delta_chunks = []
+    compressor = zlib.compressobj(level=1, method=zlib.DEFLATED, wbits=31)
+    compressed_chunks = []
     for frame in frames:
         if len(frame) != frame_size:
             raise ValueError("raw RGB delta gzip requires fixed-size frames")
         current = np.frombuffer(frame, dtype=np.uint8)
         if previous is None:
-            delta_chunks.append(frame)
+            delta_frame = frame
         else:
-            delta_chunks.append(np.bitwise_xor(current, previous).tobytes())
+            delta_frame = np.bitwise_xor(current, previous).tobytes()
+        compressed_chunks.append(compressor.compress(delta_frame))
         previous = current
 
-    compressor = zlib.compressobj(level=1, method=zlib.DEFLATED, wbits=31)
-    delta_payload = b"".join(delta_chunks)
-    return compressor.compress(delta_payload) + compressor.flush()
+    compressed_chunks.append(compressor.flush())
+    return b"".join(compressed_chunks)
 
 
 def restore_delta_gzip_raw_rgb_payload(
