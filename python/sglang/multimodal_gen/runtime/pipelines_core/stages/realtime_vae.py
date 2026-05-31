@@ -3,6 +3,9 @@
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+    unpatchify as wan_unpatchify,
+)
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
 )
@@ -73,9 +76,57 @@ class RealtimeImageVAEEncodingStage(ImageVAEEncodingStage):
 class CausalVaeDecodingStage(DecodingStage):
     """Decode realtime chunks with a persistent causal VAE cache when available."""
 
+    @staticmethod
+    def _supports_wan_decoder_cache(vae) -> bool:
+        return all(
+            hasattr(vae, attr)
+            for attr in (
+                "clear_cache",
+                "post_quant_conv",
+                "decoder",
+                "_feat_map",
+                "_conv_idx",
+            )
+        )
+
+    def _get_causal_decode_reset_fn(self):
+        reset_causal_state = getattr(self.vae, "reset_causal_decode_state", None)
+        if callable(reset_causal_state):
+            return reset_causal_state
+        if self._supports_wan_decoder_cache(self.vae):
+            return self.vae.clear_cache
+        return None
+
+    def _decode_wan_with_persistent_cache(
+        self,
+        latents: torch.Tensor,
+        *,
+        first_chunk: bool,
+    ) -> torch.Tensor:
+        x = self.vae.post_quant_conv(latents)
+        decoded_frames = []
+        for frame_idx in range(x.shape[2]):
+            self.vae._conv_idx = [0]
+            decoded = self.vae.decoder(
+                x[:, :, frame_idx : frame_idx + 1],
+                feat_cache=self.vae._feat_map,
+                feat_idx=self.vae._conv_idx,
+                first_chunk=first_chunk and frame_idx == 0,
+            )
+            decoded_frames.append(decoded)
+
+        image = torch.cat(decoded_frames, dim=2)
+        if getattr(self.vae.config, "patch_size", None) is not None:
+            image = wan_unpatchify(image, patch_size=self.vae.config.patch_size)
+        return image.clamp(-1.0, 1.0)
+
     @torch.no_grad()
     def decode_causal(
-        self, latents: torch.Tensor, server_args: ServerArgs
+        self,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        *,
+        first_chunk: bool,
     ) -> torch.Tensor:
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
@@ -104,11 +155,17 @@ class CausalVaeDecodingStage(DecodingStage):
                 latents = latents.to(vae_dtype)
 
             decode_fn = getattr(self.vae, "causal_decode", None)
-            if decode_fn is None:
-                decode_output = self.vae.decode(latents)
-            else:
+            if callable(decode_fn):
                 decode_output = decode_fn(latents)
-            image = _ensure_tensor_decode_output(decode_output)
+                image = _ensure_tensor_decode_output(decode_output)
+            elif self._supports_wan_decoder_cache(self.vae):
+                image = self._decode_wan_with_persistent_cache(
+                    latents,
+                    first_chunk=first_chunk,
+                )
+            else:
+                decode_output = self.vae.decode(latents)
+                image = _ensure_tensor_decode_output(decode_output)
 
         return (image / 2 + 0.5).clamp(0, 1)
 
@@ -123,13 +180,17 @@ class CausalVaeDecodingStage(DecodingStage):
 
         self.load_model()
 
-        reset_causal_state = getattr(self.vae, "reset_causal_decode_state", None)
+        reset_causal_state = self._get_causal_decode_reset_fn()
         decode_state = batch.session.get_or_create_state(RealtimeVAEDecodeState)
         decode_state.reset_causal_decode_state = reset_causal_state
         if batch.block_idx == 0 and callable(reset_causal_state):
             reset_causal_state()
 
-        frames = self.decode_causal(batch.latents, server_args)
+        frames = self.decode_causal(
+            batch.latents,
+            server_args,
+            first_chunk=batch.block_idx == 0,
+        )
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 
         return OutputBatch(
