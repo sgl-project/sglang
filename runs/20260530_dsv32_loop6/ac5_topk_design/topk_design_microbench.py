@@ -94,9 +94,12 @@ def main():
                    "implied_conc16_TPS": round(1000.0 / new_step, 1)}
     out = {"_purpose": "AC-5 conc-16 lever: graph-safe blocked-top-k design timing (61L, bs16, seq4096, "
                        "maxlen163840). Picks the design that reduces the residual full-width topk over-scan.",
-           "note": "A = current production merge (full width). B caps context (live-only). C is the no-context-cap "
-                   "win but needs a Triton within-block top-2048 + skip kernel. Cprime shows torch-blocked w/o a "
-                   "skip kernel is worse than monolithic. implied step uses R17's measured 36.9ms step / 12.5ms selection.",
+           "note": "A = current production merge (full width). B = the ONLY design reaching conc-16 >=30, but it "
+                   "CAPS context to the live region (== the bounded-context op-point). C (blocked bw=8192/pk=2048, "
+                   "no context cap) is WORSE than monolithic A, and Cprime (torch-blocked, no skip) is worse still: "
+                   "under CUDA-graph fixed shapes the Stage-2 merge processes num_blocks*partial_k candidates and two "
+                   "topk passes cost more launch/mem overhead than one monolithic topk even at smaller widths. So NO "
+                   "full-context blocked-topk design reaches conc-16 >=30. implied step uses R17's measured 36.9ms step / 6.56ms merge.",
            "timings_ms_per_step": {k: round(v, 3) for k, v in res.items()}, "implied_conc16": rows}
     json.dump(out, open(os.path.join(here, "topk_design_microbench.json"), "w"), indent=1)
     for k in res:
