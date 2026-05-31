@@ -9637,3 +9637,70 @@ class TestServeDoubleSparsityLauncherSignatureDtype(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBlockedTopKExactness(unittest.TestCase):
+    """Loop-6 R22: `blocked_topk_sequence_order` must return the IDENTICAL ascending
+    logical positions + valid_lengths as the monolithic `select_topk_sequence_order`,
+    across adversarial cases (all winners in one block, masked/short sequences,
+    block boundaries, padding, K >= block_width). This is the exactness contract the
+    graph-safe Triton blocked top-k (which additionally skips blocks past seq_len)
+    must satisfy. Distinct scores are used so the selected set is unambiguous."""
+
+    def _select(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            select_topk_sequence_order, blocked_topk_sequence_order,
+        )
+        return select_topk_sequence_order, blocked_topk_sequence_order
+
+    def _assert_eq(self, scores, K, bw):
+        mono, blk = self._select()
+        s_sel, s_len = mono(scores, K)
+        b_sel, b_len = blk(scores, K, bw)
+        torch.testing.assert_close(b_len, s_len, rtol=0, atol=0)
+        torch.testing.assert_close(b_sel, s_sel, rtol=0, atol=0)
+
+    def _distinct(self, bs, n, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        # a random permutation per row -> distinct scores, no ties
+        return torch.stack([torch.randperm(n, generator=g).float() for _ in range(bs)])
+
+    def test_all_winners_in_one_block(self):
+        # top-K all live in block 0; other blocks strictly lower.
+        bs, n, K, bw = 2, 4096, 2048, 512
+        sc = torch.full((bs, n), -1000.0)
+        sc[:, :bw] = torch.arange(bw).float().flip(0) + 10000.0  # block 0 is the highest 512
+        sc[:, bw:2 * bw] = torch.arange(bw).float() + 5000.0     # block 1 next
+        # fill the rest distinct-low so K=2048 spills past block 0
+        sc[:, 2 * bw:] = torch.linspace(0, 1, n - 2 * bw).unsqueeze(0).expand(bs, -1)
+        self._assert_eq(sc, K, bw)
+
+    def test_random_distinct_various_shapes(self):
+        for (bs, n, K, bw, seed) in [
+            (3, 4096, 2048, 512, 1), (1, 4608, 2048, 1024, 2),
+            (4, 8192, 2048, 2048, 3), (2, 4096, 2048, 4096, 4),  # bw==n (single block) and bw>=K
+            (2, 5000, 2048, 700, 5),  # padding: n not a multiple of bw
+            (2, 1000, 2048, 256, 6),  # K > n -> select all
+        ]:
+            with self.subTest(bs=bs, n=n, K=K, bw=bw):
+                self._assert_eq(self._distinct(bs, n, seed), K, bw)
+
+    def test_masked_short_sequences(self):
+        # per-request validity: positions past seq_len are -inf (the decode case).
+        bs, n, K, bw = 3, 4096, 2048, 512
+        sc = self._distinct(bs, n, seed=7) + 100.0
+        seqs = [2000, 2048, 2600]  # below/at/above K, at and off block boundaries
+        for i, s in enumerate(seqs):
+            sc[i, s:] = float("-inf")
+        self._assert_eq(sc, K, bw)
+
+    def test_boundary_seq_at_block_edge(self):
+        bs, n, K, bw = 2, 4096, 2048, 512
+        sc = self._distinct(bs, n, seed=8) + 50.0
+        sc[0, 2048:] = float("-inf")  # exactly K valid, at a block edge (2048 = 4*512)
+        sc[1, 1536:] = float("-inf")  # 1536 = 3*512 block edge, < K
+        self._assert_eq(sc, K, bw)
+
+
+if __name__ == "__main__":
+    unittest.main()

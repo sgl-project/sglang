@@ -486,6 +486,76 @@ def select_topk_sequence_order(
     return selected, valid_lengths.to(torch.int32)
 
 
+def blocked_topk_sequence_order(
+    token_scores: torch.Tensor,
+    max_top_k: int,
+    block_width: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exact blocked top-K — identical output to :func:`select_topk_sequence_order`.
+
+    Partitions the ``max_tokens`` score axis into fixed ``block_width`` blocks,
+    keeps each block's top ``min(max_top_k, block_width)`` candidates, then merges
+    them and takes the global top-K. The result (ascending logical positions,
+    ``-1`` padded, + valid_lengths) is identical to the monolithic selection.
+
+    Exactness: a token in the global top-K has within-block rank <= its global
+    rank <= K, so it is in its block's top-min(K, block_width); the union of the
+    per-block candidates therefore contains the global top-K, and merging them and
+    taking the global top-K reproduces the monolithic selection (tie-broken
+    arbitrarily, as ``torch.topk`` does). This is the exactness ORACLE and the
+    eager fallback for the graph-safe blocked top-k, whose value is that it can
+    SKIP blocks entirely past each request's ``seq_len`` (every such block is all
+    ``-inf`` and contributes no candidate), shrinking the per-decode-step work
+    versus a monolithic ``torch.topk`` over the full KV-index width.
+
+    token_scores: [bs, max_tokens] fp32 (unwritten/out-of-range tokens = -inf).
+    Returns: selected_indices int32 [bs, max_top_k] ascending -1-padded; valid_lengths int32 [bs].
+    """
+    if token_scores.dim() != 2:
+        raise ValueError(f"token_scores must be 2-D, got {tuple(token_scores.shape)}.")
+    if max_top_k <= 0:
+        raise ValueError(f"max_top_k must be positive, got {max_top_k}.")
+    if block_width <= 0:
+        raise ValueError(f"block_width must be positive, got {block_width}.")
+    bs, max_tokens = token_scores.shape
+    device = token_scores.device
+    K = min(max_top_k, max_tokens)
+    bw = block_width
+    nb = (max_tokens + bw - 1) // bw
+    pad = nb * bw - max_tokens
+    if pad:
+        sc = token_scores.new_full((bs, nb * bw), float("-inf"))
+        sc[:, :max_tokens] = token_scores
+    else:
+        sc = token_scores
+    blk = sc.view(bs, nb, bw)
+    kb = min(K, bw)
+    # per-block top-kb candidates (fresh outputs — never alias topk in/out, see
+    # BL-20260527-torch-topk-aliasing-corrupts-input).
+    block_vals, block_local = torch.topk(blk, k=kb, dim=-1, largest=True, sorted=False)
+    block_base = (torch.arange(nb, device=device, dtype=torch.int64) * bw).view(1, nb, 1)
+    cand_pos = (block_base + block_local).reshape(bs, nb * kb)
+    cand_vals = block_vals.reshape(bs, nb * kb)
+    # global top-K over the union of per-block candidates
+    eff = min(K, nb * kb)
+    merge_vals, merge_idx = torch.topk(cand_vals, k=eff, dim=-1, largest=True, sorted=False)
+    sel_pos = torch.gather(cand_pos, 1, merge_idx)
+    # invalid (-inf) candidates -> sentinel max_tokens (sort last, not counted)
+    invalid = torch.isneginf(merge_vals)
+    sel_pos = torch.where(invalid, torch.full_like(sel_pos, max_tokens), sel_pos)
+    sorted_pos, _ = torch.sort(sel_pos, dim=-1)
+    selected = torch.full((bs, max_top_k), SELECTED_PAD_VALUE, dtype=torch.int32, device=device)
+    valid_lengths = (sorted_pos < max_tokens).to(torch.int32).sum(dim=-1)
+    grid = torch.arange(eff, device=device)
+    keep = grid.unsqueeze(0) < valid_lengths.unsqueeze(1)
+    real = torch.where(
+        keep, sorted_pos.to(torch.int32),
+        torch.full_like(sorted_pos, SELECTED_PAD_VALUE, dtype=torch.int32),
+    )
+    selected[:, :eff] = real
+    return selected, valid_lengths.to(torch.int32)
+
+
 def _compute_logical_token_scores(
     queries: torch.Tensor,
     token_signatures: torch.Tensor,
