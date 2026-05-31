@@ -410,6 +410,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
 
         # Construct input_ids
+        # TODO: same chunked-prefill chain divergence as PR #26329.
         if not batch.forward_mode.is_idle():
             rotate_input_ids_triton(
                 forward_batch.input_ids,
