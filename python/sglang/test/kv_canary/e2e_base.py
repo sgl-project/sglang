@@ -18,7 +18,9 @@ from sglang.test.test_utils import (
 )
 
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
-# so the tokenised prompt is comfortably long; token count is roughly 7k after BPE.
+# so the tokenised prompt comfortably exceeds the SWA sliding window of swa-mode
+# fixtures (gemma-4-E2B); short prompts would never exercise the SWA-windowed
+# verify path. Token count is roughly 7k after BPE.
 _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
@@ -60,12 +62,14 @@ class CapturedServerE2EBase(CanaryViolationAssertMixin, CustomTestCase):
 
 
 class CanaryE2EBase(CapturedServerE2EBase):
-    model_mode: ClassVar[Literal["mha"]]
+    model_mode: ClassVar[Literal["mha", "swa", "dsv4"]]
     kv_canary_mode: ClassVar[CanaryMode]
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
-    # Number of sequential request batches each test method sends. Default 1 keeps tests fast.
+    # SWA divergence assertions need slot recycling across batches; setting > 1 makes the
+    # test methods send N sequential batches so the SWA allocator's full→swa index mapping
+    # diverges from identity. Default 1 keeps MHA tests fast.
     workload_n_batches: ClassVar[int] = 1
 
     _cfg: ClassVar[Optional[_ModeConfig]] = None
@@ -75,6 +79,12 @@ class CanaryE2EBase(CapturedServerE2EBase):
         cls._cfg = _MODE_CONFIGS[cls.model_mode]
         server_env = os.environ.copy()
         server_env.update(cls.extra_env)
+        if cls.model_mode == "swa":
+            # SWA mode uses google/gemma-4-E2B-it, whose forward does a
+            # ``positions += 1`` in-place. canary's WRITE/VERIFY require
+            # forward_batch.positions to stay 0-indexed, so flip the gemma
+            # path to out-of-place shift for these tests.
+            server_env.setdefault("SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION", "1")
 
         cls._stdout_buf = io.StringIO()
         cls._stderr_buf = io.StringIO()
