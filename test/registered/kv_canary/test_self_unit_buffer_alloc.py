@@ -26,6 +26,7 @@ def _config(mode: RealKvHashMode) -> CanaryConfig:
         real_kv_hash_mode=mode,
         enable_write_input_assert=False,
         enable_verify_token_assert=False,
+        stats_print_every_n_steps=100,
     )
 
 
