@@ -678,18 +678,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return ret
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
-        """Derive per-request fields for non-generation (max_new_tokens==0)
-        forwards -- embedding / reward / scoring / cross-encoder -- from
-        ``batch.reqs``. Two independent parts, each with its own gate:
+        """Derive non-generation (max_new_tokens==0) forward fields from reqs.
 
-        - Pooling fields (dimensions / return_pooled_hidden_states / MIS
-          delimiter indices): gated on ``is_prefill_only`` (the spec-disabled
-          subset of embedding mode); a missing value is a harmless default.
-        - Cross-encoder ``token_type_ids``: gated on presence in reqs, NOT on
-          ``is_prefill_only`` -- a missing tensor makes bert/roberta silently
-          fall back to zeros, so we key on the actual data. Built here (not in
-          ScheduleBatch) so SB carries no forward-only device tensor; consumed
-          by bert/roberta/transformers.
+        token_type_ids gates on presence, not is_prefill_only: a missing
+        tensor makes bert/roberta silently fall back to zeros.
         """
         if self.is_prefill_only:
             if batch.model_config.is_matryoshka and any(
