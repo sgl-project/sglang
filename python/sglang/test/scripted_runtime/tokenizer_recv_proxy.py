@@ -34,11 +34,6 @@ class ScriptedTokenizerRecvProxy:
     def __init__(self, *, underlying: zmq.Socket) -> None:
         self._underlying = underlying
         self._buffer: deque = deque()
-        # Monotonic count of items ever drained off the underlying socket, and
-        # the count ever popped via ``recv_pyobj``. Together they give each
-        # buffered item a stable drain-sequence number (``_popped_count + i``
-        # for buffer position ``i``), so a type-based wait can require a
-        # *newly*-drained match rather than re-matching a stale buffered object.
         self._total_drained = 0
         self._popped_count = 0
 

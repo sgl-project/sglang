@@ -104,12 +104,6 @@ class ScriptedHttpServer:
             name="scripted-runtime-http-server",
             daemon=False,
         )
-        # Spawn-mode children snapshot os.environ at start(); seed the
-        # scripted-runtime env vars via override so the spawned process (and
-        # the scheduler it launches) inherit them, then restore the caller's
-        # env. SYS_PATH_ENTRY keeps the scripted-runtime package directory on
-        # the spawn-mode subprocess's sys.path so user sub-scripts resolve by
-        # qualified name in the scheduler subprocess.
         sys_path_entry = os.path.dirname(os.path.abspath(__file__))
         with (
             envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint),
@@ -121,9 +115,6 @@ class ScriptedHttpServer:
         ):
             server_process.start()
 
-        # Poll for the dispatch loop's HookReady; a stuck server startup
-        # surfaces as TimeoutError instead of blocking forever (poll takes
-        # milliseconds).
         if not socket.poll(int(LISTENER_ACCEPT_TIMEOUT_S * 1000)):
             socket.setsockopt(zmq.LINGER, 0)
             socket.close()

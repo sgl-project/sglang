@@ -10,9 +10,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_all_finished,
 )
 
-# PP scripted chunked-prefill sweep. PP needs 4 GPUs, so this runs on the
-# 4-gpu-h100 runner. The single-GPU core tests live in
-# test_scripted_core_1gpu.py.
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-h100")
 
 
@@ -20,9 +17,6 @@ _CHUNK_SIZE = 64
 
 
 class TestScriptedPpChunkSweep(ScriptedTestCase):
-    # pp_async_batch_depth=2 makes pp_loop_size = pp_size + depth = 6,
-    # so the loop size strictly exceeds pp_size — the regime where the
-    # PP queue depth is larger than the GPU count.
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=SMALL_MODEL,
         tp_size=1,
@@ -50,8 +44,6 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
 
     @staticmethod
     def _script_pp_one_combo(t: ScriptedContext, num_chunks: int, num_conc_reqs: int):
-        # A few tokens short of a clean chunk multiple so the last chunk is
-        # partial — exercises the off-by-one path under PP.
         prompt_len = num_chunks * _CHUNK_SIZE - 3
         reqs = [
             t.start_req(prompt_len=prompt_len, max_new_tokens=2)
