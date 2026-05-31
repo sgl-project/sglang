@@ -24,14 +24,14 @@ const CONTROL_KEY_ACTIONS = new Map([
   ["arrowright", "l"],
 ]);
 const CONTROL_ACTION_META = {
-  w: { label: "Forward", type: "move/position" },
-  a: { label: "Left", type: "move/position" },
-  s: { label: "Back", type: "move/position" },
-  d: { label: "Right", type: "move/position" },
-  i: { label: "Pitch +", type: "look/rotation" },
-  j: { label: "Yaw -", type: "look/rotation" },
-  k: { label: "Pitch -", type: "look/rotation" },
-  l: { label: "Yaw +", type: "look/rotation" },
+  w: { label: "Forward", type: "move", amount: "0.05/frame" },
+  a: { label: "Left", type: "move", amount: "0.05/frame" },
+  s: { label: "Back", type: "move", amount: "0.05/frame" },
+  d: { label: "Right", type: "move", amount: "0.05/frame" },
+  i: { label: "Pitch +", type: "pitch", amount: "4deg/frame" },
+  j: { label: "Yaw -", type: "yaw", amount: "6deg/frame" },
+  k: { label: "Pitch -", type: "pitch", amount: "4deg/frame" },
+  l: { label: "Yaw +", type: "yaw", amount: "6deg/frame" },
 };
 
 const presets = [
@@ -739,7 +739,7 @@ function describeCameraScript(name, script, samples) {
 
 function describeControlAction(action) {
   const meta = CONTROL_ACTION_META[action];
-  return meta ? `${meta.label} [${meta.type}]` : `${action} [custom]`;
+  return meta ? `${meta.label} [${meta.type} · ${meta.amount}]` : `${action} [custom]`;
 }
 
 function enhancePrompt() {

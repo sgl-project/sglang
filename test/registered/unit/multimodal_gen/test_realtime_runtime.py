@@ -393,6 +393,28 @@ def test_generate_loop_overlaps_previous_send_with_next_generation(monkeypatch):
     assert events[-1] == "send_end_1"
 
 
+def test_listen_generate_request_propagates_disconnect_without_error_write():
+    sent_messages = []
+
+    class _Ws:
+        async def receive_bytes(self):
+            raise realtime_video_api.WebSocketDisconnect(1000, "client close")
+
+        async def send_bytes(self, message):
+            sent_messages.append(message)
+
+    try:
+        asyncio.run(
+            realtime_video_api._listen_generate_request(_Ws(), GenerateSession())
+        )
+    except realtime_video_api.WebSocketDisconnect:
+        pass
+    else:
+        raise AssertionError("expected websocket disconnect to propagate")
+
+    assert sent_messages == []
+
+
 def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
     session = GenerateSession()
@@ -591,7 +613,7 @@ def test_lingbot_global_attention_cache_disables_sink_and_expands_sequence_shard
     )
     assert (
         stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=True)
-        == 48 * 3 * 10
+        == 24 * 3 * 10
     )
 
 

@@ -245,6 +245,8 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
             # Keep session state update atomic with validated request.
             session.set_request(realtime_req)
             break
+        except WebSocketDisconnect:
+            raise
         except Exception as e:
             logger.warning(
                 "invalid generate request, session_id=%s, error=%s",
