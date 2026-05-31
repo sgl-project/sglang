@@ -65,7 +65,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -547,7 +547,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_embeds=batch.input_embeds,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
-            token_type_ids=batch.token_type_ids,
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
@@ -572,7 +571,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        ret._maybe_init_prefill_only(batch)
+        ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
 
@@ -710,37 +709,48 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         return ret
 
-    def _maybe_init_prefill_only(self, batch: ScheduleBatch):
-        """Derive per-request fields from ``batch.reqs`` for non-generation
-        (embedding / reward / scoring) forwards; a no-op otherwise."""
-        if not self.is_prefill_only:
-            return
+    def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
+        """Derive non-generation (max_new_tokens==0) forward fields from reqs.
 
-        if batch.model_config.is_matryoshka and any(
-            r.dimensions is not None for r in batch.reqs
-        ):
-            self.dimensions = [
-                r.dimensions if r.dimensions else batch.model_config.hidden_size
-                for r in batch.reqs
-            ]
+        token_type_ids gates on presence, not is_prefill_only: a missing
+        tensor makes bert/roberta silently fall back to zeros.
+        """
+        if self.is_prefill_only:
+            if batch.model_config.is_matryoshka and any(
+                r.dimensions is not None for r in batch.reqs
+            ):
+                self.dimensions = [
+                    r.dimensions if r.dimensions else batch.model_config.hidden_size
+                    for r in batch.reqs
+                ]
 
-        self.return_pooled_hidden_states = any(
-            r.return_pooled_hidden_states for r in batch.reqs
-        )
+            self.return_pooled_hidden_states = any(
+                r.return_pooled_hidden_states for r in batch.reqs
+            )
 
-        # --enable-mis: every request must carry delimiter indices (the score
-        # endpoint always produces MIS-structured requests; consumers index
-        # without None-checking).
-        if get_global_server_args().enable_mis and any(
-            r.multi_item_delimiter_indices is not None for r in batch.reqs
-        ):
-            assert all(
+            # --enable-mis: every request must carry delimiter indices (the score
+            # endpoint always produces MIS-structured requests; consumers index
+            # without None-checking).
+            if get_global_server_args().enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
-            ), "MIS batch must have delimiter indices on every request"
-            self.multi_item_delimiter_indices = [
-                torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
-                for r in batch.reqs
-            ]
+            ):
+                assert all(
+                    r.multi_item_delimiter_indices is not None for r in batch.reqs
+                ), "MIS batch must have delimiter indices on every request"
+                self.multi_item_delimiter_indices = [
+                    torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
+                    for r in batch.reqs
+                ]
+
+        token_type_ids = [
+            r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
+        ]
+        if token_type_ids:
+            self.token_type_ids = torch.tensor(
+                sum(token_type_ids, []),
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(batch.device),
+            ).to(batch.device, non_blocking=True)
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
