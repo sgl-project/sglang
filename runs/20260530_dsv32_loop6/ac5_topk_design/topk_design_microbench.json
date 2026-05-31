@@ -1,0 +1,32 @@
+{
+ "_purpose": "AC-5 conc-16 lever: graph-safe blocked-top-k design timing (61L, bs16, seq4096, maxlen163840). Picks the design that reduces the residual full-width topk over-scan.",
+ "note": "A = current production merge (full width). B caps context (live-only). C is the no-context-cap win but needs a Triton within-block top-2048 + skip kernel. Cprime shows torch-blocked w/o a skip kernel is worse than monolithic. implied step uses R17's measured 36.9ms step / 12.5ms selection.",
+ "timings_ms_per_step": {
+  "A_monolithic_163840": 6.556,
+  "B_skipideal_live4096_CAPPED": 2.378,
+  "C_blocked_bw8192_pk2048_SKIP_nocap": 8.498,
+  "Cprime_blocked_torch_full_noskip": 12.331
+ },
+ "implied_conc16": {
+  "A_monolithic_163840": {
+   "selection_topk_ms_per_step_61L": 6.556,
+   "implied_conc16_step_ms": 36.9,
+   "implied_conc16_TPS": 27.1
+  },
+  "B_skipideal_live4096_CAPPED": {
+   "selection_topk_ms_per_step_61L": 2.378,
+   "implied_conc16_step_ms": 32.72,
+   "implied_conc16_TPS": 30.6
+  },
+  "C_blocked_bw8192_pk2048_SKIP_nocap": {
+   "selection_topk_ms_per_step_61L": 8.498,
+   "implied_conc16_step_ms": 38.84,
+   "implied_conc16_TPS": 25.7
+  },
+  "Cprime_blocked_torch_full_noskip": {
+   "selection_topk_ms_per_step_61L": 12.331,
+   "implied_conc16_step_ms": 42.68,
+   "implied_conc16_TPS": 23.4
+  }
+ }
+}
