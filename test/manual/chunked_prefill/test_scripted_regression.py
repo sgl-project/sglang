@@ -1,4 +1,3 @@
-
 import unittest
 
 from sglang.test.scripted_runtime.context import ScriptedContext
@@ -322,7 +321,6 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.row_idx is None
         assert r.lock_refs == 0
         assert r.finish_event_count == 1
-
 
     def test_chunked_admission_reuse_branch_balanced(self):
         self.server.execute_script(self._script_chunked_admission_reuse_branch_balanced)

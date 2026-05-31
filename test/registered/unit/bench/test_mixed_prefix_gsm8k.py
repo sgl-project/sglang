@@ -1,4 +1,3 @@
-
 import json
 import os
 import tempfile
@@ -42,7 +41,6 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def tearDownClass(cls):
         cls._tmpdir.cleanup()
 
-
     def _make_eval(self, seed: int = 42, num_examples=None):
         return MixedPrefixGSM8KEval(
             num_examples=(
@@ -78,7 +76,6 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
                     remainder_questions.append(q_text)
         return k, remainder_questions
 
-
     def test_primary_segment_is_strict_prefix_of_primary_shots(self):
         e = self._make_eval()
         for i in range(self.NUM_EXAMPLES):
@@ -111,7 +108,6 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
             self.assertGreaterEqual(len(remainder), 0)
             self.assertLessEqual(len(remainder), self.SECONDARY_POOL_SIZE)
 
-
     def test_primary_depth_takes_multiple_values(self):
         e = self._make_eval()
         ks = {
@@ -127,7 +123,6 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
         }
         self.assertGreater(len(sizes), 2, f"sizes seen: {sizes}")
 
-
     def test_two_queries_share_min_primary_prefix(self):
         e = self._make_eval()
         lines = self._primary_lines(e)
@@ -138,7 +133,6 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
                 shared = "".join(lines[: min(ks[i], ks[j])])
                 self.assertTrue(prefixes[i].startswith(shared))
                 self.assertTrue(prefixes[j].startswith(shared))
-
 
     def test_build_prefix_is_deterministic(self):
         a = self._make_eval(seed=42)
@@ -155,7 +149,6 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
             if a._build_prefix(i) != b._build_prefix(i)
         )
         self.assertGreater(differences, self.NUM_EXAMPLES // 2)
-
 
     def test_pools_and_test_lines_pairwise_disjoint(self):
         e = self._make_eval(num_examples=None)

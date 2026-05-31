@@ -1,4 +1,3 @@
-
 import unittest
 from typing import Optional
 
@@ -337,7 +336,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     def test_mamba_pool_idx_cleanup_skip_chunked_resume(self):
         pass
 
-
     def test_chunked_req_bypasses_req_pool_exhaustion(self):
         self.server.execute_script(
             self._script_chunked_req_bypasses_req_pool_exhaustion
@@ -425,7 +423,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert (
             t.row_pool_used() <= baseline_rows
         ), f"row leak under forced chunked admission: baseline={baseline_rows}, after={t.row_pool_used()}"
-
 
     def test_stage_a_pending_middle_outputs_sync_invariant(self):
         self.server.execute_script(
@@ -618,7 +615,6 @@ class TestSpecialCaseDynamicChunking(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-
 
 
 class TestSpecialCaseMixedChunk(ScriptedTestCase):

@@ -1,9 +1,7 @@
-
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
-from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
