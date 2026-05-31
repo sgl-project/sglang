@@ -29,7 +29,7 @@ class SchedulerIpcChannels:
         is_rank_zero: bool,
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
-        enable_scripted_runtime: bool = False,
+        enable_scripted_runtime: bool,
     ) -> "SchedulerIpcChannels":
         context = zmq.Context(2)
 
