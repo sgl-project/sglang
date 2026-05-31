@@ -75,6 +75,8 @@ let lastDecodeMs = 0;
 let lastDisplayLagMs = 0;
 let lastControlKeySentAt = 0;
 let socketHadError = false;
+let socketCloseExpected = false;
+let socketServerError = "";
 const decodeRequests = new Map();
 const activeControlActions = new Set();
 
@@ -469,6 +471,7 @@ function showError(error) {
 
 function closeSession(reason = "session closed by client", clearFrames = true) {
   clearQueueOnClose = clearFrames;
+  socketCloseExpected = true;
   if (clearFrames) {
     queue = [];
     updateStats();
@@ -483,13 +486,35 @@ function closeSession(reason = "session closed by client", clearFrames = true) {
   ws.close(1000, "client close");
 }
 
+function waitForSocketClose(socket, timeoutMs = 1800) {
+  return new Promise((resolve) => {
+    if (!socket || socket.readyState === WebSocket.CLOSED) {
+      resolve();
+      return;
+    }
+    const finish = () => {
+      socket.removeEventListener("close", finish);
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, timeoutMs);
+    socket.addEventListener("close", finish, { once: true });
+    socket.close(1000, "replace session");
+  });
+}
+
 async function connect() {
   const epoch = ++streamEpoch;
   $("connectBtn").disabled = true;
   setStatus("Preparing");
   addHistory("preparing session");
   try {
-    if (ws) ws.close();
+    if (ws && ws.readyState !== WebSocket.CLOSED) {
+      socketCloseExpected = true;
+      setStatus("Replacing");
+      addHistory("closing previous socket before reconnect");
+      await waitForSocketClose(ws);
+    }
     resetStreamStats();
     if (!$("firstFrame").files[0] && !selectedReferenceBytes) {
       await setPresetReference(presets[0]);
@@ -519,6 +544,8 @@ async function connect() {
     ws = new WebSocket($("serverUrl").value);
     ws.binaryType = "arraybuffer";
     socketHadError = false;
+    socketCloseExpected = false;
+    socketServerError = "";
     ws.onopen = () => {
       if (epoch !== streamEpoch) return;
       chunkWaitStartedAt = performance.now();
@@ -539,13 +566,27 @@ async function connect() {
       clearQueueOnClose = false;
       const reason = event.reason ? ` · ${event.reason}` : "";
       const closeText = `socket closed code=${event.code}${reason}`;
-      setStatus(socketHadError ? "Socket closed" : "Closed");
-      addHistory(closeText);
+      const normalClose = event.code === 1000 || event.code === 1001;
+      if (socketServerError) {
+        setStatus("Server closed", "error");
+        addHistory(`${closeText} · ${socketServerError}`);
+      } else if (socketHadError && !socketCloseExpected && !normalClose) {
+        setStatus("Socket closed", "error");
+        addHistory(`${closeText} · transport error`);
+      } else {
+        setStatus("Closed");
+        addHistory(closeText);
+      }
+      socketCloseExpected = false;
     };
     ws.onerror = () => {
       if (epoch !== streamEpoch) return;
-      socketHadError = true;
-      $("connectBtn").disabled = false; setStatus("Socket error", "error"); addHistory("socket transport error");
+      if (!socketCloseExpected) {
+        socketHadError = true;
+        $("connectBtn").disabled = false;
+        setStatus("Socket issue", "error");
+        addHistory("socket transport issue; waiting for close code");
+      }
     };
     ws.onmessage = (event) => {
       receiveChain = receiveChain
@@ -571,8 +612,9 @@ async function receive(data) {
     pendingHeader = unpack(new Uint8Array(data));
     pendingHeader.__received_at = performance.now();
     if (pendingHeader.type === "error") {
-      setStatus(pendingHeader.content || "Server error", "error");
-      addHistory(`server error: ${pendingHeader.content || "unknown"}`);
+      socketServerError = pendingHeader.content || "unknown";
+      setStatus(socketServerError, "error");
+      addHistory(`server error: ${socketServerError}`);
       pendingHeader = null;
     }
     if (pendingHeader) setStatus("Receiving", "live");
