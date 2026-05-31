@@ -1293,6 +1293,18 @@ class BaseMultimodalProcessor(ABC):
             elif input_format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
                 dict_item = dict(dict_item)
                 feature = dict_item.pop("feature")
+                if isinstance(feature, (list, np.ndarray)):
+                    feature = torch.tensor(feature)
+                if not isinstance(feature, torch.Tensor):
+                    raise ValueError(
+                        f"precomputed_embedding feature must be a tensor, "
+                        f"got {type(feature)}"
+                    )
+                if feature.ndim < 2:
+                    raise ValueError(
+                        f"precomputed_embedding feature must be at least 2D, "
+                        f"got shape {feature.shape}"
+                    )
                 all_collected_items.append(
                     MultimodalDataItem(
                         modality=modality,

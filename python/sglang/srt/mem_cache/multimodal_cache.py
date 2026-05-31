@@ -1,4 +1,5 @@
 import abc
+import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional
@@ -17,11 +18,15 @@ class MultimodalCache(abc.ABC):
     @staticmethod
     def combine_hashes(mm_hashes: List[int]) -> Optional[int]:
         """
-        Get a combined hash from individual mm item hashes
+        Get a combined hash from individual mm item hashes.
+        Uses deterministic SHA256 instead of Python's built-in hash()
+        to ensure consistent results across processes and restarts.
         """
         if not mm_hashes:
             return None
-        return hash(tuple(mm_hashes))
+        data = b"".join(h.to_bytes(16, "big", signed=False) for h in mm_hashes)
+        digest = hashlib.sha256(data).digest()[:16]
+        return int.from_bytes(digest, "big")
 
     @abc.abstractmethod
     def get(
