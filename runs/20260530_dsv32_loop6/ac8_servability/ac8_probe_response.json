@@ -1,0 +1,27 @@
+{
+ "_purpose": "AC-8 ~70K-token /generate servability/admission probe at lifted DS int8/mem-0.7/radix-on.",
+ "endpoint": "/generate (raw)",
+ "probe_file": "probe_64k.json",
+ "probe_text_sha256": "652e4f51c00dd77e97caa7bc0337be7b4eb9c29237ad2fa0f297a231367d48cb",
+ "probe_n_tokens_local_estimate": 70759,
+ "http_status": 200,
+ "admitted_http_200": true,
+ "server_alive_before": true,
+ "server_alive_after": true,
+ "served_max_total_num_tokens": 396096,
+ "prompt_tokens_reported": 70759,
+ "completion_tokens_reported": 16,
+ "finish_reason": {
+  "type": "length",
+  "length": 16
+ },
+ "latency_s": 11.948,
+ "output_text_snippet": " The passage is a list of thethe passage the passage is a list of the",
+ "loop5_mem06": {
+  "pool_tokens": 53056,
+  "rejected_prompt_tokens": 69970,
+  "http_status": 400,
+  "reason": "Input length (69970) exceeds the maximum allowed (53050)"
+ },
+ "response_raw_if_error": null
+}

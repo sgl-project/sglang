@@ -1,0 +1,36 @@
+# AC-8 server-log excerpt — DS int8 / mem_fraction_static=0.7 / radix-on, TP=8 (node 0 localhost)
+# Source: /tmp/ac8/ds_boot.log (gitignored runtime log); these lines embedded as tracked evidence.
+# Probe window (UTC): start 2026-05-31T00:54:28Z .. end 2026-05-31T00:54:40Z
+
+## Operating point — KV pool & readiness (boot)
+[2026-05-31 00:52:17 TP0] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 396096, KV size: 17.73 GB
+[2026-05-31 00:52:17 TP0] Memory pool end. avail mem=38.38 GB
+[2026-05-31 00:53:54 TP0] max_total_num_tokens=396096, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=2048, context_len=163840, available_gpu_mem=17.65 GB
+[2026-05-31 00:53:58] The server is fired up and ready to roll!
+
+## int8 compact TokenLabelTable allocation (all 8 ranks)
+[2026-05-31 00:52:17 TP0] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-31 00:52:17 TP1] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-31 00:52:17 TP2] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-31 00:52:17 TP3] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-31 00:52:17 TP4] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-31 00:52:17 TP5] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-31 00:52:17 TP6] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+[2026-05-31 00:52:17 TP7] token_label_table: 6.48 GB/rank  L=61 T=396160 H=16 D=16 page=64 dtype=torch.int8 scales=float16
+
+## radix-on authorization (fixture artifact)
+[2026-05-31 00:51:01] DS radix-cache fixture recorded as PASSED for this ServerArgs; validator will now accept --disable-radix-cache removal. Source: record_radix_fixture_passed(). artifact=/sgl-workspace/sglang/runs/20260530_dsv32_loop6/ds_radix_fixture_state_int8.json artifact_sha256=f3b67943c0f2dd0c5ccbc8b7297dcc1d40265662c62612c6071161ffd68e5072
+
+## The ~70K-token probe: chunked prefill (8x8192 + 5248 = 70759 tokens) — no queue, token usage 0.02->0.18 of the 396096 pool, cuda graph: False (eager prefill)
+[2026-05-31 00:54:32 TP0] Prefill batch, #new-seq: 1, #new-token: 8192, #cached-token: 0, token usage: 0.02, #running-req: 0, #queue-req: 0, #pending-token: 62567, cuda graph: False, input throughput (token/s): 234.66
+[2026-05-31 00:54:32 TP0] Prefill batch, #new-seq: 1, #new-token: 8192, #cached-token: 0, token usage: 0.04, #running-req: 0, #queue-req: 0, #pending-token: 54375, cuda graph: False, input throughput (token/s): 14524.70
+[2026-05-31 00:54:33 TP0] Prefill batch, #new-seq: 1, #new-token: 8192, #cached-token: 0, token usage: 0.06, #running-req: 0, #queue-req: 0, #pending-token: 46183, cuda graph: False, input throughput (token/s): 11457.77
+[2026-05-31 00:54:34 TP0] Prefill batch, #new-seq: 1, #new-token: 8192, #cached-token: 0, token usage: 0.08, #running-req: 0, #queue-req: 0, #pending-token: 37991, cuda graph: False, input throughput (token/s): 9524.55
+[2026-05-31 00:54:35 TP0] Prefill batch, #new-seq: 1, #new-token: 8192, #cached-token: 0, token usage: 0.10, #running-req: 0, #queue-req: 0, #pending-token: 29799, cuda graph: False, input throughput (token/s): 8124.86
+[2026-05-31 00:54:36 TP0] Prefill batch, #new-seq: 1, #new-token: 8192, #cached-token: 0, token usage: 0.12, #running-req: 0, #queue-req: 0, #pending-token: 21607, cuda graph: False, input throughput (token/s): 6995.14
+[2026-05-31 00:54:37 TP0] Prefill batch, #new-seq: 1, #new-token: 8192, #cached-token: 0, token usage: 0.14, #running-req: 0, #queue-req: 0, #pending-token: 13415, cuda graph: False, input throughput (token/s): 6239.05
+[2026-05-31 00:54:39 TP0] Prefill batch, #new-seq: 1, #new-token: 8192, #cached-token: 0, token usage: 0.17, #running-req: 0, #queue-req: 0, #pending-token: 5223, cuda graph: False, input throughput (token/s): 5584.21
+[2026-05-31 00:54:40 TP0] Prefill batch, #new-seq: 1, #new-token: 5248, #cached-token: 0, token usage: 0.18, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 4946.25
+
+## OOM / CUDA-error scan across the ENTIRE boot+serve log:
+  matching lines = 0  (0 = no OOM / no instability)
