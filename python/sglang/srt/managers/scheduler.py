@@ -41,6 +41,7 @@ from torch.distributed import barrier
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -147,7 +148,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
+from sglang.srt.managers.overlap_utils import (
+    decide_needs_cpu_seq_lens,
+    resolve_forward_inputs,
+)
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -447,6 +451,9 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        if (c := self.tp_worker.model_runner.canary_manager) is not None:
+            c.attach_radix_cache(self.tree_cache)
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -549,6 +556,8 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
+
+        maybe_revert_pr_fix()
 
         self.is_initializing = False
 
@@ -1155,14 +1164,13 @@ class Scheduler(
         self.device_module = torch.get_device_module(self.device)
 
         if use_mlx():
-            # MLX overlap scheduling uses mx.async_eval / mx.eval for
-            # synchronisation so no CUDA/MPS streams or FutureMap needed.
+            # MLX: no CUDA streams / FutureMap.
             self.future_map = None
-            # Empty result_queue is needed because idle-check references it
-            # when enable_overlap is True.
             self.result_queue: Deque = deque()
             return
 
+        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
+        # via scheduler_pp_mixin; init unconditionally to match main.
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1171,10 +1179,7 @@ class Scheduler(
             self.copy_stream
         )
 
-        if not self.enable_overlap:
-            self.future_map = None
-            return
-
+        # FutureMap is always-on: input_ids relay used in both modes.
         # Workers not on BaseSpecWorker (e.g. FrozenKVMTPWorker) lack the
         # override; fall back to target-only so the helper still produces a
         # safe decision (no accidental opt-out for unaudited shapes).
@@ -1192,6 +1197,10 @@ class Scheduler(
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
         )
+
+        if not self.enable_overlap:
+            return
+
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -2371,9 +2380,12 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        batch.input_ids = torch.tensor(
+        # Stash last token into relay; resolve_forward_inputs will gather.
+        last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
+        self.future_map.stash(batch.req_pool_indices, last_tokens)
+        batch.input_ids = None
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -2970,21 +2982,30 @@ class Scheduler(
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
 
-                with self._overlap_forward_isolation(batch):
-                    future_indices = batch.req_pool_indices
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.schedule_stream)
+                    # resolve consumes SB staging (prefill_input_ids_cpu /
+                    # mix_running_indices). Run OUTSIDE isolation so the
+                    # snapshot captures the post-consume state — restoring
+                    # post-forward must not un-consume staging.
+                    resolve_forward_inputs(batch, self.future_map)
 
-                    # Spec_v2 fires on_publish mid-worker (between verify and
-                    # draft_extend) so schedule prep can overlap with draft_extend.
-                    # Non-spec has no later work — scheduler publishes after return.
-                    fwd_kwargs = (
-                        {"on_publish": partial(self.future_map.publish, future_indices)}
-                        if batch.is_spec_v2
-                        else {}
-                    )
+                    with self._overlap_forward_isolation(batch):
+                        future_indices = batch.req_pool_indices
 
-                    with self.forward_stream_ctx:
-                        self.forward_stream.wait_stream(self.schedule_stream)
-                        self.future_map.resolve_future(batch)
+                        # Spec_v2 fires on_publish mid-worker (between verify and
+                        # draft_extend) so schedule prep can overlap with draft_extend.
+                        # Non-spec has no later work — scheduler publishes after return.
+                        fwd_kwargs = (
+                            {
+                                "on_publish": partial(
+                                    self.future_map.publish, future_indices
+                                )
+                            }
+                            if batch.is_spec_v2
+                            else {}
+                        )
+
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
@@ -3014,28 +3035,42 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                self.future_map.set_input_ids_sentinel(batch, future_indices)
+                # Next-iter input_ids relayed via future_map.
+                batch.input_ids = None
 
                 if batch.is_spec_v2:
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                    self.future_map.stash(
+                        batch.req_pool_indices, batch_result.next_token_ids
+                    )
+                batch.input_ids = None
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                # PP intermediate ranks return None; DLLM returns a per-req list.
-                # Only the tensor case maps onto batch.input_ids as next-iter input.
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                    if self.spec_algorithm.is_none():
+                        # Non-spec: relay via future_map, gathered next iter.
+                        self.future_map.stash(
+                            batch.req_pool_indices, batch_result.next_token_ids
+                        )
+                        batch.input_ids = None
+                    else:
+                        # Spec_v1 (non-overlap spec): worker shape doesn't match
+                        # req_pool_indices; relay is unused (worker rebuilds input_ids
+                        # inside verify). Keep pre-PR behavior.
+                        batch.input_ids = batch_result.next_token_ids.to(torch.int64)
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
@@ -3058,6 +3093,7 @@ class Scheduler(
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    resolve_forward_inputs(batch, self.future_map)
                     pooler_output = self.tp_worker.forward_batch_embedding(batch)
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
@@ -3065,6 +3101,7 @@ class Scheduler(
                     )
                     ret.copy_to_cpu()
             else:
+                resolve_forward_inputs(batch, self.future_map)
                 pooler_output = self.tp_worker.forward_batch_embedding(batch)
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
