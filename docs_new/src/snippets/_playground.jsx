@@ -1,6 +1,7 @@
 // Engine half of the SGLang cookbook playground widget. Pairs with a
 // per-model config under `/src/snippets/configs/<vendor>/<model>.jsx`.
-// See .claude/rules/cookbook-authoring.md for the authoring workflow.
+// See the cookbook-add-model skill (.claude/skills/cookbook-add-model/) for the
+// authoring workflow; references/engine-axis.md covers adding a new axis.
 //
 // Consumes the same config shape as `_deployment.jsx`, plus
 // `config.playgroundFeatures` — a keyed map where each present key opts that

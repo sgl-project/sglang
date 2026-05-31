@@ -1,6 +1,7 @@
 // ENGINE half of the SGLang cookbook deployment-command generator. Reads a
 // per-model `config` prop (no model-specific code here). Full field semantics
-// (resolution rules, key layering) live in .claude/rules/cookbook-authoring.md §2.
+// (resolution rules, key layering) live in the cookbook-add-model skill:
+// .claude/skills/cookbook-add-model/references/authoring-reference.md.
 //
 // Config fields the engine reads:
 //   modelName          display label
