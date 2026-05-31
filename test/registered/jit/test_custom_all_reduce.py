@@ -5,11 +5,12 @@ of tensor sizes, dtypes, and algorithms, in both eager and CUDA-graph modes.
 
 Usage::
 
-    # Run the test on every supported world size (2..8 GPUs):
+    # Run the test on the default world sizes (2, 4, 8 GPUs):
     python tests/test_custom_all_reduce.py
-    # Pick a specific world size (or comma-separated list):
-    python tests/test_custom_all_reduce.py --num-gpu 4
-    python tests/test_custom_all_reduce.py --num-gpu 2,4,8
+    # Pick a specific world size (or comma-separated list), e.g. the rarer
+    # odd / non-power-of-two counts that the default sweep skips:
+    python tests/test_custom_all_reduce.py --num-gpu 3
+    python tests/test_custom_all_reduce.py --num-gpu 2,4,6,8
     # Extra pytest args (forwarded to each torchrun worker):
     python tests/test_custom_all_reduce.py -k bfloat16
 """
@@ -222,9 +223,12 @@ def test_custom_all_reduce(
 
 
 if __name__ == "__main__":
+    # Only sweep the common world sizes (2, 4, 8) by default: testing every
+    # count in 2..8 serially overruns the per-file CI time budget, and 3/5/6/7
+    # are rare in practice. Use --num-gpu to exercise them explicitly.
     multigpu_pytest_main(
         __name__,
         __file__,
-        num_gpus=range(2, 9),
+        num_gpus=(2, 4, 8),
         pre_launch_fn=_precompile_kernels,
     )
