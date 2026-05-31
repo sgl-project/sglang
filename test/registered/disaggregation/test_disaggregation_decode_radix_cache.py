@@ -22,7 +22,6 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     is_in_ci,
     try_cached_model,
 )
@@ -185,7 +184,7 @@ class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase
         os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.hicache_dir
 
         super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN)
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         cls.transfer_backend = [
             "--disaggregation-transfer-backend",
             cls.transfer_backend_name,
