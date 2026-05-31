@@ -1,23 +1,42 @@
-# AC-7-methodology DS request-time-stat attribution (queue vs prefill) — bucketed by .meta.json run-start windows
-# DS int8/mem0.7/radix-on, num_prompts=64, warmup120/window600, --enable-request-time-stats-logging (reproduces AC-7: TTFT 12.8/25.4/100.8s).
-# Rows parsed=1092: health=0, non-benchmark(output_len!=512)=4, negative-queue dropped=6, valid benchmark=1082.
+# AC-7-methodology DS request-time-stat attribution (queue vs prefill)
+#
+# PROVENANCE — this is a SEPARATE request-time-stats REPRODUCTION run, NOT the original AC-7 3-trial sweep
+# (the 3-trial sweep did not enable --enable-request-time-stats-logging). It uses the IDENTICAL methodology
+# (DS int8/mem0.7/radix-on, num_prompts=64, warmup 120s/window 600s) and REPRODUCES the AC-7 result:
+#   conc   reproduced (this run)         original 3-trial-sweep median (ac7_resweep_metrics.json)
+#     16   TTFT=12.8s achieved=16.0 completed=256   TTFT=12.838s achieved=15.998
+#     32   TTFT=25.4s achieved=32.0 completed=320   TTFT=25.491s achieved=31.996
+#     64   TTFT=100.8s achieved=47.0 completed=320   TTFT=100.836s achieved=46.983
+# Source files (reproduction run):
+#   c16: /tmp/ac7prof/results/double_sparsity_..._c16_t1.jsonl sha256=a8a015f1379214d3f6752eb851686bbe85fd3900dae6ffc7478c14bf7e9953f3  window_start(UTC)=2026-05-30T23:33:34Z duration=669s
+#   c32: /tmp/ac7prof/results/double_sparsity_..._c32_t1.jsonl sha256=34191253fc04183115aabaceff1a98f3aea807aab4e346da688ad4f0653f1290  window_start(UTC)=2026-05-30T23:47:45Z duration=695s
+#   c64: /tmp/ac7prof/results/double_sparsity_..._c64_t1.jsonl sha256=48b05965e01f4963f33daeb0728d32b6fc2e8a28ea70167392db6c1af8094504  window_start(UTC)=2026-05-31T00:01:49Z duration=727s
+#   DS server log: /tmp/ac7prof/ds_rts2.log sha256=62344785cd7a8d11da89c40cd85132a4bb7f8dba21348171c06c6c0df070cb96
+#
+# Row accounting: total ReqTimeStats parsed=1092 = health 0 + non-benchmark(output_len!=512) 4
+#   + negative-queue dropped 6 + valid benchmark 1082.
+#   per-conc valid benchmark rows: c16=320 c32=384 c64=378. These EXCEED the measured-window
+#   completed (256/320/320) because ReqTimeStats logs EVERY benchmark request incl. the 120s-warmup epoch (~64
+#   prompts/conc): e.g. c16 320 = 256 measured + 64 warmup; c32 384 = 320 + 64; c64 378 = 320 + 58.
+#   Bucketed per conc by request-completion print-time against the .meta.json run-window boundaries.
+#
 # MEASURED queue_duration (scheduler/admission wait). INFERRED post-admission residual = client TTFT_p99 - queue_p99.
 
-== conc 16 (benchmark rows 320) ==
+== conc 16 (valid benchmark rows 320) ==
   queue_duration s (admission-wait, MEASURED): p50=4.9 p95=10.5 p99=10.5 max=10.5
   client P99 TTFT s: 12.8   post-admission residual (TTFT_p99-queue_p99): 2.3
   forward_duration s (completion-time, context only): p50=36.3 p99=42.3
 
-== conc 32 (benchmark rows 384) ==
+== conc 32 (valid benchmark rows 384) ==
   queue_duration s (admission-wait, MEASURED): p50=10.6 p95=22.0 p99=22.6 max=22.7
   client P99 TTFT s: 25.4   post-admission residual (TTFT_p99-queue_p99): 2.7
   forward_duration s (completion-time, context only): p50=57.8 p99=69.4
 
-== conc 64 (benchmark rows 378) ==
+== conc 64 (valid benchmark rows 378) ==
   queue_duration s (admission-wait, MEASURED): p50=21.4 p95=95.6 p99=96.7 max=99.6
   client P99 TTFT s: 100.8   post-admission residual (TTFT_p99-queue_p99): 4.1
   forward_duration s (completion-time, context only): p50=62.5 p99=79.8
 
-# Reading: conc16 fully admitted (achieved 16) -> queue p50 small; conc64 (achieved ~47/64) -> queue p99 high =
-#   the residual admission/throughput deficit. DS-vs-DSA TTFT gap = queue (conc64) + DS slower per-request (all conc),
-#   NOT a footprint problem (DEC-7). per-req TPS FAIL is decode-batch-bound (decode_batch_ac7.txt).
+# DS TTFT is admission-queue-dominated at every conc (queue p99 ~ TTFT p99; residual ~prefill). conc-64 queue largest,
+# matching the 47/64 achieved-concurrency deficit. DS drains the request_rate=inf flood-queue slower than DSA (lower
+# throughput, decode_batch_ac7.txt) => the DS-vs-DSA TTFT gap. DEC-7 directional; not a footprint problem.

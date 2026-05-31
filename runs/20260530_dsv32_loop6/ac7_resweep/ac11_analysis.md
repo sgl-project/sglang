@@ -64,7 +64,8 @@ a footprint regression; AC-7 is **soft** (characterized).
 91/77/56%) — the footprint→admission spine validated across 3 trials. The **DS-vs-DSA parity
 gates fail** (DS per-request TPS ~1/3 of DSA, TTFT 18–49× DSA), the expected DSA-trained-indexer
 advantage + the admission-restore throughput tradeoff — a DEC-7 directional follow-up, attributed
-via AC-5, **not** a footprint regression. DSA-default reproduces its baseline (0.72/1.28/2.04 s,
+at AC-7 methodology by `decode_batch_ac7.txt` (TPS) + `queue_attribution.txt` (TTFT/queue), **not**
+a footprint regression. DSA-default reproduces its baseline (0.72/1.28/2.04 s,
 46.9/37.5/29.5 TPS; conc-64 TPS ~29.5 is the queued pre-existing DSA limit).
 
 ## Methodology note (node1 unavailable → both sides on node 0, sequential)

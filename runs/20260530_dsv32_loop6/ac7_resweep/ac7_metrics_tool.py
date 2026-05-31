@@ -23,7 +23,10 @@ RESWEEP_MD = os.path.join(HERE, "ac11_resweep.md")
 SRC_GLOB = "/tmp/ac7/results/{mode}_gsp_isl4096_osl512_c{c}_t*.jsonl"
 MODES = {"DS": "double_sparsity", "DSA": "native_nsa"}
 CONCS = [16, 32, 64]
-TOL = 0.05  # comparator prints 3 decimals; allow rounding slack
+TOL = 0.0005  # ac11_resweep.md renders 3 decimals; a value rendering differently must fail
+WINDOW_FLOOR_S = 600.0  # AC-11 measurement-window floor (MEASUREMENT_WINDOW_S)
+import re as _re
+_SHA_RE = _re.compile(r"^[0-9a-f]{64}$")
 
 
 def _percentile(values, pct):
@@ -117,9 +120,16 @@ def verify():
             tr = d["conc"][str(c)][side]
             chk(len(tr) == 3, f"c{c} {side}: {len(tr)} trials (need 3)")
             for t in tr:
-                chk(t["errors_nonempty"] == 0, f"c{c} {side} t{t['trial']}: errors>0")
-                chk(t["output_len_all_512"], f"c{c} {side} t{t['trial']}: output_len!=512")
-                chk(len(t["ttfts_s"]) == t["completed"], f"c{c} {side} t{t['trial']}: ttfts len != completed")
+                tag = f"c{c} {side} t{t['trial']}"
+                chk(isinstance(t.get("sha256"), str) and bool(_SHA_RE.match(t["sha256"])), f"{tag}: sha256 not 64-hex")
+                for fld in ("concurrency", "p99_ttft_ms", "completed", "duration_s"):
+                    chk(isinstance(t.get(fld), (int, float)), f"{tag}: field {fld} missing/non-numeric")
+                chk(t["completed"] > 0, f"{tag}: completed not > 0")
+                chk(t["duration_s"] >= WINDOW_FLOOR_S, f"{tag}: duration {t['duration_s']:.0f}s < window floor {WINDOW_FLOOR_S:.0f}s")
+                chk(t["errors_nonempty"] == 0, f"{tag}: errors>0")
+                chk(t["output_len_all_512"], f"{tag}: output_len!=512")
+                chk(len(t["ttfts_s"]) == t["completed"], f"{tag}: ttfts len {len(t['ttfts_s'])} != completed {t['completed']}")
+                chk(len(t["per_req_gen_tps"]) == t["completed"], f"{tag}: per_req_gen_tps len {len(t['per_req_gen_tps'])} != completed {t['completed']}")
         ds = d["conc"][str(c)]["DS"]; dsa = d["conc"][str(c)]["DSA"]
         r = {
             "ds_ach": _median([t["concurrency"] for t in ds]), "dsa_ach": _median([t["concurrency"] for t in dsa]),
