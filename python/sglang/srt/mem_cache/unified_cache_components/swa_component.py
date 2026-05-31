@@ -13,7 +13,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -359,7 +363,11 @@ class SWAComponent(TreeComponent):
         root = self.cache.root_node
         sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
-        swa_uuid_for_lock = None
+        swa_uuid = None
+        value_attr = "host_value" if lock_host else "value"
+        lock_attr = "host_lock_ref" if lock_host else "lock_ref"
+        uuid_attr = "host_uuid" if lock_host else "uuid"
+        lru = self.cache.host_lru_lists[ct] if lock_host else self.cache.lru_lists[ct]
 
         # Tombstoned nodes (cd.value is None) have no SWA chunk to protect
         # skip them and keep walking up. This path is hit when HiCache
@@ -367,23 +375,33 @@ class SWAComponent(TreeComponent):
         cur = node
         while cur != root and swa_lock_size < sliding_window_size:
             comp = cur.component_data[ct]
-            if comp.value is None:
+            value = getattr(comp, value_attr)
+            if value is None:
                 result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
                 cur = cur.parent
                 continue
-            if comp.lock_ref == 0:
-                key_len = len(cur.key)
-                self.cache.component_evictable_size_[ct] -= key_len
-                self.cache.component_protected_size_[ct] += key_len
-            comp.lock_ref += 1
-            swa_lock_size += len(cur.key)
+
+            ref = getattr(comp, lock_attr)
+            if ref == 0:
+                if lock_host:
+                    if lru.in_list(cur):
+                        lru.remove_node(cur)
+                else:
+                    key_len = len(cur.key)
+                    self.cache.component_evictable_size_[ct] -= key_len
+                    self.cache.component_protected_size_[ct] += key_len
+            setattr(comp, lock_attr, ref + 1)
+            swa_lock_size += len(value)
             if swa_lock_size >= sliding_window_size:
-                if comp.metadata.get("uuid") is None:
-                    comp.metadata["uuid"] = next_component_uuid()
-                swa_uuid_for_lock = comp.metadata["uuid"]
+                if comp.metadata.get(uuid_attr) is None:
+                    comp.metadata[uuid_attr] = next_component_uuid()
+                swa_uuid = comp.metadata[uuid_attr]
             cur = cur.parent
 
-        result.swa_uuid_for_lock = swa_uuid_for_lock
+        if lock_host:
+            result.swa_uuid_for_host_lock = swa_uuid
+        else:
+            result.swa_uuid_for_lock = swa_uuid
         return result
 
     def release_component_lock(
@@ -394,9 +412,16 @@ class SWAComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         root = self.cache.root_node
-        swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
+        swa_uuid_for_lock = (
+            (params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock)
+            if params
+            else None
+        )
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         dec_swa = True
+        value_attr = "host_value" if lock_host else "value"
+        lock_attr = "host_lock_ref" if lock_host else "lock_ref"
+        uuid_attr = "host_uuid" if lock_host else "uuid"
 
         # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         cur = node
@@ -405,15 +430,22 @@ class SWAComponent(TreeComponent):
             if cur.id in skip_lock_node_ids:
                 cur = cur.parent
                 continue
-            if comp.lock_ref == 0:
+            ref = getattr(comp, lock_attr)
+            if ref == 0:
                 cur = cur.parent
                 continue
-            if comp.lock_ref == 1:
-                key_len = len(cur.key)
-                self.cache.component_evictable_size_[ct] += key_len
-                self.cache.component_protected_size_[ct] -= key_len
-            comp.lock_ref -= 1
-            if swa_uuid_for_lock and comp.metadata.get("uuid") == swa_uuid_for_lock:
+            if ref == 1:
+                if lock_host:
+                    if comp.value is None and comp.host_value is not None:
+                        host_lru = self.cache.host_lru_lists[ct]
+                        if not host_lru.in_list(cur):
+                            host_lru.insert_mru(cur)
+                else:
+                    key_len = len(getattr(comp, value_attr))
+                    self.cache.component_evictable_size_[ct] += key_len
+                    self.cache.component_protected_size_[ct] -= key_len
+            setattr(comp, lock_attr, ref - 1)
+            if swa_uuid_for_lock and comp.metadata.get(uuid_attr) == swa_uuid_for_lock:
                 dec_swa = False
             cur = cur.parent
 
@@ -483,6 +515,47 @@ class SWAComponent(TreeComponent):
                 )
             ]
 
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None or not node.hash_value:
+                return None
+            num_pages = len(cd.host_value) // self.cache.page_size
+            if num_pages == 0:
+                return None
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=cd.host_value[-num_pages * self.cache.page_size :],
+                    keys=node.hash_value[-num_pages:],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            prefetch_tokens = kw.get("prefetch_tokens", 0)
+            num_pages = min(
+                prefetch_tokens // self.cache.page_size,
+                (self.sliding_window_size + self.cache.page_size - 1)
+                // self.cache.page_size,
+            )
+            if num_pages == 0:
+                return None
+            num_tokens = num_pages * self.cache.page_size
+            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+            if host_indices is None:
+                self.cache.evict_host(num_tokens, ComponentType.SWA)
+                host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+            if host_indices is None:
+                return []
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=host_indices,
+                    keys=["__placeholder__"] * num_pages,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+
         return None
 
     def commit_hicache_transfer(
@@ -520,6 +593,87 @@ class SWAComponent(TreeComponent):
                 offset += n_tokens
             assert offset == len(xfer.host_indices)
             return
+
+        if phase == CacheTransferPhase.PREFETCH:
+            self._commit_prefetch(node, transfers, **kw)
+            return
+
+    def _release_swa_host(self, host_indices: torch.Tensor) -> None:
+        if host_indices is not None and host_indices.numel() > 0:
+            self.cache.cache_controller.append_host_mem_release(
+                extra_pools=[PoolTransfer(name=PoolName.SWA, host_indices=host_indices)]
+            )
+
+    def _attach_swa_host_value(
+        self, node: "UnifiedTreeNode", host_indices: torch.Tensor
+    ) -> None:
+        """Write host_indices into node's SWA host_value and refresh tree state."""
+        ct = self.component_type
+        cd = node.component_data[ct]
+        cd.host_value = host_indices.clone()
+        host_lru = self.cache.host_lru_lists[ct]
+        if cd.value is None and not host_lru.in_list(node):
+            host_lru.insert_mru(node)
+        self.cache._update_evictable_leaf_sets(node)
+        if node.parent:
+            self.cache._update_evictable_leaf_sets(node.parent)
+
+    def _commit_prefetch(self, anchor, transfers: list[PoolTransfer], **kw) -> None:
+        """Distribute the prefetched SWA buffer onto the leaf→anchor path.
+
+        The buffer holds the trailing ``loaded_pages`` of the completed KV
+        prefix, mapped to token range ``[loaded_start, total_len)``. We walk
+        upward from ``inserted_host_node`` to ``anchor`` and, for each node
+        whose token range overlaps the buffer:
+          - SWA tombstone (host_value is None) → fill from buffer (split if
+            the node only partially overlaps at the buffer's left edge)
+          - already has SWA host_value → release the corresponding slice
+        Any leftover buffer beyond the walked range is also released.
+        """
+        if not transfers:
+            return
+        host_indices = transfers[0].host_indices
+        insert_result = kw.get("insert_result")
+        pool_storage_result = kw.get("pool_storage_result")
+        loaded_pages = (
+            pool_storage_result.extra_pool_hit_pages.get(PoolName.SWA, 0)
+            if pool_storage_result
+            else 0
+        )
+        target = insert_result.inserted_host_node if insert_result else None
+        if not loaded_pages or target is None:
+            self._release_swa_host(host_indices)
+            return
+
+        # Buffer covers token range [loaded_start, total_len).
+        loaded_start = insert_result.total_len - loaded_pages * self.cache.page_size
+
+        # Walk leaf → anchor; ``pos`` is the right edge of ``cur`` in tokens.
+        pos, cur = insert_result.total_len, target
+        while cur is not anchor and pos > loaded_start:
+            node_start = pos - len(cur.key)
+            # Intersection of cur's range and the buffer.
+            fill_start = max(node_start, loaded_start)
+            fill_len = pos - fill_start
+            buf_off = fill_start - loaded_start
+            slice_ = host_indices[buf_off : buf_off + fill_len]
+
+            cd = cur.component_data[ct]
+            if cd.host_value is None and fill_len > 0:
+                # Tombstone: split off the in-buffer tail if needed, then fill.
+                if fill_start > node_start:
+                    self.cache._split_node(cur.key, cur, fill_start - node_start)
+                self._attach_swa_host_value(cur, slice_)
+            else:
+                # Already has SWA (or empty overlap): drop this slice.
+                self._release_swa_host(slice_)
+
+            pos = node_start
+            cur = cur.parent
+
+        # Buffer prefix that fell outside the anchor→leaf path.
+        if pos > loaded_start:
+            self._release_swa_host(host_indices[: pos - loaded_start])
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]

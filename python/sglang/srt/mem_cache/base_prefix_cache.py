@@ -74,6 +74,7 @@ class InsertResult:
     """Result of an insert operation"""
 
     prefix_len: int
+    total_len: int = 0
     mamba_exist: bool = False
     inserted_host_node: Any = None
 
