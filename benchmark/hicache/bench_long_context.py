@@ -12,14 +12,27 @@ from bench_multiturn import (
 )
 from tqdm.asyncio import tqdm
 
+from sglang.bench_serving import get_auth_headers
 from sglang.benchmark.utils import get_tokenizer
-from sglang.test.kits.cache_hit_kit import async_request_sglang_generate
+from sglang.test.kits.cache_hit_kit import (
+    async_request_openai_chat_completions,
+    async_request_sglang_generate,
+    gen_payload_openai,
+)
 
 
 class ContextWorkloadGenerator(WorkloadGenerator):
     def __init__(self, args):
-        self.url = f"http://{args.host}:{args.port}/generate"
-        self.request_func = async_request_sglang_generate
+        self.api_format = args.api_format
+        self.model_path = args.model_path
+
+        # Construct the base URL and select request/payload functions
+        if self.api_format == "openai":
+            self.url = f"http://{args.host}:{args.port}/v1/chat/completions"
+            self.request_func = async_request_openai_chat_completions
+        else:
+            self.url = f"http://{args.host}:{args.port}/generate"
+            self.request_func = async_request_sglang_generate
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
@@ -41,13 +54,18 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                 self.dataset["contexts"][context_id]
                 + self.dataset["queries"][i]["question"]
             )
-            input_ids = self.tokenizer.encode(prompt_text)
             output_len = len(
                 self.tokenizer(self.dataset["queries"][i]["reference_answer"])[
                     "input_ids"
                 ]
             )
-            init_requests.append((i, gen_payload(input_ids, output_len)))
+            if self.api_format == "openai":
+                messages = [{"role": "user", "content": prompt_text}]
+                payload = gen_payload_openai(messages, output_len, self.model_path)
+            else:
+                input_ids = self.tokenizer.encode(prompt_text)
+                payload = gen_payload(input_ids, output_len)
+            init_requests.append((i, payload))
         self.ready_queue = ReadyQueue(init_requests=init_requests)
 
         self.response_queue = queue.Queue()
@@ -94,7 +112,7 @@ if __name__ == "__main__":
 
     for request_rate in [24, 16, 12, 8, 4, 2, 1]:
         args.request_rate = request_rate
-        requests.post(flush_cache_url)
+        requests.post(flush_cache_url, headers=get_auth_headers())
         time.sleep(1)
         performance_data = ContextWorkloadGenerator(args).run()
         log_to_jsonl_file(performance_data, args.log_file, args.tag)
