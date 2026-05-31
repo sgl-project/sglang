@@ -48,12 +48,14 @@ class ScriptedContext:
         max_new_tokens: int = 8,
         rid: Optional[str] = None,
         ignore_eos: bool = False,
+        prompt_token: int = 1,
     ) -> "ScriptedReqHandle":
         return self._req_starter.start_req(
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
             rid=rid,
             ignore_eos=ignore_eos,
+            prompt_token=prompt_token,
         )
 
     def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:

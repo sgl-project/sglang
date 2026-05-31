@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Dict
 
+from sglang.srt.mem_cache.swa_radix_cache import TreeNode as SWATreeNode
+
 if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
@@ -11,7 +13,16 @@ def get_all_node_hit_counts(ctx: "ScriptedContext") -> Dict[int, int]:
 
 
 def get_all_node_lock_refs(ctx: "ScriptedContext") -> Dict[int, int]:
-    return _collect_node_attr(ctx, lambda node: node.lock_ref)
+    return _collect_node_attr(ctx, _node_lock_ref)
+
+
+def _node_lock_ref(node: Any) -> int:
+    # SWA radix nodes track the full-attention and sliding-window lock refs
+    # separately; a node is held if either is locked. Plain radix nodes expose a
+    # single lock_ref.
+    if isinstance(node, SWATreeNode):
+        return node.full_lock_ref + node.swa_lock_ref
+    return node.lock_ref
 
 
 def _collect_node_attr(

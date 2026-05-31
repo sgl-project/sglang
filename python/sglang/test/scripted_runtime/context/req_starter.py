@@ -24,6 +24,7 @@ class ScriptedContextReqStarter:
         max_new_tokens: int,
         rid: Optional[str],
         ignore_eos: bool,
+        prompt_token: int = 1,
     ) -> ScriptedReqHandle:
         ctx = self._ctx
 
@@ -32,7 +33,7 @@ class ScriptedContextReqStarter:
             self._req_counter += 1
 
         payload = {
-            "input_ids": [1] * prompt_len,
+            "input_ids": [prompt_token] * prompt_len,
             "sampling_params": {
                 "max_new_tokens": max_new_tokens,
                 "ignore_eos": ignore_eos,
