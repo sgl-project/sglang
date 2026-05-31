@@ -50,7 +50,6 @@ def _post_and_await_control(
 def pause_generation(
     ctx: "ScriptedContext", *, mode: Literal["retract", "in_place"]
 ) -> None:
-    assert ctx._is_driver, "pause_generation is only callable from the driver rank"
     _post_and_await_control(
         ctx,
         path="/pause_generation",
@@ -60,7 +59,6 @@ def pause_generation(
 
 
 def continue_generation(ctx: "ScriptedContext", *, torch_empty_cache: bool) -> None:
-    assert ctx._is_driver, "continue_generation is only callable from the driver rank"
     _post_and_await_control(
         ctx,
         path="/continue_generation",
@@ -70,7 +68,6 @@ def continue_generation(ctx: "ScriptedContext", *, torch_empty_cache: bool) -> N
 
 
 def abort_all(ctx: "ScriptedContext") -> None:
-    assert ctx._is_driver, "abort_all is only callable from the driver rank"
     _post_and_await_control(
         ctx,
         path="/abort_request",
@@ -80,7 +77,6 @@ def abort_all(ctx: "ScriptedContext") -> None:
 
 
 def flush_cache(ctx: "ScriptedContext") -> None:
-    assert ctx._is_driver, "flush_cache is only callable from the driver rank"
     _post_and_await_control(
         ctx,
         path="/flush_cache",

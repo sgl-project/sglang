@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import traceback
+from pathlib import Path
 from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
@@ -112,21 +113,21 @@ class ScriptedSchedulerHook:
             return
 
         if exc_tb is not None and self._is_driver:
-            self._write_out_of_band_error(exc_tb)
+            _write_out_of_band_error(exc_tb)
         sys.exit(0 if exc_tb is None else 1)
 
-    def _write_out_of_band_error(self, exc_tb: str) -> None:
-        path = envs.SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH.get()
-        if not path:
-            return
-        error = OutOfBandError(traceback=exc_tb or "<no traceback>")
-        try:
-            with open(path, "w") as f:
-                f.write(error.to_json())
-        except OSError:
-            logger.exception(
-                "Failed to write scripted_runtime out-of-band error to %s", path
-            )
+
+def _write_out_of_band_error(exc_tb: str) -> None:
+    path = envs.SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH.get()
+    if not path:
+        return
+    error = OutOfBandError(traceback=exc_tb or "<no traceback>")
+    try:
+        Path(path).write_text(error.to_json())
+    except OSError:
+        logger.exception(
+            "Failed to write scripted_runtime out-of-band error to %s", path
+        )
 
 
 def _advance_generator(generator: Generator) -> Tuple[bool, Optional[str]]:
