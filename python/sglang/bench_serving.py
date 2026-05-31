@@ -694,9 +694,26 @@ async def async_request_sglang_generate(
                                 last_output_len = output_len
 
                     output.generated_text = generated_text
-                    output.success = True
                     output.latency = latency
-                    output.output_len = output_len
+                    # Fail closed on an HTTP 200 that produced no decoded token:
+                    # if no streamed chunk carried a non-empty "text", `ttft` was
+                    # never set and `output_len` still holds the *requested* count
+                    # (it is initialised to request_func_input.output_len above).
+                    # Recording that as a successful generation silently fabricates
+                    # throughput — an empty generated_text with no first-token
+                    # timing would otherwise be counted as a full max_new_tokens
+                    # completion. Treat it as a failed request instead.
+                    if ttft == 0.0 and not generated_text:
+                        output.success = False
+                        output.output_len = last_output_len
+                        output.error = (
+                            "HTTP 200 but streaming response produced no tokens "
+                            "(empty generated_text, no first-token timing); refusing "
+                            "to record as a completed request"
+                        )
+                    else:
+                        output.success = True
+                        output.output_len = output_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -1027,6 +1044,24 @@ def calculate_metrics(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
             stacklevel=2,
+        )
+
+    # Fail closed on a degenerate streaming measurement: requests that "completed"
+    # but recorded zero per-request latency (no inter-token latencies and no
+    # first-token times) are not valid SLO samples. Publishing them fabricates
+    # throughput (observed: empty generations counted as full-length completions
+    # -> impossible aggregate token/s). Refuse rather than emit unusable metrics.
+    if (
+        completed > 0
+        and not getattr(args, "disable_stream", False)
+        and len(itls) == 0
+        and (len(ttfts) == 0 or all(t == 0.0 for t in ttfts))
+    ):
+        raise RuntimeError(
+            f"Benchmark recorded {completed} completed requests but zero per-request "
+            "latency (no inter-token latencies and no first-token times) on a streaming "
+            "run. The generation/streaming path is broken; refusing to emit unusable "
+            "TTFT/ITL/throughput metrics. Re-check the server streaming response format."
         )
 
     max_output_tokens_per_s = 0.0

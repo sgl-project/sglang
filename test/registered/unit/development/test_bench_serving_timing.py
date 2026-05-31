@@ -611,3 +611,76 @@ class TestBenchServingMultiEpochRealMetrics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBenchServingFailClosedEmptyLatency(unittest.TestCase):
+    """Loop-6 R19: a streaming run that reports completed requests but captures
+    zero per-request latency (empty inter-token latencies + zero first-token
+    times) is a broken measurement path. ``calculate_metrics`` must FAIL CLOSED
+    rather than emit fabricated throughput (R18: empty generations were counted
+    as full max_new_tokens completions -> impossible aggregate token/s)."""
+
+    def setUp(self):
+        self.bs = _load_bs()
+
+    def _mk_output(self, *, success, ttft, itl, output_len, text):
+        o = self.bs.RequestFuncOutput()
+        o.success = success
+        o.ttft = ttft
+        o.itl = list(itl)
+        o.output_len = output_len
+        o.generated_text = text
+        o.latency = ttft + sum(itl)
+        return o
+
+    def _tok(self):
+        return SimpleNamespace(encode=lambda s, add_special_tokens=False: list(s))
+
+    def test_degenerate_streaming_run_fails_closed(self):
+        # R18 reproduction: many "completed" requests, output_len defaulted to
+        # the requested 512, but ttft==0 and itl==[] and empty text.
+        outputs = [
+            self._mk_output(success=True, ttft=0.0, itl=[], output_len=512, text="")
+            for _ in range(100)
+        ]
+        with mock.patch.object(self.bs, "args",
+                               SimpleNamespace(disable_stream=False), create=True):
+            with self.assertRaises(RuntimeError):
+                self.bs.calculate_metrics(
+                    input_requests=None, outputs=outputs, dur_s=60.0,
+                    tokenizer=self._tok(), backend="sglang",
+                )
+
+    def test_valid_streaming_run_passes(self):
+        outputs = [
+            self._mk_output(success=True, ttft=0.5, itl=[0.02] * 7,
+                            output_len=8, text="hello wo")
+            for _ in range(20)
+        ]
+        with mock.patch.object(self.bs, "args",
+                               SimpleNamespace(disable_stream=False), create=True):
+            metrics, out_lens = self.bs.calculate_metrics(
+                input_requests=None, outputs=outputs, dur_s=10.0,
+                tokenizer=self._tok(), backend="sglang",
+            )
+        self.assertEqual(metrics.completed, 20)
+        self.assertGreater(metrics.p99_ttft_ms, 0.0)
+
+    def test_non_streaming_empty_itl_is_allowed(self):
+        # --disable-stream legitimately has no inter-token latencies; the guard
+        # must not false-trigger (ttft is set to e2e on the single response).
+        outputs = [
+            self._mk_output(success=True, ttft=1.0, itl=[], output_len=8, text="hi")
+            for _ in range(10)
+        ]
+        with mock.patch.object(self.bs, "args",
+                               SimpleNamespace(disable_stream=True), create=True):
+            metrics, _ = self.bs.calculate_metrics(
+                input_requests=None, outputs=outputs, dur_s=10.0,
+                tokenizer=self._tok(), backend="sglang",
+            )
+        self.assertEqual(metrics.completed, 10)
+
+
+if __name__ == "__main__":
+    unittest.main()
