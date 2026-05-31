@@ -132,7 +132,7 @@ def _router_triton_kernel(
         sp = tl.where(
             scores > 20.0,
             scores,  # log1p(exp(big)) = big
-            tl.log(1.0 + tl.exp(scores)),
+            tl.log1p(tl.exp(scores)),
         )
         activated = tl.sqrt(sp)
     biased = activated + bias
