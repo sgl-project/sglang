@@ -13,7 +13,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pybase64
@@ -81,10 +81,8 @@ logger = logging.getLogger(__name__)
 _SAMPLE_WIDTH = 2
 
 
-def _slice_pcm_from(buffer, start: int) -> bytes:
-    """Immutable snapshot of ``buffer[start:]`` via memoryview — one slice-sized
-    copy instead of the two ``bytes(bytearray)[start:]`` would do. ``buffer`` is
-    bytes or bytearray. Raises instead of silently returning empty."""
+def _slice_pcm_from(buffer: Union[bytes, bytearray], start: int) -> bytes:
+    """Return an immutable ``buffer[start:]`` snapshot with bounds checking."""
     if not (0 <= start <= len(buffer)):
         raise ValueError(f"_slice_pcm_from: start={start} not in [0, {len(buffer)}]")
     return bytes(memoryview(buffer)[start:])
@@ -145,15 +143,11 @@ class _SessionConfig:
 
 @dataclass
 class _AudioState:
-    """Per-item audio state. Once the slicing gate is reached (``state.emitted_text``
-    non-empty AND ``state.chunk_index >= slicing_min_chunk_index``), inference
-    switches from the cumulative buffer to a tail slice at
-    ``pcm_buffer[committed_audio_until_bytes - left_overlap_bytes:]``. The FIRST
-    gated call still starts at offset 0 because ``committed_audio_until_bytes`` is
-    initialized to 0; only subsequent calls are bounded to the left overlap plus
-    newly appended audio. ``emitted_text`` is not injected into the prompt — the
-    retained acoustic overlap plus output-side dedupe takes the place of a
-    continuation prefix."""
+    """Per-item audio buffer and slicing state.
+
+    After the slicing gate is reached, inference switches from the cumulative
+    buffer to a tail slice. The first gated call may still start at offset 0;
+    later calls use ``committed_audio_until_bytes - left_overlap_bytes``."""
 
     max_buffer_bytes: int
     chunk_size_bytes: int
@@ -209,8 +203,9 @@ class RealtimeConnection:
         self.config = _SessionConfig()
 
         slicing_cfg = adapter.realtime_slicing_config
-        left_overlap_ms = int(slicing_cfg["left_overlap_ms"])
-        min_audio_sec = float(slicing_cfg["min_audio_sec"])
+        slicing_opt_in = bool(slicing_cfg.get("enabled", False))
+        left_overlap_ms = int(slicing_cfg.get("left_overlap_ms", 0))
+        min_audio_sec = float(slicing_cfg.get("min_audio_sec", 0.0))
         left_overlap_bytes = int(left_overlap_ms / 1000 * self.bytes_per_second)
 
         state = StreamingASRState(**adapter.chunked_streaming_config)
@@ -220,11 +215,14 @@ class RealtimeConnection:
                 f"adapter.chunked_streaming_config produced non-positive "
                 f"chunk_size_sec; got {state.chunk_size_sec!r}"
             )
-        slicing_min_chunk_index = math.ceil(min_audio_sec / state.chunk_size_sec)
-        slicing_enabled = (
-            left_overlap_bytes < state.unfixed_chunk_num * chunk_size_bytes
+        slicing_min_chunk_index = (
+            math.ceil(min_audio_sec / state.chunk_size_sec) if slicing_opt_in else 0
         )
-        if not slicing_enabled:
+        slicing_enabled = (
+            slicing_opt_in
+            and left_overlap_bytes < state.unfixed_chunk_num * chunk_size_bytes
+        )
+        if slicing_opt_in and not slicing_enabled:
             logger.warning(
                 "[realtime] left_overlap=%dms >= unfixed_chunks_duration=%dms; "
                 "audio slicing disabled, falling back to cumulative inference",
@@ -580,7 +578,10 @@ class RealtimeConnection:
             tail = self.audio.state.finalize()
             await self._emit_transcription_delta(tail)
 
-        # Use emitted_deltas: under slicing, state.full_transcript is the deduped tail.
+        # Build from emitted_deltas, not state.full_transcript: both paths leave
+        # full_transcript a partial — prefix injection (cumulative path) leaves
+        # only the continuation tail, dedupe (slicing path) leaves only the
+        # deduped tail. emitted_deltas reconstructs the full transcript verbatim.
         transcript = normalize_whitespace("".join(self.item.emitted_deltas))
 
         await self._send(
@@ -615,9 +616,13 @@ class RealtimeConnection:
         )
 
     async def _run_inference(self, is_last: bool) -> bool:
-        """Run ASR on the current cumulative buffer. Returns False on failure:
-        commit-time emits transcription.failed and rolls the item; append-time
-        emits a generic error envelope and closes the WebSocket."""
+        """Run ASR on the current audio window.
+
+        The cumulative path uses the whole PCM buffer. The slicing path uses a
+        tail slice with left overlap and trims duplicated text before
+        ``StreamingASRState`` ingests it. Returns False on failure: commit-time
+        emits transcription.failed and rolls the item; append-time emits a
+        generic error envelope and closes the WebSocket."""
         # Bare prompt under slicing: emitted_text is not injected as a
         # continuation prefix; the retained overlap + output dedupe
         # takes its place.
