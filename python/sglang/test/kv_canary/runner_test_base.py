@@ -49,6 +49,7 @@ def make_manager(
     group: CanaryBufferGroup | None = None,
     req_pool: SimpleNamespace | None = None,
     per_forward_verify_capacity: int = 16,
+    speculative_num_steps: int = 1,
 ) -> CanaryManager:
     if config is None:
         config = make_config()
@@ -66,6 +67,7 @@ def make_manager(
             per_forward_write_req_capacity=2,
             per_forward_write_entry_capacity=8,
         ),
+        speculative_num_steps=speculative_num_steps,
     )
 
 
