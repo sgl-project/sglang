@@ -97,8 +97,8 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    is_npu,
     is_non_idle_and_non_empty,
+    is_npu,
     make_layers,
     use_intel_amx_backend,
 )
@@ -596,10 +596,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def op_combine_b(self, state):
         if self.ep_size > 1:
-            state.hidden_states_after_combine = (
-                self.experts.dispatcher.combine_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
+            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
     def op_output(self, state):

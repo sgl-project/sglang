@@ -26,6 +26,9 @@ from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
 
+# TBO
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+
 # Configs
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -96,15 +99,11 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
-    is_non_idle_and_non_empty,
     is_npu,
     make_layers,
     set_weight_attrs,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
-
-# TBO
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -846,18 +845,20 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             output["input_deepstack_embeds"] = input_deepstack_embeds
 
         state.clear(
-            expect_keys={
-                "positions",
-                "forward_batch",
-                "tbo_subbatch_index",
-                "input_deepstack_embeds",
-            }
-            if input_deepstack_embeds is not None
-            else {
-                "positions",
-                "forward_batch",
-                "tbo_subbatch_index",
-            }
+            expect_keys=(
+                {
+                    "positions",
+                    "forward_batch",
+                    "tbo_subbatch_index",
+                    "input_deepstack_embeds",
+                }
+                if input_deepstack_embeds is not None
+                else {
+                    "positions",
+                    "forward_batch",
+                    "tbo_subbatch_index",
+                }
+            )
         )
         return output
 
@@ -1293,18 +1294,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             output["input_deepstack_embeds"] = input_deepstack_embeds
 
         state.clear(
-            expect_keys={
-                "positions",
-                "forward_batch",
-                "tbo_subbatch_index",
-                "input_deepstack_embeds",
-            }
-            if input_deepstack_embeds is not None
-            else {
-                "positions",
-                "forward_batch",
-                "tbo_subbatch_index",
-            }
+            expect_keys=(
+                {
+                    "positions",
+                    "forward_batch",
+                    "tbo_subbatch_index",
+                    "input_deepstack_embeds",
+                }
+                if input_deepstack_embeds is not None
+                else {
+                    "positions",
+                    "forward_batch",
+                    "tbo_subbatch_index",
+                }
+            )
         )
         return output
 

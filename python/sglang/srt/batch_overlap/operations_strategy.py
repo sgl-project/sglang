@@ -37,11 +37,15 @@ class OperationsStrategy:
         forward_mode: ForwardMode,
     ) -> "OperationsStrategy":
         # Filter out PPMissingLayer for Pipeline Parallelism
-        real_layers = [layer for layer in layers if not isinstance(layer, PPMissingLayer)]
+        real_layers = [
+            layer for layer in layers if not isinstance(layer, PPMissingLayer)
+        ]
         if len(real_layers) == 0:
             # All layers are PPMissingLayer, return empty strategy
-            return OperationsStrategy(operations=[], deep_gemm_num_sms=None, tbo_delta_stages=0)
-        
+            return OperationsStrategy(
+                operations=[], deep_gemm_num_sms=None, tbo_delta_stages=0
+            )
+
         layer_name = real_layers[0].__class__.__name__
         if layer_name == "DeepseekV2DecoderLayer":
             return OperationsStrategy.concat(

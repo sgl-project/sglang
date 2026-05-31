@@ -847,7 +847,7 @@ def model_forward_maybe_tbo(
     if len(real_layers) == 0:
         # All layers are PPMissingLayer, just return inputs
         return hidden_states, residual
-    
+
     layer_input_scatter_mode = real_layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
         real_layers, forward_batch.global_forward_mode
