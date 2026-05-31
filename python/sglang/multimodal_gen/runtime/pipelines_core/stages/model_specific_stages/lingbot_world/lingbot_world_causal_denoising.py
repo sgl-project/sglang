@@ -35,7 +35,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_LINGBOT_SEQUENCE_SHARDED_GLOBAL_CACHE_CHUNKS = 24
+_LINGBOT_SEQUENCE_SHARDED_GLOBAL_CACHE_CHUNKS = 48
 
 
 class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
