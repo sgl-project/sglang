@@ -19,6 +19,8 @@ ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_1100="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_1100_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -32,6 +34,9 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
+ENV SGLANG_USE_AITER="1"
+ENV SGLANG_USE_ROCM700A="1"
+ENV PYTORCH_ROCM_ARCH="gfx942;gfx950"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -42,6 +47,9 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
+ENV SGLANG_USE_AITER="1"
+ENV SGLANG_USE_ROCM700A="1"
+ENV PYTORCH_ROCM_ARCH="gfx942;gfx950"
 
 # ===============================
 # Base image 950 and args
@@ -52,6 +60,9 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
+ENV SGLANG_USE_AITER="1"
+ENV SGLANG_USE_ROCM700A="1"
+ENV PYTORCH_ROCM_ARCH="gfx942;gfx950"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -62,6 +73,35 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
+ENV SGLANG_USE_AITER="1"
+ENV SGLANG_USE_ROCM700A="1"
+ENV PYTORCH_ROCM_ARCH="gfx942;gfx950"
+
+# ===============================
+# Base image 1100 (7900XTX, consumer GPU) with rocm700 and args
+FROM $BASE_IMAGE_1100 AS gfx1100
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="0"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT=""
+ENV SGLANG_USE_AITER="0"
+ENV HSA_OVERRIDE_GFX_VERSION="11.0.0"
+ENV PYTORCH_ROCM_ARCH="gfx1100"
+
+# ===============================
+# Base image 1100 (7900XTX, consumer GPU) with rocm720 and args
+FROM $BASE_IMAGE_1100_ROCM720 AS gfx1100-rocm720
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="0"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT=""
+ENV SGLANG_USE_AITER="0"
+ENV HSA_OVERRIDE_GFX_VERSION="11.0.0"
+ENV PYTORCH_ROCM_ARCH="gfx1100"
 
 # ===============================
 # Chosen arch and args
@@ -70,7 +110,6 @@ FROM ${GPU_ARCH}
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
-ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
@@ -210,13 +249,16 @@ RUN pip uninstall -y aiter
 # block switching to commits that predate that rule (e.g. the current default
 # AITER_COMMIT_DEFAULT). The working tree was just produced by a fresh
 # `git clone` above, so there are no real user changes to preserve.
-RUN git clone ${AITER_REPO} \
+RUN if [ "$SGLANG_USE_AITER" = "1" ]; then \
+     git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
- && pip install -r requirements.txt
+ && pip install -r requirements.txt; \
+    fi
 
-RUN cd aiter \
+RUN if [ "$SGLANG_USE_AITER" = "1" ]; then \
+     cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
@@ -228,7 +270,8 @@ RUN cd aiter \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         fi \
-      && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
+      && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc; \
+    fi
 
 # -----------------------
 # Build Mooncake
@@ -585,8 +628,6 @@ ENV SGLANG_MOE_PADDING=1
 ENV SGLANG_ROCM_DISABLE_LINEARQUANT=0
 ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
-ENV SGLANG_USE_AITER=1
-ENV SGLANG_USE_ROCM700A=1
 
 ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
