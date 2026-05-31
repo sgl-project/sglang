@@ -482,7 +482,7 @@ def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():
     assert state.sample_camera_actions(3) == [["s"], ["s"], ["s"]]
 
 
-def test_lingbot_realtime_adapter_waits_for_input_after_initial_chunk():
+def test_lingbot_realtime_adapter_does_not_wait_for_idle_chunks():
     async def run():
         adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
         session = GenerateSession()
@@ -490,12 +490,7 @@ def test_lingbot_realtime_adapter_waits_for_input_after_initial_chunk():
         await adapter.wait_for_next_chunk(session)
 
         session.generate_chunk_cnt = 1
-        task = asyncio.create_task(adapter.wait_for_next_chunk(session))
-        await asyncio.sleep(0)
-
-        assert not task.done()
-        adapter._state(session).receive_camera_actions([["w"]], event_id=1)
-        await asyncio.wait_for(task, timeout=1)
+        await asyncio.wait_for(adapter.wait_for_next_chunk(session), timeout=1)
 
     asyncio.run(run())
 
