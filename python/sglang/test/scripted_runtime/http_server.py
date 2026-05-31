@@ -26,11 +26,10 @@ from typing import Any, Callable, Optional, Tuple
 
 import zmq
 
+from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.environ import envs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
-from sglang.test.scripted_runtime.http_server_subprocess import (
-    launch_scripted_http_server,
-)
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
     RunScript,
@@ -100,16 +99,26 @@ class ScriptedHttpServer:
             kwargs=dict(
                 host=host,
                 port=port,
-                traceback_path=str(traceback_path),
                 **engine_kwargs,
             ),
             name="scripted-runtime-http-server",
             daemon=False,
         )
-        # Spawn-mode children snapshot os.environ at start(); seed the IPC
-        # endpoint via override so the spawned process (and the scheduler it
-        # launches) inherit it, then restore the caller's env.
-        with envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint):
+        # Spawn-mode children snapshot os.environ at start(); seed the
+        # scripted-runtime env vars via override so the spawned process (and
+        # the scheduler it launches) inherit them, then restore the caller's
+        # env. SYS_PATH_ENTRY keeps the scripted-runtime package directory on
+        # the spawn-mode subprocess's sys.path so user sub-scripts resolve by
+        # qualified name in the scheduler subprocess.
+        sys_path_entry = os.path.dirname(os.path.abspath(__file__))
+        with (
+            envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint),
+            envs.SGLANG_TEST_SCRIPTED_RUNTIME.override(True),
+            envs.SGLANG_TEST_SCRIPTED_RUNTIME_TRACEBACK_PATH.override(
+                str(traceback_path)
+            ),
+            envs.SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY.override(sys_path_entry),
+        ):
             server_process.start()
 
         # Poll for the dispatch loop's HookReady; a stuck server startup
@@ -239,3 +248,40 @@ class ScriptedHttpServer:
         if process.is_alive():
             process.kill()
             process.join(timeout=10.0)
+
+
+def launch_scripted_http_server(
+    *,
+    model_path: str,
+    host: str,
+    port: int,
+    **engine_overrides: Any,
+) -> None:
+    """Subprocess entry point: run the dispatch loop behind a real HTTP server.
+
+    Runs inside the dedicated ``mp.Process`` spawned by
+    :meth:`ScriptedHttpServer.start`. The ``SGLANG_TEST_SCRIPTED_RUNTIME*`` env
+    vars (seeded by ``start`` via ``override`` before the process starts) make
+    every scheduler subprocess install a :class:`ScriptedSchedulerHook`; the
+    driver rank's hook owns the ZMQ dispatch loop that pulls and runs each
+    caller-requested sub-script.
+
+    Running the HTTP server in its own subprocess (rather than a background
+    thread of the test process) matches a real deployment and sidesteps the
+    ``uvicorn`` "signal only works in main thread" failure — uvicorn installs
+    its signal handlers in this subprocess's main thread.
+
+    Blocks in :func:`launch_server` until the scheduler subprocess(es)
+    terminate (the dispatch loop returning on shutdown triggers a clean
+    scheduler exit; the watchdog then stops the server). On a fatal
+    scheduler-side exception the traceback is written to the path named by
+    ``SGLANG_TEST_SCRIPTED_RUNTIME_TRACEBACK_PATH`` for the session to surface.
+    """
+    server_args = ServerArgs(
+        model_path=model_path,
+        host=host,
+        port=port,
+        **engine_overrides,
+    )
+
+    launch_server(server_args)

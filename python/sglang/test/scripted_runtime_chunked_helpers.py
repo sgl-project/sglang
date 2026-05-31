@@ -6,7 +6,7 @@ scripts uniform, not in factoring shared logic.
 
 API surface used by these tests:
 
-* :func:`sglang.test.scripted_runtime.http_server_subprocess.launch_scripted_http_server`
+* :func:`sglang.test.scripted_runtime.http_server.launch_scripted_http_server`
 * :class:`sglang.test.scripted_runtime.ScriptedContext`
 * :class:`sglang.test.scripted_runtime.ScriptedReqHandle`
 """
