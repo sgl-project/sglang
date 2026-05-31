@@ -137,4 +137,5 @@ def _advance_generator(generator: Generator) -> Tuple[bool, Optional[str]]:
     except StopIteration:
         return True, None
     except Exception:
+        logger.exception("Failed to advance generator")
         return True, traceback.format_exc()
