@@ -380,7 +380,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
       "Tensor!? out, Tensor? alibi_slopes, "
       "float p_dropout, float softmax_scale, bool is_causal, "
-      "float softcap, bool return_softmax, Generator? gen)"
+      "float softcap, bool return_softmax)"
       "-> Tensor[]");
   m.impl("fwd_sparse", torch::kCUDA, &flash::mha_fwd_sparse);
 
@@ -390,8 +390,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor!? out, Tensor cu_seqlens_q, "
       "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? alibi_slopes, "
       "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
-      "bool is_causal, float softcap, bool return_softmax, "
-      "Generator? gen) -> Tensor[]");
+      "bool is_causal, float softcap, bool return_softmax)"
+      " -> Tensor[]");
   m.impl("varlen_fwd_sparse", torch::kCUDA, &flash::mha_varlen_fwd_sparse);
 
   // Sparse Attention utils

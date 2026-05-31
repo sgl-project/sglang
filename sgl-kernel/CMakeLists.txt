@@ -79,11 +79,11 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashinfer)
 
-# flash-attention
+# flash-attention — local dev override pointing at janeyx's sparse-fa2-no-philox commit
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
+    GIT_REPOSITORY /home/janeyx/repos/sgl-flash-attn
+    GIT_TAG        a069560
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
