@@ -1214,6 +1214,123 @@ class TestParallelRankInFilename:
         assert any("pp_rank=2" in f and "tp_rank=3" in f for f in filenames)
 
 
+class TestTransformModelParamName:
+    def test_base_plugin_returns_none(self):
+        """The default plugin hook keeps the original name (returns None)."""
+        plugin = _SGLangPlugin()
+        assert (
+            plugin.transform_model_param_name(torch.nn.Linear(2, 2), "layers.0.weight")
+            is None
+        )
+
+    def test_dump_model_keeps_name_without_transform(self, tmp_path):
+        """With no plugin rewriting names, dump_model uses the original param name."""
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
+
+        d.dump_model(model, name_prefix="m")
+
+        _assert_files(_get_filenames(tmp_path), exist=["m__layers.0.weight"])
+
+    def test_dump_model_applies_plugin_transform(self, tmp_path, monkeypatch):
+        """dump_model rewrites param names through the plugin transform hook."""
+
+        def _shift_layers(self, model, param_name):
+            return re.sub(
+                r"layers\.(\d+)", lambda m: f"layers.{int(m.group(1)) + 4}", param_name
+            )
+
+        monkeypatch.setattr(_SGLangPlugin, "transform_model_param_name", _shift_layers)
+
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
+
+        d.dump_model(model, name_prefix="m")
+
+        _assert_files(
+            _get_filenames(tmp_path),
+            exist=["m__layers.4.weight"],
+            not_exist=["m__layers.0.weight"],
+        )
+
+    def test_get_model_config_unwraps_module_chain(self):
+        """_get_model_config peels nested .module wrappers to find .config."""
+        config = object()
+        leaf = type("Leaf", (), {"config": config})()
+        wrapped = type("W", (), {"module": type("W2", (), {"module": leaf})()})()
+        assert _MegatronPlugin._get_model_config(wrapped) is config
+
+    def test_get_model_config_returns_none_when_absent(self):
+        """_get_model_config returns None when no .config is reachable."""
+        assert _MegatronPlugin._get_model_config(object()) is None
+
+
+class _FakeMpu:
+    _pp_size = 2
+
+    @classmethod
+    def get_pipeline_model_parallel_world_size(cls):
+        return cls._pp_size
+
+
+class TestMegatronTransformModelParamName:
+    @pytest.fixture(autouse=True)
+    def _patch_megatron(self, monkeypatch):
+        monkeypatch.setattr(_MegatronPlugin, "_available", True)
+        monkeypatch.setattr(_MegatronPlugin, "_mpu", _FakeMpu, raising=False)
+        monkeypatch.setattr(
+            _MegatronPlugin,
+            "_get_model_config",
+            staticmethod(lambda model: object()),
+        )
+        monkeypatch.setattr(
+            _MegatronPlugin,
+            "_get_transformer_layer_offset",
+            staticmethod(lambda config: 4),
+        )
+
+    def test_remaps_local_layer_index_to_global(self):
+        """layers.N is shifted by the PP-stage offset; other tokens untouched."""
+        plugin = _MegatronPlugin()
+        result = plugin.transform_model_param_name(object(), "decoder.layers.0.weight")
+        assert result == "decoder.layers.4.weight"
+
+    def test_remaps_all_layer_occurrences(self):
+        """Every ``layers.N`` occurrence in the name is shifted."""
+        plugin = _MegatronPlugin()
+        result = plugin.transform_model_param_name(object(), "layers.1.x.layers.2.y")
+        assert result == "layers.5.x.layers.6.y"
+
+    def test_returns_none_when_not_available(self, monkeypatch):
+        """No transform when megatron is unavailable."""
+        monkeypatch.setattr(_MegatronPlugin, "_available", False)
+        plugin = _MegatronPlugin()
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
+
+    def test_returns_none_when_pp_size_one(self, monkeypatch):
+        """No transform without pipeline parallelism (pp_size == 1)."""
+        monkeypatch.setattr(_FakeMpu, "_pp_size", 1)
+        plugin = _MegatronPlugin()
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
+        monkeypatch.setattr(_FakeMpu, "_pp_size", 2)
+
+    def test_returns_none_when_offset_zero(self, monkeypatch):
+        """A zero offset (e.g. first PP stage) leaves the name unchanged (None)."""
+        monkeypatch.setattr(
+            _MegatronPlugin,
+            "_get_transformer_layer_offset",
+            staticmethod(lambda config: 0),
+        )
+        plugin = _MegatronPlugin()
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
+
+
 class TestCleanup:
     def test_cleanup_removes_old_dumps(self, tmp_path):
         old_dir = tmp_path / "dump_old"
