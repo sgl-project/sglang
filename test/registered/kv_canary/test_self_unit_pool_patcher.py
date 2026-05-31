@@ -10,6 +10,7 @@ from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_base_config,
     make_mha_pool,
+    make_swa_pool,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +42,22 @@ class TestAttachCanaryBuffers(PoolPatcherHelper, CustomTestCase):
         self.assertIsNotNone(group.v_tail)
         self.assertEqual(group.v_head.shape, (16, CANARY_SLOT_BYTES))
 
+    def test_canary_buffer_group_allocate_full_and_swa(self):
+        """Verify SWA pools allocate full and SWA canary buffers."""
+        pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
+        groups_tuple = attach_canary_buffers(
+            pool=pool,
+            config=self.config,
+            device=self.device,
+            kv_token_id_vs_position_offset=0,
+        )
+        groups = {g.kind: g for g in groups_tuple}
+        self.assertEqual(set(groups.keys()), {PoolKind.FULL, PoolKind.SWA})
+        self.assertEqual(groups[PoolKind.FULL].k_head.shape[0], 16)
+        self.assertEqual(groups[PoolKind.SWA].k_head.shape[0], 8)
+        self.assertIsNotNone(groups[PoolKind.SWA].swa_index_lut)
+        self.assertIsNone(groups[PoolKind.FULL].swa_index_lut)
+
 
 class TestPoolPatcherBufferInfos(PoolPatcherHelper, CustomTestCase):
     def test_get_contiguous_buf_infos_inserts_canary_entries(self):
@@ -63,6 +80,24 @@ class TestPoolPatcherBufferInfos(PoolPatcherHelper, CustomTestCase):
                 else:
                     ptrs_after, _, _ = pool.get_contiguous_buf_infos()
                     self.assertEqual(ptrs_after, ptrs_before)
+
+    def test_swa_attach_splices_full_into_contiguous_and_swa_into_state(self):
+        """Verify SWA patching splices canary buffers into both buffer lists."""
+        pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
+        contiguous_before, _, _ = pool.get_contiguous_buf_infos()
+        state_before, _, _ = pool.get_state_buf_infos()
+
+        attach_canary_buffers(
+            pool=pool,
+            config=self.config,
+            device=self.device,
+            kv_token_id_vs_position_offset=0,
+        )
+
+        contiguous_after, _, _ = pool.get_contiguous_buf_infos()
+        state_after, _, _ = pool.get_state_buf_infos()
+        self.assertEqual(len(contiguous_after), len(contiguous_before) + 4)
+        self.assertEqual(len(state_after), len(state_before) + 4)
 
     def test_pd_layout_canary_inserted_correctly(self):
         """Verify PD (prefill-decode disaggregation) canary buffers are inserted in layout order."""

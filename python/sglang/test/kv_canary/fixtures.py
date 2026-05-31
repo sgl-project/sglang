@@ -10,6 +10,7 @@ from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patcher.adapters.mha import attach_mha
+from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patcher.api import register_pool_attacher
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -35,6 +36,48 @@ class FakeMHAPool:
         return ptrs, lens, item_lens
 
 
+@dataclass
+class FakeSwaSubPool:
+    k_buffer: List[torch.Tensor]
+    v_buffer: List[torch.Tensor]
+
+
+@dataclass
+class FakeSWAPool:
+    full_kv_pool: object
+    swa_kv_pool: object
+    full_to_swa_index_mapping: torch.Tensor
+    page_size: int = 1
+
+    def get_contiguous_buf_infos(self):
+        return _kv_buf_infos(
+            k_buffer=self.full_kv_pool.k_buffer,
+            v_buffer=self.full_kv_pool.v_buffer,
+            page_size=self.page_size,
+        )
+
+    def get_state_buf_infos(self):
+        return _kv_buf_infos(
+            k_buffer=self.swa_kv_pool.k_buffer,
+            v_buffer=self.swa_kv_pool.v_buffer,
+            page_size=self.page_size,
+        )
+
+
+def _kv_buf_infos(
+    *,
+    k_buffer: List[torch.Tensor],
+    v_buffer: List[torch.Tensor],
+    page_size: int,
+) -> tuple:
+    ptrs = [b.data_ptr() for b in k_buffer] + [b.data_ptr() for b in v_buffer]
+    lens = [b.nbytes for b in k_buffer] + [b.nbytes for b in v_buffer]
+    item_lens = [b[0].nbytes * page_size for b in k_buffer] + [
+        b[0].nbytes * page_size for b in v_buffer
+    ]
+    return ptrs, lens, item_lens
+
+
 def make_mha_pool(
     device: torch.device = DEFAULT_DEVICE,
     *,
@@ -51,6 +94,41 @@ def make_mha_pool(
         for _ in range(layer_num)
     ]
     return FakeMHAPool(layer_num=layer_num, k_buffer=k_layers, v_buffer=v_layers)
+
+
+def make_swa_pool(
+    device: torch.device = DEFAULT_DEVICE,
+    *,
+    full_slots: int = 16,
+    swa_slots: int = 8,
+    dim: int = 8,
+    layer_num: int = 1,
+) -> FakeSWAPool:
+    full = FakeSwaSubPool(
+        k_buffer=[
+            torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+        v_buffer=[
+            torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+    )
+    swa = FakeSwaSubPool(
+        k_buffer=[
+            torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+        v_buffer=[
+            torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
+            for _ in range(layer_num)
+        ],
+    )
+    lut = torch.full((full_slots + 1,), -1, dtype=torch.int64, device=device)
+    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int64, device=device)
+    return FakeSWAPool(
+        full_kv_pool=full, swa_kv_pool=swa, full_to_swa_index_mapping=lut
+    )
 
 
 def make_base_config() -> CanaryConfig:
@@ -189,3 +267,4 @@ def make_radix_cache(
 
 
 register_pool_attacher(FakeMHAPool, attach_mha)
+register_pool_attacher(FakeSWAPool, attach_swa)
