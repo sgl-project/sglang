@@ -415,6 +415,26 @@ def test_listen_generate_request_propagates_disconnect_without_error_write():
     assert sent_messages == []
 
 
+def test_wait_for_active_session_slot_observes_release(monkeypatch):
+    async def run():
+        realtime_video_api._ACTIVE_SESSION_IDS.clear()
+        realtime_video_api._ACTIVE_SESSION_IDS.add("old-session")
+
+        async def fake_sleep(_seconds):
+            realtime_video_api._ACTIVE_SESSION_IDS.clear()
+
+        monkeypatch.setattr(realtime_video_api.asyncio, "sleep", fake_sleep)
+        try:
+            return await realtime_video_api._wait_for_active_session_slot(
+                timeout_s=1.0,
+                interval_s=0.1,
+            )
+        finally:
+            realtime_video_api._ACTIVE_SESSION_IDS.clear()
+
+    assert asyncio.run(run())
+
+
 def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
     session = GenerateSession()

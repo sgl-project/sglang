@@ -41,6 +41,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 _ACTIVE_SESSION_IDS: set[str] = set()
+_ACTIVE_SESSION_WAIT_SECONDS = 5.0
+_ACTIVE_SESSION_WAIT_INTERVAL_SECONDS = 0.1
+
+
+async def _wait_for_active_session_slot(
+    *,
+    timeout_s: float = _ACTIVE_SESSION_WAIT_SECONDS,
+    interval_s: float = _ACTIVE_SESSION_WAIT_INTERVAL_SECONDS,
+) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while _ACTIVE_SESSION_IDS and time.monotonic() < deadline:
+        await asyncio.sleep(interval_s)
+    return not _ACTIVE_SESSION_IDS
 
 
 def _log_realtime_chunk_timing(
@@ -261,7 +274,7 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
 async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
     await websocket.accept()
-    if _ACTIVE_SESSION_IDS:
+    if _ACTIVE_SESSION_IDS and not await _wait_for_active_session_slot():
         logger.warning(
             "reject realtime session because another session is active: %s",
             sorted(_ACTIVE_SESSION_IDS),
