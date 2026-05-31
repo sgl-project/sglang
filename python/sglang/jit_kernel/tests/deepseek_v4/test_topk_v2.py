@@ -151,6 +151,20 @@ def _run(scores, seq_lens, page_table, inv_cpu, k):
     return [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
 
 
+def _run_raw(scores, seq_lens, page_table, k):
+    """Run the kernel and return its optional raw (pre-transform) top-k index
+    output per row, dropping -1 padding -- the selected positions themselves,
+    NOT the page-table transform of them."""
+    batch = scores.shape[0]
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    raw = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    metadata = plan_topk_v2(seq_lens)
+    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
+    torch.cuda.synchronize()
+    raw_cpu = raw.cpu().tolist()
+    return [[v for v in raw_cpu[i] if v != -1] for i in range(batch)]
+
+
 @pytest.mark.parametrize("page_mode", ["identity", "perm"])
 @pytest.mark.parametrize("k", [512, 1024, 2048])
 @pytest.mark.parametrize("batch,seq", FIXED_CONFIGS)
@@ -254,6 +268,31 @@ def test_topk_v2_raw_indices(batch: int, seq: int, page_mode: str) -> None:
             else:
                 inv = (int(inv_cpu[i][o >> PAGE_BITS]) << PAGE_BITS) | (o & PAGE_MASK)
                 assert r == inv, f"b={i} j={j}: raw={r} != inverse(out)={inv}"
+
+
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("batch,seq", FIXED_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
+    """Validate the raw (pre-transform) index output DIRECTLY against torch.topk.
+
+    Unlike ``test_topk_v2`` -- which checks the page-transformed output and inverts
+    it through the page table -- this exercises the selected indices themselves, so
+    it isolates the top-k selection from the page-table transform. A permuted page
+    table is used so raw != out, catching any bug that leaks transformed page
+    indices into the raw buffer. Covers every dispatch template/boundary.
+    """
+    torch.manual_seed(batch * 100003 + seq * 7 + k + 1)
+    device = "cuda"
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(batch, num_pages, "perm", device)
+
+    our_raw = _run_raw(scores, seq_lens, page_table, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
 if __name__ == "__main__":
