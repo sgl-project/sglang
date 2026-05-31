@@ -73,8 +73,8 @@ class ScriptedHttpServer:
         )
         sys_path_entry = os.path.dirname(os.path.abspath(__file__))
         with (
-            envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint),
             envs.SGLANG_TEST_SCRIPTED_RUNTIME.override(True),
+            envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.override(endpoint),
             envs.SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH.override(
                 str(out_of_band_error_path)
             ),
