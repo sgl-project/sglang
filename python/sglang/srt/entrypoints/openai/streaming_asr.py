@@ -41,8 +41,8 @@ class StreamingASRState:
     unfixed_chunk_num: int
     unfixed_token_num: int
     confirmed_text: str = ""
-    # Monotonic accumulator; used as prompt prefix so the model sees a
-    # natural continuation point, not the rolled-back ``confirmed_text``.
+    # Monotonic accumulator. Used as the prompt prefix on cumulative paths and
+    # as the dedupe prefix on the slicing path.
     emitted_text: str = ""
     full_transcript: str = ""
     chunk_index: int = 0
@@ -68,10 +68,9 @@ class StreamingASRState:
             self.confirmed_text = ""
         self.full_transcript = new_transcript
         self.chunk_index += 1
-        if self.confirmed_text.startswith(old_confirmed):
-            return self._record_emit(self.confirmed_text[len(old_confirmed) :].strip())
-        # Model revised earlier text, use word level common prefix to avoid
-        # re-emitting already-sent content and cutting mid-word.
+        # Token-level common prefix, not char-level startswith: startswith
+        # sliced mid-word when a confirmed token was extended ("world" ->
+        # "worldly" emitted "ly").
         old_words = old_confirmed.split()
         new_words = self.confirmed_text.split()
         common_count = 0
@@ -173,22 +172,23 @@ def _dedupe_norm(word: str) -> str:
 def _dedupe_word_level(committed_text: str, candidate_out: str) -> str:
     """Drop the longest prefix of ``candidate_out`` matching the suffix of
     ``committed_text`` word-for-word (case- and punctuation-insensitive)."""
-    cand_words = candidate_out.split()
-    if not cand_words:
+    candidate_words = candidate_out.split()
+    if not candidate_words:
         return candidate_out
-    c_words = committed_text.split()
-    if not c_words:
+    committed_words = committed_text.split()
+    if not committed_words:
         return candidate_out
-    # Longest possible overlap is bounded by candidate length; normalize
-    # only that tail of committed text instead of scanning the whole history.
-    # Pre-normalize once instead of O(k²) calls inside the inner loop, then
-    # compare list slices in C rather than glyph-by-glyph in Python.
-    max_k = min(len(c_words), len(cand_words))
-    c_norm = [_dedupe_norm(w) for w in c_words[-max_k:]]
-    cand_norm = [_dedupe_norm(w) for w in cand_words]
-    for k in range(max_k, 0, -1):
-        if c_norm[-k:] == cand_norm[:k]:
-            return " ".join(cand_words[k:])
+    # The overlap is at most as long as the candidate, so only the last
+    # `max_overlap` committed words can match. Normalize that committed tail and
+    # the candidate prefix once, then compare list slices instead of
+    # re-normalizing inside the loop.
+    max_overlap = min(len(committed_words), len(candidate_words))
+    committed_tail_norm = [_dedupe_norm(w) for w in committed_words[-max_overlap:]]
+    candidate_norm = [_dedupe_norm(w) for w in candidate_words[:max_overlap]]
+    # Longest overlap first; the first match wins.
+    for overlap in range(max_overlap, 0, -1):
+        if committed_tail_norm[-overlap:] == candidate_norm[:overlap]:
+            return " ".join(candidate_words[overlap:])
     return candidate_out
 
 
@@ -209,29 +209,28 @@ def _dedupe_cjk_char_level(committed_text: str, candidate_out: str) -> str:
     """Drop leading CJK glyphs of ``candidate_out`` matching the CJK-tail of
     ``committed_text``. Non-CJK glyphs are skipped during match, preserved
     in trimmed output."""
-    cand_chars = [c for c in candidate_out if not c.isspace() and _is_cjk(c)]
-    if not cand_chars:
+    candidate_chars = [c for c in candidate_out if not c.isspace() and _is_cjk(c)]
+    if not candidate_chars:
         return candidate_out
-    # Longest possible overlap is bounded by candidate CJK length; collect
-    # only that tail of committed CJK glyphs instead of scanning the whole
-    # history. We iterate committed_text in reverse and stop once we have
-    # len(cand_chars) CJK glyphs.
-    max_cand = len(cand_chars)
-    c_tail_rev = []
+    # The overlap is at most the candidate's CJK length, so collect only that
+    # many CJK glyphs from the end of committed_text (scanning in reverse and
+    # stopping early) instead of the whole history.
+    max_overlap = len(candidate_chars)
+    committed_tail_rev = []
     for c in reversed(committed_text):
         if c.isspace() or not _is_cjk(c):
             continue
-        c_tail_rev.append(c)
-        if len(c_tail_rev) >= max_cand:
+        committed_tail_rev.append(c)
+        if len(committed_tail_rev) >= max_overlap:
             break
-    if not c_tail_rev:
+    if not committed_tail_rev:
         return candidate_out
-    c_chars = list(reversed(c_tail_rev))
-    max_k = min(len(c_chars), len(cand_chars))
-    for k in range(max_k, 0, -1):
-        if c_chars[-k:] != cand_chars[:k]:
+    committed_tail_chars = list(reversed(committed_tail_rev))
+    # Longest overlap first; the first match wins.
+    for overlap in range(len(committed_tail_chars), 0, -1):
+        if committed_tail_chars[-overlap:] != candidate_chars[:overlap]:
             continue
-        cut_pos = _find_kth_cjk_pos(candidate_out, k)
+        cut_pos = _find_kth_cjk_pos(candidate_out, overlap)
         if cut_pos is None:
             return ""
         return candidate_out[cut_pos:].lstrip()
