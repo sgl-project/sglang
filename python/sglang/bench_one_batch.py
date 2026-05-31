@@ -388,7 +388,7 @@ def prepare_extend_inputs_for_correctness_test(
         req.fill_len = len(req.full_untruncated_fill_ids)
         if model_runner is not None:
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                i, : bench_args.cut_len
+                req.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
             req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
@@ -539,7 +539,7 @@ class _MlxBenchRunner:
         if server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = server_args.max_total_tokens
         self.mlx_runner = MlxModelRunner(**init_kwargs)
-        self.mlx_runner.init_kv_pool(req_to_token_pool=None)
+        self.mlx_runner.init_cache_pools(req_to_token_pool=None)
         self.fake_torch_runner = model_runner
 
     def clear(self):
