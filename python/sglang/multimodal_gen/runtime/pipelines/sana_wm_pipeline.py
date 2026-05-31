@@ -1,15 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# SANA-WM TI2V pipelines.
-#
-#   SanaWMPipeline (single-stage):
-#     InputValidation -> TextEncoding (Gemma-2) -> SanaWMBeforeDenoising
-#       -> Denoising -> standard decoding (LTX-2 VAE)
-#
-#   SanaWMTwoStagePipeline (matches NVlabs official inference):
-#     ... -> Denoising -> SanaWMLTX2RefinerStage
-#       -> refiner decoding (LTX-2 VAE + drop clean sink anchor frame)
-#
+
 import os
 
 # Stage-2 refiner sub-modules live under `<model_path>/refiner/...` rather

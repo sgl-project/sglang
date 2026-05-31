@@ -18,6 +18,20 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_SANA_WM_TRITON_GDN_DISABLED_REASON: Optional[str] = None
+_SANA_WM_TRITON_GDN_FALLBACK_LOGGED = False
+
+
+def _log_sana_wm_triton_gdn_fallback(reason: str) -> None:
+    global _SANA_WM_TRITON_GDN_FALLBACK_LOGGED
+    if not _SANA_WM_TRITON_GDN_FALLBACK_LOGGED:
+        logger.warning(
+            "SANA-WM Triton GDN fast path is unavailable; falling back to torch "
+            "GDN scan. reason=%s",
+            reason,
+        )
+        _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = True
+
 
 # ---------------------------------------------------------------------------
 # Small primitives (RMSNorm, ShortConvolution) -- shapes match upstream
@@ -217,6 +231,177 @@ def _apply_block_diagonal(
     assert feats.shape[-1] == sum(block_sizes), (feats.shape, block_sizes)
     x_blocks = torch.split(feats, list(block_sizes), dim=-1)
     return torch.cat([f(b) for f, b in zip(funcs, x_blocks)], dim=-1)
+
+
+def _sana_wm_chunk_index_from_chunk_size(
+    T: int,
+    chunk_size: int,
+    strategy: str = "uniform",
+) -> list[int]:
+    """Return upstream-style temporal chunk start indices."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}.")
+    if T <= 0:
+        raise ValueError(f"T must be > 0, got {T}.")
+
+    strategy = "uniform" if strategy is None else str(strategy).lower()
+
+    if strategy in ("uniform", "default"):
+        indices = list(range(0, T, chunk_size))
+        if len(indices) > 1 and (T - indices[-1]) < chunk_size:
+            indices.pop()
+        return indices
+
+    if strategy in ("first_frame", "first_frame_alone", "first_frame_only"):
+        if T <= 1:
+            return [0]
+        indices = [0] + list(range(1, T, chunk_size))
+        if len(indices) > 2 and (T - indices[-1]) < chunk_size:
+            indices.pop()
+        return indices
+
+    if strategy in ("first_plus_one", "first_chunk_plus_one"):
+        if T <= chunk_size + 1:
+            return [0]
+        indices = [0] + list(range(chunk_size + 1, T, chunk_size))
+        if len(indices) > 1 and (T - indices[-1]) < chunk_size:
+            indices.pop()
+        return indices
+
+    raise ValueError(
+        f"Unknown chunk_split_strategy '{strategy}'. Supported: "
+        "uniform, first_frame, first_plus_one."
+    )
+
+
+def _sana_wm_normalize_chunk_index(
+    chunk_index: Optional[List[int]],
+    T: int,
+    chunk_size: Optional[int] = None,
+    chunk_split_strategy: str = "uniform",
+) -> list[int]:
+    if chunk_index is not None:
+        normalized = [int(idx) for idx in chunk_index]
+        if not normalized or normalized[0] != 0:
+            normalized = [0] + [idx for idx in normalized if idx > 0]
+        normalized = [idx for idx in normalized if idx < T]
+        if not normalized:
+            normalized = [0]
+    else:
+        if chunk_size is None:
+            raise ValueError("Either chunk_index or chunk_size must be provided.")
+        normalized = _sana_wm_chunk_index_from_chunk_size(
+            T,
+            int(chunk_size),
+            strategy=chunk_split_strategy,
+        )
+
+    if normalized[-1] != T:
+        normalized.append(T)
+    if any(end <= start for start, end in zip(normalized[:-1], normalized[1:])):
+        raise ValueError(f"chunk_index must be strictly increasing, got {normalized}.")
+    return normalized
+
+
+def _sana_wm_chunk_boundaries_for_attention(
+    HW: Tuple[int, int, int],
+    chunk_size: Optional[int],
+    chunk_split_strategy: str,
+    chunk_index: Optional[List[int]],
+) -> Optional[list[int]]:
+    T, _, _ = HW
+    if chunk_index is None and (chunk_size is None or int(chunk_size) >= T):
+        return None
+
+    boundaries = _sana_wm_normalize_chunk_index(
+        chunk_index,
+        T,
+        chunk_size=chunk_size,
+        chunk_split_strategy=chunk_split_strategy,
+    )
+    if boundaries == [0, T]:
+        return None
+    return boundaries
+
+
+def _sana_wm_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> torch.Tensor:
+    q_sdpa = q.transpose(1, 2)
+    k_sdpa = k.transpose(1, 2)
+    v_sdpa = v.transpose(1, 2)
+
+    dtype_orig = q_sdpa.dtype
+    head_dim = q_sdpa.shape[-1]
+    need_pad = head_dim not in (32, 64, 128, 256) and head_dim < 256
+    if need_pad:
+        pad_to = 128 if head_dim <= 128 else 256
+        pad_size = pad_to - head_dim
+        q_sdpa = F.pad(q_sdpa, (0, pad_size))
+        k_sdpa = F.pad(k_sdpa, (0, pad_size))
+        v_sdpa = F.pad(v_sdpa, (0, pad_size))
+
+    # CUDA SDPA cannot use flash kernels for fp32; SANA's reference code casts
+    # to bf16 on that path and casts the output back to the caller dtype.
+    if q_sdpa.device.type == "cuda" and q_sdpa.dtype == torch.float32:
+        q_sdpa = q_sdpa.bfloat16()
+        k_sdpa = k_sdpa.bfloat16()
+        v_sdpa = v_sdpa.bfloat16()
+
+    out = F.scaled_dot_product_attention(
+        q_sdpa,
+        k_sdpa,
+        v_sdpa,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=softmax_scale,
+    )
+    if need_pad:
+        out = out[..., :head_dim]
+    return out.transpose(1, 2).to(dtype_orig)
+
+
+def _sana_wm_chunked_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    HW: Tuple[int, int, int],
+    chunk_size: Optional[int],
+    chunk_split_strategy: str,
+    chunk_index: Optional[List[int]],
+    softmax_scale: float,
+) -> Optional[torch.Tensor]:
+    """Exact chunk-causal softmax attention without materializing an NxN mask."""
+    boundaries = _sana_wm_chunk_boundaries_for_attention(
+        HW,
+        chunk_size,
+        chunk_split_strategy,
+        chunk_index,
+    )
+    if boundaries is None:
+        return None
+
+    _, H_sp, W_sp = HW
+    tokens_per_frame = H_sp * W_sp
+    out_chunks = []
+    for start_frame, end_frame in zip(boundaries[:-1], boundaries[1:]):
+        query_start = start_frame * tokens_per_frame
+        query_end = end_frame * tokens_per_frame
+        kv_end = end_frame * tokens_per_frame
+        out_chunks.append(
+            _sana_wm_sdpa(
+                q[:, query_start:query_end],
+                k[:, :kv_end],
+                v[:, :kv_end],
+                softmax_scale=softmax_scale,
+            )
+        )
+    return torch.cat(out_chunks, dim=1)
 
 
 def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
@@ -861,6 +1046,100 @@ def _gdn_scan_forward(
     return num / (den + eps)
 
 
+def _gdn_chunk_scan_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    chunk_size: Optional[int] = 21,
+    eps: float = 1e-6,
+    return_components: bool = False,
+) -> torch.Tensor:
+    """Chunk-scan form of SANA GDN.
+
+    This mirrors upstream ``torch_chunk_sana_gdn`` algebraically, but computes
+    W/U per chunk instead of materializing all temporal transitions at once.
+    That keeps peak memory closer to the recurrent path on long videos.
+    """
+    B, H, D, N = q.shape
+    T = beta.shape[2]
+    S = N // T
+
+    def fold(x: torch.Tensor) -> torch.Tensor:
+        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
+
+    q, k, v = fold(q), fold(k), fold(v)
+    q_rot, k_rot = fold(q_rot), fold(k_rot)
+    if beta.ndim == 4:
+        beta_e = beta.unsqueeze(3)
+    else:
+        beta_e = beta.view(B, H, T, 1, 1)
+    decay_e = decay.view(B, H, T, 1, 1)
+
+    if chunk_size is None or int(chunk_size) <= 0:
+        boundaries = [0, T]
+    else:
+        boundaries = _sana_wm_normalize_chunk_index(
+            None,
+            T,
+            chunk_size=int(chunk_size),
+            chunk_split_strategy="uniform",
+        )
+
+    eye = torch.eye(D, device=q.device, dtype=q.dtype).view(1, 1, 1, D, D)
+    state_kv = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
+    state_z = torch.zeros(B, H, D, 1, device=q.device, dtype=q.dtype)
+    num_chunks, den_chunks = [], []
+
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        q_c = q[:, :, start:end]
+        k_c = k[:, :, start:end]
+        v_c = v[:, :, start:end]
+        q_rot_c = q_rot[:, :, start:end]
+        k_rot_c = k_rot[:, :, start:end]
+        beta_c = beta_e[:, :, start:end]
+        decay_c = decay_e[:, :, start:end]
+
+        k_rot_beta = k_rot_c * beta_c
+        w_kv = decay_c * (
+            eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2))
+        )
+        u_kv = torch.matmul(v_c * beta_c, k_rot_c.transpose(-1, -2))
+
+        k_beta = k_c * beta_c
+        w_z = decay_c * (eye - torch.matmul(k_beta, k_c.transpose(-1, -2)))
+        u_z = k_beta.sum(dim=-1, keepdim=True)
+
+        state_kv_frames, state_z_frames = [], []
+        for offset in range(end - start):
+            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[
+                :, :, offset
+            ]
+            state_z = torch.matmul(w_z[:, :, offset], state_z) + u_z[:, :, offset]
+            state_kv_frames.append(state_kv)
+            state_z_frames.append(state_z)
+
+        state_kv_all = torch.stack(state_kv_frames, dim=2)
+        state_z_all = torch.stack(state_z_frames, dim=2)
+        num_chunks.append(torch.matmul(state_kv_all, q_rot_c))
+        den_chunks.append(torch.matmul(state_z_all.transpose(-1, -2), q_c))
+
+    num = torch.cat(num_chunks, dim=2)
+    den = torch.cat(den_chunks, dim=2)
+
+    def restore(tensor: torch.Tensor, d_out: int) -> torch.Tensor:
+        return tensor.permute(0, 1, 3, 2, 4).reshape(B, H, d_out, N)
+
+    num = restore(num, D)
+    den = restore(den, 1)
+    if return_components:
+        return num, den
+    return num / (den + eps)
+
+
 def _flip_and_shift(x: torch.Tensor, dim: int, shift_val: float = 0.0) -> torch.Tensor:
     """``flip_and_shift`` helper from upstream: flip along ``dim`` then shift
     by one with ``shift_val`` filling the head.  Used for the backward pass
@@ -882,15 +1161,48 @@ def _gdn_scan_bidirectional(
     beta: torch.Tensor,
     decay: torch.Tensor,
     HW: Tuple[int, int, int],
+    chunk_size: Optional[int] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Bidirectional GDN: forward (inclusive) + backward (exclusive) scan,
     summed in numerator/denominator space (mirrors upstream
     ``BidirectionalGDN.forward``).
     """
-    num_fwd, den_fwd = _gdn_scan_forward(
-        q, k, v, q_rot, k_rot, beta, decay, eps=eps, return_components=True
-    )
+    def run_scan(
+        q_in: torch.Tensor,
+        k_in: torch.Tensor,
+        v_in: torch.Tensor,
+        q_rot_in: torch.Tensor,
+        k_rot_in: torch.Tensor,
+        beta_in: torch.Tensor,
+        decay_in: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if chunk_size is None:
+            return _gdn_scan_forward(
+                q_in,
+                k_in,
+                v_in,
+                q_rot_in,
+                k_rot_in,
+                beta_in,
+                decay_in,
+                eps=eps,
+                return_components=True,
+            )
+        return _gdn_chunk_scan_forward(
+            q_in,
+            k_in,
+            v_in,
+            q_rot_in,
+            k_rot_in,
+            beta_in,
+            decay_in,
+            chunk_size=chunk_size,
+            eps=eps,
+            return_components=True,
+        )
+
+    num_fwd, den_fwd = run_scan(q, k, v, q_rot, k_rot, beta, decay)
 
     # Backward pass: flip Q, flip+shift K/V/k_rot/beta and shift decay-by-1.
     B, H, D, N = q.shape
@@ -923,7 +1235,7 @@ def _gdn_scan_bidirectional(
     q_rot_bwd_f = from_time(q_rot_bwd, D)
     k_rot_bwd_f = from_time(k_rot_bwd, D)
 
-    num_bwd_flipped, den_bwd_flipped = _gdn_scan_forward(
+    num_bwd_flipped, den_bwd_flipped = run_scan(
         q_bwd_f,
         k_bwd_f,
         v_bwd_f,
@@ -931,8 +1243,6 @@ def _gdn_scan_bidirectional(
         k_rot_bwd_f,
         beta_bwd,
         decay_bwd,
-        eps=eps,
-        return_components=True,
     )
 
     def flip_back(tensor):
@@ -996,6 +1306,72 @@ def _single_path_delta_scan_forward(
     return out.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
 
 
+def _single_path_delta_chunk_scan_forward(
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    chunk_size: Optional[int] = 21,
+) -> torch.Tensor:
+    """Chunk-scan form of the SANA-WM camera single-path delta rule."""
+    B, H, D, N = q_rot.shape
+    T = beta.shape[2]
+    S = N // T
+
+    def fold(x: torch.Tensor) -> torch.Tensor:
+        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
+
+    q_rot = fold(q_rot)
+    k_rot = fold(k_rot)
+    v = fold(v)
+    if beta.ndim == 4:
+        beta_e = beta.unsqueeze(3)
+    else:
+        beta_e = beta.view(B, H, T, 1, 1)
+    decay_e = decay.view(B, H, T, 1, 1)
+
+    if chunk_size is None or int(chunk_size) <= 0:
+        boundaries = [0, T]
+    else:
+        boundaries = _sana_wm_normalize_chunk_index(
+            None,
+            T,
+            chunk_size=int(chunk_size),
+            chunk_split_strategy="uniform",
+        )
+
+    eye = torch.eye(D, device=q_rot.device, dtype=q_rot.dtype).view(1, 1, 1, D, D)
+    state_kv = torch.zeros(B, H, D, D, device=q_rot.device, dtype=q_rot.dtype)
+    out_chunks = []
+
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        q_rot_c = q_rot[:, :, start:end]
+        k_rot_c = k_rot[:, :, start:end]
+        v_c = v[:, :, start:end]
+        beta_c = beta_e[:, :, start:end]
+        decay_c = decay_e[:, :, start:end]
+
+        k_rot_beta = k_rot_c * beta_c
+        w_kv = decay_c * (
+            eye - torch.matmul(k_rot_beta, k_rot_c.transpose(-1, -2))
+        )
+        u_kv = torch.matmul(v_c * beta_c, k_rot_c.transpose(-1, -2))
+
+        state_frames = []
+        for offset in range(end - start):
+            state_kv = torch.matmul(state_kv, w_kv[:, :, offset]) + u_kv[
+                :, :, offset
+            ]
+            state_frames.append(state_kv)
+
+        state_all = torch.stack(state_frames, dim=2)
+        out_chunks.append(torch.matmul(state_all, q_rot_c))
+
+    out = torch.cat(out_chunks, dim=2)
+    return out.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+
+
 def _single_path_delta_scan_bidirectional(
     q_rot: torch.Tensor,
     k_rot: torch.Tensor,
@@ -1003,6 +1379,7 @@ def _single_path_delta_scan_bidirectional(
     beta: torch.Tensor,
     decay: torch.Tensor,
     HW: Tuple[int, int, int],
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Bidirectional single-path camera scan.
 
@@ -1010,7 +1387,15 @@ def _single_path_delta_scan_bidirectional(
     forward scan plus exclusive backward scan with ``flip_and_shift`` on K/V,
     beta, and decay.
     """
-    out_fwd = _single_path_delta_scan_forward(q_rot, k_rot, v, beta, decay)
+    scan_forward = (
+        _single_path_delta_chunk_scan_forward
+        if chunk_size is not None
+        else _single_path_delta_scan_forward
+    )
+    if chunk_size is None:
+        out_fwd = scan_forward(q_rot, k_rot, v, beta, decay)
+    else:
+        out_fwd = scan_forward(q_rot, k_rot, v, beta, decay, chunk_size=chunk_size)
 
     B, H, D, N = q_rot.shape
     T, H_sp, W_sp = HW
@@ -1032,13 +1417,23 @@ def _single_path_delta_scan_bidirectional(
     beta_bwd = _flip_and_shift(beta, dim=2, shift_val=0.0)
     decay_bwd = _flip_and_shift(decay, dim=2, shift_val=1.0)
 
-    out_bwd_flipped = _single_path_delta_scan_forward(
-        from_time(q_rot_bwd),
-        from_time(k_rot_bwd),
-        from_time(v_bwd),
-        beta_bwd,
-        decay_bwd,
-    )
+    if chunk_size is None:
+        out_bwd_flipped = scan_forward(
+            from_time(q_rot_bwd),
+            from_time(k_rot_bwd),
+            from_time(v_bwd),
+            beta_bwd,
+            decay_bwd,
+        )
+    else:
+        out_bwd_flipped = scan_forward(
+            from_time(q_rot_bwd),
+            from_time(k_rot_bwd),
+            from_time(v_bwd),
+            beta_bwd,
+            decay_bwd,
+            chunk_size=chunk_size,
+        )
     out_bwd = torch.flip(
         out_bwd_flipped.view(B, H, D, T, S),
         dims=[3],
@@ -1089,6 +1484,11 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         k_conv_only: bool = True,
         eps: float = 1e-8,
         softmax_main: bool = False,
+        update_rule: str = "torch_chunk",
+        cam_update_rule: str = "torch_chunk",
+        chunk_gdn_chunk_size: int = 21,
+        use_chunked_softmax_attention: bool = False,
+        gdn_backend: str = "auto",
     ) -> None:
         super().__init__()
         out_dim = heads * head_dim
@@ -1101,6 +1501,22 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.dim = head_dim
         self.eps = eps
         self.softmax_main = softmax_main
+        self.update_rule = update_rule
+        self.cam_update_rule = cam_update_rule
+        self.chunk_gdn_chunk_size = chunk_gdn_chunk_size
+        self.use_chunked_softmax_attention = use_chunked_softmax_attention
+        self.gdn_backend = gdn_backend
+        if self.update_rule not in ("torch_chunk", "torch_recurrent"):
+            raise ValueError(f"Unsupported SANA-WM update_rule: {self.update_rule}")
+        if self.cam_update_rule not in ("torch_chunk", "torch_recurrent"):
+            raise ValueError(
+                f"Unsupported SANA-WM cam_update_rule: {self.cam_update_rule}"
+            )
+        if self.gdn_backend not in ("auto", "torch", "triton"):
+            raise ValueError(
+                "Unsupported SANA-WM gdn_backend: "
+                f"{self.gdn_backend}. Expected one of auto, torch, triton."
+            )
 
         # Main branch: fused QKV + output proj (shared with cam branch)
         self.qkv = nn.Linear(in_dim, 3 * out_dim, bias=False)
@@ -1197,6 +1613,103 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
     # ------------------------------------------------------------------ #
 
+    def _triton_gdn_unavailable_reason(
+        self,
+        qkv: torch.Tensor,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        HW: Tuple[int, int, int],
+    ) -> Optional[str]:
+        if self.gdn_backend == "torch":
+            return "gdn_backend=torch"
+        if _SANA_WM_TRITON_GDN_DISABLED_REASON is not None:
+            return _SANA_WM_TRITON_GDN_DISABLED_REASON
+        if self.training or torch.is_grad_enabled():
+            return "requires eval/inference mode"
+        if not qkv.is_cuda:
+            return "requires CUDA tensor"
+        if qkv.dtype not in (torch.float16, torch.bfloat16):
+            return f"requires fp16/bf16 qkv, got {qkv.dtype}"
+        if not qkv.is_contiguous():
+            return "qkv must be contiguous"
+        if beta.ndim != 4:
+            return f"requires beta shape (B, H, T, S), got {tuple(beta.shape)}"
+
+        B, N, three, heads, head_dim = qkv.shape
+        T, H_sp, W_sp = HW
+        S = H_sp * W_sp
+        if three != 3:
+            return f"requires qkv third dim=3, got {three}"
+        if N != T * S:
+            return f"requires N=T*S, got N={N}, T*S={T * S}"
+        if head_dim > 128:
+            return f"requires head_dim <= 128, got {head_dim}"
+        if beta.shape != (B, heads, T, S):
+            return f"requires beta shape {(B, heads, T, S)}, got {tuple(beta.shape)}"
+        if decay.shape != (B, heads, T):
+            return f"requires decay shape {(B, heads, T)}, got {tuple(decay.shape)}"
+        if not hasattr(self.q_norm, "weight") or not hasattr(self.k_norm, "weight"):
+            return "requires learned q/k RMSNorm weights"
+        return None
+
+    def _maybe_main_branch_triton_gdn(
+        self,
+        qkv: torch.Tensor,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        HW: Tuple[int, int, int],
+        rotary_emb: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        global _SANA_WM_TRITON_GDN_DISABLED_REASON
+
+        reason = self._triton_gdn_unavailable_reason(qkv, beta, decay, HW)
+        if reason is not None:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(f"SANA-WM Triton GDN backend unavailable: {reason}")
+            return None
+
+        try:
+            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
+                fused_bigdn_func,
+                fused_qk_inv_rms,
+                prepare_rope_tables,
+            )
+
+            B, N, _, heads, head_dim = qkv.shape
+            T, H_sp, W_sp = HW
+            S = H_sp * W_sp
+            q_norm_weight = self.q_norm.weight.float().contiguous()
+            k_norm_weight = self.k_norm.weight.float().contiguous()
+            norm_eps = float(getattr(self.q_norm, "eps", 1e-5))
+            q_inv_rms, k_inv_rms = fused_qk_inv_rms(qkv, eps=norm_eps)
+            rope_cos, rope_sin = prepare_rope_tables(
+                rotary_emb, N, head_dim, qkv.device
+            )
+            out = fused_bigdn_func(
+                qkv,
+                q_inv_rms,
+                k_inv_rms,
+                q_norm_weight=q_norm_weight,
+                k_norm_weight=k_norm_weight,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+                beta=beta.contiguous(),
+                decay=decay.contiguous(),
+                F=T,
+                S=S,
+                k_scale=(head_dim**-0.5) * (S**-0.5),
+                eps=self.eps,
+            )
+            return out.reshape(B, N, heads * head_dim)
+        except Exception as exc:
+            if self.gdn_backend == "triton":
+                raise
+            _SANA_WM_TRITON_GDN_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_gdn_fallback(str(exc))
+            return None
+
+    # ------------------------------------------------------------------ #
+
     def _main_branch_gdn(
         self,
         x: torch.Tensor,
@@ -1210,7 +1723,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         T, H_sp, W_sp = HW
         S = H_sp * W_sp
 
-        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
+        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim).contiguous()
         q, k, v = qkv.unbind(2)
 
         # Short conv on K only.
@@ -1219,6 +1732,29 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 k.reshape(B, N, C), self.conv_k, HW, bidirectional=True
             )
             k = k.reshape(B, N, self.heads, self.dim)
+            qkv = torch.stack((q, k, v), dim=2).contiguous()
+
+        beta, decay = _compute_frame_gates(
+            x,
+            HW,
+            self.heads,
+            self.beta_proj,
+            self.gate_proj,
+            self.dt_bias,
+            self.A_log,
+        )
+
+        triton_out = self._maybe_main_branch_triton_gdn(
+            qkv,
+            beta,
+            decay,
+            HW,
+            rotary_emb,
+        )
+        if triton_out is not None:
+            return triton_out, beta, decay
+
+        q, k, v = qkv.unbind(2)
 
         # Q/K norm on the flattened channel dim (B, N, C)
         q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
@@ -1242,18 +1778,11 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             q_rot = q
             k_rot = k
 
-        beta, decay = _compute_frame_gates(
-            x,
-            HW,
-            self.heads,
-            self.beta_proj,
-            self.gate_proj,
-            self.dt_bias,
-            self.A_log,
-        )
-
         # fp32 scan for stability
         dtype = q.dtype
+        scan_chunk_size = (
+            self.chunk_gdn_chunk_size if self.update_rule == "torch_chunk" else None
+        )
         out = _gdn_scan_bidirectional(
             q.float(),
             k.float(),
@@ -1263,6 +1792,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             beta.float(),
             decay.float(),
             HW=HW,
+            chunk_size=scan_chunk_size,
             eps=self.eps,
         ).to(dtype)
 
@@ -1274,6 +1804,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         x: torch.Tensor,
         HW: Tuple[int, int, int],
         rotary_emb: Optional[torch.Tensor],
+        chunk_size: Optional[int] = None,
+        chunk_split_strategy: str = "uniform",
+        chunk_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Softmax variant of the main branch, dispatched through SGLang's
         pluggable attention backend.
@@ -1300,11 +1833,23 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if rotary_emb is not None:
             q = _apply_rotary_emb_bhnd(q, rotary_emb)
             k = _apply_rotary_emb_bhnd(k, rotary_emb)
-        out = self.softmax_attn(
-            q.transpose(1, 2).contiguous(),
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
-        )  # (B, N, H, D)
+        q_in = q.transpose(1, 2).contiguous()
+        k_in = k.transpose(1, 2).contiguous()
+        v_in = v.transpose(1, 2).contiguous()
+        out = None
+        if self.use_chunked_softmax_attention:
+            out = _sana_wm_chunked_attention(
+                q_in,
+                k_in,
+                v_in,
+                HW=HW,
+                chunk_size=chunk_size,
+                chunk_split_strategy=chunk_split_strategy,
+                chunk_index=chunk_index,
+                softmax_scale=self.softmax_attn.softmax_scale,
+            )
+        if out is None:
+            out = self.softmax_attn(q_in, k_in, v_in)
         out = out.reshape(B, N, C)
 
         # Compute the gates anyway -- they are needed by the cam branch and
@@ -1389,6 +1934,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             beta = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
 
         dtype = q_dn.dtype
+        scan_chunk_size = (
+            self.chunk_gdn_chunk_size if self.cam_update_rule == "torch_chunk" else None
+        )
         out = _single_path_delta_scan_bidirectional(
             q_dn.float(),
             k_dn.float(),
@@ -1396,6 +1944,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             beta.float(),
             decay.float(),
             HW=HW,
+            chunk_size=scan_chunk_size,
         ).to(dtype)
         # apply inverse UCPE projection on output
         out_bhnd = out.permute(0, 1, 3, 2)
@@ -1409,6 +1958,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         apply_q: Callable,
         apply_kv: Callable,
         apply_o: Callable,
+        chunk_size: Optional[int] = None,
+        chunk_split_strategy: str = "uniform",
+        chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
         B, N, C = x.shape
 
@@ -1443,7 +1995,20 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         q_in = q_dn.permute(0, 3, 1, 2).contiguous()
         k_in = k_dn.permute(0, 3, 1, 2).contiguous()
         v_in = v_dn.permute(0, 3, 1, 2).contiguous()
-        out = self.softmax_attn(q_in, k_in, v_in)  # (B, N, H, D)
+        out = None
+        if self.use_chunked_softmax_attention:
+            out = _sana_wm_chunked_attention(
+                q_in,
+                k_in,
+                v_in,
+                HW=HW,
+                chunk_size=chunk_size,
+                chunk_split_strategy=chunk_split_strategy,
+                chunk_index=chunk_index,
+                softmax_scale=self.softmax_attn.softmax_scale,
+            )
+        if out is None:
+            out = self.softmax_attn(q_in, k_in, v_in)  # (B, N, H, D)
 
         out_bhnd = out.transpose(1, 2).contiguous()
         out_bhnd = apply_o(out_bhnd)
@@ -1457,16 +2022,35 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         HW: Tuple[int, int, int],
         rotary_emb: Optional[torch.Tensor] = None,
         prope_fns: Optional[Tuple[Callable, Callable, Callable]] = None,
+        chunk_size: Optional[int] = None,
+        chunk_split_strategy: str = "uniform",
+        chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
         if self.softmax_main:
-            main_raw, beta, decay = self._main_branch_softmax(x, HW, rotary_emb)
+            main_raw, beta, decay = self._main_branch_softmax(
+                x,
+                HW,
+                rotary_emb,
+                chunk_size=chunk_size,
+                chunk_split_strategy=chunk_split_strategy,
+                chunk_index=chunk_index,
+            )
         else:
             main_raw, beta, decay = self._main_branch_gdn(x, HW, rotary_emb)
 
         if prope_fns is not None:
             apply_q, apply_kv, apply_o = prope_fns
             if self.softmax_main:
-                cam_raw = self._cam_branch_softmax(x, HW, apply_q, apply_kv, apply_o)
+                cam_raw = self._cam_branch_softmax(
+                    x,
+                    HW,
+                    apply_q,
+                    apply_kv,
+                    apply_o,
+                    chunk_size=chunk_size,
+                    chunk_split_strategy=chunk_split_strategy,
+                    chunk_index=chunk_index,
+                )
             else:
                 cam_raw = self._cam_branch(
                     x, HW, apply_q, apply_kv, apply_o, beta, decay
@@ -1556,9 +2140,18 @@ class SanaWMBlock(nn.Module):
         k_conv_only: bool,
         softmax_main: bool,
         use_chunk_plucker_post_attn: bool,
+        chunk_size: Optional[int] = None,
+        chunk_split_strategy: str = "uniform",
+        update_rule: str = "torch_chunk",
+        cam_update_rule: str = "torch_chunk",
+        chunk_gdn_chunk_size: int = 21,
+        use_chunked_softmax_attention: bool = False,
+        gdn_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.softmax_main = softmax_main
+        self.chunk_size = chunk_size
+        self.chunk_split_strategy = chunk_split_strategy
 
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -1571,6 +2164,11 @@ class SanaWMBlock(nn.Module):
             conv_kernel_size=conv_kernel_size,
             k_conv_only=k_conv_only,
             softmax_main=softmax_main,
+            update_rule=update_rule,
+            cam_update_rule=cam_update_rule,
+            chunk_gdn_chunk_size=chunk_gdn_chunk_size,
+            use_chunked_softmax_attention=use_chunked_softmax_attention,
+            gdn_backend=gdn_backend,
         )
 
         self.cross_attn = MultiHeadCrossAttention(
@@ -1621,6 +2219,9 @@ class SanaWMBlock(nn.Module):
         prope_fns: Optional[Tuple[Callable, Callable, Callable]],
         plucker_emb: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
+        chunk_size: Optional[int] = None,
+        chunk_split_strategy: Optional[str] = None,
+        chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
         B = x.shape[0]
         if t.dim() == 2:
@@ -1643,7 +2244,19 @@ class SanaWMBlock(nn.Module):
                 self.norm1(x), num_frames
             )
             x_in = self._modulate(x_norm, shift_msa, scale_msa).reshape_as(x)
-        attn_out = self.attn(x_in, HW=HW, rotary_emb=rotary_emb, prope_fns=prope_fns)
+        attn_out = self.attn(
+            x_in,
+            HW=HW,
+            rotary_emb=rotary_emb,
+            prope_fns=prope_fns,
+            chunk_size=self.chunk_size if chunk_size is None else chunk_size,
+            chunk_split_strategy=(
+                self.chunk_split_strategy
+                if chunk_split_strategy is None
+                else chunk_split_strategy
+            ),
+            chunk_index=chunk_index,
+        )
         if num_frames is None:
             x = x + gate_msa * attn_out
         else:
@@ -1767,6 +2380,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self.plucker_embedder = None
         self.use_chunk_plucker_post_attn = arch.use_chunk_plucker_post_attn
         self.use_chunk_plucker_input = arch.use_chunk_plucker_input
+        self.chunk_size = getattr(arch, "chunk_size", None)
+        self.chunk_split_strategy = getattr(arch, "chunk_split_strategy", "uniform")
 
         # --- RoPE ---
         self.rope = WanRotaryPosEmbed(
@@ -1805,6 +2420,15 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                             or i < arch.chunk_plucker_post_attn_blocks
                         )
                     ),
+                    chunk_size=self.chunk_size,
+                    chunk_split_strategy=self.chunk_split_strategy,
+                    update_rule=getattr(arch, "update_rule", "torch_chunk"),
+                    cam_update_rule=getattr(arch, "cam_update_rule", "torch_chunk"),
+                    chunk_gdn_chunk_size=getattr(arch, "chunk_gdn_chunk_size", 21),
+                    use_chunked_softmax_attention=getattr(
+                        arch, "use_chunked_softmax_attention", False
+                    ),
+                    gdn_backend=getattr(arch, "gdn_backend", "auto"),
                 )
                 for i in range(depth)
             ]
@@ -1861,6 +2485,11 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         T = T_raw // p_t
         H = H_raw // p_h
         W = W_raw // p_w
+        chunk_size = kwargs.get("chunk_size", self.chunk_size)
+        chunk_split_strategy = kwargs.get(
+            "chunk_split_strategy", self.chunk_split_strategy
+        )
+        chunk_index = kwargs.get("chunk_index", None)
 
         # --- 1. Patch embed: (B, C, T, H, W) -> (B, T*H*W, D) ---
         x = self.x_embedder(hidden_states.to(dtype=self.x_embedder.proj.weight.dtype))
@@ -1959,6 +2588,9 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 prope_fns=prope_fns,
                 plucker_emb=plucker_emb,
                 mask=encoder_attention_mask,
+                chunk_size=chunk_size,
+                chunk_split_strategy=chunk_split_strategy,
+                chunk_index=chunk_index,
             )
 
         # --- 7. Final layer ---

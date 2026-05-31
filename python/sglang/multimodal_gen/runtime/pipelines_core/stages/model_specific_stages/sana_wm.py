@@ -690,6 +690,14 @@ class SanaWMDenoisingStage(DenoisingStage):
             )
 
         extra = batch.extra or {}
+        diffusers_kwargs = extra.get("diffusers_kwargs", {})
+        if not isinstance(diffusers_kwargs, dict):
+            diffusers_kwargs = {}
+        chunk_kwargs = {}
+        for key in ("chunk_index", "chunk_size", "chunk_split_strategy"):
+            value = extra.get(key, diffusers_kwargs.get(key))
+            if value is not None:
+                chunk_kwargs[key] = value
         camera_conditions = _to_device_dtype(
             extra.get("camera_conditions"), device=device, dtype=target_dtype
         )
@@ -780,6 +788,7 @@ class SanaWMDenoisingStage(DenoisingStage):
                             else chunk_plucker
                         ),
                     }
+                model_kwargs.update(chunk_kwargs)
 
                 with set_forward_context(
                     current_timestep=step_idx,
@@ -1712,13 +1721,26 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         vae_temporal_stride = self.pipeline_config.vae_stride[0]
         camera_compute_dtype = torch.float32
 
-        camera_conditions = extra.get("camera_conditions", None)
-        chunk_plucker = extra.get("chunk_plucker", None)
         diffusers_kwargs = extra.get("diffusers_kwargs", {})
         if not isinstance(diffusers_kwargs, dict):
             diffusers_kwargs = {}
+        camera_conditions = self._first_request_mapping_value(
+            extra, diffusers_kwargs, "camera_conditions"
+        )
+        chunk_plucker = self._first_request_mapping_value(
+            extra, diffusers_kwargs, "chunk_plucker"
+        )
         preprocess_info = extra.get(_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY)
         action = self._request_action_value(extra, diffusers_kwargs)
+        arch = getattr(
+            getattr(self.pipeline_config, "dit_config", None),
+            "arch_config",
+            None,
+        )
+        requires_chunk_plucker = bool(
+            getattr(arch, "use_chunk_plucker_post_attn", False)
+            or getattr(arch, "use_chunk_plucker_input", False)
+        )
         if action is not None and (
             camera_conditions is not None or chunk_plucker is not None
         ):
@@ -1741,6 +1763,12 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 )
             if camera_conditions.shape[0] == 1 and batch_size > 1:
                 camera_conditions = camera_conditions.expand(batch_size, -1, -1)
+            if camera_conditions.shape[0] != batch_size:
+                raise ValueError(
+                    "camera_conditions batch dimension must be 1 or match "
+                    f"request batch size {batch_size}, got "
+                    f"{camera_conditions.shape[0]}."
+                )
             if camera_conditions.shape[-1] != 20:
                 raise ValueError(
                     "camera_conditions must have last dimension 20, got "
@@ -1748,6 +1776,14 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 )
             if camera_conditions.shape[1] == T_lat:
                 source = "prepacked"
+                if chunk_plucker is None and requires_chunk_plucker:
+                    raise ValueError(
+                        "Prepacked latent-frame camera_conditions require "
+                        "chunk_plucker for this SANA-WM checkpoint. Pass "
+                        "chunk_plucker with shape (B,48,T,H,W), or pass "
+                        "original-frame camera_conditions so SGLang can "
+                        "derive chunk_plucker."
+                    )
             else:
                 source = "prebuilt_original_frames"
                 original_camera_conditions = self._pad_or_trim_frames(
@@ -1986,6 +2022,12 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 raise ValueError(
                     "chunk_plucker must have shape (48,T,H,W) or "
                     f"(B,48,T,H,W), got {tuple(chunk_plucker.shape)}"
+                )
+            if chunk_plucker.shape[0] != batch_size:
+                raise ValueError(
+                    "chunk_plucker batch dimension must be 1 or match "
+                    f"request batch size {batch_size}, got "
+                    f"{chunk_plucker.shape[0]}."
                 )
             expected_chunk_shape = (batch_size, 48, T_lat, sp_h, sp_w)
             if tuple(chunk_plucker.shape) != expected_chunk_shape:

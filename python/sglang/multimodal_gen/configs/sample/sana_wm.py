@@ -30,7 +30,9 @@ class SanaWMSamplingParams(SamplingParams):
                          "w-80,jw-40,w-40,lw-60,w-100". This is rolled out
                          to camera_to_world before the existing camera branch.
         If camera_to_world is omitted, SGLang uses a static identity camera.
-        If intrinsics is omitted, SGLang uses centered heuristic intrinsics.
+        If intrinsics is omitted, SGLang uses centered heuristic intrinsics;
+        pass explicit intrinsics for closest parity with NVlabs inference, where
+        missing intrinsics can be estimated from the input image.
     """
 
     data_type: DataType = DataType.VIDEO

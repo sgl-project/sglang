@@ -17,7 +17,14 @@ from sglang.multimodal_gen.registry import _get_config_info, get_pipeline_config
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _downscale_to_reference_rms,
+    _gdn_chunk_scan_forward,
+    _gdn_scan_forward,
     _RMSNorm,
+    _sana_wm_chunk_index_from_chunk_size,
+    _sana_wm_chunked_attention,
+    _sana_wm_normalize_chunk_index,
+    _single_path_delta_chunk_scan_forward,
+    _single_path_delta_scan_forward,
     compute_chunk_plucker,
 )
 from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
@@ -783,6 +790,35 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(camera_conditions.shape, (1, 3, 20))
         self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
 
+    def test_camera_conditioning_accepts_diffusers_prebuilt_raymap(self) -> None:
+        stage = SanaWMBeforeDenoisingStage(
+            vae=None,
+            transformer=None,
+            scheduler=None,
+            pipeline_config=SanaWMPipelineConfig(),
+        )
+        camera_conditions = torch.zeros(1, 17, 20)
+        camera_conditions[..., :16] = torch.eye(4).reshape(1, 1, 16)
+        camera_conditions[..., 16:] = torch.tensor([16.0, 16.0, 10.0, 6.0])
+        batch = SimpleNamespace(
+            extra={"diffusers_kwargs": {"camera_conditions": camera_conditions}},
+            height=384,
+            width=640,
+        )
+
+        camera_conditions, chunk_plucker, source = stage._build_camera_conditioning(
+            batch,
+            batch_size=1,
+            num_frames=17,
+            latent_shape=(1, 128, 3, 12, 20),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(source, "prebuilt_original_frames")
+        self.assertEqual(camera_conditions.shape, (1, 3, 20))
+        self.assertEqual(chunk_plucker.shape, (1, 48, 3, 12, 20))
+
     def test_camera_conditioning_rejects_bad_prepacked_shapes(self) -> None:
         stage = SanaWMBeforeDenoisingStage(
             vae=None,
@@ -801,6 +837,48 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
                 batch_size=1,
                 num_frames=17,
                 latent_shape=(1, 128, 3, 12, 20),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+        with self.assertRaisesRegex(ValueError, "batch dimension"):
+            stage._build_camera_conditioning(
+                SimpleNamespace(
+                    extra={"camera_conditions": torch.zeros(3, 3, 20)},
+                    height=384,
+                    width=640,
+                ),
+                batch_size=2,
+                num_frames=17,
+                latent_shape=(2, 128, 3, 12, 20),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+        with self.assertRaisesRegex(ValueError, "require chunk_plucker"):
+            stage._build_camera_conditioning(
+                SimpleNamespace(
+                    extra={"camera_conditions": torch.zeros(1, 3, 20)},
+                    height=384,
+                    width=640,
+                ),
+                batch_size=1,
+                num_frames=17,
+                latent_shape=(1, 128, 3, 12, 20),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+        with self.assertRaisesRegex(ValueError, "batch dimension"):
+            stage._build_camera_conditioning(
+                SimpleNamespace(
+                    extra={"chunk_plucker": torch.zeros(3, 48, 3, 12, 20)},
+                    height=384,
+                    width=640,
+                ),
+                batch_size=2,
+                num_frames=17,
+                latent_shape=(2, 128, 3, 12, 20),
                 device=torch.device("cpu"),
                 dtype=torch.float32,
             )
@@ -983,6 +1061,140 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
 
         self.assertTrue(torch.allclose(combined_from_pos_rank, serial))
         self.assertTrue(torch.allclose(combined_from_neg_rank, serial))
+
+
+class TestSanaWMNativeDiTChunking(unittest.TestCase):
+    def test_softmax_chunking_is_disabled_by_default_for_upstream_parity(self) -> None:
+        arch = SanaWMConfig().arch_config
+
+        self.assertFalse(arch.use_chunked_softmax_attention)
+
+    def test_main_gdn_backend_defaults_to_auto(self) -> None:
+        arch = SanaWMConfig().arch_config
+
+        self.assertEqual(arch.gdn_backend, "auto")
+
+    def test_first_chunk_plus_one_chunk_indices_match_upstream(self) -> None:
+        self.assertEqual(
+            _sana_wm_chunk_index_from_chunk_size(
+                21, 4, strategy="first_chunk_plus_one"
+            ),
+            [0, 5, 9, 13, 17],
+        )
+
+    def test_normalize_chunk_index_adds_start_and_final_boundary(self) -> None:
+        self.assertEqual(_sana_wm_normalize_chunk_index([3], 5), [0, 3, 5])
+
+    def test_chunked_attention_matches_prefix_attention_per_chunk(self) -> None:
+        torch.manual_seed(0)
+        q = torch.randn(1, 5, 1, 4)
+        k = torch.randn(1, 5, 1, 4)
+        v = torch.randn(1, 5, 1, 4)
+        scale = 0.5
+
+        out = _sana_wm_chunked_attention(
+            q,
+            k,
+            v,
+            HW=(5, 1, 1),
+            chunk_size=2,
+            chunk_split_strategy="first_chunk_plus_one",
+            chunk_index=None,
+            softmax_scale=scale,
+        )
+
+        first = torch.nn.functional.scaled_dot_product_attention(
+            q[:, :3].transpose(1, 2),
+            k[:, :3].transpose(1, 2),
+            v[:, :3].transpose(1, 2),
+            dropout_p=0.0,
+            scale=scale,
+        ).transpose(1, 2)
+        second = torch.nn.functional.scaled_dot_product_attention(
+            q[:, 3:].transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            dropout_p=0.0,
+            scale=scale,
+        ).transpose(1, 2)
+        expected = torch.cat([first, second], dim=1)
+
+        self.assertTrue(torch.allclose(out, expected))
+
+    def test_chunked_attention_returns_none_when_bidirectional(self) -> None:
+        q = torch.randn(1, 3, 1, 4)
+
+        out = _sana_wm_chunked_attention(
+            q,
+            q,
+            q,
+            HW=(3, 1, 1),
+            chunk_size=10,
+            chunk_split_strategy="first_chunk_plus_one",
+            chunk_index=None,
+            softmax_scale=0.5,
+        )
+
+        self.assertIsNone(out)
+
+    def test_gdn_chunk_scan_matches_recurrent_scan(self) -> None:
+        torch.manual_seed(0)
+        B, H, D, T, S = 1, 2, 4, 5, 3
+        N = T * S
+        q = torch.randn(B, H, D, N, dtype=torch.float64)
+        k = torch.randn(B, H, D, N, dtype=torch.float64)
+        v = torch.randn(B, H, D, N, dtype=torch.float64)
+        q_rot = torch.randn(B, H, D, N, dtype=torch.float64)
+        k_rot = torch.randn(B, H, D, N, dtype=torch.float64)
+        beta = torch.sigmoid(torch.randn(B, H, T, S, dtype=torch.float64))
+        decay = torch.sigmoid(torch.randn(B, H, T, dtype=torch.float64))
+
+        recurrent = _gdn_scan_forward(
+            q,
+            k,
+            v,
+            q_rot,
+            k_rot,
+            beta,
+            decay,
+            return_components=True,
+        )
+        chunked = _gdn_chunk_scan_forward(
+            q,
+            k,
+            v,
+            q_rot,
+            k_rot,
+            beta,
+            decay,
+            chunk_size=2,
+            return_components=True,
+        )
+
+        self.assertTrue(torch.allclose(chunked[0], recurrent[0], atol=1e-9))
+        self.assertTrue(torch.allclose(chunked[1], recurrent[1], atol=1e-9))
+
+    def test_camera_chunk_scan_matches_recurrent_scan(self) -> None:
+        torch.manual_seed(0)
+        B, H, D, T, S = 1, 2, 4, 5, 3
+        N = T * S
+        q_rot = torch.randn(B, H, D, N, dtype=torch.float64)
+        k_rot = torch.randn(B, H, D, N, dtype=torch.float64)
+        v = torch.randn(B, H, D, N, dtype=torch.float64)
+        beta = torch.sigmoid(torch.randn(B, H, T, S, dtype=torch.float64))
+        decay = torch.sigmoid(torch.randn(B, H, T, dtype=torch.float64))
+
+        recurrent = _single_path_delta_scan_forward(q_rot, k_rot, v, beta, decay)
+        chunked = _single_path_delta_chunk_scan_forward(
+            q_rot,
+            k_rot,
+            v,
+            beta,
+            decay,
+            chunk_size=2,
+        )
+
+        self.assertTrue(torch.allclose(chunked, recurrent, atol=1e-9))
 
 
 class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):

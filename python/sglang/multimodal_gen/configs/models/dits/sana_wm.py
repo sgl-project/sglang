@@ -53,6 +53,9 @@ class SanaWMArchConfig(DiTArchConfig):
     chunk_gdn_chunk_size: int = 21
     update_rule: str = "torch_chunk"   # main branch update rule
     cam_update_rule: str = "torch_chunk"  # camera branch update rule
+    # main GDN scan backend: "auto" uses the SANA-WM Triton fast path on
+    # supported CUDA inference runs, otherwise falls back to the torch scan.
+    gdn_backend: str = "auto"
 
     # --- Camera conditioning ---
     cam_attn_compress: int = 1        # cam_dim == in_dim
@@ -64,6 +67,10 @@ class SanaWMArchConfig(DiTArchConfig):
 
     chunk_split_strategy: str = "first_chunk_plus_one"
     chunk_size: int = 10
+    # Upstream currently forwards chunk metadata through the softmax blocks but
+    # does not apply a chunk-causal mask there. Keep this disabled by default
+    # for checkpoint-output parity; it can be enabled for experiments.
+    use_chunked_softmax_attention: bool = False
 
     # --- Temporal FFN (GLUMBConvTemp) ---
     ffn_type: str = "GLUMBConvTemp"
