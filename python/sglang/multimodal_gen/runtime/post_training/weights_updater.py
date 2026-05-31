@@ -50,6 +50,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    get_param_names_mapping,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -119,6 +120,9 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     For offloaded modules, updates CPU buffers directly via
     update_cpu_weights(); non-offloaded parameters use in-place copy.
     """
+    model_params = dict(module.named_parameters())
+    weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
+
     offload_managers: list = []
     if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
         offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
@@ -129,9 +133,56 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
         for manager in offload_managers:
             offloaded_names.update(manager.update_cpu_weights(weight_dict))
         remaining = ((n, w) for n, w in weight_dict.items() if n not in offloaded_names)
-        load_weights_into_model(remaining, dict(module.named_parameters()))
+        load_weights_into_model(remaining, model_params)
     else:
-        load_weights_into_model(weights_iter, dict(module.named_parameters()))
+        load_weights_into_model(weights_iter, model_params)
+
+
+def _build_module_weight_name_mapper(module: torch.nn.Module):
+    """Build a chained regex mapper from mapping dicts exposed by the module."""
+    mapping_fns = []
+    for attr in ("lora_param_names_mapping", "param_names_mapping"):
+        mapping = getattr(module, attr, None)
+        if not mapping:
+            continue
+        mapping_fns.append(get_param_names_mapping(mapping))
+
+    if not mapping_fns:
+        return None
+
+    def map_name(name: str) -> str:
+        mapped_name = name
+        for mapping_fn in mapping_fns:
+            mapped_name = mapping_fn(mapped_name)[0]
+        return mapped_name
+
+    return map_name
+
+
+def _iter_module_weight_updates(
+    module: torch.nn.Module,
+    weights_iter,
+    model_params: dict,
+):
+    map_name = _build_module_weight_name_mapper(module)
+    module_name = type(module).__name__
+
+    for name, loaded_weight in weights_iter:
+        if name in model_params:
+            yield name, loaded_weight
+            continue
+
+        mapped_name = map_name(name) if map_name is not None else name
+        if mapped_name in model_params:
+            yield mapped_name, loaded_weight
+            continue
+
+        logger.warning(
+            "Skipping weight update for %s: parameter %r not found after mapping to %r",
+            module_name,
+            name,
+            mapped_name,
+        )
 
 
 def load_weights_into_model(
@@ -140,6 +191,7 @@ def load_weights_into_model(
     """Copy weights from weights_iter into model_params in-place."""
     for name, loaded_weight in weights_iter:
         if name not in model_params:
+            logger.warning("Skipping weight update: parameter %r not found", name)
             continue
         param = model_params[name]
         weight_loader = getattr(param, "weight_loader", None)
