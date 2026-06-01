@@ -6,13 +6,14 @@ Currently supported configurations: **TP=8** (single-node) and **TP=16** (two-no
 
 ### Prerequisites
 
-1. Install [MSCCL++](https://github.com/microsoft/mscclpp) from source (requires CMake and a CUDA toolkit):
+1. If you use the default SGLang Docker image build from `docker/Dockerfile`, [MSCCL++](https://github.com/microsoft/mscclpp) is already installed by default.
+2. If you are not using that Docker image (or want to install manually), install [MSCCL++](https://github.com/microsoft/mscclpp) from source (requires CMake and a CUDA toolkit):
     ```bash
     git clone https://github.com/microsoft/mscclpp.git
     cd mscclpp && mkdir build && cd build
     cmake .. && make -j && pip install ..
     ```
-2. Ensure `mscclpp` is importable in your Python environment before running the benchmark or using MSCCL++ for inference.
+3. Ensure `mscclpp` is importable in your Python environment before running the benchmark or using MSCCL++ for inference.
 
 ### Running the Benchmark
 
@@ -42,7 +43,7 @@ torchrun --nproc_per_node 8 \
 
 ### Inference with MSCCL++
 
-Use the `--disable-custom-all-reduce` and `--enable-mscclpp` flags to select MSCCL++ as the all-reduce backend during CUDA-graph-captured inference:
+Use the `--enable-mscclpp` flag to select MSCCL++ as the all-reduce backend during CUDA-graph-captured inference:
 
 ```bash
 python -m sglang.launch_server \
