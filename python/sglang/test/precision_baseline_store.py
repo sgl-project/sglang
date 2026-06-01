@@ -249,6 +249,7 @@ def push_run(
             lambda: api.upload_folder(
                 repo_id=config.repo,
                 repo_type="dataset",
+                revision=config.revision,
                 folder_path=str(run_dir),
                 path_in_repo=run_path,
                 commit_message=commit_msg,
@@ -280,6 +281,7 @@ def push_run(
                 path_in_repo="manifest.jsonl",
                 repo_id=config.repo,
                 repo_type="dataset",
+                revision=config.revision,
                 commit_message=f"manifest += {sha7} {date_str}",
             ),
             what="manifest upload",
@@ -368,6 +370,7 @@ def prune_old_runs(
                 path_in_repo="manifest.jsonl",
                 repo_id=config.repo,
                 repo_type="dataset",
+                revision=config.revision,
                 commit_message=f"manifest -= {len(pruned_rows)} pruned",
             ),
             what="manifest rewrite (prune)",
