@@ -632,6 +632,7 @@ class SWAComponent(TreeComponent):
         """
         if not transfers:
             return
+        ct = self.component_type
         host_indices = transfers[0].host_indices
         insert_result = kw.get("insert_result")
         pool_storage_result = kw.get("pool_storage_result")

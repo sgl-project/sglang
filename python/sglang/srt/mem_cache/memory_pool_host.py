@@ -2015,7 +2015,6 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
 
-        logger.info(f"Pool {self.pool_name} load {host_rows}")
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
@@ -2350,7 +2349,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
-        logger.info(f"Pool {self.pool_name} load {host_rows}")
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],

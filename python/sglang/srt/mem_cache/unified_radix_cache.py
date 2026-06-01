@@ -1722,6 +1722,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             return True
+        if (
+            completed
+            and getattr(operation, "pool_transfers", None)
+            and not getattr(operation, "pool_transfers_done", True)
+        ):
+            can_terminate = False
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
@@ -2168,7 +2174,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         last_best_match_device_node,
                     )
 
-                logger.info(
+                logger.debug(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(new_indices),
                     best_match_node.id,

@@ -136,6 +136,7 @@ class PrefetchOperation(StorageOperation):
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
         )
+        self.pool_transfers_done = not bool(pool_transfers)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -624,7 +625,6 @@ class HybridCacheController(BaseHiCacheController):
         kv_completed_pages = operation.completed_tokens // self.page_size
         if (
             operation.pool_transfers
-            and not operation.is_terminated()
             and kv_completed_pages == len(operation.hash_value)
         ):
             self._sync_trailing_keys(
@@ -633,6 +633,7 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+        operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
         # Backup extra pools
@@ -666,7 +667,6 @@ class HybridCacheController(BaseHiCacheController):
                 transfer.host_indices = source.host_indices
                 if transfer.keys is None:
                     transfer.keys = source.keys
-                logger.info(f"Resolved {transfer.name} from {source.name}, keys: {transfer.keys}")
             else:
                 transfer.host_indices = operation.host_indices
                 if transfer.keys is None:
