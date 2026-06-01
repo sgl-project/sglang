@@ -56,21 +56,6 @@ def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_S
     )
 
 
-def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_STEPS):
-    # Populate the radix cache with a prefix by running a real request to
-    # completion, so a later request hits the cached prefix. Uniform prompts
-    # only (every manual call site passes [v] * n).
-    assert prompt_tokens, "warmup_radix needs a non-empty prompt"
-    token = prompt_tokens[0]
-    assert all(
-        x == token for x in prompt_tokens
-    ), "warmup_radix supports only uniform prompts"
-    handle = t.start_req(
-        prompt_len=len(prompt_tokens), max_new_tokens=1, prompt_token=token
-    )
-    yield from run_until_finished(handle, max_steps=max_steps)
-
-
 LIFECYCLE_STAGES = (
     "first_chunk",
     "last_chunk",

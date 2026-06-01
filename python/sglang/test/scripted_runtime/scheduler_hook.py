@@ -50,7 +50,6 @@ class ScriptedBatchRecord:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx._scheduler
 
-    ctx._release_exhausted_pools()
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
         yield
