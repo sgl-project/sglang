@@ -3180,13 +3180,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # _in_piecewise_cuda_graph stay consistent with the PCG-traced
                 # graph (preventing runtime recompilation) and (b) PCG-specific
                 # code paths (MoE, attention) can access their layer objects.
-                with enable_piecewise_cuda_graph(), set_forward_context(
-                    forward_batch,
-                    self.attention_layers,
-                    getattr(self.model, "quant_config", None),
-                    self.moe_layers,
-                    self.moe_fusions,
-                    dsa_indexers=self.dsa_indexers,
+                with (
+                    enable_piecewise_cuda_graph(),
+                    set_forward_context(
+                        forward_batch,
+                        self.attention_layers,
+                        getattr(self.model, "quant_config", None),
+                        self.moe_layers,
+                        self.moe_fusions,
+                        dsa_indexers=self.dsa_indexers,
+                    ),
                 ):
                     ret = self.model.forward(
                         forward_batch.input_ids,

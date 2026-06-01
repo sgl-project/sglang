@@ -61,6 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_bool_env_var,
     is_hip,
     is_musa,
     is_npu,

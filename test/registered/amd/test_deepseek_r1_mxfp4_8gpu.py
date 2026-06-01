@@ -43,7 +43,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             "--enforce-piecewise-cuda-graph",
             "--piecewise-cuda-graph-compiler",
             "eager",
-            "--piecewise-cuda-graph-max-token",
+            "--piecewise-cuda-graph-max-tokens",
             "8192",
         ]
         cls.process = popen_launch_server(
