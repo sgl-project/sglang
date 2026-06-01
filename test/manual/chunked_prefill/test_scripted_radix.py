@@ -279,7 +279,7 @@ class TestRadixHitCountInvariant(ScriptedTestCase):
                 stack.extend(node.children.values())
             return snapshot
 
-        s = t._scheduler
+        s = t.scheduler
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         baseline = _snapshot_hit_counts(s.tree_cache.root_node)
@@ -322,7 +322,7 @@ class TestRadixPartialPage(ScriptedTestCase):
 
     @staticmethod
     def _script_partial_page_tail_no_double_free_invariant(t: ScriptedContext):
-        s = t._scheduler
+        s = t.scheduler
         allocator = s.token_to_kv_pool_allocator
         free_before: int = allocator.available_size()
         prompt_len: int = 4 * DEFAULT_CHUNK_SIZE + 7

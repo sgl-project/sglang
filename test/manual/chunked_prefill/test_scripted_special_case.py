@@ -141,11 +141,11 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield
 
         assert (
-            1 if t._scheduler.chunked_req is not None else 0
-        ) == 0, f"abort must clear in-flight count; got {(1 if t._scheduler.chunked_req is not None else 0)}"
+            1 if t.scheduler.chunked_req is not None else 0
+        ) == 0, f"abort must clear in-flight count; got {(1 if t.scheduler.chunked_req is not None else 0)}"
         assert (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         ) is None
         assert r.kv_pages == 0
@@ -162,8 +162,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
                 cur = (
-                    t._scheduler.chunked_req.rid
-                    if t._scheduler.chunked_req is not None
+                    t.scheduler.chunked_req.rid
+                    if t.scheduler.chunked_req is not None
                     else None
                 )
                 assert cur in (None, r.rid), (
@@ -178,8 +178,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.finished
         assert saw_match, "getter must return r.rid at least once while r.is_chunking"
         assert (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         ) is None
 
@@ -194,8 +194,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             if (
                 r.is_chunking
                 and (
-                    t._scheduler.chunked_req.rid
-                    if t._scheduler.chunked_req is not None
+                    t.scheduler.chunked_req.rid
+                    if t.scheduler.chunked_req is not None
                     else None
                 )
                 == r.rid
@@ -209,8 +209,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             saw_chunking_match
         ), "must observe scheduler.chunked_req == r at least once during chunking"
         assert (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         ) is None
 
@@ -262,18 +262,18 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             yield
         assert t.is_idle
         assert (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         ) is None, (
             f"with no in-flight reqs, chunked slot must be None; "
-            f"got {(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
+            f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
         )
         for _ in range(5):
             assert t.is_idle, "scheduler must remain idle with no work"
             assert (
-                t._scheduler.chunked_req.rid
-                if t._scheduler.chunked_req is not None
+                t.scheduler.chunked_req.rid
+                if t.scheduler.chunked_req is not None
                 else None
             ) is None
             yield
@@ -408,14 +408,14 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield
 
         assert (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         ) is None, (
             f"pause(retract) must clear chunked_req; "
-            f"got {(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
+            f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
         )
-        assert (1 if t._scheduler.chunked_req is not None else 0) == 0
+        assert (1 if t.scheduler.chunked_req is not None else 0) == 0
 
         t.continue_generation()
 
@@ -456,16 +456,16 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
 
         baseline_rows = (
-            t._scheduler.req_to_token_pool.size
-            - t._scheduler.req_to_token_pool.available_size()
+            t.scheduler.req_to_token_pool.size
+            - t.scheduler.req_to_token_pool.available_size()
         )
         t.exhaust_kv(leave_pages=0)
         yield from run_until_finished(r)
         assert r.finished
         assert (
-            t._scheduler.req_to_token_pool.size
-            - t._scheduler.req_to_token_pool.available_size()
-        ) <= baseline_rows, f"row leak under forced chunked admission: baseline={baseline_rows}, after={(t._scheduler.req_to_token_pool.size - t._scheduler.req_to_token_pool.available_size())}"
+            t.scheduler.req_to_token_pool.size
+            - t.scheduler.req_to_token_pool.available_size()
+        ) <= baseline_rows, f"row leak under forced chunked admission: baseline={baseline_rows}, after={(t.scheduler.req_to_token_pool.size - t.scheduler.req_to_token_pool.available_size())}"
 
     def test_stage_a_inflight_middle_chunks_sync_invariant(self):
         self.server.execute_script(
@@ -522,7 +522,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_req_slot_cleared_when_chunk_completes(t: ScriptedContext):
-        s = t._scheduler
+        s = t.scheduler
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):

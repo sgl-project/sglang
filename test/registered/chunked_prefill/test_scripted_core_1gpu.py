@@ -79,7 +79,7 @@ class TestScriptedCore(ScriptedTestCase):
         yield
 
         req = r.req
-        assert req is not None and req in t._scheduler.waiting_queue, (
+        assert req is not None and req in t.scheduler.waiting_queue, (
             f"stage={stage}: pause(retract) should park the req back in "
             f"waiting_queue; found={req!r}"
         )
@@ -163,7 +163,7 @@ def _assert_prefill_twice_decode_once(t: ScriptedContext, *, prompt_len: int) ->
     # on finish, so every decode node settles at 1. Chunking only splits the prompt
     # into more nodes, so chunked and non-chunked prefill produce identical
     # per-role counts.
-    root = t._scheduler.tree_cache.root_node
+    root = t.scheduler.tree_cache.root_node
     prefill_hits: list[int] = []
     decode_hits: list[int] = []
     stack = [(child, len(child.key)) for child in root.children.values()]

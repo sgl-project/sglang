@@ -95,8 +95,8 @@ class TestKVPressureBasic(ScriptedTestCase):
     @staticmethod
     def _script_row_pool_tight_admits_after_release(t: ScriptedContext):
         baseline_rows_used = (
-            t._scheduler.req_to_token_pool.size
-            - t._scheduler.req_to_token_pool.available_size()
+            t.scheduler.req_to_token_pool.size
+            - t.scheduler.req_to_token_pool.available_size()
         )
         yield from exhaust_row_pool(t, leave_rows=2)
 
@@ -109,8 +109,8 @@ class TestKVPressureBasic(ScriptedTestCase):
                 f"kv_pages={r.kv_pages}"
             )
         final_rows_used = (
-            t._scheduler.req_to_token_pool.size
-            - t._scheduler.req_to_token_pool.available_size()
+            t.scheduler.req_to_token_pool.size
+            - t.scheduler.req_to_token_pool.available_size()
         )
         assert final_rows_used <= baseline_rows_used, (
             f"row pool leak after admit-after-release: baseline used="

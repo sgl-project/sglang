@@ -409,14 +409,14 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_abort_when_chunked_only_then_idle(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        assert (1 if t._scheduler.chunked_req is not None else 0) == 1
+        assert (1 if t.scheduler.chunked_req is not None else 0) == 1
 
         t.abort(r)
         yield
         yield
 
         assert r.kv_pages == 0
-        assert (1 if t._scheduler.chunked_req is not None else 0) == 0
+        assert (1 if t.scheduler.chunked_req is not None else 0) == 0
         assert t.is_idle, "engine must be idle after the only chunked req is aborted"
 
     def test_chunked_req_then_abort_then_new_short_in_one_yield(self):
@@ -429,12 +429,12 @@ class TestAbortBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         ) == r1.rid, (
             f"r1 should hold the chunked slot before abort; got "
-            f"{(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
+            f"{(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
         )
 
         t.abort(r1)
@@ -442,8 +442,8 @@ class TestAbortBasic(ScriptedTestCase):
         yield
 
         cur = (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         )
         assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
@@ -486,7 +486,7 @@ class TestAbortBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
-        assert (1 if t._scheduler.chunked_req is not None else 0) == 1
+        assert (1 if t.scheduler.chunked_req is not None else 0) == 1
 
         t.abort(r1)
         yield
@@ -510,7 +510,7 @@ class TestAbortDualQueueInvariant(ScriptedTestCase):
 
     @staticmethod
     def _script_dual_queue_abort_no_double_release_invariant(t: ScriptedContext):
-        s = t._scheduler
+        s = t.scheduler
         allocator = s.token_to_kv_pool_allocator
 
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)

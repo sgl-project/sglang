@@ -29,7 +29,7 @@ def _collect_node_attr(
     ctx: "ScriptedContext", get_value: Callable[[Any], int]
 ) -> Dict[int, int]:
     values: Dict[int, int] = {}
-    stack = list(ctx._scheduler.tree_cache.root_node.children.values())
+    stack = list(ctx.scheduler.tree_cache.root_node.children.values())
     while stack:
         node = stack.pop()
         values[node.id] = get_value(node)

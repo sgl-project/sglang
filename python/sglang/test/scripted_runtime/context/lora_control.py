@@ -16,7 +16,7 @@ def _resolve_lora_id(ctx: "ScriptedContext", adapter: str) -> Optional[str]:
     # The scheduler's reqs already carry a resolved lora_id; the name->id map
     # lives in the model runner's lora_manager.lora_refs (lora_id -> LoRARef with
     # lora_path / lora_name). Match on either so the test can pass an adapter path.
-    lora_manager = ctx._scheduler.tp_worker.model_runner.lora_manager
+    lora_manager = ctx.scheduler.tp_worker.model_runner.lora_manager
     for lora_id, lora_ref in lora_manager.lora_refs.items():
         if adapter in (lora_ref.lora_path, lora_ref.lora_name):
             return lora_id
@@ -32,7 +32,7 @@ def force_lora_drainer_reject(ctx: "ScriptedContext", *, adapter: str) -> None:
     # same durable field its own _update_draining_loras would set. is_draining_for
     # persists while the adapter still has running reqs; the drainer only clears
     # it via _update_fully_drained_loras once the adapter has fully drained.
-    drainer = ctx._scheduler.lora_drainer
+    drainer = ctx.scheduler.lora_drainer
     assert drainer is not None, "force_lora_drainer_reject requires LoRA enabled"
 
     lora_id = _resolve_lora_id(ctx, adapter)

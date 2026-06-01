@@ -7,7 +7,7 @@ if TYPE_CHECKING:
 
 
 def engine_stats(ctx: "ScriptedContext") -> Dict[str, int]:
-    s = ctx._scheduler
+    s = ctx.scheduler
     return {
         "kv_pool_free": s.token_to_kv_pool_allocator.available_size(),
         "req_pool_free": s.req_to_token_pool.available_size(),

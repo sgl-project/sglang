@@ -70,7 +70,7 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
 
     @staticmethod
     def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedContext):
-        s = t._scheduler
+        s = t.scheduler
 
         # Sustained memory pressure: ignore_eos decoders that keep the small SWA
         # pool saturated and trigger repeated real retractions.

@@ -89,7 +89,7 @@ class TestPPBasic(ScriptedTestCase):
         for _ in range(50):
             if r1.is_chunking and r2.is_chunking:
                 observed_both_chunking = True
-                count = 1 if t._scheduler.chunked_req is not None else 0
+                count = 1 if t.scheduler.chunked_req is not None else 0
                 assert count <= 2, (
                     f"global chunked_in_flight_count exceeds pp_size, got " f"{count}"
                 )

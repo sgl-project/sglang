@@ -56,7 +56,7 @@ class ScriptedBatchRecord:
 
 
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
-    scheduler = ctx._scheduler
+    scheduler = ctx.scheduler
 
     ctx._release_exhausted_pools()
     ctx.abort_all()
@@ -88,7 +88,7 @@ class ScriptedSchedulerHook:
         scheduler: "Scheduler",
         tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
     ) -> None:
-        self._scheduler = scheduler
+        self.scheduler = scheduler
         self._is_driver = (
             scheduler.ps.pp_rank == 0
             and scheduler.ps.tp_rank == 0
@@ -146,7 +146,7 @@ class ScriptedSchedulerHook:
     def on_run_batch(self, batch) -> None:
         if not self._is_driver:
             return
-        chunked = self._scheduler.chunked_req
+        chunked = self.scheduler.chunked_req
         self._batch_log.append(
             ScriptedBatchRecord(
                 forward_iter=batch.forward_iter,

@@ -20,7 +20,7 @@ def _http_post_and_await_recv_msg(
     description: str,
     timeout_s: float = RECV_MSG_ARRIVAL_TIMEOUT_S,
 ) -> None:
-    server_args = ctx._scheduler.server_args
+    server_args = ctx.scheduler.server_args
     url = f"http://{server_args.host}:{server_args.port}{path}"
 
     async def _post() -> None:

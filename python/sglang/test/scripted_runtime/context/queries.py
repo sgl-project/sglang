@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 
 
 def _get_all_reqs(ctx: "ScriptedContext") -> Iterator["Req"]:
-    s = ctx._scheduler
+    s = ctx.scheduler
     if s.chunked_req is not None:
         yield s.chunked_req
     yield from s.waiting_queue
@@ -23,7 +23,7 @@ def list_active_reqs(ctx: "ScriptedContext") -> List["Req"]:
 
 
 def batch_composition(ctx: "ScriptedContext") -> Dict[str, List[str]]:
-    s = ctx._scheduler
+    s = ctx.scheduler
     chunked_rid = s.chunked_req.rid if s.chunked_req is not None else None
     chunked = [chunked_rid] if chunked_rid is not None else []
     running = (
@@ -46,7 +46,7 @@ def batch_composition(ctx: "ScriptedContext") -> Dict[str, List[str]]:
 
 
 def is_idle(ctx: "ScriptedContext") -> bool:
-    s = ctx._scheduler
+    s = ctx.scheduler
     return (
         s.chunked_req is None
         and len(s.waiting_queue) == 0
@@ -55,12 +55,12 @@ def is_idle(ctx: "ScriptedContext") -> bool:
 
 
 def is_fully_idle(ctx: "ScriptedContext") -> bool:
-    s = ctx._scheduler
+    s = ctx.scheduler
     return is_idle(ctx) and (s.last_batch is None or s.last_batch.is_empty())
 
 
 def last_batch_forward_mode(ctx: "ScriptedContext") -> Optional[str]:
-    s = ctx._scheduler
+    s = ctx.scheduler
     if s.last_batch is not None and s.last_batch.forward_mode is not None:
         return s.last_batch.forward_mode.name
     return None
@@ -84,12 +84,12 @@ def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
 
 
 def is_chunking(ctx: "ScriptedContext", rid: str) -> bool:
-    s = ctx._scheduler
+    s = ctx.scheduler
     return s.chunked_req is not None and s.chunked_req.rid == rid
 
 
 def status(ctx: "ScriptedContext", rid: str) -> str:
-    s = ctx._scheduler
+    s = ctx.scheduler
     if rid in {r.rid for r in s.waiting_queue}:
         return "waiting"
     req = find_req_by_rid(ctx, rid)
@@ -164,7 +164,7 @@ def load_inquirer_num_pending_tokens(ctx: "ScriptedContext") -> int:
     # its pending-token tally is directly readable here. _get_num_pending_tokens
     # is the exact value the scheduler reports for load balancing; reading it (not
     # recomputing) keeps the test honest about what the engine actually decides.
-    return ctx._scheduler.load_inquirer._get_num_pending_tokens()
+    return ctx.scheduler.load_inquirer._get_num_pending_tokens()
 
 
 def _pending_tokens_count_for_rid(ctx: "ScriptedContext", rid: str) -> int:
@@ -172,7 +172,7 @@ def _pending_tokens_count_for_rid(ctx: "ScriptedContext", rid: str) -> int:
     # from the same real state _get_num_pending_tokens sums over: a waiting-queue
     # req contributes its full seqlen, the single chunked req contributes only
     # the part not yet committed to its prefix.
-    s = ctx._scheduler
+    s = ctx.scheduler
     chunked = s.chunked_req
     if chunked is not None and chunked.rid == rid:
         return chunked.seqlen - len(chunked.prefix_indices)
@@ -201,7 +201,7 @@ def in_flight_other_mb_rids(ctx: "ScriptedContext") -> List[str]:
     # micro-batch and must be excluded from the local running set by filter_batch.
     # running_mbs only exists once init_pp_loop_state has run (PP path); without
     # PP there are no other micro-batches.
-    s = ctx._scheduler
+    s = ctx.scheduler
     if not hasattr(s, "running_mbs"):
         return []
     current = s.running_batch

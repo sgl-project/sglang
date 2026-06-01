@@ -39,13 +39,13 @@ class ScriptedContext:
         assert (
             scheduler_hook._is_driver
         ), "ScriptedContext only exists on the driver rank"
-        self._scheduler = scheduler_hook._scheduler
+        self.scheduler = scheduler_hook.scheduler
         self._scheduler_hook = scheduler_hook
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._http_poster = http_poster
 
         self._seen_rids: set[str] = set()
-        self._kv_exhauster = ScriptedKvPoolExhauster(self._scheduler)
+        self._kv_exhauster = ScriptedKvPoolExhauster(self.scheduler)
         self._req_starter = ScriptedContextReqStarter(self)
 
     def start_req(

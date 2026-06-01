@@ -239,7 +239,7 @@ class TestPriorityBasic(ScriptedTestCase):
     def _script_watchdog_skips_chunked_resume_invariant(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        s = t._scheduler
+        s = t.scheduler
         req = t.find_req_by_rid(r.rid)
         assert req is not None
         assert s.chunked_req is req, (

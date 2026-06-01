@@ -163,7 +163,7 @@ class TestRegressionBasic(ScriptedTestCase):
         observed_excluded_from_running = False
         for _ in range(DEFAULT_MAX_STEPS):
             in_flight_other_mb = t.in_flight_other_mb_rids()
-            running = [req.rid for req in t._scheduler.running_batch.reqs]
+            running = [req.rid for req in t.scheduler.running_batch.reqs]
             if r.rid in in_flight_other_mb:
                 observed_in_flight_other_mb = True
                 assert r.rid not in running, (
@@ -320,12 +320,12 @@ class TestRegressionBasic(ScriptedTestCase):
             r.is_chunking
         ), f"is_chunking must be set while mid-chunk; got {r.is_chunking!r}"
         assert (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         ) is None, (
             f"v2 must not maintain a top-level chunked_req field; "
-            f"got {(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
+            f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
         )
 
         yield from run_until_finished(r)
@@ -404,8 +404,8 @@ class TestRegressionBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
         for _ in range(DEFAULT_MAX_STEPS):
-            in_waiting = r.rid in [req.rid for req in t._scheduler.waiting_queue]
-            in_batch = r.rid in [req.rid for req in t._scheduler.running_batch.reqs]
+            in_waiting = r.rid in [req.rid for req in t.scheduler.waiting_queue]
+            in_batch = r.rid in [req.rid for req in t.scheduler.running_batch.reqs]
             if in_waiting and in_batch:
                 break
             if r.finished:
@@ -474,13 +474,13 @@ class TestRegressionBasic(ScriptedTestCase):
         t.retract_all()
         yield
 
-        assert len(t._scheduler.running_batch.reqs) == 0, (
+        assert len(t.scheduler.running_batch.reqs) == 0, (
             f"f0388931bf: retract_all must clear batch; got batch_size="
-            f"{len(t._scheduler.running_batch.reqs)}"
+            f"{len(t.scheduler.running_batch.reqs)}"
         )
         assert (
-            t._scheduler.chunked_req.rid
-            if t._scheduler.chunked_req is not None
+            t.scheduler.chunked_req.rid
+            if t.scheduler.chunked_req is not None
             else None
         ) is None
         for r in (r1, r2):
@@ -510,7 +510,7 @@ class TestRegressionPp(ScriptedTestCase):
         t.abort(r)
         yield
 
-        rids_after_abort = [req.rid for req in t._scheduler.running_batch.reqs]
+        rids_after_abort = [req.rid for req in t.scheduler.running_batch.reqs]
         occurrences = sum(1 for rid in rids_after_abort if rid == r.rid)
         assert occurrences <= 1, (
             f"b823c16e60: batch_rids must dedup across mbs + "
@@ -531,7 +531,7 @@ class TestRegressionPp(ScriptedTestCase):
         ctrl_exclude_engaged = False
         for _ in range(2000):
             in_flight_other_mb = t.in_flight_other_mb_rids()
-            running = [req.rid for req in t._scheduler.running_batch.reqs]
+            running = [req.rid for req in t.scheduler.running_batch.reqs]
             if r_long.rid in in_flight_other_mb:
                 long_exclude_engaged = True
                 assert r_long.rid not in running, (
@@ -541,7 +541,7 @@ class TestRegressionPp(ScriptedTestCase):
                 )
             if r_ctrl.rid in in_flight_other_mb and r_ctrl.rid in running:
                 ctrl_exclude_engaged = True
-            in_flight = 1 if t._scheduler.chunked_req is not None else 0
+            in_flight = 1 if t.scheduler.chunked_req is not None else 0
             assert (
                 in_flight <= 1
             ), f"PP cross-mb chunked exclusion broken: in_flight={in_flight}"
