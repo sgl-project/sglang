@@ -63,12 +63,35 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if self.local_attn_size != -1:
             return self.local_attn_size * self.num_token_per_frame
 
-        return (
-            self.sink_size + self.sliding_window_num_frames
-        ) * self.num_token_per_frame
+        return self.sliding_window_num_frames * self.num_token_per_frame
 
-    def _get_causal_sink_tokens(self) -> int:
-        return super()._get_causal_sink_tokens()
+    def _apply_realtime_causal_cache_config(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        pipeline_config = server_args.pipeline_config
+        sink_size = getattr(batch, "realtime_causal_sink_size", None)
+        if sink_size is None:
+            sink_size = pipeline_config.realtime_causal_sink_size
+        if sink_size is not None:
+            if sink_size < 0:
+                raise ValueError("realtime_causal_sink_size must be non-negative")
+            self.sink_size = int(sink_size)
+
+        kv_cache_num_frames = getattr(
+            batch,
+            "realtime_causal_kv_cache_num_frames",
+            None,
+        )
+        if kv_cache_num_frames is None:
+            kv_cache_num_frames = pipeline_config.realtime_causal_kv_cache_num_frames
+        if kv_cache_num_frames is not None:
+            if kv_cache_num_frames <= 0:
+                raise ValueError(
+                    "realtime_causal_kv_cache_num_frames must be positive"
+                )
+            self.sliding_window_num_frames = int(kv_cache_num_frames)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -121,7 +144,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             self.num_frames_per_block,
             self.sliding_window_num_frames,
             self.local_attn_size,
-            self.transformer.config.arch_config.sink_size,
+            self.sink_size,
             sink_tokens,
             kv_cache_size,
             num_attention_heads,
@@ -216,9 +239,13 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if chunk_idx < len(condition_chunks):
             condition = condition_chunks[chunk_idx]
         else:
-            # only the first global condition chunk carries the reference frame;
-            # later realtime chunks must not be re-anchored to that first frame
-            condition = torch.zeros_like(condition_chunks[-1])
+            condition = condition_full.new_zeros(
+                condition_full.shape[0],
+                condition_full.shape[1],
+                chunk_size,
+                condition_full.shape[3],
+                condition_full.shape[4],
+            )
 
         if condition.shape[2] == chunk_size:
             return condition
@@ -285,6 +312,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         latents = ctx.latents
         prompt_embeds = ctx.prompt_embeds
         b, t, h, w = ctx.batch_size, ctx.num_frames, ctx.height, ctx.width
+        self._apply_realtime_causal_cache_config(batch, server_args)
 
         # --- KV cache from session state ---
         cache_state, persist_cache_state = self._get_cache_state(batch)
@@ -304,6 +332,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         expected_cache_tokens = self._get_lingbot_causal_kv_cache_size(
             sequence_shard_enabled=sequence_shard_enabled
         )
+        expected_sink_tokens = self._get_causal_sink_tokens()
 
         should_reset_cache = (
             batch.block_idx == 0
@@ -311,8 +340,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             or crossattn_cache is None
             or len(causal_kv_cache) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
-            or causal_kv_cache[0]["k"].shape[1] < expected_cache_tokens
+            or causal_kv_cache[0]["k"].shape[1] != expected_cache_tokens
             or causal_kv_cache[0]["k"].shape[2] != expected_cache_heads
+            or causal_kv_cache[0].sink_tokens != expected_sink_tokens
         )
 
         if should_reset_cache:

@@ -253,7 +253,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
     def _expand_timestep(
         timestep: torch.Tensor, batch_size: int, device
     ) -> torch.Tensor:
-        return timestep.reshape(1).to(device=device, dtype=torch.long).expand(batch_size)
+        return timestep.reshape(1).to(device=device).expand(batch_size)
 
     def _forward_causal_transformer(
         self,

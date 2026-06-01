@@ -97,13 +97,8 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
     if adapter is None:
         raise ValueError("realtime adapter is not initialized")
 
-    pending_send_task = None
     while not session.reached_max_chunks():
         try:
-            if pending_send_task is not None and pending_send_task.done():
-                await pending_send_task
-                pending_send_task = None
-
             # send to scheduler and generate video chunk
             server_args = get_global_server_args()
 
@@ -132,39 +127,26 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
             # finish
             adapter.on_chunk_complete(session, result)
-            if pending_send_task is not None:
-                await pending_send_task
-            pending_send_task = asyncio.create_task(
-                _send_output_and_log(
-                    ws,
-                    session,
-                    chunk,
-                    batch,
-                    result,
-                    request_prepare_ms,
-                    scheduler_forward_ms,
-                    chunk_started,
-                )
+            await _send_output_and_log(
+                ws,
+                session,
+                chunk,
+                batch,
+                result,
+                request_prepare_ms,
+                scheduler_forward_ms,
+                chunk_started,
             )
 
         except asyncio.CancelledError:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
             logger.info("generation completed, session_id=%s", session.id)
             break
         except WebSocketDisconnect:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
             logger.info(
                 "client disconnected during generation, session_id=%s", session.id
             )
             break
         except Exception as e:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
             err_msg = str(e).splitlines()[0]
             logger.error("error during generate loop: %s", err_msg)
             try:
@@ -176,8 +158,6 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 )
             break
     else:
-        if pending_send_task is not None:
-            await pending_send_task
         logger.info(
             "generation reached max chunks, session_id=%s, max_chunks=%s",
             session.id,

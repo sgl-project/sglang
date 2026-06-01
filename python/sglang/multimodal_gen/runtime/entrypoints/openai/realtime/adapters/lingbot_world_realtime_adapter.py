@@ -285,6 +285,10 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         batch.realtime_event_id = self._state(session).latest_event_id
         if session.request is not None:
             batch.realtime_output_format = session.request.realtime_output_format
+            batch.realtime_causal_sink_size = session.request.realtime_causal_sink_size
+            batch.realtime_causal_kv_cache_num_frames = (
+                session.request.realtime_causal_kv_cache_num_frames
+            )
         return batch
 
     async def send_output(
