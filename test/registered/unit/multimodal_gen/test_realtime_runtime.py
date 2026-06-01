@@ -1680,23 +1680,40 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
 
     from msgpack import unpackb
 
-    header = unpackb(payloads[0], raw=False)
-    assert header["content_type"] == RAW_RGB_DELTA_GZIP_CONTENT_TYPE
-    assert header["encoding"] == "delta-gzip"
-    assert header["event_id"] == 3
-    assert header["format"] == "rgb24"
-    assert header["channels"] == 3
-    assert header["bytes_per_frame"] == 3000
-    assert header["raw_size"] == 6000
-    assert header["total_size"] == len(payloads[1])
+    first_header = unpackb(payloads[0], raw=False)
+    second_header = unpackb(payloads[2], raw=False)
+    assert first_header["content_type"] == RAW_RGB_DELTA_GZIP_CONTENT_TYPE
+    assert first_header["encoding"] == "delta-gzip"
+    assert first_header["event_id"] == 3
+    assert first_header["format"] == "rgb24"
+    assert first_header["channels"] == 3
+    assert first_header["bytes_per_frame"] == 3000
+    assert first_header["raw_size"] == 3000
+    assert first_header["total_size"] == len(payloads[1])
+    assert first_header["num_frames"] == 1
+    assert first_header["num_frame_batches"] == 2
+    assert first_header["frame_batch_index"] == 0
+    assert "delta_reference" not in first_header
+    assert second_header["raw_size"] == 3000
+    assert second_header["num_frames"] == 1
+    assert second_header["num_frame_batches"] == 2
+    assert second_header["frame_batch_index"] == 1
+    assert second_header["delta_reference"] == "previous-frame"
     assert stats["raw_bytes"] == 6000
-    assert stats["ws_payload_bytes"] < 6000 + len(payloads[0])
-    restored = restore_delta_gzip_raw_rgb_payload(
+    assert stats["num_batches"] == 2
+    assert stats["num_frames"] == 2
+    first_frame = restore_delta_gzip_raw_rgb_payload(
         payloads[1],
         bytes_per_frame=3000,
-        num_frames=2,
+        num_frames=1,
     )
-    assert restored == expected_frames
+    second_frame = restore_delta_gzip_raw_rgb_payload(
+        payloads[3],
+        bytes_per_frame=3000,
+        num_frames=1,
+        reference_frame=first_frame,
+    )
+    assert first_frame + second_frame == expected_frames
 
 
 def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
@@ -1740,14 +1757,25 @@ def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
 
     from msgpack import unpackb
 
-    header = unpackb(payloads[0], raw=False)
-    assert header["content_type"] == RAW_RGB_CONTENT_TYPE
-    assert header["encoding"] == "raw"
-    assert header["raw_size"] == 6000
-    assert header["total_size"] == 6000
-    assert payloads[1] == expected_frames
+    first_header = unpackb(payloads[0], raw=False)
+    second_header = unpackb(payloads[2], raw=False)
+    assert first_header["content_type"] == RAW_RGB_CONTENT_TYPE
+    assert first_header["encoding"] == "raw"
+    assert first_header["raw_size"] == 3000
+    assert first_header["total_size"] == 3000
+    assert first_header["num_frames"] == 1
+    assert first_header["num_frame_batches"] == 2
+    assert first_header["frame_batch_index"] == 0
+    assert second_header["raw_size"] == 3000
+    assert second_header["total_size"] == 3000
+    assert second_header["num_frames"] == 1
+    assert second_header["num_frame_batches"] == 2
+    assert second_header["frame_batch_index"] == 1
+    assert payloads[1] + payloads[3] == expected_frames
     assert stats["raw_bytes"] == 6000
-    assert stats["ws_payload_bytes"] == 6000 + len(payloads[0])
+    assert stats["num_batches"] == 2
+    assert stats["num_frames"] == 2
+    assert stats["ws_payload_bytes"] == 6000 + len(payloads[0]) + len(payloads[2])
 
 
 def test_raw_rgb_realtime_output_adapter_uses_previous_frame_reference():
@@ -1862,20 +1890,24 @@ def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
     from msgpack import unpackb
 
     headers = [unpackb(payloads[idx], raw=False) for idx in range(0, len(payloads), 2)]
-    assert len(headers) == 3
-    assert [header["chunk_index"] for header in headers] == [4, 4, 4]
-    assert [header["frame_batch_index"] for header in headers] == [0, 1, 2]
-    assert [header["num_frame_batches"] for header in headers] == [3, 3, 3]
-    assert [header["num_frames"] for header in headers] == [3, 3, 1]
+    assert len(headers) == 7
+    assert [header["chunk_index"] for header in headers] == [4] * 7
+    assert [header["frame_batch_index"] for header in headers] == list(range(7))
+    assert [header["num_frame_batches"] for header in headers] == [7] * 7
+    assert [header["num_frames"] for header in headers] == [1] * 7
     assert [header["is_final_frame_batch"] for header in headers] == [
+        False,
+        False,
+        False,
+        False,
         False,
         False,
         True,
     ]
     assert "delta_reference" not in headers[0]
-    assert headers[1]["delta_reference"] == "previous-frame"
-    assert headers[2]["delta_reference"] == "previous-frame"
-    assert stats["num_batches"] == 3
+    for header in headers[1:]:
+        assert header["delta_reference"] == "previous-frame"
+    assert stats["num_batches"] == 7
     assert stats["num_frames"] == 7
 
 
