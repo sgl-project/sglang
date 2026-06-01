@@ -1,7 +1,7 @@
-"""Lossless output parity: spec decode output == non-spec reference.
+"""Lossless output parity: spec-decode greedy output == a non-spec reference.
 
-Launches a second non-spec reference server, so it needs the large (Hopper)
-runner for the memory headroom (two models on one GPU).
+The reference is a separate non-spec server, launched and torn down BEFORE the
+spec server (sequential -- one model resident at a time; see SpecParityKit).
 """
 
 import unittest

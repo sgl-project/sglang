@@ -1,10 +1,7 @@
-"""EAGLE3 spec-decoding core: overlap (spec v2) x no-overlap (spec v1) matrix.
-
-Both cases run the full sanity kit set on the same standard config (EAGLE3,
-topk=1, page_size=1, flashinfer); the only difference is ``disable_overlap``.
-flashinfer is pinned (the 5090 default) so a future default change can't silently
-alter what this exercises. Other backends / page sizes / topk>1 / heavy checks
-live in the sibling test_spec_eagle_*.py files.
+"""EAGLE3 spec-decoding core: overlap (spec v2) x no-overlap (spec v1) matrix,
+same standard config (topk=1, page_size=1), only ``disable_overlap`` differs.
+flashinfer is pinned (the 5090 default) so a default-selection change can't
+silently alter what this exercises.
 """
 
 import unittest

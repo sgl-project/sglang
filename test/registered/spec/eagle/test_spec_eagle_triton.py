@@ -27,8 +27,7 @@ class TestEagle3Triton(
     SpecPenaltyKit,
     SpecFeatureKit,
 ):
-    """EAGLE3 spec v2 on triton: gsm8k + spec-v2 logprob match + matched-stop
-    + penalty + radix."""
+    """EAGLE3 spec v2 on triton (kits listed in bases)."""
 
     attention_backend = "triton"
     max_running_requests = 64

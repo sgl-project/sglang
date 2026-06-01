@@ -39,12 +39,11 @@ class TestEagleLlama2Suite(
     SpecPenaltyKit,
     SpecFeatureKit,
 ):
-    """EAGLE/Llama-2 topk=8 full coverage: correctness, gsm8k, logprobs,
-    penalty, radix, abort, constrained decoding."""
+    """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases)."""
 
 
 class TestEagleLlama2Chunked4(EagleLlama2Base, SpecCorrectnessKit):
-    """Correctness under tiny chunked prefill (old TestEAGLEEngine 2nd config)."""
+    """Correctness under tiny chunked prefill."""
 
     chunked_prefill_size = 4
 
