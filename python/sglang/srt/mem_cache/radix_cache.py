@@ -157,10 +157,16 @@ class RadixKey:
             return 0
 
         # Vectorized comparison with numpy to avoid per-element PyLong boxing.
-        # array('q') stores signed 64-bit integers; we interpret the buffer
-        # directly as int64 to avoid copying when possible.
-        a0 = np.frombuffer(t0, dtype=np.int64, count=n)
-        a1 = np.frombuffer(t1, dtype=np.int64, count=n)
+        # Use np.frombuffer for array.array (zero-copy), fall back to np.asarray
+        # for Python lists to avoid TypeError from np.frombuffer.
+        if isinstance(t0, array):
+            a0 = np.frombuffer(t0, dtype=np.int64, count=n)
+        else:
+            a0 = np.asarray(t0[:n], dtype=np.int64)
+        if isinstance(t1, array):
+            a1 = np.frombuffer(t1, dtype=np.int64, count=n)
+        else:
+            a1 = np.asarray(t1[:n], dtype=np.int64)
 
         # Find first mismatch: argmax on the inequality mask returns the
         # index of the first True (mismatch). If all equal, argmax returns 0,
