@@ -50,7 +50,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done >= 2
+        assert r.chunks_done == 8
         assert len(r.req.output_ids) == 2
 
     def test_long_prompt_long_decode(self):
@@ -63,7 +63,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         )
         yield from run_until(r, lambda h: h.finished, max_steps=1000)
         assert r.finished
-        assert r.chunks_done >= 2
+        assert r.chunks_done == 8
         assert len(r.req.output_ids) == 64
 
     def test_tiny_prompt_long_decode(self):
@@ -173,7 +173,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done >= 2
+        assert r.chunks_done == 8
         assert len(r.req.output_ids) == 1
 
     def test_kv_pages_consistent_during_run(self):
@@ -281,7 +281,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 2
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if prompt == VERY_LONG_PROMPT_LEN:
-                assert r.chunks_done >= 2
+                assert r.chunks_done == 8
             else:
                 assert r.chunks_done == 0
 
@@ -297,7 +297,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 1
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
-                assert r.chunks_done >= 2
+                assert r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
             else:
                 assert r.chunks_done == 0
 
@@ -313,7 +313,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 1
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
-                assert r.chunks_done >= 2
+                assert r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
             else:
                 assert r.chunks_done == 0
 
@@ -344,7 +344,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 2
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L == VERY_LONG_PROMPT_LEN:
-                assert r.chunks_done >= 2
+                assert r.chunks_done == 8
             else:
                 assert r.chunks_done == 0
 
