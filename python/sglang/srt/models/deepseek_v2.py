@@ -2224,6 +2224,7 @@ class DeepseekV2Model(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=False,
             )
         else:
             self.embed_tokens = PPMissingLayer()

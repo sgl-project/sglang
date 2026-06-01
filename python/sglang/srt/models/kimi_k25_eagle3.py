@@ -199,6 +199,7 @@ class Eagle3MLAModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
+            enable_tp=False,
         )
 
         target_hidden_size = (
