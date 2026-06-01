@@ -478,12 +478,7 @@ def test_raw_rgb_realtime_output_adapter_can_send_webp_preview_frames():
             output_compression=90,
         )
         result = OutputBatch(
-            raw_frame_batches=[
-                [
-                    bytes([255, 0, 0, 0, 255, 0]),
-                    bytes([0, 0, 255, 255, 255, 0]),
-                ]
-            ],
+            raw_frame_batches=[[bytes([255, 0, 0, 0, 255, 0])]],
             raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
             raw_frame_metadata={
                 "format": "rgb24",
@@ -544,7 +539,12 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
             output_compression=90,
         )
         result = OutputBatch(
-            raw_frame_batches=[[bytes([255, 0, 0, 0, 255, 0])]],
+            raw_frame_batches=[
+                [
+                    bytes([255, 0, 0, 0, 255, 0]),
+                    bytes([0, 0, 255, 255, 255, 0]),
+                ]
+            ],
             raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
             raw_frame_metadata={
                 "format": "rgb24",
