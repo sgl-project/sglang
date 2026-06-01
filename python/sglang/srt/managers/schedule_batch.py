@@ -1632,6 +1632,29 @@ def release_req(
     req.reset_for_retract()
 
 
+def retract_all(
+    *,
+    reqs: List[Req],
+    server_args: ServerArgs,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    tree_cache: BasePrefixCache,
+    hisparse_coordinator: Optional[HiSparseCoordinator],
+) -> List[Req]:
+    retracted_reqs = reqs
+    for idx in range(len(reqs)):
+        release_req(
+            req=reqs[idx],
+            remaing_req_count=len(reqs) - idx,
+            server_args=server_args,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            hisparse_coordinator=hisparse_coordinator,
+        )
+    return retracted_reqs
+
+
 def _compute_chunked_req_next_prompt_token(
     chunked_req: Optional[Req],
 ) -> Optional[int]:
