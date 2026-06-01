@@ -1163,24 +1163,23 @@ class Cosmos3OmniTransformer(CachableDiT):
             self.cached_kv[cache_key] = self.language_model(
                 text_ids, text_mask, freqs_und[0], freqs_und[1]
             )
-            self.cached_freqs_gen[cache_key] = freqs_gen
+            cos_gen, sin_gen = freqs_gen
+            if sequence_shard_enabled:
+                if seq_shard_pad > 0:
+                    pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
+                    pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
+                    cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
+                    sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
+                cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
+                sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
+                cos_gen = cos_gen[:, self.sp_rank, :, :]
+                sin_gen = sin_gen[:, self.sp_rank, :, :]
+            cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
+            sin_gen = sin_gen.unsqueeze(2)
+            self.cached_freqs_gen[cache_key] = (cos_gen, sin_gen)
 
         freqs_gen = self.cached_freqs_gen[cache_key]
         cos_gen, sin_gen = freqs_gen
-
-        if sequence_shard_enabled:
-            if seq_shard_pad > 0:
-                pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
-                sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
-            cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-            sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-            cos_gen = cos_gen[:, self.sp_rank, :, :]
-            sin_gen = sin_gen[:, self.sp_rank, :, :]
-
-        cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
-        sin_gen = sin_gen.unsqueeze(2)
 
         # Run GEN layers. `residual` is threaded so each layer's
         # input_layernorm and post_attention_layernorm can use the
