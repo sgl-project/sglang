@@ -133,11 +133,11 @@ class AiterRunnerCore(MoeRunnerCore):
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
         if quant_info.swiglu_limit > 0:
-            # Default to SEPARATED so we match the layout produced by the
-            # SGLang Mxfp4MoEMethod weight shuffle (is_guinterleave=False) and
-            # the gptoss_fp4 tuned FlyDSL kernels. Opt into INTERLEAVE only
-            # when the weights were prepared with the gate/up-interleaved
-            # layout (ATOM_MOE_GU_ITLV-equivalent path).
+            # Default (INTERLEAVE) preserves the pre-fix behavior for paths
+            # that prepare weights in the gate/up-interleaved layout. Set
+            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
+            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
+            # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
             extra["gate_mode"] = (
                 GateMode.INTERLEAVE.value
                 if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
