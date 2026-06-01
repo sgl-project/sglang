@@ -262,6 +262,10 @@ class TRTLLMMLADecodeMetadata:
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     """TRTLLM MLA attention kernel from flashinfer."""
 
+    # trtllm-gen kernels rebuild metadata from preallocated buffers and never
+    # read seq_lens_cpu / seq_lens_sum; opt out of the D2H sync.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -335,6 +339,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.cuda_graph_custom_mask = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -442,7 +447,57 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
+        if self.num_draft_tokens and not self.skip_prefill:
+            # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
+            # in-place so the gpu_only path needs no seq_lens_sum.
+            self.cuda_graph_custom_mask = torch.zeros(
+                max_num_tokens * (self.max_context_len + self.num_draft_tokens),
+                dtype=torch.bool,
+                device=self.device,
+            )
+
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return [self.cuda_graph_custom_mask, None]
+
+    def _init_cuda_graph_metadata(
+        self,
+        bs: int,
+        num_tokens: int,
+        forward_mode: ForwardMode,
+        seq_lens: torch.Tensor,
+        device: torch.device,
+    ):
+        """Allocate persistent metadata buffers for CUDA graph capture."""
+        metadata = TRTLLMMLADecodeMetadata()
+
+        if forward_mode.is_target_verify():
+            metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+        elif forward_mode.is_draft_extend(include_v2=True):
+            num_tokens_per_bs = num_tokens // bs
+            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                num_tokens_per_bs,
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata.seq_lens_q = torch.full(
+                (bs,), num_tokens_per_bs, dtype=torch.int32, device=device
+            )
+            metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+
+        # Capture with full width so future longer sequences are safe during replay.
+        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
+        metadata.block_kv_indices = block_kv_indices
+        metadata.max_seq_len_k = self.max_context_len
+
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_decode_metadata = metadata
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -472,60 +527,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 spec_info,
             )
 
-        metadata = TRTLLMMLADecodeMetadata()
-
-        if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.num_draft_tokens
-            metadata.seq_lens_k = torch.zeros(
-                (bs,), dtype=torch.int32, device=seq_lens.device
-            )
-            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-        elif forward_mode.is_draft_extend(include_v2=True):
-            num_tokens_per_bs = num_tokens // bs
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                num_tokens_per_bs,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
-            metadata.seq_lens_q = torch.full(
-                (bs,), num_tokens_per_bs, dtype=torch.int32, device=seq_lens.device
-            )
-            # NOTE(draft_extend seq_len handling):
-            # forward_batch.seq_lens is the seq_lens of the prev_context + verified tokens.
-            # To account for pad_draft_extend_query, we need seq_lens = prev_context + max_draft_tokens.
-            # This will ensure queries align with kvs correctly when calling
-            # flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla.
-            seq_lens = seq_lens - metadata.seq_lens_q + metadata.max_seq_len_q
-            metadata.seq_lens_k = torch.zeros(
-                (bs,), dtype=torch.int32, device=seq_lens.device
-            )
-            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-
-        # Custom fast-path for decode/idle.
-        # Capture with full width so future longer sequences are safe during replay
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
-
-        create_flashmla_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            req_pool_indices,
-            seq_lens,
-            None,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            max_blocks_per_seq,
-            PAGED_SIZE=self.page_size,
+        self._init_cuda_graph_metadata(
+            bs, num_tokens, forward_mode, seq_lens, seq_lens.device
         )
-
-        metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
-
-        self.decode_cuda_graph_metadata[bs] = metadata
-        self.forward_decode_metadata = metadata
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -1243,6 +1257,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
+
+    # Per-step draft decode never reads seq_lens_cpu / seq_lens_sum; opt out so
+    # decide_needs_cpu_seq_lens' OR over the backends stays False.
+    needs_cpu_seq_lens: bool = False
 
     def __init__(
         self,

@@ -1650,7 +1650,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 @dataclass
 class CheckWeightsReqInput(BaseReq):
-    action: str
+    action: str = "checksum"
 
 
 @dataclass
@@ -1773,6 +1773,7 @@ class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     log_requests_format: Optional[str] = None
+    log_level: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
