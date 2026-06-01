@@ -87,10 +87,7 @@ jobs:
         include:
           - runner: xeon-gnr
             suite: base-b-test-cpu
-            partition_args: "--auto-partition-id 0 --auto-partition-size 2"
-          - runner: xeon-gnr
-            suite: base-b-test-cpu
-            partition_args: "--auto-partition-id 1 --auto-partition-size 2"
+            partition_args: ""
     steps:
       - name: Cleanup workspace
         run: |
