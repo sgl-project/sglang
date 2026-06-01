@@ -64,7 +64,11 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        in_reasoning = self._in_reasoning or self.think_start_token in text
+        in_reasoning = (
+            self._in_reasoning
+            or self.think_start_token in text
+            or self.think_end_token in text  # orphan close tag: open prefilled in prompt
+        )
 
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)
@@ -133,6 +137,17 @@ class BaseReasoningFormatDetector:
             for token in tokens_to_check
         ):
             return StreamingParseResult()
+
+        # Orphan closing tag (open tag prefilled in the prompt, not generated):
+        # enter reasoning so the end tag is stripped instead of leaked as content.
+        if (
+            not self.stripped_think_start
+            and not self._in_reasoning
+            and self.think_end_token in current_text
+            and think_start_text not in current_text
+        ):
+            self._in_reasoning = True
+            self.stripped_think_start = True
 
         # Strip `<think>` token if present
         if not self.stripped_think_start and think_start_text in current_text:
