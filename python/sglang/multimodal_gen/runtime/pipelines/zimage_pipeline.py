@@ -1,10 +1,16 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 
-
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines.zimage_progressive import (
+    ZImageProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -55,7 +61,29 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_standard_t2i_stages(prepare_extra_timestep_kwargs=[prepare_mu])
+        self.add_stage(InputValidationStage())
+        self.add_standard_text_encoding_stage()
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
+        self._add_zimage_denoising_stage()
+        self.add_standard_decoding_stage()
+
+    def _add_zimage_denoising_stage(self, stage_name: str = "denoising_stage") -> None:
+        """Add ZImageProgressiveDenoisingStage.
+
+        Routes to DenoisingStage.forward() when progressive_mode == 'fullres'
+        (the default), preserving identical behaviour for non-progressive requests.
+        """
+
+        def create_stage():
+            return ZImageProgressiveDenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+                pipeline=self,
+                vae=self.get_module("vae", None),
+            )
+
+        self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
 
 
 EntryClass = ZImagePipeline
