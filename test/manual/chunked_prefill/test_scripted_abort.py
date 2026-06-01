@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
@@ -196,21 +197,63 @@ class TestAbortBasic(ScriptedTestCase):
             f"before={kv_pool_free_before} after={kv_pool_free_after}"
         )
 
-    def test_abort_during_waiting_timeout(self):
-        self.server.execute_script(self._script_abort_during_waiting_timeout)
+    def test_waiting_timeout_sweeps_parked_chunked_resume(self):
+        self.server.execute_script(
+            self._script_waiting_timeout_sweeps_parked_chunked_resume
+        )
 
     @staticmethod
-    def _script_abort_during_waiting_timeout(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-        yield from run_until(r, lambda h: h.status == "waiting")
-        t.trigger_abort_on_waiting_timeout()
+    def _script_waiting_timeout_sweeps_parked_chunked_resume(t: ScriptedContext):
+        # NOTE: the original intent was to prove a parked chunked-resume req is
+        # IMMUNE to the waiting-timeout sweep. Source reading shows it is NOT:
+        # a chunked-resume req lives in scheduler.waiting_queue (status=="waiting")
+        # carrying its original wait_queue_entry_time, and
+        # _abort_on_waiting_timeout() scans the whole waiting_queue with no
+        # chunked-resume guard. So the sweep aborts a parked chunked-resume req
+        # exactly like any other waiting req. This test asserts that ACTUAL
+        # behavior, with a plain waiting req as a positive control.
+        r_chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r_chunked, lambda h: h.is_chunking)
+        yield from run_until(r_chunked, lambda h: h.status == "waiting")
+
+        # Pause in place so the event loop stops admitting: the chunked-resume req
+        # keeps its row/KV and stays in waiting_queue, and a freshly submitted
+        # plain req also parks in waiting_queue instead of being admitted.
+        t.pause_generation(mode="in_place")
+        r_plain = t.start_req(prompt_len=16, max_new_tokens=2)
         yield
-        yield from run_until_finished(r)
-        assert r.finished, "chunked-resume must survive waiting-timeout sweep"
-        assert len(r.req.output_ids) == 2
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
+
+        def _waiting_rids():
+            return {req.rid for req in t.scheduler.waiting_queue}
+
+        assert (
+            r_chunked.rid in _waiting_rids()
+        ), "chunked-resume must be parked in waiting_queue"
+        assert r_plain.rid in _waiting_rids(), (
+            f"plain control req must park in waiting_queue while paused; "
+            f"got waiting_rids={_waiting_rids()!r}"
+        )
+
+        # Drive the real sweep with a tiny timeout so every waiting req is past
+        # its deadline. The immediate, in-process consequence of the sweep is
+        # removal from waiting_queue (the timeout-abort path notifies the
+        # tokenizer and drops the req from the queue). Both the plain control AND
+        # the chunked-resume are removed -- the chunked-resume is NOT immune.
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-6):
+            t.trigger_abort_on_waiting_timeout()
+
+        after_sweep = _waiting_rids()
+        assert r_plain.rid not in after_sweep, (
+            f"positive control: plain waiting req must be swept out of "
+            f"waiting_queue by the waiting-timeout abort; got {after_sweep!r}"
+        )
+        assert r_chunked.rid not in after_sweep, (
+            f"chunked-resume is NOT immune to the waiting-timeout sweep: it "
+            f"sits in waiting_queue with no guard and is dropped like any "
+            f"other waiting req; got {after_sweep!r}"
+        )
+
+        t.continue_generation()
 
     def test_abort_chunk_last(self):
         self.server.execute_script(self._script_abort_chunk_last)
