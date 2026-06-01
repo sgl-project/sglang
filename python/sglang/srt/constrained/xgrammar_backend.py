@@ -70,6 +70,25 @@ def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
     )
 
 
+def apply_token_bitmask_inplace_torch(
+    logits: torch.Tensor,
+    bitmask: torch.Tensor,
+) -> None:
+    """Backend-agnostic torch fallback for packed-bitmask application.
+
+    This path is currently used as a fallback on NPU in xgrammar backend.
+    """
+    vocab_size = logits.shape[-1]
+    bitmask_cpu = bitmask.detach().cpu()
+    token_ids = torch.arange(vocab_size, device="cpu", dtype=torch.int32)
+    word_idx = token_ids // 32
+    bit_idx = token_ids % 32
+    words = bitmask_cpu[:, word_idx].to(torch.int32)
+    allowed = ((words >> bit_idx) & 1).to(torch.bool)
+    allowed = allowed.to(logits.device, non_blocking=True)
+    logits.masked_fill_(~allowed, float("-inf"))
+
+
 class XGrammarGrammar(BaseGrammarObject):
 
     def __init__(
@@ -134,11 +153,7 @@ class XGrammarGrammar(BaseGrammarObject):
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
         elif logits.device.type == "cpu":
-            # Used by the MLX backend, which builds its additive mask rows
-            # on the CPU before inserting them into the lazy graph.
-            from xgrammar import apply_token_bitmask_inplace
-
-            apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
+            apply_token_bitmask_inplace_torch(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
