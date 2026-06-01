@@ -45,6 +45,7 @@ import traceback
 import types
 import uuid
 import warnings
+from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
+from unittest.case import _ShouldStop
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -99,6 +101,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
+    """Flatten array.array('q') buffers into one int64 CPU tensor.
+
+    NumPy memcpy instead of a per-element PyLong-to-int64 walk. Stays on
+    (optionally pinned) CPU; H2D is the caller's job.
+    """
+    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
+    cpu_t = torch.from_numpy(combined)
+    if pin:
+        cpu_t = cpu_t.pin_memory()
+    return cpu_t
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor on `device`."""
+    return flatten_arrays_to_pinned_cpu(parts, pin).to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -316,6 +338,18 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+@lru_cache(maxsize=1)
+def is_tokenspeed_mla_available():
+    """
+    Check whether the tokenspeed_mla CuTe DSL kernels are available.
+    Only available on NVIDIA Blackwell (SM100) at the moment.
+    """
+    return (
+        importlib.util.find_spec("tokenspeed_mla") is not None
+        and is_blackwell_supported()
+    )
+
+
 def is_nvidia_cublas_version_ge_12_9():
     """
     temporary fix for issue #11272 (cublas 12.9+)
@@ -365,7 +399,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+    return backend not in ["torch_native", "intel_amx"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -495,6 +529,25 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
+def empty_device_cache(device_module: Optional[Any] = None) -> bool:
+    """Release unused cached blocks from the active device allocator.
+
+    This does not clear SGLang KV/radix/request caches and does not free live
+    tensors. It only forwards to the backend allocator's empty_cache hook when
+    one is available.
+    """
+
+    if device_module is None:
+        device_module = torch.get_device_module()
+
+    empty_cache = getattr(device_module, "empty_cache", None)
+    if empty_cache is None:
+        return False
+
+    empty_cache()
+    return True
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -513,7 +566,7 @@ def get_available_gpu_memory(
             )
 
         if empty_cache:
-            torch.cuda.empty_cache()
+            empty_device_cache(torch.cuda)
         props = torch.cuda.get_device_properties(gpu_id)
         if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
@@ -535,7 +588,7 @@ def get_available_gpu_memory(
             )
 
         if empty_cache:
-            torch.xpu.empty_cache()
+            empty_device_cache(torch.xpu)
         used_memory = torch.xpu.memory_allocated()
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
@@ -567,8 +620,17 @@ def get_available_gpu_memory(
                 "which may cause useless memory allocation for torch NPU context.",
             )
         if empty_cache:
-            torch.npu.empty_cache()
-        free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+            empty_device_cache(torch.npu)
+        if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+            import zbal
+
+            if not zbal.is_mix_alloc():
+                free_gpu_memory, total_gpu_memory = zbal.zbal_module.mem_get_info()
+            else:
+                # mix mode fall back into npu mem info since gva may not inited yet
+                free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+        else:
+            free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
     elif device == "musa":
         num_gpus = torch.musa.device_count()
         assert gpu_id < num_gpus
@@ -579,7 +641,7 @@ def get_available_gpu_memory(
                 "which may cause useless memory allocation for torch MUSA context.",
             )
         if empty_cache:
-            torch.musa.empty_cache()
+            empty_device_cache(torch.musa)
         props = torch.musa.get_device_properties(gpu_id)
         if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
@@ -688,6 +750,16 @@ def make_layers_non_pp(
     return layers
 
 
+def get_dispatch_device_backend():
+    if is_cuda_alike():
+        dispatch_key = "CUDA"
+    elif is_xpu():
+        dispatch_key = "XPU"
+    else:
+        raise RuntimeError("No supported accelerator (CUDA/XPU) available")
+    return dispatch_key
+
+
 @lru_cache(maxsize=1)
 def get_device_module():
     return torch.get_device_module()
@@ -700,6 +772,8 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.xpu.is_available():
+        torch.xpu.manual_seed_all(seed)
 
 
 def load_audio(
@@ -730,17 +804,24 @@ def load_audio(
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
-        decoder = AudioDecoder(
-            source,
-            sample_rate=sr,
-            num_channels=1 if mono else None,
-        )
-        samples = decoder.get_all_samples()
-        if mono:
-            return samples.data.squeeze(0).numpy()
-        return samples.data.T.numpy()
+        try:
+            decoder = AudioDecoder(
+                source,
+                sample_rate=sr,
+                num_channels=1 if mono else None,
+            )
+            samples = decoder.get_all_samples()
+            if mono:
+                return samples.data.squeeze(0).numpy()
+            return samples.data.T.numpy()
+        except Exception as e:
+            # torchcodec's bytes-buffer IO can fail on WAV files that carry
+            # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
+            logger.warning(
+                f"torchcodec AudioDecoder failed ({e}); falling back to soundfile + torchaudio."
+            )
 
-    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg / torchcodec failure)
     import soundfile as sf
     import torch
     import torchaudio
@@ -775,6 +856,13 @@ class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
+    preprocess_kwargs: Optional[Dict] = None
+
+
+@dataclass
+class VideoData:
+    url: str
+    preprocess_kwargs: Optional[Dict] = None
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -912,7 +1000,11 @@ def _normalize_video_input(
         return None
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+    if isinstance(video_file, VideoData):
+        # preprocess_kwargs is consumed by the multimodal processor, not here.
+        video_file = video_file.url
+
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
         return video_file
 
@@ -990,6 +1082,33 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
+    # cutlass-dsl emits these inside `catch_warnings()+simplefilter("always")`,
+    # which bypasses filterwarnings; override showwarning to drop them too.
+    cutlass_dsl_noisy = {
+        (
+            DeprecationWarning,
+            "Use explicit `struct.scalar.ptr` for pointer instead.",
+        ),
+        (
+            UserWarning,
+            "NamedBarrier wait also arrives on the barrier. "
+            "Routing call to NamedBarrier.arrive_and_wait().",
+        ),
+    }
+    for cat, msg in cutlass_dsl_noisy:
+        warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
+
+    if not getattr(warnings.showwarning, "_sglang_patched_cutlass_dsl", False):
+        prev_showwarning = warnings.showwarning
+
+        def _filtered_showwarning(message, category, *args, **kwargs):
+            if (category, str(message)) in cutlass_dsl_noisy:
+                return
+            prev_showwarning(message, category, *args, **kwargs)
+
+        _filtered_showwarning._sglang_patched_cutlass_dsl = True
+        warnings.showwarning = _filtered_showwarning
+
     # Suppress noisy third-party HTTP loggers.
     # huggingface_hub uses httpx which logs every HTTP request at INFO level.
     for name in ("httpx", "httpcore"):
@@ -1035,7 +1154,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.8.post1")
+        min_version: Minimum version required (e.g., "0.6.11.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1047,33 +1166,59 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
+def _still_holding_resources(procs):
+    """Procs still holding GPU context, pinned memory or fds.
+
+    A zombie has already had its resources freed by the kernel (only the exit
+    status lingers), so it counts as gone; NoSuchProcess / OSError (see
+    _wait_for_reap_or_raise) mean the same.
+    """
+    alive = []
+    for p in procs:
+        try:
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                alive.append(p)
+        except (psutil.NoSuchProcess, OSError):
+            pass
+    return alive
+
+
 def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
     """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
 
     SIGKILL is asynchronous -- children hold GPU context, pinned memory and
     fds until the kernel reaps them. Raise on timeout so a stuck process
     surfaces instead of leaving a latent race.
+
+    Polls /proc via is_running()/status() rather than psutil.wait_procs, whose
+    os.pidfd_open path (used for non-child procs) raises OSError(EINVAL) against
+    a just-killed process on some kernels and aborts the whole wait.
     """
     warn_at = min(10.0, wait_timeout / 2)
-    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
-    if not alive:
-        return
-    logger.warning(
-        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
-        "continuing to wait up to %.1fs total. pids=%s",
-        len(alive),
-        warn_at,
-        wait_timeout,
-        [p.pid for p in alive],
-    )
-    remaining = wait_timeout - warn_at
-    if remaining > 0:
-        _, alive = psutil.wait_procs(alive, timeout=remaining)
-    if alive:
-        raise RuntimeError(
-            f"kill_process_tree: {len(alive)} process(es) not reaped within "
-            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
-        )
+    deadline = time.monotonic() + wait_timeout
+    warn_deadline = time.monotonic() + warn_at
+    warned = False
+    while True:
+        alive = _still_holding_resources(procs)
+        if not alive:
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"kill_process_tree: {len(alive)} process(es) not reaped within "
+                f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+            )
+        if not warned and now >= warn_deadline:
+            logger.warning(
+                "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+                "continuing to wait up to %.1fs total. pids=%s",
+                len(alive),
+                warn_at,
+                wait_timeout,
+                [p.pid for p in alive],
+            )
+            warned = True
+        time.sleep(0.1)
 
 
 def kill_process_tree(
@@ -1089,6 +1234,11 @@ def kill_process_tree(
     `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
     for itself -- use `include_parent=False` if child reap must finish first.
     """
+    logger.info(
+        f"kill_process_tree called: parent_pid={parent_pid}, "
+        f"include_parent={include_parent}, pid={os.getpid()}"
+    )
+
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -1205,6 +1355,11 @@ def configure_logger(server_args, prefix: str = ""):
     # don't inherit the parent's logger state, so this must run here too.
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    if is_flashinfer_available():
+        from flashinfer.jit.core import logger as flashinfer_logger
+
+        flashinfer_logger.setLevel(logging.ERROR)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
@@ -1530,7 +1685,7 @@ def get_amdgpu_memory_capacity():
 
 
 def get_device_sm():
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() or is_musa():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
@@ -1642,7 +1797,10 @@ def get_npu_memory_capacity():
     try:
         import torch_npu  # noqa: F401
 
-        return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+        if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+            return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
+        else:
+            return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
     except ImportError as e:
         raise ImportError("torch_npu is required when run on npu device.")
 
@@ -1948,6 +2106,8 @@ def get_device_count() -> int:
 def get_device_core_count(device_id: int = 0) -> int:
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu.get_device_properties(device_id).gpu_eu_count
 
     return 0
 
@@ -2074,6 +2234,8 @@ def direct_register_custom_op(
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")
+        elif is_musa():
+            my_lib.impl(op_name, op_func, "MUSA")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
@@ -2228,6 +2390,8 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "sglang.srt.disaggregation.",
+        "sglang.srt.managers.",
         "torch_npu.",
     }
 
@@ -2266,6 +2430,16 @@ class SafeUnpickler(pickle.Unpickler):
 def safe_pickle_load(fp):
     """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
     return SafeUnpickler(fp).load()
+
+
+def safe_pickle_loads(data):
+    """Drop-in replacement for pickle.loads() that blocks unsafe class loading."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        buf = bytes(data)
+    else:
+        # zmq.Frame and other buffer-protocol objects
+        buf = bytes(memoryview(data))
+    return SafeUnpickler(io.BytesIO(buf)).load()
 
 
 def debug_timing(func):
@@ -2528,7 +2702,7 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         app,
         host=host,
         port=port,
-        timeout_keep_alive=5,
+        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
         loop="auto",
         log_config=None,
         log_level="warning",
@@ -2645,6 +2819,13 @@ def retry(
             return fn()
         except SkipTest:
             # Do NOT retry skipped tests - used in CI and unittest
+            raise
+        except _ShouldStop:
+            # `unittest.case._ShouldStop` is raised by `subTest.__exit__`
+            # when a subtest fails/skips and `result.failfast` is True
+            # (CI invokes `python3 file.py -f`). It signals the outer
+            # `testPartExecutor` to stop the test method cleanly; do
+            # NOT retry, just propagate so unittest handles it.
             raise
         except Exception as e:
             traceback.print_exc()
@@ -2836,6 +3017,8 @@ def is_fa3_default_architecture(hf_config):
         "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
         "StepVLForConditionalGeneration",
+        "Step3p7ForConditionalGeneration",
+        "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
@@ -2860,8 +3043,30 @@ def log_info_on_rank0(logger, msg):
     try:
         if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
             logger.info(msg)
-    except:
-        logger.info(msg)
+    except Exception as e:
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                logger.info(f"{msg} (rank-check failed: {e})")
+        else:
+            logger.info(f"{msg} (rank-check failed: {e})")
+
+
+def log_debug_on_rank0(logger, msg):
+    """
+    Log a debug message only on tensor model parallel rank 0.
+    Falls back to logging if distributed is not initialized or error occurs.
+    """
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    try:
+        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+            logger.debug(msg)
+    except Exception as e:
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                logger.debug(f"{msg} (rank-check failed: {e})")
+        else:
+            logger.debug(f"{msg} (rank-check failed: {e})")
 
 
 def load_json_config(data: str):
@@ -2941,10 +3146,16 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    # Opt-out for models that manage SP scatter/gather at the model level
+    # and do not consume the upstream gathered_buffer. Without this, the
+    # cuda graph runner pads num_tokens to attn_tp_size, which can cause
+    # autotuners to pick suboptimal kernel variants at small batches.
+    if server_args.disable_attn_tp_gather:
+        return False
+
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    assert server_args.moe_dense_tp_size in [1, None]
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -3440,12 +3651,22 @@ def is_gfx95_supported():
         return False
 
 
+def get_hip_version():
+    if torch.version.hip:
+        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
+    return (0, 0, 0)
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
     "k_proj",
     "v_proj",
     "o_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "q_b_proj",
+    "kv_b_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
@@ -3546,7 +3767,15 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    return importlib.util.find_spec("triton_kernels") is not None
+    if importlib.util.find_spec("triton_kernels") is None:
+        return False
+    try:
+        ragged_metadata_spec = importlib.util.find_spec(
+            "triton_kernels.tensor_details.ragged_tensor"
+        )
+    except ModuleNotFoundError:
+        return False
+    return ragged_metadata_spec is not None
 
 
 @lru_cache(maxsize=1)
@@ -3592,6 +3821,15 @@ def check_cuda_result(raw_output):
         raise Exception(f"CUDA error: {err}")
 
     return results
+
+
+def get_cuda_driver_bindings():
+    try:
+        from cuda.bindings import driver as cuda_driver
+    except ImportError:
+        from cuda import cuda as cuda_driver
+
+    return cuda_driver
 
 
 def get_physical_device_id(pytorch_device_id: int) -> int:

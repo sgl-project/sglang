@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import pprint
+from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional, Union
@@ -37,6 +38,23 @@ from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 logger = init_logger(__name__)
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
+
+
+@dataclass
+class BatchMetricsWindow:
+    """Counters accumulated between dynamic batching metric logs.
+
+    `total_capacity` uses each dispatch's effective admission cap, so
+    utilization reflects model/config limits instead of only the user max.
+    """
+
+    dispatches: int = 0
+    total_requests: int = 0
+    total_capacity: int = 0
+    merged_dispatches: int = 0
+    full_dispatches: int = 0
+    wait_times_ms: list[float] = field(default_factory=list)
+    reject_reasons: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass(init=False)
@@ -69,8 +87,13 @@ class Req:
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
-    prompt_attention_mask: list[torch.Tensor] | None = None
-    negative_attention_mask: list[torch.Tensor] | None = None
+    prompt_attention_mask: list[torch.Tensor | None] | None = None
+    negative_attention_mask: list[torch.Tensor | None] | None = None
+    # Masks and lengths aligned to postprocessed embeddings, one entry per text encoder.
+    prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    negative_prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    prompt_seq_lens: list[list[int]] | None = None
+    negative_prompt_seq_lens: list[list[int]] | None = None
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 
@@ -128,6 +151,14 @@ class Req:
     paired_timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
+
+    # request-local scheduler used by timestep/denoising stages.
+    # This is optional because the normal worker path executes one request at a time, so it can
+    # point at the stage-local scheduler and preserve warmup/device caches.
+    # Request-local cloned schedulers are only needed when a request can run
+    # concurrently with another request or outlive the stage-local scheduler
+    # state, such as grouped execution or disaggregation.
+    scheduler: Any | None = None
 
     eta: float = 0.0
     sigmas: list[float] | None = None
@@ -261,6 +292,13 @@ class Req:
             return None
         return os.path.join(self.output_path, output_file_name)
 
+    @property
+    def resolution_key(self) -> str | None:
+        """Return the batching config resolution key, e.g. "1024x1024"."""
+        if self.width is None or self.height is None:
+            return None
+        return f"{int(self.width)}x{int(self.height)}"
+
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
@@ -290,9 +328,6 @@ class Req:
 
         self.metrics = RequestMetrics(request_id=self.request_id)
 
-    def adjust_size(self, server_args: ServerArgs):
-        pass
-
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
 
@@ -318,6 +353,12 @@ class Req:
                 self.negative_prompt, key_hint="negative_prompt"
             )
 
+        effective_flow_shift = (
+            self.flow_shift
+            if self.flow_shift is not None
+            else getattr(server_args.pipeline_config, "flow_shift", None)
+        )
+
         debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
@@ -331,7 +372,7 @@ class Req:
               guidance_scale: {self.guidance_scale}
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
-                  flow_shift: {server_args.pipeline_config.flow_shift}
+                  flow_shift: {effective_flow_shift}
                   image_path: {self.image_path}
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
@@ -345,7 +386,7 @@ class OutputBatch:
     Final output (after pipeline completion)
     """
 
-    output: torch.Tensor | None = None
+    output: Any | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
@@ -357,7 +398,18 @@ class OutputBatch:
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None
+    metrics_list: Optional[list[Optional["RequestMetrics"]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+
+    def drop_payload_for_warmup(self) -> None:
+        self.output = None
+        self.audio = None
+        self.trajectory_timesteps = None
+        self.trajectory_latents = None
+        self.rollout_trajectory_data = None
+        self.trajectory_decoded = None
+        self.output_file_paths = None
+        self.noise_pred = None
