@@ -25,11 +25,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -262,9 +262,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )
         if kv_cache_num_frames is not None:
             if kv_cache_num_frames <= 0:
-                raise ValueError(
-                    "realtime_causal_kv_cache_num_frames must be positive"
-                )
+                raise ValueError("realtime_causal_kv_cache_num_frames must be positive")
             self.sliding_window_num_frames = int(kv_cache_num_frames)
 
     def _causal_sequence_shard_enabled(self, batch: Req) -> bool:

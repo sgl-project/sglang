@@ -39,12 +39,8 @@ def test_lingbot_realtime_attention_cache_uses_bounded_sink_window():
     stage.num_token_per_frame = 10
 
     assert stage._get_causal_sink_tokens() == 9 * 10
-    assert (
-        stage._get_causal_kv_cache_size(sequence_shard_enabled=False) == 18 * 10
-    )
-    assert (
-        stage._get_causal_kv_cache_size(sequence_shard_enabled=True) == 18 * 10
-    )
+    assert stage._get_causal_kv_cache_size(sequence_shard_enabled=False) == 18 * 10
+    assert stage._get_causal_kv_cache_size(sequence_shard_enabled=True) == 18 * 10
 
 
 def test_lingbot_realtime_cache_config_overrides_checkpoint_defaults():
@@ -65,9 +61,7 @@ def test_lingbot_realtime_cache_config_overrides_checkpoint_defaults():
     stage._apply_causal_cache_overrides(SimpleNamespace(), server_args)
 
     assert stage._get_causal_sink_tokens() == 3 * 10
-    assert (
-        stage._get_causal_kv_cache_size(sequence_shard_enabled=False) == 45 * 10
-    )
+    assert stage._get_causal_kv_cache_size(sequence_shard_enabled=False) == 45 * 10
 
 
 def test_lingbot_realtime_cache_config_uses_request_overrides():
@@ -92,9 +86,7 @@ def test_lingbot_realtime_cache_config_uses_request_overrides():
     stage._apply_causal_cache_overrides(batch, server_args)
 
     assert stage._get_causal_sink_tokens() == 4 * 10
-    assert (
-        stage._get_causal_kv_cache_size(sequence_shard_enabled=False) == 12 * 10
-    )
+    assert stage._get_causal_kv_cache_size(sequence_shard_enabled=False) == 12 * 10
 
 
 def test_lingbot_realtime_attention_cache_rolls_with_sink_window():

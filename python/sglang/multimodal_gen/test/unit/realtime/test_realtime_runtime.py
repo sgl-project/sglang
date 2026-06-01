@@ -91,6 +91,7 @@ def test_realtime_session_cache_rejects_missing_nonzero_chunk():
     else:
         raise AssertionError("expected missing realtime session to fail")
 
+
 def test_lingbot_realtime_state_uses_generic_condition_queue():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
