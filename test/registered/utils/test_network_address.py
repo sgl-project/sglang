@@ -318,7 +318,7 @@ class TestGetMooncakeTransferEngineHostname(unittest.TestCase):
     )
     def test_sglang_host_ip_overrides_server_host(self):
         self.assertEqual(
-            get_mooncake_transfer_engine_hostname("prefill", "192.168.0.55"),
+            get_mooncake_transfer_engine_hostname("192.168.0.55"),
             "10.10.10.1",
         )
 
@@ -329,7 +329,7 @@ class TestGetMooncakeTransferEngineHostname(unittest.TestCase):
     )
     def test_pd_mode_uses_explicit_bind_host(self, _mock_auto):
         self.assertEqual(
-            get_mooncake_transfer_engine_hostname("prefill", "192.168.0.55"),
+            get_mooncake_transfer_engine_hostname("192.168.0.55"),
             "192.168.0.55",
         )
 
@@ -340,7 +340,7 @@ class TestGetMooncakeTransferEngineHostname(unittest.TestCase):
     )
     def test_null_disaggregation_ignores_server_host(self, mock_auto):
         self.assertEqual(
-            get_mooncake_transfer_engine_hostname("null", "192.168.0.55"),
+            get_mooncake_transfer_engine_hostname("192.168.0.55"),
             "10.0.0.99",
         )
         mock_auto.assert_called_once_with()
@@ -352,13 +352,13 @@ class TestGetMooncakeTransferEngineHostname(unittest.TestCase):
     )
     def test_pd_mode_bind_all_interfaces_falls_back_to_auto(self, mock_auto):
         self.assertEqual(
-            get_mooncake_transfer_engine_hostname("prefill", "0.0.0.0"),
+            get_mooncake_transfer_engine_hostname("0.0.0.0"),
             "10.0.0.99",
         )
         mock_auto.assert_called_once_with()
         mock_auto.reset_mock()
         self.assertEqual(
-            get_mooncake_transfer_engine_hostname("decode", "::"),
+            get_mooncake_transfer_engine_hostname("::"),
             "10.0.0.99",
         )
 
