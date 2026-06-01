@@ -363,6 +363,10 @@ For more details, see the [HiCache documentation](../../../docs/advanced_feature
 
 ### 5.1 Accuracy Benchmark
 
+For accuracy benchmarking on DeepSeek-V4 models, please make sure that:
+- `SGLANG_DEFAULT_THINKING=1 SGLANG_REASONING_EFFORT=max` are set when launching model.
+- For GPQA and AIME25 benchmarks, run at least 16 turns to reduce randomness.
+
 #### 5.1.1 GSM8K Benchmark
 
 - **Benchmark Command:**
@@ -383,47 +387,35 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
     Invalid: 0.000
     ```
 
-#### 5.1.2 MMLU Benchmark
+#### 5.1.2 GPQA Diamond Benchmark
 
-- **Benchmark Command:**
+For GPQA Diamond benchmark, we recommend applying [sgl-eval](https://github.com/sgl-project/sgl-eval) as the benchmark tool.
 
 ```shell Command
-cd sglang
-bash benchmark/mmlu/download_data.sh
-python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 30000
+# Install
+pip install git+https://github.com/sgl-project/sgl-eval
+
+# For Flash model, reference accuracy: 88.1%
+sgl-eval run gpqa --model deepseek-ai/DeepSeek-V4-Flash --api-key <api-key> --n-repeats 16 --max-tokens 200000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
+
+# For Pro model, reference accuracy: 90.1%
+sgl-eval run gpqa --model deepseek-ai/DeepSeek-V4-Pro --api-key <api-key> --n-repeats 16 --max-tokens 400000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
 ```
 
-- **Test Results:**
-  - DeepSeek-V4-Pro (FP4, B300, low-latency)
-    ```
-    subject: abstract_algebra, #q:100, acc: 0.820
-    subject: anatomy, #q:135, acc: 0.881
-    subject: astronomy, #q:152, acc: 0.934
-    subject: business_ethics, #q:100, acc: 0.840
-    subject: clinical_knowledge, #q:265, acc: 0.913
-    subject: college_biology, #q:144, acc: 0.972
-    subject: college_chemistry, #q:100, acc: 0.680
-    subject: college_computer_science, #q:100, acc: 0.890
-    subject: college_mathematics, #q:100, acc: 0.870
-    subject: college_medicine, #q:173, acc: 0.873
-    Total latency: 14.903
-    Average accuracy: 0.879
-    ```
-  - DeepSeek-V4-Pro (FP4, H200, low-latency)
-    ```
-    subject: abstract_algebra, #q:100, acc: 0.850
-    subject: anatomy, #q:135, acc: 0.889
-    subject: astronomy, #q:152, acc: 0.947
-    subject: business_ethics, #q:100, acc: 0.860
-    subject: clinical_knowledge, #q:265, acc: 0.932
-    subject: college_biology, #q:144, acc: 0.972
-    subject: college_chemistry, #q:100, acc: 0.710
-    subject: college_computer_science, #q:100, acc: 0.910
-    subject: college_mathematics, #q:100, acc: 0.830
-    subject: college_medicine, #q:173, acc: 0.896
-    Total latency: 42.004
-    Average accuracy: 0.893
-    ```
+#### 5.1.3 AIME25 Benchmark
+
+For AIME25 benchmark, we recommend applying [sgl-eval](https://github.com/sgl-project/sgl-eval) as the benchmark tool.
+
+```shell Command
+# Install
+pip install git+https://github.com/sgl-project/sgl-eval
+
+# For Flash model, reference accuracy: ~95%
+sgl-eval run aime25 --model deepseek-ai/DeepSeek-V4-Flash --api-key <api-key> --n-repeats 16 --max-tokens 200000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
+
+# For Pro model, reference accuracy: ~97.5%
+sgl-eval run aime25 --model deepseek-ai/DeepSeek-V4-Pro --api-key <api-key> --n-repeats 16 --max-tokens 400000 --temperature 1.0 --top-p 1.0 --thinking --out-dir /sgl-workspace/logs --base-url http://localhost:30000/v1
+```
 
 ### 5.2 Speed Benchmark
 
