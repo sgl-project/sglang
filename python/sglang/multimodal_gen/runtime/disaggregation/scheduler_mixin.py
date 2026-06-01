@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import json
 import logging
 import pickle
@@ -47,6 +48,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     is_transfer_message,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -86,6 +91,9 @@ _EXCLUDE_FIELDS = frozenset(
         "trajectory_audio_latents",
         "timestep",
         "step_index",
+        # Request scheduler is a local runtime object cloned from the pipeline
+        # scheduler template. It may hold live mutable state and is not JSON-safe.
+        "scheduler",
         "prompt_template",
         "max_sequence_length",
         # trace_ctx holds live OTel SDK objects that aren't JSON-serializable.
@@ -163,6 +171,45 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             pass
 
 
+def _init_request_scheduler_from_template(
+    scheduler_template: Any, req: Req, device: torch.device
+) -> None:
+    scheduler = clone_scheduler_runtime(scheduler_template)
+    extra_kwargs = {}
+    mu = req.extra.get("mu") if hasattr(req, "extra") else None
+    if mu is not None:
+        extra_kwargs["mu"] = mu
+
+    set_timesteps_params = inspect.signature(scheduler.set_timesteps).parameters
+    timesteps = getattr(req, "timesteps", None)
+    sigmas = getattr(req, "sigmas", None)
+    num_steps = getattr(req, "num_inference_steps", None)
+
+    if sigmas is not None and "sigmas" in set_timesteps_params:
+        if isinstance(sigmas, torch.Tensor):
+            sigmas = sigmas.detach().cpu()
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **extra_kwargs)
+    elif timesteps is not None and "timesteps" in set_timesteps_params:
+        if isinstance(timesteps, torch.Tensor):
+            timesteps = timesteps.detach().cpu()
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **extra_kwargs)
+    elif num_steps is not None:
+        scheduler.set_timesteps(num_steps, device=device, **extra_kwargs)
+    else:
+        return
+
+    req.scheduler = scheduler
+    req.timesteps = scheduler.timesteps
+
+
+def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
+    scheduler_template = self.worker.pipeline.get_module("scheduler")
+    if scheduler_template is None:
+        return
+    device = torch.device(f"{current_platform.device_type}:{self.worker.local_rank}")
+    _init_request_scheduler_from_template(scheduler_template, req, device)
+
+
 def extract_transfer_fields(req) -> tuple[dict, dict]:
     """Extract all transferable fields from a Req, split into tensors and scalars."""
     tensor_fields = {}
@@ -217,6 +264,11 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
                 scalar_fields[name] = _to_json_serializable(value)
             except (TypeError, ValueError):
                 pass
+
+    if getattr(req, "generator", None) is not None:
+        seed = getattr(req, "seed", None)
+        if seed is not None:
+            scalar_fields["seed"] = _to_json_serializable(seed)
 
     if _debug_transfer:
         import torch as _torch
@@ -333,8 +385,8 @@ class SchedulerDisaggMixin:
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
-            device = torch.device(f"cuda:{local_rank}")
-            self._transfer_stream = torch.cuda.Stream(device=device)
+            device = torch.device(f"{current_platform.device_type}:{local_rank}")
+            self._transfer_stream = torch.get_device_module().Stream(device=device)
             self._init_disagg_sockets()
             self._init_disagg_transfer_manager()
 
@@ -404,7 +456,11 @@ class SchedulerDisaggMixin:
         )
 
         # Use GPU buffer when engine supports GPUDirect RDMA, CPU pinned otherwise
-        device = f"cuda:{physical_gpu_id}" if engine.supports_gpu_direct else "cpu"
+        device = (
+            f"{current_platform.device_type}:{physical_gpu_id}"
+            if engine.supports_gpu_direct
+            else "cpu"
+        )
         buffer = TransferTensorBuffer(
             pool_size=pool_size, device=device, role_name=self._disagg_role.value
         )
@@ -600,7 +656,7 @@ class SchedulerDisaggMixin:
             self._transfer_manager.register_prealloc_as_receive(request_id, slot)
 
         # Load tensors on transfer_stream (non-blocking)
-        local_device = f"cuda:{self.worker.local_rank}"
+        local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
         tensors, load_event = self._transfer_manager.load_tensors_async(
             request_id,
             manifest,
@@ -727,7 +783,9 @@ class SchedulerDisaggMixin:
         # (set via torch.cuda.set_device(local_rank) during init), which is
         # already the right physical GPU — the .to() is effectively a no-op
         # but makes the invariant explicit for future readers.
-        local_device = torch.device(f"cuda:{self.worker.local_rank}")
+        local_device = torch.device(
+            f"{current_platform.device_type}:{self.worker.local_rank}"
+        )
         for key, value in list(tensor_fields.items()):
             if isinstance(value, torch.Tensor):
                 tensor_fields[key] = value.to(local_device, non_blocking=True)
@@ -796,7 +854,9 @@ class SchedulerDisaggMixin:
                     )
                     # Wait for load to complete on compute stream
                     if load_event is not None:
-                        torch.cuda.current_stream().wait_event(load_event)
+                        torch.get_device_module().current_stream().wait_event(
+                            load_event
+                        )
                     # Now safe to free the receive slot
                     if prealloc_slot_id is not None:
                         with self._transfer_manager._lock:
@@ -817,17 +877,7 @@ class SchedulerDisaggMixin:
                     # Init scheduler timesteps on main thread (safe — no
                     # concurrent denoising loop can be running here).
                     if self._disagg_role == RoleType.DENOISER:
-                        scheduler_mod = self.worker.pipeline.get_module("scheduler")
-                        num_steps = getattr(req, "num_inference_steps", None)
-                        if scheduler_mod is not None and num_steps is not None:
-                            device = torch.device(f"cuda:{self.worker.local_rank}")
-                            extra_kwargs = {}
-                            mu = req.extra.get("mu") if hasattr(req, "extra") else None
-                            if mu is not None:
-                                extra_kwargs["mu"] = mu
-                            scheduler_mod.set_timesteps(
-                                num_steps, device=device, **extra_kwargs
-                            )
+                        _init_disagg_request_scheduler(self, req)
                     # Run compute
                     if self._disagg_role == RoleType.DENOISER:
                         self._disagg_denoiser_compute(req, request_id, rn)
@@ -1181,7 +1231,7 @@ class SchedulerDisaggMixin:
             self._transfer_manager.register_prealloc_as_receive(request_id, slot)
 
         # 1. Start load on transfer_stream (non-blocking)
-        local_device = f"cuda:{self.worker.local_rank}"
+        local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
         tensors, load_event = self._transfer_manager.load_tensors_async(
             request_id,
             manifest,
@@ -1194,19 +1244,11 @@ class SchedulerDisaggMixin:
 
         # 3. Init scheduler timesteps if denoiser (CPU work, overlapped)
         if self._disagg_role == RoleType.DENOISER:
-            scheduler_mod = self.worker.pipeline.get_module("scheduler")
-            num_steps = getattr(req, "num_inference_steps", None)
-            if scheduler_mod is not None and num_steps is not None:
-                device = torch.device(local_device)
-                extra_kwargs = {}
-                mu = req.extra.get("mu") if hasattr(req, "extra") else None
-                if mu is not None:
-                    extra_kwargs["mu"] = mu
-                scheduler_mod.set_timesteps(num_steps, device=device, **extra_kwargs)
+            _init_disagg_request_scheduler(self, req)
 
         # 4. Wait for load before compute (GPU must see the data)
         if load_event is not None:
-            torch.cuda.current_stream().wait_event(load_event)
+            torch.get_device_module().current_stream().wait_event(load_event)
 
         # 5. Free receive slot after load completes (data is on compute GPU)
         if prealloc_slot_id is not None:
@@ -1246,15 +1288,7 @@ class SchedulerDisaggMixin:
         """
         if self._disagg_role == RoleType.DENOISER:
             # Initialize scheduler timesteps (same as rank 0)
-            scheduler_mod = self.worker.pipeline.get_module("scheduler")
-            num_steps = getattr(req, "num_inference_steps", None)
-            if scheduler_mod is not None and num_steps is not None:
-                device = torch.device(f"cuda:{self.worker.local_rank}")
-                extra_kwargs = {}
-                mu = req.extra.get("mu") if hasattr(req, "extra") else None
-                if mu is not None:
-                    extra_kwargs["mu"] = mu
-                scheduler_mod.set_timesteps(num_steps, device=device, **extra_kwargs)
+            _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
                 self.worker.execute_forward([req], return_req=True)
@@ -1296,9 +1330,13 @@ class SchedulerDisaggMixin:
         # Recreate torch.Generator from seed (not serializable over transfer)
         seed = scalar_fields.get("seed")
         if seed is not None:
-            gen = torch.Generator(device="cpu")
-            gen.manual_seed(int(seed))
-            req.generator = gen
+            if isinstance(seed, list):
+                req.generator = [
+                    torch.Generator(device="cpu").manual_seed(int(item))
+                    for item in seed
+                ]
+            else:
+                req.generator = torch.Generator(device="cpu").manual_seed(int(seed))
         # Rebuild trace_ctx from the propagated __getstate__ dict so this role's
         # spans nest under the sender's trace (same mechanism SRT uses via pickle).
         if trace_state and trace_state.get("tracing_enable"):

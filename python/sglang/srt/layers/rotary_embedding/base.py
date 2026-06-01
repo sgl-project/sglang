@@ -99,7 +99,8 @@ class RotaryEmbedding(MultiPlatformOp):
 
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
+        if get_global_server_args().rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
                 apply_rotary_emb
@@ -418,6 +419,7 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
+        self._match_cos_sin_cache_dtype(query)
         return torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,

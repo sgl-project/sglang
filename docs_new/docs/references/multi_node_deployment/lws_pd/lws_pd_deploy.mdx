@@ -147,7 +147,7 @@ spec:
             name: model
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs
             name: cf
           - mountPath: /root/.cache
             name: sgl-cache
@@ -305,7 +305,7 @@ spec:
             name: model
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs
             name: cf
         dnsPolicy: ClusterFirstWithHostNet
         hostIPC: true
@@ -458,7 +458,7 @@ spec:
             name: model
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs
             name: cf
         dnsPolicy: ClusterFirstWithHostNet
         hostIPC: true
@@ -592,7 +592,7 @@ spec:
             name: model
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs
             name: cf
         dnsPolicy: ClusterFirstWithHostNet
         hostIPC: true

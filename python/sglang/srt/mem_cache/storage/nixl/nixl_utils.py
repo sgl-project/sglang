@@ -1,8 +1,8 @@
 import logging
 import os
-from typing import Any, List, Optional, Tuple, Union
+from typing import Optional
 
-import torch
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,17 @@ class NixlBackendConfig:
                 {'param1': 'value1', 'param2': 'value2', ...}
         """
         self.config = config or {}
+
+    def get_use_direct_io(self) -> bool:
+        """Return True if O_DIRECT should be requested when opening files.
+
+        Checks the top-level ``use_direct_io`` key in the long-form JSON config first,
+        then falls back to the ``SGLANG_HICACHE_NIXL_USE_DIRECT_IO`` environment variable
+        (default: enabled).
+        """
+        if "use_direct_io" in self.config:
+            return bool(self.config["use_direct_io"])
+        return envs.SGLANG_HICACHE_NIXL_USE_DIRECT_IO.get()
 
     def get_specified_plugin(self) -> str:
         """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
@@ -90,11 +101,6 @@ class NixlBackendSelection:
         self.mem_type = None
         self.nixlconfig = nixlconfig
 
-    def set_bucket(self, bucket_name: str) -> None:
-        """Set AWS bucket name in environment variable."""
-        os.environ["AWS_DEFAULT_BUCKET"] = bucket_name
-        logger.debug(f"Set AWS bucket name to: {bucket_name}")
-
     def create_backend(self, agent) -> bool:
         """Create the appropriate NIXL backend based on configuration."""
         try:
@@ -162,77 +168,28 @@ class NixlBackendSelection:
             return False
 
 
-class NixlRegistration:
-    """Handles NIXL memory registration."""
-
-    def __init__(self, agent):
-        self.agent = agent
-
-    def create_query_tuples(
-        self, key: str, mem_type: str, file_manager=None
-    ) -> List[Tuple]:
-        """Create NIXL tuples for querying memory.
-        Args:
-            key: Key to query (file path for FILE or object key for OBJ)
-            mem_type: Memory type ("FILE" or "OBJ")
-            file_manager: Optional NixlFileManager for FILE memory type
-        Returns:
-            List of NIXL tuples for querying
-        """
-        if mem_type == "FILE":
-            if file_manager is None:
-                logger.error("file_manager required for FILE memory type")
-                return []
-            return [(0, 0, 0, file_manager.get_file_path(key))]
-        else:  # OBJ
-            return [(0, 0, 0, key)]
-
-    def _register_memory(
-        self,
-        items: Union[List[tuple], torch.Tensor, List[torch.Tensor]],
-        mem_type: Optional[str] = None,
-    ) -> Optional[Any]:
-        """Common registration logic for files, objects, and buffers.
-        Args:
-            items: List of tuples or tensors to register
-            mem_type: Memory type ("FILE", "OBJ") or None for tensor or list of tensors
-        """
-        if isinstance(items, list) and not items:
-            return None
-
-        reg_descs = self.agent.get_reg_descs(items, mem_type)
-        if reg_descs is None:
-            logger.error("Failed to create registration descriptors")
-            return None
-
-        try:
-            registered_memory = self.agent.register_memory(reg_descs)
-            return registered_memory  # Could be None in case of error
-        except Exception as e:
-            if not mem_type:
-                logger.error(f"Failed to register Tensors with NIXL: {e}")
-            else:
-                logger.error(
-                    f"Failed to register memory of type {mem_type} with NIXL: {e}"
-                )
-            return None
-
-
 class NixlFileManager:
     """Handles file system operations for NIXL."""
 
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, use_direct_io: bool = True):
         """
         Initialize file manager.
         Args:
             base_dir: Base directory for storing tensor files
+            use_direct_io: If True, open files with O_DIRECT (bypasses OS page cache).
+                Falls back to buffered I/O with a warning when O_DIRECT is unavailable.
         """
         self.base_dir = base_dir
+        self.use_direct_io = use_direct_io
         if base_dir == "":
-            logger.debug(f"Initialized file manager without a base directory")
+            logger.debug(
+                f"Initialized file manager without a base directory. Direct I/O: {use_direct_io}"
+            )
         else:
             os.makedirs(base_dir, exist_ok=True)
-            logger.debug(f"Initialized file manager with base directory: {base_dir}")
+            logger.debug(
+                f"Initialized file manager with base directory: {base_dir}. Direct I/O: {use_direct_io}"
+            )
 
     def clear(self) -> None:
         """Clear all files in the base directory."""
@@ -254,23 +211,26 @@ class NixlFileManager:
         """Get full file path for a given key."""
         return os.path.join(self.base_dir, key)
 
-    def create_file(self, file_path: str) -> bool:
-        """Create a file if it doesn't exist."""
-        try:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            if not os.path.exists(file_path):
-                with open(file_path, "wb") as f:
-                    pass  # Create empty file
-            return True
-        except Exception as e:
-            logger.error(f"Failed to create file {file_path}: {e}")
-            return False
+    def open_file(self, file_path: str, create: bool = False) -> Optional[int]:
+        """Open a file and return its file descriptor.
 
-    def open_file(self, file_path: str) -> Optional[int]:
-        """Open a file and return its file descriptor."""
+        If ``create`` is True, the file is created if it does not exist
+        (mode 0o644, no truncation). When ``self.use_direct_io`` is True,
+        the file is opened with ``O_DIRECT`` (bypasses the OS page cache);
+        falls back to buffered I/O with a warning if ``O_DIRECT`` is
+        unavailable on this platform.
+        """
+        flags = os.O_RDWR | os.O_CREAT if create else os.O_RDWR
+        if self.use_direct_io:
+            if hasattr(os, "O_DIRECT"):
+                flags |= os.O_DIRECT
+            else:
+                logger.warning(
+                    "use_direct_io is True, but O_DIRECT is not available on "
+                    "this system. Falling back to buffered I/O."
+                )
         try:
-            fd = os.open(file_path, os.O_RDWR)
-            return fd
+            return os.open(file_path, flags, 0o644)
         except Exception as e:
             logger.error(f"Failed to open file {file_path}: {e}")
             return None
@@ -283,17 +243,3 @@ class NixlFileManager:
         except Exception as e:
             logger.error(f"Failed to close file descriptor {fd}: {e}")
             return False
-
-    def files_to_nixl_tuples(
-        self, file_paths: List[str]
-    ) -> List[Tuple[int, int, int, str]]:
-        """Create NIXL tuples (offset, length, fd, file_path) for given files."""
-        tuples = []
-        for path in file_paths:
-            if (fd := self.open_file(path)) is None:
-                # Clean up on failure
-                for t in tuples:
-                    self.close_file(t[2])
-                return []
-            tuples.append((0, 0, fd, path))
-        return tuples
