@@ -139,11 +139,16 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-fixes-v25" in index_html
-    assert "app.js?v=realtime-fixes-v25" in index_html
+    assert "app.js?v=realtime-fixes-v26" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";' in app_js
     assert 'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";' in app_js
     assert "Dragon Dolly" in app_js
     assert "no creature morphing" in app_js
+    assert "A static locked-off view of the back side of Plastic Beach" in app_js
+    assert "clouds slowly drifting behind the island" in app_js
+    assert "occasional shooting star" in app_js
+    assert "tiny distant pigeons" in app_js
+    assert "A slow aerial orbit around a pastel floating island hotel" not in app_js
     assert app_js.index("Dragon Ride") < app_js.index("Dragon Dolly")
     assert app_js.index("Dragon Dolly") < app_js.index("Kid A")
     assert "dragon-ride.jpg" in app_js
