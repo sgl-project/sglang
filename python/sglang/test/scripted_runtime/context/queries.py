@@ -108,18 +108,22 @@ def remaining_prompt_tokens(ctx: "ScriptedContext", rid: str) -> int:
 
 
 def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
-    # Count the prefill forward passes a chunked prompt took. The scheduler holds
-    # the req as chunked_req for every chunk except the final one that completes the
-    # prefill: add_chunked_req clears chunked_req before that batch runs, so the
-    # completing chunk never appears with chunked_rid == rid. Count the held chunks
-    # (chunked_rid == rid while it ran) and add the completing chunk back. A prompt
-    # that fits in a single pass is never chunked, so it reports zero.
-    held = sum(
-        1
-        for record in ctx._scheduler_hook._batch_log
-        if record.chunked_rid == rid and rid in record.rids
+    # Count the prefill forward passes a chunked prompt has taken so far. The
+    # scheduler holds the req as chunked_req for every chunk except the final one
+    # that completes the prefill: add_chunked_req clears chunked_req before that
+    # batch runs, so the completing chunk runs as an extend batch carrying the rid
+    # with chunked_rid != rid. Count the held chunks, then add the completing chunk
+    # only once it has actually run. This stays exact mid-flight -- it does not jump
+    # ahead by one before the prompt finishes prefilling -- and matches the total
+    # after completion. A prompt that never chunks reports zero.
+    log = ctx._scheduler_hook._batch_log
+    held = sum(1 for record in log if record.chunked_rid == rid and rid in record.rids)
+    if held == 0:
+        return 0
+    completed = any(
+        rid in record.extend_rids and record.chunked_rid != rid for record in log
     )
-    return held + 1 if held > 0 else 0
+    return held + (1 if completed else 0)
 
 
 def chunked_parks(ctx: "ScriptedContext", rid: str) -> int:
