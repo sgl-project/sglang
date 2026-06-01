@@ -4,7 +4,7 @@ import unittest
 
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
-    SpecSlotParams,
+    AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -12,9 +12,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class TestSpecSlotParams(unittest.TestCase):
+class TestAdaptiveStepSlot(unittest.TestCase):
     def _make_params_from_config(self, initial_steps: int, config: dict):
-        return SpecSlotParams(initial_steps=initial_steps, bs_cfg=config)
+        return AdaptiveStepSlot(initial_steps=initial_steps, bs_cfg=config)
 
     def test_initial_steps_snaps_to_middle_when_missing(self):
         params = self._make_params_from_config(2, {"candidate_steps": [1, 3, 7]})
@@ -229,7 +229,7 @@ class TestSpecSlotParams(unittest.TestCase):
 
 class TestAdaptiveSpeculativeParams(unittest.TestCase):
     def test_default_config_loads(self):
-        params = AdaptiveSpeculativeParams()
+        params = AdaptiveSpeculativeParams(initial_steps=1)
         self.assertEqual(params._bs_list, [1, 8, 32])
         self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
         self.assertEqual(params._slots[8].candidate_steps, [1, 3])
@@ -245,7 +245,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
                 f,
             )
             f.flush()
-            params = AdaptiveSpeculativeParams(f.name)
+            params = AdaptiveSpeculativeParams(initial_steps=1, cfg_path=f.name)
         self.assertEqual(params._bs_list, [1, 32])
         self.assertEqual(params._slots[1].candidate_steps, [1, 5])
         self.assertEqual(params._slots[1].up_hysteresis, 0.3)
@@ -256,14 +256,14 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
             json.dump({"not_a_bs": "bad"}, f)
             f.flush()
             with self.assertRaises(ValueError):
-                AdaptiveSpeculativeParams(f.name)
+                AdaptiveSpeculativeParams(initial_steps=1, cfg_path=f.name)
 
     def test_invalid_steps_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump({"1": {"candidate_steps": "bad"}}, f)
             f.flush()
             with self.assertRaises(ValueError):
-                AdaptiveSpeculativeParams(f.name)
+                AdaptiveSpeculativeParams(initial_steps=1, cfg_path=f.name)
 
     def test_global_hysteresis_inherited(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -275,7 +275,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
                 f,
             )
             f.flush()
-            params = AdaptiveSpeculativeParams(f.name)
+            params = AdaptiveSpeculativeParams(initial_steps=1, cfg_path=f.name)
         self.assertEqual(params._slots[1].up_hysteresis, 0.5)
 
     def test_entry_hysteresis_overrides_global(self):
@@ -288,7 +288,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
                 f,
             )
             f.flush()
-            params = AdaptiveSpeculativeParams(f.name)
+            params = AdaptiveSpeculativeParams(initial_steps=1, cfg_path=f.name)
         self.assertEqual(params._slots[1].up_hysteresis, 0.1)
 
 
@@ -297,7 +297,7 @@ class TestBatchSizeRouting(unittest.TestCase):
 
     def _params(self):
         # Slots: bs=1 -> [1,3,7], bs=8 -> [1,3], bs=32 -> [1].
-        return AdaptiveSpeculativeParams()
+        return AdaptiveSpeculativeParams(initial_steps=1)
 
     def test_routes_to_floor_slot_without_cuda_graph(self):
         params = self._params()

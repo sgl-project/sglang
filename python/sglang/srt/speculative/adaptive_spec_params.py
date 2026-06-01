@@ -129,7 +129,7 @@ def resolve_candidate_steps_from_config(
     return sorted(all_steps)
 
 
-class SpecSlotParams:
+class AdaptiveStepSlot:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
     The core idea: if drafts are consistently accepted, try more steps;
@@ -171,7 +171,7 @@ class SpecSlotParams:
 
         log_info_on_rank0(
             logger,
-            f"SpecSlotParams initialized: "
+            f"AdaptiveStepSlot initialized: "
             f"steps={self.current_steps}, candidate_steps={self.candidate_steps}",
         )
 
@@ -242,7 +242,10 @@ class SpecSlotParams:
 
 
 class AdaptiveSpeculativeParams:
-    """Routes ``batch_size`` to the correct per-BS ``SpecSlotParams``."""
+    """Routes ``batch_size`` to the correct per-BS slot.
+
+    A slot is a per-BS configuration of adaptive step selection.
+    """
 
     def __init__(
         self,
@@ -251,12 +254,12 @@ class AdaptiveSpeculativeParams:
     ):
         cfg, bs_entries = _load_adaptive_config(cfg_path)
         self._bs_list: list[int] = sorted(bs_entries)
-        self._slots: dict[int, SpecSlotParams] = {}
+        self._slots: dict[int, AdaptiveStepSlot] = {}
         for bs, entry in sorted(bs_entries.items()):
             merged = {**cfg, **entry}
-            # SpecSlotParams handles fallback internally: if initial_steps
+            # AdaptiveStepSlot handles fallback internally: if initial_steps
             # is not in this slot's candidate_steps, it snaps to the middle.
-            self._slots[bs] = SpecSlotParams(
+            self._slots[bs] = AdaptiveStepSlot(
                 initial_steps=initial_steps,
                 bs_cfg=merged,
             )
@@ -299,7 +302,7 @@ class AdaptiveSpeculativeParams:
             if step in self._slots[self._find_closest_bs(v)].candidate_steps
         ]
 
-    def _route(self, batch_size: int) -> SpecSlotParams:
+    def _route(self, batch_size: int) -> AdaptiveStepSlot:
         """Map *batch_size* → pad to CUDA-graph BS → closest slot."""
         return self._slots[
             self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
