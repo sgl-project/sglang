@@ -187,6 +187,34 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=True,
         run_component_accuracy_check=False,
     ),
+    DiffusionTestCase(
+        "cosmos3_nano_t2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
+            modality="video",
+            env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
+        ),
+        DiffusionSamplingParams(
+            prompt="A tiny warehouse robot moves a blue box across a clean floor.",
+            output_size="832x480",
+            num_frames=5,
+            fps=5,
+            extras={
+                "num_inference_steps": 8,
+                "seed": 0,
+                "max_sequence_length": 128,
+                "flow_shift": 10.0,
+                "extra_args": {
+                    "guardrails": False,
+                    "use_duration_template": False,
+                    "use_resolution_template": False,
+                },
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+    ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
