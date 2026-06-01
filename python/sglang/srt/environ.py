@@ -381,6 +381,16 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
+    # before the MoE block for models whose MoE input hidden_size must be
+    # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
+    # 256). When False (default) the pad runs as a separate
+    # torch.nn.functional.pad call inside the MoE method. When True, the
+    # aiter Triton kernel `fused_add_rmsnorm_pad` produces a padded
+    # post-attention layernorm output in one launch and the MoE method
+    # skips the explicit pad. Currently only takes effect on the
+    # post_attention_layernorm path with aiter backend and TP=1.
+    SGLANG_FUSE_RMSNORM_PAD = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
