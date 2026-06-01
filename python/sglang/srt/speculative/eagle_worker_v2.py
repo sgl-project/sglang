@@ -224,8 +224,11 @@ class EagleDraftWorker(BaseDraftWorker):
             sa.max_running_requests or 0,
             1,
         )
+        # The slow path drops the last step's parents, so a single-step chain
+        # has no parent entries. Match that to keep build_tree inputs identical.
+        parent_width = n_extra if self.speculative_num_steps > 1 else 0
         self._topk1_parents_prealloc = torch.arange(
-            -1, n_extra - 1, dtype=torch.long, device=self.device
+            -1, parent_width - 1, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
         self._topk1_score_indices_prealloc = torch.arange(
             n_extra, dtype=torch.long, device=self.device
