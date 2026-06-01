@@ -35,6 +35,7 @@ class TestEagleLlama2Fa3Page256(
     spec_steps = 8
     attention_backend = "fa3"
     page_size = 256
+    chunked_prefill_size = 4096  # must be divisible by page_size (256)
     cuda_graph_max_bs = 5
 
 
