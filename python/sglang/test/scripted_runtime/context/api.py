@@ -95,6 +95,13 @@ class ScriptedContext:
     def flush_cache(self) -> None:
         return lifecycle.flush_cache(self)
 
+    def trigger_abort_on_waiting_timeout(self) -> None:
+        # Drive the real waiting-timeout sweep the event loop runs at the top of
+        # get_next_batch_to_run. No state is hand-mutated: this invokes the
+        # scheduler's own sweep, which scans waiting_queue and aborts entries
+        # whose wait_queue_entry_time is older than SGLANG_REQ_WAITING_TIMEOUT.
+        self.scheduler._abort_on_waiting_timeout()
+
     def evict_radix(self, *, prefix_tokens: Optional[List[int]]) -> None:
         assert (
             prefix_tokens is None
