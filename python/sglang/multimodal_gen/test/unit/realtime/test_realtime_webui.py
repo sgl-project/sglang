@@ -54,8 +54,13 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "clouds slowly drifting behind the island" in app_js
     assert "occasional shooting star" in app_js
     assert "tiny distant pigeons" in app_js
+    assert "Ziggy Stardust" in app_js
+    assert "blue K. West sign" in app_js
+    assert "wet pavement reflecting a yellow streetlamp" in app_js
+    assert "ZiggyStardust.jpg" in app_js
     assert "A slow aerial orbit around a pastel floating island hotel" not in app_js
     assert app_js.index("Dragon Ride") < app_js.index("Dragon Dolly")
+    assert app_js.index("Ziggy Stardust") < app_js.index("Plastic Beach")
     assert app_js.index("Dragon Dolly") < app_js.index("Kid A")
     assert "dragon-ride.jpg" in app_js
     assert "stageRenderFps" not in app_js
