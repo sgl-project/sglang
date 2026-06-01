@@ -17,7 +17,9 @@ _CHUNK_SIZE = 64
 _PROMPT_LEN = 4 * _CHUNK_SIZE - 3
 
 _NUM_MIDDLE_CHUNKS = (_PROMPT_LEN - 1) // _CHUNK_SIZE
-_LIFECYCLE_MAX_NEW_TOKENS = 4
+# 6 so the decode stages stay distinct once last_decode leaves two tokens of
+# headroom for the overlap pipeline: first_decode=1, mid_decode=3, last_decode=4.
+_LIFECYCLE_MAX_NEW_TOKENS = 6
 
 
 def _advance_to_stage(r, stage: str):
@@ -76,23 +78,16 @@ class TestScriptedCore(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        # The overlap scheduler completes the one forward already in flight when
-        # pause is requested, so output_ids advances by one before generation
-        # halts. At the last_decode stage that final token reaches max_new_tokens,
-        # finishing the req before the retract can park it -- a valid terminal
-        # outcome (only possible one token from the end), so accept it.
-        if r.finished:
-            t.continue_generation()
-            return
-
         req = r.req
         assert req is not None and req in t.scheduler.waiting_queue, (
             f"stage={stage}: pause(retract) should park the req back in "
             f"waiting_queue; found={req!r}"
         )
 
-        # Snapshot after the retract settles; the paused engine must not advance
-        # the req from here.
+        # The overlap scheduler completes the one forward already in flight when
+        # pause is requested, so output_ids advances by one before generation
+        # halts. Snapshot after the retract settles; the paused engine must not
+        # advance the req from here.
         output_tokens_after_pause = len(req.output_ids)
         for _ in range(3):
             yield
