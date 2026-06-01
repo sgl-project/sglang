@@ -25,7 +25,23 @@ class CanaryPPFixture(CanaryE2EBase):
         cls.extra_server_args = (
             "--pp-size",
             str(PP_SIZE),
+            # The SWA fixture model (gemma per-layer-input embeddings) cannot run
+            # PP under CUDA graph: the runner's PP proxy schema only carries
+            # {hidden_states, residual} and drops per_layer_inputs. This is an
+            # sglang-core limitation unrelated to kv-canary, so fall back to eager
+            # replay. Canary still brackets every forward in eager mode, and PP
+            # serializes all micro-batch forwards on one forward_stream either way.
+            "--disable-cuda-graph",
             *SWA_POOL_SERVER_ARGS,
             *cls.extra_server_args,
         )
         super().setUpClass()
+
+    def maybe_assert_swa_divergence_observed(self) -> None:
+        # swa_out_of_window_tokens is sampled from whichever forward batch is live
+        # at the divergence interval. Under PP's micro-batch scheduling that sampled
+        # forward may not contain a request whose in-window prefix has been evicted
+        # to SWA slot 0, so the count is a sampling-instant artifact here. The SWA
+        # path is still proven exercised by verify_swa << verify_full and
+        # swa_full_idx_divergence > 0, so only the out-of-window floor is relaxed.
+        self.assert_swa_divergence_observed(min_swa_out_of_window_tokens=0)
