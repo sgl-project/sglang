@@ -5,7 +5,6 @@ import functools
 import logging
 from dataclasses import dataclass, field
 from typing import (
-    Any,
     TYPE_CHECKING,
     Dict,
     List,
@@ -48,10 +47,8 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.jit_kernel.dsv4.online_c128_mtp import (
-    online_c128_mtp_lazy_commit,
-    online_c128_mtp_prepare,
-    online_c128_mtp_write_prefix_states,
+from sglang.srt.layers.attention.dsv4.online_c128_mtp_controller import (
+    OnlineC128MTPController,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -346,23 +343,6 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
-@dataclass
-class _OnlineC128LayerRuntime:
-    layer_id: int
-    compressor: Any
-    head_dim: int
-    state_width: int
-    main_state: torch.Tensor
-    temp_state_slot_offset: int
-    ape: torch.Tensor
-
-
-@dataclass
-class _OnlineC128VerifyContext:
-    req_pool_indices: torch.Tensor
-    seq_lens: torch.Tensor
-
-
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -415,9 +395,7 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
-        self._online_c128_verify_ctx: Optional[_OnlineC128VerifyContext] = None
-        self._online_c128_compressors: Optional[List[Tuple[int, Any]]] = None
-        self._online_c128_layer_runtimes: Optional[List[_OnlineC128LayerRuntime]] = None
+        self.online_c128_mtp = OnlineC128MTPController(self)
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -430,101 +408,6 @@ class DeepseekV4AttnBackend(
         pinned.copy_(x.to(torch.int64), non_blocking=False)
         return pinned
 
-    def _online_c128_mtp_enabled(self) -> bool:
-        return (
-            envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
-            and self.mtp_enabled
-        )
-
-    def _online_c128_mtp_state_slot_offset(self) -> int:
-        if not self._online_c128_mtp_enabled():
-            return 0
-        return self.token_to_kv_pool.get_online_c128_mtp_state_slot_offset()
-
-    def _online_c128_mtp_max_draft_tokens(self) -> int:
-        if not self._online_c128_mtp_enabled():
-            return 0
-        return self.token_to_kv_pool.get_online_c128_mtp_max_draft_tokens()
-
-    def _clear_online_c128_verify_context(self) -> None:
-        self._online_c128_verify_ctx = None
-
-    def _set_online_c128_verify_context(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> None:
-        if not self._online_c128_mtp_enabled():
-            self._online_c128_verify_ctx = None
-            return
-        self._online_c128_verify_ctx = _OnlineC128VerifyContext(
-            req_pool_indices=req_pool_indices.detach(),
-            seq_lens=seq_lens.detach(),
-        )
-        if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
-            # Empty DP ranks may still replay a TARGET_VERIFY graph bucket with
-            # padded bs=1. Do not touch MTP state banks when there is no real
-            # request state to prepare.
-            return
-        self._prepare_online_c128_verify_layers()
-
-    def _iter_online_c128_layers(self):
-        if self._online_c128_compressors is None:
-            compressors = []
-            for layer in self.model_runner.model.model.layers:
-                attn = getattr(layer, "self_attn", None)
-                compressor = getattr(attn, "compressor", None)
-                if compressor is not None and compressor.ratio == 128:
-                    compressors.append((compressor.layer_id, compressor))
-            self._online_c128_compressors = compressors
-        return iter(self._online_c128_compressors)
-
-    def _iter_online_c128_layer_runtimes(self):
-        if self._online_c128_layer_runtimes is None:
-            runtimes = []
-            token_to_kv_pool = self.token_to_kv_pool
-            for layer_id, compressor in self._iter_online_c128_layers():
-                head_dim = compressor.head_dim
-                main_pool = token_to_kv_pool.get_attention_compress_states(layer_id)
-                runtimes.append(
-                    _OnlineC128LayerRuntime(
-                        layer_id=layer_id,
-                        compressor=compressor,
-                        head_dim=head_dim,
-                        state_width=head_dim * 3,
-                        main_state=main_pool.kv_score_buffer.kv_score,
-                        temp_state_slot_offset=main_pool.online_mtp_state_slot_offset,
-                        ape=compressor.ape.reshape(128, head_dim),
-                    )
-                )
-            self._online_c128_layer_runtimes = runtimes
-        return iter(self._online_c128_layer_runtimes)
-
-    def _prepare_online_c128_verify_layers(self) -> None:
-        ctx = self._online_c128_verify_ctx
-        if ctx is None:
-            return
-
-        bs = ctx.seq_lens.shape[0]
-        token_to_kv_pool = self.token_to_kv_pool
-        req_to_token = self.req_to_token
-        full_to_swa_index_mapping = token_to_kv_pool.full_to_swa_index_mapping
-        swa_page_size = token_to_kv_pool.swa_page_size
-
-        for runtime in self._iter_online_c128_layer_runtimes():
-            online_c128_mtp_prepare(
-                seq_lens=ctx.seq_lens,
-                req_pool_indices=ctx.req_pool_indices,
-                req_to_token=req_to_token,
-                full_to_swa_index_mapping=full_to_swa_index_mapping,
-                main_state=runtime.main_state,
-                bs=bs,
-                swa_page_size=swa_page_size,
-                temp_state_slot_offset=runtime.temp_state_slot_offset,
-                state_width=runtime.state_width,
-            )
-
     def write_online_c128_mtp_prefix_states(
         self,
         layer_id: int,
@@ -532,98 +415,12 @@ class DeepseekV4AttnBackend(
         kv_score_input: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        if (
-            not self._online_c128_mtp_enabled()
-            or logical_forward_mode != ForwardMode.TARGET_VERIFY
-            or compressor.is_in_indexer
-            or compressor.ratio != 128
-        ):
-            return
-        ctx = self._online_c128_verify_ctx
-        if ctx is None or ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
-            return
-        if kv_score_input.numel() == 0:
-            return
-
-        head_dim = compressor.head_dim
-        num_verify_tokens = int(self.speculative_num_draft_tokens)
-        max_draft_tokens = self._online_c128_mtp_max_draft_tokens()
-        if num_verify_tokens <= 0 or num_verify_tokens > max_draft_tokens:
-            return
-
-        token_to_kv_pool = self.token_to_kv_pool
-        state_pool = token_to_kv_pool.get_attention_compress_states(layer_id)
-        total_bs = kv_score_input.numel() // (num_verify_tokens * head_dim * 2)
-        layer_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0], total_bs)
-        if layer_bs <= 0:
-            return
-
-        online_c128_mtp_write_prefix_states(
+        self.online_c128_mtp.write_prefix_states(
+            layer_id=layer_id,
+            compressor=compressor,
             kv_score_input=kv_score_input,
-            seq_lens=ctx.seq_lens,
-            req_pool_indices=ctx.req_pool_indices,
-            req_to_token=self.req_to_token,
-            full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
-            ape=compressor.ape.reshape(128, head_dim),
-            state=state_pool.kv_score_buffer.kv_score,
-            layer_bs=layer_bs,
-            swa_page_size=token_to_kv_pool.swa_page_size,
-            num_verify_tokens=num_verify_tokens,
-            state_slot_stride=state_pool.online_mtp_state_slot_offset,
-            head_dim=head_dim,
+            logical_forward_mode=_get_logical_forward_mode(forward_batch),
         )
-
-    def _commit_pending_online_c128_state(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> None:
-        ctx = self._online_c128_verify_ctx
-        if ctx is None:
-            return
-        if not self._online_c128_mtp_enabled():
-            self._clear_online_c128_verify_context()
-            return
-        if ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
-            self._clear_online_c128_verify_context()
-            return
-        if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
-            return
-
-        num_verify_tokens = int(self.speculative_num_draft_tokens)
-        max_draft_tokens = self._online_c128_mtp_max_draft_tokens()
-        if num_verify_tokens <= 0 or num_verify_tokens > max_draft_tokens:
-            self._clear_online_c128_verify_context()
-            return
-
-        req_to_token = self.req_to_token
-        token_to_kv_pool = self.token_to_kv_pool
-        full_to_swa_index_mapping = token_to_kv_pool.full_to_swa_index_mapping
-        swa_page_size = token_to_kv_pool.swa_page_size
-        cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
-        cur_seq_lens = seq_lens.to(ctx.seq_lens.device)
-        old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
-        cur_bs = min(cur_seq_lens.shape[0], cur_req_pool_indices.shape[0])
-
-        for runtime in self._iter_online_c128_layer_runtimes():
-            online_c128_mtp_lazy_commit(
-                old_seq_lens=ctx.seq_lens,
-                old_req_pool_indices=ctx.req_pool_indices,
-                cur_seq_lens=cur_seq_lens,
-                cur_req_pool_indices=cur_req_pool_indices,
-                req_to_token=req_to_token,
-                full_to_swa_index_mapping=full_to_swa_index_mapping,
-                state=runtime.main_state,
-                old_bs=old_bs,
-                cur_bs=cur_bs,
-                swa_page_size=swa_page_size,
-                num_verify_tokens=num_verify_tokens,
-                head_dim=runtime.head_dim,
-                state_slot_stride=runtime.temp_state_slot_offset,
-            )
-
-        self._clear_online_c128_verify_context()
 
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(
@@ -935,7 +732,7 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         if self.mtp_enabled and logical_forward_mode.is_idle():
-            self._clear_online_c128_verify_context()
+            self.online_c128_mtp.clear()
             return
 
         req_pool_indices = forward_batch.req_pool_indices
@@ -948,7 +745,7 @@ class DeepseekV4AttnBackend(
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if logical_forward_mode.is_decode_or_idle():
-            self._commit_pending_online_c128_state(
+            self.online_c128_mtp.commit_pending(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
             )
@@ -970,18 +767,20 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=out_cache_loc,
             )
         elif logical_forward_mode.is_target_verify():
-            verify_bs = getattr(forward_batch, "_original_batch_size", forward_batch.batch_size)
+            verify_bs = getattr(
+                forward_batch, "_original_batch_size", forward_batch.batch_size
+            )
             verify_req_pool_indices = req_pool_indices[:verify_bs]
             verify_seq_lens = seq_lens[:verify_bs]
-            self._commit_pending_online_c128_state(
+            self.online_c128_mtp.commit_pending(
                 req_pool_indices=verify_req_pool_indices,
                 seq_lens=verify_seq_lens,
             )
-            self._set_online_c128_verify_context(
+            self.online_c128_mtp.begin_verify(
                 req_pool_indices=verify_req_pool_indices,
                 seq_lens=verify_seq_lens,
             )
-            online_c128_state_slot_offset = self._online_c128_mtp_state_slot_offset()
+            online_c128_state_slot_offset = self.online_c128_mtp.state_slot_offset()
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -990,7 +789,7 @@ class DeepseekV4AttnBackend(
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
         elif logical_forward_mode.is_prefill(include_draft_extend_v2=True):
-            self._commit_pending_online_c128_state(
+            self.online_c128_mtp.commit_pending(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
             )
@@ -1122,7 +921,7 @@ class DeepseekV4AttnBackend(
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
-            self._commit_pending_online_c128_state(
+            self.online_c128_mtp.commit_pending(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
             )
@@ -1142,17 +941,17 @@ class DeepseekV4AttnBackend(
             verify_bs = getattr(fb, "_original_batch_size", fb.batch_size)
             verify_req_pool_indices = req_pool_indices[:verify_bs]
             verify_seq_lens = seq_lens[:verify_bs]
-            if self._online_c128_mtp_enabled() and verify_bs == 0:
-                self._clear_online_c128_verify_context()
+            if self.online_c128_mtp.enabled() and verify_bs == 0:
+                self.online_c128_mtp.clear()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
                     bucket
                 ][bs]
                 return
-            self._commit_pending_online_c128_state(
+            self.online_c128_mtp.commit_pending(
                 req_pool_indices=verify_req_pool_indices,
                 seq_lens=verify_seq_lens,
             )
-            self._set_online_c128_verify_context(
+            self.online_c128_mtp.begin_verify(
                 req_pool_indices=verify_req_pool_indices,
                 seq_lens=verify_seq_lens,
             )
@@ -1164,10 +963,8 @@ class DeepseekV4AttnBackend(
                 mode="constant",
                 value=0,
             )
-            if self._online_c128_mtp_enabled():
-                online_c128_state_slot_offset = (
-                    self._online_c128_mtp_state_slot_offset()
-                )
+            if self.online_c128_mtp.enabled():
+                online_c128_state_slot_offset = self.online_c128_mtp.state_slot_offset()
                 temp_metadata = self.init_forward_metadata_target_verify_old(
                     max_seq_len=chosen_max_seq_len,
                     req_pool_indices=req_pool_indices,
@@ -1186,7 +983,7 @@ class DeepseekV4AttnBackend(
                     use_prefill_cuda_graph=True,
                 )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
-            self._commit_pending_online_c128_state(
+            self.online_c128_mtp.commit_pending(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
             )
@@ -1200,7 +997,7 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=True,
             )
         else:
-            self._clear_online_c128_verify_context()
+            self.online_c128_mtp.clear()
             raise NotImplementedError
 
         self.replay_cuda_graph_metadata_from(
@@ -1275,7 +1072,7 @@ class DeepseekV4AttnBackend(
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
-                online_c128_state_slot_offset=self._online_c128_mtp_state_slot_offset(),
+                online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
             )
         elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
