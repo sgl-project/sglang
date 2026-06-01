@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.lora.trtllm_moe import (
     get_lora_side_stream,
+    get_original_fp4_moe_lora_func,
     get_original_moe_lora_func,
     is_two_stream_active,
 )
@@ -226,4 +227,198 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
     )
+    return StandardCombineInput(hidden_states=output)
+
+
+def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream(
+    dispatch_output,
+    quant_info,
+    runner_config,
+    lora_info,
+):
+    """Two-stream NVFP4 sibling of the FP8 two-stream MoE LoRA dispatch.
+
+    Fires only for virtual-experts LoRA + decode-shaped batches; everything else
+    delegates to the saved-original single-stream FP4 dispatch (byte-identical).
+    """
+    hidden_states = dispatch_output.hidden_states
+
+    use_virtual_lora_store = bool(
+        lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0
+    )
+    if not (use_virtual_lora_store and is_two_stream_active(hidden_states)):
+        return get_original_fp4_moe_lora_func()(
+            dispatch_output, quant_info, runner_config, lora_info
+        )
+
+    # ---- two-stream fast path ----
+    from sglang.jit_kernel.flashinfer_trtllm_moe import (
+        trtllm_fp4_block_scale_routed_moe_lora,
+    )
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        use_symmetric_memory,
+    )
+    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        _pack_topk_for_flashinfer_routed,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.lora.triton_ops import merged_experts_fused_moe_lora_add
+
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "sgl_flashinfer_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    )
+    topk_output = dispatch_output.topk_output
+    assert TopKOutputChecker.format_is_standard(topk_output)
+    assert runner_config.top_k is not None
+
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    token_lora_mapping = lora_info.token_lora_mapping
+    fused_lora_routing_cache: dict = {}
+    # Down-proj LoRA overlap is DISABLED: its side-stream NCCL all-reduce + act_ready_event
+    # cross-stream sync corrupts decode state under sustained heavy LoRA load (cuda-graph replay) —
+    # the server produces persistent garbage ("The!!!!") after a heavy LoRA bench. The gate_up
+    # overlap above is unaffected (verified safe under the same load); only the down-overlap is buggy,
+    # so the down-proj LoRA runs serially on the main stream. This is a PRE-EXISTING race (present in
+    # the env-gated nvfp4-lora reference too); re-enable only once the side-stream collective under
+    # cuda-graph capture is made correct.
+    _overlap_down = False
+
+    inter = quant_info.intermediate_size_per_partition
+    side_stream = get_lora_side_stream()
+
+    gate_up_delta = hidden_states.new_empty(
+        (hidden_states.shape[0], runner_config.top_k, quant_info.w13_weight.shape[1])
+    )
+
+    def _run_gate_up_lora():
+        merged_experts_fused_moe_lora_add(
+            output=gate_up_delta,
+            hidden_states=hidden_states,
+            lora_a=lora_info.gate_up_lora_a_weights,
+            lora_b=lora_info.gate_up_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=False,
+            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+            experts_shared_outer_loras_b=False,
+            routing_cache=fused_lora_routing_cache,
+            fuse_add_to_output=False,
+            use_direct_expand_add=lora_info.max_lora_rank <= 64,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+        )
+
+    # O1-fp4 fork: gate_up shrink/expand on the side stream, concurrent with the
+    # FP4 op's permute + gate_up GEMM1 below. The op waits on lora_event right
+    # before its activation kernel (the only consumer of gate_up_delta).
+    lora_event = torch.cuda.Event()
+    act_ready_event = torch.cuda.Event() if _overlap_down else None
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        _run_gate_up_lora()
+        lora_event.record()
+
+    activation_lora_input = torch.empty(
+        (hidden_states.shape[0], runner_config.top_k, inter),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    packed_topk_ids = _pack_topk_for_flashinfer_routed(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        direct_down_output = torch.empty(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        # Down-LoRA overlap: allocate + zero the delta buffer (symm-mem, for its all-reduce) BEFORE
+        # the op, so the op's act_ready_event (recorded mid-op, after activation) sequences after this
+        # zero-init and the side stream can safely accumulate the all-reduced down delta into it.
+        down_delta = torch.zeros_like(direct_down_output) if _overlap_down else None
+
+    # Keep the event alive through cuda-graph capture so the captured wait inside
+    # the FP4 op isn't torn down before instantiation (eager relies on deferred destroy).
+    if torch.cuda.is_current_stream_capturing():
+        _LORA_OVERLAP_EVENTS.append(lora_event)
+        if act_ready_event is not None:
+            _LORA_OVERLAP_EVENTS.append(act_ready_event)
+    lora_ready_handle = lora_event.cuda_event
+    act_ready_handle = act_ready_event.cuda_event if act_ready_event is not None else 0
+
+    output = trtllm_fp4_block_scale_routed_moe_lora(
+        topk_ids=packed_topk_ids,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        gemm1_weights=quant_info.w13_weight,
+        gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
+        gemm2_weights=quant_info.w2_weight,
+        gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
+        output1_scales_scalar=quant_info.g1_scale_c,
+        output1_scales_gate_scalar=quant_info.g1_alphas,
+        output2_scales_scalar=quant_info.g2_alphas,
+        gate_up_lora_delta=gate_up_delta,
+        activation_lora_input=activation_lora_input,
+        lora_ready_event=lora_ready_handle,
+        act_ready_event=act_ready_handle,
+        num_experts=quant_info.global_num_experts,
+        top_k=runner_config.top_k,
+        intermediate_size=inter,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=quant_info.local_num_experts,
+        routed_scaling_factor=(
+            runner_config.routed_scaling_factor
+            if runner_config.routed_scaling_factor is not None
+            else 1.0
+        ),
+        routing_method_type=quant_info.routing_method_type,
+        do_finalize=True,
+        output=direct_down_output,
+    )
+
+    def _run_down_lora(out):
+        merged_experts_fused_moe_lora_add(
+            output=out,
+            hidden_states=activation_lora_input.view(-1, inter),
+            lora_a=lora_info.down_lora_a_weights,
+            lora_b=lora_info.down_lora_b_weights,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=True,
+            experts_shared_outer_loras_a=False,
+            experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+            routing_cache=fused_lora_routing_cache,
+            fuse_add_to_output=False,
+            fuse_sum_all_reduce=True,
+            use_direct_expand_add=lora_info.max_lora_rank <= 64,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+        )
+
+    if _overlap_down:
+        # Step-1 down overlap (all-reduce structure UNCHANGED, byte-equivalent to the serial path
+        # below): the op recorded act_ready_event after its activation kernel, so the side stream runs
+        # the down shrink/expand/all-reduce concurrent with the op's requant + down-GEMM + finalize,
+        # into the pre-zeroed symm-mem `down_delta`; the main stream adds it to the op output after
+        # both join.  (Step 2 — folding the add into a single finalize/all-reduce — is a follow-up.)
+        down_event = torch.cuda.Event()
+        with torch.cuda.stream(side_stream):
+            side_stream.wait_event(act_ready_event)
+            _run_down_lora(down_delta)
+            down_event.record()
+        if torch.cuda.is_current_stream_capturing():
+            _LORA_OVERLAP_EVENTS.append(down_event)
+        torch.cuda.current_stream().wait_event(down_event)
+        output.add_(down_delta)
+    else:
+        _run_down_lora(output)
     return StandardCombineInput(hidden_states=output)

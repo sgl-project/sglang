@@ -1876,6 +1876,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
+        # Per-token NVFP4 activation scaling (env-gated, default off — per-tensor is faster).
+        # When on, force w13/w2 input_scale==1 so the decomposed LoRA scale composition matches the
+        # fused path. Required (=1) for NVFP4 LoRA on sgl_flashinfer_trtllm; off keeps no-lora fast.
         if (
             self.enable_flashinfer_trtllm_moe
             and envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()

@@ -425,8 +425,18 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
-    # Enable per-token NVFP4 activation scaling path for FlashInfer TRT-LLM MoE.
+    # NVFP4 per-token activation scaling for the flashinfer-trtllm MoE. Default OFF (per-tensor,
+    # faster — main's behavior). Set =1 when serving NVFP4 LoRA on the sgl_flashinfer_trtllm
+    # backend: the decomposed LoRA scale composition needs w13/w2 input_scale==1 (see
+    # lora/trtllm_moe/lora_dispatch.py path-3 comment). Leaving it OFF for no-lora avoids the
+    # ~9-13% per-token overhead on the no-lora base.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # Token-count ceiling for the trtllm-LoRA decode two-stream overlap (now ALWAYS-ON): decode batches
+    # with <= this many tokens run two-stream; larger batches run single-stream. NOTE: the LoRA
+    # two-stream (attention + gate_up) overlap and the permute-memset skip are now unconditional
+    # (their env gates were removed — proven useful). The down-proj overlap is DISABLED (load-triggered
+    # cuda-graph/NCCL race → decode garbage; see moe_overlap.py `_overlap_down`).
+    SGLANG_TWO_STREAM_MAX_TOKENS = EnvInt(256)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

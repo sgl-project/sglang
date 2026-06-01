@@ -900,7 +900,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    # Quantize hidden states to FP4
+    # Quantize hidden states to FP4. Per-token activation (env-gated, default off) is needed only
+    # for the NVFP4 LoRA decomposed-scale path (sgl_flashinfer_trtllm); no-lora keeps the cheaper
+    # per-tensor quant. Gate must match the input_scale==1 weight-prep in modelopt_quant.
     if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
         from flashinfer import SfLayout, nvfp4_quantize
 

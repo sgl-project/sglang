@@ -2480,7 +2480,8 @@ class FP4BlockScaleLoraLauncher {
                             Optional<TensorView> const& output1_scales_gate_scalar,
                             Optional<TensorView> const& output2_scales_scalar,
                             TensorView const& gate_up_lora_delta,
-                            TensorView const& activation_lora_input, TensorView const& output)
+                            TensorView const& activation_lora_input, TensorView const& output,
+                            int64_t lora_ready_event, int64_t act_ready_event)
       : expert_indices_(expert_indices),
         expert_weights_(expert_weights),
         routing_bias_(routing_bias),
@@ -2495,7 +2496,9 @@ class FP4BlockScaleLoraLauncher {
         output2_scales_scalar_(output2_scales_scalar),
         gate_up_lora_delta_(gate_up_lora_delta),
         activation_lora_input_(activation_lora_input),
-        output_(output) {}
+        output_(output),
+        lora_ready_event_(lora_ready_event),
+        act_ready_event_(act_ready_event) {}
 
   // Returns {output} when do_finalize, else {gemm2_output, expert_weights,
   // expanded_idx_to_permuted_idx} for a downstream finalize kernel.
@@ -2588,10 +2591,11 @@ class FP4BlockScaleLoraLauncher {
       // ---- 3) permute (gather) bf16 hidden -> [max_padded, hidden] (transient, freed at block end)
       Tensor permuted_hidden_bf16 =
           alloc_tensor({max_num_padded_tokens, hidden_size}, dl_bfloat16, device);
-      // Zero-init so padded (unused) rows are well-defined for the subsequent quant.
-      cudaMemsetAsync(permuted_hidden_bf16.data_ptr(), 0,
-                      (size_t)max_num_padded_tokens * hidden_size * sizeof(cutlass::bfloat16_t),
-                      stream);
+      // Padded (unused) rows of permuted_hidden_bf16 are intentionally left UNINITIALIZED: the prior
+      // DEFENSIVE zero-init memset is always skipped now (env gate removed — proven safe). Padding rows
+      // never reach a valid output (moe::dev::finalize gathers only real tokens via the index map and
+      // skips permutedIdx==-1; the NvFP4 per-token scale is strictly per-row; the grouped GEMMs are
+      // per-row), so skipping it reclaims the ~max_padded*hidden*2B memset (a prefill/TTFT win).
       {
         moe::dev::permute::Data permData;
         permData.mDtypeElt = btg::Dtype::Bfloat16;
@@ -2673,6 +2677,14 @@ class FP4BlockScaleLoraLauncher {
           inter);
     }
 
+    // GEMM1-LoRA overlap: wait the side-stream LoRA event that produced the
+    // gate_up_lora_delta consumed by the activation below, so the gate_up GEMM1 +
+    // de-interleave above overlap the side-stream LoRA shrink/expand. No-op (0)
+    // on the single-stream path.
+    if (lora_ready_event_ != 0) {
+      cudaStreamWaitEvent(stream, reinterpret_cast<cudaEvent_t>(lora_ready_event_), 0);
+    }
+
     // ---- 6) activation (LoRA-aware): SwiGLU on raw gate_up + gate_up_lora_delta pre-act ----
     Tensor activated_bf16 = alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
     {
@@ -2695,6 +2707,12 @@ class FP4BlockScaleLoraLauncher {
           static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
       actData.totalNumPaddedTokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
       moe::dev::activation::run(actData, stream);
+      // Two-stream down-LoRA overlap (SGLANG_LORA_OVERLAP_DOWN): signal that activation_lora_input is
+      // ready so the side stream can run the down shrink/expand concurrent with the requant + down
+      // GEMM below. No-op (handle 0) unless the two-stream dispatch passes an event.
+      if (act_ready_event_ != 0) {
+        cudaEventRecord(reinterpret_cast<cudaEvent_t>(act_ready_event_), stream);
+      }
     }
 
     // ---- 7) NvFP4 quant of activated bf16 (already permuted) -> permuted fp4 + sf + per-token ----
@@ -2804,6 +2822,8 @@ class FP4BlockScaleLoraLauncher {
   TensorView gate_up_lora_delta_;
   TensorView activation_lora_input_;
   TensorView output_;
+  int64_t lora_ready_event_ = 0;
+  int64_t act_ready_event_ = 0;
 };
 
 Array<Tensor> sgl_trtllm_fp4_block_scale_moe_lora(
@@ -2821,7 +2841,7 @@ Array<Tensor> sgl_trtllm_fp4_block_scale_moe_lora(
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, int64_t act_type, TensorView output, Array<int64_t> config_index,
     bool norm_topk_prob, Optional<TensorView> routing_replay_out, TensorView gate_up_lora_delta,
-    TensorView activation_lora_input) {
+    TensorView activation_lora_input, int64_t lora_ready_event, int64_t act_ready_event) {
   auto activation_type = validateAndCastActivationType(act_type);
   TVM_FFI_ICHECK(isGatedActivation(activation_type))
       << "sgl_trtllm_fp4_block_scale_moe_lora currently supports gated (SwiGLU) activation only.";
@@ -2868,7 +2888,7 @@ Array<Tensor> sgl_trtllm_fp4_block_scale_moe_lora(
       expert_indices, expert_weights, routing_bias, hidden_states, hidden_states_scale,
       gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output1_scales_scalar,
       output1_scales_gate_scalar, output2_scales_scalar, gate_up_lora_delta, activation_lora_input,
-      output);
+      output, lora_ready_event, act_ready_event);
   return launcher.run(num_experts, top_k, intermediate_size, local_expert_offset, local_num_experts,
                       routed_scaling_factor.value_or(1.0), routing_method_type, tile_tokens_dim,
                       norm_topk_prob, do_finalize, enable_pdl);

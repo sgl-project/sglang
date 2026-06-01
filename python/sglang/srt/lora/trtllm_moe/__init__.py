@@ -21,25 +21,15 @@ to the saved-original implementation for non-decode batches (token count above
 ``SGLANG_TWO_STREAM_MAX_TOKENS`` default 256), so prefill stays on the serial
 path even with the patch installed.
 """
-import os
 from typing import Callable, Optional
 
 import torch
 
-_ENV_KEY = "SGLANG_LORA_TWO_STREAM"
-_MAX_TOKENS_KEY = "SGLANG_TWO_STREAM_MAX_TOKENS"
-_MAX_TOKENS_DEFAULT = 256
-
+from sglang.srt.environ import envs
 
 def is_two_stream_active(x: torch.Tensor) -> bool:
-    """Per-batch gate. True iff env is on AND batch is decode-shaped."""
-    if os.environ.get(_ENV_KEY) != "1":
-        return False
-    try:
-        max_tok = int(os.environ.get(_MAX_TOKENS_KEY, str(_MAX_TOKENS_DEFAULT)))
-    except ValueError:
-        max_tok = _MAX_TOKENS_DEFAULT
-    return x.shape[0] <= max_tok
+    """Per-batch gate (two-stream now always-on). True iff batch is decode-shaped (<= SGLANG_TWO_STREAM_MAX_TOKENS)."""
+    return x.shape[0] <= envs.SGLANG_TWO_STREAM_MAX_TOKENS.get()
 
 
 _LORA_SIDE_STREAM: Optional[torch.cuda.Stream] = None
@@ -66,10 +56,8 @@ def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> Non
     lazy, the first eligible decode forward would create it — which can fall
     inside capture if warmup didn't happen to exercise a two-stream batch.
     Calling this from a pre-capture hook pins creation to init/warmup on the
-    correct device. No-op unless ``SGLANG_LORA_TWO_STREAM=1``.
+    correct device.
     """
-    if os.environ.get(_ENV_KEY) != "1":
-        return
     if device is not None:
         with torch.cuda.device(device):
             get_lora_side_stream()
@@ -82,7 +70,10 @@ def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> Non
 _ORIGINAL_QKV_FORWARD: Optional[Callable] = None
 _ORIGINAL_ROW_FORWARD: Optional[Callable] = None
 _ORIGINAL_MERGED_FORWARD: Optional[Callable] = None
+_ORIGINAL_COLUMN_FORWARD: Optional[Callable] = None
+_ORIGINAL_REPLICATED_FORWARD: Optional[Callable] = None
 _ORIGINAL_MOE_LORA_FUNC: Optional[Callable] = None
+_ORIGINAL_FP4_MOE_LORA_FUNC: Optional[Callable] = None
 _INSTALLED: bool = False
 
 
@@ -98,8 +89,20 @@ def get_original_merged_column_forward() -> Callable:
     return _ORIGINAL_MERGED_FORWARD
 
 
+def get_original_column_forward() -> Callable:
+    return _ORIGINAL_COLUMN_FORWARD
+
+
+def get_original_replicated_forward() -> Callable:
+    return _ORIGINAL_REPLICATED_FORWARD
+
+
 def get_original_moe_lora_func() -> Callable:
     return _ORIGINAL_MOE_LORA_FUNC
+
+
+def get_original_fp4_moe_lora_func() -> Callable:
+    return _ORIGINAL_FP4_MOE_LORA_FUNC
 
 
 def install_two_stream_overrides() -> None:
@@ -118,39 +121,56 @@ def install_two_stream_overrides() -> None:
     :func:`get_original_row_forward`, :func:`get_original_moe_lora_func` so the
     new versions can fall back when their per-batch gate says single-stream.
     """
-    global _INSTALLED, _ORIGINAL_QKV_FORWARD, _ORIGINAL_ROW_FORWARD, _ORIGINAL_MERGED_FORWARD, _ORIGINAL_MOE_LORA_FUNC
+    global _INSTALLED, _ORIGINAL_QKV_FORWARD, _ORIGINAL_ROW_FORWARD, _ORIGINAL_MERGED_FORWARD, _ORIGINAL_COLUMN_FORWARD, _ORIGINAL_REPLICATED_FORWARD, _ORIGINAL_MOE_LORA_FUNC, _ORIGINAL_FP4_MOE_LORA_FUNC
 
     if _INSTALLED:
         return
-    if os.environ.get(_ENV_KEY) != "1":
-        return
 
     from sglang.srt.lora.layers import (
+        ColumnParallelLinearWithLoRA,
         MergedColumnParallelLinearWithLoRA,
         QKVParallelLinearWithLoRA,
+        ReplicatedLinearWithLoRA,
         RowParallelLinearWithLoRA,
     )
     from sglang.srt.lora.trtllm_moe.attention import (
+        column_parallel_lora_forward,
         qkv_proj_lora_forward,
+        replicated_lora_forward,
         row_parallel_lora_forward,
     )
     from sglang.srt.lora.trtllm_moe.merged_column import merged_column_lora_forward
 
+    # Capture all originals before patching: QKV / MergedColumn subclass
+    # ColumnParallel, so the plain-Column O10 patch must not clobber the
+    # subclasses' own (3-/2-slice) forwards captured here as their fallbacks.
     _ORIGINAL_QKV_FORWARD = QKVParallelLinearWithLoRA.forward
     _ORIGINAL_ROW_FORWARD = RowParallelLinearWithLoRA.forward
     _ORIGINAL_MERGED_FORWARD = MergedColumnParallelLinearWithLoRA.forward
+    _ORIGINAL_COLUMN_FORWARD = ColumnParallelLinearWithLoRA.forward
+    _ORIGINAL_REPLICATED_FORWARD = ReplicatedLinearWithLoRA.forward
     QKVParallelLinearWithLoRA.forward = qkv_proj_lora_forward
     RowParallelLinearWithLoRA.forward = row_parallel_lora_forward
     MergedColumnParallelLinearWithLoRA.forward = merged_column_lora_forward
+    # O10 (MLA q_b_proj / kv_b_proj) + O11 (MLA fused_qkv_a_proj_with_mqa).
+    ColumnParallelLinearWithLoRA.forward = column_parallel_lora_forward
+    ReplicatedLinearWithLoRA.forward = replicated_lora_forward
 
     import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm as ft
     from sglang.srt.lora.trtllm_moe.moe_overlap import (
+        fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream,
         fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream,
     )
 
+    # O1 (FP8 Qwen) + O1-fp4 (NVFP4 Kimi): MoE gate_up LoRA overlap. Each patched
+    # fn falls back to its saved single-stream original for non-decode batches.
     _ORIGINAL_MOE_LORA_FUNC = ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora
+    _ORIGINAL_FP4_MOE_LORA_FUNC = ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora
     ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora = (
         fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream
+    )
+    ft.fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora = (
+        fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora_two_stream
     )
 
     _INSTALLED = True
@@ -163,6 +183,9 @@ __all__ = [
     "get_original_qkv_forward",
     "get_original_row_forward",
     "get_original_merged_column_forward",
+    "get_original_column_forward",
+    "get_original_replicated_forward",
     "get_original_moe_lora_func",
+    "get_original_fp4_moe_lora_func",
     "install_two_stream_overrides",
 ]

@@ -115,3 +115,98 @@ def apply_v_correction(
         attn_module.v_head_dim,
     )
     return attn_bmm_flat
+
+
+# ---------------------------------------------------------------------------
+# Two-stream overlap (O12) for the absorbed kv_b correction.
+#
+# Each correction factors into an input-only A-step (reads q_nope / attn_output,
+# independent of the absorbed bmm output) and a B-step that adds into that bmm
+# output. ``*_prepare`` forks the A-step onto the shared LoRA side stream so it
+# overlaps the main-stream ``q_nope @ w_kc`` / ``attn_output @ w_vc`` bmm;
+# ``*_apply`` rejoins and runs the B-step.
+#
+# Gated by ``SGLANG_LORA_TWO_STREAM`` (decode batches only) via
+# ``is_two_stream_active``. When inactive, ``*_prepare`` returns None and
+# ``*_apply`` falls back to the serial ``apply_*_correction`` (or a no-op when no
+# kv_b adapter is wrapped), so the deepseek call sites stay byte-identical with
+# two-stream off. Same fork/join (``wait_stream``) idiom as the O7/O8 attention
+# overrides — cuda-graph-capture safe.
+# ---------------------------------------------------------------------------
+
+
+def _kv_b_two_stream_state(attn_module, x):
+    from sglang.srt.lora.trtllm_moe import get_lora_side_stream, is_two_stream_active
+
+    if not is_two_stream_active(x):
+        return None
+    state = _get_state(attn_module)
+    if state is None:
+        return None
+    A_buf, B_buf, batch_info = state
+    return A_buf, B_buf, batch_info, get_lora_side_stream()
+
+
+def kv_b_lora_q_prepare(attn_module, q_nope):
+    """Fork the q-correction A-step onto the side stream (``step_a_q`` reads only
+    ``q_nope``) so it overlaps the main-stream ``q_nope @ w_kc`` bmm. Returns a
+    handle for :func:`kv_b_lora_q_apply`, or None when two-stream is inactive."""
+    st = _kv_b_two_stream_state(attn_module, q_nope)
+    if st is None:
+        return None
+    A_buf, B_buf, batch_info, side_stream = st
+    full_K_per_head = attn_module.qk_nope_head_dim + attn_module.v_head_dim
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        q_lora_a = step_a_q_fwd(q_nope, B_buf, batch_info, full_K_per_head)
+    return q_lora_a, A_buf, batch_info, side_stream
+
+
+def kv_b_lora_q_apply(attn_module, q_nope, q_nope_out, handle):
+    """Finish the q-correction: two-stream (rejoin + B-step) when ``handle`` is
+    set, else the serial correction, else a no-op. Single call replacing the
+    ``if is_kv_b_lora_active: apply_q_correction`` at the call site."""
+    if handle is not None:
+        q_lora_a, A_buf, batch_info, side_stream = handle
+        torch.cuda.current_stream().wait_stream(side_stream)
+        return step_b_q_fwd(q_lora_a, A_buf, batch_info, q_nope_out)
+    if is_kv_b_lora_active(attn_module):
+        return apply_q_correction(attn_module, q_nope, q_nope_out)
+    return q_nope_out
+
+
+def kv_b_lora_v_prepare(attn_module, attn_output):
+    """Fork the v-correction A-step onto the side stream (``step_a_v`` reads only
+    ``attn_output``) so it overlaps the main-stream ``attn_output @ w_vc`` bmm.
+    Returns a handle for :func:`kv_b_lora_v_apply`, or None when inactive."""
+    st = _kv_b_two_stream_state(attn_module, attn_output)
+    if st is None:
+        return None
+    A_buf, B_buf, batch_info, side_stream = st
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        attn_lora_a = step_a_v_fwd(attn_output, A_buf, batch_info)
+    return attn_lora_a, B_buf, batch_info, side_stream
+
+
+def kv_b_lora_v_apply(attn_module, attn_output, attn_bmm_flat, handle):
+    """Finish the v-correction: two-stream (rejoin + B-step) when ``handle`` is
+    set, else the serial correction, else a no-op."""
+    if handle is not None:
+        attn_lora_a, B_buf, batch_info, side_stream = handle
+        torch.cuda.current_stream().wait_stream(side_stream)
+        base_view = attn_bmm_flat.view(
+            -1, attn_module.num_local_heads, attn_module.v_head_dim
+        )
+        step_b_v_fwd(
+            attn_lora_a,
+            B_buf,
+            batch_info,
+            base_view,
+            attn_module.qk_nope_head_dim,
+            attn_module.v_head_dim,
+        )
+        return attn_bmm_flat
+    if is_kv_b_lora_active(attn_module):
+        return apply_v_correction(attn_module, attn_output, attn_bmm_flat)
+    return attn_bmm_flat

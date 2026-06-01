@@ -312,15 +312,6 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora(
         "sgl_flashinfer_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
     )
 
-    from sglang.srt.environ import envs
-
-    assert envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get(), (
-        "NVFP4 trtllm MoE LoRA requires SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1: it "
-        "forces w13/w2 input_scale==1 so g1_scale_c==g1_alphas and g2_alphas==w2_weight_scale_2, "
-        "which is what makes the decomposed gate_up(g1_alphas)/SwiGLU/down(g2_alphas) scale "
-        "composition match the plain fused path. Relaunch with that env var set."
-    )
-
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
