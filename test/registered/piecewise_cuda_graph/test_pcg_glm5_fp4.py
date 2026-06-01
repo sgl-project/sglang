@@ -47,7 +47,7 @@ class TestPCGGlm5Fp4(CustomTestCase):
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
-            env={"SGLANG_ENABLE_PCG_DSA_EAGER_FUSION": "1"},
+            env={"SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION": "1"},
         )
 
     @classmethod

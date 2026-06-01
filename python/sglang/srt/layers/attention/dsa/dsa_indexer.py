@@ -13,7 +13,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     fused_store_index_k_cache,
 )
 from sglang.srt.compilation.compilation_config import (
-    is_pcg_dsa_eager_fusion_enabled,
+    is_graph_dsa_eager_fusion_enabled,
 )
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
@@ -108,7 +108,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
-_enable_pcg_dsa_eager_fusion = is_pcg_dsa_eager_fusion_enabled(_is_cuda)
+_enable_graph_dsa_eager_fusion = is_graph_dsa_eager_fusion_enabled(_is_cuda)
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -1506,7 +1506,7 @@ class Indexer(MultiPlatformOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if (
-            _enable_pcg_dsa_eager_fusion
+            _enable_graph_dsa_eager_fusion
             and in_piecewise_or_breakable_cuda_graph
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not self.dsa_enable_prefill_cp

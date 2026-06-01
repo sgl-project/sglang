@@ -16,10 +16,10 @@ def register_split_op(op_name: Optional[str] = None):
     return decorator
 
 
-def is_pcg_dsa_eager_fusion_enabled(is_cuda: bool) -> bool:
+def is_graph_dsa_eager_fusion_enabled(is_cuda: bool) -> bool:
     from sglang.srt.environ import envs
 
-    return is_cuda and envs.SGLANG_ENABLE_PCG_DSA_EAGER_FUSION.get()
+    return is_cuda and envs.SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION.get()
 
 
 # TODO(Yuwei): support better compile config support
