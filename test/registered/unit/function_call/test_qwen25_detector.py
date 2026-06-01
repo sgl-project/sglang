@@ -119,7 +119,8 @@ class TestQwen25Detector(CustomTestCase):
     # ==================== Streaming Tests ====================
 
     def test_streaming_single_call(self):
-        """Streaming parse should accumulate and detect complete tool call."""
+        """Streaming parse returns incremental partial calls; the accumulated
+        result across all chunks should reconstruct the full tool call."""
         chunks = [
             "<tool_call>\n",
             '{"name": "get_weather",',
@@ -129,12 +130,17 @@ class TestQwen25Detector(CustomTestCase):
         all_calls = []
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
-            if result.calls:
+            if result and result.calls:
                 all_calls.extend(result.calls)
 
-        # Across all chunks, we should have accumulated one parsed call
-        self.assertEqual(len(all_calls), 1)
-        self.assertEqual(all_calls[0].name, "get_weather")
+        # parse_streaming_increment emits partial updates (name first, then
+        # argument diffs). We assert on the accumulated stream, not on the
+        # last chunk's result (which is just the closing tag and is empty).
+        self.assertGreaterEqual(len(all_calls), 1)
+        names = [c.name for c in all_calls if c.name]
+        self.assertIn("get_weather", names)
+        full_params = "".join((c.parameters or "") for c in all_calls)
+        self.assertEqual(json.loads(full_params), {"city": "Beijing"})
 
     def test_streaming_normal_text_before_call(self):
         """Normal text streamed before a tool call is captured."""
