@@ -175,7 +175,9 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
         device = get_local_torch_device()
         target_dtype = PRECISION_TO_TYPE.get(getattr(pcfg, "dit_precision", "bf16"), torch.bfloat16)
 
-        latents = batch.latents.to(device=device, dtype=target_dtype)
+        # .clone() detaches from the loader's InferenceMode tensor so the
+        # per-chunk in-place latent updates below are allowed.
+        latents = batch.latents.to(device=device, dtype=target_dtype).clone()
         init_latents = latents.clone()
         B, C, total_frames, H, W = latents.shape
 
