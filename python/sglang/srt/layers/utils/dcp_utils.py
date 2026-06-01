@@ -462,7 +462,7 @@ def all_gather_kv_cache_for_mha_chunk_extend(
         )
         kv_a, k_pe = gathered_kv.split([kv_a.shape[-1], k_pe.shape[-1]], dim=-1)
         kv_a = kv_a.squeeze(1)
-    return kv_a.contiguous(), k_pe
+    return kv_a.contiguous(), k_pe.contiguous()
 
 
 def all_gather_kv_cache_for_mha_extend(
@@ -511,7 +511,7 @@ def all_gather_kv_cache_for_mha_extend(
         )
     kv_a = torch.cat(kv_a_tuple, dim=0)
     k_pe = torch.cat(k_pe_tuple, dim=0)
-    return kv_a.contiguous(), k_pe
+    return kv_a.contiguous(), k_pe.contiguous()
 
 
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
