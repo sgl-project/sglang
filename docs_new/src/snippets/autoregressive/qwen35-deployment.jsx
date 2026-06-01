@@ -77,7 +77,7 @@ export const Qwen35Deployment = () => {
         const isXeon = values.hardware === 'xeon';
         return [
           { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon },
-          { id: 'fp8',  label: 'FP8',  default: hasFp8,  disabled: !hasFp8,
+          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon, disabled: !hasFp8,
             disabledReason: 'No FP8 variant available for this model' },
           { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon,
             disabledReason: isXeon ? 'FP4 is not supported on Xeon' : 'FP4 is only available for Qwen3.5-397B-A17B' }
@@ -155,7 +155,7 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 8, mem: 0.8 }, fp8: { tp: 4, mem: 0.8 } },
       mi325x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } },
       mi355x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } },
-      xeon:   { bf16: { tp: 6, mem: 0.8 } }
+      xeon:   { bf16: { tp: 6, mem: 0.8 }, fp8: { tp: 6, mem: 0.8 } }
     },
     '122b': {
       h100:   { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } },
@@ -165,7 +165,7 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 6, mem: 0.8 } }
+      xeon:   { bf16: { tp: 6, mem: 0.8 }, fp8: { tp: 6, mem: 0.8 } }
     },
     '35b': {
       h100:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -175,7 +175,7 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 3, mem: 0.8 } }
+      xeon:   { bf16: { tp: 3, mem: 0.8 }, fp8: { tp: 3, mem: 0.8 } }
     },
     '27b': {
       h100:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -185,7 +185,7 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 6, mem: 0.8 } }
+      xeon:   { bf16: { tp: 6, mem: 0.8 }, fp8: { tp: 6, mem: 0.8 } }
     },
     '9b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
