@@ -182,9 +182,7 @@ class ScriptedSchedulerHook:
                     else ()
                 ),
                 chunked_rid=chunked.rid if chunked is not None else None,
-                send_idx_by_rid=tuple(
-                    (r.rid, r.start_send_idx) for r in batch.reqs
-                ),
+                send_idx_by_rid=tuple((r.rid, r.start_send_idx) for r in batch.reqs),
                 prompt_len_by_rid=tuple(
                     (r.rid, len(r.origin_input_ids)) for r in batch.reqs
                 ),

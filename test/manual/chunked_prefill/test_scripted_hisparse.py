@@ -35,9 +35,9 @@ class TestHiSparseBasic(ScriptedTestCase):
         # No per-request staging-buffer count exists; the staging buffers live in
         # the hisparse allocator pool, gated per request by Req.hisparse_staging.
         # After finish that flag must be clear (no DMA staging left held).
-        assert not r.hisparse_dma_in_flight, (
-            "hisparse + chunked left staging in flight after finish"
-        )
+        assert (
+            not r.hisparse_dma_in_flight
+        ), "hisparse + chunked left staging in flight after finish"
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         assert len(r.req.output_ids) == 4

@@ -176,9 +176,7 @@ def kv_send_events(ctx: "ScriptedContext", rid: str) -> int:
     # across the snapshotted series. Each successful send advances start_send_idx
     # to the just-sent end index (disagg prefill send_kv_chunk).
     series = _send_idx_series(ctx, rid)
-    return sum(
-        1 for prev, curr in zip(series, series[1:]) if curr > prev
-    )
+    return sum(1 for prev, curr in zip(series, series[1:]) if curr > prev)
 
 
 def kv_send_last_chunk_events(ctx: "ScriptedContext", rid: str) -> int:

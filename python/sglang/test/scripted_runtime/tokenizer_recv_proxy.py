@@ -20,9 +20,7 @@ class ScriptedTokenizerRecvProxy:
         # them. A batch output carries this rid when `rid` is in its `rids` list.
         self._drain_underlying()
         return [
-            obj
-            for obj in self._buffer
-            if rid in (getattr(obj, "rids", None) or [])
+            obj for obj in self._buffer if rid in (getattr(obj, "rids", None) or [])
         ]
 
     def recv_pyobj(self, flags: int = 0) -> Any:
