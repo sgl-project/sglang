@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LRURefreshPhase,
     TreeComponent,
     next_component_uuid,
 )
@@ -59,6 +60,31 @@ class SWAComponent(TreeComponent):
         return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
             full_indices
         )
+
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                # Walk-down would refresh every visited ancestor to MRU,
+                # but most are outside the active sliding window and must
+                # stay evictable. Window-bounded refresh runs at
+                # MATCH_END / INSERT_END instead.
+                return
+            case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
+                self.cache.lru_lists[
+                    self.component_type
+                ].reset_node_and_window_ancestors_mru(
+                    node,
+                    root_node,
+                    self.sliding_window_size + self.cache.page_size,
+                    self.node_has_component_data,
+                )
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type
