@@ -5,6 +5,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.compilation.compilation_config import (
+    is_graph_dsa_split_op_fusion_enabled,
+)
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -12,9 +16,17 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     get_attention_dp_rank,
 )
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
+
+# Cached once at import. Master switch for the graph DSA split-op fusions
+# (`is_cuda and SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION`), shared by the indexer
+# split-op dispatch and the MLA BMM-into-attention fusion.
+_enable_graph_dsa_split_op_fusion = is_graph_dsa_split_op_fusion_enabled()
 
 
 @lru_cache(maxsize=1)
@@ -79,6 +91,14 @@ def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
         and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
+    )
+
+
+def is_graph_dsa_split_op_surface_active(forward_batch: "ForwardBatch") -> bool:
+    return (
+        _enable_graph_dsa_split_op_fusion
+        and (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+        and forward_batch.forward_mode.is_extend_without_speculative()
     )
 
 

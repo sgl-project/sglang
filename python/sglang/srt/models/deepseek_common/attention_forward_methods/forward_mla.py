@@ -5,12 +5,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.compilation.compilation_config import (
-    is_graph_dsa_split_op_fusion_enabled,
-)
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_graph_dsa_split_op_surface_active,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -32,7 +32,6 @@ from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import 
 )
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
     call_with_graph_break,
-    is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -58,8 +57,6 @@ from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-
-_enable_graph_dsa_split_op_fusion = is_graph_dsa_split_op_fusion_enabled(_is_cuda)
 
 
 @dataclass(frozen=True)
@@ -219,15 +216,9 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
-        if not _enable_graph_dsa_split_op_fusion:
-            return False
-        if not (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph()):
-            return False
-        # Keep this fusion on the same non-speculative extend PCG/BCG surface
-        # as dsa_indexer_graph_dispatch. This path already goes through
-        # unified_attention_with_output via RadixAttention.forward, so bypassing
-        # RadixAttention does not change the backend call shape.
-        if not forward_batch.forward_mode.is_extend_without_speculative():
+        # Shared activation surface with dsa_indexer_graph_dispatch (feature flag
+        # + in piecewise/breakable graph + non-speculative extend).
+        if not is_graph_dsa_split_op_surface_active(forward_batch):
             return False
         if not self.use_dsa:
             return False

@@ -12,9 +12,6 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
-from sglang.srt.compilation.compilation_config import (
-    is_graph_dsa_split_op_fusion_enabled,
-)
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
     is_in_piecewise_cuda_graph,
@@ -24,6 +21,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
+    is_graph_dsa_split_op_surface_active,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
@@ -108,7 +106,6 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
-_enable_graph_dsa_split_op_fusion = is_graph_dsa_split_op_fusion_enabled(_is_cuda)
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -1507,9 +1504,7 @@ class Indexer(MultiPlatformOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if (
-            _enable_graph_dsa_split_op_fusion
-            and in_piecewise_or_breakable_cuda_graph
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            is_graph_dsa_split_op_surface_active(forward_batch)
             and not self.dsa_enable_prefill_cp
             and not isinstance(x, tuple)
         ):
