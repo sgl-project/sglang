@@ -916,8 +916,9 @@ class SchedulerDecoupledSpecMixin:
                 f"kv_allocated_len={req.kv_allocated_len}"
             )
 
-        # check the committed_token_pos's mamba ckpt exiests
-        self._draft_mamba_ckpt_slot(state, committed_token_pos, for_write=False)
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            # check the committed_token_pos's mamba ckpt exiests
+            self._draft_mamba_ckpt_slot(state, committed_token_pos, for_write=False)
 
         if req.grammar is not None:
             try:
