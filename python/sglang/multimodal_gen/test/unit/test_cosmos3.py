@@ -3,13 +3,25 @@
 
 import unittest
 
+from fastapi import HTTPException
+
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.registry import get_non_diffusers_pipeline_name
+from sglang.multimodal_gen.registry import (
+    _get_config_info,
+    get_non_diffusers_pipeline_name,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    ImageGenerationsRequest,
+    VideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
+    _reject_unsupported_cosmos3_modes,
+)
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
 
@@ -213,7 +225,7 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
 class TestCosmos3ModelResolution(unittest.TestCase):
     """Verify Cosmos3 checkpoints resolve to the native SGLang pipeline."""
 
-    def test_hf_checkpoint_resolves_as_non_diffusers_pipeline(self):
+    def test_hf_checkpoint_uses_registered_native_pipeline_config(self):
         for model_path in (
             "nvidia/Cosmos3-Nano",
             "nvidia/Cosmos3-Super",
@@ -221,10 +233,42 @@ class TestCosmos3ModelResolution(unittest.TestCase):
             "nvidia/Cosmos3-Super-Image2Video",
         ):
             with self.subTest(model_path=model_path):
-                self.assertEqual(
-                    get_non_diffusers_pipeline_name(model_path),
-                    "Cosmos3OmniDiffusersPipeline",
-                )
+                self.assertIsNone(get_non_diffusers_pipeline_name(model_path))
+                config_info = _get_config_info(model_path)
+                self.assertIsNotNone(config_info)
+                self.assertIs(config_info.sampling_param_cls, Cosmos3SamplingParams)
+                self.assertIs(config_info.pipeline_config_cls, Cosmos3Config)
+
+
+class TestCosmos3OpenAIProtocol(unittest.TestCase):
+    """Verify Cosmos3-only knobs stay out of the stable request schema."""
+
+    def test_cosmos3_private_fields_are_extra_fields(self):
+        for request_cls in (ImageGenerationsRequest, VideoGenerationsRequest):
+            with self.subTest(request_cls=request_cls.__name__):
+                self.assertIn("max_sequence_length", request_cls.model_fields)
+                self.assertIn("flow_shift", request_cls.model_fields)
+                self.assertNotIn("use_duration_template", request_cls.model_fields)
+                self.assertNotIn("use_resolution_template", request_cls.model_fields)
+                self.assertNotIn("use_system_prompt", request_cls.model_fields)
+                self.assertNotIn("use_guardrails", request_cls.model_fields)
+
+        self.assertNotIn("generate_sound", VideoGenerationsRequest.model_fields)
+        self.assertNotIn("sound_duration", VideoGenerationsRequest.model_fields)
+
+    def test_unsupported_cosmos3_modes_allow_falsy_extra_fields(self):
+        req = VideoGenerationsRequest(
+            prompt="test",
+            generate_sound=False,
+            action_mode="",
+            condition_frame_indexes_vision=[],
+            condition_video_keep={},
+        )
+        _reject_unsupported_cosmos3_modes(req, "nvidia/Cosmos3-Nano")
+
+        req = VideoGenerationsRequest(prompt="test", generate_sound=True)
+        with self.assertRaises(HTTPException):
+            _reject_unsupported_cosmos3_modes(req, "nvidia/Cosmos3-Nano")
 
 
 if __name__ == "__main__":

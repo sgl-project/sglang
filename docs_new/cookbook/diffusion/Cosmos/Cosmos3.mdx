@@ -162,12 +162,14 @@ Path("cosmos3_i2v.mp4").write_bytes(response.content)
 
 Cosmos3 supports the standard SGLang video and image fields such as `size`, `num_frames`, `fps`, `num_inference_steps`, `guidance_scale`, `negative_prompt`, and `seed`.
 
-Cosmos3-specific request fields:
+Top-level Cosmos3 request fields:
 
 - `max_sequence_length`: maximum text token length used by the Cosmos3 tokenizer.
 - `flow_shift`: per-request scheduler flow shift. If omitted, SGLang uses `--flow-shift`, then the checkpoint scheduler default.
+
+Put model-specific compatibility knobs in `extra_params` for video requests, or `extra_args` for image requests:
+
 - `use_duration_template`: whether to append SGLang's generated duration suffix to video prompts.
 - `use_resolution_template`: accepted for vLLM-Omni request compatibility.
 - `use_system_prompt`: whether to add the Cosmos3 system prompt to the chat template.
 - `guardrails` or `use_guardrails`: per-request guardrail toggle when the server started with guardrails enabled.
-

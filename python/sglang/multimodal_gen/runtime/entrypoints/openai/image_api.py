@@ -181,18 +181,12 @@ async def generations(
             flow_shift=request.flow_shift
             if request.flow_shift is not None
             else _get_extra_field(request, "flow_shift"),
-            use_duration_template=request.use_duration_template
-            if request.use_duration_template is not None
-            else _get_extra_field(request, "use_duration_template"),
-            use_resolution_template=request.use_resolution_template
-            if request.use_resolution_template is not None
-            else _get_extra_field(request, "use_resolution_template"),
-            use_system_prompt=request.use_system_prompt
-            if request.use_system_prompt is not None
-            else _get_extra_field(request, "use_system_prompt"),
-            use_guardrails=request.use_guardrails
-            if request.use_guardrails is not None
-            else _get_extra_field(request, "use_guardrails"),
+            use_duration_template=_get_extra_field(request, "use_duration_template"),
+            use_resolution_template=_get_extra_field(
+                request, "use_resolution_template"
+            ),
+            use_system_prompt=_get_extra_field(request, "use_system_prompt"),
+            use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
             output_compression=request.output_compression,
             output_quality=request.output_quality,

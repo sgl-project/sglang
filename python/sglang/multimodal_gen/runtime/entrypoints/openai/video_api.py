@@ -51,6 +51,19 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 
+def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
+    return (request.model_extra or {}).get(name)
+
+
+def _parse_form_extra_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
     """Resolve video-specific defaults (fps, seconds → num_frames) then
     delegate to the shared build_sampling_params."""
@@ -80,10 +93,10 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         negative_prompt=request.negative_prompt,
         max_sequence_length=request.max_sequence_length,
         flow_shift=request.flow_shift,
-        use_duration_template=request.use_duration_template,
-        use_resolution_template=request.use_resolution_template,
-        use_system_prompt=request.use_system_prompt,
-        use_guardrails=request.use_guardrails,
+        use_duration_template=_extra_value(request, "use_duration_template"),
+        use_resolution_template=_extra_value(request, "use_resolution_template"),
+        use_system_prompt=_extra_value(request, "use_system_prompt"),
+        use_guardrails=_extra_value(request, "use_guardrails"),
         enable_teacache=request.enable_teacache,
         enable_frame_interpolation=request.enable_frame_interpolation,
         frame_interpolation_exp=request.frame_interpolation_exp,
@@ -107,19 +120,19 @@ def _reject_unsupported_cosmos3_modes(
         return
 
     extra = req.model_extra or {}
-    if req.generate_sound:
+    if extra.get("generate_sound"):
         raise HTTPException(
             status_code=400,
             detail="Cosmos3 video-with-sound is not supported by SGLang yet; omit generate_sound for video-only generation.",
         )
-    if extra.get("action_mode") is not None:
+    if extra.get("action_mode"):
         raise HTTPException(
             status_code=400,
             detail="Cosmos3 action generation is not supported by SGLang yet.",
         )
     if (
-        extra.get("condition_frame_indexes_vision") is not None
-        or extra.get("condition_video_keep") is not None
+        extra.get("condition_frame_indexes_vision")
+        or extra.get("condition_video_keep")
     ):
         raise HTTPException(
             status_code=400,
@@ -238,12 +251,6 @@ async def create_video(
     num_inference_steps: Optional[int] = Form(None),
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
-    use_duration_template: Optional[bool] = Form(None),
-    use_resolution_template: Optional[bool] = Form(None),
-    use_system_prompt: Optional[bool] = Form(None),
-    use_guardrails: Optional[bool] = Form(None),
-    generate_sound: Optional[bool] = Form(None),
-    sound_duration: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(None),
     enable_frame_interpolation: Optional[bool] = Form(None),
     frame_interpolation_exp: Optional[int] = Form(None),
@@ -320,6 +327,23 @@ async def create_video(
         def form_value(name: str, value: Any) -> Any:
             return value if value is not None else extra_from_form.get(name)
 
+        raw_form = await request.form()
+        for key in (
+            "use_duration_template",
+            "use_resolution_template",
+            "use_system_prompt",
+            "use_guardrails",
+            "guardrails",
+            "generate_sound",
+            "sound_duration",
+            "action_mode",
+            "condition_frame_indexes_vision",
+            "condition_video_keep",
+        ):
+            if key in raw_form and key not in extra_from_form:
+                extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+        flatten_extra_params(extra_from_form)
+
         request_field_names = set(VideoGenerationsRequest.model_fields)
         extra_request_fields = {
             key: value
@@ -352,16 +376,6 @@ async def create_video(
                 "max_sequence_length", max_sequence_length
             ),
             flow_shift=form_value("flow_shift", flow_shift),
-            use_duration_template=form_value(
-                "use_duration_template", use_duration_template
-            ),
-            use_resolution_template=form_value(
-                "use_resolution_template", use_resolution_template
-            ),
-            use_system_prompt=form_value("use_system_prompt", use_system_prompt),
-            use_guardrails=form_value("use_guardrails", use_guardrails),
-            generate_sound=form_value("generate_sound", generate_sound),
-            sound_duration=form_value("sound_duration", sound_duration),
             enable_teacache=form_value("enable_teacache", enable_teacache),
             enable_frame_interpolation=form_value(
                 "enable_frame_interpolation", enable_frame_interpolation
@@ -471,18 +485,6 @@ async def create_video(
             batch.max_sequence_length = req.diffusers_kwargs["max_sequence_length"]
         if "flow_shift" in req.diffusers_kwargs:
             batch.flow_shift = req.diffusers_kwargs["flow_shift"]
-        extra_params = req.diffusers_kwargs.get("extra_params")
-        if isinstance(extra_params, dict):
-            for key in (
-                "use_duration_template",
-                "use_resolution_template",
-                "use_system_prompt",
-                "use_guardrails",
-            ):
-                if key in extra_params:
-                    setattr(batch, key, extra_params[key])
-            if "guardrails" in extra_params:
-                batch.use_guardrails = extra_params["guardrails"]
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(
         _dispatch_job_async(
@@ -515,12 +517,6 @@ async def create_video_sync(
     num_inference_steps: Optional[int] = Form(None),
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
-    use_duration_template: Optional[bool] = Form(None),
-    use_resolution_template: Optional[bool] = Form(None),
-    use_system_prompt: Optional[bool] = Form(None),
-    use_guardrails: Optional[bool] = Form(None),
-    generate_sound: Optional[bool] = Form(None),
-    sound_duration: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(None),
     enable_frame_interpolation: Optional[bool] = Form(None),
     frame_interpolation_exp: Optional[int] = Form(None),
@@ -554,12 +550,6 @@ async def create_video_sync(
         num_inference_steps=num_inference_steps,
         max_sequence_length=max_sequence_length,
         flow_shift=flow_shift,
-        use_duration_template=use_duration_template,
-        use_resolution_template=use_resolution_template,
-        use_system_prompt=use_system_prompt,
-        use_guardrails=use_guardrails,
-        generate_sound=generate_sound,
-        sound_duration=sound_duration,
         enable_teacache=enable_teacache,
         enable_frame_interpolation=enable_frame_interpolation,
         frame_interpolation_exp=frame_interpolation_exp,
@@ -576,6 +566,8 @@ async def create_video_sync(
     )
 
     while True:
+        if await request.is_disconnected():
+            raise HTTPException(status_code=499, detail="Client closed connection")
         job = await VIDEO_STORE.get(queued.id)
         if not job:
             raise HTTPException(status_code=404, detail="Video not found")

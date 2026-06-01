@@ -52,10 +52,6 @@ class ImageGenerationsRequest(BaseModel):
     enable_teacache: Optional[bool] = False
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
-    use_duration_template: Optional[bool] = None
-    use_resolution_template: Optional[bool] = None
-    use_system_prompt: Optional[bool] = None
-    use_guardrails: Optional[bool] = None
     # Upscaling
     enable_upscaling: Optional[bool] = False
     upscaling_model_path: Optional[str] = None
@@ -115,12 +111,6 @@ class VideoGenerationsRequest(BaseModel):
     negative_prompt: Optional[str] = None
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
-    use_duration_template: Optional[bool] = None
-    use_resolution_template: Optional[bool] = None
-    use_system_prompt: Optional[bool] = None
-    use_guardrails: Optional[bool] = None
-    generate_sound: Optional[bool] = None
-    sound_duration: Optional[float] = None
     enable_teacache: Optional[bool] = False
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False

@@ -356,7 +356,7 @@ class Req:
         effective_flow_shift = (
             self.flow_shift
             if self.flow_shift is not None
-            else server_args.pipeline_config.flow_shift
+            else getattr(server_args.pipeline_config, "flow_shift", None)
         )
 
         debug_str = f"""Sampling params:
