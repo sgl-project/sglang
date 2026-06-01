@@ -1115,6 +1115,12 @@
                 "pages": [
                   "cookbook/diffusion/intro",
                   {
+                    "group": "Cosmos",
+                    "pages": [
+                      "cookbook/diffusion/Cosmos/Cosmos3"
+                    ]
+                  },
+                  {
                     "group": "FLUX",
                     "pages": [
                       "cookbook/diffusion/FLUX/FLUX"
