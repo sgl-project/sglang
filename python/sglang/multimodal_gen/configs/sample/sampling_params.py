@@ -174,12 +174,8 @@ class SamplingParams:
     progressive_mode: str = field(
         default="fullres", metadata={"batch_sig_exclude": True}
     )
-    progressive_levels: int = field(
-        default=1, metadata={"batch_sig_exclude": True}
-    )
-    progressive_delta: float = field(
-        default=0.01, metadata={"batch_sig_exclude": True}
-    )
+    progressive_levels: int = field(default=1, metadata={"batch_sig_exclude": True})
+    progressive_delta: float = field(default=0.01, metadata={"batch_sig_exclude": True})
 
     # TeaCache parameters
     enable_teacache: bool = False
@@ -759,7 +755,7 @@ class SamplingParams:
             dest="progressive_mode",
             choices=["fullres", "dct", "dct_rewind"],
             help="Progressive resolution mode. 'fullres' disables (default). "
-                 "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
+            "'dct_rewind' uses DCT-II upsample + scheduler sigma rewind (recommended).",
         )
         add_argument(
             "--progressive-levels",

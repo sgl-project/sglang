@@ -136,9 +136,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
         )
         gen = torch.Generator(device="cpu")
         gen.manual_seed(seed)
-        noise_spatial = torch.randn(
-            1, C, h_lat, w_lat, generator=gen, dtype=dtype
-        ).to(device)
+        noise_spatial = torch.randn(1, C, h_lat, w_lat, generator=gen, dtype=dtype).to(
+            device
+        )
         return self._repack_latent(noise_spatial, h_lat, w_lat, batch, server_args)
 
     def _run_stage_steps(
@@ -198,7 +198,11 @@ class ProgressiveDenoisingStage(DenoisingStage):
 
         logger.info(
             "Progressive denoising: mode=%s levels=%d delta=%.3f initial=%dx%d",
-            mode, levels, delta, init_h_lat, init_w_lat,
+            mode,
+            levels,
+            delta,
+            init_h_lat,
+            init_w_lat,
         )
 
         # ── Prepare initial state ──────────────────────────────────────────────
@@ -221,7 +225,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
         n_steps = int(batch.num_inference_steps)
         timesteps_cpu = ctx.timesteps.cpu()
 
-        transition_steps = find_transition_steps(scheduler.sigmas, stage_sigmas, n_steps)
+        transition_steps = find_transition_steps(
+            scheduler.sigmas, stage_sigmas, n_steps
+        )
         rewind = mode.endswith("_rewind")
 
         # For rewind mode we patch scheduler.sigmas/timesteps and ctx.timesteps
@@ -245,7 +251,12 @@ class ProgressiveDenoisingStage(DenoisingStage):
 
             logger.info(
                 "Stage %d/%d: %dx%d latent, steps [%d, %d)",
-                stage, num_stages, cur_h_lat, cur_w_lat, stage_start, stage_end,
+                stage,
+                num_stages,
+                cur_h_lat,
+                cur_w_lat,
+                stage_start,
+                stage_end,
             )
 
             self._run_stage_steps(
@@ -273,7 +284,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 timesteps_cpu[stage_end] = t_eff * 1000
                 logger.info(
                     "  rewind: sigma=%.4f → t_eff=%.4f at step %d",
-                    sigma_t, t_eff, stage_end,
+                    sigma_t,
+                    t_eff,
+                    stage_end,
                 )
             else:
                 x_spatial_up = result

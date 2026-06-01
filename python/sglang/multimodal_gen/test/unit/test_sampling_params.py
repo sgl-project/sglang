@@ -372,7 +372,8 @@ class TestProgressiveSamplingParams(unittest.TestCase):
 
     def test_cli_unset_progressive_fields_suppressed(self):
         """Without --progressive-* flags, progressive fields are absent from get_cli_args
-        (add_cli_args uses argparse.SUPPRESS so unset flags don't appear in the namespace)."""
+        (add_cli_args uses argparse.SUPPRESS so unset flags don't appear in the namespace).
+        """
         parser = argparse.ArgumentParser()
         SamplingParams.add_cli_args(parser)
         args = parser.parse_args([])

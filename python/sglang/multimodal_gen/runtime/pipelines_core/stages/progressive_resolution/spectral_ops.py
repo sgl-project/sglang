@@ -11,10 +11,10 @@ import math
 
 import torch
 
-
 # ---------------------------------------------------------------------------
 # 1-D DCT-II / IDCT-II (ortho-normalized, operates on last dim)
 # ---------------------------------------------------------------------------
+
 
 def dct_1d(x: torch.Tensor, norm: str = "ortho") -> torch.Tensor:
     """1-D DCT-II via torch.fft. Input: (..., N). Output: same shape."""
@@ -66,6 +66,7 @@ def idct_1d(X: torch.Tensor, norm: str = "ortho") -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # 2-D DCT-II / IDCT-II (separable: apply 1-D along H then W)
 # ---------------------------------------------------------------------------
+
 
 def dct_2d(x: torch.Tensor, norm: str = "ortho") -> torch.Tensor:
     """2-D DCT-II on the last two dims of x (..., H, W)."""
