@@ -1120,6 +1120,16 @@ function unpack(buf) {
     if (b === 0xcc) return buf[i++];
     if (b === 0xcd) return (buf[i++] << 8) | buf[i++];
     if (b === 0xce) return (buf[i++] * 16777216) + (buf[i++] << 16) + (buf[i++] << 8) + buf[i++];
+    if (b === 0xca) {
+      const value = new DataView(buf.buffer, buf.byteOffset + i, 4).getFloat32(0);
+      i += 4;
+      return value;
+    }
+    if (b === 0xcb) {
+      const value = new DataView(buf.buffer, buf.byteOffset + i, 8).getFloat64(0);
+      i += 8;
+      return value;
+    }
     if (b === 0xd9) return readStr(buf[i++]);
     if (b === 0xda) return readStr((buf[i++] << 8) | buf[i++]);
     if (b === 0xde) return readMap((buf[i++] << 8) | buf[i++]);
