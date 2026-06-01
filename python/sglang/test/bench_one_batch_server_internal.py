@@ -190,7 +190,7 @@ class BenchArgs:
             "--dataset-name",
             type=str,
             default=BenchArgs.dataset_name,
-            choices=["mmmu", "random", "generated-shared-prefix"],
+            choices=["mmmu", "random", "random-ids", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
         )
         parser.add_argument(
@@ -517,7 +517,7 @@ def run_one_case(
         _flush_cache_with_retry(url, "/flush_cache")
 
     # Load input token ids via bench_serving.get_dataset
-    supported_datasets = ("random", "mmmu", "generated-shared-prefix")
+    supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
     if dataset_name not in supported_datasets:
         raise ValueError(
             f"Unsupported dataset for batch benchmark: {dataset_name}. "
