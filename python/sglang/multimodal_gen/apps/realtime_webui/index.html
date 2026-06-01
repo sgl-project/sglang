@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SGLD Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v21" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v22" />
   </head>
   <body>
     <main class="shell">
@@ -107,6 +107,7 @@
         <div class="telemetry stage-telemetry">
           <span>Render FPS<b id="renderFps">0</b></span>
           <span>Payload<b id="payloadMode">webp</b></span>
+          <span>Theoretical FPS<b id="theoreticalFpsText">-</b></span>
           <span>Server send<b id="serverSendText">-</b></span>
           <span>Chunk bytes<b id="chunkPayloadText">-</b></span>
           <span>Chunk wait<b id="latencyText">-</b></span>
@@ -129,6 +130,6 @@
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-    <script src="./app.js?v=realtime-fixes-v21"></script>
+    <script src="./app.js?v=realtime-fixes-v22"></script>
   </body>
 </html>

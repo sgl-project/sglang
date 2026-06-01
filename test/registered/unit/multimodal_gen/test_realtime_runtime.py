@@ -110,10 +110,11 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="transportFormat"' in index_html
     assert '<option value="webp" selected>WebP preview</option>' in index_html
     assert 'id="serverSendText"' in index_html
+    assert 'id="theoreticalFpsText"' in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-fixes-v21" in index_html
-    assert "app.js?v=realtime-fixes-v21" in index_html
+    assert "styles.css?v=realtime-fixes-v22" in index_html
+    assert "app.js?v=realtime-fixes-v22" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v5";' in app_js
     assert 'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";' in app_js
     assert "Dragon Dolly" in app_js
@@ -121,6 +122,9 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "decodeChain = decodeChain" in app_js
     assert "receiveChain" not in app_js
     assert 'message.type === "chunk_stats"' in app_js
+    assert "chunkTotal > 0 ? numFrames / chunkTotal" in app_js
+    assert "encodedImageElementFallback" in app_js
+    assert "handleEncodedPreviewDecodeError" in app_js
     assert "if (b === 0xca)" in app_js
     assert "if (b === 0xcb)" in app_js
     assert "RAW_RGB_FRAMES_PER_WS_MESSAGE = 1" in (

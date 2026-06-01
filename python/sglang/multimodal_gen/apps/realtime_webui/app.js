@@ -206,6 +206,7 @@ let decodeRequestId = 1;
 let streamEpoch = 0;
 let lastDecodeMs = 0;
 let lastDisplayLagMs = 0;
+let encodedDecodeErrors = 0;
 let socketHadError = false;
 let socketCloseExpected = false;
 let socketServerError = "";
@@ -263,6 +264,7 @@ function resetStreamStats() {
   chunkReceiveStartedAt = 0;
   currentReceiveChunk = null;
   currentReceiveChunkFrames = 0;
+  encodedDecodeErrors = 0;
   controlStateController?.reset({ sendRelease: false });
   resetDecoderState();
   updateStats();
@@ -274,6 +276,7 @@ function resetStreamStats() {
   $("displayLagText").textContent = "-";
   $("serverSendText").textContent = "-";
   $("chunkPayloadText").textContent = "-";
+  $("theoreticalFpsText").textContent = "-";
   $("chunkText").textContent = "chunk -";
   $("payloadMode").textContent = selectedTransportLabel();
 }
@@ -529,10 +532,81 @@ async function framePayloadToImageData(header, payload) {
   return rgbToImageData(header, rawPayload);
 }
 
+function isEncodedPreviewContentType(contentType) {
+  return (
+    contentType === WEBP_FRAME_CONTENT_TYPE ||
+    contentType === JPEG_FRAME_CONTENT_TYPE
+  );
+}
+
 async function encodedImageToImageData(header, payload) {
   const blob = new Blob([payload], { type: header.content_type });
-  const bitmap = await createImageBitmap(blob);
-  return [{ image: bitmap, chunk: header.chunk_index }];
+  if (typeof createImageBitmap === "function") {
+    try {
+      const bitmap = await createImageBitmap(blob);
+      return [{ image: bitmap, chunk: header.chunk_index }];
+    } catch (error) {
+      return [await encodedImageElementFallback(blob, header, error)];
+    }
+  }
+  return [
+    await encodedImageElementFallback(
+      blob,
+      header,
+      new Error("createImageBitmap unavailable"),
+    ),
+  ];
+}
+
+async function encodedImageElementFallback(blob, header, createBitmapError) {
+  const url = URL.createObjectURL(blob);
+  try {
+    const image = await loadImageElement(url, createBitmapError);
+    if (
+      scratchCanvas.width !== image.naturalWidth ||
+      scratchCanvas.height !== image.naturalHeight
+    ) {
+      scratchCanvas.width = image.naturalWidth;
+      scratchCanvas.height = image.naturalHeight;
+    }
+    scratchCtx.drawImage(image, 0, 0);
+    return {
+      image: scratchCtx.getImageData(0, 0, image.naturalWidth, image.naturalHeight),
+      chunk: header.chunk_index,
+    };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function loadImageElement(url, createBitmapError) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(createBitmapError);
+    image.src = url;
+  });
+}
+
+function handleEncodedPreviewDecodeError(error, header, data, payloadBytes) {
+  encodedDecodeErrors += 1;
+  const signature = payloadSignature(data);
+  const mode = shortPayloadMode(header.content_type);
+  const message = error?.message || "encoded preview decode failed";
+  $("decodeText").textContent = `drop ${encodedDecodeErrors}`;
+  setStatus("Decode dropped", "error");
+  addHistory(
+    `decode drop c${header.chunk_index} ${mode} ${formatBytes(payloadBytes)} ${signature} · ${message}`,
+  );
+}
+
+function payloadSignature(data) {
+  if (!(data instanceof ArrayBuffer)) return "";
+  const bytes = new Uint8Array(data, 0, Math.min(12, data.byteLength));
+  return Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function drawFrame(image) {
@@ -850,7 +924,15 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   const chunkFrameCount = Number(header.num_frames || 0);
   const payloadBytes = data.byteLength || data.size || 0;
   const isEventCutover = awaitedEventId && eventId >= awaitedEventId;
-  const decodedFrames = await decodeFrameBatch(header, data);
+  let decodedFrames;
+  try {
+    decodedFrames = await decodeFrameBatch(header, data);
+    if (isEncodedPreviewContentType(header.content_type)) encodedDecodeErrors = 0;
+  } catch (error) {
+    if (!isEncodedPreviewContentType(header.content_type)) throw error;
+    handleEncodedPreviewDecodeError(error, header, data, payloadBytes);
+    return;
+  }
   if (epoch !== streamEpoch) {
     for (const item of decodedFrames) item.image?.close?.();
     return;
@@ -880,8 +962,16 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
 function updateServerChunkStats(stats) {
   const rawWrite = Number(stats.raw_write_ms || 0) / 1000;
   const wsWrite = Number(stats.ws_write_ms || 0) / 1000;
+  const chunkTotal = Number(stats.chunk_total_ms || 0) / 1000;
+  const numFrames = Number(stats.num_frames || 0);
+  const requestedFps = Number($("fps").value || 16);
+  const theoreticalFps = chunkTotal > 0 ? numFrames / chunkTotal : 0;
+  const realtimeRatio = requestedFps > 0 ? theoreticalFps / requestedFps : 0;
   $("serverSendText").textContent = `raw ${rawWrite.toFixed(2)}s · ws ${wsWrite.toFixed(2)}s`;
-  $("chunkPayloadText").textContent = `${formatBytes(stats.ws_payload_bytes || 0)} · ${stats.num_frames || 0}f`;
+  $("chunkPayloadText").textContent = `${formatBytes(stats.ws_payload_bytes || 0)} · ${numFrames}f`;
+  $("theoreticalFpsText").textContent = theoreticalFps > 0
+    ? `${theoreticalFps.toFixed(1)} fps · ${realtimeRatio.toFixed(2)}x`
+    : "-";
   if (stats.content_type) $("payloadMode").textContent = shortPayloadMode(stats.content_type);
 }
 
