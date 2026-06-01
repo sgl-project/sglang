@@ -796,7 +796,11 @@ class PrefillAdder:
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
-            # Non-chunked prefill
+            # Non-chunked prefill — the whole sequence is committed this iter.
+            req.fill_len = len(req.full_untruncated_fill_ids)
+            assert (
+                req.fill_len == len(req.prefix_indices) + req.extend_input_len
+            ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -908,7 +912,9 @@ class PrefillAdder:
                     )
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+                req.set_extend_input_len(
+                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
@@ -935,7 +941,12 @@ class PrefillAdder:
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill (first-and-only chunk).
+                # Non-chunked prefill (first-and-only chunk) — the whole
+                # sequence is committed this iter.
+                req.fill_len = len(req.full_untruncated_fill_ids)
+                assert (
+                    req.fill_len == len(req.prefix_indices) + req.extend_input_len
+                ), f"{req.fill_len=} {len(req.prefix_indices)=} {req.extend_input_len=}"
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
