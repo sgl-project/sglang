@@ -122,9 +122,8 @@ def _send_idx_series(ctx: "ScriptedContext", rid: str) -> List[int]:
     # by the subsequent decode step that still carries the req.
     series: List[int] = []
     for record in ctx._scheduler_hook._batch_log:
-        for record_rid, send_idx in record.send_idx_by_rid:
-            if record_rid == rid:
-                series.append(send_idx)
+        if rid in record.send_idx_of_rid:
+            series.append(record.send_idx_of_rid[rid])
     return series
 
 
