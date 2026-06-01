@@ -8,6 +8,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    exhaust_row_pool,
     run_until,
     run_until_all_finished,
     run_until_finished,
@@ -97,8 +98,7 @@ class TestKVPressureBasic(ScriptedTestCase):
             t._scheduler.req_to_token_pool.size
             - t._scheduler.req_to_token_pool.available_size()
         )
-        t.exhaust_row_pool(leave_rows=2)
-        yield
+        yield from exhaust_row_pool(t, leave_rows=2)
 
         reqs = [t.start_req(prompt_len=8, max_new_tokens=1) for _ in range(5)]
         yield from run_until_all_finished(reqs, max_steps=2000)

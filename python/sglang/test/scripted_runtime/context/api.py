@@ -43,7 +43,6 @@ class ScriptedContext:
 
         self._seen_rids: set[str] = set()
         self._held_kv_allocations: list = []
-        self._held_row_slots: List[int] = []
         self._req_starter = ScriptedContextReqStarter(self)
 
     def start_req(
@@ -96,9 +95,6 @@ class ScriptedContext:
 
     def exhaust_kv(self, *, leave_pages: int) -> None:
         return pools.exhaust_kv(self, leave_pages=leave_pages)
-
-    def exhaust_row_pool(self, *, leave_rows: int) -> None:
-        return pools.exhaust_row_pool(self, leave_rows=leave_rows)
 
     def _release_exhausted_pools(self) -> None:
         return pools.release_exhausted(self)

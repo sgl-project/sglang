@@ -71,6 +71,29 @@ def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_ST
     yield from run_until_finished(handle, max_steps=max_steps)
 
 
+def exhaust_row_pool(t, *, leave_rows: int, max_steps: int = DEFAULT_MAX_STEPS):
+    # Pressure req_to_token_pool with REAL ballast requests instead of slicing
+    # the pool's internal free_slots: a request occupies exactly one row for its
+    # whole lifetime, so M never-finishing ballast reqs hold exactly M rows. The
+    # engine's abort_all() drain on reset frees them, so no custom restore needed.
+    target: int = t._scheduler.req_to_token_pool.available_size() - leave_rows
+    if target <= 0:
+        return
+
+    for _ in range(target):
+        t.start_req(prompt_len=1, max_new_tokens=100000, ignore_eos=True)
+
+    for _ in range(max_steps):
+        if t._scheduler.req_to_token_pool.available_size() <= leave_rows:
+            return
+        yield
+    raise AssertionError(
+        f"exhaust_row_pool: ballast reqs never filled the row pool down to "
+        f"leave_rows={leave_rows} after {max_steps} steps "
+        f"(available_size={t._scheduler.req_to_token_pool.available_size()})"
+    )
+
+
 LIFECYCLE_STAGES = (
     "first_chunk",
     "last_chunk",

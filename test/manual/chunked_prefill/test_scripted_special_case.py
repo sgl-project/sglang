@@ -8,6 +8,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    exhaust_row_pool,
     run_until,
     run_until_finished,
 )
@@ -379,7 +380,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         chunks_before_pressure = r.chunks_done
 
-        t.exhaust_row_pool(leave_rows=0)
+        yield from exhaust_row_pool(t, leave_rows=0)
 
         progressed_under_pressure = False
         for _ in range(DEFAULT_MAX_STEPS * 2):
