@@ -1200,16 +1200,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         if not batch.forward_mode.is_idle():
-            # accept_tokens = predict[accept_index] is [bs, spec_steps + 1], so its
-            # per-req stride is spec_steps + 1 (NOT num_draft_tokens, which only
-            # coincides when topk == 1).
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            # stride = accept_tokens per-req width = accept_index.shape[1]
+            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
             fill_bonus_tokens[(bs,)](
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
-                self.speculative_num_steps + 1,
+                accept_index.shape[1],
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
