@@ -2884,8 +2884,17 @@ class Scheduler(
             self.spec_algorithm,
         )
 
+        # Faithful equivalent of the base branch's
+        # `self.chunked_req is None or len(can_run_list) != 1`. The base set
+        # `self.chunked_req` to its POST-admission value (after
+        # add_chunked_req / new_chunked_req) before this line, so the
+        # pre-admission local `chunked_req` is NOT the right input. Instead we
+        # reuse `chunked_in_batch` (computed above from `has_pending_chunk`),
+        # which is the post-admission single-flight chunked-resume req — the
+        # derived-property equivalent of the base's post-admission
+        # `self.chunked_req`.
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            not chunked_in_batch or len(can_run_list) != 1
         )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
