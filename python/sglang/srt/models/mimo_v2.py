@@ -282,7 +282,11 @@ class MiMoV2MoE(nn.Module):
         )
 
         # todo : implement tbo forward needed
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -299,7 +303,9 @@ class MiMoV2MoE(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         )
 
     def get_moe_weights(self):
