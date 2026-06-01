@@ -92,9 +92,15 @@ class TestChunkSizeDefault(ScriptedTestCase):
 
     @staticmethod
     def _script_prompt_n_chunks_plus_minus_1(t: ScriptedContext):
+        # Each req gets a distinct prompt_token: all reqs run in this one script
+        # (no inter-script radix flush), and an identical fill token would make every
+        # prompt a prefix of the longer ones, so later reqs would hit the cache and
+        # chunk fewer times than the exact boundary count asserted below.
         for n in range(1, 6):
             prompt_minus = n * DEFAULT_CHUNK_SIZE - 1
-            r_minus = t.start_req(prompt_len=prompt_minus, max_new_tokens=1)
+            r_minus = t.start_req(
+                prompt_len=prompt_minus, max_new_tokens=1, prompt_token=2 * n
+            )
             yield from run_until_finished(r_minus, max_steps=800)
             assert r_minus.finished
             expected_minus = _expected_chunks(prompt_minus, DEFAULT_CHUNK_SIZE)
@@ -104,7 +110,9 @@ class TestChunkSizeDefault(ScriptedTestCase):
             )
 
             prompt_plus = n * DEFAULT_CHUNK_SIZE + 1
-            r_plus = t.start_req(prompt_len=prompt_plus, max_new_tokens=1)
+            r_plus = t.start_req(
+                prompt_len=prompt_plus, max_new_tokens=1, prompt_token=2 * n + 1
+            )
             yield from run_until_finished(r_plus, max_steps=800)
             assert r_plus.finished
             expected_plus = _expected_chunks(prompt_plus, DEFAULT_CHUNK_SIZE)
