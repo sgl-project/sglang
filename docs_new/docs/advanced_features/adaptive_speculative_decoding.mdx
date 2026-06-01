@@ -29,7 +29,7 @@ The adaptive mechanism has three pieces:
 
 - `AdaptiveSpeculativeParams`: the EMA-based policy
 - `SpecRuntimeState`: the per-tier runtime state bundle
-- `AdaptiveController`: the coordinator that maintains per-batch-size state and activates the matching runtime state
+- `AdaptiveController`: the coordinator that queries the policy for the current batch size and activates the matching runtime state
 
 ### Per-batch-size independent tracking
 
@@ -139,7 +139,7 @@ Non-integer keys (`ema_alpha`, `warmup_batches`, `update_interval`) are global o
 
 ## Config file reference
 
-The config file is optional. Any omitted keys use defaults.
+The config file is optional. When provided, each integer BS-slot key must specify `candidate_steps`; all other keys fall back to defaults.
 
 ### Per-BS slot parameters
 
@@ -159,8 +159,8 @@ The config file is optional. Any omitted keys use defaults.
   <tbody>
     <tr>
       <td><code>candidate_steps</code></td>
-      <td><code>[1, 3, 7]</code></td>
-      <td>Candidate <code>speculative_num_steps</code> tiers for this BS range</td>
+      <td><em>required</em></td>
+      <td>Candidate <code>speculative_num_steps</code> tiers for this BS range. Must be a non-empty list of positive ints; a slot that omits it raises a config error</td>
     </tr>
     <tr>
       <td><code>down_hysteresis</code></td>
@@ -241,12 +241,13 @@ The built-in default is conservative — safe for all draft models but may under
 
 ### Conservative (default) — for weak draft models
 
-Locks to `step=1` at BS≥8 to avoid wasted compute. Best for models like MiniMax-M2.5, DSV4.
+This is the built-in default: BS 8–31 allows `[1, 3]`, and BS≥32 locks to `step=1` to avoid wasted compute. Best for models like MiniMax-M2.5, DSV4.
 
 ```json
 {
-  "1": {"candidate_steps": [1, 3, 7], "up_hysteresis": 0.0, "down_hysteresis": -0.25, "ceiling_coeff": 0},
-  "8": {"candidate_steps": [1],       "up_hysteresis": 0.0, "down_hysteresis": 0.0,   "ceiling_coeff": 0}
+  "1":  {"candidate_steps": [1, 3, 7], "up_hysteresis": 0.0, "down_hysteresis": -0.25, "ceiling_coeff": 0},
+  "8":  {"candidate_steps": [1, 3],    "up_hysteresis": 0.0, "down_hysteresis": 0.0,   "ceiling_coeff": 0},
+  "32": {"candidate_steps": [1],       "up_hysteresis": 0.0, "down_hysteresis": 0.0,   "ceiling_coeff": 0}
 }
 ```
 
