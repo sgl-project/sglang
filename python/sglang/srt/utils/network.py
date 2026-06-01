@@ -349,7 +349,6 @@ def get_local_ip_auto(fallback: str = None) -> str:
 
 
 def get_mooncake_transfer_engine_hostname(
-    disaggregation_mode: str,
     server_host: str,
 ) -> str:
     """
@@ -365,8 +364,7 @@ def get_mooncake_transfer_engine_hostname(
     if host_ip:
         return host_ip
     if (
-        disaggregation_mode in ("prefill", "decode")
-        and server_host
+        server_host
         and server_host not in ("0.0.0.0", "::")
     ):
         return server_host
