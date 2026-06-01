@@ -428,18 +428,21 @@ class Cosmos3CausalAttention(nn.Module):
         batch_size, seq_len = hidden_states.shape[:2]
 
         qkv, _ = self.to_qkv(hidden_states)
-        # split returns strided views into qkv; .contiguous() before .view()
-        # because the per-head reshape needs row-major memory.
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.contiguous().view(
-            batch_size, seq_len, self.num_attention_heads, self.head_dim
+        qkv = qkv.view(
+            batch_size,
+            seq_len,
+            self.num_attention_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
         )
-        k = k.contiguous().view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
-        )
-        v = v.contiguous().view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
-        )
+        q = qkv[:, :, : self.num_attention_heads, :]
+        k = qkv[
+            :,
+            :,
+            self.num_attention_heads : self.num_attention_heads
+            + self.num_key_value_heads,
+            :,
+        ]
+        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
         q = F.rms_norm(
             q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
@@ -536,16 +539,21 @@ class Cosmos3CrossAttention(nn.Module):
         batch_size, seq_len_gen = hidden_states.shape[:2]
 
         qkv, _ = self.to_qkv(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.contiguous().view(
-            batch_size, seq_len_gen, self.num_attention_heads, self.head_dim
+        qkv = qkv.view(
+            batch_size,
+            seq_len_gen,
+            self.num_attention_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
         )
-        k = k.contiguous().view(
-            batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim
-        )
-        v = v.contiguous().view(
-            batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim
-        )
+        q = qkv[:, :, : self.num_attention_heads, :]
+        k = qkv[
+            :,
+            :,
+            self.num_attention_heads : self.num_attention_heads
+            + self.num_key_value_heads,
+            :,
+        ]
+        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
         q = F.rms_norm(
             q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
@@ -558,10 +566,7 @@ class Cosmos3CrossAttention(nn.Module):
         # K/V = [text (replicated full on every SP rank) | image (sharded same as Q)].
         # USPAttention routes through the registered attention backend (FA, sage,
         # …) and handles the Ulysses all-to-all when SP > 1.
-        num_und = k_und.shape[1]
-        k = torch.cat([k_und, k], dim=1)
-        v = torch.cat([v_und, v], dim=1)
-        out = self.attn(q, k, v, num_replicated_kv_prefix=num_und)
+        out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
