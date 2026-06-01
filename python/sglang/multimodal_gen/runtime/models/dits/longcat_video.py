@@ -2,7 +2,6 @@
 # Auxiliary blocks are copied from:
 #   ../LongCat-Video/longcat_video/modules/blocks.py
 #   ../LongCat-Video/longcat_video/modules/attention.py
-#   ../LongCat-Video/longcat_video/modules/rope_3d.py
 
 # SPDX-License-Identifier: Apache-2.0
 import math
@@ -14,7 +13,7 @@ import torch
 import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.dits import LongCatVideoConfig
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
@@ -22,6 +21,10 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import FP32LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    NDRotaryEmbedding,
+    _apply_rotary_emb as apply_rotary_emb,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -196,100 +199,74 @@ class CaptionEmbedder(nn.Module):
         return caption
 
 
-def broadcat(tensors, dim=-1):
-    num_tensors = len(tensors)
-    shape_lens = set(list(map(lambda t: len(t.shape), tensors)))
-    assert len(shape_lens) == 1, "tensors must all have the same number of dimensions"
-    shape_len = list(shape_lens)[0]
-    dim = (dim + shape_len) if dim < 0 else dim
-    dims = list(zip(*map(lambda t: list(t.shape), tensors)))
-    expandable_dims = [(i, val) for i, val in enumerate(dims) if i != dim]
-    assert all(
-        [*map(lambda t: len(set(t[1])) <= 2, expandable_dims)]
-    ), "invalid dimensions for broadcastable concatentation"
-    max_dims = list(map(lambda t: (t[0], max(t[1])), expandable_dims))
-    expanded_dims = list(map(lambda t: (t[0], (t[1],) * num_tensors), max_dims))
-    expanded_dims.insert(dim, (dim, dims[dim]))
-    expandable_shapes = list(zip(*map(lambda t: t[1], expanded_dims)))
-    tensors = list(map(lambda t: t[0].expand(*t[1]), zip(tensors, expandable_shapes)))
-    return torch.cat(tensors, dim=dim)
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x = rearrange(x, "... (d r) -> ... d r", r=2)
-    x1, x2 = x.unbind(dim=-1)
-    x = torch.stack((-x2, x1), dim=-1)
-    return rearrange(x, "... d r -> ... (d r)")
-
-
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, head_dim):
         super().__init__()
         self.head_dim = head_dim
         assert self.head_dim % 8 == 0, "Dim must be a multiply of 8 for 3D RoPE."
-        self.base = 10000
-        self.freqs_dict = {}
+        rope_dim_list = [
+            self.head_dim - 4 * (self.head_dim // 6),
+            2 * (self.head_dim // 6),
+            2 * (self.head_dim // 6),
+        ]
+        self.rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=rope_dim_list,
+            rope_theta=10000,
+            dtype=torch.float32,
+        )
+        self.freqs_dict: dict[tuple[int, int, int], torch.Tensor] = {}
 
-    def register_grid_size(self, grid_size):
-        if grid_size not in self.freqs_dict:
-            self.freqs_dict.update({grid_size: self.precompute_freqs_cis_3d(grid_size)})
-
-    def precompute_freqs_cis_3d(self, grid_size):
+    @staticmethod
+    def _grid_positions(
+        grid_size: tuple[int, int, int], device: torch.device
+    ) -> torch.Tensor:
+        # NDRotaryEmbedding.forward_from_grid assumes initialized SP groups.
+        # LongCat's MVP path is explicitly no-SP, so build full-grid positions here.
         num_frames, height, width = grid_size
-        dim_t = self.head_dim - 4 * (self.head_dim // 6)
-        dim_h = 2 * (self.head_dim // 6)
-        dim_w = 2 * (self.head_dim // 6)
-        freqs_t = 1.0 / (
-            self.base ** (torch.arange(0, dim_t, 2)[: (dim_t // 2)].float() / dim_t)
+        grid_t, grid_h, grid_w = torch.meshgrid(
+            torch.arange(num_frames, device=device),
+            torch.arange(height, device=device),
+            torch.arange(width, device=device),
+            indexing="ij",
         )
-        freqs_h = 1.0 / (
-            self.base ** (torch.arange(0, dim_h, 2)[: (dim_h // 2)].float() / dim_h)
-        )
-        freqs_w = 1.0 / (
-            self.base ** (torch.arange(0, dim_w, 2)[: (dim_w // 2)].float() / dim_w)
-        )
-        grid_t = torch.from_numpy(
-            np.linspace(0, num_frames, num_frames, endpoint=False, dtype=np.float32)
-        ).float()
-        grid_h = torch.from_numpy(
-            np.linspace(0, height, height, endpoint=False, dtype=np.float32)
-        ).float()
-        grid_w = torch.from_numpy(
-            np.linspace(0, width, width, endpoint=False, dtype=np.float32)
-        ).float()
-        freqs_t = torch.einsum("..., f -> ... f", grid_t, freqs_t)
-        freqs_h = torch.einsum("..., f -> ... f", grid_h, freqs_h)
-        freqs_w = torch.einsum("..., f -> ... f", grid_w, freqs_w)
-        freqs_t = repeat(freqs_t, "... n -> ... (n r)", r=2)
-        freqs_h = repeat(freqs_h, "... n -> ... (n r)", r=2)
-        freqs_w = repeat(freqs_w, "... n -> ... (n r)", r=2)
-        freqs = broadcat(
-            (
-                freqs_t[:, None, None, :],
-                freqs_h[None, :, None, :],
-                freqs_w[None, None, :, :],
-            ),
-            dim=-1,
-        )
-        return rearrange(freqs, "T H W D -> (T H W) D")
+        return torch.stack((grid_t, grid_h, grid_w), dim=-1).reshape(-1, 3)
+
+    def register_grid_size(self, grid_size, device: torch.device | None = None):
+        grid_size = tuple(grid_size)
+        target_device = torch.device("cpu") if device is None else torch.device(device)
+        if grid_size in self.freqs_dict:
+            freqs = self.freqs_dict[grid_size]
+            if freqs.device != target_device:
+                self.freqs_dict[grid_size] = freqs.to(target_device)
+            return
+
+        positions = self._grid_positions(grid_size, torch.device("cpu"))
+        cos, sin = self.rotary_emb.forward_uncached(positions)
+        cos_sin_cache = torch.cat((cos, sin), dim=-1)
+        if cos_sin_cache.device != target_device:
+            cos_sin_cache = cos_sin_cache.to(target_device)
+        self.freqs_dict[grid_size] = cos_sin_cache
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, grid_size):
+        grid_size = tuple(grid_size)
         if grid_size not in self.freqs_dict:
-            self.register_grid_size(grid_size)
+            self.register_grid_size(grid_size, q.device)
 
-        freqs_cis = self.freqs_dict[grid_size]
-        if freqs_cis.device != q.device:
-            freqs_cis = freqs_cis.to(q.device)
+        cos_sin_cache = self.freqs_dict[grid_size]
+        if cos_sin_cache.device != q.device:
+            cos_sin_cache = cos_sin_cache.to(q.device)
             self.freqs_dict[grid_size] = (
-                freqs_cis  # Cache GPU tensor to avoid repeated CPU→GPU copies
+                cos_sin_cache  # Cache GPU tensor to avoid repeated CPU→GPU copies
             )
-        q_, k_ = q.float(), k.float()
-        freqs_cis = freqs_cis.float()
-        cos, sin = freqs_cis.cos(), freqs_cis.sin()
-        cos, sin = rearrange(cos, "n d -> 1 1 n d"), rearrange(sin, "n d -> 1 1 n d")
-        q_ = (q_ * cos) + (rotate_half(q_) * sin)
-        k_ = (k_ * cos) + (rotate_half(k_) * sin)
-        return q_.type_as(q), k_.type_as(k)
+        cos, sin = cos_sin_cache.chunk(2, dim=-1)
+        q = rearrange(q, "B H S D -> B S H D").contiguous()
+        k = rearrange(k, "B H S D -> B S H D").contiguous()
+        q = apply_rotary_emb(q, cos, sin, is_neox_style=False)
+        k = apply_rotary_emb(k, cos, sin, is_neox_style=False)
+        return (
+            rearrange(q, "B S H D -> B H S D").contiguous(),
+            rearrange(k, "B S H D -> B H S D").contiguous(),
+        )
 
 
 class Attention(nn.Module):

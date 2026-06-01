@@ -285,7 +285,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             output_size="832x480",
             num_frames=25,
             extras={
-                "num_inference_steps": 10,
+                "num_inference_steps": 50,
                 "guidance_scale": 4.0,
                 "seed": 0,
             },

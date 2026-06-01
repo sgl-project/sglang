@@ -31,6 +31,10 @@ def _longcat_cfg_helpers():
     )
 
 
+def _longcat_dit_module():
+    return import_module("sglang.multimodal_gen.runtime.models.dits.longcat_video")
+
+
 def _mock_longcat_server_args():
     return SimpleNamespace(
         attention_backend=None,
@@ -139,6 +143,57 @@ def test_longcat_optimized_cfg_helper_matches_st_star_and_sign_flip():
 
     assert torch.allclose(before_flip, expected_before_flip)
     assert torch.allclose(after_flip, expected_after_flip)
+
+
+def _longcat_reference_rope_cache(head_dim: int, grid_size: tuple[int, int, int]):
+    num_frames, height, width = grid_size
+    dim_t = head_dim - 4 * (head_dim // 6)
+    dim_h = 2 * (head_dim // 6)
+    dim_w = 2 * (head_dim // 6)
+    freqs = []
+    for size, dim in [(num_frames, dim_t), (height, dim_h), (width, dim_w)]:
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, dim, 2).float()[: (dim // 2)] / dim)
+        )
+        freqs.append(torch.outer(torch.arange(size, dtype=torch.float32), inv_freq))
+
+    freqs_t = freqs[0][:, None, None, :].expand(num_frames, height, width, -1)
+    freqs_h = freqs[1][None, :, None, :].expand(num_frames, height, width, -1)
+    freqs_w = freqs[2][None, None, :, :].expand(num_frames, height, width, -1)
+    freqs = torch.cat((freqs_t, freqs_h, freqs_w), dim=-1).reshape(
+        num_frames * height * width, -1
+    )
+    return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+
+
+def _longcat_reference_apply_rope(x: torch.Tensor, cos_sin_cache: torch.Tensor):
+    cos, sin = cos_sin_cache.chunk(2, dim=-1)
+    x = x.transpose(1, 2)
+    x1 = x[..., ::2].float()
+    x2 = x[..., 1::2].float()
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    out = torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).flatten(-2)
+    return out.transpose(1, 2).type_as(x)
+
+
+def test_longcat_rope_reuses_shared_nd_embedding_without_changing_math():
+    module = _longcat_dit_module()
+    head_dim = 128
+    grid_size = (2, 3, 4)
+    seq_len = grid_size[0] * grid_size[1] * grid_size[2]
+    rope = module.RotaryPositionalEmbedding(head_dim)
+
+    q = torch.randn(2, 3, seq_len, head_dim)
+    k = torch.randn(2, 3, seq_len, head_dim)
+    q_out, k_out = rope(q, k, grid_size)
+
+    expected_cache = _longcat_reference_rope_cache(head_dim, grid_size)
+    assert q_out.dtype == q.dtype
+    assert k_out.dtype == k.dtype
+    assert torch.allclose(rope.freqs_dict[grid_size], expected_cache)
+    assert torch.allclose(q_out, _longcat_reference_apply_rope(q, expected_cache))
+    assert torch.allclose(k_out, _longcat_reference_apply_rope(k, expected_cache))
 
 
 def test_longcat_synthesizes_diffusers_model_index_for_official_layout(tmp_path: Path):
