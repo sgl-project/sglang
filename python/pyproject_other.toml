@@ -19,6 +19,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 runtime_common = [
   "IPython",
   "aiohttp",
+  "apache-tvm-ffi",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
   "av",
