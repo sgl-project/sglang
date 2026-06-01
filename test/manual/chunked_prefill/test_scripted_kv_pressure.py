@@ -316,9 +316,7 @@ class TestKVPressureBasic(ScriptedTestCase):
 
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        # The scheduler is busy with a chunked request, so the flush is a no-op;
-        # we only check the server survives the request and finishes cleanly.
-        yield from t.flush_cache(assert_flushed=False)
+        t.flush_cache()
         yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert r.kv_pages == 0

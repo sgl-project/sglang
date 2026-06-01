@@ -57,7 +57,8 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     for _ in range(2 * (server_args.pp_size + server_args.pp_async_batch_depth)):
         yield
 
-    yield from ctx.flush_cache()
+    ctx.flush_cache()
+    yield
 
 
 class ScriptedSchedulerHook:
