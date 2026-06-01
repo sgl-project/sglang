@@ -632,7 +632,7 @@ impl Router {
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_success() {
+            if !status.is_success() && !status.is_client_error() {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);
