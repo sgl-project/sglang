@@ -28,8 +28,8 @@ class TestChunkSizeDefault(ScriptedTestCase):
         r = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done <= 1, (
-            f"prompt_len == chunk_size should fit in one chunk, "
+        assert r.chunks_done == 0, (
+            f"prompt_len == chunk_size completes in one non-chunked shot, "
             f"got chunks_done={r.chunks_done}"
         )
 
@@ -192,7 +192,7 @@ class TestChunkSize2(ScriptedTestCase):
         r = t.start_req(prompt_len=2, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done <= 1
+        assert r.chunks_done == 0
 
     def test_chunk_size_two_prompt_five(self):
         self.server.execute_script(self._script_chunk_size_two_prompt_five)
@@ -326,7 +326,7 @@ class TestChunkSize1024MaxPrefill1024(ScriptedTestCase):
         r = t.start_req(prompt_len=1024, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done <= 1
+        assert r.chunks_done == 0
 
 
 class TestChunkSize2048MaxPrefill1024(ScriptedTestCase):
@@ -342,6 +342,10 @@ class TestChunkSize2048MaxPrefill1024(ScriptedTestCase):
         r = t.start_req(prompt_len=512, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
+        # chunked prefill is governed by chunked_prefill_size (2048), not by
+        # max_prefill_tokens (1024): a 512-token prompt stays under the 2048
+        # chunk budget and completes in one non-chunked shot.
+        assert r.chunks_done == 0
 
 
 class TestChunkSize16Page16(ScriptedTestCase):
@@ -356,6 +360,20 @@ class TestChunkSize16Page16(ScriptedTestCase):
         yield from run_until_finished(r, max_steps=400)
         assert r.finished
         assert r.chunks_done == 8
+        assert r.kv_pages == 0
+
+    def test_chunk_size_equals_page_size_plus_one(self):
+        self.server.execute_script(self._script_chunk_size_equals_page_size_plus_one)
+
+    @staticmethod
+    def _script_chunk_size_equals_page_size_plus_one(t: ScriptedContext):
+        # One token past an exact 8-page (128-token) prompt: the single extra
+        # token rounds up to its own 16-token page, adding exactly one more
+        # page-padded chunk on top of the prompt_len=128 -> chunks_done=8 case.
+        r = t.start_req(prompt_len=129, max_new_tokens=2)
+        yield from run_until_finished(r, max_steps=400)
+        assert r.finished
+        assert r.chunks_done == 9
         assert r.kv_pages == 0
 
 
