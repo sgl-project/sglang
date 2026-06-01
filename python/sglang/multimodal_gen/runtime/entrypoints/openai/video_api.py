@@ -130,10 +130,7 @@ def _reject_unsupported_cosmos3_modes(
             status_code=400,
             detail="Cosmos3 action generation is not supported by SGLang yet.",
         )
-    if (
-        extra.get("condition_frame_indexes_vision")
-        or extra.get("condition_video_keep")
-    ):
+    if extra.get("condition_frame_indexes_vision") or extra.get("condition_video_keep"):
         raise HTTPException(
             status_code=400,
             detail="Cosmos3 video-to-video conditioning is not supported by SGLang yet.",
@@ -368,13 +365,9 @@ async def create_video(
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
             negative_prompt=form_value("negative_prompt", negative_prompt),
-            num_inference_steps=form_value(
-                "num_inference_steps", num_inference_steps
-            ),
+            num_inference_steps=form_value("num_inference_steps", num_inference_steps),
             guidance_scale=form_value("guidance_scale", guidance_scale),
-            max_sequence_length=form_value(
-                "max_sequence_length", max_sequence_length
-            ),
+            max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
             enable_frame_interpolation=form_value(
@@ -572,10 +565,9 @@ async def create_video_sync(
         if not job:
             raise HTTPException(status_code=404, detail="Video not found")
         if job.get("status") == "failed":
-            detail = (
-                (job.get("error") or {}).get("message")
-                or "Video generation failed"
-            )
+            detail = (job.get("error") or {}).get(
+                "message"
+            ) or "Video generation failed"
             raise HTTPException(status_code=500, detail=detail)
         if job.get("status") == "completed":
             break

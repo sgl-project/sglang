@@ -175,12 +175,16 @@ async def generations(
             guidance_scale=request.guidance_scale,
             true_cfg_scale=request.true_cfg_scale,
             negative_prompt=request.negative_prompt,
-            max_sequence_length=request.max_sequence_length
-            if request.max_sequence_length is not None
-            else _get_extra_field(request, "max_sequence_length"),
-            flow_shift=request.flow_shift
-            if request.flow_shift is not None
-            else _get_extra_field(request, "flow_shift"),
+            max_sequence_length=(
+                request.max_sequence_length
+                if request.max_sequence_length is not None
+                else _get_extra_field(request, "max_sequence_length")
+            ),
+            flow_shift=(
+                request.flow_shift
+                if request.flow_shift is not None
+                else _get_extra_field(request, "flow_shift")
+            ),
             use_duration_template=_get_extra_field(request, "use_duration_template"),
             use_resolution_template=_get_extra_field(
                 request, "use_resolution_template"
