@@ -48,6 +48,13 @@ const CONTROL_ACTION_META = {
 const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";
 
 const presets = [
+  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth first-person dolly toward the castle, natural parallax, stable fantasy scene detail.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
+  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
+  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 16, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
+  { name: "Lake Scout", tone: "green", size: "832x480", fps: 16, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
+  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 16, prompt: "A slow aerial orbit around a pastel floating island hotel in the open ocean, hazy sunlight, turquoise water, toy-like architectural detail, clean horizon, cinematic but playful.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
+  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 16, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
+  { name: "Kid A", tone: "accent", size: "832x480", fps: 16, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
   {
     name: "Dragon Ride",
     tone: "green",
@@ -184,7 +191,8 @@ let clearQueueOnClose = false;
 let fpsSamples = [];
 let playbackFps = 0;
 let droppedFrames = 0;
-let receiveChain = Promise.resolve();
+let decodeChain = Promise.resolve();
+let pendingDecodeBatches = 0;
 let nextEventId = 1;
 let awaitedEventId = 0;
 let awaitedEventSentAt = 0;
@@ -249,7 +257,8 @@ function resetStreamStats() {
   clearQueueOnClose = false;
   playbackFps = Number($("fps").value || 16);
   droppedFrames = 0;
-  receiveChain = Promise.resolve();
+  decodeChain = Promise.resolve();
+  pendingDecodeBatches = 0;
   awaitedEventId = 0;
   awaitedEventSentAt = 0;
   chunkReceiveStartedAt = 0;
@@ -804,20 +813,12 @@ async function connect() {
       }
     };
     socket.onmessage = (event) => {
-      receiveChain = receiveChain
-        .then(() => {
-          if (epoch !== streamEpoch) return undefined;
-          return receive(event.data);
-        })
-        .catch((error) => {
-          if (epoch !== streamEpoch) return;
-          setStatus("Receive failed", "error");
-          addHistory(error.message || "receive failed");
-          abortCurrentSession(error.message || "receive failed", {
-            clearFrames: false,
-            expectedClose: false,
-          });
-        });
+      if (epoch !== streamEpoch) return;
+      try {
+        receive(event.data, epoch);
+      } catch (error) {
+        handleReceiveError(error, epoch);
+      }
     };
   } catch (error) {
     $("connectBtn").disabled = false;
@@ -826,7 +827,17 @@ async function connect() {
   }
 }
 
-async function receive(data) {
+function handleReceiveError(error, epoch) {
+  if (epoch !== streamEpoch) return;
+  setStatus("Receive failed", "error");
+  addHistory(error.message || "receive failed");
+  abortCurrentSession(error.message || "receive failed", {
+    clearFrames: false,
+    expectedClose: false,
+  });
+}
+
+function receive(data, epoch) {
   if (!pendingHeader) {
     pendingHeader = unpack(new Uint8Array(data));
     pendingHeader.__received_at = performance.now();
@@ -841,11 +852,22 @@ async function receive(data) {
   }
   const header = pendingHeader;
   pendingHeader = null;
+  pendingDecodeBatches += 1;
+  decodeChain = decodeChain
+    .then(() => decodeAndEnqueueFrameBatch(header, data, epoch))
+    .catch((error) => handleReceiveError(error, epoch))
+    .finally(() => {
+      pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
+    });
+}
+
+async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   const eventId = Number(header.event_id || 0);
   const chunkFrameCount = Number(header.num_frames || 0);
   const payloadBytes = data.byteLength || data.size || 0;
   const isEventCutover = awaitedEventId && eventId >= awaitedEventId;
   const decodedFrames = await decodeFrameBatch(header, data);
+  if (epoch !== streamEpoch) return;
   if (isEventCutover) {
     droppedFrames += queue.length;
     queue = [];
