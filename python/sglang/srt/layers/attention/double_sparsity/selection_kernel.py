@@ -754,7 +754,9 @@ def retrieve_topk_via_labels(
         # above) for the harness-registered NIAH trial. Guarded by the same
         # capture check as the metrics call: the oracle does host syncs
         # (``.item()``/dict build) that are illegal during CUDA-graph capture.
-        _maybe_record_recall_oracle(scores, indices, layer_id, max_top_k)
+        _maybe_record_recall_oracle(
+            scores, indices, layer_id, max_top_k, process_group=process_group
+        )
     return indices, valid_lengths
 
 
@@ -763,19 +765,34 @@ def _maybe_record_recall_oracle(
     selected_indices: torch.Tensor,
     layer_id: int,
     max_top_k: int,
+    process_group=None,
 ) -> None:
     """Record one recall-oracle sample for the active NIAH trial, if enabled.
 
     Pure no-op (single env lookup, immediate return) when the oracle flag is off
     or no trial is registered — so production selection is byte-for-byte
     unchanged. NIAH trials are single-request; the active context carries the
-    harness-provided needle span. Best-effort: a diagnostic failure must never
-    break selection.
+    harness-provided needle span. Records ONLY on the primary TP rank: the
+    scores are identical across ranks after ``all_reduce_token_scores``, so
+    rank-0-only recording avoids 8× duplicate writes + cross-process file
+    contention on the sink. Best-effort: a diagnostic failure must never break
+    selection.
     """
     from sglang.srt.layers.attention.double_sparsity import oracle_artifact_sink as _sink
 
     if not _sink.oracle_enabled():
         return
+    # Primary-rank guard (scores are all-reduce-identical across TP ranks).
+    try:
+        if (
+            process_group is not None
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_rank(group=process_group) != 0
+        ):
+            return
+    except Exception:
+        pass
     trial = _sink.get_active_trial()
     if trial is None:
         return
@@ -1069,6 +1086,17 @@ def retrieve_topk_graph_safe(
         sorted_vals_view, boundary_view, right=False, out=valid_i64_view
     )
     out_lengths[:bs].copy_(valid_i64_view.squeeze(-1))
+
+    # Flag-gated recall oracle on the production GPU decode path. ``scores_view``
+    # is the all-reduced + per-request-masked score tensor (after the all_reduce
+    # above, the same tensor the top-K consumed); ``out_indices[:bs]`` is the
+    # selection. Capture-guarded (host syncs illegal during graph capture) and
+    # off by default, so production decode is unaffected. Records only in eager
+    # decode (under graph replay this Python does not re-run).
+    if not torch.cuda.is_current_stream_capturing():
+        _maybe_record_recall_oracle(
+            scores_view, out_indices[:bs], layer_id, max_top_k, process_group=process_group
+        )
 
     return out_indices, out_lengths
 

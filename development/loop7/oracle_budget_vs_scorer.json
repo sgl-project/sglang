@@ -1,0 +1,37 @@
+{
+  "op_point": "DS int8 / mem 0.7 / TP=8, eager (oracle records only in eager)",
+  "method": "score-only recall@K on live all-reduced score tensor (after all_reduce, before top-K); needle span via raw-prompt offset mapping (token_match verified); per (trial,layer) sample",
+  "index_topk": 2048,
+  "lengths": {
+    "4096": {
+      "trials": 4,
+      "layer_samples": 230,
+      "score_only_recall_at_k": {
+        "512": 0.0,
+        "1024": 0.0,
+        "2048": 0.0,
+        "4096": 1.0,
+        "8192": 1.0
+      },
+      "needle_rank_median": 2208,
+      "needle_rank_min": 2105,
+      "needle_rank_max": 2580,
+      "verdict": "budget-limited"
+    },
+    "16384": {
+      "trials": 3,
+      "layer_samples": 144,
+      "score_only_recall_at_k": {
+        "512": 0.0,
+        "1024": 0.0,
+        "2048": 0.0,
+        "4096": 0.0,
+        "8192": 0.0
+      },
+      "needle_rank_median": 10218,
+      "needle_rank_min": 8832,
+      "needle_rank_max": 10306,
+      "verdict": "scorer-limited"
+    }
+  }
+}

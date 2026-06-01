@@ -118,10 +118,24 @@ class OracleTrialContext:
 
 _ACTIVE_TRIAL: Optional[OracleTrialContext] = None
 _ACTIVE_TRIAL_LOCK = threading.Lock()
+_TRIAL_FILE_ENV = "SGLANG_DS_RECALL_ORACLE_TRIAL_FILE"
+
+# Cache for the cross-process trial file: (mtime, parsed context).
+_TRIAL_FILE_CACHE: tuple = (None, None)
+
+
+def _trial_file() -> Optional[str]:
+    return os.environ.get(_TRIAL_FILE_ENV) or None
 
 
 def set_active_trial(request_id: Any, trial_id: Any, needle_positions) -> None:
-    """Register the active NIAH oracle trial's needle span (harness-side)."""
+    """Register the active NIAH oracle trial's needle span.
+
+    NIAH oracle trials are single-request. When ``SGLANG_DS_RECALL_ORACLE_TRIAL_FILE``
+    is set, the span is also written (atomically) to that file so a *separate*
+    server process (the selector) can read it — the harness and the server are
+    different processes, so a module-level var alone does not cross the boundary.
+    """
     span = [int(p) for p in needle_positions]
     if not span:
         raise ValueError("needle_positions must be non-empty (the oracle never guesses).")
@@ -130,16 +144,60 @@ def set_active_trial(request_id: Any, trial_id: Any, needle_positions) -> None:
         _ACTIVE_TRIAL = OracleTrialContext(
             request_id=request_id, trial_id=trial_id, needle_positions=span
         )
+    path = _trial_file()
+    if path is not None:
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"request_id": request_id, "trial_id": trial_id, "needle_positions": span},
+                fh,
+            )
+        os.replace(tmp, path)
 
 
 def clear_active_trial() -> None:
     global _ACTIVE_TRIAL
     with _ACTIVE_TRIAL_LOCK:
         _ACTIVE_TRIAL = None
+    path = _trial_file()
+    if path is not None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 def get_active_trial() -> Optional[OracleTrialContext]:
-    return _ACTIVE_TRIAL
+    """Return the active trial, preferring the in-process var, then the file.
+
+    The file read is mtime-cached so the selector hot path (eager only) does not
+    re-parse JSON every call within a single request.
+    """
+    if _ACTIVE_TRIAL is not None:
+        return _ACTIVE_TRIAL
+    path = _trial_file()
+    if path is None:
+        return None
+    global _TRIAL_FILE_CACHE
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    cached_mtime, cached_ctx = _TRIAL_FILE_CACHE
+    if cached_mtime == mtime and cached_ctx is not None:
+        return cached_ctx
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        ctx = OracleTrialContext(
+            request_id=data["request_id"],
+            trial_id=data["trial_id"],
+            needle_positions=[int(p) for p in data["needle_positions"]],
+        )
+    except (OSError, ValueError, KeyError):
+        return None
+    _TRIAL_FILE_CACHE = (mtime, ctx)
+    return ctx
 
 
 def next_sample_index() -> int:
