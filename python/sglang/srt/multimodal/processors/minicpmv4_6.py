@@ -419,7 +419,7 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         video_data = getattr(request_obj, "video_data", None) or kwargs.get(
             "video_data"
         )
-        base = self.load_mm_data(
+        base = await self.load_mm_data(
             prompt=input_text,
             audio_data=audio_data,
             image_data=image_data,

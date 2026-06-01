@@ -29,40 +29,6 @@ class InputLogprobsResult:
     input_token_ids_logprobs_idx: Optional[List] = None
 
 
-def compute_temp_top_p_normalized_logprobs(
-    last_logits: torch.Tensor,
-    logits_metadata: LogitsMetadata,
-    top_p: Optional[torch.Tensor] = None,
-    temperature: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    compute logprobs for the output token from the given logits.
-
-    Returns:
-        torch.Tensor: logprobs from logits
-    """
-    if top_p is None:
-        top_p = logits_metadata.top_p
-    if temperature is None:
-        temperature = logits_metadata.temperature
-
-    # Scale logits if temperature scaling is enabled
-    if logits_metadata.temp_scaled_logprobs:
-        last_logits = last_logits / temperature
-
-    # Normalize logprobs if top_p normalization is enabled
-    # NOTE: only normalize logprobs when top_p is set and not equal to 1.0
-    if logits_metadata.top_p_normalized_logprobs and (top_p != 1.0).any():
-        from sglang.srt.layers.sampler import top_p_normalize_probs_torch
-
-        probs = torch.softmax(last_logits, dim=-1)
-        del last_logits
-        probs = top_p_normalize_probs_torch(probs, top_p)
-        return torch.log(probs)
-    else:
-        return torch.nn.functional.log_softmax(last_logits, dim=-1)
-
-
 def get_top_logprobs_raw(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
@@ -415,17 +381,28 @@ def add_output_logprobs_for_spec_v1(
     for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
         for _ in range(num_tokens):
             if req.return_logprob:
-                req.output_token_logprobs_val.append(next_token_logprobs[pt])
-                req.output_token_logprobs_idx.append(accept_tokens_list[pt])
-                if req.top_logprobs_num > 0:
+                req.logprob.output_token_logprobs_val.append(next_token_logprobs[pt])
+                req.logprob.output_token_logprobs_idx.append(accept_tokens_list[pt])
+                if req.logprob.top_logprobs_num > 0:
                     assert (
                         should_top_logprobs
                     ), "Inconsistent state: should_top_logprobs is False"
-                    req.output_top_logprobs_val.append(token_top_logprobs_val[pt])
-                    req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])
-                if req.token_ids_logprob is not None and should_token_ids_logprobs:
-                    req.output_token_ids_logprobs_val.append(token_ids_logprobs_val[pt])
-                    req.output_token_ids_logprobs_idx.append(token_ids_logprobs_idx[pt])
+                    req.logprob.output_top_logprobs_val.append(
+                        token_top_logprobs_val[pt]
+                    )
+                    req.logprob.output_top_logprobs_idx.append(
+                        token_top_logprobs_idx[pt]
+                    )
+                if (
+                    req.logprob.token_ids_logprob is not None
+                    and should_token_ids_logprobs
+                ):
+                    req.logprob.output_token_ids_logprobs_val.append(
+                        token_ids_logprobs_val[pt]
+                    )
+                    req.logprob.output_token_ids_logprobs_idx.append(
+                        token_ids_logprobs_idx[pt]
+                    )
             pt += 1
 
 
