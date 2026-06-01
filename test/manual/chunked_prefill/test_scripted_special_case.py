@@ -403,7 +403,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
 
         assert (
@@ -415,6 +415,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             f"got {(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
         )
         assert (1 if t._scheduler.chunked_req is not None else 0) == 0
+
+        t.continue_generation()
 
     def test_load_inquirer_pending_tokens_dedup_chunked(self):
         self.server.execute_script(

@@ -428,7 +428,11 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_chunked_req_then_abort_then_new_short_in_one_yield(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
-        assert (t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None) == r1.rid, (
+        assert (
+            t._scheduler.chunked_req.rid
+            if t._scheduler.chunked_req is not None
+            else None
+        ) == r1.rid, (
             f"r1 should hold the chunked slot before abort; got "
             f"{(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
         )
@@ -437,7 +441,11 @@ class TestAbortBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=16, max_new_tokens=2)
         yield
 
-        cur = (t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)
+        cur = (
+            t._scheduler.chunked_req.rid
+            if t._scheduler.chunked_req is not None
+            else None
+        )
         assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
         assert r1.kv_pages == 0
         yield from run_until_finished(r2)
@@ -452,7 +460,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.is_chunking)
         assert r1.kv_pages > 0
 
-        t.force_retract(r1)
+        t.pause_generation(mode="retract")
         t.abort(r1)
         yield
 
@@ -468,6 +476,7 @@ class TestAbortBasic(ScriptedTestCase):
         )
         # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         yield
+        t.continue_generation()
 
     def test_abort_chunked_with_baton_handoff(self):
         self.server.execute_script(self._script_abort_chunked_with_baton_handoff)

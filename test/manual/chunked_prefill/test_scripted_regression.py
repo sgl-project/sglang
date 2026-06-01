@@ -78,13 +78,15 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         yield from run_until(r, lambda h: h.status == "waiting")
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
 
         assert r.kv_pages == 0
         assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
         assert not r.is_chunking
+
+        t.continue_generation()
 
     def test_inflight_middle_chunks_invariant(self):
         self.server.execute_script(self._script_inflight_middle_chunks_invariant)
@@ -274,7 +276,7 @@ class TestRegressionBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        t.force_retract(r1)
+        t.pause_generation(mode="retract")
         yield
         yield from run_until(r1, lambda h: h.status == "waiting")
 
@@ -304,6 +306,7 @@ class TestRegressionBasic(ScriptedTestCase):
             f"(no-subtraction) sum — fix is regressed"
         )
 
+        t.continue_generation()
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
 
@@ -384,10 +387,11 @@ class TestRegressionBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
 
         load_back_before = r.init_load_back_count
+        t.continue_generation()
         yield from run_until(r, lambda h: h.chunks_done >= 2)
         load_back_during = r.init_load_back_count - load_back_before
         assert load_back_during <= 1, (
@@ -601,7 +605,7 @@ class TestRegressionPp(ScriptedTestCase):
                 )
             if r_ctrl.rid in in_flight_other_mb and r_ctrl.rid in running:
                 ctrl_exclude_engaged = True
-            in_flight = (1 if t._scheduler.chunked_req is not None else 0)
+            in_flight = 1 if t._scheduler.chunked_req is not None else 0
             assert (
                 in_flight <= 1
             ), f"PP cross-mb chunked exclusion broken: in_flight={in_flight}"
@@ -637,13 +641,15 @@ class TestRegressionDisagg(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
 
         assert r.disagg_send_state in (None, "idle"), (
             f"414efd4a27: disagg send state must reset on chunked-resume "
             f"retract; got {r.disagg_send_state!r}"
         )
+
+        t.continue_generation()
 
 
 class TestRegressionPriority(ScriptedTestCase):

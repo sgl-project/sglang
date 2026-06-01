@@ -48,11 +48,12 @@ class TestPriorityBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.status == "waiting"
         assert r.kv_pages == 0
 
+        t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
 
@@ -64,9 +65,10 @@ class TestPriorityBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield
         yield
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0
+        t.continue_generation()
 
     def test_force_retract_at_chunk_mid(self):
         self.server.execute_script(self._script_force_retract_at_chunk_mid)
@@ -75,9 +77,10 @@ class TestPriorityBasic(ScriptedTestCase):
     def _script_force_retract_at_chunk_mid(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0
+        t.continue_generation()
 
     def test_force_retract_at_last_chunk(self):
         self.server.execute_script(self._script_force_retract_at_last_chunk)
@@ -86,10 +89,11 @@ class TestPriorityBasic(ScriptedTestCase):
     def _script_force_retract_at_last_chunk(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0
         assert r.req.inflight_middle_chunks == 0
+        t.continue_generation()
 
     def test_force_retract_then_readmit(self):
         self.server.execute_script(self._script_force_retract_then_readmit)
@@ -98,9 +102,10 @@ class TestPriorityBasic(ScriptedTestCase):
     def _script_force_retract_then_readmit(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0, "retract must release KV before re-admission"
+        t.continue_generation()
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
         assert r.kv_pages == 0
@@ -114,7 +119,9 @@ class TestPriorityBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
         r2 = t.start_req(prompt_len=8, max_new_tokens=2)
-        t.force_retract(r1)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until_finished(r2)
         assert r2.finished
         assert r2.kv_pages == 0
@@ -131,9 +138,10 @@ class TestPriorityBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=8, max_new_tokens=32)
         yield from run_until(r, lambda h: h.status == "running")
         assert r.kv_pages > 0, "decode-state req must own KV before retract"
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0, f"retract must release KV; got {r.kv_pages}"
+        t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
         assert r.kv_pages == 0
@@ -146,10 +154,11 @@ class TestPriorityBasic(ScriptedTestCase):
     def _script_retract_then_abort_idempotent(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         t.abort(r)
         yield
         assert r.kv_pages == 0
+        t.continue_generation()
 
     def test_disagg_retract_resets_send_state_extra(self):
         self.server.execute_script(self._script_disagg_retract_resets_send_state_extra)
@@ -158,9 +167,10 @@ class TestPriorityBasic(ScriptedTestCase):
     def _script_disagg_retract_resets_send_state_extra(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.disagg_send_state in (None, "idle")
+        t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
 
@@ -172,11 +182,12 @@ class TestPriorityBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         yield from run_until(r, lambda h: h.status == "waiting")
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0
         assert r.req.req_pool_idx is None
         assert r.status in ("waiting", "finished")
+        t.continue_generation()
 
     def test_two_retracts_same_yield(self):
         self.server.execute_script(self._script_two_retracts_same_yield)
@@ -186,11 +197,11 @@ class TestPriorityBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
-        t.force_retract(r1)
-        t.force_retract(r2)
+        t.pause_generation(mode="retract")
         yield
         assert r1.kv_pages == 0
         assert r2.kv_pages == 0
+        t.continue_generation()
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
         assert r1.lock_refs == 0
@@ -203,9 +214,10 @@ class TestPriorityBasic(ScriptedTestCase):
     def _script_retract_then_re_chunk(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 1)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0, "retract must release KV"
+        t.continue_generation()
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
         assert r.lock_refs == 0
@@ -418,7 +430,7 @@ class TestPriorityDisagg(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
 
         assert r.status == "waiting"
@@ -428,6 +440,7 @@ class TestPriorityDisagg(ScriptedTestCase):
             "idle",
         ), f"disagg send state must reset on retract, got {r.disagg_send_state}"
 
+        t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
 

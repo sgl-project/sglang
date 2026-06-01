@@ -74,7 +74,9 @@ class TestPiecewiseDynamicChunking(ScriptedTestCase):
     def _script_piecewise_cg_retract_resume_different_bucket(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
         assert r.kv_pages == 0

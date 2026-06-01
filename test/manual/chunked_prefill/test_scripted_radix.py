@@ -240,10 +240,11 @@ class TestRadixBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0, f"retract must release KV; got {r.kv_pages}"
 
+        t.continue_generation()
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
         expected_total: int = prompt_len // DEFAULT_CHUNK_SIZE

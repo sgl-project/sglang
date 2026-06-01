@@ -93,7 +93,10 @@ class TestKVPressureBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_row_pool_tight_admits_after_release(t: ScriptedContext):
-        baseline_rows_used = (t._scheduler.req_to_token_pool.size - t._scheduler.req_to_token_pool.available_size())
+        baseline_rows_used = (
+            t._scheduler.req_to_token_pool.size
+            - t._scheduler.req_to_token_pool.available_size()
+        )
         t.exhaust_row_pool(leave_rows=2)
         yield
 
@@ -105,7 +108,10 @@ class TestKVPressureBasic(ScriptedTestCase):
                 f"row-pool pressure must not leave KV held: rid={r.rid}, "
                 f"kv_pages={r.kv_pages}"
             )
-        final_rows_used = (t._scheduler.req_to_token_pool.size - t._scheduler.req_to_token_pool.available_size())
+        final_rows_used = (
+            t._scheduler.req_to_token_pool.size
+            - t._scheduler.req_to_token_pool.available_size()
+        )
         assert final_rows_used <= baseline_rows_used, (
             f"row pool leak after admit-after-release: baseline used="
             f"{baseline_rows_used}, final used={final_rows_used}"
@@ -181,7 +187,9 @@ class TestKVPressureBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         chunks_before_retract = r.chunks_done
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         for _ in range(2000):
             if r.finished:
                 break
@@ -270,7 +278,9 @@ class TestKVPressureBasic(ScriptedTestCase):
         baseline = t.engine_stats()["kv_pool_free"]
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert r.kv_pages == 0
@@ -291,21 +301,27 @@ class TestKVPressureBasic(ScriptedTestCase):
 
         r_first = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r_first, lambda h: h.is_chunking)
-        t.force_retract(r_first)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until_finished(r_first, max_steps=2000)
         assert r_first.finished
         assert r_first.kv_pages == 0
 
         r_mid = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r_mid, lambda h: h.chunks_done >= mid_chunk)
-        t.force_retract(r_mid)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until_finished(r_mid, max_steps=2000)
         assert r_mid.finished
         assert r_mid.kv_pages == 0
 
         r_last = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r_last, lambda h: h.chunks_done >= last_minus_one)
-        t.force_retract(r_last)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until_finished(r_last, max_steps=2000)
         assert r_last.finished
         assert r_last.kv_pages == 0
@@ -336,7 +352,9 @@ class TestKVPressureBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         chunks_at_first = r.chunks_done
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until(
             r,
             lambda h: h.is_chunking and h.chunks_done >= chunks_at_first,
@@ -348,7 +366,9 @@ class TestKVPressureBasic(ScriptedTestCase):
             f"before={chunks_at_first}, after={chunks_after_first_resume}"
         )
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until(
             r,
             lambda h: h.is_chunking and h.chunks_done >= chunks_after_first_resume,
@@ -357,7 +377,9 @@ class TestKVPressureBasic(ScriptedTestCase):
         chunks_after_second_resume = r.chunks_done
         assert chunks_after_second_resume >= chunks_after_first_resume
 
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert r.chunks_done >= chunks_after_second_resume
@@ -412,7 +434,9 @@ class TestKVPressurePageSize(ScriptedTestCase):
     def _script_strict_mem_check_handles_chunked_tail(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 17, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.force_retract(r)
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
         yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert r.kv_pages == 0
