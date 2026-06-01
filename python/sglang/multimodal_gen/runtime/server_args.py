@@ -905,9 +905,6 @@ class ServerArgs(DisaggArgsMixin):
         flag_names = cpu_offload_flags_for_layerwise_components(component_names)
         disabled_flag_names: list[str] = []
 
-        if "dit_cpu_offload" in flag_names and self.dit_cpu_offload is not False:
-            self.dit_cpu_offload = False
-            disabled_flag_names.append("dit_cpu_offload")
         if (
             "text_encoder_cpu_offload" in flag_names
             and self.text_encoder_cpu_offload is not False
@@ -1254,7 +1251,9 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
             "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
-            "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. May be combined with "
+            "--dit-cpu-offload, in which case DiT weights stay on host memory and only the "
+            "layers needed for the current step are brought on-device (lowest peak GPU memory).",
         )
         parser.add_argument(
             "--layerwise-offload-components",
@@ -1842,12 +1841,6 @@ class ServerArgs(DisaggArgsMixin):
                     "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
-
-            if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
-                logger.warning(
-                    "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."
-                )
-                self.dit_cpu_offload = False
 
             if envs.SGLANG_CACHE_DIT_ENABLED and should_disable_dit_cpu_offload:
                 raise ValueError(
