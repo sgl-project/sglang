@@ -79,8 +79,11 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#9ca3af" : "#6b7280",
       minWidth: "38px", textTransform: "uppercase", letterSpacing: "0.04em",
     },
-    itemsGrid: (cols) => ({
-      display: "grid", gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+    // auto-fit + a real min width: columns wrap on narrow screens instead of
+    // shrinking below their label (the old minmax(0,1fr) let buttons overlap on
+    // mobile). `cols` no longer needed — auto-fit never exceeds the item count.
+    itemsGrid: () => ({
+      display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(72px, 1fr))",
       gap: "4px", flex: 1,
     }),
     labelBase: {
@@ -106,7 +109,8 @@ export const Deployment = ({ config, benchmarks }) => {
       overflow: "hidden",
     },
     commandHeader: {
-      display: "flex", justifyContent: "space-between", alignItems: "center",
+      display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center",
+      gap: "6px 10px",
       padding: "6px 10px",
       borderBottom: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
       background: isDark ? "#1f2937" : "#fafafa",
@@ -140,7 +144,7 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "11px", fontWeight: 500, cursor: "pointer",
       display: "inline-flex", alignItems: "center", gap: "4px",
     },
-    iconRow: { display: "inline-flex", gap: "6px" },
+    iconRow: { display: "inline-flex", flexWrap: "wrap", gap: "6px" },
     runModeWrap: {
       display: "inline-flex",
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
@@ -171,7 +175,7 @@ export const Deployment = ({ config, benchmarks }) => {
         ? (isDark ? "#e5e7eb" : "#111827")
         : (isDark ? "#9ca3af" : "#6b7280"),
     }),
-    headerLeft: { display: "inline-flex", alignItems: "center", gap: "8px" },
+    headerLeft: { display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: "8px" },
     modalBackdrop: {
       position: "fixed", inset: 0,
       background: "rgba(0,0,0,0.5)",
@@ -223,8 +227,8 @@ export const Deployment = ({ config, benchmarks }) => {
       display: "flex", flexDirection: "column", gap: "8px",
     },
     benchHeader: {
-      display: "flex", alignItems: "baseline", justifyContent: "space-between",
-      gap: "12px",
+      display: "flex", flexWrap: "wrap", alignItems: "baseline", justifyContent: "space-between",
+      gap: "6px 12px",
     },
     benchTitle: {
       fontSize: "13px", fontWeight: 600,
@@ -235,7 +239,7 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#9ca3af" : "#6b7280",
     },
     benchHeaderRight: {
-      display: "flex", alignItems: "center", gap: "10px", flexShrink: 0,
+      display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px 10px", flexShrink: 0,
     },
     benchChipRow: {
       display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap",

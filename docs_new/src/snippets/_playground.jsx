@@ -1169,7 +1169,8 @@ export const Playground = ({ config }) => {
       overflow: "hidden",
     },
     commandHeader: {
-      display: "flex", justifyContent: "space-between", alignItems: "center",
+      display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center",
+      gap: "6px 10px",
       padding: "6px 10px",
       borderBottom: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
       background: isDark ? "#1f2937" : "#fafafa",
@@ -1221,7 +1222,7 @@ export const Playground = ({ config }) => {
       fontSize: "11px", fontWeight: 500, cursor: "pointer",
       display: "inline-flex", alignItems: "center", gap: "4px",
     },
-    iconRow: { display: "inline-flex", gap: "6px" },
+    iconRow: { display: "inline-flex", flexWrap: "wrap", gap: "6px" },
     runModeWrap: {
       display: "inline-flex",
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
@@ -1241,7 +1242,7 @@ export const Playground = ({ config }) => {
       background: active ? (isDark ? "#1f2937" : "#fff") : "transparent",
       color: active ? (isDark ? "#e5e7eb" : "#111827") : (isDark ? "#9ca3af" : "#6b7280"),
     }),
-    headerLeft: { display: "inline-flex", alignItems: "center", gap: "8px" },
+    headerLeft: { display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: "8px" },
     // Native <dialog> in top-layer mode (.showModal()) escapes Mintlify's
     // `container-type: inline-size` trap that catches plain fixed-position
     // modals. ::backdrop can't be styled inline (injected via useEffect).
