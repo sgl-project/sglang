@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
@@ -84,7 +85,7 @@ IGNORE_EOS_RESERVE_TOKENS = 1
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
-    token_ids: Optional[List[int]] = None,
+    token_ids: Optional[array[int]] = None,
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
@@ -825,9 +826,7 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if (
-            self.dsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
-        ) and len(self.can_run_list) >= 1:
+        if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:

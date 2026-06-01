@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    TypeAlias,
+)
 
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+
+logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
@@ -16,6 +26,10 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
+    TopkTransformMethod,
+)
 from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.dsa.transform_index import (
     transform_index_page_table_decode,
@@ -158,13 +172,6 @@ class DSAMetadata:
     token_to_batch_idx: Optional[torch.Tensor] = None
 
 
-class TopkTransformMethod(IntEnum):
-    # Transform topk indices to indices to the page table (page_size = 1)
-    PAGED = auto()
-    # Transform topk indices to indices to ragged kv (non-paged)
-    RAGGED = auto()
-
-
 @torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return torch.cat(tensors, dim=dim)
@@ -190,6 +197,7 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 class DSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: DSAMetadata
     topk_transform_method: TopkTransformMethod
+    topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
 
@@ -228,17 +236,11 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         logits: torch.Tensor,
         topk: int,
         ks: Optional[torch.Tensor] = None,
-        cu_seqlens_q: torch.Tensor = None,
-        ke_offset: torch.Tensor = None,
-        batch_idx_list: List[int] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        ke_offset: Optional[torch.Tensor] = None,
+        batch_idx_list: Optional[List[int]] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sgl_kernel import (
-            fast_topk_transform_fused,
-            fast_topk_transform_ragged_fused,
-            fast_topk_v2,
-        )
-
         if topk_indices_offset_override is not None:
             cu_topk_indices_offset = topk_indices_offset_override
             cu_seqlens_q_topk = None
@@ -256,38 +258,18 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             seq_lens_topk = ke_offset
         else:
             seq_lens_topk = self.get_seqlens_expanded()
-        if batch_idx_list is not None:
-            page_table_size_1 = self.attn_metadata.page_table_1[batch_idx_list]
-        else:
-            page_table_size_1 = self.attn_metadata.page_table_1
-
-        if not envs.SGLANG_DSA_FUSE_TOPK.get() or self.force_unfused_topk:
-            return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
-        elif self.topk_transform_method == TopkTransformMethod.PAGED:
-            # NOTE(dark): if fused, we return a transformed page table directly
-            return fast_topk_transform_fused(
-                score=logits,
-                lengths=seq_lens_topk,
-                page_table_size_1=page_table_size_1,
-                cu_seqlens_q=cu_seqlens_q_topk,
-                topk=topk,
-                row_starts=ks,
-            )
-        elif self.topk_transform_method == TopkTransformMethod.RAGGED:
-            if cu_topk_indices_offset is None:
-                raise RuntimeError(
-                    "RAGGED topk_transform requires topk_indices_offset; "
-                    "expected extend-without-speculative metadata."
-                )
-            return fast_topk_transform_ragged_fused(
-                score=logits,
-                lengths=seq_lens_topk,
-                topk_indices_offset=cu_topk_indices_offset,
-                topk=topk,
-                row_starts=ks,
-            )
-        else:
-            assert False, f"Unsupported {self.topk_transform_method = }"
+        return self.topk_backend.topk_transform(
+            logits=logits,
+            lengths=seq_lens_topk,
+            topk=topk,
+            topk_transform_method=self.topk_transform_method,
+            attn_metadata=self.attn_metadata,
+            cu_seqlens_q_topk=cu_seqlens_q_topk,
+            topk_indices_offset=cu_topk_indices_offset,
+            row_starts=ks,
+            batch_idx_list=batch_idx_list,
+            force_unfused_topk=self.force_unfused_topk,
+        )
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
@@ -340,6 +322,9 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
+            model_runner.server_args.dsa_topk_backend
+        )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -394,6 +379,16 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+    def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
+        if (
+            self.dsa_topk_backend.is_sgl_kernel()
+            or self.dsa_topk_backend.is_flashinfer()
+        ):
+            return topk_indices
+        raise RuntimeError(
+            f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+        )
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -818,19 +813,21 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
+        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        out_cache_loc: Optional[torch.Tensor] = None,
+        actual_forward_mode: Optional["ForwardMode"] = None,
     ):
+        """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
 
-        """Initialize forward metadata for capturing CUDA graph."""
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -852,11 +849,11 @@ class DeepseekSparseAttnBackend(
             )
 
             seqlens_expanded = cache_seqlens_int32
-            dsa_extend_seq_lens_list = [1] * num_tokens
+            dsa_extend_seq_lens_list = [1] * bs
             if self.dsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
-                ].slice(slice(0, num_tokens + 1))
+                ].slice(slice(0, bs + 1))
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=dsa_cache_seqlens_int32,
@@ -974,6 +971,28 @@ class DeepseekSparseAttnBackend(
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        """Initialize forward metadata for capturing CUDA graph."""
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
+        )
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -989,6 +1008,20 @@ class DeepseekSparseAttnBackend(
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         assert seq_lens_cpu is not None
+
+        if bs not in self.decode_cuda_graph_metadata:
+            self._build_forward_metadata_cuda_graph(
+                bs,
+                None,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu,
+                forward_mode,
+                spec_info,
+                out_cache_loc,
+                actual_forward_mode,
+            )
+            return
 
         self.set_dsa_prefill_impl(forward_batch=None)
 
@@ -1428,7 +1461,7 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
         if envs.SGLANG_DSA_FUSE_TOPK.get():
-            page_table_1 = topk_indices
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = metadata.topk_indices_offset
@@ -1616,7 +1649,7 @@ class DeepseekSparseAttnBackend(
                 layer.layer_id,
             )
         elif envs.SGLANG_DSA_FUSE_TOPK.get():
-            page_table_1 = topk_indices
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
@@ -2123,7 +2156,7 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
         if envs.SGLANG_DSA_FUSE_TOPK.get():
-            page_table_1 = topk_indices
+            page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
                 page_table=metadata.page_table_1,
@@ -2169,8 +2202,8 @@ class DeepseekSparseAttnBackend(
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
-        # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
-        return out.squeeze(1)
+
+        return out
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
@@ -2201,10 +2234,18 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
+        from sglang.srt.compilation.piecewise_context_manager import (
+            is_in_piecewise_cuda_graph,
+        )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
-        if forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
+        if is_in_piecewise_cuda_graph():
+            # Can't branch on seq_lens_cpu in PCG, force mha off to guarantee correctness.
+            self.use_mha = False
+        elif (
+            forward_batch and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
@@ -2276,6 +2317,7 @@ class DeepseekSparseAttnBackend(
             topk_transform_method=self.get_topk_transform_method(
                 forward_batch.forward_mode
             ),
+            topk_backend=self.dsa_topk_backend,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             force_unfused_topk=force_unfused,
         )
