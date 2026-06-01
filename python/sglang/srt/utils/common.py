@@ -1167,13 +1167,11 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
 
 def _still_holding_resources(procs):
-    """Return the procs that still hold GPU context, pinned memory and fds.
+    """Procs still holding GPU context, pinned memory or fds.
 
-    A SIGKILL'd process becomes a zombie once the kernel has released its
-    memory, fds and GPU context but before the parent reaps it -- a zombie
-    holds nothing, so treat it as gone. `NoSuchProcess` (already reaped) and
-    `OSError` (e.g. `pidfd_open` raising EINVAL/ESRCH on an exiting process,
-    kernel-version dependent) likewise mean the process is no longer alive.
+    A zombie has already had its resources freed by the kernel (only the exit
+    status lingers), so it counts as gone; NoSuchProcess / OSError (see
+    _wait_for_reap_or_raise) mean the same.
     """
     alive = []
     for p in procs:
@@ -1192,11 +1190,9 @@ def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
     fds until the kernel reaps them. Raise on timeout so a stuck process
     surfaces instead of leaving a latent race.
 
-    Polls process status rather than `psutil.wait_procs`: for processes that
-    are not direct children, `wait_procs` reaches for `os.pidfd_open`, which
-    can raise `OSError(EINVAL)` against a just-killed/exiting process on some
-    kernels and abort the whole wait. `is_running()`/`status()` read /proc and
-    avoid that path.
+    Polls /proc via is_running()/status() rather than psutil.wait_procs, whose
+    os.pidfd_open path (used for non-child procs) raises OSError(EINVAL) against
+    a just-killed process on some kernels and aborts the whole wait.
     """
     warn_at = min(10.0, wait_timeout / 2)
     deadline = time.monotonic() + wait_timeout
