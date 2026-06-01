@@ -12,7 +12,7 @@ from sglang.test.scripted_runtime.context import (
 from sglang.test.scripted_runtime.context.req_starter import ScriptedContextReqStarter
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ReqLogprob
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
     from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -100,8 +100,8 @@ class ScriptedContext:
         return queries.is_fully_idle(self)
 
     @property
-    def forward_mode(self) -> Optional[str]:
-        return queries.forward_mode(self)
+    def last_batch_forward_mode(self) -> Optional[str]:
+        return queries.last_batch_forward_mode(self)
 
     def find_req_by_rid(self, rid: str) -> Optional["Req"]:
         return queries.find_req_by_rid(self, rid)
@@ -117,12 +117,6 @@ class ScriptedContext:
 
     def remaining_prompt_tokens(self, rid: str) -> int:
         return queries.remaining_prompt_tokens(self, rid)
-
-    def logprobs(self, rid: str) -> Optional["ReqLogprob"]:
-        return queries.logprobs(self, rid)
-
-    def num_input_logprobs(self, rid: str) -> int:
-        return queries.num_input_logprobs(self, rid)
 
     def list_active_reqs(self) -> List["Req"]:
         return queries.list_active_reqs(self)

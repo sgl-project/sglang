@@ -101,8 +101,8 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert r.logprobs is not None
-        assert len(r.logprobs.output_token_logprobs_val) == 4
+        assert r.req.logprob is not None
+        assert len(r.req.logprob.output_token_logprobs_val) == 4
 
     def test_ignore_eos_chunked(self):
         self.server.execute_script(self._script_ignore_eos_chunked)
@@ -221,8 +221,8 @@ class TestSamplingBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert r.logprobs is not None
-        top = r.logprobs.output_top_logprobs_val
+        assert r.req.logprob is not None
+        top = r.req.logprob.output_top_logprobs_val
         assert len(top) == 4, (
             f"top logprobs must be reported once per output token; "
             f"got {len(top)} entries for 4 tokens"
@@ -509,8 +509,8 @@ class TestSamplingBasic(ScriptedTestCase):
         assert (
             r.chunks_done >= 2
         ), f"prompt should span multiple chunks, got chunks_done={r.chunks_done}"
-        assert r.logprobs is not None
-        input_lp = r.logprobs.input_token_logprobs_val
+        assert r.req.logprob is not None
+        input_lp = r.req.logprob.input_token_logprobs_val
         assert len(input_lp) == prompt_len - 1, (
             f"expected {prompt_len - 1} input logprobs (one per token after "
             f"the first), got {len(input_lp)}"
@@ -534,8 +534,8 @@ class TestSamplingBasic(ScriptedTestCase):
         assert (
             r.chunks_done >= 3
         ), f"prompt should span 3+ chunks, got chunks_done={r.chunks_done}"
-        assert r.logprobs is not None
-        input_lp = r.logprobs.input_token_logprobs_val
+        assert r.req.logprob is not None
+        input_lp = r.req.logprob.input_token_logprobs_val
         assert len(input_lp) == prompt_len - start_len, (
             f"expected {prompt_len - start_len} input logprobs for tokens "
             f">= logprob_start_len={start_len}, got {len(input_lp)}"

@@ -57,7 +57,7 @@ class TestLoRASingleAdapter(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert r.num_input_logprobs == prompt_len
+        assert len(r.req.logprob.input_token_logprobs_val) == prompt_len
 
 
 class TestLoRADrainerBypass(ScriptedTestCase):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ReqLogprob
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
@@ -59,7 +59,7 @@ def is_fully_idle(ctx: "ScriptedContext") -> bool:
     return is_idle(ctx) and (s.last_batch is None or s.last_batch.is_empty())
 
 
-def forward_mode(ctx: "ScriptedContext") -> Optional[str]:
+def last_batch_forward_mode(ctx: "ScriptedContext") -> Optional[str]:
     s = ctx._scheduler
     if s.last_batch is not None and s.last_batch.forward_mode is not None:
         return s.last_batch.forward_mode.name
@@ -105,18 +105,6 @@ def remaining_prompt_tokens(ctx: "ScriptedContext", rid: str) -> int:
     if req is None:
         return 0
     return max(0, len(req.origin_input_ids) - req.kv_committed_len)
-
-
-def logprobs(ctx: "ScriptedContext", rid: str) -> Optional["ReqLogprob"]:
-    req = find_req_by_rid(ctx, rid)
-    return req.logprob if req is not None else None
-
-
-def num_input_logprobs(ctx: "ScriptedContext", rid: str) -> int:
-    lp = logprobs(ctx, rid)
-    if lp is None or lp.input_token_logprobs_val is None:
-        return 0
-    return len(lp.input_token_logprobs_val)
 
 
 def chunks_done(ctx: "ScriptedContext", rid: str) -> int:

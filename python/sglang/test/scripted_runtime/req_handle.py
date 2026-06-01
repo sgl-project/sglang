@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ReqLogprob
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
@@ -30,28 +30,12 @@ class ScriptedReqHandle:
         return self.context.chunks_done(self.rid)
 
     @property
-    def start_send_idx(self) -> int:
-        return self.req.start_send_idx
-
-    @property
-    def tmp_end_idx(self) -> int:
-        return self.req.tmp_end_idx
-
-    @property
     def status(self) -> str:
         return self.context.status(self.rid)
 
     @property
     def remaining_prompt_tokens(self) -> int:
         return self.context.remaining_prompt_tokens(self.rid)
-
-    @property
-    def logprobs(self) -> Optional["ReqLogprob"]:
-        return self.context.logprobs(self.rid)
-
-    @property
-    def num_input_logprobs(self) -> int:
-        return self.context.num_input_logprobs(self.rid)
 
     @property
     def kv_pages(self) -> int:

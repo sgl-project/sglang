@@ -681,8 +681,8 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
             d.rid in running_in_batch for d in decodes
         ), f"enable_mixed_chunk should merge decode reqs into chunked iter; got {comp!r}"
         assert (
-            t.forward_mode == "MIXED"
-        ), f"expected forward_mode == MIXED with enable_mixed_chunk, got {t.forward_mode!r}"
+            t.last_batch_forward_mode == "MIXED"
+        ), f"expected forward_mode == MIXED with enable_mixed_chunk, got {t.last_batch_forward_mode!r}"
 
         all_reqs = [r_chunk, *decodes]
         for _ in range(DEFAULT_MAX_STEPS * 2):
@@ -703,8 +703,8 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
         )
         yield from run_until(r, lambda h: h.is_chunking)
         assert (
-            t.forward_mode != "MIXED"
-        ), f"return_logprob must disable mixed-chunk path; got {t.forward_mode!r}"
+            t.last_batch_forward_mode != "MIXED"
+        ), f"return_logprob must disable mixed-chunk path; got {t.last_batch_forward_mode!r}"
         yield from run_until_finished(r)
 
     def test_mixed_chunk_with_running_batch(self):
@@ -720,8 +720,8 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
         yield from run_until(r_chunk, lambda h: h.is_chunking)
 
         assert (
-            t.forward_mode == "MIXED"
-        ), f"chunked admission with running batch must enter MIXED; got {t.forward_mode!r}"
+            t.last_batch_forward_mode == "MIXED"
+        ), f"chunked admission with running batch must enter MIXED; got {t.last_batch_forward_mode!r}"
         for _ in range(DEFAULT_MAX_STEPS * 2):
             if r_chunk.finished and r_dec.finished:
                 break
