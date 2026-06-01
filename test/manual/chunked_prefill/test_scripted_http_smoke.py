@@ -43,7 +43,10 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
         assert r1.finished
         assert r2.finished
         assert r1.chunks_done == 0
-        assert r2.chunks_done >= 1
+        # r2's prompt is 2 * DEFAULT_CHUNK_SIZE (512), an exact multiple of the
+        # 256 chunk size, so it chunks into ceil(512 / 256) = 2 partial prefill
+        # iterations regardless of co-batching with r1.
+        assert r2.chunks_done == 2
 
 
 if __name__ == "__main__":
