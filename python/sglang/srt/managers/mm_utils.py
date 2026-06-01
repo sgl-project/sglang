@@ -4,7 +4,6 @@ Multi-modality utils
 
 import copy
 import hashlib
-import math
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
