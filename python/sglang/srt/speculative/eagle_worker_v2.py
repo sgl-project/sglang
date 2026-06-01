@@ -1092,7 +1092,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
-        # Prepare for target verify in a separate stream
+        # Prepare for target verify in a separate stream.
+        # The plan stream must wait for draft kernels on the forward stream
+        # to finish: prepare_for_v2_verify reads draft output (draft_token,
+        # req_to_token) and replay_prepare touches mamba state indices that
+        # draft may still be writing.
+        if self.plan_stream:
+            self.plan_stream.wait_stream(fwd_stream)
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
