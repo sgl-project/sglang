@@ -4,7 +4,7 @@ const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
 const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
-const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v5";
+const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
@@ -347,7 +347,7 @@ async function decodeFrameBatch(header, data) {
     }));
   }
 
-  const payload = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
+  const payload = await payloadToArrayBuffer(data);
   const id = decodeRequestId++;
   const decodeHeader = { ...header, __decode_id: id };
   const useTransfer = isWorkerDecodableRawContentType(header.content_type);
@@ -378,12 +378,26 @@ async function decodeFrameBatch(header, data) {
       }
     });
   } catch (error) {
+    if (isEncodedPreviewContentType(header.content_type)) {
+      const items = await framePayloadToImageData(header, data);
+      const decodedAt = performance.now();
+      lastDecodeMs = decodedAt - decodeStartedAt;
+      return items.map((item) => ({
+        ...item,
+        receivedAt: header.__received_at,
+        decodedAt,
+        decodeMs: lastDecodeMs,
+      }));
+    }
     throw error;
   }
 }
 
 function isWorkerDecodableContentType(contentType) {
-  return isWorkerDecodableRawContentType(contentType);
+  return (
+    isWorkerDecodableRawContentType(contentType) ||
+    isEncodedPreviewContentType(contentType)
+  );
 }
 
 function isWorkerDecodableRawContentType(contentType) {
@@ -602,11 +616,25 @@ function handleEncodedPreviewDecodeError(error, header, data, payloadBytes) {
 }
 
 function payloadSignature(data) {
-  if (!(data instanceof ArrayBuffer)) return "";
-  const bytes = new Uint8Array(data, 0, Math.min(12, data.byteLength));
+  let bytes;
+  if (data instanceof Uint8Array) {
+    bytes = data.subarray(0, Math.min(12, data.byteLength));
+  } else if (data instanceof ArrayBuffer) {
+    bytes = new Uint8Array(data, 0, Math.min(12, data.byteLength));
+  } else {
+    return "";
+  }
   return Array.from(bytes)
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+async function payloadToArrayBuffer(data) {
+  if (data instanceof ArrayBuffer) return data;
+  if (data instanceof Uint8Array) {
+    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+  }
+  return data.arrayBuffer();
 }
 
 function drawFrame(image) {
@@ -902,6 +930,19 @@ function receive(data, epoch) {
     }
     if (message.type === "chunk_stats") {
       updateServerChunkStats(message);
+      return;
+    }
+    if (message.type === "frame_batch") {
+      const payload = message.payload;
+      delete message.payload;
+      pendingDecodeBatches += 1;
+      decodeChain = decodeChain
+        .then(() => decodeAndEnqueueFrameBatch(message, payload, epoch))
+        .catch((error) => handleReceiveError(error, epoch))
+        .finally(() => {
+          pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
+        });
+      setStatus("Receiving", "live");
       return;
     }
     pendingHeader = message;
@@ -1220,12 +1261,20 @@ function unpack(buf) {
       i += 8;
       return value;
     }
+    if (b === 0xc4) return readBin(buf[i++]);
+    if (b === 0xc5) return readBin((buf[i++] << 8) | buf[i++]);
+    if (b === 0xc6) {
+      return readBin(
+        (buf[i++] * 16777216) + (buf[i++] << 16) + (buf[i++] << 8) + buf[i++],
+      );
+    }
     if (b === 0xd9) return readStr(buf[i++]);
     if (b === 0xda) return readStr((buf[i++] << 8) | buf[i++]);
     if (b === 0xde) return readMap((buf[i++] << 8) | buf[i++]);
     throw new Error(`Unsupported msgpack byte ${b}`);
   };
   const readStr = (n) => text.decode(buf.slice(i, i += n));
+  const readBin = (n) => buf.subarray(i, i += n);
   const readMap = (n) => {
     const obj = {};
     for (let j = 0; j < n; j++) obj[read()] = read();

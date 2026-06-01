@@ -88,6 +88,18 @@ class _State(BaseRealtimeState):
         self.disposed = True
 
 
+def _unpack_frame_batch_messages(payloads):
+    from msgpack import unpackb
+
+    messages = []
+    for payload in payloads:
+        message = unpackb(payload, raw=False)
+        assert message.pop("type") == "frame_batch"
+        frame_payload = message.pop("payload")
+        messages.append((message, frame_payload))
+    return messages
+
+
 def test_realtime_webui_presets_do_not_emit_camera_scripts():
     repo_root = Path(__file__).parents[4]
     app_js = (
@@ -114,9 +126,9 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="theoreticalFpsText"' in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-fixes-v22" in index_html
-    assert "app.js?v=realtime-fixes-v22" in index_html
-    assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v5";' in app_js
+    assert "styles.css?v=realtime-fixes-v23" in index_html
+    assert "app.js?v=realtime-fixes-v23" in index_html
+    assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";' in app_js
     assert 'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";' in app_js
     assert "Dragon Dolly" in app_js
     assert "dragon-ride.jpg" in app_js
@@ -128,6 +140,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "handleEncodedPreviewDecodeError" in app_js
     assert "if (b === 0xca)" in app_js
     assert "if (b === 0xcb)" in app_js
+    assert "if (b === 0xc4)" in app_js
+    assert 'message.type === "frame_batch"' in app_js
     assert "RAW_RGB_FRAMES_PER_WS_MESSAGE = 1" in (
         repo_root
         / "python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_output_adapter.py"
@@ -1756,10 +1770,9 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
 
     payloads, stats, expected_frames = asyncio.run(run())
 
-    from msgpack import unpackb
-
-    first_header = unpackb(payloads[0], raw=False)
-    second_header = unpackb(payloads[2], raw=False)
+    (first_header, first_payload), (second_header, second_payload) = (
+        _unpack_frame_batch_messages(payloads)
+    )
     assert first_header["content_type"] == RAW_RGB_DELTA_GZIP_CONTENT_TYPE
     assert first_header["encoding"] == "delta-gzip"
     assert first_header["event_id"] == 3
@@ -1767,7 +1780,7 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
     assert first_header["channels"] == 3
     assert first_header["bytes_per_frame"] == 3000
     assert first_header["raw_size"] == 3000
-    assert first_header["total_size"] == len(payloads[1])
+    assert first_header["total_size"] == len(first_payload)
     assert first_header["num_frames"] == 1
     assert first_header["num_frame_batches"] == 2
     assert first_header["frame_batch_index"] == 0
@@ -1781,12 +1794,12 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
     assert stats["num_batches"] == 2
     assert stats["num_frames"] == 2
     first_frame = restore_delta_gzip_raw_rgb_payload(
-        payloads[1],
+        first_payload,
         bytes_per_frame=3000,
         num_frames=1,
     )
     second_frame = restore_delta_gzip_raw_rgb_payload(
-        payloads[3],
+        second_payload,
         bytes_per_frame=3000,
         num_frames=1,
         reference_frame=first_frame,
@@ -1846,24 +1859,23 @@ def test_raw_rgb_realtime_output_adapter_offloads_delta_payload_build(
 
     payloads, expected_frames = asyncio.run(run())
 
-    from msgpack import unpackb
-
     assert [call[0] for call in calls] == [
         realtime_output_adapter._build_transport_payload,
         realtime_output_adapter._build_transport_payload,
     ]
-    first_header = unpackb(payloads[0], raw=False)
-    second_header = unpackb(payloads[2], raw=False)
+    (first_header, first_payload), (second_header, second_payload) = (
+        _unpack_frame_batch_messages(payloads)
+    )
     assert first_header["encoding"] == "delta-gzip"
     assert "delta_reference" not in first_header
     assert second_header["delta_reference"] == "previous-frame"
     first_frame = restore_delta_gzip_raw_rgb_payload(
-        payloads[1],
+        first_payload,
         bytes_per_frame=3000,
         num_frames=1,
     )
     second_frame = restore_delta_gzip_raw_rgb_payload(
-        payloads[3],
+        second_payload,
         bytes_per_frame=3000,
         num_frames=1,
         reference_frame=first_frame,
@@ -1910,10 +1922,9 @@ def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
 
     payloads, stats, expected_frames = asyncio.run(run())
 
-    from msgpack import unpackb
-
-    first_header = unpackb(payloads[0], raw=False)
-    second_header = unpackb(payloads[2], raw=False)
+    (first_header, first_payload), (second_header, second_payload) = (
+        _unpack_frame_batch_messages(payloads)
+    )
     assert first_header["content_type"] == RAW_RGB_CONTENT_TYPE
     assert first_header["encoding"] == "raw"
     assert first_header["raw_size"] == 3000
@@ -1926,11 +1937,11 @@ def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
     assert second_header["num_frames"] == 1
     assert second_header["num_frame_batches"] == 2
     assert second_header["frame_batch_index"] == 1
-    assert payloads[1] + payloads[3] == expected_frames
+    assert first_payload + second_payload == expected_frames
     assert stats["raw_bytes"] == 6000
     assert stats["num_batches"] == 2
     assert stats["num_frames"] == 2
-    assert stats["ws_payload_bytes"] == 6000 + len(payloads[0]) + len(payloads[2])
+    assert stats["ws_payload_bytes"] == sum(len(payload) for payload in payloads)
 
 
 def test_raw_rgb_realtime_output_adapter_uses_previous_frame_reference():
@@ -1984,19 +1995,18 @@ def test_raw_rgb_realtime_output_adapter_uses_previous_frame_reference():
 
     payloads = asyncio.run(run())
 
-    from msgpack import unpackb
-
-    first_header = unpackb(payloads[0], raw=False)
-    second_header = unpackb(payloads[2], raw=False)
+    (first_header, first_payload), (second_header, second_payload) = (
+        _unpack_frame_batch_messages(payloads)
+    )
     assert "delta_reference" not in first_header
     assert second_header["delta_reference"] == "previous-frame"
     first_frame = restore_delta_gzip_raw_rgb_payload(
-        payloads[1],
+        first_payload,
         bytes_per_frame=6,
         num_frames=1,
     )
     second_frame = restore_delta_gzip_raw_rgb_payload(
-        payloads[3],
+        second_payload,
         bytes_per_frame=6,
         num_frames=1,
         reference_frame=first_frame,
@@ -2042,9 +2052,7 @@ def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
 
     payloads, stats = asyncio.run(run())
 
-    from msgpack import unpackb
-
-    headers = [unpackb(payloads[idx], raw=False) for idx in range(0, len(payloads), 2)]
+    headers = [header for header, _ in _unpack_frame_batch_messages(payloads)]
     assert len(headers) == 7
     assert [header["chunk_index"] for header in headers] == [4] * 7
     assert [header["frame_batch_index"] for header in headers] == list(range(7))
@@ -2104,15 +2112,13 @@ def test_raw_rgb_realtime_output_adapter_can_send_webp_preview_frames():
 
     payloads, stats = asyncio.run(run())
 
-    from msgpack import unpackb
-
-    header = unpackb(payloads[0], raw=False)
+    [(header, frame_payload)] = _unpack_frame_batch_messages(payloads)
     assert header["content_type"] == WEBP_FRAME_CONTENT_TYPE
     assert header["format"] == "webp"
     assert header["encoding"] == "webp"
     assert header["num_frames"] == 1
     assert header["is_final_frame_batch"] is True
-    assert payloads[1].startswith(b"RIFF")
+    assert frame_payload.startswith(b"RIFF")
     assert stats["num_batches"] == 1
     assert stats["num_frames"] == 1
 
@@ -2167,15 +2173,13 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
 
     payloads = asyncio.run(run())
 
-    from msgpack import unpackb
-
     assert [call[0] for call in calls] == [
         realtime_output_adapter._build_transport_payload,
     ]
-    header = unpackb(payloads[0], raw=False)
+    [(header, frame_payload)] = _unpack_frame_batch_messages(payloads)
     assert header["content_type"] == WEBP_FRAME_CONTENT_TYPE
     assert header["encoding"] == "webp"
-    assert payloads[1].startswith(b"RIFF")
+    assert frame_payload.startswith(b"RIFF")
 
 
 def test_raw_rgb_realtime_output_adapter_can_send_jpeg_preview_frames():
@@ -2216,14 +2220,12 @@ def test_raw_rgb_realtime_output_adapter_can_send_jpeg_preview_frames():
 
     payloads, stats = asyncio.run(run())
 
-    from msgpack import unpackb
-
-    header = unpackb(payloads[0], raw=False)
+    [(header, frame_payload)] = _unpack_frame_batch_messages(payloads)
     assert header["content_type"] == JPEG_FRAME_CONTENT_TYPE
     assert header["format"] == "jpeg"
     assert header["encoding"] == "jpeg"
     assert header["num_frames"] == 1
     assert header["is_final_frame_batch"] is True
-    assert payloads[1].startswith(b"\xff\xd8")
+    assert frame_payload.startswith(b"\xff\xd8")
     assert stats["num_batches"] == 1
     assert stats["num_frames"] == 1

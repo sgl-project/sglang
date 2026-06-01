@@ -54,6 +54,10 @@ class RealtimeFrameBatchHeader(TypedDict, total=False):
     is_final_frame_batch: bool
 
 
+class RealtimeFrameBatchMessage(RealtimeFrameBatchHeader, total=False):
+    payload: bytes
+
+
 class RealtimeFrameSendStats(TypedDict):
     header_pack_ms: float
     header_write_ms: float
@@ -119,6 +123,7 @@ def _frame_shape_from_metadata(
 
 
 RAW_RGB_FRAMES_PER_WS_MESSAGE = 1
+FRAME_BATCH_PACK_OFFLOAD_BYTES = 64 * 1024
 WEBP_DEFAULT_QUALITY = 90
 JPEG_DEFAULT_QUALITY = 95
 JPEG_SUBSAMPLING = 0
@@ -176,6 +181,18 @@ def _encode_rgb_frame_to_jpeg(
         subsampling=JPEG_SUBSAMPLING,
     )
     return buffer.getvalue()
+
+
+def _pack_frame_batch_message(
+    header: RealtimeFrameBatchHeader,
+    payload: bytes,
+) -> bytes:
+    message: RealtimeFrameBatchMessage = {
+        **header,
+        "type": "frame_batch",
+        "payload": payload,
+    }
+    return packb(message, use_bin_type=True)
 
 
 def _build_transport_payload(
@@ -391,19 +408,25 @@ class RawRGBRealtimeOutputAdapter:
                 header.update(transport_metadata)
                 header.update(transport_payload.metadata)
 
-                header_payload = packb(header, use_bin_type=True)
+                if len(transport_payload.payload) >= FRAME_BATCH_PACK_OFFLOAD_BYTES:
+                    message_payload = await asyncio.to_thread(
+                        _pack_frame_batch_message,
+                        header,
+                        transport_payload.payload,
+                    )
+                else:
+                    message_payload = _pack_frame_batch_message(
+                        header,
+                        transport_payload.payload,
+                    )
                 stats["header_pack_ms"] += timer.mark_ms()
 
-                await ws.send_bytes(header_payload)
                 stats["header_write_ms"] += timer.mark_ms()
-
-                await ws.send_bytes(transport_payload.payload)
+                await ws.send_bytes(message_payload)
                 stats["raw_write_ms"] += timer.mark_ms()
 
                 stats["raw_bytes"] += sum(len(frame) for frame in transport_frames)
-                stats["ws_payload_bytes"] += len(header_payload) + len(
-                    transport_payload.payload
-                )
+                stats["ws_payload_bytes"] += len(message_payload)
                 stats["num_frames"] += len(transport_frames)
                 stats["num_batches"] += 1
                 stats["content_type"] = transport_payload.content_type
