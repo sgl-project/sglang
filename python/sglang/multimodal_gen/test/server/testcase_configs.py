@@ -250,6 +250,7 @@ class DiffusionSamplingParams:
     # /v1/realtime_video/generate and fold streamed chunks back into mp4 bytes.
     realtime_num_chunks: int | None = None
     realtime_events: list[dict[str, Any]] = field(default_factory=list)
+    realtime_perf_thresholds: dict[str, float] = field(default_factory=dict)
 
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.

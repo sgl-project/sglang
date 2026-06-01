@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import statistics
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,31 @@ from sglang.multimodal_gen.test.test_utils import is_image_url
 _REALTIME_WS_TIMEOUT_SECS = float(
     os.environ.get("SGLANG_TEST_REALTIME_WS_TIMEOUT_SECS", "1200")
 )
+
+
+@dataclass(frozen=True)
+class RealtimeChunkStats:
+    chunk_index: int
+    request_id: str | None
+    content_type: str
+    num_frames: int
+    raw_bytes: int
+    ws_payload_bytes: int
+    request_prepare_ms: float
+    scheduler_forward_ms: float
+    raw_payload_build_ms: float
+    raw_write_ms: float
+    ws_write_ms: float
+    chunk_total_ms: float
+
+
+@dataclass(frozen=True)
+class RealtimeCollectionResult:
+    frames: list[np.ndarray]
+    chunk_stats: list[RealtimeChunkStats]
+
+
+_REALTIME_CHUNK_STATS_BY_CASE: dict[str, list[RealtimeChunkStats]] = {}
 
 
 def realtime_ws_url(client: Client) -> str:
@@ -83,6 +110,92 @@ def build_realtime_event_payload(event: dict[str, Any]) -> dict[str, Any]:
     if "kind" not in payload:
         raise ValueError("realtime event config must include kind")
     return payload
+
+
+def parse_realtime_chunk_stats(header: dict[str, Any]) -> RealtimeChunkStats:
+    if header.get("type") != "chunk_stats":
+        raise ValueError(f"Unexpected realtime chunk stats message: {header}")
+    return RealtimeChunkStats(
+        chunk_index=int(header["chunk_index"]),
+        request_id=header.get("request_id"),
+        content_type=str(header.get("content_type", "")),
+        num_frames=int(header.get("num_frames", 0)),
+        raw_bytes=int(header.get("raw_bytes", 0)),
+        ws_payload_bytes=int(header.get("ws_payload_bytes", 0)),
+        request_prepare_ms=float(header.get("request_prepare_ms", 0.0)),
+        scheduler_forward_ms=float(header.get("scheduler_forward_ms", 0.0)),
+        raw_payload_build_ms=float(header.get("raw_payload_build_ms", 0.0)),
+        raw_write_ms=float(header.get("raw_write_ms", 0.0)),
+        ws_write_ms=float(header.get("ws_write_ms", 0.0)),
+        chunk_total_ms=float(header.get("chunk_total_ms", 0.0)),
+    )
+
+
+def summarize_realtime_perf_stats(
+    chunk_stats: list[RealtimeChunkStats],
+) -> dict[str, float]:
+    if not chunk_stats:
+        return {}
+
+    metrics = {
+        "request_prepare_ms": [s.request_prepare_ms for s in chunk_stats],
+        "scheduler_forward_ms": [s.scheduler_forward_ms for s in chunk_stats],
+        "raw_payload_build_ms": [s.raw_payload_build_ms for s in chunk_stats],
+        "raw_write_ms": [s.raw_write_ms for s in chunk_stats],
+        "ws_write_ms": [s.ws_write_ms for s in chunk_stats],
+        "chunk_total_ms": [s.chunk_total_ms for s in chunk_stats],
+        "ws_payload_mb": [s.ws_payload_bytes / (1024 * 1024) for s in chunk_stats],
+    }
+    summary: dict[str, float] = {
+        "num_chunks": float(len(chunk_stats)),
+        "total_frames": float(sum(s.num_frames for s in chunk_stats)),
+    }
+    for name, values in metrics.items():
+        sorted_values = sorted(values)
+        p95_idx = min(len(sorted_values) - 1, int(len(sorted_values) * 0.95))
+        summary[f"avg_{name}"] = statistics.fmean(values)
+        summary[f"p95_{name}"] = sorted_values[p95_idx]
+        summary[f"max_{name}"] = max(values)
+    return summary
+
+
+def validate_realtime_perf_stats(
+    case_id: str,
+    chunk_stats: list[RealtimeChunkStats],
+    thresholds: dict[str, float],
+) -> None:
+    if not thresholds:
+        return
+    summary = summarize_realtime_perf_stats(chunk_stats)
+    if not summary:
+        pytest.fail(f"{case_id}: no realtime chunk stats were received")
+
+    failures = []
+    for metric_name, threshold in thresholds.items():
+        if metric_name not in summary:
+            raise ValueError(
+                f"{case_id}: unknown realtime perf metric {metric_name!r}; "
+                f"available metrics: {sorted(summary)}"
+            )
+        actual = summary[metric_name]
+        if actual > threshold:
+            failures.append(f"{metric_name}: actual={actual:.2f}, limit={threshold:.2f}")
+
+    if failures:
+        pytest.fail(
+            f"Realtime performance guard failed for {case_id}:\n"
+            + "\n".join(f"  - {failure}" for failure in failures)
+        )
+
+
+def record_realtime_perf_stats(
+    case_id: str, chunk_stats: list[RealtimeChunkStats]
+) -> None:
+    _REALTIME_CHUNK_STATS_BY_CASE[case_id] = list(chunk_stats)
+
+
+def pop_realtime_perf_stats(case_id: str) -> list[RealtimeChunkStats]:
+    return _REALTIME_CHUNK_STATS_BY_CASE.pop(case_id, [])
 
 
 def decode_realtime_raw_rgb_frames(
@@ -166,12 +279,31 @@ async def collect_realtime_frames(
     events: list[dict[str, Any]],
     num_chunks: int,
 ) -> list[np.ndarray]:
+    return (
+        await collect_realtime_output(
+            ws_url=ws_url,
+            init_payload=init_payload,
+            events=events,
+            num_chunks=num_chunks,
+        )
+    ).frames
+
+
+async def collect_realtime_output(
+    *,
+    ws_url: str,
+    init_payload: dict[str, Any],
+    events: list[dict[str, Any]],
+    num_chunks: int,
+    require_chunk_stats: bool = False,
+) -> RealtimeCollectionResult:
     try:
         import websockets
     except ImportError:
         pytest.skip("websockets is required for realtime consistency checks")
 
     frames: list[np.ndarray] = []
+    chunk_stats: list[RealtimeChunkStats] = []
     sent_event_indices: set[int] = set()
 
     async def send_events_for_boundary(ws, completed_chunk: int) -> None:
@@ -189,13 +321,18 @@ async def collect_realtime_frames(
 
         received_chunks: set[int] = set()
         previous_frame: bytes | None = None
-        while len(received_chunks) < num_chunks:
+        while len(received_chunks) < num_chunks or (
+            require_chunk_stats and len(chunk_stats) < len(received_chunks)
+        ):
             header_payload = await asyncio.wait_for(
                 ws.recv(), timeout=_REALTIME_WS_TIMEOUT_SECS
             )
             header = unpackb(header_payload, raw=False)
             if header.get("type") == "error":
                 pytest.fail(f"Realtime generation failed: {header.get('content')}")
+            if header.get("type") == "chunk_stats":
+                chunk_stats.append(parse_realtime_chunk_stats(header))
+                continue
             if header.get("type") != "frame_batch_header":
                 raise ValueError(f"Unexpected realtime message: {header}")
 
@@ -218,4 +355,4 @@ async def collect_realtime_frames(
                 received_chunks.add(chunk_index)
                 await send_events_for_boundary(ws, chunk_index)
 
-    return frames
+    return RealtimeCollectionResult(frames=frames, chunk_stats=chunk_stats)

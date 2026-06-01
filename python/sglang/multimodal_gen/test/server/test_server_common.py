@@ -23,6 +23,10 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
+from sglang.multimodal_gen.test.server.realtime_consistency import (
+    pop_realtime_perf_stats,
+    validate_realtime_perf_stats,
+)
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -1201,11 +1205,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         )
 
         # Single generation - output is reused for both validations
+        is_realtime_case = case.sampling_params.realtime_num_chunks is not None
         perf_record, content = self.run_and_collect(
             diffusion_server,
             case.id,
             generate_fn,
-            collect_perf=not is_gt_gen_mode,
+            collect_perf=not is_gt_gen_mode and not is_realtime_case,
         )
 
         if is_gt_gen_mode:
@@ -1223,10 +1228,20 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     raise
                 failures.append((name, str(exc)))
 
-        run_case_check(
-            "performance",
-            lambda: self._validate_and_record(case, perf_record),
-        )
+        if is_realtime_case:
+            run_case_check(
+                "performance",
+                lambda: validate_realtime_perf_stats(
+                    case.id,
+                    pop_realtime_perf_stats(case.id),
+                    case.sampling_params.realtime_perf_thresholds,
+                ),
+            )
+        else:
+            run_case_check(
+                "performance",
+                lambda: self._validate_and_record(case, perf_record),
+            )
 
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (

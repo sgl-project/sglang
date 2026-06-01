@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+import sys
 from types import SimpleNamespace
 
+from msgpack import packb, unpackb
 import numpy as np
 import pytest
 
@@ -14,9 +17,13 @@ from sglang.multimodal_gen.runtime.utils.realtime_video import (
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     build_realtime_event_payload,
     build_realtime_init_payload,
+    collect_realtime_output,
     decode_realtime_raw_rgb_frames,
+    parse_realtime_chunk_stats,
     prepare_realtime_first_frame,
     realtime_ws_url,
+    summarize_realtime_perf_stats,
+    validate_realtime_perf_stats,
 )
 from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -184,6 +191,170 @@ def test_decode_realtime_rgba_delta_gzip_strips_alpha():
     assert len(frames) == 2
     np.testing.assert_array_equal(frames[0], first[:, :, :3])
     np.testing.assert_array_equal(frames[1], second[:, :, :3])
+
+
+# Stream collection and realtime performance stats
+
+
+class _FakeRealtimeWebSocket:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def send(self, payload):
+        self.sent.append(unpackb(payload, raw=False))
+
+    async def recv(self):
+        if not self.messages:
+            raise AssertionError("fake websocket received too many recv calls")
+        return self.messages.pop(0)
+
+
+def _packed_realtime_frame_message(chunk_index: int, frame: np.ndarray):
+    header = {
+        "type": "frame_batch_header",
+        "content_type": RAW_RGB_CONTENT_TYPE,
+        "chunk_index": chunk_index,
+        "is_final_frame_batch": True,
+        "num_frames": 1,
+        "width": frame.shape[1],
+        "height": frame.shape[0],
+        "channels": frame.shape[2],
+        "bytes_per_frame": frame.nbytes,
+    }
+    return packb(header, use_bin_type=True), frame.tobytes()
+
+
+def _packed_realtime_chunk_stats(chunk_index: int, **overrides):
+    payload = {
+        "type": "chunk_stats",
+        "request_id": f"req-{chunk_index}",
+        "chunk_index": chunk_index,
+        "content_type": RAW_RGB_CONTENT_TYPE,
+        "num_frames": 1,
+        "raw_bytes": 12,
+        "ws_payload_bytes": 128,
+        "request_prepare_ms": 1.0,
+        "scheduler_forward_ms": 20.0,
+        "raw_payload_build_ms": 2.0,
+        "raw_write_ms": 3.0,
+        "ws_write_ms": 4.0,
+        "chunk_total_ms": 30.0,
+    }
+    payload.update(overrides)
+    return packb(payload, use_bin_type=True)
+
+
+def test_collect_realtime_output_skips_and_records_chunk_stats(monkeypatch):
+    first = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+    second = first + 1
+    chunk0_header, chunk0_payload = _packed_realtime_frame_message(0, first)
+    chunk1_header, chunk1_payload = _packed_realtime_frame_message(1, second)
+    websocket = _FakeRealtimeWebSocket(
+        [
+            chunk0_header,
+            chunk0_payload,
+            _packed_realtime_chunk_stats(0, chunk_total_ms=31.0),
+            chunk1_header,
+            chunk1_payload,
+            _packed_realtime_chunk_stats(1, chunk_total_ms=32.0),
+        ]
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "websockets",
+        SimpleNamespace(connect=lambda *args, **kwargs: websocket),
+    )
+
+    result = asyncio.run(
+        collect_realtime_output(
+            ws_url="ws://example.test/v1/realtime_video/generate",
+            init_payload={"type": "init", "prompt": "test"},
+            events=[
+                {
+                    "after_chunk": 0,
+                    "kind": "camera_actions",
+                    "payload": [["w"]],
+                }
+            ],
+            num_chunks=2,
+            require_chunk_stats=True,
+        )
+    )
+
+    assert len(result.frames) == 2
+    np.testing.assert_array_equal(result.frames[0], first)
+    np.testing.assert_array_equal(result.frames[1], second)
+    assert [stat.chunk_index for stat in result.chunk_stats] == [0, 1]
+    assert [stat.chunk_total_ms for stat in result.chunk_stats] == [31.0, 32.0]
+    assert websocket.sent == [
+        {"type": "init", "prompt": "test"},
+        {
+            "type": "event",
+            "kind": "camera_actions",
+            "payload": [["w"]],
+        },
+    ]
+
+
+def test_realtime_perf_stats_summary_and_thresholds():
+    stats = [
+        parse_realtime_chunk_stats(
+            unpackb(
+                _packed_realtime_chunk_stats(
+                    0,
+                    scheduler_forward_ms=10.0,
+                    raw_write_ms=2.0,
+                    ws_write_ms=3.0,
+                    ws_payload_bytes=1024 * 1024,
+                    chunk_total_ms=20.0,
+                ),
+                raw=False,
+            )
+        ),
+        parse_realtime_chunk_stats(
+            unpackb(
+                _packed_realtime_chunk_stats(
+                    1,
+                    scheduler_forward_ms=30.0,
+                    raw_write_ms=4.0,
+                    ws_write_ms=5.0,
+                    ws_payload_bytes=2 * 1024 * 1024,
+                    chunk_total_ms=40.0,
+                ),
+                raw=False,
+            )
+        ),
+    ]
+
+    summary = summarize_realtime_perf_stats(stats)
+
+    assert summary["num_chunks"] == 2
+    assert summary["total_frames"] == 2
+    assert summary["avg_scheduler_forward_ms"] == 20.0
+    assert summary["p95_chunk_total_ms"] == 40.0
+    assert summary["avg_ws_payload_mb"] == 1.5
+    validate_realtime_perf_stats(
+        "case",
+        stats,
+        {
+            "avg_scheduler_forward_ms": 25.0,
+            "p95_chunk_total_ms": 45.0,
+            "avg_ws_payload_mb": 2.0,
+        },
+    )
+    with pytest.raises(pytest.fail.Exception, match="p95_chunk_total_ms"):
+        validate_realtime_perf_stats(
+            "case",
+            stats,
+            {"p95_chunk_total_ms": 35.0},
+        )
 
 
 # Generate function routing
