@@ -67,6 +67,9 @@ class ScriptedContext:
     def abort_all(self) -> None:
         return lifecycle.abort_all(self)
 
+    def abort_req(self, rid: str) -> None:
+        return lifecycle.abort_req(self, rid=rid)
+
     def flush_cache(self) -> None:
         return lifecycle.flush_cache(self)
 
