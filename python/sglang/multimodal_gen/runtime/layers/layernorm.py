@@ -434,6 +434,40 @@ def _ensure_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]
     return tensor.contiguous() if tensor is not None else None
 
 
+def _fuse_scale_shift_native(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    """Pure PyTorch scale/shift used by HIP fallbacks."""
+    if scale.dim() == 4:
+        # [B, F, 1, C] -> [B, L, C]
+        batch_size, seq_len, hidden_size = x.shape
+        num_frames = scale.shape[1]
+        frame_seqlen = seq_len // num_frames
+        scale = (
+            scale.squeeze(2)
+            .unsqueeze(2)
+            .expand(batch_size, num_frames, frame_seqlen, hidden_size)
+            .reshape(batch_size, seq_len, hidden_size)
+        )
+    elif scale.dim() == 2:
+        scale = scale.unsqueeze(1)
+
+    if shift.dim() == 4:
+        batch_size, seq_len, hidden_size = x.shape
+        num_frames = shift.shape[1]
+        frame_seqlen = seq_len // num_frames
+        shift = (
+            shift.squeeze(2)
+            .unsqueeze(2)
+            .expand(batch_size, num_frames, frame_seqlen, hidden_size)
+            .reshape(batch_size, seq_len, hidden_size)
+        )
+    elif shift.dim() == 2:
+        shift = shift.unsqueeze(1)
+
+    return x * (1 + scale) + shift
+
+
 class _ScaleResidualNormScaleShift(CustomOp):
     """
     Fused kernel that combines:
@@ -506,10 +540,32 @@ class _ScaleResidualNormScaleShift(CustomOp):
             self.eps,
         )
 
-    def forward_hip(self, *args, **kwargs):
-        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_hip(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Keep HIP on a pure PyTorch path; avoid compiled/fused scale-shift.
+        if isinstance(gate, int):
+            assert gate == 1
+            residual_output = residual + x
+        elif isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_output = residual + (
+                    x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                ).flatten(1, 2)
+            else:
+                residual_output = residual + x * gate
+        else:
+            raise ValueError(f"Gate type {type(gate)} not supported")
+        normalized = self.norm(residual_output)
+        modulated = _fuse_scale_shift_native(normalized, scale, shift)
+        return modulated.to(x.dtype), residual_output
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
@@ -648,10 +704,13 @@ class _NormScaleShift(CustomOp):
             self.eps,
         )
 
-    def forward_hip(self, *args, **kwargs):
-        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_hip(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        # Keep HIP on a pure PyTorch path; avoid compiled/fused scale-shift.
+        normalized = self.norm(x)
+        modulated = _fuse_scale_shift_native(normalized, scale, shift)
+        return modulated.to(x.dtype)
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
