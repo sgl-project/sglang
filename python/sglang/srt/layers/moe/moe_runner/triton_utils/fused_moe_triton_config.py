@@ -30,10 +30,7 @@ def _get_cuda_shared_memory_per_block_optin() -> Optional[int]:
 
 def _use_low_smem_fp8_default() -> bool:
     smem_limit = _get_cuda_shared_memory_per_block_optin()
-    return (
-        smem_limit is not None
-        and smem_limit < _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES
-    )
+    return smem_limit is not None and smem_limit < _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES
 
 
 def get_config_file_name(
