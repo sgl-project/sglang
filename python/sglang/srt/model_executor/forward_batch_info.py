@@ -993,9 +993,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # make sure that each rank has the same number of tokens to do collective communication and
         # we can divide the tokens into 2 * CP chunks for load balance.
+        # Only pad to 2*CP when CP is enabled; with CP off the extra even-length
+        # padding breaks EAGLE/MTP draft prefill (NaN draft logits, see #23269).
         attn_cp_size = get_attention_cp_size()
-        for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size * 2)
+        if attn_cp_size > 1:
+            for i in range(sync_group_size):
+                global_num_tokens[i] = ceil_align(
+                    global_num_tokens[i], attn_cp_size * 2
+                )
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
