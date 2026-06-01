@@ -35,6 +35,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
+    get_model_task_type_for_server_args,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -1085,19 +1086,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert (
             model["num_gpus"] == case.server_args.num_gpus
         ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
-        # Verify task_type is consistent with the modality specified in the test config.
-        # We can't access pipeline_config from test config, but we can validate against modality.
-        modality_to_valid_task_types = {
-            "image": {"T2I", "I2I", "TI2I"},
-            "video": {"T2V", "I2V", "TI2V"},
-            "3d": {"I2M"},
-        }
-        valid_task_types = modality_to_valid_task_types.get(
-            case.server_args.modality, set()
-        )
-        assert model["task_type"] in valid_task_types, (
-            f"task_type '{model['task_type']}' not valid for modality "
-            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        expected_task_type = get_model_task_type_for_server_args(case.server_args).name
+        assert model["task_type"] == expected_task_type, (
+            f"task_type mismatch: expected {expected_task_type}, "
+            f"got {model['task_type']}"
         )
         logger.info(
             "[Models API] GET /v1/models returned valid response with extended fields"
@@ -1118,9 +1110,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         # Verify extended fields on single model endpoint too
         assert "num_gpus" in single_model, "Single model missing 'num_gpus' field"
         assert "task_type" in single_model, "Single model missing 'task_type' field"
-        assert single_model["task_type"] in valid_task_types, (
-            f"Single model task_type '{single_model['task_type']}' not valid for modality "
-            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        assert single_model["task_type"] == expected_task_type, (
+            f"Single model task_type mismatch: expected {expected_task_type}, "
+            f"got {single_model['task_type']}"
         )
         logger.info(
             "[Models API] GET /v1/models/{model_path} returned valid response with extended fields"

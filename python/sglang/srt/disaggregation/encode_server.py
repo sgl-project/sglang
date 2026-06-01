@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import ctypes
+import functools
 import logging
 import multiprocessing as mp
 import os
@@ -278,6 +279,11 @@ class MMEncoder:
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        # Dedicated executor for image preprocessing (resize/normalize).
+        # Separate from self.executor (ZMQ sends) to avoid contention under high concurrency.
+        self.preproc_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
+        )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
@@ -1358,7 +1364,10 @@ class MMEncoder:
         image_config = self.vision_config.get("image", {})
         if self.model_type in ["kimi_k25", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
-        return self.image_processor(images=images, **image_config)
+        return await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(self.image_processor, images=images, **image_config),
+        )
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
@@ -1367,7 +1376,12 @@ class MMEncoder:
             raise ValueError("No video processor available")
 
         videos, video_processor_kwargs = await self._flatten_and_load_videos(mm_items)
-        processor_input = self.video_processor(videos=videos, **video_processor_kwargs)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.video_processor, videos=videos, **video_processor_kwargs
+            ),
+        )
 
         # Get additional video metadata
         if (
@@ -1430,7 +1444,12 @@ class MMEncoder:
             raise ValueError("No audio processor available")
 
         audio_config = self.vision_config.get("audio", {})
-        processor_input = self.audio_processor.feature_extractor(audios, **audio_config)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.audio_processor.feature_extractor, audios, **audio_config
+            ),
+        )
         processor_input["feature_attention_mask"] = processor_input.pop(
             "attention_mask"
         )
