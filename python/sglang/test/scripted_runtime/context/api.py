@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Dict, Literal, Optional
 
 from sglang.test.scripted_runtime.context import (
     lifecycle,
-    pool,
     queries,
     radix,
 )
@@ -85,11 +84,3 @@ class ScriptedContext:
 
     def is_chunking(self, rid: str) -> bool:
         return queries.is_chunking(self, rid)
-
-    def full_attention_available_size(self) -> int:
-        return pool.full_attention_available_size(self)
-
-    def reserve_full_attention_kv(
-        self, num_tokens: int
-    ) -> "pool.FullAttentionKvReservation":
-        return pool.reserve_full_attention_kv(self, num_tokens)
