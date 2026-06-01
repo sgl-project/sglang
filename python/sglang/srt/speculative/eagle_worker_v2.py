@@ -188,6 +188,19 @@ class EagleDraftWorker(BaseDraftWorker):
         self.init_token_map()
         self.init_lm_head()
 
+        # Pre-allocate constant buffers for topk=1 fast path (chain topology).
+        # Must be before init_cuda_graphs() since capture calls draft_forward().
+        self._topk1_parent_proto = None
+        self._topk1_score_idx_proto = None
+        if self.topk == 1:
+            n_extra = self.speculative_num_draft_tokens - 1
+            max_bs = max(1, server_args.cuda_graph_max_bs or 1)
+            # Chain topology: parent_list = [-1, 0, 1, 2, ...], top_scores_index = [0, 1, 2, ...]
+            parents = torch.arange(-1, n_extra - 1, dtype=torch.long).repeat(max_bs, 1)
+            indices = torch.arange(n_extra, dtype=torch.long).repeat(max_bs, 1)
+            self._topk1_parent_proto = parents.to(self.device)
+            self._topk1_score_idx_proto = indices.to(self.device)
+
         # Init attention backend and cuda graphs
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_tp_context = (
@@ -206,18 +219,6 @@ class EagleDraftWorker(BaseDraftWorker):
             self.init_cuda_graphs()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
-
-        # Pre-allocate constant buffers for topk=1 fast path (chain topology)
-        self._topk1_parent_proto = None
-        self._topk1_score_idx_proto = None
-        if self.topk == 1:
-            n_extra = self.speculative_num_draft_tokens - 1
-            max_bs = max(1, server_args.cuda_graph_max_bs or 1)
-            # Chain topology: parent_list = [-1, 0, 1, 2, ...], top_scores_index = [0, 1, 2, ...]
-            parents = torch.arange(-1, n_extra - 1, dtype=torch.long).repeat(max_bs, 1)
-            indices = torch.arange(n_extra, dtype=torch.long).repeat(max_bs, 1)
-            self._topk1_parent_proto = parents.to(self.device)
-            self._topk1_score_idx_proto = indices.to(self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
