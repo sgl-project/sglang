@@ -50,6 +50,14 @@ __global__ void build_tree_efficient(
   if (tid >= draft_token_num) {
     return;
   }
+
+  // Initialize retrieve buffers in-kernel (fused from host-side torch.full(..., -1))
+  int base = bid * draft_token_num + tid;
+  retrive_index[base] = -1;
+  retrive_next_token[base] = -1;
+  retrive_next_sibling[base] = -1;
+  __syncthreads();
+
   int seq_tree_idx = draft_token_num * draft_token_num * bid;
   for (int i = 0; i < bid; i++) {
     seq_tree_idx += verified_seq_len[i] * draft_token_num;
@@ -149,6 +157,14 @@ __global__ void build_tree_efficient_partial_packed(
   if (tid >= draft_token_num) {
     return;
   }
+
+  // Initialize retrieve buffers in-kernel (fused from host-side torch.full(..., -1))
+  int base = bid * draft_token_num + tid;
+  retrive_index[base] = -1;
+  retrive_next_token[base] = -1;
+  retrive_next_sibling[base] = -1;
+  __syncthreads();
+
   int seq_len = verified_seq_len[bid];
   int token_tree_idx = (bid * draft_token_num + tid) * num_bytes_per_item;
   tree_mask[token_tree_idx] = 1;  // little endian
