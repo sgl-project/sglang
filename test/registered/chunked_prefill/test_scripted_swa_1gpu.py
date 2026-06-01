@@ -86,25 +86,32 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
                 break
             yield
 
-        # Feed chunked candidates until one is parked by the add_chunked_req
-        # hybrid-SWA early-return.
+        # Feed chunked candidates until any one is parked by the add_chunked_req
+        # hybrid-SWA early-return. Which candidate gets parked depends on the exact
+        # churn, and a park can land on an earlier candidate after we have moved on
+        # to feeding the next one -- the batch log is not cleared mid-script -- so
+        # check chunked_parks across every candidate fed so far, not just the latest.
+        candidates = []
         parked = False
         for _ in range(_N_CANDIDATES):
-            r = t.start_req(
-                prompt_len=_CHUNKED_PROMPT,
-                max_new_tokens=_CHUNKED_MAX_NEW,
-                prompt_token=2,
+            candidates.append(
+                t.start_req(
+                    prompt_len=_CHUNKED_PROMPT,
+                    max_new_tokens=_CHUNKED_MAX_NEW,
+                    prompt_token=2,
+                )
             )
             for _ in range(_STEPS_PER_CANDIDATE):
-                if t.chunked_parks(r.rid) > 0:
+                if any(t.chunked_parks(c.rid) > 0 for c in candidates):
                     parked = True
                     break
-                if r.finished:
+                if candidates[-1].finished:
                     break
                 yield
             if parked:
                 break
 
+        parked = parked or any(t.chunked_parks(c.rid) > 0 for c in candidates)
         assert parked, (
             "no chunked candidate was ever parked by add_chunked_req's hybrid-SWA "
             "early-return; the test never exercised the stash gate"
