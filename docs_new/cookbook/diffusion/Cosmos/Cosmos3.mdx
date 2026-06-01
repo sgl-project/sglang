@@ -88,11 +88,10 @@ curl -sS -X POST http://127.0.0.1:30010/v1/images/generations \
 
 ### Text to video
 
-Use `/v1/videos/sync` to block until the MP4 is ready, or `/v1/videos` for the asynchronous job API.
+Use `/v1/videos` to create an asynchronous job, then poll the job and download the completed MP4.
 
 ```bash Command
-curl -sS -X POST http://127.0.0.1:30010/v1/videos/sync \
-  -H "Accept: video/mp4" \
+job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
   --form-string "prompt=A small warehouse robot moves a blue box across a clean floor." \
   --form-string "negative_prompt=blurry, distorted, low quality" \
   --form-string "size=1280x720" \
@@ -103,6 +102,17 @@ curl -sS -X POST http://127.0.0.1:30010/v1/videos/sync \
   --form-string "flow_shift=10.0" \
   --form-string "seed=42" \
   --form-string 'extra_params={"guardrails":true,"use_resolution_template":false,"use_duration_template":false}' \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+
+while true; do
+  status=$(curl -sS "http://127.0.0.1:30010/v1/videos/${job_id}" \
+    | python -c 'import json, sys; print(json.load(sys.stdin)["status"])')
+  [ "$status" = "completed" ] && break
+  [ "$status" = "failed" ] && exit 1
+  sleep 1
+done
+
+curl -sS -L "http://127.0.0.1:30010/v1/videos/${job_id}/content" \
   -o cosmos3_t2v.mp4
 ```
 
@@ -112,6 +122,7 @@ This mirrors the official `nvidia/Cosmos3-Nano` Hugging Face image-to-video exam
 
 ```python Python
 import json
+import time
 from pathlib import Path
 
 import requests
@@ -148,12 +159,23 @@ data = {
 
 with (asset_dir / "example_i2v_input.jpg").open("rb") as image:
     response = requests.post(
-        f"{base_url}/v1/videos/sync",
+        f"{base_url}/v1/videos",
         data=data,
         files={"input_reference": ("example_i2v_input.jpg", image, "image/jpeg")},
-        headers={"Accept": "video/mp4"},
-        timeout=600,
+        timeout=60,
     )
+response.raise_for_status()
+video_id = response.json()["id"]
+
+while True:
+    job = requests.get(f"{base_url}/v1/videos/{video_id}", timeout=30).json()
+    if job["status"] == "completed":
+        break
+    if job["status"] == "failed":
+        raise RuntimeError(job.get("error") or "Video generation failed")
+    time.sleep(1)
+
+response = requests.get(f"{base_url}/v1/videos/{video_id}/content", timeout=300)
 response.raise_for_status()
 Path("cosmos3_i2v.mp4").write_bytes(response.content)
 ```
