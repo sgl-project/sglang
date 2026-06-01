@@ -172,7 +172,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if get_global_server_args().enable_mamba_extra_buffer():
             batch.mamba_track_indices = torch.tensor(
                 [
-                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                    req.mamba_track_slot[0] if req.mamba_track_slot is not None else 0
                     for req in batch.reqs
                 ],
                 dtype=torch.int64,

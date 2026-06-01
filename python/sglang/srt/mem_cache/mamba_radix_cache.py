@@ -558,21 +558,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
             if self.enable_mamba_extra_buffer:
-                mamba_ping_pong_track_buffer_to_keep = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
-                )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[
-                        mamba_ping_pong_track_buffer_to_keep
-                    ]
-                    .unsqueeze(-1)
-                    .clone()
-                )
+                if req.mamba_track_slot is not None:
+                    mamba_value = req.mamba_track_slot.clone()
+                else:
+                    mamba_value = req.mamba_pool_idx.unsqueeze(0).clone()
             else:
                 mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
-                mamba_ping_pong_track_buffer_to_keep = None
 
             result = self.insert(
                 InsertParams(
@@ -587,15 +578,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
 
-        if mamba_exist:
-            mamba_ping_pong_track_buffer_to_keep = None
+        donated_to_tree = self.enable_mamba_extra_buffer and not mamba_exist
+        free_mamba = self.enable_mamba_extra_buffer or mamba_exist
 
-        free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
-
-        if free_mamba_cache:
+        if free_mamba:
             self.req_to_token_pool.free_mamba_cache(
-                req,
-                mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
+                req, donated_to_tree=donated_to_tree
             )
 
         self.dec_lock_ref(req.last_node)
@@ -641,26 +629,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
-        # Donate the mamba index to the radix cache instead of copying.
-        # This avoids a data copy that would race with the forward stream.
         if self.enable_mamba_extra_buffer:
-            mamba_ping_pong_track_buffer_to_keep = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            )
-            mamba_value_donated = (
-                req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
-                .unsqueeze(-1)
-                .clone()
-            )
-            new_slot = self._alloc_mamba_slot()
-            req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep] = (
-                new_slot[0]
-            )
-            self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                req.req_pool_idx
-            ] = req.mamba_ping_pong_track_buffer
+            if req.mamba_track_slot is not None:
+                mamba_value_donated = req.mamba_track_slot.clone()
+            else:
+                mamba_value_donated = req.mamba_pool_idx.unsqueeze(0).clone()
         else:
             mamba_value_donated = self._alloc_mamba_slot()
             self.req_to_token_pool.mamba_pool.copy_from(
@@ -677,8 +650,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
-        if mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_donated)
+        if self.enable_mamba_extra_buffer:
+            if mamba_exist and req.mamba_track_slot is not None:
+                self.req_to_token_pool.mamba_pool.free(req.mamba_track_slot)
+            req.mamba_track_slot = None
+        else:
+            if mamba_exist:
+                self.req_to_token_pool.mamba_pool.free(mamba_value_donated)
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(

@@ -75,6 +75,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -757,8 +758,7 @@ class Req(ReqDllmMixin):
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
-        self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
-        self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
+        self.mamba_track_slot: Optional[torch.Tensor] = None  # shape (1,), lazily allocated
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
@@ -1321,8 +1321,7 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
-        self.mamba_ping_pong_track_buffer = None
-        self.mamba_next_track_idx = None
+        self.mamba_track_slot = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
@@ -1446,23 +1445,14 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
 
 
 def set_mamba_track_indices_from_reqs(batch):
-    """Build mamba_track_indices from req objects (authoritative source)."""
-    req_to_token_pool = batch.req_to_token_pool
-    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
-    ]  # (bs, ping_pong_size), int64, on device
-    idx = (
-        torch.tensor(
-            [req.mamba_next_track_idx for req in batch.reqs],
-            dtype=torch.int64,
-            pin_memory=True,
-        )
-        .unsqueeze(1)
-        .to(device=all_buffers.device, non_blocking=True)
-    )
-    batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
-    )
+    """Build mamba_track_indices from lazily-allocated tracking slots."""
+    slots = []
+    for req in batch.reqs:
+        if req.mamba_track_slot is not None:
+            slots.append(req.mamba_track_slot)
+        else:
+            slots.append(torch.zeros(1, dtype=torch.int64, device=batch.device))
+    batch.mamba_track_indices = torch.cat(slots).to(torch.int64)
 
 
 @dataclasses.dataclass
@@ -2106,10 +2096,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def _alloc_mamba_track_slot(self) -> torch.Tensor:
+        """Allocate one mamba pool slot for tracking, evicting tree nodes if needed."""
+        slot = self.req_to_token_pool.mamba_pool.alloc(1)
+        if slot is None and self.tree_cache is not None and self.tree_cache.supports_mamba():
+            self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = self.req_to_token_pool.mamba_pool.alloc(1)
+        assert slot is not None, (
+            "Cannot allocate mamba tracking slot even after eviction. "
+            "Try increasing --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
+        return slot
+
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,
     ) -> "_MambaRadixCacheV2TrackEntry":
+        # Skip mamba state tracking during middle chunks of chunked prefill.
+        # Eliminates per-chunk radix tree inserts, mamba slot allocations,
+        # and GPU state copies. The full prefix + final mamba state is inserted
+        # after the last chunk (when inflight_middle_chunks == 0).
+        if req.inflight_middle_chunks > 0:
+            return _MambaRadixCacheV2TrackEntry(
+                track_mask=False,
+                track_index=0,
+                track_seqlen=-1,
+            )
+
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         def _force_track_h(i: int) -> int:
@@ -2124,7 +2137,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return i + 1
 
         mask = req.extend_input_len >= mamba_cache_chunk_size
-        track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+        if mask:
+            slot = self._alloc_mamba_track_slot()
+            req.mamba_track_slot = slot
+            track_index = slot[0].item()
+        else:
+            track_index = 0
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -2154,15 +2172,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 * mamba_cache_chunk_size
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
-                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            req.mamba_next_track_idx = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            )
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -2500,15 +2511,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
+                self.mamba_track_mask = torch.empty(
+                    (0,), dtype=torch.bool, device=self.device
+                )
             else:
+                mamba_track_interval = get_global_server_args().mamba_track_interval
+                for i, req in enumerate(self.reqs):
+                    if self.seq_lens_cpu[i] % mamba_track_interval == 0:
+                        if req.mamba_track_slot is None:
+                            req.mamba_track_slot = self._alloc_mamba_track_slot()
                 set_mamba_track_indices_from_reqs(self)
 
-            # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
-            )
+                # async H2D
+                self.mamba_track_mask = (
+                    (self.seq_lens_cpu % mamba_track_interval == 0)
+                    .pin_memory()
+                    .to(device=self.device, non_blocking=True)
+                )
 
     def filter_batch(
         self,

@@ -1186,11 +1186,9 @@ class ServerArgs:
         if envs.SGLANG_USE_MODELSCOPE.get():
             self._handle_modelscope_paths()
 
-        # Mamba scheduler strategy
-        if self.mamba_scheduler_strategy == "auto":
-            # TODO: when extra_buffer is more verified, we can set the default path based on
-            #       [overlap, non-overlap]
-            self.mamba_scheduler_strategy = "no_buffer"
+        # Mamba scheduler strategy: resolved per-model in _handle_mamba_radix_cache()
+        # based on model capabilities and device support. For non-mamba models,
+        # "auto" stays unresolved (enable_mamba_extra_buffer() returns False for "auto").
 
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
@@ -2608,6 +2606,20 @@ class ServerArgs:
             assert (
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
+
+        if self.mamba_scheduler_strategy == "auto":
+            if (
+                support_mamba_cache_extra_buffer
+                and not self.disable_radix_cache
+                and (is_cuda() or is_musa() or is_npu())
+            ):
+                self.mamba_scheduler_strategy = "extra_buffer"
+                logger.info(
+                    f"Auto-selected extra_buffer mamba scheduler strategy for {model_arch} "
+                    "to enable overlap scheduling with radix cache."
+                )
+            else:
+                self.mamba_scheduler_strategy = "no_buffer"
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:

@@ -20,8 +20,7 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
-# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 1
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
