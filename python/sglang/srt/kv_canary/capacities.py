@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from sglang.srt.model_executor.cuda_graph_config import Phase
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -63,7 +65,8 @@ class CanaryLaunchCapacities:
                 f"kv-canary: pool_slot_count must be positive, got {pool_slot_count}"
             )
 
-        cuda_graph_max_bs = server_args.cuda_graph_max_bs or 0
+        decode_cg_cfg = (server_args.cuda_graph_config or {}).get(Phase.DECODE) or {}
+        cuda_graph_max_bs = decode_cg_cfg.get("max_bs") or 0
         if cuda_graph_max_bs < 0:
             raise ValueError(
                 f"kv-canary: cuda_graph_max_bs must be non-negative, got {cuda_graph_max_bs}"
