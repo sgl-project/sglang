@@ -237,8 +237,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             yield
         assert t.get_all_node_hit_counts(), "expected radix nodes after a finished req"
 
-        t.flush_cache()
-        yield
+        yield from t.flush_cache()
         assert (
             not t.get_all_node_hit_counts()
         ), "flush_cache did not clear the radix tree"
@@ -248,8 +247,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
     @staticmethod
     def _script_hit_counts_increment_on_cache_hit(t: ScriptedContext):
-        t.flush_cache()
-        yield
+        yield from t.flush_cache()
 
         r1 = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r1)
@@ -272,8 +270,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
     @staticmethod
     def _script_lock_refs_held_then_released(t: ScriptedContext):
-        t.flush_cache()
-        yield
+        yield from t.flush_cache()
 
         r = t.start_req(
             prompt_len=_LONG_PROMPT_LEN, max_new_tokens=_DECODE_MAX_NEW_TOKENS
