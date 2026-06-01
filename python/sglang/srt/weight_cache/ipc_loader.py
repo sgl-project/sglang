@@ -183,14 +183,16 @@ class IpcModelLoader(BaseModelLoader):
                     model_config, self.load_config, quant_config,
                 )
 
-        # Build lookup sets of existing parameter/buffer names in the
+        # Build lookup dicts of existing parameter/buffer names in the
         # meta-device model. Post-quantization parameters (e.g. weight_scale
         # from FP8) are created by process_weights_after_loading, which the
         # daemon already ran. These params exist in the daemon's entries but
         # NOT in the meta-device model — we must register them as new attrs.
-        existing_params = set(name for name, _ in model.named_parameters())
-        existing_buffers = set(name for name, _ in model.named_buffers())
-        existing_names = existing_params | existing_buffers
+        # Use dicts (not sets) so we can do O(1) shape/dtype validation
+        # without re-traversing the model tree on every lookup.
+        existing_params = {name: param for name, param in model.named_parameters()}
+        existing_buffers = {name: buf for name, buf in model.named_buffers()}
+        existing_names = set(existing_params) | set(existing_buffers)
 
         imported_refs = []
         imported_count = 0
@@ -209,9 +211,9 @@ class IpcModelLoader(BaseModelLoader):
             if name in existing_names:
                 # Existing parameter/buffer — validate shape/dtype
                 if name in existing_params:
-                    ref_param = dict(model.named_parameters())[name]
+                    ref_param = existing_params[name]
                 else:
-                    ref_param = dict(model.named_buffers())[name]
+                    ref_param = existing_buffers[name]
                 if imported_tensor.shape != ref_param.shape or imported_tensor.dtype != ref_param.dtype:
                     logger.warning(
                         f"[IpcModelLoader] Shape/dtype mismatch for {name}: "
