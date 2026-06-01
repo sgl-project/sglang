@@ -1095,11 +1095,22 @@ class Cosmos3OmniTransformer(CachableDiT):
         # Check if sequence parallelism is enabled
         sequence_shard_enabled = self.sp_size > 1
 
-        # Patchify visual tokens. With Ulysses enabled, shard before proj_in
-        # because the projection is token-local and replicated on every rank.
-        hidden_gen = self.patchify(hidden_states, T, H, W)
+        # Patchify and project to hidden dim
+        hidden_gen, _ = self.proj_in(self.patchify(hidden_states, T, H, W))
         seq_len_orig = hidden_gen.shape[1]
         seq_shard_pad = 0
+
+        # Per-token noisy mask follows the same pad/shard as hidden_gen, so
+        # build it before the SP split.
+        token_noisy_mask: torch.Tensor | None = None
+        if noisy_frame_mask is not None:
+            token_noisy_mask = (
+                noisy_frame_mask[:, 0, :, 0, 0]
+                .unsqueeze(-1)
+                .expand(-1, -1, Hp * Wp)
+                .reshape(batch_size, -1, 1)
+                .to(hidden_gen.dtype)
+            )
 
         # Shard sequence across GPUs if SP enabled
         if sequence_shard_enabled:
@@ -1111,32 +1122,19 @@ class Cosmos3OmniTransformer(CachableDiT):
                     device=hidden_gen.device,
                 )
                 hidden_gen = torch.cat([hidden_gen, pad], dim=1)
+                if token_noisy_mask is not None:
+                    mask_pad = torch.zeros(
+                        (batch_size, seq_shard_pad, 1),
+                        dtype=token_noisy_mask.dtype,
+                        device=token_noisy_mask.device,
+                    )
+                    token_noisy_mask = torch.cat([token_noisy_mask, mask_pad], dim=1)
             local_seq_len = hidden_gen.shape[1] // self.sp_size
             hidden_gen = hidden_gen.view(
                 batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
             )
             hidden_gen = hidden_gen[:, self.sp_rank, :, :]
-
-        hidden_gen, _ = self.proj_in(hidden_gen)
-
-        # Per-token noisy mask follows the same pad/shard as hidden_gen.
-        token_noisy_mask: torch.Tensor | None = None
-        if noisy_frame_mask is not None:
-            token_noisy_mask = (
-                noisy_frame_mask[:, 0, :, 0, 0]
-                .unsqueeze(-1)
-                .expand(-1, -1, Hp * Wp)
-                .reshape(batch_size, -1, 1)
-                .to(hidden_gen.dtype)
-            )
-            if sequence_shard_enabled and seq_shard_pad > 0:
-                mask_pad = torch.zeros(
-                    (batch_size, seq_shard_pad, 1),
-                    dtype=token_noisy_mask.dtype,
-                    device=token_noisy_mask.device,
-                )
-                token_noisy_mask = torch.cat([token_noisy_mask, mask_pad], dim=1)
-            if sequence_shard_enabled:
+            if token_noisy_mask is not None:
                 token_noisy_mask = token_noisy_mask.view(
                     batch_size, self.sp_size, local_seq_len, 1
                 )[:, self.sp_rank, :, :]
