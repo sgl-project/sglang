@@ -47,20 +47,6 @@ class ScriptedBatchRecord:
     chunked_rid: Optional[str]
 
 
-def _forward_mode_str(forward_mode) -> str:
-    if forward_mode is None:
-        return "unknown"
-    if forward_mode.is_idle():
-        return "idle"
-    if forward_mode.is_extend():
-        return "extend"
-    if forward_mode.is_decode():
-        return "decode"
-    if forward_mode.is_mixed():
-        return "mixed"
-    return "unknown"
-
-
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx._scheduler
 
@@ -155,7 +141,11 @@ class ScriptedSchedulerHook:
         self._batch_log.append(
             ScriptedBatchRecord(
                 forward_iter=batch.forward_iter,
-                mode=_forward_mode_str(batch.forward_mode),
+                mode=(
+                    batch.forward_mode.name.lower()
+                    if batch.forward_mode is not None
+                    else "unknown"
+                ),
                 rids=tuple(r.rid for r in batch.reqs),
                 extend_rids=tuple(r.rid for r in batch.reqs if r.is_extend_in_batch),
                 chunked_rid=chunked.rid if chunked is not None else None,
