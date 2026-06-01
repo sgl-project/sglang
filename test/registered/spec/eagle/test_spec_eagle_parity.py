@@ -13,12 +13,15 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
 
 
-class TestEagle3Parity(Eagle3Base, SpecParityKit):
-    """EAGLE3 spec v2 (flashinfer) greedy output == non-spec reference."""
+class TestEagle3Parity(SpecParityKit, Eagle3Base):
+    """EAGLE3 spec v2 (flashinfer) greedy output == non-spec reference.
+
+    SpecParityKit is first so its setUpClass runs the reference server (and tears
+    it down) before the fixture launches the spec server -- sequential, one model
+    at a time.
+    """
 
     disable_overlap = False
-    # Main 0.5 + reference 0.35 (SpecParityKit) = 0.85, both fit on an 80GB GPU.
-    mem_fraction_static = 0.5
 
 
 if __name__ == "__main__":

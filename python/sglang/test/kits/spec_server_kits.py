@@ -14,7 +14,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
-from urllib.parse import urlparse, urlunparse
 
 import numpy as np
 import requests
@@ -24,6 +23,7 @@ from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     popen_launch_server,
     run_logprob_check,
 )
@@ -100,12 +100,24 @@ class SpecCorrectnessKit:
         self.assertNotIn(self.tokenizer.eos_token_id, tokens)
 
 
-class SpecParityKit:
-    """Lossless output parity vs a non-spec reference (launches a 2nd server).
+def _greedy(url, text, max_new_tokens=48):
+    return requests.post(
+        url + "/generate",
+        json={
+            "text": text,
+            "sampling_params": {"temperature": 0, "max_new_tokens": max_new_tokens},
+        },
+    ).json()["text"]
 
-    Heavy: spins a temporary non-spec server. Apply to one representative class,
-    not every config. The host class must keep ``mem_fraction_static`` low enough
-    for the reference server to coexist.
+
+class SpecParityKit:
+    """Lossless output parity vs a non-spec reference.
+
+    Sequential (NOT concurrent): launch a non-spec reference server on the
+    standard port, capture greedy outputs, tear it down, THEN let the fixture
+    launch the spec server. Only one model is resident at a time -- two 8B
+    servers don't fit on one GPU. Mix this kit FIRST in the bases so its
+    setUpClass runs before the fixture's:  ``class T(SpecParityKit, Eagle3Base)``.
     """
 
     parity_prompts = [
@@ -114,55 +126,44 @@ class SpecParityKit:
         "The three primary colors are",
         "def fibonacci(n):",
     ]
-    # Reference server's mem fraction. Must be big enough to hold the target
-    # model + a little KV (0.15 ~ 12GB on an 80GB GPU can't even load an 8B
-    # model). The host class lowers its own mem_fraction_static so the two
-    # coexist on one (large) GPU.
-    parity_ref_mem_fraction = 0.35
 
-    def test_parity_vs_reference(self):
-        """Spec decoding is lossless: greedy output must equal a non-spec
-        reference. Launch a temporary non-spec server (same target model),
-        compare greedy outputs, then tear it down.
-        """
-        parsed = urlparse(self.base_url)
-        ref_port = parsed.port + 137
-        ref_url = urlunparse(parsed._replace(netloc=f"{parsed.hostname}:{ref_port}"))
+    @classmethod
+    def setUpClass(cls):
+        ref_url = DEFAULT_URL_FOR_TEST
         ref_proc = popen_launch_server(
-            self.model,
+            cls.model,
             ref_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--mem-fraction-static",
-                str(self.parity_ref_mem_fraction),
+                "0.8",  # ref alone -> full GPU available
                 "--attention-backend",
-                self.attention_backend,
+                cls.attention_backend,
                 "--page-size",
                 "1",
                 "--dtype",
-                self.dtype,
-                *(["--trust-remote-code"] if self.trust_remote_code else []),
+                cls.dtype,
+                *(["--trust-remote-code"] if cls.trust_remote_code else []),
             ],
         )
         try:
-
-            def gen(url, text):
-                return requests.post(
-                    url + "/generate",
-                    json={
-                        "text": text,
-                        "sampling_params": {"temperature": 0, "max_new_tokens": 48},
-                    },
-                ).json()["text"]
-
-            for prompt in self.parity_prompts:
-                spec_out = gen(self.base_url, prompt)
-                ref_out = gen(ref_url, prompt)
-                self.assertEqual(
-                    spec_out, ref_out, f"spec != ref for prompt {prompt!r}"
-                )
+            cls.parity_ref_outputs = {
+                p: _greedy(ref_url, p) for p in cls.parity_prompts
+            }
         finally:
             kill_process_tree(ref_proc.pid, wait_timeout=60)
+        # Now the spec server (same port; ref is gone).
+        super().setUpClass()
+
+    def test_parity_vs_reference(self):
+        """Spec decode greedy output must equal the non-spec reference."""
+        for prompt in self.parity_prompts:
+            spec_out = _greedy(self.base_url, prompt)
+            self.assertEqual(
+                spec_out,
+                self.parity_ref_outputs[prompt],
+                f"spec != ref for prompt {prompt!r}",
+            )
 
 
 class SpecAccuracyKit:
