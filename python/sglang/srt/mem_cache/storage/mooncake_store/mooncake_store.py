@@ -597,6 +597,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            # Hybrid logical anchors only own allocation indices. Their physical
+            # tensors are registered through register_mem_host_pool_v2().
+            return
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -622,16 +626,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
 
-        # Hybrid pools expose the tensors that Mooncake needs for zero-copy I/O.
-        # The storage backend only depends on this accessor, not concrete fields.
-        buf_list = host_pool.get_hybrid_pool_buffer()
-        for buf in buf_list:
+        # Non-anchor pools are either sidecar-specific pools with their own
+        # accessor, or ordinary KV-like host pools used as SWA side pools.
+        get_buffers = getattr(
+            host_pool,
+            "get_hybrid_pool_buffer",
+            lambda: [getattr(host_pool, "kv_buffer", None)],
+        )
+        for buf in get_buffers():
+            if buf is None:
+                continue
             super().register_buffer(buf)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
             return keys
-        return [f"{ self.extra_backend_tag}_{key}" for key in keys]
+        return [f"{self.extra_backend_tag}_{key}" for key in keys]
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
@@ -639,19 +649,45 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # A logical "page" may map to multiple physical objects in storage.
         # - INDEXER: one key per page
         # - MAMBA  : one temporal key + N conv keys per page
+        # - MHA SWA: K/V keys per page
         # key_multiplier records how many component keys are generated per page.
+        # The suffix order must match host_pool.get_page_buffer_meta(), because
+        # Mooncake batch IO zips generated keys with returned buffer pointers.
+        # Mooncake rejects layer_first for the anchor pool, so v2 sidecar keys
+        # are generated for page-packed layouts only.
         name = transfer.name
-        suffixes = []
+        host_pool = getattr(self, "registered_pools", {}).get(name)
+
         if name == PoolName.INDEXER:
             suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
         elif name == PoolName.MAMBA:
-            pools = getattr(self, "registered_pools", {})
-            mamba_pool = pools.get(PoolName.MAMBA)
-            conv_num = len(getattr(mamba_pool, "conv_buffer", None) or [])
+            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
             base_suffix = f"_{self.mha_suffix}"
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name == PoolName.SWA:
+            if self.is_mla_backend or not hasattr(host_pool, "v_buffer"):
+                # MLA and packed SWA side pools expose one object per page.
+                suffixes = [f"_{self.mla_suffix}_{name}"]
+            else:
+                # Ordinary MHA SWA exposes K/V objects, matching the anchor KV format.
+                base_suffix = f"_{self.mha_suffix}_{name}"
+                suffixes = [f"{base_suffix}_k", f"{base_suffix}_v"]
+        elif name in {
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        }:
+            # DeepSeek V4 compressed/state side pools expose one packed object
+            # per page for Mooncake-supported layouts.
+            suffixes = [f"_{self.mla_suffix}_{name}"]
+        else:
+            raise ValueError(f"Unsupported Mooncake hybrid pool: {name}")
+
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
@@ -665,7 +701,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
         qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(qkeys, extra_info)
+        if self.mem_pool_host.kv_buffer is None:
+            # Logical anchor: no physical KV object exists in Mooncake, so the
+            # usable prefix is determined entirely by required sidecar objects.
+            kv_pages = len(keys)
+        else:
+            kv_pages = self.batch_exists(qkeys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -840,6 +881,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.mem_pool_host.kv_buffer is None:
+            # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
+            return [True] * len(keys)
+
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
@@ -865,6 +910,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.mem_pool_host.kv_buffer is None:
+            # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
+            return [True] * len(keys)
+
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
