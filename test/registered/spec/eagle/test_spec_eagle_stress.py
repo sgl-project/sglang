@@ -20,7 +20,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestEagle3Perf(Eagle3Base, SpecPerfKit):
@@ -38,6 +38,20 @@ class TestEagleLlama2Retract(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
         (envs.SGLANG_ENABLE_SPEC_V2, False),
         (envs.SGLANG_TEST_RETRACT, True),
     )
+
+
+class TestEagle3Topk16V2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
+    """EAGLE3 topk=16 tree on spec v2 under retract; must not leak KV. Stresses
+    the accepted-path KV move (move_accepted_tokens_to_target_kvcache)."""
+
+    spec_topk = 16
+    spec_tokens = 64
+    disable_overlap = False
+    cuda_graph_max_bs = 5
+    max_running_requests = 64
+    gsm8k_accept_len_thres = 2.4
+    extra_args = ("--max-total-tokens", 4500)  # small KV to trigger retract
+    env_overrides = ((envs.SGLANG_TEST_RETRACT, True),)
 
 
 class TestEagleLlama2AbortAll(EagleLlama2Base, AbortAllMixin):
