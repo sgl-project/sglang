@@ -491,15 +491,29 @@ class TestRadixPriority(ScriptedTestCase):
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
         )
-        saw_skip = False
+
+        # The scheduler does not record which admission branch it took. The
+        # observable consequence of skipping r1's chunked-resume in the priority
+        # calc is that the lower-priority r2 never preempts r1's in-flight chunked
+        # prefill: r1's chunk progress only advances (a preemption/retract would
+        # drop it back to waiting and reset chunks_done), and r1 stays ahead of r2.
+        prev_chunks_done = r1.chunks_done
+        r1_finished_first = False
         while not (r1.finished and r2.finished):
-            path = t.last_admission_path()
-            if path == "priority_skip_chunked_resume":
-                saw_skip = True
+            assert r1.chunks_done >= prev_chunks_done, (
+                f"r1 chunked prefill was preempted by lower-priority r2: "
+                f"chunks_done regressed {prev_chunks_done} -> {r1.chunks_done}"
+            )
+            prev_chunks_done = r1.chunks_done
+            if r1.finished and not r2.finished:
+                r1_finished_first = True
             yield
-        assert (
-            saw_skip
-        ), "expected priority-skip-chunked-resume branch to fire at least once"
+
+        assert r1.finished and r2.finished
+        assert r1_finished_first, (
+            "high-priority r1 must finish its chunked prefill before low-priority "
+            "r2 completes; lower-priority r2 must not jump ahead of r1's resume"
+        )
 
 
 if __name__ == "__main__":
