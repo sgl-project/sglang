@@ -943,6 +943,23 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 residual_input_mode=residual_input_mode,
             )
 
+        if (
+            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
+            and (hidden_states_output_mode == ScatterMode.TP_ATTN_FULL)
+            and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
+            and context.attn_tp_size > 1
+        ):
+            # Used when the dense MLP is tensor-parallelized along the
+            # attention TP group (``moe_dense_tp_size > 1``): hidden states
+            # need an all-reduce inside the attention TP group before the
+            # next layernorm, while staying in TP_ATTN_FULL on both sides.
+            return (
+                CommunicateWithAllReduceAndLayerNormFn._tp_attn_all_reduce_and_layernorm
+            )
+
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
         )
@@ -956,6 +973,25 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _tp_attn_all_reduce_and_layernorm(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+    ):
+        """All-reduce hidden states inside the attention TP group, then layernorm.
+
+        Used when the dense MLP shares the attention TP group
+        (``moe_dense_tp_size > 1``): both hidden states and residual stay in
+        ``TP_ATTN_FULL`` across the boundary.
+        """
+        hidden_states = get_attention_tp_group().all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual

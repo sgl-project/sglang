@@ -492,8 +492,9 @@ class FlashInferWorkspaceManager:
             backend_name = getattr(self.workspace, "backend", "unknown")
             if not self._logged_init:
                 logger.info(
-                    f"FlashInfer AllReduce Fusion enabled: backend={backend_name}, "
-                    f"rank={rank}, world_size={world_size}"
+                    f"FlashInfer AllReduce Fusion enabled and workspace initialized: "
+                    f"backend={backend_name}, rank={rank}, world_size={world_size}, "
+                    f"max_token_num={self.max_token_num}, hidden_dim={self.hidden_dim}"
                 )
                 self._logged_init = True
             else:
@@ -509,6 +510,8 @@ class FlashInferWorkspaceManager:
             )
             self.workspace = None
             self.initialized = False
+            return
+
 
     def is_buffer_size_sufficient(
         self,
