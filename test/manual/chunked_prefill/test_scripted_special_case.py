@@ -279,6 +279,46 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             r.finished
         ), "continue_generation must drive the re-queued req to completion"
 
+    def test_retract_during_gap_inflight_middle_chunks_positive(self):
+        self.server.execute_script(
+            self._script_retract_during_gap_inflight_middle_chunks_positive
+        )
+
+    @staticmethod
+    def _script_retract_during_gap_inflight_middle_chunks_positive(t: ScriptedContext):
+        # Retract-side mirror of test_abort_during_gap_inflight_middle_chunks_positive
+        # (test_scripted_abort.py): drive a chunked req into the parked gap state
+        # (inflight_middle_chunks > 0 but chunked_req slot released, so not
+        # is_chunking), then retract there. Unlike abort, retract must re-queue the
+        # req and resume it to completion, while still releasing KV/row and resetting
+        # inflight_middle_chunks in the same transition.
+        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        yield from run_until(
+            r,
+            lambda h: h.req.inflight_middle_chunks > 0 and not h.is_chunking,
+        )
+        assert r.req.inflight_middle_chunks > 0
+        assert not r.is_chunking
+
+        t.pause_generation(mode="retract")
+        yield
+
+        assert r.kv_pages == 0, (
+            f"retract during gap must release KV; got kv_pages={r.kv_pages}"
+        )
+        assert not r.finished, "retract must re-queue r, not finish or abort it"
+        req = t.find_req_by_rid(r.rid)
+        assert req is not None and req.inflight_middle_chunks == 0, (
+            f"retract must reset inflight_middle_chunks; got "
+            f"{req.inflight_middle_chunks if req is not None else None}"
+        )
+
+        t.continue_generation()
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished, "continue_generation must drive the re-queued req to completion"
+        assert r.kv_pages == 0
+        assert len(r.req.output_ids) == 2
+
     def test_load_inquirer_pending_tokens_dedup_chunked(self):
         self.server.execute_script(
             self._script_load_inquirer_pending_tokens_dedup_chunked
