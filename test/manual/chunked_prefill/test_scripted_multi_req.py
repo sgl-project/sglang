@@ -470,5 +470,59 @@ class TestMultiReqPriority(ScriptedTestCase):
             yield
 
 
+class TestMultiReqMixedChunk(ScriptedTestCase):
+    # enable_mixed_chunk lets a chunked prefill share its forward batch with
+    # running decode. Only then does the scheduler pass
+    # num_mixed_decode_tokens = running_bs into PrefillAdder, which subtracts it
+    # from rem_chunk_tokens (schedule_policy.py:436-437) so each prefill chunk is
+    # smaller than chunked_prefill_size while a decode is co-running.
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        enable_mixed_chunk=True,
+    )
+
+    def test_long_prefill_chunks_more_with_concurrent_decode(self):
+        self.server.execute_script(
+            self._script_long_prefill_chunks_more_with_concurrent_decode
+        )
+
+    @staticmethod
+    def _script_long_prefill_chunks_more_with_concurrent_decode(t: ScriptedContext):
+        """Concurrent decode steals chunk budget, so a 4-chunk prompt chunks >= 4 times."""
+        # Push a short req into the decoding state first so a decode is in flight
+        # when the long prompt arrives and starts chunking.
+        decoder = t.start_req(prompt_len=16, max_new_tokens=64)
+        yield from run_until(decoder, lambda h: h.status == "running")
+
+        # prompt_len = 4 * chunk_size: without decode-stealing this would chunk
+        # exactly 4 times. With enable_mixed_chunk, the co-running decode consumes
+        # part of rem_chunk_tokens each mixed iteration (rem_chunk_tokens -=
+        # num_mixed_decode_tokens), shrinking each chunk, so the long req needs at
+        # least as many chunks -- and page-aligned truncation plus the timing of
+        # when decode co-runs make the exact count non-deterministic.
+        long_req = t.start_req(
+            prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2
+        )
+        yield from run_until(long_req, lambda h: h.is_chunking)
+
+        # Confirm the scheduler actually produced a MIXED batch (chunked prefill +
+        # running decode in one forward pass) at least once during the run; this is
+        # the precondition for any decode-stealing to occur.
+        saw_mixed_batch: bool = False
+        for _ in range(DEFAULT_MAX_STEPS * 5):
+            if t.last_batch_forward_mode == "MIXED":
+                saw_mixed_batch = True
+            if long_req.finished and decoder.finished:
+                break
+            yield
+        assert long_req.finished and decoder.finished
+
+        assert saw_mixed_batch, "expected at least one MIXED (prefill+decode) batch"
+        assert long_req.chunks_done >= 4, (
+            f"a 4-chunk prompt must chunk >= 4 times under concurrent decode; "
+            f"got {long_req.chunks_done}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
