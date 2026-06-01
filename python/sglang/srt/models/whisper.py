@@ -8,6 +8,7 @@ from transformers import WhisperConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.conv import Conv1dLayer
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -313,10 +314,10 @@ class WhisperEncoder(torch.nn.Module):
         embed_dim = config.d_model
         self.embed_scale = embed_dim**-0.5 if config.scale_embedding else 1.0
 
-        self.conv1 = torch.nn.Conv1d(
+        self.conv1 = Conv1dLayer(
             config.num_mel_bins, embed_dim, kernel_size=3, padding=1
         )
-        self.conv2 = torch.nn.Conv1d(
+        self.conv2 = Conv1dLayer(
             embed_dim, embed_dim, kernel_size=3, stride=2, padding=1
         )
         self.embed_positions = torch.nn.Embedding(
@@ -342,9 +343,14 @@ class WhisperEncoder(torch.nn.Module):
         position_ids = position_ids.to(device=device)
 
         inputs_embeds = torch.nn.functional.gelu(self.conv1(input_features))
-        inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
-
-        inputs_embeds = inputs_embeds.mT.contiguous()
+        if _is_cpu and _is_amx_available:
+            # CPU AMX path: conv2 returns [N, L_out, OC] directly, skip transpose
+            inputs_embeds = torch.nn.functional.gelu(
+                self.conv2.forward_cpu_nhwc(inputs_embeds)
+            )
+        else:
+            inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
+            inputs_embeds = inputs_embeds.mT.contiguous()
         hidden_states = inputs_embeds + self.embed_positions(position_ids)
 
         for encoder_layer in self.layers:
