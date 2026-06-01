@@ -25,10 +25,14 @@ class HfStoreConfig:
     revision: str = "main"
 
     @classmethod
-    def from_env(cls) -> Optional["HfStoreConfig"]:
+    def from_env(cls) -> "HfStoreConfig":
         repo = os.environ.get("SGLANG_PRECISION_HF_REPO")
         if not repo:
-            return None
+            raise RuntimeError(
+                "SGLANG_PRECISION_HF_REPO is not set. The precision baseline "
+                "store is required (there is no local-only mode); set the repo "
+                "and HF_TOKEN_PRECISION_STORE."
+            )
         revision = os.environ.get("SGLANG_PRECISION_HF_REVISION", "main")
         return cls(repo=repo, revision=revision)
 

@@ -743,7 +743,8 @@ jobs:
         timeout-minutes: 120
         env:
           SGLANG_PRECISION_BASELINE_DIR: /tmp/sglang_precision_baselines
-          # Empty SGLANG_PRECISION_HF_REPO → local-only (no cross-run state).
+          # Required: the test errors if SGLANG_PRECISION_HF_REPO is unset (no
+          # local-only mode). Set the var + the HF_TOKEN_PRECISION_STORE secret.
           SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
           SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
           HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}

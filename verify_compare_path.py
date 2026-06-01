@@ -37,7 +37,7 @@ def main() -> int:
     print(
         f"[verify] MODEL={MODEL} TP={TP_SIZE} BASELINE_DIR={BASELINE_DIR}", flush=True
     )
-    print(f"[verify] HF: {'repo=' + hf_cfg.repo if hf_cfg else 'disabled'}", flush=True)
+    print(f"[verify] HF repo={hf_cfg.repo}", flush=True)
 
     if RESET_BASELINE and BASELINE_DIR.exists():
         shutil.rmtree(BASELINE_DIR)

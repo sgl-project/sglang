@@ -316,13 +316,14 @@ class TestNightlyPrecisionRegression(unittest.TestCase):
         cls.force_update = os.environ.get("SGLANG_PRECISION_FORCE_UPDATE", "0") == "1"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-        cls.hf_cfg = None
-        if _hfs is not None:
-            try:
-                cls.hf_cfg = _hfs.HfStoreConfig.from_env()
-            except Exception as e:
-                warnings.warn(f"precision_baseline_store disabled: {e}")
-                cls.hf_cfg = None
+        if _hfs is None:
+            raise RuntimeError(
+                "precision baseline store unavailable: could not import "
+                "sglang.test.precision_baseline_store"
+            )
+        # Raises if SGLANG_PRECISION_HF_REPO is unset — the test requires a
+        # remote baseline store, there is no local-only mode.
+        cls.hf_cfg = _hfs.HfStoreConfig.from_env()
 
     def test_precision_all_models(self):
         warnings.filterwarnings(
@@ -362,7 +363,7 @@ def _test_one_model(
     diff_threshold: float,
     force_update: bool,
     base_url: str,
-    hf_cfg=None,
+    hf_cfg,
 ):
     model = model_setup.model_path
     model_dir_name = _sanitize_model_name(model)
@@ -468,8 +469,6 @@ def _test_one_model(
 def _maybe_hf_fetch(
     *, hf_cfg, model: str, baseline_exp_dir: Path, capture_signature: str
 ) -> None:
-    if hf_cfg is None or _hfs is None:
-        return
     if baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt")):
         return
     try:
@@ -502,8 +501,6 @@ def _maybe_hf_push(
 ) -> None:
     # Under CI a push failure raises rather than warns, so a misconfigured
     # store can't quietly mask the regression-detection guarantee.
-    if hf_cfg is None or _hfs is None:
-        return
     pt_files = list(tensors_dir.glob("*.pt"))
     if not pt_files:
         return
