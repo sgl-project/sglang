@@ -2174,7 +2174,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # Post-ack callback for cache controller (e.g. to trigger next write-backs)
             self.cache_controller.record_l1_l2_transfer_complete(
-                direction="onboard",
+                direction="offload",
                 ack=ack,
             )
 
