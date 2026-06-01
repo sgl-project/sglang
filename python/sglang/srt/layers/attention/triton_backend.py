@@ -78,6 +78,10 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
+    # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
+    # buffers; it never reads seq_lens_cpu / seq_lens_sum.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -340,7 +344,7 @@ class TritonAttnBackend(AttentionBackend):
                 seq_lens,
                 req_pool_indices,
                 bs,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                token_to_kv_pool=self.token_to_kv_pool,
                 window_kv_indices=self.cuda_graph_window_kv_indices,
             )
         return kv_indptr, window_kv_indptr, window_kv_lens
@@ -385,7 +389,7 @@ class TritonAttnBackend(AttentionBackend):
                     seq_lens[:bs],
                     req_pool_indices,
                     bs,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    token_to_kv_pool=self.token_to_kv_pool,
                     window_kv_indices=window_kv_indices,
                 )
             )
@@ -416,6 +420,8 @@ class TritonAttnBackend(AttentionBackend):
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
     ):
         """Fill QO + KV cuda-graph buffers for draft_extend mode.
 
@@ -431,8 +437,33 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        if forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
+            # Triton extend kernel receives extend K/V as separate tensors, so
+            # kv_indptr/kv_indices must cover only the prefix portion.
+            # extend_seq_lens_tensor is only attached to spec_info at real
+            # replay (eagle_draft_extend_cuda_graph_runner.replay); during the
+            # capture-time warmup it's absent, so fall back to zeros (matches
+            # the pre-unification capture path in #26651). Clamp at 0 because
+            # padded rows (raw_bs..bs) leave seq_lens at the fill value (1)
+            # while extend_seq_lens stays at num_tokens_per_bs, which would
+            # otherwise produce negative kv_lens; padded rows reference
+            # reserved req-pool slot 0 and their output is discarded.
+            if (
+                spec_info is not None
+                and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
+            ):
+                extend_seq_lens = spec_info.extend_seq_lens_tensor[:bs].to(torch.int32)
+            else:
+                extend_seq_lens = torch.zeros(
+                    bs, dtype=torch.int32, device=seq_lens.device
+                )
+            kv_lens = torch.clamp(seq_lens - extend_seq_lens, min=0).to(torch.int32)
+        else:
+            # DRAFT_EXTEND_V1: seq_lens = prefix only.
+            kv_lens = seq_lens
         kv_indptr = self._fill_kv_indptr_and_indices(
-            bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+            bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
         return qo_indptr, kv_indptr, num_tokens_per_bs
 
@@ -472,7 +503,7 @@ class TritonAttnBackend(AttentionBackend):
                             forward_batch.req_pool_indices,
                             bs,
                             self.device,
-                            self.token_to_kv_pool_allocator,
+                            self.token_to_kv_pool,
                         )
                     )
                     window_num_kv_splits = torch.empty(
@@ -517,9 +548,13 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # Different with flashinfer kv_indptr and kv_indices construction
+            # Different with flashinfer kv_indptr and kv_indices construction.
+            # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
+            seq_lens_sum = forward_batch.seq_lens_sum
+            if seq_lens_sum is None:
+                seq_lens_sum = bs * self.max_context_len
             kv_indices = torch.empty(
-                forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
+                seq_lens_sum, dtype=torch.int64, device=self.device
             )
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs,
@@ -543,7 +578,7 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices,
                     bs,
                     self.device,
-                    self.token_to_kv_pool_allocator,
+                    self.token_to_kv_pool,
                 )
 
             custom_mask = spec_info.custom_mask
@@ -559,11 +594,19 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse = None
 
         elif forward_batch.forward_mode.is_draft_extend():
+            # Eager only (CG replay bypasses init); explicit D2H here instead of
+            # letting torch.empty inside generate_attn_arg_prefill .item() on a
+            # GPU cumsum tensor.
+            seq_lens_sum = (
+                forward_batch.seq_lens_sum
+                if forward_batch.seq_lens_sum is not None
+                else int(forward_batch.seq_lens.sum())
+            )
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
-                    None,
+                    seq_lens_sum,
                     self.req_to_token,
                 )
             )
@@ -577,8 +620,14 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
         else:
+            # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
+            # from GPU tensor, extra tail unused).
+            if forward_batch.extend_prefix_lens_cpu is not None:
+                kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
+            else:
+                kv_indices_len = bs * self.max_context_len
             kv_indices = torch.empty(
-                sum(forward_batch.extend_prefix_lens_cpu),
+                kv_indices_len,
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -603,7 +652,7 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices,
                     bs,
                     self.device,
-                    self.token_to_kv_pool_allocator,
+                    self.token_to_kv_pool,
                 )
 
             qo_indptr = self.qo_indptr
@@ -613,7 +662,12 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+            # Caller usually supplies extend_seq_lens_cpu (eagle_info gpu_only
+            # sets host-constant mirror); defensive GPU-max fallback if not.
+            if forward_batch.extend_seq_lens_cpu is not None:
+                max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+            else:
+                max_extend_len = int(forward_batch.extend_seq_lens.max())
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(
@@ -867,7 +921,9 @@ class TritonAttnBackend(AttentionBackend):
                 bs, seq_lens, req_pool_indices, spec_info
             )
         elif forward_mode.is_draft_extend(include_v2=True):
-            self._update_draft_extend_buffers(bs, seq_lens, req_pool_indices)
+            self._update_draft_extend_buffers(
+                bs, seq_lens, req_pool_indices, forward_mode, spec_info
+            )
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
@@ -1245,6 +1301,8 @@ class TritonMultiStepDraftBackend:
     draft decoding steps.
     """
 
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1293,6 +1351,10 @@ class TritonMultiStepDraftBackend:
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is None:
+            # seq_lens_sum here only slice-clamps a preallocated kv_indices buffer;
+            # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
+            seq_lens_sum = num_seqs * self.max_context_len
 
         generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
@@ -1456,7 +1518,7 @@ def update_sliding_window_buffer(
     req_pool_indices,
     bs,
     device=None,
-    token_to_kv_pool_allocator=None,
+    token_to_kv_pool=None,
     window_kv_indices=None,
 ):
     """Fill window KV buffers for sliding-window attention.
@@ -1485,11 +1547,14 @@ def update_sliding_window_buffer(
         window_kv_indices,
         req_to_token.stride(0),
     )
-    if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
+    if hasattr(token_to_kv_pool, "translate_loc_from_full_to_swa"):
         kv_last_index = window_kv_indptr[-1]
+        # Flush before+after: window_kv_indices is a different tensor than out_cache_loc.
+        token_to_kv_pool.invalidate_loc_cache()
         window_kv_indices[:kv_last_index] = (
-            token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+            token_to_kv_pool.translate_loc_from_full_to_swa(
                 window_kv_indices[:kv_last_index]
             )
         )
+        token_to_kv_pool.invalidate_loc_cache()
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx

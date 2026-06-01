@@ -48,11 +48,14 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
-    maybe_detect_nan,
-    maybe_detect_oob,
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
+)
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    maybe_detect_oob,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
 
@@ -407,6 +410,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
 
         # Construct input_ids
+        # TODO: same chunked-prefill chain divergence as PR #26329.
         if not batch.forward_mode.is_idle():
             rotate_input_ids_triton(
                 forward_batch.input_ids,
@@ -422,6 +426,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
             maybe_detect_nan(
+                output.logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
+            )
+            maybe_detect_inf(
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
             )
@@ -658,6 +666,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         return self._draft_worker
 
+    @property
+    def spec_v2_attn_backends(self) -> tuple:
+        return (
+            self._target_worker.model_runner.attn_backend,
+            *self._draft_worker.draft_extend_attn_backend_list,
+        )
+
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
@@ -764,6 +779,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_lens,
