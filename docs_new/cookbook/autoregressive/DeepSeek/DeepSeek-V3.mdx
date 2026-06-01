@@ -89,11 +89,11 @@ For basic API usage and request examples, please refer to:
 
 #### 4.2.1 Reasoning Parser
 
-[DeepSeek-V3-0324](https://huggingface.co/deepseek-ai/DeepSeek-V3-0324) adds optional extended thinking to the V3 architecture. Enable the reasoning parser during deployment to separate the thinking and content sections:
+DeepSeek-V3 supports reasoning mode. Enable the reasoning parser during deployment to separate the thinking and content sections:
 
 ```shell Command
 python -m sglang.launch_server \
-  --model deepseek-ai/DeepSeek-V3-0324 \
+  --model deepseek-ai/DeepSeek-V3 \
   --reasoning-parser deepseek-v3 \
   --tp 8
 ```
@@ -110,7 +110,7 @@ client = OpenAI(
 
 # Enable streaming to see the thinking process in real-time
 response = client.chat.completions.create(
-    model="deepseek-ai/DeepSeek-V3-0324",
+    model="deepseek-ai/DeepSeek-V3",
     messages=[
         {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
     ],
