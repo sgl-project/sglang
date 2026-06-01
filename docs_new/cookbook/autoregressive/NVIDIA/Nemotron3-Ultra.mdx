@@ -128,7 +128,7 @@ Reasoning: The user wants 3 bullet points about SGLang. Let me recall what I kno
 
 Content: - **Radix Attention** — SGLang reuses KV cache across requests sharing a common prefix, dramatically reducing memory and compute for multi-turn agent loops and few-shot workloads.
 - **OpenAI-compatible API and structured generation** — Drop-in replacement for the OpenAI client, with first-class support for constrained decoding (JSON schema, regex) and OpenAI-style tool calling.
-- **High-throughput serving on NVIDIA GPUs** — Continuous batching, chunked prefill, NVFP4 quantization, and optimized CUDA kernels deliver state-of-the-art throughput across H100, H200, B200, and GB200.
+- **High-throughput serving on NVIDIA GPUs** — Continuous batching, chunked prefill, FP8/NVFP4 quantization, and optimized CUDA kernels deliver state-of-the-art throughput across H100, H200, B200, and GB200.
 ```
 
 Streaming chat completion:
