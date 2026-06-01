@@ -2399,7 +2399,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             get_fp4_gemm_runner_backend,
         )
 
-        fp4_gemm_needs_autotune = get_fp4_gemm_runner_backend().is_flashinfer_cutlass() or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+        fp4_gemm_needs_autotune = (
+            get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
+            or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+        )
 
         from sglang.srt.utils.common import is_sm120_supported
 
