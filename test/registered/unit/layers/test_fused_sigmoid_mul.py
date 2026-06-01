@@ -45,7 +45,7 @@ def test_correctness(num_tokens, hidden_dim, dtype):
     list(itertools.product(TOKEN_COUNTS, NUM_HEADS, DTYPES)),
 )
 def test_3d_shape(num_tokens, num_heads, dtype):
-    """Test with 3D tensors (num_tokens, num_heads, head_dim) as used in attention."""
+    """Test with 3D contiguous tensors (num_tokens, num_heads, head_dim)."""
     rtol, atol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
     head_dim = 128
 
@@ -56,6 +56,32 @@ def test_3d_shape(num_tokens, num_heads, dtype):
 
     ref = _reference(attn_output, gate)
     out = fused_sigmoid_mul(attn_output, gate)
+
+    torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    "num_tokens, num_heads, dtype",
+    list(itertools.product(TOKEN_COUNTS, NUM_HEADS, DTYPES)),
+)
+def test_strided_gate(num_tokens, num_heads, dtype):
+    """Test strided gate path: attn_output is 2D, gate is 3D non-contiguous from chunk."""
+    rtol, atol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
+    head_dim = 128
+    hidden_dim = num_heads * head_dim
+
+    # Simulate the real pattern: chunk produces non-contiguous views
+    q_gate = torch.randn(
+        num_tokens, num_heads, 2 * head_dim, dtype=dtype, device="cuda"
+    )
+    _, gate = torch.chunk(q_gate, 2, dim=-1)
+    # gate is non-contiguous when num_tokens > 1 or num_heads > 1
+
+    attn_output = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    gate_flat = gate.reshape(num_tokens, hidden_dim)
+
+    ref = _reference(attn_output, gate_flat)
+    out = fused_sigmoid_mul(attn_output, gate, inplace=False)
 
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 

@@ -551,6 +551,34 @@ def _fused_sigmoid_mul_kernel(
     tl.store(output_ptr + offsets, result, mask=mask)
 
 
+@triton.jit
+def _fused_sigmoid_mul_strided_gate_kernel(
+    output_ptr,
+    attn_output_ptr,
+    gate_ptr,
+    gate_stride_row,
+    gate_stride_head,
+    hidden_dim,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Fuse sigmoid(gate) * attn_output with strided gate access."""
+    pid_row = tl.program_id(0).to(tl.int64)
+    pid_head = tl.program_id(1)
+
+    d_offsets = tl.arange(0, BLOCK_D)
+    mask = d_offsets < HEAD_DIM
+
+    attn_off = pid_row * hidden_dim + pid_head * HEAD_DIM + d_offsets
+    attn = tl.load(attn_output_ptr + attn_off, mask=mask, other=0.0).to(tl.float32)
+
+    gate_off = pid_row * gate_stride_row + pid_head * gate_stride_head + d_offsets
+    g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
+
+    result = attn * tl.sigmoid(g)
+    tl.store(output_ptr + attn_off, result, mask=mask)
+
+
 def fused_sigmoid_mul(
     attn_output: torch.Tensor,
     gate: torch.Tensor,
@@ -561,8 +589,37 @@ def fused_sigmoid_mul(
 
     Equivalent to: attn_output * sigmoid(gate)
 
+    Only beneficial when num_tokens <= 512 (decode). For larger batches,
+    PyTorch eager (attn_output * torch.sigmoid(gate)) is faster.
+
     When inplace=True, writes result back to attn_output and returns it.
+
+    Supports strided gate: if gate is 3D (num_tokens, num_heads, head_dim)
+    and attn_output is 2D (num_tokens, hidden_dim), the kernel reads gate
+    via explicit strides without requiring a contiguous copy.
     """
+    if gate.ndim == 3 and attn_output.ndim == 2:
+        # Strided gate path: gate is 3D (num_tokens, num_heads, head_dim)
+        num_tokens, num_heads, head_dim = gate.shape
+        hidden_dim = num_heads * head_dim
+        assert attn_output.shape == (num_tokens, hidden_dim)
+        out = attn_output if inplace else torch.empty_like(attn_output)
+        BLOCK_D = triton.next_power_of_2(head_dim)
+        grid = (num_tokens, num_heads)
+        _fused_sigmoid_mul_strided_gate_kernel[grid](
+            out,
+            attn_output,
+            gate,
+            gate.stride(0),
+            gate.stride(1),
+            hidden_dim,
+            HEAD_DIM=head_dim,
+            BLOCK_D=BLOCK_D,
+            num_warps=min(max(BLOCK_D // 32, 1), 8),
+        )
+        return out
+
+    # Flat path: both tensors have the same shape
     assert (
         attn_output.shape == gate.shape
     ), "attn_output and gate must have the same shape"

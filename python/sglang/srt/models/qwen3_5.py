@@ -884,7 +884,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            # gate stays as 3D strided view; fused_sigmoid_mul handles it directly
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
@@ -971,7 +971,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+            if attn_output.shape[0] <= 512:
+                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+            else:
+                num_tokens = attn_output.shape[0]
+                attn_output = (
+                    attn_output.view(num_tokens, self.num_heads, -1)
+                    * torch.sigmoid(gate)
+                ).view(num_tokens, -1)
 
         output, _ = self.o_proj(attn_output)
         return output
