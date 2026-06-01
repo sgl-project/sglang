@@ -19,6 +19,7 @@ from typing import Any, Callable, List, Optional, Sequence, Union
 import imageio
 import numpy as np
 import torch
+from PIL import Image
 
 try:
     import scipy.io.wavfile as scipy_wavfile
@@ -643,11 +644,30 @@ def post_process_sample(
                             indexed_path = f"{parts[0]}_{i}.{parts[1]}"
                         else:
                             indexed_path = f"{save_file_path}_{i}"
-                        imageio.imwrite(indexed_path, image, quality=quality)
+                        _save_image_frame(
+                            indexed_path, image, quality, output_compression
+                        )
                 else:
-                    imageio.imwrite(save_file_path, frames[0], quality=quality)
+                    _save_image_frame(
+                        save_file_path, frames[0], quality, output_compression
+                    )
             logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
             logger.info(f"No output path provided, output not saved")
 
     return frames
+
+
+def _save_image_frame(
+    path: str, frame: np.ndarray, quality: int | None, output_compression: int | None
+) -> None:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".png":
+        compress_level = 1
+        if output_compression is not None and output_compression != 75:
+            compress_level = max(0, min(9, round(output_compression / 100 * 9)))
+        if frame.ndim == 3 and frame.shape[-1] == 1:
+            frame = frame[..., 0]
+        Image.fromarray(frame).save(path, format="PNG", compress_level=compress_level)
+    else:
+        imageio.imwrite(path, frame, quality=quality)
