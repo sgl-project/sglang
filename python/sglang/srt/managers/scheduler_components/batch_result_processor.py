@@ -430,10 +430,11 @@ class SchedulerBatchResultProcessor:
     ):
         """Validate PP skip output comm correctness.
 
-        - When skip=True: all reqs must be middle chunks (inflight_middle_chunks > 0)
-          so placeholder zeros are never consumed via req.output_ids.append().
+        Uses the per-req `batch.output_process_mode` list (1:1 with `batch.reqs`):
+        - When skip=True: all reqs must be intermediate (mode.is_intermediate() is
+          True) so placeholder zeros are never consumed via req.output_ids.append().
         - When skip=False: at least one req should consume next_token_ids
-          (inflight_middle_chunks <= 0), otherwise warn.
+          (mode.is_intermediate() is False), otherwise warn.
         """
         if not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
             return
@@ -441,25 +442,28 @@ class SchedulerBatchResultProcessor:
         if not getattr(result, "skipped_output_comm", False):
             if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
                 has_consumed_output = any(
-                    req.inflight_middle_chunks <= 0
-                    for req in batch.reqs
+                    not mode.is_intermediate()
+                    for req, mode in zip(
+                        batch.reqs, batch.output_process_mode, strict=True
+                    )
                     if not req.finished() and not req.is_retracted
                 )
                 if not has_consumed_output and len(batch.reqs) > 0:
-                    chunks = list([r.inflight_middle_chunks for r in batch.reqs])
+                    modes = [m.name for m in batch.output_process_mode]
                     logger.warning(
                         f"PP non-skip output comm: no req consumed next_token_ids. "
                         f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
-                        f"num_reqs={len(batch.reqs)}, all inflight_middle_chunks={chunks}"
+                        f"num_reqs={len(batch.reqs)}, all output_process_mode={modes}"
                     )
             return
 
-        for req in batch.reqs:
+        for req, mode in zip(batch.reqs, batch.output_process_mode, strict=True):
             if not req.finished() and not req.is_retracted:
-                assert req.inflight_middle_chunks > 0, (
+                assert mode.is_intermediate(), (
                     f"PP skip output comm invariant violated: req {req.rid} "
-                    f"has inflight_middle_chunks={req.inflight_middle_chunks} "
-                    f"but output was skipped (contains_last_prefill_chunk="
+                    f"has output_process_mode={mode.name} "
+                    f"(not intermediate) but output was skipped "
+                    f"(contains_last_prefill_chunk="
                     f"{batch.contains_last_prefill_chunk}). "
                     f"Placeholder zeros would be appended to output_ids."
                 )
