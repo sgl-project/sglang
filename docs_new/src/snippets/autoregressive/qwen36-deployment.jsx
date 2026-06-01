@@ -25,7 +25,7 @@ export const Qwen36Deployment = () => {
       getDynamicItems: (values) => {
         const isXeon = values.hardware === 'xeon';
         return [
-          { id: 'fp8', label: 'FP8', default: true, disabled: false,
+          { id: 'fp8', label: 'FP8', default: !isXeon, disabled: false,
             disabledReason: '' },
           { id: 'bf16', label: 'BF16', default: isXeon },
         ];
@@ -89,14 +89,14 @@ export const Qwen36Deployment = () => {
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon: { bf16: { tp: 3, mem: 0.8 } },
+      xeon: { bf16: { tp: 3, mem: 0.8 }, fp8: { tp: 3, mem: 0.8 } },
     },
     '27b': {
       baseName: '27B',
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon: { bf16: { tp: 6, mem: 0.8 } },
+      xeon: { bf16: { tp: 6, mem: 0.8 }, fp8: { tp: 6, mem: 0.8 } },
     },
   };
 
