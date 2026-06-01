@@ -113,10 +113,7 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
 
 
 class Glm4MoeThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
-    """A logit processor that controls the length of thinking for GLM-4.5 / GLM-4.6 / GLM-4.5V / GLM-4.6V / GLM-4.7 / GLM-4.7-Flash / GLM-Glyph models.
-
-    All supported models share thinking token IDs 151350 (start) and 151351 (end).
-    """
+    """A logit processor that controls the length of thinking for GLM-4.5 / GLM-4.6 / GLM-4.5V / GLM-4.6V models."""
 
     THINKING_START_TOKEN_ID: int = 151350
     THINKING_END_TOKEN_ID: int = 151351
