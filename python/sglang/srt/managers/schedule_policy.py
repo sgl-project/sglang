@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
@@ -34,7 +35,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
+from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -84,7 +85,7 @@ IGNORE_EOS_RESERVE_TOKENS = 1
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
-    token_ids: Optional[List[int]] = None,
+    token_ids: Optional[array[int]] = None,
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
@@ -467,7 +468,7 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
-        self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
+        self.dsa_prefill_cp_in_seq_split = is_dsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
@@ -825,9 +826,7 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if (
-            self.nsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
-        ) and len(self.can_run_list) >= 1:
+        if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
@@ -860,7 +859,14 @@ class PrefillAdder:
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
-        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and real_input_tokens >= self.rem_input_tokens
+        ):
+            # If without chunked prefill:
+            # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+            # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -888,7 +894,14 @@ class PrefillAdder:
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            if (
+                self.rem_chunk_tokens is None
+                and len(self.can_run_list) != 0
+                and input_tokens >= self.rem_input_tokens
+            ):
+                # If without chunked prefill:
+                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+                # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
