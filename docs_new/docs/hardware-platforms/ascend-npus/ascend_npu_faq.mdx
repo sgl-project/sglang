@@ -288,3 +288,14 @@ FP8 model is not supported
 
 ### Solution
 Replace model weights, e.g., switch Qwen/Qwen3.5-27B-FP8 to Eco-Tech/Qwen3.5-27B-w8a8-mtp.
+
+## 8. Docker image versions: stable release vs. daily build
+
+Docker images for Ascend NPU are available in two types:
+
+- **Stable release** — validated version with a specific tag, e.g., `quay.io/ascend/sglang:v0.5.10-npu.rc1-a3`.
+  Recommended for production deployments.
+- **Daily build** — includes the latest development changes, e.g., `quay.io/ascend/sglang:main-cann8.5.0-a3`. Use this
+  if you need the latest features or bug fixes that have not yet been included in a stable release.
+
+If you encounter issues with a stable release, try switching to a daily build to see if the issue has been resolved in the latest development version.

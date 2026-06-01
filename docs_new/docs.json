@@ -873,6 +873,12 @@
               {
                 "group": "Ascend NPUs",
                 "pages": [
+                  {
+                    "group": "Model Tutorials",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1"
+                    ]
+                  },
                   "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
                   "docs/hardware-platforms/ascend-npus/ascend_npu",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",
