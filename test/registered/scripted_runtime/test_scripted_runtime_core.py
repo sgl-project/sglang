@@ -10,11 +10,13 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     advance_to_decode_step,
     advance_to_nth_chunk,
     base_engine_kwargs,
+    exhaust_row_pool,
     run_until_finished,
+    warmup_radix,
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=460, stage="base-b", runner_config="1-gpu-small")
 
 
 _CHUNK_SIZE = 64
@@ -524,6 +526,177 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         assert (
             r.chunks_done == 5
         ), f"5*chunk_size prompt -> 5 chunks; got {r.chunks_done}"
+
+    def test_is_idle_reflects_engine_activity(self):
+        self.server.execute_script(self._script_is_idle_reflects_activity)
+
+    @staticmethod
+    def _script_is_idle_reflects_activity(t: ScriptedContext):
+        assert t.is_idle, "engine should be idle at script start"
+        r = t.start_req(
+            prompt_len=_SHORT_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        assert not t.is_idle, "is_idle True while a req is decoding"
+        yield from run_until_finished(r)
+        for _ in range(5):
+            yield
+        assert t.is_idle, "is_idle False after the req drained"
+        assert t.is_fully_idle, "is_fully_idle False after the req drained"
+
+    def test_status_transitions_running_to_finished(self):
+        self.server.execute_script(self._script_status_transitions)
+
+    @staticmethod
+    def _script_status_transitions(t: ScriptedContext):
+        assert (
+            t.status("no-such-rid") == "unknown"
+        ), "status of a never-seen rid must be 'unknown'"
+        r = t.start_req(
+            prompt_len=_SHORT_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        assert (
+            r.status == "running"
+        ), f"decoding req status should be running; got {r.status!r}"
+        yield from run_until_finished(r)
+        assert (
+            r.status == "finished"
+        ), f"completed req status should be finished; got {r.status!r}"
+
+    def test_last_batch_forward_mode_extend_then_decode(self):
+        self.server.execute_script(self._script_last_batch_forward_mode)
+
+    @staticmethod
+    def _script_last_batch_forward_mode(t: ScriptedContext):
+        r = t.start_req(
+            prompt_len=_LONG_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_nth_chunk(r, 1)
+        assert t.last_batch_forward_mode in ("EXTEND", "MIXED"), (
+            f"mid-prefill batch should be an extend mode; "
+            f"got {t.last_batch_forward_mode!r}"
+        )
+        yield from advance_to_decode_step(r, 1)
+        assert (
+            t.last_batch_forward_mode == "DECODE"
+        ), f"decode batch mode should be DECODE; got {t.last_batch_forward_mode!r}"
+        yield from run_until_finished(r)
+
+    def test_remaining_prompt_tokens_shrinks_to_zero(self):
+        self.server.execute_script(self._script_remaining_prompt_tokens)
+
+    @staticmethod
+    def _script_remaining_prompt_tokens(t: ScriptedContext):
+        r = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from advance_to_nth_chunk(r, 1)
+        rem = r.remaining_prompt_tokens
+        assert 0 < rem < _LONG_PROMPT_LEN, (
+            f"mid-prefill remaining_prompt_tokens should be partial; "
+            f"got {rem} (prompt={_LONG_PROMPT_LEN})"
+        )
+        yield from run_until_finished(r)
+        assert (
+            r.remaining_prompt_tokens == 0
+        ), f"finished req should have 0 remaining; got {r.remaining_prompt_tokens}"
+
+    def test_evict_radix_full_clears_tree_and_rejects_prefix(self):
+        self.server.execute_script(self._script_evict_radix)
+
+    @staticmethod
+    def _script_evict_radix(t: ScriptedContext):
+        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r)
+        for _ in range(3):
+            yield
+        assert t.get_all_node_hit_counts(), "expected radix nodes after a finished req"
+
+        t.evict_radix(prefix_tokens=None)
+        yield
+        assert (
+            not t.get_all_node_hit_counts()
+        ), "evict_radix(prefix_tokens=None) did not clear the radix tree"
+
+        rejected = False
+        try:
+            t.evict_radix(prefix_tokens=[1, 2, 3])
+        except AssertionError:
+            rejected = True
+        assert (
+            rejected
+        ), "evict_radix must reject a non-None prefix (only full evict supported)"
+
+    def test_warmup_radix_populates_prefix(self):
+        self.server.execute_script(self._script_warmup_radix_populates_prefix)
+
+    @staticmethod
+    def _script_warmup_radix_populates_prefix(t: ScriptedContext):
+        t.flush_cache()
+        yield
+        yield from warmup_radix(t, [1] * (2 * _CHUNK_SIZE))
+
+        r = t.start_req(prompt_len=2 * _CHUNK_SIZE + 1, max_new_tokens=1)
+        yield from run_until_finished(r)
+        assert (
+            r.req is not None
+        ), "finished req vanished before cached_tokens could be read"
+        assert r.req.cached_tokens > 0, (
+            f"req with the warmed prefix should hit the radix cache; "
+            f"got cached_tokens={r.req.cached_tokens}"
+        )
+
+    def test_exhaust_kv_creates_pressure_and_release_restores(self):
+        self.server.execute_script(self._script_exhaust_kv_round_trip)
+
+    @staticmethod
+    def _script_exhaust_kv_round_trip(t: ScriptedContext):
+        stats = t.engine_stats()
+        page = stats["page_size"]
+        baseline = stats["kv_pool_free"]
+        assert (
+            baseline > 4 * page
+        ), f"need KV headroom to test pressure; baseline={baseline}"
+
+        t.exhaust_kv(leave_pages=2)
+        pressured = t.engine_stats()["kv_pool_free"]
+        assert (
+            pressured < baseline
+        ), f"exhaust_kv must reduce free KV; pressured={pressured} baseline={baseline}"
+        assert (
+            pressured <= 3 * page
+        ), f"exhaust_kv(leave_pages=2) left too much free KV; got {pressured} (page={page})"
+
+        t._release_exhausted_pools()
+        restored = t.engine_stats()["kv_pool_free"]
+        assert (
+            restored == baseline
+        ), f"release must restore the full pool; restored={restored} baseline={baseline}"
+        yield
+
+    def test_exhaust_row_pool_leaves_requested_free_rows(self):
+        self.server.execute_script(self._script_exhaust_row_pool)
+
+    @staticmethod
+    def _script_exhaust_row_pool(t: ScriptedContext):
+        avail = t.engine_stats()["req_pool_free"]
+        assert avail >= 5, f"need free rows to test; avail={avail}"
+        target_free = avail - 3
+
+        yield from exhaust_row_pool(t, leave_rows=target_free)
+
+        free_after = t.engine_stats()["req_pool_free"]
+        assert (
+            free_after <= target_free
+        ), f"exhaust_row_pool should leave <= {target_free} free rows; got {free_after}"
+        assert (
+            free_after < avail
+        ), f"exhaust_row_pool did not consume any rows; avail={avail} after={free_after}"
 
     def test_forward_ct_advances_once_per_yield(self):
         self.server.execute_script(self._script_forward_ct_advances_once_per_yield)
