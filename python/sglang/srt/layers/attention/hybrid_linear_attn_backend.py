@@ -586,17 +586,11 @@ class MambaAttnBackendBase(AttentionBackend):
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and self.topk > 1:
-            if (
-                spec_info is not None
-                and getattr(spec_info, "retrieve_next_token", None) is not None
-            ):
-                bs_without_pad = spec_info.retrieve_next_token.shape[0]
-                self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
-                    spec_info.retrieve_next_token
-                )
-                self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
-                    spec_info.retrieve_next_sibling
-                )
+            # Skip copying retrieve_next_token/sibling here: these tensors are
+            # outputs of build_tree_kernel_efficient on the forward stream and
+            # may not be ready when _replay_metadata runs on the plan stream.
+            # The copy is deferred to update_verify_buffers_to_fill_after_draft
+            # which runs after the plan-stream/forward-stream sync.
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -615,6 +609,30 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Copy retrieve_next_token/sibling from spec_info into the pre-allocated
+        # cuda-graph buffers. This is deferred from _replay_metadata because
+        # these tensors are draft outputs that may not be ready on the plan stream.
+        if (
+            self.topk > 1
+            and spec_info is not None
+            and getattr(spec_info, "retrieve_next_token", None) is not None
+        ):
+            bs = (
+                cuda_graph_bs
+                if cuda_graph_bs is not None
+                else spec_info.retrieve_next_token.shape[0]
+            )
+            bs_without_pad = spec_info.retrieve_next_token.shape[0]
+            self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
+                spec_info.retrieve_next_token
+            )
+            self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
+                spec_info.retrieve_next_sibling
+            )
 
     def _track_mamba_state_decode(
         self,
@@ -935,9 +953,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        self.full_attn_backend.update_verify_buffers_to_fill_after_draft(
-            spec_info, cuda_graph_bs
-        )
+        for attn_backend in self.attn_backend_list:
+            attn_backend.update_verify_buffers_to_fill_after_draft(
+                spec_info, cuda_graph_bs
+            )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()

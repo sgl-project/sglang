@@ -1092,13 +1092,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
-        # Prepare for target verify in a separate stream.
-        # The plan stream must wait for draft kernels on the forward stream
-        # to finish: prepare_for_v2_verify reads draft output (draft_token,
-        # req_to_token) and replay_prepare touches mamba state indices that
-        # draft may still be writing.
-        if self.plan_stream:
-            self.plan_stream.wait_stream(fwd_stream)
+        # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
@@ -1129,17 +1123,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self._target_worker.model_runner, batch
                 )
 
-            # Some values such as custom_mask and position depend on the output of draft,
-            # so the previous plan step used the wrong values. Here, we need to run the related
-            # computation again to update them to the correct values.
-            self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
-                verify_input,
-                (
-                    self.target_worker.model_runner.graph_runner.bs
-                    if can_run_cuda_graph
-                    else None
-                ),
-            )
+        # Some values such as custom_mask and position depend on the output of draft,
+        # so the previous plan step used the wrong values. Here, we need to run the related
+        # computation again to update them to the correct values.
+        # Always called (not just plan_stream): backends may defer draft-dependent
+        # copies from _replay_metadata to this method to avoid stream races.
+        self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+            verify_input,
+            (
+                self.target_worker.model_runner.graph_runner.bs
+                if can_run_cuda_graph
+                else None
+            ),
+        )
 
         # Prepare grammar data on CPU if needed
         if batch.has_grammar:
