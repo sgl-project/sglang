@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
 )

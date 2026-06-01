@@ -49,27 +49,28 @@ def _make_generator(model_path: str, attention_backend: str):
 
     return DiffGenerator.from_pretrained(
         model_path=model_path,
-        server_args_kwargs={"attention_backend": attention_backend},
+        attention_backend=attention_backend,
+        dit_cpu_offload=False,
     )
 
 
 def _generate(gen, prompt, seed, steps, height, width, mode, levels, delta, outfile):
-    from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-
-    params = SamplingParams(
-        prompt=prompt,
-        seed=seed,
-        num_inference_steps=steps,
-        height=height,
-        width=width,
-        save_output=True,
-        output_file_path=outfile,
-        progressive_mode=mode,
-        progressive_levels=levels,
-        progressive_delta=delta,
-    )
+    out_path = str(Path(outfile).parent)
+    out_name = Path(outfile).stem
     t0 = time.time()
-    result = gen.generate(sampling_params=params)
+    result = gen.generate(sampling_params_kwargs={
+        "prompt": prompt,
+        "seed": seed,
+        "num_inference_steps": steps,
+        "height": height,
+        "width": width,
+        "save_output": True,
+        "output_path": out_path,
+        "output_file_name": out_name,
+        "progressive_mode": mode,
+        "progressive_levels": levels,
+        "progressive_delta": delta,
+    })
     elapsed = time.time() - t0
     return result, elapsed
 

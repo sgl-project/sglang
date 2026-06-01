@@ -24,10 +24,8 @@ Extension hooks for model-specific subclasses
 from __future__ import annotations
 
 import time
-from typing import Any
 
 import torch
-from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
