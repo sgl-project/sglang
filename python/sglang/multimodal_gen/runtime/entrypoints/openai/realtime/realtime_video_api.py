@@ -95,6 +95,42 @@ def _log_realtime_chunk_timing(
     )
 
 
+async def _send_realtime_chunk_stats(
+    ws: WebSocket,
+    session: GenerateSession,
+    chunk: RealtimeChunkContext,
+    batch: "Req",
+    request_prepare_ms: float,
+    scheduler_forward_ms: float,
+    chunk_total_ms: float,
+    send_stats: RealtimeFrameSendStats,
+) -> None:
+    await ws.send_bytes(
+        packb(
+            {
+                "type": "chunk_stats",
+                "session_id": session.id,
+                "request_id": chunk.request_id,
+                "chunk_index": batch.block_idx,
+                "event_id": getattr(batch, "realtime_event_id", None),
+                "request_prepare_ms": request_prepare_ms,
+                "scheduler_forward_ms": scheduler_forward_ms,
+                "header_write_ms": send_stats["header_write_ms"],
+                "raw_payload_build_ms": send_stats["raw_payload_build_ms"],
+                "raw_write_ms": send_stats["raw_write_ms"],
+                "ws_write_ms": send_stats["ws_write_ms"],
+                "chunk_total_ms": chunk_total_ms,
+                "num_batches": send_stats["num_batches"],
+                "num_frames": send_stats["num_frames"],
+                "raw_bytes": send_stats["raw_bytes"],
+                "ws_payload_bytes": send_stats["ws_payload_bytes"],
+                "content_type": send_stats["content_type"],
+            },
+            use_bin_type=True,
+        )
+    )
+
+
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
     adapter = session.adapter
     if adapter is None:
@@ -208,6 +244,16 @@ async def _send_output_and_log(
     )
     chunk_total_ms = (time.perf_counter() - chunk_started) * 1000
     _log_realtime_chunk_timing(
+        session,
+        chunk,
+        batch,
+        request_prepare_ms,
+        scheduler_forward_ms,
+        chunk_total_ms,
+        send_stats,
+    )
+    await _send_realtime_chunk_stats(
+        ws,
         session,
         chunk,
         batch,

@@ -27,7 +27,7 @@ body {
   font-family: ui-sans-serif, "Avenir Next", "Helvetica Neue", sans-serif;
 }
 
-button, input, textarea { font: inherit; }
+button, input, textarea, select { font: inherit; }
 button:disabled { cursor: wait; opacity: 0.64; transform: none; }
 
 .shell {
@@ -149,7 +149,7 @@ label {
   transform: translateY(0);
 }
 
-input, textarea {
+input, textarea, select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -160,7 +160,7 @@ input, textarea {
 }
 
 textarea { resize: vertical; line-height: 1.45; }
-input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.12); }
+input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.12); }
 
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .actions { display: grid; grid-template-columns: 1fr 0.7fr; gap: 10px; margin-top: 16px; }

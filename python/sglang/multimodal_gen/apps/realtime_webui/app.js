@@ -5,8 +5,8 @@ const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v5";
-const PREVIEW_OUTPUT_FORMAT = "";
-const PREVIEW_OUTPUT_QUALITY = 95;
+const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
+const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
@@ -202,7 +202,6 @@ let currentReceiveChunkFrames = 0;
 let lastRawRgbFrame = null;
 let decoderWorker = null;
 let decodeWorkerUnavailable = false;
-let encodedWorkerDecodeUnavailable = false;
 let decodeRequestId = 1;
 let streamEpoch = 0;
 let lastDecodeMs = 0;
@@ -249,7 +248,7 @@ function drawIdle() {
 
 function resetStreamStats() {
   pendingHeader = null;
-  queue = [];
+  clearFrameQueue();
   frames = 0;
   bytes = 0;
   fpsSamples = [];
@@ -273,7 +272,10 @@ function resetStreamStats() {
   $("stageLatencyText").textContent = "-";
   $("decodeText").textContent = "-";
   $("displayLagText").textContent = "-";
+  $("serverSendText").textContent = "-";
+  $("chunkPayloadText").textContent = "-";
   $("chunkText").textContent = "chunk -";
+  $("payloadMode").textContent = selectedTransportLabel();
 }
 
 function rejectPendingDecodes(message) {
@@ -373,30 +375,12 @@ async function decodeFrameBatch(header, data) {
       }
     });
   } catch (error) {
-    if (!useTransfer && isEncodedPreviewContentType(header.content_type)) {
-      encodedWorkerDecodeUnavailable = true;
-      const items = await framePayloadToImageData(header, payload);
-      const decodedAt = performance.now();
-      lastDecodeMs = decodedAt - decodeStartedAt;
-      return items.map((item) => ({
-        ...item,
-        receivedAt: header.__received_at,
-        decodedAt,
-        decodeMs: lastDecodeMs,
-      }));
-    }
     throw error;
   }
 }
 
 function isWorkerDecodableContentType(contentType) {
-  return (
-    isWorkerDecodableRawContentType(contentType) ||
-    (
-      isEncodedPreviewContentType(contentType) &&
-      !encodedWorkerDecodeUnavailable
-    )
-  );
+  return isWorkerDecodableRawContentType(contentType);
 }
 
 function isWorkerDecodableRawContentType(contentType) {
@@ -404,13 +388,6 @@ function isWorkerDecodableRawContentType(contentType) {
     contentType === RAW_RGB_CONTENT_TYPE ||
     contentType === RAW_RGB_DELTA_GZIP_CONTENT_TYPE ||
     contentType === RAW_RGBA_DELTA_GZIP_CONTENT_TYPE
-  );
-}
-
-function isEncodedPreviewContentType(contentType) {
-  return (
-    contentType === WEBP_FRAME_CONTENT_TYPE ||
-    contentType === JPEG_FRAME_CONTENT_TYPE
   );
 }
 
@@ -430,7 +407,7 @@ function trimLiveQueue(latestFrameCount) {
   );
   if (queue.length <= maxQueue) return;
   const dropCount = queue.length - maxQueue;
-  queue.splice(0, dropCount);
+  dropQueuedFrames(dropCount);
   droppedFrames += dropCount;
 }
 
@@ -439,8 +416,17 @@ function trimQueueForPendingEvent() {
   const keep = Math.max(1, Math.round(targetFps * EVENT_QUEUE_SECONDS));
   if (queue.length <= keep) return;
   const dropCount = queue.length - keep;
-  queue.splice(0, dropCount);
+  dropQueuedFrames(dropCount);
   droppedFrames += dropCount;
+}
+
+function clearFrameQueue() {
+  for (const item of queue) item.image?.close?.();
+  queue = [];
+}
+
+function dropQueuedFrames(count) {
+  for (const item of queue.splice(0, count)) item.image?.close?.();
 }
 
 function rgbToImageData(header, payload) {
@@ -546,31 +532,28 @@ async function framePayloadToImageData(header, payload) {
 async function encodedImageToImageData(header, payload) {
   const blob = new Blob([payload], { type: header.content_type });
   const bitmap = await createImageBitmap(blob);
-  const offscreen = typeof OffscreenCanvas !== "undefined"
-    ? new OffscreenCanvas(bitmap.width, bitmap.height)
-    : document.createElement("canvas");
-  offscreen.width = bitmap.width;
-  offscreen.height = bitmap.height;
-  const imageCtx = offscreen.getContext("2d", { alpha: false });
-  imageCtx.drawImage(bitmap, 0, 0);
-  const image = imageCtx.getImageData(0, 0, bitmap.width, bitmap.height);
-  bitmap.close?.();
-  return [{ image, chunk: header.chunk_index }];
+  return [{ image: bitmap, chunk: header.chunk_index }];
 }
 
 function drawFrame(image) {
-  if (scratchCanvas.width !== image.width || scratchCanvas.height !== image.height) {
-    scratchCanvas.width = image.width;
-    scratchCanvas.height = image.height;
+  const sourceWidth = image.width;
+  const sourceHeight = image.height;
+  let drawSource = image;
+  if (image instanceof ImageData) {
+    if (scratchCanvas.width !== sourceWidth || scratchCanvas.height !== sourceHeight) {
+      scratchCanvas.width = sourceWidth;
+      scratchCanvas.height = sourceHeight;
+    }
+    scratchCtx.putImageData(image, 0, 0);
+    drawSource = scratchCanvas;
   }
-  scratchCtx.putImageData(image, 0, 0);
 
   const rect = canvas.getBoundingClientRect();
   const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
   const targetWidth = Math.max(1, Math.round(rect.width * dpr));
   const targetHeight = Math.max(
     1,
-    Math.round((targetWidth * image.height) / image.width),
+    Math.round((targetWidth * sourceHeight) / sourceWidth),
   );
   if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
     canvas.width = targetWidth;
@@ -578,7 +561,8 @@ function drawFrame(image) {
   }
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(scratchCanvas, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(drawSource, 0, 0, canvas.width, canvas.height);
+  if (!(image instanceof ImageData)) image.close?.();
 }
 
 function renderLoop(now) {
@@ -680,7 +664,7 @@ function abortCurrentSession(reason = "session closed by client", {
   rejectPendingDecodes("session aborted");
   resetDecoderState();
   if (clearFrames) {
-    queue = [];
+    clearFrameQueue();
     updateStats();
   }
   if (!socket) {
@@ -741,12 +725,7 @@ async function connect() {
       $("connectBtn").disabled = false;
       return;
     }
-    const previewTransportParams = PREVIEW_OUTPUT_FORMAT
-      ? {
-          output_compression: PREVIEW_OUTPUT_QUALITY,
-          realtime_output_format: PREVIEW_OUTPUT_FORMAT,
-        }
-      : {};
+    const previewTransportParams = readPreviewTransportParams();
     const init = compact({
       type: "init",
       model: $("model").value,
@@ -786,7 +765,7 @@ async function connect() {
       if (ws === socket) ws = null;
       $("connectBtn").disabled = false;
       if (clearQueueOnClose) {
-        queue = [];
+        clearFrameQueue();
         updateStats();
       }
       clearQueueOnClose = false;
@@ -839,14 +818,19 @@ function handleReceiveError(error, epoch) {
 
 function receive(data, epoch) {
   if (!pendingHeader) {
-    pendingHeader = unpack(new Uint8Array(data));
-    pendingHeader.__received_at = performance.now();
-    if (pendingHeader.type === "error") {
-      socketServerError = pendingHeader.content || "unknown";
+    const message = unpack(new Uint8Array(data));
+    message.__received_at = performance.now();
+    if (message.type === "error") {
+      socketServerError = message.content || "unknown";
       setStatus(socketServerError, "error");
       addHistory(`server error: ${socketServerError}`);
-      pendingHeader = null;
+      return;
     }
+    if (message.type === "chunk_stats") {
+      updateServerChunkStats(message);
+      return;
+    }
+    pendingHeader = message;
     if (pendingHeader) setStatus("Receiving", "live");
     return;
   }
@@ -867,10 +851,13 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   const payloadBytes = data.byteLength || data.size || 0;
   const isEventCutover = awaitedEventId && eventId >= awaitedEventId;
   const decodedFrames = await decodeFrameBatch(header, data);
-  if (epoch !== streamEpoch) return;
+  if (epoch !== streamEpoch) {
+    for (const item of decodedFrames) item.image?.close?.();
+    return;
+  }
   if (isEventCutover) {
     droppedFrames += queue.length;
-    queue = [];
+    clearFrameQueue();
     lastFrameAt = 0;
     if (awaitedEventSentAt) {
       const eventLatency = (performance.now() - awaitedEventSentAt) / 1000;
@@ -888,6 +875,14 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   updatePlaybackPace(header, performance.now(), chunkFrameCount);
   setStatus("Live", "live");
   updateStats(header);
+}
+
+function updateServerChunkStats(stats) {
+  const rawWrite = Number(stats.raw_write_ms || 0) / 1000;
+  const wsWrite = Number(stats.ws_write_ms || 0) / 1000;
+  $("serverSendText").textContent = `raw ${rawWrite.toFixed(2)}s · ws ${wsWrite.toFixed(2)}s`;
+  $("chunkPayloadText").textContent = `${formatBytes(stats.ws_payload_bytes || 0)} · ${stats.num_frames || 0}f`;
+  if (stats.content_type) $("payloadMode").textContent = shortPayloadMode(stats.content_type);
 }
 
 function updatePlaybackPace(header, now, frameCount) {
@@ -1022,6 +1017,34 @@ function readOptionalInteger(id) {
   return Number(value);
 }
 
+function readPreviewTransportParams() {
+  const outputFormat = $("transportFormat").value;
+  const outputQuality = Number($("transportQuality").value || DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  if (!outputFormat) return {};
+  const params = { realtime_output_format: outputFormat };
+  if (outputFormat === "webp" || outputFormat === "jpeg") {
+    params.output_compression = outputQuality;
+  }
+  return params;
+}
+
+function selectedTransportLabel() {
+  const select = $("transportFormat");
+  return select.options[select.selectedIndex]?.textContent || "raw RGB";
+}
+
+function shortPayloadMode(contentType) {
+  if (contentType === WEBP_FRAME_CONTENT_TYPE) return "webp";
+  if (contentType === JPEG_FRAME_CONTENT_TYPE) return "jpeg";
+  if (contentType === RAW_RGB_DELTA_GZIP_CONTENT_TYPE) return "delta-gzip";
+  if (contentType === RAW_RGB_CONTENT_TYPE) return "raw RGB";
+  return contentType;
+}
+
+function formatBytes(value) {
+  return `${(Number(value || 0) / 1048576).toFixed(1)} MB`;
+}
+
 function renderPresets() {
   $("presetList").innerHTML = "";
   presets.forEach((preset) => {
@@ -1038,6 +1061,8 @@ function applyQueryParams() {
   const params = new URLSearchParams(window.location.search);
   const server = params.get("server");
   if (server) $("serverUrl").value = server;
+  $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
+  $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
 }
 
 function pack(value) {

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -105,17 +106,21 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "repeatActions" not in app_js
     assert 'id="eventFrames"' not in index_html
     assert "ControlStateController" in app_js
-    assert "const PREVIEW_OUTPUT_FORMAT = \"\";" in app_js
+    assert 'const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";' in app_js
+    assert 'id="transportFormat"' in index_html
+    assert '<option value="webp" selected>WebP preview</option>' in index_html
+    assert 'id="serverSendText"' in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-fixes-v18" in index_html
-    assert "app.js?v=realtime-fixes-v18" in index_html
+    assert "styles.css?v=realtime-fixes-v19" in index_html
+    assert "app.js?v=realtime-fixes-v19" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v5";' in app_js
     assert 'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";' in app_js
     assert "Dragon Dolly" in app_js
     assert "dragon-ride.jpg" in app_js
     assert "decodeChain = decodeChain" in app_js
     assert "receiveChain" not in app_js
+    assert 'message.type === "chunk_stats"' in app_js
     assert "RAW_RGB_FRAMES_PER_WS_MESSAGE = 1" in (
         repo_root
         / "python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_output_adapter.py"
@@ -598,11 +603,74 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
         )
     )
 
-    asyncio.run(realtime_video_api._generate_loop(SimpleNamespace(), session))
+    class _Ws:
+        async def send_bytes(self, _message):
+            pass
+
+    asyncio.run(realtime_video_api._generate_loop(_Ws(), session))
 
     assert events.index("generate_start_1") < events.index("send_end_0")
     assert events.index("send_end_0") < events.index("send_start_1")
     assert events[-1] == "send_end_1"
+
+
+def test_send_output_emits_chunk_stats_message():
+    sent_messages = []
+
+    class _Ws:
+        async def send_bytes(self, message):
+            sent_messages.append(message)
+
+    class _Adapter:
+        async def send_output(self, ws, session, result, batch):
+            del ws, session, result, batch
+            return {
+                "header_pack_ms": 0.1,
+                "header_write_ms": 0.2,
+                "raw_payload_build_ms": 3.0,
+                "raw_write_ms": 42.0,
+                "ws_write_ms": 42.2,
+                "raw_bytes": 1200,
+                "ws_payload_bytes": 450,
+                "num_frames": 3,
+                "num_batches": 3,
+                "frame_shape": (1, 2, 3),
+                "content_type": "image/webp",
+            }
+
+    session = GenerateSession()
+    session.adapter = _Adapter()
+    chunk = session.new_chunk()
+    batch = SimpleNamespace(
+        block_idx=7,
+        realtime_event_id=11,
+        condition_inputs={"camera_actions": [["w"]]},
+    )
+
+    stats = asyncio.run(
+        realtime_video_api._send_output_and_log(
+            _Ws(),
+            session,
+            chunk,
+            batch,
+            SimpleNamespace(),
+            request_prepare_ms=1.0,
+            scheduler_forward_ms=2.0,
+            chunk_started=time.perf_counter(),
+        )
+    )
+
+    from msgpack import unpackb
+
+    message = unpackb(sent_messages[-1], raw=False)
+    assert stats["raw_write_ms"] == 42.0
+    assert message["type"] == "chunk_stats"
+    assert message["chunk_index"] == 7
+    assert message["event_id"] == 11
+    assert message["raw_write_ms"] == 42.0
+    assert message["ws_write_ms"] == 42.2
+    assert message["ws_payload_bytes"] == 450
+    assert message["content_type"] == "image/webp"
 
 
 def test_listen_generate_request_propagates_disconnect_without_error_write():
