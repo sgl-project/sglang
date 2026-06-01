@@ -1000,21 +1000,50 @@ class GLUMBConvTemp(nn.Module):
             dim=0,
         )
 
-    def forward(self, x: torch.Tensor, HW: Tuple[int, int, int]) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        HW: Tuple[int, int, int],
+        *,
+        ffn_tail: Optional[torch.Tensor] = None,
+        save_ffn_tail: bool = False,
+    ):
         B, N, C = x.shape
         T, H, W = HW
         assert N == T * H * W, f"GLUMBConvTemp: N={N} != T*H*W={T * H * W}"
 
-        # Spatial path -- (B*T, C, H, W)
+        # Spatial path -- (B*T, C, H, W). Frame-local, so identical chunked or whole.
         x_sp = x.reshape(B * T, H, W, C).permute(0, 3, 1, 2).contiguous()
         x_sp = self._apply_spatial_autochunked(x_sp)  # (B*T, C, H, W)
 
         # Temporal additive path -- (B, C, T, S=H*W)
         x_t = x_sp.view(B, T, C, H * W).permute(0, 2, 1, 3).contiguous()
-        x_out = x_t + self.t_conv(x_t)
 
-        # back to (B, N, C)
-        return x_out.permute(0, 2, 3, 1).reshape(B, N, C)
+        if ffn_tail is None and not save_ffn_tail:
+            # Dense (bidirectional / symmetric-padding) path -- unchanged.
+            x_out = x_t + self.t_conv(x_t)
+            return x_out.permute(0, 2, 3, 1).reshape(B, N, C)
+
+        # Streaming causal path (cache slot 9): prepend the previous chunk's last
+        # `pad` frames as real left context, then drop them from the output. The
+        # right edge still sees the conv's own zero-pad, so a chunk matches the
+        # whole-sequence pass for every frame whose right context lies in-chunk
+        # (always true for the final chunk). Mirrors the reference GLUMBConvTemp.
+        pad = self.t_conv.kernel_size[0] // 2
+        conv_in = x_t
+        padded_size = 0
+        if ffn_tail is not None:
+            prefix = ffn_tail.to(device=x_t.device, dtype=x_t.dtype)
+            conv_in = torch.cat([prefix[:, :, -pad:], x_t], dim=2)
+            padded_size = conv_in.shape[2] - x_t.shape[2]
+        new_tail = (
+            x_t[:, :, -pad:].detach().clone()
+            if (save_ffn_tail and pad > 0)
+            else ffn_tail
+        )
+        tconv_out = self.t_conv(conv_in)[:, :, padded_size:]
+        x_out = x_t + tconv_out
+        return x_out.permute(0, 2, 3, 1).reshape(B, N, C), new_tail
 
 
 # ---------------------------------------------------------------------------

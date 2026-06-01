@@ -26,6 +26,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     BidirectionalGDNUCPESinglePathLiteLA,
+    GLUMBConvTemp,
     _gdn_scan_bidirectional,
     _gdn_scan_cached,
     _ShortConvolution,
@@ -212,3 +213,44 @@ def test_short_conv_cached_forward_continuity_across_chunks():
     )
     chunked = torch.cat([o0, o1], dim=1)  # reassemble frame-major
     torch.testing.assert_close(chunked, whole, atol=1e-9, rtol=0)
+
+
+# --------------------------------------------------------------------------- #
+# 4. Cached FFN temporal tail (GLUMBConvTemp, cache slot 9)
+# --------------------------------------------------------------------------- #
+
+C_FFN, HID = 6, 8
+HFFN, WFFN = S, 1  # S spatial tokens per frame
+
+
+def _ffn():
+    m = GLUMBConvTemp(C_FFN, HID, t_kernel_size=3).double().eval()
+    with torch.no_grad():  # zero-init t_conv -> randomize for a non-trivial temporal filter
+        m.t_conv.weight.copy_(torch.randn_like(m.t_conv.weight))
+    return m
+
+
+def test_ffn_cached_no_prefix_reduces_to_dense():
+    torch.manual_seed(3)
+    x = torch.randn(B, N, C_FFN, dtype=torch.float64)
+    m = _ffn()
+    dense = m(x, (T, HFFN, WFFN))
+    cached, tail = m(x, (T, HFFN, WFFN), save_ffn_tail=True)
+    torch.testing.assert_close(cached, dense, atol=1e-9, rtol=0)
+    assert tail.shape[2] == m.t_conv.kernel_size[0] // 2
+
+
+def test_ffn_cached_final_chunk_matches_whole():
+    # The prefix supplies real left context, so the LAST chunk (right edge = end
+    # of sequence, same as the whole pass) matches the whole-sequence output.
+    torch.manual_seed(4)
+    x = torch.randn(B, N, C_FFN, dtype=torch.float64)
+    m = _ffn()
+    whole, _ = m(x, (T, HFFN, WFFN), save_ffn_tail=True)
+
+    split = 2
+    _, tail0 = m(_nslice(x, 0, split), (split, HFFN, WFFN), save_ffn_tail=True)
+    o1, _ = m(
+        _nslice(x, split, T), (T - split, HFFN, WFFN), ffn_tail=tail0, save_ffn_tail=True
+    )
+    torch.testing.assert_close(whole[:, split * S :, :], o1, atol=1e-9, rtol=0)
