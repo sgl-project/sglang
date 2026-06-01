@@ -663,7 +663,7 @@ class SchedulerPPMixin:
                 # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None                                                                                                
                 if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
                     batch.input_ids = batch.prefill_input_ids_cpu.to(
-                      self.device, non_blocking=True
+                        self.device, non_blocking=True
                     )
                     batch.prefill_input_ids_cpu = None
 
