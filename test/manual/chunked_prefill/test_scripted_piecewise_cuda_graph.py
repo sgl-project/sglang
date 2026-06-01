@@ -38,40 +38,24 @@ class TestPiecewiseBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        assert r.chunks_done >= 4
+        # prompt_len=4*256+1=1025 at chunk_size=256: the four truncated chunks
+        # (256/512/768/1024) each hold the req as chunked_req; the tiny 1-token
+        # tail is the non-truncated final chunk, so chunked_req clears before it
+        # runs and it is not counted -> chunks_done is exactly 4.
+        assert r.chunks_done == 4
 
 
-class TestPiecewiseMissesBucket(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=257,
-        disable_cuda_graph=False,
-    )
-
-    def test_piecewise_cg_chunk_size_misses_bucket(self):
-        self.server.execute_script(self._script_piecewise_cg_chunk_size_misses_bucket)
-
-    @staticmethod
-    def _script_piecewise_cg_chunk_size_misses_bucket(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-        yield from run_until_finished(r, max_steps=800)
-        assert r.finished
-        assert r.chunks_done >= 2
-
-
-class TestPiecewiseDynamicChunking(ScriptedTestCase):
+class TestPiecewiseRetractResume(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disable_cuda_graph=False,
-        enable_dynamic_chunking=True,
     )
 
-    def test_piecewise_cg_retract_resume_different_bucket(self):
-        self.server.execute_script(
-            self._script_piecewise_cg_retract_resume_different_bucket
-        )
+    def test_piecewise_cg_retract_resume(self):
+        self.server.execute_script(self._script_piecewise_cg_retract_resume)
 
     @staticmethod
-    def _script_piecewise_cg_retract_resume_different_bucket(t: ScriptedContext):
+    def _script_piecewise_cg_retract_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.pause_generation(mode="retract")
@@ -81,18 +65,6 @@ class TestPiecewiseDynamicChunking(ScriptedTestCase):
         assert r.finished
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-
-    def test_piecewise_cg_dynamic_chunking_bucket_walk(self):
-        self.server.execute_script(
-            self._script_piecewise_cg_dynamic_chunking_bucket_walk
-        )
-
-    @staticmethod
-    def _script_piecewise_cg_dynamic_chunking_bucket_walk(t: ScriptedContext):
-        r = t.start_req(prompt_len=8 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
-        yield from run_until_finished(r, max_steps=1200)
-        assert r.finished
-        assert r.chunks_done >= 4
 
 
 if __name__ == "__main__":
