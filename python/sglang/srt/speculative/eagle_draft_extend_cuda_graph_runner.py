@@ -257,12 +257,6 @@ class EAGLEDraftExtendCudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _anchor_draft_extend_v2_logits(self, ret: LogitsProcessorOutput) -> None:
-        # DRAFT_EXTEND_V2 recomputes selected-row topk in EagleDraftWorker.
-        # This cheap full-logits consumer keeps the graph replay output materialized.
-        ret.topk_p = torch.amax(ret.next_token_logits, dim=-1, keepdim=True)
-        ret.topk_index = torch.zeros_like(ret.topk_p, dtype=torch.int64)
-
     def _capture_init(self, run_once_fn):
         for _ in range(2):
             torch.cuda.synchronize()
@@ -410,9 +404,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
-                self._anchor_draft_extend_v2_logits(ret)
-            elif self.topk == 1 and not _is_hip:
+            if self.topk == 1 and not _is_hip:
                 # ROCm's argmax tie-breaks differently from CUDA's softmax+max
                 # path on FP8 logits, which corrupts MTP draft selection on AMD.
                 # Keep the fastpath CUDA-only.
