@@ -1200,9 +1200,7 @@ class UnifiedRadixCacheSuite:
         aux = aux_types[0]
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        # One page keeps the leaf within a single SWA window so the SWA
-        # leaf-cap split does not fire; this test is about aux-only tombstone
-        # on a Full-locked leaf, not multi-node topology.
+        # One page stays within a single SWA window (no leaf-cap split).
         seq = self._make_seq(1, 1)
         self._insert(tree, allocator, req_to_token_pool, seq)
 
@@ -1530,11 +1528,7 @@ class UnifiedRadixCacheSuite:
         return False
 
     def _simulate_backup(self, tree, node):
-        """Simulate D->H backup by setting host_value on each component, for
-        the whole root->node path (parent-first), mirroring write-through.
-        A single insert may span several tree nodes (e.g. SWA caps a long leaf
-        to one window), so backing up only `node` would leave an unbacked
-        ancestor."""
+        """Simulate D->H backup over the whole root->node path (parent-first)."""
         chain = []
         cur = node
         while cur is not tree.root_node:
@@ -1607,11 +1601,8 @@ class UnifiedRadixCacheSuite:
         return fixture
 
     def _backup_node(self, tree, node):
-        # Back up the whole root->node path, ancestors first. Mirrors real
-        # write-through parent-first backup: a single insert may span several
-        # tree nodes (e.g. SWA caps a long leaf to one window), so backing up
-        # only `node` would leave an unbacked ancestor that production never
-        # produces.
+        # Parent-first backup over the whole path: one insert can span several
+        # nodes, so a single-node backup would leave an unbacked ancestor.
         chain = []
         cur = node
         while cur is not tree.root_node:
@@ -1791,10 +1782,8 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         self.assertIs(m.last_device_node, tree.root_node)
 
-        # Under the SWA leaf-cap split a single insert spans several nodes, so
-        # locate the host prefix via the match result and reconstruct the
-        # prefix/suffix by concatenating keys along the path rather than
-        # assuming a fixed parent/child shape.
+        # Locate the host prefix via last_host_node and rebuild prefix/suffix
+        # from path keys (a leaf may span several nodes).
         if self.cfg.has_mamba:
             self.assertEqual(m.host_hit_length, 0)
             self.assertIs(m.last_host_node, tree.root_node)
@@ -1908,9 +1897,7 @@ class UnifiedRadixCacheSuite:
         self._load_back_node(tree, node)
         self.assertFalse(node.evicted)
         self.assertIsNotNone(node.component_data[ComponentType.FULL].value)
-        # A single insert may span multiple tree nodes (SWA caps a long leaf to
-        # one window), so gather the whole reloaded prefix via match rather than
-        # the leaf's value alone.
+        # Gather the whole reloaded prefix via match (a leaf may be split).
         loaded_indices = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", base)))
         ).device_indices
@@ -1989,11 +1976,9 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_swa_deep_tree_backup_evict_loadback_stress(self):
-        """Multi-node SWA tree under real write-through: long leaves cap-split,
-        varied swa_evicted_seqlen tombstones, and shared-prefix branches build
-        a deep/wide tree; then backup -> stepwise evict -> loadback, asserting
-        sanity throughout. Exercises the split topology far more than the 1-2
-        page micro-tests, where a single insert yields at most two nodes."""
+        """Deep multi-node SWA tree (long leaves, decode-evict tombstones,
+        shared-prefix branches) through write-through backup -> evict ->
+        loadback, asserting sanity throughout."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
         if self._skip_unsupported_hicache_test():
@@ -2004,8 +1989,7 @@ class UnifiedRadixCacheSuite:
         tree, allocator, req_to_token_pool = self._build_hicache_fixture()
         tree.write_through_threshold = 1  # real eager write-through auto-backup
         ps = self.cfg.page_size
-        # Window measured in pages; sizes scale with it so the SWA leaf-cap
-        # split fires across configs (window may be < page or many pages).
+        # Window in pages; sizes scale with it so the leaf-cap split fires.
         tail_size = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
         wp = max(1, tail_size // ps)
 
@@ -2024,20 +2008,15 @@ class UnifiedRadixCacheSuite:
             tree.sanity_check()
             return True
 
-        # (1) Long leaf -> SWA cap-split (prefix + one-window tail).
-        base = self._make_seq(1, wp + 2)
+        base = self._make_seq(1, wp + 2)  # long leaf -> cap-split
         if not insert_swa(base, 0):
             self.skipTest("kv pool too small for deep-tree stress")
-        # (2) Fresh decode-evicted sequence: one page evicted during decode ->
-        #     tombstone-prefix + cap-split stacked (the cache_finished shape).
+        # fresh decode-evicted seq: tombstone-prefix + cap-split stacked
         insert_swa(self._make_seq(20000, wp + 2), ps)
-        # (3) Depth: extend the base chain.
-        insert_swa(base + self._make_seq(70000, 2), 0)
-        # (4) Width: branches sharing the base prefix.
-        for i in range(2):
+        insert_swa(base + self._make_seq(70000, 2), 0)  # depth
+        for i in range(2):  # width: branches off the base prefix
             insert_swa(base[: 2 * ps] + self._make_seq(80000 + 1000 * i, 3), 0)
 
-        # The tree must actually be deep/wide, otherwise the stress is moot.
         self.assertGreaterEqual(len(tree._collect_all_nodes()), 5)
 
         # Stepwise eviction -> demote to host, sanity after each round.
