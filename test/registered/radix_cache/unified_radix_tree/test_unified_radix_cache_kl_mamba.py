@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=768, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=964, stage="base-c", runner_config="4-gpu-h100")
 
 MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64

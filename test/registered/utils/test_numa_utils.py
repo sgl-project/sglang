@@ -9,7 +9,7 @@ from sglang.srt.utils.numa_utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb200")
 register_cuda_ci(est_time=10, stage="base-c", runner_config="8-gpu-b200")
 

@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=279, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=153, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestEpDeepGEMM(CustomTestCase):
