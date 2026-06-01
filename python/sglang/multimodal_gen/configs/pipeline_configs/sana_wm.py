@@ -90,6 +90,11 @@ class SanaWMPipelineConfig(PipelineConfig):
     sink_token: bool = True
     denoising_step_list: tuple = (1000, 960, 889, 727, 0)
     streaming_cfg_scale: float = 1.0
+    # Streaming refiner (S2b): chunked LTX-2 sink/current refiner.
+    sink_size: int = 1
+    refiner_block_size: int = 3
+    refiner_kv_max_frames: int = 11
+    refiner_seed: int = 42
 
     # --- DiT ---
     dit_config: DiTConfig = field(default_factory=SanaWMConfig)

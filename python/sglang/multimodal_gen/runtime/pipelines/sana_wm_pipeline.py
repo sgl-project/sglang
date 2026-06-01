@@ -296,9 +296,15 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             "sana_wm_refiner",
         )
 
-    def _add_decoding_stage(self) -> None:
-        if sana_wm_skip_refiner_enabled():
-            return super()._add_decoding_stage()
+    def _add_decoding_stage(self, server_args: ServerArgs = None) -> None:
+        # Streaming routes to the base, which selects SanaWMStreamingDecodingStage
+        # (causal-VAE chunk decode of the refined latents). Skip-refiner also uses
+        # the base (dense decode). Otherwise the dense refiner-decode.
+        streaming = server_args is not None and getattr(
+            server_args.pipeline_config, "streaming", False
+        )
+        if streaming or sana_wm_skip_refiner_enabled():
+            return super()._add_decoding_stage(server_args)
         self.add_stage(
             SanaWMRefinerDecodingStage(
                 vae=self.get_module("vae"),
