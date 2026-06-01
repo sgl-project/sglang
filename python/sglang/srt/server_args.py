@@ -2727,13 +2727,15 @@ class ServerArgs:
 
         if not use_mla_backend:
             # MHA architecture
-            is_mixtral = "MixtralForCausalLM" in (
-                model_config.hf_config.architectures or []
+            architectures = model_config.hf_config.architectures or []
+            skip_fa3_default = any(
+                arch in architectures
+                for arch in ("MistralForCausalLM", "MixtralForCausalLM")
             )
             if (
                 is_hopper_with_cuda_12_3()
                 and is_no_spec_infer_or_topk_one(self)
-                and not is_mixtral
+                and not skip_fa3_default
             ):
                 # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
                 # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
