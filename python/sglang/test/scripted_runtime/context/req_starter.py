@@ -24,6 +24,8 @@ class ScriptedContextReqStarter:
         max_new_tokens: int,
         rid: Optional[str],
         ignore_eos: bool,
+        priority: Optional[int],
+        dp_rank: Optional[int],
         prompt_token: int = 1,
     ) -> ScriptedReqHandle:
         ctx = self._ctx
@@ -32,15 +34,17 @@ class ScriptedContextReqStarter:
             rid = f"scripted-{self._req_counter}-{uuid.uuid4().hex}"
             self._req_counter += 1
 
+        sampling_params = {"max_new_tokens": max_new_tokens, "ignore_eos": ignore_eos}
         payload = {
             "input_ids": [prompt_token] * prompt_len,
-            "sampling_params": {
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "rid": rid,
             "stream": True,
         }
+        if priority is not None:
+            payload["priority"] = priority
+        if dp_rank is not None:
+            payload["routed_dp_rank"] = dp_rank
         _http_post_and_await_recv_msg(
             ctx,
             path="/generate",

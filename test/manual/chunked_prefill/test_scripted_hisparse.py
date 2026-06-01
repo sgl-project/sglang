@@ -38,7 +38,7 @@ class TestHiSparseBasic(ScriptedTestCase):
         )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_hisparse_staging_dma_during_chunk_admit(self):
         self.server.execute_script(self._script_hisparse_staging_dma_during_chunk_admit)

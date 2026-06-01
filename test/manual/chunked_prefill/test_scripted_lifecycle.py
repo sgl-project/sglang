@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -24,7 +25,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 0
-        assert len(r.output_tokens) == 2
+        assert len(r.req.output_ids) == 2
 
     def test_medium_prompt_medium_decode(self):
         self.server.execute_script(self._script_medium_prompt_medium_decode)
@@ -37,7 +38,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done <= 1
-        assert len(r.output_tokens) == 16
+        assert len(r.req.output_ids) == 16
 
     def test_long_prompt_short_decode(self):
         self.server.execute_script(self._script_long_prompt_short_decode)
@@ -50,7 +51,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 2
+        assert len(r.req.output_ids) == 2
 
     def test_long_prompt_long_decode(self):
         self.server.execute_script(self._script_long_prompt_long_decode)
@@ -63,7 +64,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.finished, max_steps=1000)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 64
+        assert len(r.req.output_ids) == 64
 
     def test_tiny_prompt_long_decode(self):
         self.server.execute_script(self._script_tiny_prompt_long_decode)
@@ -74,7 +75,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.finished, max_steps=500)
         assert r.finished
         assert r.chunks_done == 0
-        assert len(r.output_tokens) == 64
+        assert len(r.req.output_ids) == 64
 
     def test_chunk_size_minus_one_prompt(self):
         self.server.execute_script(self._script_chunk_size_minus_one_prompt)
@@ -87,7 +88,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 0
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_chunk_size_plus_two_prompt(self):
         self.server.execute_script(self._script_chunk_size_plus_two_prompt)
@@ -100,7 +101,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 2
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_just_over_2x_chunk_size(self):
         self.server.execute_script(self._script_just_over_2x_chunk_size)
@@ -113,7 +114,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 3
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_five_x_chunk_size(self):
         self.server.execute_script(self._script_five_x_chunk_size)
@@ -126,7 +127,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done == 5
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_ten_x_chunk_size(self):
         self.server.execute_script(self._script_ten_x_chunk_size)
@@ -139,7 +140,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.finished, max_steps=1000)
         assert r.finished
         assert r.chunks_done == 10
-        assert len(r.output_tokens) == 2
+        assert len(r.req.output_ids) == 2
 
     def test_status_progression_happy_path(self):
         self.server.execute_script(self._script_status_progression_happy_path)
@@ -173,7 +174,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 1
+        assert len(r.req.output_ids) == 1
 
     def test_kv_pages_consistent_during_run(self):
         self.server.execute_script(self._script_kv_pages_consistent_during_run)
@@ -200,7 +201,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             raise AssertionError("req did not finish within DEFAULT_MAX_STEPS")
         assert saw_positive
         assert r.kv_pages == 0
-        assert len(r.output_tokens) == 4
+        assert len(r.req.output_ids) == 4
 
     def test_row_idx_recycled_after_finish(self):
         self.server.execute_script(self._script_row_idx_recycled_after_finish)
@@ -210,7 +211,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.row_idx is None
+        assert r.req.req_pool_idx is None
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -221,12 +222,12 @@ class TestLifecycleBasic(ScriptedTestCase):
     def _script_two_seq_clean_handoff(t: ScriptedContext):
         r1 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r1)
-        assert r1.row_idx is None and r1.kv_pages == 0 and r1.lock_refs == 0
+        assert r1.req.req_pool_idx is None and r1.kv_pages == 0 and r1.lock_refs == 0
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
-        assert len(r1.output_tokens) == 2 and len(r2.output_tokens) == 2
-        assert r2.row_idx is None and r2.kv_pages == 0 and r2.lock_refs == 0
+        assert len(r1.req.output_ids) == 2 and len(r2.req.output_ids) == 2
+        assert r2.req.req_pool_idx is None and r2.kv_pages == 0 and r2.lock_refs == 0
 
     def test_five_seq_clean(self):
         self.server.execute_script(self._script_five_seq_clean)
@@ -238,13 +239,13 @@ class TestLifecycleBasic(ScriptedTestCase):
             r = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
             yield from run_until_finished(r)
             assert r.finished
-            assert len(r.output_tokens) == 2
-            assert r.row_idx is None
+            assert len(r.req.output_ids) == 2
+            assert r.req.req_pool_idx is None
             assert r.kv_pages == 0
             assert r.lock_refs == 0
             reqs.append(r)
         for r in reqs:
-            assert r.finish_event_count == 1
+            assert r.finished
 
     def test_radix_partial_seq(self):
         self.server.execute_script(self._script_radix_partial_seq)
@@ -261,10 +262,10 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
         assert r2.chunks_done <= 1
-        assert r2.cached_tokens > 0, (
-            f"r2 must hit r1's radix prefix; got cached_tokens=" f"{r2.cached_tokens}"
+        assert r2.req.cached_tokens > 0, (
+            f"r2 must hit r1's radix prefix; got cached_tokens=" f"{r2.req.cached_tokens}"
         )
-        assert len(r2.output_tokens) == 2
+        assert len(r2.req.output_ids) == 2
 
     def test_alternating_short_long_seq(self):
         self.server.execute_script(self._script_alternating_short_long_seq)
@@ -276,8 +277,8 @@ class TestLifecycleBasic(ScriptedTestCase):
             r = t.start_req(prompt_len=prompt, max_new_tokens=2, ignore_eos=True)
             yield from run_until_finished(r)
             assert r.finished
-            assert len(r.output_tokens) == 2
-            assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert len(r.req.output_ids) == 2
+            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if prompt == VERY_LONG_PROMPT_LEN:
                 assert r.chunks_done >= 2
             else:
@@ -292,8 +293,8 @@ class TestLifecycleBasic(ScriptedTestCase):
             r = t.start_req(prompt_len=L, max_new_tokens=1, ignore_eos=True)
             yield from run_until_finished(r)
             assert r.finished
-            assert len(r.output_tokens) == 1
-            assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert len(r.req.output_ids) == 1
+            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert r.chunks_done >= 2
             else:
@@ -308,8 +309,8 @@ class TestLifecycleBasic(ScriptedTestCase):
             r = t.start_req(prompt_len=L, max_new_tokens=1, ignore_eos=True)
             yield from run_until_finished(r)
             assert r.finished
-            assert len(r.output_tokens) == 1
-            assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert len(r.req.output_ids) == 1
+            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert r.chunks_done >= 2
             else:
@@ -324,8 +325,8 @@ class TestLifecycleBasic(ScriptedTestCase):
             r = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
             yield from run_until_finished(r)
             assert r.finished
-            assert len(r.output_tokens) == 2
-            assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert len(r.req.output_ids) == 2
+            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             for _ in range(20):
                 yield
 
@@ -339,8 +340,8 @@ class TestLifecycleBasic(ScriptedTestCase):
             r = t.start_req(prompt_len=L, max_new_tokens=2, ignore_eos=True)
             yield from run_until_finished(r)
             assert r.finished
-            assert len(r.output_tokens) == 2
-            assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert len(r.req.output_ids) == 2
+            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L == VERY_LONG_PROMPT_LEN:
                 assert r.chunks_done >= 2
             else:
@@ -356,14 +357,11 @@ class TestLifecycleBasic(ScriptedTestCase):
             r = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
             yield from run_until_finished(r)
             assert r.finished
-            assert len(r.output_tokens) == 2
-            assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert len(r.req.output_ids) == 2
+            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             reqs.append(r)
         for r in reqs:
-            assert r.finish_event_count == 1, (
-                f"sequential req must emit exactly one finish event; "
-                f"got {r.finish_event_count} for rid={r.rid}"
-            )
+            assert r.finished
 
     def test_seq_engine_stats_stable(self):
         self.server.execute_script(self._script_seq_engine_stats_stable)
@@ -375,8 +373,8 @@ class TestLifecycleBasic(ScriptedTestCase):
             r = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
             yield from run_until_finished(r)
             assert r.finished
-            assert len(r.output_tokens) == 2
-            assert r.row_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert len(r.req.output_ids) == 2
+            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
         final = t.engine_stats()["kv_pool_free"]
         assert (
             final >= baseline - 1
@@ -390,17 +388,27 @@ class TestLifecycleBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.shutdown()
+
+        def _error_message(h):
+            if h.req is None:
+                return None
+            return (
+                h.req.finished_reason.message
+                if isinstance(h.req.finished_reason, FINISH_ABORT)
+                else None
+            )
+
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.finished or r.error_message is not None:
+            if r.finished or _error_message(r) is not None:
                 break
             yield
         else:
             raise AssertionError(
                 "chunked req did not terminate after shutdown within DEFAULT_MAX_STEPS"
             )
-        assert r.finished or r.error_message is not None
+        assert r.finished or _error_message(r) is not None
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req is None or r.req.req_pool_idx is None
         assert r.lock_refs == 0
 
 

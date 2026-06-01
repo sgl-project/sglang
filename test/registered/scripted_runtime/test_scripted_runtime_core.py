@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
@@ -291,6 +292,238 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         assert released and all(
             ref == 0 for ref in released.values()
         ), f"radix nodes still locked after the req finished: {released}"
+
+    def test_start_req_ignore_eos_runs_full_length(self):
+        self.server.execute_script(self._script_ignore_eos_runs_full_length)
+
+    @staticmethod
+    def _script_ignore_eos_runs_full_length(t: ScriptedContext):
+        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=6, ignore_eos=True)
+        yield from run_until_finished(r)
+        req = r.req
+        assert req is not None, "finished req vanished before its output could be read"
+        assert (
+            len(req.output_ids) == 6
+        ), f"ignore_eos must decode the full length; got {list(req.output_ids)!r}"
+
+    def test_start_req_priority_is_propagated(self):
+        self.server.execute_script(self._script_priority_is_propagated)
+
+    @staticmethod
+    def _script_priority_is_propagated(t: ScriptedContext):
+        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=4, priority=7)
+        yield from advance_to_decode_step(r, 1)
+        req = r.req
+        assert req is not None and req.priority == 7, (
+            f"priority not propagated to the scheduler req; "
+            f"got {None if req is None else req.priority}"
+        )
+        yield from run_until_finished(r)
+
+    def test_start_req_dp_rank_zero_accepted(self):
+        self.server.execute_script(self._script_dp_rank_zero_accepted)
+
+    @staticmethod
+    def _script_dp_rank_zero_accepted(t: ScriptedContext):
+        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=4, dp_rank=0)
+        yield from run_until_finished(r)
+        assert r.finished, "dp_rank=0 req did not finish"
+
+    def test_abort_single_handle_finishes_with_abort_reason(self):
+        self.server.execute_script(self._script_abort_single_handle)
+
+    @staticmethod
+    def _script_abort_single_handle(t: ScriptedContext):
+        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=64)
+        yield from advance_to_decode_step(r, 1)
+        assert not r.finished, "req finished before abort could act"
+
+        t.abort(r)
+        saw_abort_reason = False
+        for _ in range(16):
+            yield
+            req = r.req
+            if req is not None and isinstance(req.finished_reason, FINISH_ABORT):
+                saw_abort_reason = True
+            if r.finished:
+                break
+        assert r.finished, "single-handle abort did not finish the req"
+        assert saw_abort_reason, "aborted req never carried a FINISH_ABORT reason"
+
+    def test_abort_single_handle_leaves_other_reqs_running(self):
+        self.server.execute_script(self._script_abort_single_handle_targeted)
+
+    @staticmethod
+    def _script_abort_single_handle_targeted(t: ScriptedContext):
+        keep = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=64)
+        victim = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=64)
+        yield from advance_to_decode_step(keep, 1)
+
+        t.abort(victim)
+        for _ in range(16):
+            yield
+            if victim.finished:
+                break
+        assert victim.finished, "targeted abort did not finish the victim req"
+        assert not keep.finished, "targeted abort wrongly finished the other req"
+
+        t.abort(keep)
+        yield from run_until_finished(keep)
+
+    def test_list_active_reqs_contains_live_req(self):
+        self.server.execute_script(self._script_list_active_reqs)
+
+    @staticmethod
+    def _script_list_active_reqs(t: ScriptedContext):
+        assert t.list_active_reqs() == [], "no active reqs expected when idle"
+        r = t.start_req(
+            prompt_len=_SHORT_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        actives = t.list_active_reqs()
+        assert any(req.rid == r.rid for req in actives), (
+            f"live req {r.rid!r} missing from active reqs "
+            f"{[req.rid for req in actives]!r}"
+        )
+        yield from run_until_finished(r)
+        for _ in range(5):
+            yield
+        assert (
+            t.list_active_reqs() == []
+        ), "active reqs should drain to empty after finish"
+
+    def test_kv_pages_held_during_run_released_after(self):
+        self.server.execute_script(self._script_kv_pages_set_then_released)
+
+    @staticmethod
+    def _script_kv_pages_set_then_released(t: ScriptedContext):
+        r = t.start_req(
+            prompt_len=_LONG_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        assert r.kv_pages > 0, f"expected kv_pages>0 mid-run; got {r.kv_pages}"
+        yield from run_until_finished(r)
+        assert r.kv_pages == 0, f"kv_pages should be 0 after finish; got {r.kv_pages}"
+
+    def test_engine_stats_tracks_kv_pool(self):
+        self.server.execute_script(self._script_engine_stats_tracks_kv)
+
+    @staticmethod
+    def _script_engine_stats_tracks_kv(t: ScriptedContext):
+        stats = t.engine_stats()
+        for key in ("kv_pool_free", "req_pool_free", "req_pool_total", "page_size"):
+            assert key in stats, f"engine_stats missing {key!r}: {stats!r}"
+        baseline_free = stats["kv_pool_free"]
+        assert baseline_free > 0
+        r = t.start_req(
+            prompt_len=_LONG_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        during_free = t.engine_stats()["kv_pool_free"]
+        assert during_free < baseline_free, (
+            f"kv_pool_free should drop while a req holds KV; "
+            f"baseline={baseline_free} during={during_free}"
+        )
+        yield from run_until_finished(r)
+        t.flush_cache()
+        for _ in range(5):
+            yield
+        after_free = t.engine_stats()["kv_pool_free"]
+        assert (
+            after_free >= during_free
+        ), f"kv_pool_free should recover after finish; during={during_free} after={after_free}"
+
+    def test_lock_refs_held_during_run_released_after(self):
+        self.server.execute_script(self._script_lock_refs_held_then_released)
+
+    @staticmethod
+    def _script_lock_refs_held_then_released(t: ScriptedContext):
+        t.flush_cache()
+        yield
+        r = t.start_req(
+            prompt_len=_LONG_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        assert (
+            r.lock_refs >= 1
+        ), f"radix lock_ref must be held mid-run; got {r.lock_refs}"
+        yield from run_until_finished(r)
+        assert (
+            r.lock_refs == 0
+        ), f"lock_refs must be released after finish; got {r.lock_refs}"
+
+    def test_batch_composition_shape_and_disjoint(self):
+        self.server.execute_script(self._script_batch_composition)
+
+    @staticmethod
+    def _script_batch_composition(t: ScriptedContext):
+        r = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from advance_to_nth_chunk(r, 1)
+        comp = t.batch_composition()
+        assert set(comp) == {
+            "prefill",
+            "decode",
+            "chunked",
+            "running",
+        }, f"unexpected batch_composition keys: {comp!r}"
+        assert (
+            r.rid in comp["chunked"]
+        ), f"chunked req must be in 'chunked'; got {comp!r}"
+        prefill, decode, chunked = (
+            set(comp["prefill"]),
+            set(comp["decode"]),
+            set(comp["chunked"]),
+        )
+        assert (
+            prefill.isdisjoint(decode)
+            and prefill.isdisjoint(chunked)
+            and decode.isdisjoint(chunked)
+        ), f"prefill/decode/chunked subsets must be disjoint; got {comp!r}"
+        yield from run_until_finished(r)
+        assert (
+            t.batch_composition()["chunked"] == []
+        ), "no chunked req should remain after the req finishes"
+
+    def test_chunks_done_zero_for_unchunked_prompt(self):
+        self.server.execute_script(self._script_chunks_done_zero)
+
+    @staticmethod
+    def _script_chunks_done_zero(t: ScriptedContext):
+        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2, ignore_eos=True)
+        yield from run_until_finished(r)
+        assert (
+            r.chunks_done == 0
+        ), f"prompt <= chunk must not chunk; got {r.chunks_done}"
+
+    def test_chunks_done_counts_two_chunks(self):
+        self.server.execute_script(self._script_chunks_done_two)
+
+    @staticmethod
+    def _script_chunks_done_two(t: ScriptedContext):
+        r = t.start_req(prompt_len=_CHUNK_SIZE + 2, max_new_tokens=2, ignore_eos=True)
+        yield from run_until_finished(r)
+        assert (
+            r.chunks_done == 2
+        ), f"chunk_size+2 prompt -> 2 chunks; got {r.chunks_done}"
+
+    def test_chunks_done_scales_with_prompt(self):
+        self.server.execute_script(self._script_chunks_done_five)
+
+    @staticmethod
+    def _script_chunks_done_five(t: ScriptedContext):
+        r = t.start_req(prompt_len=5 * _CHUNK_SIZE, max_new_tokens=2, ignore_eos=True)
+        yield from run_until_finished(r)
+        assert (
+            r.chunks_done == 5
+        ), f"5*chunk_size prompt -> 5 chunks; got {r.chunks_done}"
 
     def test_forward_ct_advances_once_per_yield(self):
         self.server.execute_script(self._script_forward_ct_advances_once_per_yield)

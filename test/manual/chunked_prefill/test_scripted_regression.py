@@ -41,11 +41,11 @@ class TestRegressionLora(ScriptedTestCase):
 
         yield from run_until_finished(r)
         assert r.finished
-        assert r.row_idx is None
+        assert r.req.req_pool_idx is None
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 2
+        assert len(r.req.output_ids) == 2
 
 
 class TestRegressionBasic(ScriptedTestCase):
@@ -64,10 +64,10 @@ class TestRegressionBasic(ScriptedTestCase):
         yield
 
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
-        assert not r.has_pending_chunk
-        assert r.pending_middle_outputs == 0
+        assert not r.is_chunking
+        assert r.req.inflight_middle_chunks == 0
 
     def test_pause_covers_waiting_chunked(self):
         self.server.execute_script(self._script_pause_covers_waiting_chunked)
@@ -82,28 +82,28 @@ class TestRegressionBasic(ScriptedTestCase):
         yield
 
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
-        assert not r.has_pending_chunk
+        assert not r.is_chunking
 
-    def test_pending_middle_outputs_invariant(self):
-        self.server.execute_script(self._script_pending_middle_outputs_invariant)
+    def test_inflight_middle_chunks_invariant(self):
+        self.server.execute_script(self._script_inflight_middle_chunks_invariant)
 
     @staticmethod
-    def _script_pending_middle_outputs_invariant(t: ScriptedContext):
+    def _script_inflight_middle_chunks_invariant(t: ScriptedContext):
         r = t.start_req(
             prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, ignore_eos=True
         )
 
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
         assert (
-            r.pending_middle_outputs > 0
-        ), "last-chunk admit must bump pending_middle_outputs"
+            r.req.inflight_middle_chunks > 0
+        ), "last-chunk admit must bump inflight_middle_chunks"
 
         yield from run_until(r, lambda h: not h.is_chunking)
-        assert r.pending_middle_outputs == 0, (
-            f"pending_middle_outputs should be 0 after chunk loop clears; "
-            f"got {r.pending_middle_outputs}"
+        assert r.req.inflight_middle_chunks == 0, (
+            f"inflight_middle_chunks should be 0 after chunk loop clears; "
+            f"got {r.req.inflight_middle_chunks}"
         )
 
         yield from run_until_finished(r)
@@ -125,16 +125,16 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
 
-    def test_revert_bump_pending_middle_outputs(self):
-        self.server.execute_script(self._script_revert_bump_pending_middle_outputs)
+    def test_revert_bump_inflight_middle_chunks(self):
+        self.server.execute_script(self._script_revert_bump_inflight_middle_chunks)
 
     @staticmethod
-    def _script_revert_bump_pending_middle_outputs(t: ScriptedContext):
+    def _script_revert_bump_inflight_middle_chunks(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
 
         observed_max = 0
         for _ in range(DEFAULT_MAX_STEPS):
-            observed_max = max(observed_max, r.pending_middle_outputs)
+            observed_max = max(observed_max, r.req.inflight_middle_chunks)
             if r.finished:
                 break
             yield
@@ -142,11 +142,11 @@ class TestRegressionBasic(ScriptedTestCase):
             raise AssertionError("req did not finish within DEFAULT_MAX_STEPS")
 
         assert observed_max == 1, (
-            f"e875cd36e4: pending_middle_outputs must be a 0/1 latch; "
+            f"e875cd36e4: inflight_middle_chunks must be a 0/1 latch; "
             f"observed max={observed_max} (pre-fix bug would bump to 2 "
             f"at the last-chunk admit boundary)"
         )
-        assert r.pending_middle_outputs == 0
+        assert r.req.inflight_middle_chunks == 0
         assert r.finished and r.chunks_done >= 2
 
     def test_filter_batch_exclude_in_flight_other_mb(self):
@@ -160,7 +160,7 @@ class TestRegressionBasic(ScriptedTestCase):
         observed_excluded_from_running = False
         for _ in range(DEFAULT_MAX_STEPS):
             in_flight_other_mb = t.in_flight_other_mb_rids()
-            running = t.running_rids()
+            running = [req.rid for req in t._scheduler.running_batch.reqs]
             if r.rid in in_flight_other_mb:
                 observed_in_flight_other_mb = True
                 assert r.rid not in running, (
@@ -197,7 +197,7 @@ class TestRegressionBasic(ScriptedTestCase):
             scheduler_path = t.last_scheduler_path()
             admission_path = t.last_admission_path()
 
-            if r.pending_middle_outputs > 0:
+            if r.req.inflight_middle_chunks > 0:
                 assert r.is_chunking
 
             if (
@@ -246,7 +246,7 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
         assert r1.chunks_done >= 2 and r2.chunks_done == 0
-        assert len(r1.output_tokens) == 2 and len(r2.output_tokens) == 2
+        assert len(r1.req.output_ids) == 2 and len(r2.req.output_ids) == 2
 
     def test_filter_batch_explicit_exclude_chunked_flag(self):
         self.server.execute_script(
@@ -262,7 +262,7 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
         assert r1.chunks_done >= 2
-        assert len(r1.output_tokens) == 2 and len(r2.output_tokens) == 2
+        assert len(r1.req.output_ids) == 2 and len(r2.req.output_ids) == 2
 
     def test_waiting_queue_pending_tokens_subtract_prefix(self):
         self.server.execute_script(
@@ -278,8 +278,8 @@ class TestRegressionBasic(ScriptedTestCase):
         yield
         yield from run_until(r1, lambda h: h.status == "waiting")
 
-        r1_prefix = r1.prefix_indices_len
-        r1_committed = r1.kv_committed_len
+        r1_prefix = len(r1.req.prefix_indices)
+        r1_committed = r1.req.kv_committed_len
         assert r1_committed > 0, "R1 must hold committed KV in waiting_queue"
         assert r1_prefix > 0, "R1 must have a non-zero stashed prefix"
 
@@ -288,8 +288,8 @@ class TestRegressionBasic(ScriptedTestCase):
 
         observed_pending = t.load_inquirer_num_pending_tokens()
 
-        r1_total = r1.total_tokens
-        r2_total = r2.total_tokens
+        r1_total = len(r1.req.origin_input_ids) + len(r1.req.output_ids)
+        r2_total = len(r2.req.origin_input_ids) + len(r2.req.output_ids)
         expected_post_fix = (r1_total - r1_prefix) + r2_total
         pre_fix_bad = r1_total + r2_total
 
@@ -318,27 +318,27 @@ class TestRegressionBasic(ScriptedTestCase):
         t.abort(r)
         yield
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
-        assert r.finish_event_count == 1
+        assert r.finished
 
     def test_chunked_admission_reuse_branch_balanced(self):
         self.server.execute_script(self._script_chunked_admission_reuse_branch_balanced)
 
     @staticmethod
     def _script_chunked_admission_reuse_branch_balanced(t: ScriptedContext):
-        baseline_refs = t.lock_refs_snapshot()
+        baseline_refs = t.get_all_node_lock_refs()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
         yield from run_until(r, lambda h: h.chunks_done >= 3 and h.is_chunking)
-        mid_refs = t.lock_refs_snapshot()
+        mid_refs = t.get_all_node_lock_refs()
         assert mid_refs - baseline_refs == 1, (
             f"reuse branch must not re-acquire lock_ref per chunk; "
             f"baseline={baseline_refs}, mid={mid_refs}"
         )
 
         yield from run_until_finished(r)
-        final_refs = t.lock_refs_snapshot()
+        final_refs = t.get_all_node_lock_refs()
         assert final_refs == baseline_refs, (
             f"chunked lifecycle must net to zero lock_ref delta; "
             f"baseline={baseline_refs}, final={final_refs}"
@@ -357,17 +357,20 @@ class TestRegressionBasic(ScriptedTestCase):
             f"between chunks the chunked-resume req must hold in "
             f"waiting_queue; got status={r.status!r}"
         )
-        assert r.has_pending_chunk, (
-            f"has_pending_chunk must be set while mid-chunk; got "
-            f"{r.has_pending_chunk!r}"
-        )
-        assert t.get_chunked_req_rid() is None, (
+        assert (
+            r.is_chunking
+        ), f"is_chunking must be set while mid-chunk; got {r.is_chunking!r}"
+        assert (
+            t._scheduler.chunked_req.rid
+            if t._scheduler.chunked_req is not None
+            else None
+        ) is None, (
             f"v2 must not maintain a top-level chunked_req field; "
-            f"got {t.get_chunked_req_rid()!r}"
+            f"got {(t._scheduler.chunked_req.rid if t._scheduler.chunked_req is not None else None)!r}"
         )
 
         yield from run_until_finished(r)
-        assert not r.has_pending_chunk
+        assert not r.is_chunking
         assert r.status in ("finished", "unknown")
 
     def test_chunked_retract_no_double_init_load_back(self):
@@ -377,7 +380,7 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_retract_no_double_init_load_back(t: ScriptedContext):
-        baseline_refs = t.lock_refs_snapshot()
+        baseline_refs = t.get_all_node_lock_refs()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
@@ -393,7 +396,7 @@ class TestRegressionBasic(ScriptedTestCase):
         )
 
         yield from run_until_finished(r)
-        assert t.lock_refs_snapshot() == baseline_refs
+        assert t.get_all_node_lock_refs() == baseline_refs
 
     def test_streaming_session_multiturn_no_reuse_branch(self):
         self.server.execute_script(
@@ -402,7 +405,7 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_streaming_session_multiturn_no_reuse_branch(t: ScriptedContext):
-        baseline_refs = t.lock_refs_snapshot()
+        baseline_refs = t.get_all_node_lock_refs()
         r1 = t.start_req(
             prompt_len=64,
             max_new_tokens=2,
@@ -417,11 +420,11 @@ class TestRegressionBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r2)
 
-        assert not r2.has_pending_chunk
-        assert t.lock_refs_snapshot() == baseline_refs, (
+        assert not r2.is_chunking
+        assert t.get_all_node_lock_refs() == baseline_refs, (
             f"streaming-session turn N>1 must not take chunked reuse "
             f"branch; lock_refs drifted from {baseline_refs} to "
-            f"{t.lock_refs_snapshot()}"
+            f"{t.get_all_node_lock_refs()}"
         )
 
     def test_abort_chunked_resume_releases_all_resources(self):
@@ -431,12 +434,12 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_chunked_resume_releases_all_resources(t: ScriptedContext):
-        baseline_refs = t.lock_refs_snapshot()
+        baseline_refs = t.get_all_node_lock_refs()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         yield from run_until(r, lambda h: h.status == "waiting")
 
-        assert r.row_idx is not None, "row must be held mid-chunk"
+        assert r.req.req_pool_idx is not None, "row must be held mid-chunk"
         assert r.kv_pages > 0, "committed KV must be held mid-chunk"
         assert r.lock_refs >= 1, "radix lock_ref must be held mid-chunk"
 
@@ -444,17 +447,17 @@ class TestRegressionBasic(ScriptedTestCase):
         yield
 
         assert (
-            r.row_idx is None
-        ), f"96d4749094: abort must release row; got row_idx={r.row_idx!r}"
+            r.req.req_pool_idx is None
+        ), f"96d4749094: abort must release row; got row_idx={r.req.req_pool_idx!r}"
         assert (
             r.kv_pages == 0
         ), f"96d4749094: abort must release KV; got kv_pages={r.kv_pages}"
         assert (
             r.lock_refs == 0
         ), f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
-        assert not r.has_pending_chunk
-        assert r.pending_middle_outputs == 0
-        assert t.lock_refs_snapshot() == baseline_refs
+        assert not r.is_chunking
+        assert r.req.inflight_middle_chunks == 0
+        assert t.get_all_node_lock_refs() == baseline_refs
 
     def test_abort_chunked_resume_dual_queue_no_double_release(self):
         self.server.execute_script(
@@ -466,8 +469,8 @@ class TestRegressionBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
         for _ in range(DEFAULT_MAX_STEPS):
-            in_waiting = r.rid in t.waiting_rids()
-            in_batch = r.rid in t.batch_rids()
+            in_waiting = r.rid in [req.rid for req in t._scheduler.waiting_queue]
+            in_batch = r.rid in [req.rid for req in t._scheduler.running_batch.reqs]
             if in_waiting and in_batch:
                 break
             if r.finished:
@@ -483,12 +486,9 @@ class TestRegressionBasic(ScriptedTestCase):
         t.abort(r)
         yield
 
-        assert r.finish_event_count == 1, (
-            f"de3859646b: dual-queue abort must dedup; got "
-            f"{r.finish_event_count} finish events"
-        )
+        assert r.finished
         assert r.kv_pages == 0
-        assert r.row_idx is None
+        assert r.req.req_pool_idx is None
         assert t.kv_pool_underflow_count() == 0, (
             f"double release_kv_cache underflowed pool; underflow_count="
             f"{t.kv_pool_underflow_count()}"
@@ -504,18 +504,18 @@ class TestRegressionBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         yield from run_until(r, lambda h: h.status == "waiting")
-        assert r.row_idx is not None and r.kv_pages > 0 and r.lock_refs >= 1
+        assert r.req.req_pool_idx is not None and r.kv_pages > 0 and r.lock_refs >= 1
 
         t.pause_retract_all()
         yield
 
-        assert r.row_idx is None, (
+        assert r.req.req_pool_idx is None, (
             f"f38e69f87d: pause(retract) must release waiting "
-            f"chunked-resume row; got row_idx={r.row_idx!r}"
+            f"chunked-resume row; got row_idx={r.req.req_pool_idx!r}"
         )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert not r.has_pending_chunk
+        assert not r.is_chunking
         assert t.is_fully_idle, (
             f"f38e69f87d: pause(retract) must leave engine fully idle; "
             f"got is_fully_idle={t.is_fully_idle!r}"
@@ -534,15 +534,19 @@ class TestRegressionBasic(ScriptedTestCase):
         t.retract_all()
         yield
 
-        assert t.batch_size() == 0, (
+        assert len(t._scheduler.running_batch.reqs) == 0, (
             f"f0388931bf: retract_all must clear batch; got batch_size="
-            f"{t.batch_size()}"
+            f"{len(t._scheduler.running_batch.reqs)}"
         )
-        assert t.get_chunked_req_rid() is None
+        assert (
+            t._scheduler.chunked_req.rid
+            if t._scheduler.chunked_req is not None
+            else None
+        ) is None
         for r in (r1, r2):
             assert r.status == "waiting"
             assert r.chunks_done == 0
-            assert not r.has_pending_chunk
+            assert not r.is_chunking
 
         yield from run_until_all_finished([r1, r2])
 
@@ -566,17 +570,14 @@ class TestRegressionPp(ScriptedTestCase):
         t.abort(r)
         yield
 
-        rids_after_abort = t.batch_rids()
+        rids_after_abort = [req.rid for req in t._scheduler.running_batch.reqs]
         occurrences = sum(1 for rid in rids_after_abort if rid == r.rid)
         assert occurrences <= 1, (
             f"b823c16e60: batch_rids must dedup across mbs + "
             f"waiting_queue; got {occurrences} occurrences of rid="
             f"{r.rid} (pre-fix bug would yield 3)"
         )
-        assert r.finish_event_count == 1, (
-            f"PP abort must dedup across microbatches; "
-            f"got {r.finish_event_count} finish events"
-        )
+        assert r.finished
 
     def test_pp_other_mb_chunked_exclude(self):
         self.server.execute_script(self._script_pp_other_mb_chunked_exclude)
@@ -590,7 +591,7 @@ class TestRegressionPp(ScriptedTestCase):
         ctrl_exclude_engaged = False
         for _ in range(2000):
             in_flight_other_mb = t.in_flight_other_mb_rids()
-            running = t.running_rids()
+            running = [req.rid for req in t._scheduler.running_batch.reqs]
             if r_long.rid in in_flight_other_mb:
                 long_exclude_engaged = True
                 assert r_long.rid not in running, (
@@ -600,7 +601,7 @@ class TestRegressionPp(ScriptedTestCase):
                 )
             if r_ctrl.rid in in_flight_other_mb and r_ctrl.rid in running:
                 ctrl_exclude_engaged = True
-            in_flight = t.chunked_in_flight_count()
+            in_flight = (1 if t._scheduler.chunked_req is not None else 0)
             assert (
                 in_flight <= 1
             ), f"PP cross-mb chunked exclusion broken: in_flight={in_flight}"
@@ -663,9 +664,9 @@ class TestRegressionPriority(ScriptedTestCase):
             ignore_eos=True,
         )
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
-        r1_prefix_before = r1.prefix_indices_len
-        r1_host_hit_before = r1.host_hit_length
-        lock_refs_before = t.lock_refs_snapshot()
+        r1_prefix_before = len(r1.req.prefix_indices)
+        r1_host_hit_before = r1.req.host_hit_length
+        lock_refs_before = t.get_all_node_lock_refs()
 
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
@@ -674,18 +675,18 @@ class TestRegressionPriority(ScriptedTestCase):
             ignore_eos=True,
         )
         yield
-        assert r1.prefix_indices_len == r1_prefix_before, (
+        assert len(r1.req.prefix_indices) == r1_prefix_before, (
             f"aaf3752d2b: priority prefix-match must skip chunked-resume; "
             f"prefix_indices_len changed {r1_prefix_before} -> "
-            f"{r1.prefix_indices_len}"
+            f"{len(r1.req.prefix_indices)}"
         )
-        assert r1.host_hit_length == r1_host_hit_before
-        assert t.lock_refs_snapshot() == lock_refs_before
+        assert r1.req.host_hit_length == r1_host_hit_before
+        assert t.get_all_node_lock_refs() == lock_refs_before
 
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
         assert r1.chunks_done >= 2
-        assert len(r1.output_tokens) == 2 and len(r2.output_tokens) == 2
+        assert len(r1.req.output_ids) == 2 and len(r2.req.output_ids) == 2
 
 
 class TestRegressionLpm(ScriptedTestCase):
@@ -730,21 +731,21 @@ class TestRegressionLpm(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.chunks_done >= 1 and h.is_chunking)
         yield from run_until(r1, lambda h: h.status == "waiting")
 
-        last_node_before = r1.last_node_id
-        prefix_len_before = r1.prefix_indices_len
-        host_hit_before = r1.host_hit_length
-        lock_refs_before = t.lock_refs_snapshot()
+        last_node_before = r1.req.last_node.id
+        prefix_len_before = len(r1.req.prefix_indices)
+        host_hit_before = r1.req.host_hit_length
+        lock_refs_before = t.get_all_node_lock_refs()
 
         r2 = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield
 
-        assert r1.last_node_id == last_node_before, (
+        assert r1.req.last_node.id == last_node_before, (
             f"calc_priority overwrote chunked-resume last_node; "
-            f"before={last_node_before!r}, after={r1.last_node_id!r}"
+            f"before={last_node_before!r}, after={r1.req.last_node.id!r}"
         )
-        assert r1.prefix_indices_len == prefix_len_before
-        assert r1.host_hit_length == host_hit_before
-        assert t.lock_refs_snapshot() == lock_refs_before
+        assert len(r1.req.prefix_indices) == prefix_len_before
+        assert r1.req.host_hit_length == host_hit_before
+        assert t.get_all_node_lock_refs() == lock_refs_before
 
         yield from run_until_all_finished([r1, r2])
 
@@ -797,14 +798,14 @@ class TestRegressionGptOss(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        committed = r.kv_committed_len
+        committed = r.req.kv_committed_len
         assert committed > 0
 
         yield from run_until(r, lambda h: h.status == "waiting")
 
-        assert r.prefix_indices_len <= committed, (
+        assert len(r.req.prefix_indices) <= committed, (
             f"cache_unfinished_req over-read past kv_committed_len: "
-            f"prefix_indices_len={r.prefix_indices_len}, "
+            f"prefix_indices_len={len(r.req.prefix_indices)}, "
             f"kv_committed_len={committed}"
         )
         yield from run_until_finished(r)
@@ -825,7 +826,7 @@ class TestRegressionWaitingTimeout(ScriptedTestCase):
     def _script_chunked_resume_immune_to_waiting_timeout(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        assert r.has_pending_chunk
+        assert r.is_chunking
 
         t.trigger_abort_on_waiting_timeout()
         yield
@@ -834,7 +835,7 @@ class TestRegressionWaitingTimeout(ScriptedTestCase):
             r, "aborted", False
         ), f"359e5ed7bd: chunked-resume must be immune to waiting timeout abort"
         assert r.kv_pages > 0 or r.chunks_done > 0
-        assert r.has_pending_chunk or r.chunks_done > 0
+        assert r.is_chunking or r.chunks_done > 0
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2

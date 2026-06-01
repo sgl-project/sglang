@@ -53,9 +53,9 @@ class TestSpecBasic(ScriptedTestCase):
             f"first spec verify must see prefix_len == prompt_len, got "
             f"{r.spec_first_verify_prefix_len}"
         )
-        assert r.spec_verify_count >= 1, (
+        assert r.req.spec_verify_ct >= 1, (
             f"expected >=1 spec verify after chunked handoff, got "
-            f"{r.spec_verify_count}"
+            f"{r.req.spec_verify_ct}"
         )
 
     def test_spec_acceptance_chunked_matches_baseline(self):

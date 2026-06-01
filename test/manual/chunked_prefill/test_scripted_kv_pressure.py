@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -31,7 +32,7 @@ class TestKVPressureBasic(ScriptedTestCase):
 
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.row_idx is None
+        assert r.req.req_pool_idx is None
         stats = t.engine_stats()
         assert stats["kv_pool_free"] >= 1
 
@@ -46,10 +47,14 @@ class TestKVPressureBasic(ScriptedTestCase):
 
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         for _ in range(2000):
-            if r.finished or r.error_message is not None:
+            if r.finished or (
+                r.req is not None and isinstance(r.req.finished_reason, FINISH_ABORT)
+            ):
                 break
             yield
-        assert r.finished or r.error_message is not None
+        assert r.finished or (
+            r.req is not None and isinstance(r.req.finished_reason, FINISH_ABORT)
+        )
         assert r.kv_pages == 0
         final = t.engine_stats()["kv_pool_free"]
         assert final >= baseline, (
@@ -88,7 +93,7 @@ class TestKVPressureBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_row_pool_tight_admits_after_release(t: ScriptedContext):
-        baseline_rows_used = t.row_pool_used()
+        baseline_rows_used = (t._scheduler.req_to_token_pool.size - t._scheduler.req_to_token_pool.available_size())
         t.exhaust_row_pool(leave_rows=2)
         yield
 
@@ -100,7 +105,7 @@ class TestKVPressureBasic(ScriptedTestCase):
                 f"row-pool pressure must not leave KV held: rid={r.rid}, "
                 f"kv_pages={r.kv_pages}"
             )
-        final_rows_used = t.row_pool_used()
+        final_rows_used = (t._scheduler.req_to_token_pool.size - t._scheduler.req_to_token_pool.available_size())
         assert final_rows_used <= baseline_rows_used, (
             f"row pool leak after admit-after-release: baseline used="
             f"{baseline_rows_used}, final used={final_rows_used}"
@@ -111,7 +116,7 @@ class TestKVPressureBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_lock_refs_tight_concurrent_prefix(t: ScriptedContext):
-        baseline_lock_refs = t.lock_refs_snapshot()
+        baseline_lock_refs = t.get_all_node_lock_refs()
         t.exhaust_lock_refs(leave_refs=4)
         yield
         r_warm = t.start_req(prompt_len=128, max_new_tokens=2)
@@ -125,7 +130,7 @@ class TestKVPressureBasic(ScriptedTestCase):
             assert (
                 r.lock_refs == 0
             ), f"req {r.rid} leaked {r.lock_refs} lock_refs after finish"
-        final_lock_refs = t.lock_refs_snapshot()
+        final_lock_refs = t.get_all_node_lock_refs()
         assert final_lock_refs <= baseline_lock_refs, (
             f"global lock_refs leaked from baseline={baseline_lock_refs} "
             f"to final={final_lock_refs}"

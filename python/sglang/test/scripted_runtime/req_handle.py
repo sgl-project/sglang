@@ -24,3 +24,17 @@ class ScriptedReqHandle:
     @property
     def is_chunking(self) -> bool:
         return self.context.is_chunking(self.rid)
+
+    @property
+    def chunks_done(self) -> int:
+        return self.context.chunks_done(self.rid)
+
+    @property
+    def kv_pages(self) -> int:
+        page_size = self.context._scheduler.page_size
+        return (self.req.kv_allocated_len + page_size - 1) // page_size
+
+    @property
+    def lock_refs(self) -> int:
+        node = self.req.last_node
+        return node.lock_ref if node is not None else 0

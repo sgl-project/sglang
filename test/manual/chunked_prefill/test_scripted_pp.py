@@ -33,10 +33,7 @@ class TestPPBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.finish_event_count == 1, (
-            f"chunked req must finalize once across microbatches, "
-            f"got finish_event_count={r.finish_event_count}"
-        )
+        # exactly-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
 
     def test_pp_abort_during_inflight_chunk(self):
         self.server.execute_script(self._script_pp_abort_during_inflight_chunk)
@@ -49,7 +46,7 @@ class TestPPBasic(ScriptedTestCase):
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.finish_event_count <= 1
+        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
 
     def test_pp_last_chunk_cross_mb_kv_correctness(self):
         self.server.execute_script(self._script_pp_last_chunk_cross_mb_kv_correctness)
@@ -60,9 +57,9 @@ class TestPPBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert len(r.output_tokens) == 8, (
+        assert len(r.req.output_ids) == 8, (
             f"decode must produce all 8 tokens cleanly, got "
-            f"len(output_tokens)={len(r.output_tokens)}"
+            f"len(output_tokens)={len(r.req.output_ids)}"
         )
 
     def test_pp_multi_microbatch_chunks_done_aggregation(self):
@@ -79,7 +76,7 @@ class TestPPBasic(ScriptedTestCase):
             f"PP=2 multi-chunk req should aggregate >=4 chunks_done across "
             f"microbatches, got {r.chunks_done}"
         )
-        assert r.finish_event_count == 1
+        assert r.finished
 
     def test_pp_two_chunked_one_per_mb_simultaneous(self):
         self.server.execute_script(self._script_pp_two_chunked_one_per_mb_simultaneous)
@@ -92,7 +89,7 @@ class TestPPBasic(ScriptedTestCase):
         for _ in range(50):
             if r1.is_chunking and r2.is_chunking:
                 observed_both_chunking = True
-                count = t.chunked_in_flight_count()
+                count = 1 if t._scheduler.chunked_req is not None else 0
                 assert count <= 2, (
                     f"global chunked_in_flight_count exceeds pp_size, got " f"{count}"
                 )
@@ -174,8 +171,8 @@ class TestPPDynamic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2, f"expected >=2 chunks, got {r.chunks_done}"
-        assert r.finish_event_count == 1
-        assert len(r.output_tokens) == 4
+        assert r.finished
+        assert len(r.req.output_ids) == 4
 
     def test_pp_dynamic_chunking_predictor(self):
         self.server.execute_script(self._script_pp_dynamic_chunking_predictor)

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 from sglang.test.scripted_runtime.context import (
+    engine,
     lifecycle,
     queries,
     radix,
@@ -35,6 +36,7 @@ class ScriptedContext:
             scheduler_hook._is_driver
         ), "ScriptedContext only exists on the driver rank"
         self._scheduler = scheduler_hook._scheduler
+        self._scheduler_hook = scheduler_hook
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._http_poster = http_poster
 
@@ -48,6 +50,8 @@ class ScriptedContext:
         max_new_tokens: int = 8,
         rid: Optional[str] = None,
         ignore_eos: bool = False,
+        priority: Optional[int] = None,
+        dp_rank: Optional[int] = None,
         prompt_token: int = 1,
     ) -> "ScriptedReqHandle":
         return self._req_starter.start_req(
@@ -55,6 +59,8 @@ class ScriptedContext:
             max_new_tokens=max_new_tokens,
             rid=rid,
             ignore_eos=ignore_eos,
+            priority=priority,
+            dp_rank=dp_rank,
             prompt_token=prompt_token,
         )
 
@@ -67,8 +73,8 @@ class ScriptedContext:
     def abort_all(self) -> None:
         return lifecycle.abort_all(self)
 
-    def abort_req(self, rid: str) -> None:
-        return lifecycle.abort_req(self, rid=rid)
+    def abort(self, handle: "ScriptedReqHandle") -> None:
+        return lifecycle.abort(self, rid=handle.rid)
 
     def flush_cache(self) -> None:
         return lifecycle.flush_cache(self)
@@ -87,3 +93,15 @@ class ScriptedContext:
 
     def is_chunking(self, rid: str) -> bool:
         return queries.is_chunking(self, rid)
+
+    def list_active_reqs(self) -> List["Req"]:
+        return queries.list_active_reqs(self)
+
+    def chunks_done(self, rid: str) -> int:
+        return queries.chunks_done(self, rid)
+
+    def batch_composition(self) -> Dict[str, List[str]]:
+        return queries.batch_composition(self)
+
+    def engine_stats(self) -> Dict[str, int]:
+        return engine.engine_stats(self)

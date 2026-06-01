@@ -57,7 +57,7 @@ def abort_all(ctx: "ScriptedContext") -> None:
     )
 
 
-def abort_req(ctx: "ScriptedContext", *, rid: str) -> None:
+def abort(ctx: "ScriptedContext", *, rid: str) -> None:
     _await_control(
         ctx,
         path="/abort_request",
