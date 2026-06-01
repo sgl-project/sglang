@@ -13,20 +13,27 @@ register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 
 _SWA_MODEL = "openai/gpt-oss-20b"
 
-# To reach add_chunked_req's early-return the full KV pool must run out while the
-# chunked req r is mid-prefill. The admission gate already reserves the resident
-# competitor's future decode tokens, so r is only admitted when competitor +
-# r_prompt fits the pool; the pool can therefore only overflow via the resident
-# req decoding *more* than its (0.7x) reservation. enable_mixed_chunk lets the
-# competitor decode alongside r's prefill chunks, and the prompt/decode sizes are
-# tuned so that extra growth pushes the pool to 1.00 on r's final chunk while the
-# competitor (ignore_eos) is still resident -- parking r until it frees its KV.
+# To reach add_chunked_req's hybrid-SWA early-return the full KV pool must run
+# out while the chunked req r is mid-prefill. We arrange this WITHOUT
+# enable_mixed_chunk and WITHOUT an ignore_eos competitor:
+#
+# A resident competitor (bounded by max_new_tokens, EOS allowed) finishes its
+# own prefill first, so its entire prompt occupies the full-attention KV pool.
+# While r then prefills chunk by chunk, prefill batches preempt decode, so the
+# competitor never gets a decode step -- it neither advances toward EOS nor
+# grows, staying pinned at its full prompt footprint. The competitor prompt +
+# r prompt deliberately exceed the full pool (4096 + 4608 > 8192), so r's
+# per-chunk add_chunked_req drives rem_total_tokens <= 0 partway through its
+# prefill -- the early-return parks r (kept as scheduler.chunked_req but absent
+# from the forward batch). Only once r is parked does the decode batch run,
+# letting the competitor decode to max_new_tokens, finish, and free its KV so r
+# can resume and complete.
 _MAX_TOTAL_TOKENS = 8192
 _SWA_FULL_TOKENS_RATIO = 0.8
 _CHUNK_SIZE = 64
-_RESIDENT_PROMPT = 4032
+_RESIDENT_PROMPT = 4096
 _RESIDENT_DECODE = 82
-_CHUNKED_PROMPT = 4096
+_CHUNKED_PROMPT = 4608
 
 
 class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
@@ -38,7 +45,6 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
         page_size=1,
         mem_fraction_static=0.70,
         disable_piecewise_cuda_graph=True,
-        enable_mixed_chunk=True,
     )
 
     def test_swa_chunked_req_early_return_no_double_free(self):
@@ -53,7 +59,6 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
         competitor = t.start_req(
             prompt_len=_RESIDENT_PROMPT,
             max_new_tokens=_RESIDENT_DECODE,
-            ignore_eos=True,
         )
         yield from run_until(competitor, lambda h: h.is_chunking)
         yield from run_until(competitor, lambda h: not h.is_chunking)

@@ -45,9 +45,7 @@ class ScriptedContext:
         self._fully_free_kv_size = (
             self._scheduler.token_to_kv_pool_allocator.available_size()
         )
-        self._fully_free_req_slots = (
-            self._scheduler.req_to_token_pool.available_size()
-        )
+        self._fully_free_req_slots = self._scheduler.req_to_token_pool.available_size()
 
         self._seen_rids: set[str] = set()
         self._req_starter = ScriptedContextReqStarter(self)
