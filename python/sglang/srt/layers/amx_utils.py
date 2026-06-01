@@ -222,3 +222,96 @@ class PackWeightMethod:
         _amx_process_weight_after_loading(
             module, self.weight_names, self.transpose_dims
         )
+
+
+class PackWeightMethodBMM:
+    """Pack weight for batched matrix multiplication (bmm_cpu).
+
+    Replaces the default UnquantizedLinearMethod on a linear layer so that
+    the 2D weight [G*R, D] is reshaped to 3D [G, R, D] and then VNNI-packed.
+    """
+
+    def __init__(self, n_groups, group_size):
+        self.n_groups = n_groups
+        self.group_size = group_size
+
+    def process_weights_after_loading(self, module) -> None:
+        weight = module.weight
+        device = weight.device
+
+        # Reshape [G*R, D] → [G, R, D] for batched GEMM
+        weight_3d = weight.data.view(self.n_groups, self.group_size, -1).contiguous()
+
+        if not dim_is_supported(weight_3d):
+            logger.warning(
+                f"Unsupported dimension for prepacking for weight "
+                f"'weight' with shape {weight_3d.shape} in {module}. "
+                f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
+            )
+            module.use_intel_amx_backend = False
+            return
+
+        packed_weight = torch.nn.Parameter(
+            amx_process_weight_after_loading(weight_3d),
+            requires_grad=False,
+        )
+        module.weight = packed_weight
+        module.use_intel_amx_backend = (
+            device == torch.device("cpu") and cpu_has_amx_support()
+        )
+
+
+def amx_fused_experts_mxfp4(
+    layer,
+    dispatch_output,
+    moe_runner_config,
+    *,
+    scale_attrs=("w13_weight_scale", "w2_weight_scale"),
+):
+    """Run the CPU AMX fused_experts kernel for MxFP4 MoE.
+
+    Returns a StandardCombineInput wrapping the output tensor.
+    """
+    from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+    from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+    hidden_states = dispatch_output.hidden_states
+    topk_weights, topk_ids, _ = dispatch_output.topk_output
+    x, topk_weights = apply_topk_weights_cpu(
+        moe_runner_config.apply_router_weight_on_input,
+        topk_weights,
+        hidden_states,
+    )
+
+    # Two checkpoint conventions expose the gate/up clamp differently
+    # (gemm1_clamp_limit on GPT-OSS/Step3.5, swiglu_limit on DSv4). No model
+    # sets both today. Add an assertion that they can't be both set to avoid
+    # silent bug in the future
+    assert not (
+        moe_runner_config.gemm1_clamp_limit is not None
+        and moe_runner_config.swiglu_limit is not None
+    ), "gemm1_clamp_limit and swiglu_limit must not both be set"
+    clamp = moe_runner_config.gemm1_clamp_limit
+    if clamp is None and moe_runner_config.swiglu_limit is not None:
+        clamp = float(moe_runner_config.swiglu_limit)
+
+    output = torch.ops.sgl_kernel.fused_experts_cpu(
+        x,
+        layer.w13_weight,
+        layer.w2_weight,
+        topk_weights,
+        topk_ids.to(torch.int32),
+        False,  # inplace See [Note] inplace should be False in fused_experts.
+        CPUQuantMethod.MXFP4,
+        getattr(layer, scale_attrs[0]),
+        getattr(layer, scale_attrs[1]),
+        None,  # w1_zp
+        None,  # w2_zp
+        None,  # block_size
+        getattr(layer, "w13_weight_bias", None),
+        getattr(layer, "w2_weight_bias", None),
+        moe_runner_config.gemm1_alpha,
+        clamp,
+        True,  # is_vnni
+    )
+    return StandardCombineInput(hidden_states=output)

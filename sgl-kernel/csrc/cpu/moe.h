@@ -173,6 +173,43 @@ inline void silu_and_mul_stub(
 }
 
 template <typename scalar_t>
+inline void clamped_silu_and_mul_stub(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,   // gate buffer
+    const scalar_t* __restrict__ input2,  // up buffer
+    int64_t size,
+    const float limit) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  const fVec one = fVec(1.f);
+  const fVec limit_v = fVec(limit);
+  const fVec nlimit_v = fVec(-limit);
+
+  // no remainder
+#pragma GCC unroll 4
+  for (int64_t d = 0; d < size; d += bVec::size()) {
+    bVec x = bVec::loadu(input + d);
+    fVec x0, x1;
+    std::tie(x0, x1) = at::vec::convert_to_float(x);
+    bVec y = bVec::loadu(input2 + d);
+    fVec y0, y1;
+    std::tie(y0, y1) = at::vec::convert_to_float(y);
+    // gate: clamp at upper bound only; up: clamp symmetrically
+    x0 = at::vec::minimum(x0, limit_v);
+    x1 = at::vec::minimum(x1, limit_v);
+    y0 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y0));
+    y1 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y1));
+    // silu(gate) * up
+    x0 = x0 / (one + x0.neg().exp_u20());
+    x1 = x1 / (one + x1.neg().exp_u20());
+    x0 = x0 * y0;
+    x1 = x1 * y1;
+    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+    out_vec.store(out + d);
+  }
+}
+
+template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
