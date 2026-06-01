@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import (
@@ -14,6 +16,7 @@ register_cuda_ci(est_time=450, stage="nightly", runner_config="2-gpu-large")
 RESULT_DIR = "performance_results_text_models"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyTextModelsPerformance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
