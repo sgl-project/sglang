@@ -69,6 +69,23 @@ table is a live reference.
 - Format raw API objects (`ChatCompletionMessage(...)`) into readable Reasoning /
   Content / Tool Calls blocks.
 
+## Frontmatter
+
+- **Top-level `description:`** is the canonical field — it sets the page's SEO meta
+  description (`og:`/`twitter:description` fall back to it) AND renders as the visible
+  **subtitle** under the title, filling the header band before the first heading. Give every
+  page a one-line top-level `description` (a lede / value prop) — without it, a page that
+  opens straight into `## Deployment` shows an empty gap under the title (the title and
+  `## Deployment` are the same size, so they read as two bare headings). Do **not** put the
+  description inside a `metatags` block — `metatags` is for other/custom tags, and
+  `metatags.description` is redundant with (and non-canonical vs) the top-level field.
+  - **Write it for SEO** (it doubles as the search-result snippet): front-load the exact
+    model name + intent — e.g. `Deploy <Model> with SGLang — …` — aim for ~150–160 chars, and
+    pack secondary keywords (variants + sizes, `Mixture-of-Experts` / architecture, target
+    GPUs). Phrase it as a value prop, not a generic "`<Model>` is a … model" intro.
+- Frontmatter MUST be the first thing in the file — no comment or blank line before the
+  opening `---`.
+
 ## Commands & ports
 
 - **Deploy/launch** commands use `sglang serve --model-path …` — never
