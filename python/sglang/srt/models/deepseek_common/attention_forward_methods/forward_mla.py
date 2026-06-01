@@ -221,10 +221,7 @@ class DeepseekMLAForwardMixin:
     ) -> bool:
         if not _enable_graph_dsa_split_op_fusion:
             return False
-        if not (
-            _is_cuda
-            and (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-        ):
+        if not (is_in_piecewise_cuda_graph() or is_in_breakable_cuda_graph()):
             return False
         # Keep this fusion on the same non-speculative extend PCG/BCG surface
         # as dsa_indexer_graph_dispatch. This path already goes through
@@ -243,8 +240,6 @@ class DeepseekMLAForwardMixin:
         if self.w_kc.dtype == torch.float8_e4m3fn:
             return False
         if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            return False
-        if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
             return False
         return True
 
