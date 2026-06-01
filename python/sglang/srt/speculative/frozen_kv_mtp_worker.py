@@ -651,7 +651,10 @@ class FrozenKVMTPWorker(TpModelWorker):
         forward_batch.spec_info.hidden_states = seed_prev_hidden
         self._set_positions(forward_batch)
 
-        with self._target_kv_pool_view(forward_batch):
+        with (
+            self._target_kv_pool_view(forward_batch),
+            forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+        ):
             seed_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
