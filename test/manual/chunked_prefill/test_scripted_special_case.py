@@ -459,7 +459,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             t._scheduler.req_to_token_pool.size
             - t._scheduler.req_to_token_pool.available_size()
         )
-        t.exhaust_kv()
+        t.exhaust_kv(leave_pages=0)
         yield from run_until_finished(r)
         assert r.finished
         assert (
@@ -632,7 +632,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     def _script_add_chunked_req_non_swa_forced_admit_on_rem_zero(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.exhaust_kv()
+        t.exhaust_kv(leave_pages=0)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished, (
             "non-SWA chunked-resume must be force-admitted when "

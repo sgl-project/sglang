@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 from sglang.test.scripted_runtime.context import (
     engine,
     lifecycle,
-    pools,
     queries,
     radix,
+)
+from sglang.test.scripted_runtime.context.kv_pool_exhauster import (
+    ScriptedKvPoolExhauster,
 )
 from sglang.test.scripted_runtime.context.req_starter import ScriptedContextReqStarter
 
@@ -42,7 +44,7 @@ class ScriptedContext:
         self._http_poster = http_poster
 
         self._seen_rids: set[str] = set()
-        self._held_kv_allocations: list = []
+        self._kv_exhauster = ScriptedKvPoolExhauster(self._scheduler)
         self._req_starter = ScriptedContextReqStarter(self)
 
     def start_req(
@@ -94,10 +96,10 @@ class ScriptedContext:
         return lifecycle.flush_cache(self)
 
     def exhaust_kv(self, *, leave_pages: int) -> None:
-        return pools.exhaust_kv(self, leave_pages=leave_pages)
+        return self._kv_exhauster.exhaust(leave_pages=leave_pages)
 
     def _release_exhausted_pools(self) -> None:
-        return pools.release_exhausted(self)
+        return self._kv_exhauster.release()
 
     def get_all_node_hit_counts(self) -> Dict[int, int]:
         return radix.get_all_node_hit_counts(self)
