@@ -31,7 +31,7 @@ class TestPhi4ReasoningCPU(unittest.TestCase):
             ModelLaunchSettings(
                 MODEL_PATH,
                 extra_args=BASE_ARGS,
-                tp_size=1,
+                tp_size=2,
                 launch_timeout=CPU_LAUNCH_TIMEOUT,
             ),
         ]
