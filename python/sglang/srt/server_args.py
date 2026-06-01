@@ -29,6 +29,7 @@ import uuid
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -110,6 +111,8 @@ LLAMA4_MODEL_ARCHS = (
 )
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+    SAMPLING_BACKEND_CHOICES.add("token_oracle")
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -797,6 +800,9 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     disable_attn_tp_gather: bool = False
     gc_threshold: Optional[List[int]] = None
+    kv_canary: str = "none"
+    kv_canary_real_data: str = "none"
+    kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
     dsa_prefill_cp_mode: str = "round-robin-split"
@@ -1008,6 +1014,9 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+
+        # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
+        self._validate_cutedsl_a2a_token_budget()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -3489,6 +3498,61 @@ class ServerArgs:
                 f"with torch.compile)."
             )
 
+    def cutedsl_moe_max_num_tokens(self) -> int:
+        """Largest number of tokens a single forward routes through a CuteDSL
+        MoE layer on one (DP) rank. Single source of truth for both the
+        standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
+        budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
+        capture, and decode/verify bounds; num_tokens_per_bs is
+        speculative_num_draft_tokens under speculative decoding, else 1.
+        """
+        if self.speculative_algorithm:
+            num_tokens_per_bs = self.speculative_num_draft_tokens or 1
+        else:
+            num_tokens_per_bs = 1
+        prefill_tokens = self.max_prefill_tokens
+        prefill_cfg = self.cuda_graph_config[Phase.PREFILL]
+        if prefill_cfg["backend"] == Backend.TC_PIECEWISE:
+            prefill_tokens = max(prefill_tokens, prefill_cfg.get("max_bs") or 0)
+        decode_max_bs = self.cuda_graph_config[Phase.DECODE].get("max_bs") or 0
+        decode_tokens = decode_max_bs * num_tokens_per_bs
+        return max(prefill_tokens, decode_tokens)
+
+    def _validate_cutedsl_a2a_token_budget(self):
+        """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
+        largest CuteDSL MoE forward. Runs after speculative decoding is resolved
+        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_bs."""
+        if not (
+            self.moe_a2a_backend == "flashinfer"
+            and self.moe_runner_backend == "flashinfer_cutedsl"
+            and self.max_prefill_tokens > 0
+            and self.disaggregation_mode != "decode"
+        ):
+            return
+        required_tokens = self.cutedsl_moe_max_num_tokens()
+        max_dispatch_tokens_per_rank = get_int_env_var(
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
+        )
+        max_cutedsl_tokens = max_dispatch_tokens_per_rank * self.ep_size
+        if max_cutedsl_tokens < required_tokens:
+            required_per_rank = (required_tokens + self.ep_size - 1) // self.ep_size
+            raise ValueError(
+                "FlashInfer MoE A2A with flashinfer_cutedsl requires "
+                "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
+                "ep_size to cover the largest CuteDSL MoE forward "
+                f"({required_tokens} tokens). Otherwise the FlashInfer "
+                "dispatcher can crash at runtime with "
+                "`ValueError: num_tokens (...) exceeds max_num_tokens (...)`. "
+                "Current values: "
+                f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                f"{max_dispatch_tokens_per_rank}, ep_size={self.ep_size}, "
+                f"capacity={max_cutedsl_tokens}, required={required_tokens}. "
+                f"Set `export "
+                f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                f"{required_per_rank}` or lower the relevant limit "
+                f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
+            )
+
     def _handle_a2a_moe(self):
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
             logger.warning(
@@ -3585,37 +3649,6 @@ class ServerArgs:
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
-            if (
-                self.moe_runner_backend == "flashinfer_cutedsl"
-                and self.max_prefill_tokens is not None
-                and self.max_prefill_tokens > 0
-                and self.disaggregation_mode != "decode"
-            ):
-                max_dispatch_tokens_per_rank = get_int_env_var(
-                    "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
-                )
-                max_cutedsl_tokens = max_dispatch_tokens_per_rank * self.ep_size
-                if max_cutedsl_tokens < self.max_prefill_tokens:
-                    required_per_rank = (
-                        self.max_prefill_tokens + self.ep_size - 1
-                    ) // self.ep_size
-                    raise ValueError(
-                        "FlashInfer MoE A2A with flashinfer_cutedsl requires "
-                        "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
-                        "ep_size to cover --max-prefill-tokens. Otherwise the "
-                        "FlashInfer dispatcher can crash at runtime with "
-                        "`ValueError: num_tokens (...) exceeds max_num_tokens (...)` "
-                        "when a local DP rank schedules too many prefill tokens. "
-                        "Current values: "
-                        f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                        f"{max_dispatch_tokens_per_rank}, ep_size={self.ep_size}, "
-                        f"capacity={max_cutedsl_tokens}, "
-                        f"max_prefill_tokens={self.max_prefill_tokens}. "
-                        f"Set `export "
-                        f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                        f"{required_per_rank}` or lower `--max-prefill-tokens` "
-                        f"to <= {max_cutedsl_tokens}."
-                    )
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
@@ -6457,6 +6490,38 @@ class ServerArgs:
             "convenience flags and over legacy flags.",
         )
 
+        # --- KV canary debug flags (upstream PR #26818-26821) ------------
+        parser.add_argument(
+            "--kv-canary",
+            type=str,
+            default=ServerArgs.kv_canary,
+            choices=["none", "log", "raise"],
+            help=(
+                "KV cache canary mode. "
+                "'none' disables the canary (default). "
+                "'log' prints them while the server keeps running (production-safe). "
+                "'raise' fails the server on the first detected mismatch (CI lane)."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-real-data",
+            type=str,
+            default=ServerArgs.kv_canary_real_data,
+            choices=[m.name.lower() for m in RealKvHashMode],
+            help=(
+                "Check the real KV-cache in the canary. "
+                "'none' (default) disables the feature. "
+                "'partial' checks the first 16 bytes of each real-KV slot. "
+                "'all' checks the full real-KV slot."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-sweep-interval",
+            type=int,
+            default=ServerArgs.kv_canary_sweep_interval,
+            help="Every N forward steps, run a full-pool sweep.",
+        )
+
         # --- CUDA graph: per-phase convenience flags ---------------------
         parser.add_argument(
             "--cuda-graph-backend-decode",
@@ -7450,10 +7515,11 @@ class ServerArgs:
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-        assert self.moe_dense_tp_size in {
-            1,
+        assert self.moe_dense_tp_size in (
             None,
-        }, "moe_dense_tp_size only support 1 and None currently"
+            1,
+            self.tp_size,
+        ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
         if not is_runai_obj_uri(self.served_model_name):
@@ -7603,6 +7669,11 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
+            raise ValueError(
+                "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

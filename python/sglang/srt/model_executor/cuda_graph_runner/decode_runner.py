@@ -512,6 +512,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:bs]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
 
         buffers.num_token_non_padded[...] = num_tokens
         if (
@@ -621,6 +627,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
@@ -686,17 +694,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
-            shape_key = self._make_graph_key(bs, stream_idx, variant_label)
-            self.backend.capture_one(
-                shape_key,
-                run_once,
-                dummies=None,
-                post_warmup_hook=getattr(
-                    self.model_runner.attn_backend,
-                    "on_after_cuda_graph_warmup",
-                    None,
-                ),
+            canary_ctx = (
+                c.with_active_single_forward_manager(0)
+                if (c := self.model_runner.canary_manager) is not None
+                else contextlib.nullcontext()
             )
+            with canary_ctx:
+                shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                self.backend.capture_one(
+                    shape_key,
+                    run_once,
+                    dummies=None,
+                    post_warmup_hook=getattr(
+                        self.model_runner.attn_backend,
+                        "on_after_cuda_graph_warmup",
+                        None,
+                    ),
+                )
 
     # -----------------------------------------------------------------
     # recapture
