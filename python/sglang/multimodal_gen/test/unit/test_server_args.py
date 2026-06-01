@@ -559,7 +559,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["image_encoder", "vae"])
 
-    def test_layerwise_components_disable_matching_cpu_offloads(self):
+    def test_layerwise_components_disable_matching_non_dit_cpu_offloads(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             memory_gb=16,

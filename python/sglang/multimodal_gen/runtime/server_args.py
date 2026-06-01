@@ -893,15 +893,15 @@ class ServerArgs(DisaggArgsMixin):
 
         if explicitly_set_component_names is not None:
             self.layerwise_offload_components = explicitly_set_component_names
-            self._disable_cpu_offload_for_layerwise_components(
+            self._disable_non_dit_cpu_offload_for_layerwise_components(
                 explicitly_set_component_names
             )
             return
 
-    def _disable_cpu_offload_for_layerwise_components(
+    def _disable_non_dit_cpu_offload_for_layerwise_components(
         self, component_names: list[str]
     ) -> None:
-        # Layerwise offload owns H2D/D2H for selected component weights.
+        # non-DiT layerwise offload replaces the corresponding component-level CPU offload
         flag_names = cpu_offload_flags_for_layerwise_components(component_names)
         disabled_flag_names: list[str] = []
 
@@ -1835,14 +1835,14 @@ class ServerArgs(DisaggArgsMixin):
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
-            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
-            if self.use_fsdp_inference and should_disable_dit_cpu_offload:
+            is_dit_layerwise_offload_selected = self.is_dit_layerwise_offload_selected
+            if self.use_fsdp_inference and is_dit_layerwise_offload_selected:
                 logger.warning(
                     "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
 
-            if envs.SGLANG_CACHE_DIT_ENABLED and should_disable_dit_cpu_offload:
+            if envs.SGLANG_CACHE_DIT_ENABLED and is_dit_layerwise_offload_selected:
                 raise ValueError(
                     "DiT layerwise offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
