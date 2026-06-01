@@ -366,7 +366,7 @@ class PrefillBootstrapQueue:
                 req.time_stats.set_wait_queue_entry_time()
             else:
                 raise RuntimeError(
-                    f"Unexpected poll state {poll} for req {req.rid} in handle_pending_bootstrap"
+                    f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
                 )
 
         self.queue = [
@@ -843,12 +843,14 @@ class SchedulerDisaggregationPrefillMixin:
                 self.optimistic_release_and_requeue(req)
             return False
         elif poll == KVPoll.WaitingForInput:
-            if should_force_retry(
-                req
-            ) or not self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req):
+            force_retry = should_force_retry(req)  # test hook
+            if force_retry:
                 if not defer_release:
                     self.optimistic_release_and_requeue(req)
                 return False
+            # Metadata buffer was allocated in pop_bootstrapped before
+            # the request entered the waiting queue, so finalize should not fail.
+            assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
             return True
         else:
             raise RuntimeError(
