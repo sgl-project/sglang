@@ -772,9 +772,7 @@ class PiecewiseCudaGraphRunner:
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
             mm_input_embeds=forward_batch.mm_input_embeds,
-            temp_scaled_logprobs=forward_batch.temp_scaled_logprobs,
             temperature=forward_batch.temperature,
-            top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
             return_pooled_hidden_states=(
