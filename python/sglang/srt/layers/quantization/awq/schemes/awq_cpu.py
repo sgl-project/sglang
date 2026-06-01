@@ -102,7 +102,7 @@ class AWQIntelAMXMoEKernel:
             None,  # w1 bias
             None,  # w3 bias
             None,  # alpha
-            None,  # limi
+            None,  # limit
             True,  # is_vnni
         )
         return StandardCombineInput(hidden_states=output)

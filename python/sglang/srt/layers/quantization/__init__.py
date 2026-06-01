@@ -29,7 +29,11 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.gptq import (
+    GPTQAscendConfig,
+    GPTQConfig,
+    GPTQMarlinConfig,
+)
 from sglang.srt.layers.quantization.gptq_cpu import CPUGPTQConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -100,6 +104,14 @@ if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
     )
 
 
+if is_npu():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQAscendConfig,
+        }
+    )
+
+
 if is_mps():
     BASE_QUANTIZATION_METHODS.update(
         {
@@ -115,6 +127,7 @@ CPU_QUANTIZATION_METHODS = {
     "compressed-tensors": CompressedTensorsConfig,
     "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
+    "mxfp4": Mxfp4Config,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}

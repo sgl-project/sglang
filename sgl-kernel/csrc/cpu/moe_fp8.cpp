@@ -32,7 +32,7 @@ void fused_experts_fp_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    CPUAcTMethod act_func,
+    CPUActMethod act_func,
     bool with_bias) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
@@ -43,7 +43,6 @@ void fused_experts_fp_kernel_impl(
   int64_t scale_size_N = div_up(2 * N, block_size_N);
   int64_t scale_size_K = div_up(K, block_size_K);
   int64_t blocks_n_per_group = block_size_N / BLOCK_N;
-
   std::function<int64_t(int64_t)> scale_offset_per_block;
   if constexpr (is_mxfp4) {
     scale_offset_per_block = [&](int64_t a) { return a * BLOCK_N; };
@@ -118,19 +117,19 @@ void fused_experts_fp_kernel_impl(
   });
 
   // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
-  if (act_func == CPUAcTMethod::silu_and_mul) {
+  if (act_func == CPUActMethod::silu_and_mul) {
     at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
       }
     });
-  } else if (act_func == CPUAcTMethod::clamped_silu_and_mul) {
+  } else if (act_func == CPUActMethod::clamped_silu_and_mul) {
     at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         clamped_silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N, limit);
       }
     });
-  } else if (act_func == CPUAcTMethod::swiglu) {
+  } else if (act_func == CPUActMethod::swiglu) {
     at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         clamp_sigmoid_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, N, alpha, limit);
@@ -138,7 +137,6 @@ void fused_experts_fp_kernel_impl(
       }
     });
   }
-
   // stage 2: intermediate_cache2 = intermediate_cache1 @ w2
   //   w2 : [E, K, N] as [E, OC, IC]
   const int64_t OC = K;  // rename K as OC
@@ -247,7 +245,7 @@ void fused_experts_fp_kernel_impl(
       int64_t num_tokens_post_pad,                                           \
       float alpha,                                                           \
       float limit,                                                           \
-      CPUAcTMethod act_func,                                                 \
+      CPUActMethod act_func,                                                 \
       bool with_bias)
 
 INSTANTIATE_MOE_FP_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float, false);
@@ -276,7 +274,7 @@ void shared_expert_fp_kernel_impl(
     int64_t K,
     float alpha,
     float limit,
-    CPUAcTMethod act_func) {
+    CPUActMethod act_func) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
@@ -333,19 +331,19 @@ void shared_expert_fp_kernel_impl(
   });
 
   // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
-  if (act_func == CPUAcTMethod::silu_and_mul) {
+  if (act_func == CPUActMethod::silu_and_mul) {
     at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
       }
     });
-  } else if (act_func == CPUAcTMethod::clamped_silu_and_mul) {
+  } else if (act_func == CPUActMethod::clamped_silu_and_mul) {
     at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         clamped_silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N, limit);
       }
     });
-  } else if (act_func == CPUAcTMethod::swiglu) {
+  } else if (act_func == CPUActMethod::swiglu) {
     at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         clamp_sigmoid_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, N, alpha, limit);
@@ -431,7 +429,7 @@ void shared_expert_fp_kernel_impl(
       int64_t K,                                                             \
       float alpha,                                                           \
       float limit,                                                           \
-      CPUAcTMethod act_func)
+      CPUActMethod act_func)
 
 INSTANTIATE_SHARED_EXPERT_FP_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float, false);
 INSTANTIATE_SHARED_EXPERT_FP_TEMPLATE(at::Half, at::Float8_e4m3fn, float, false);

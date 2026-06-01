@@ -67,25 +67,17 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1, clamped_silu_and_mul = 2 };
+enum class CPUActMethod : int { silu_and_mul = 0, swiglu = 1, clamped_silu_and_mul = 2, gelu_and_mul = 3 };
 
 // Select activation based on which clamp/scale parameters the caller provided:
 //   limit + alpha ⇒ gpt-oss swiglu.
 //   limit only    ⇒ DSV4-2604B clamped silu_and_mul.
 //   neither       ⇒ plain silu_and_mul.
-inline CPUAcTMethod select_act_func(const std::optional<double>& alpha, const std::optional<double>& limit) {
+inline CPUActMethod select_act_func(const std::optional<double>& alpha, const std::optional<double>& limit) {
   if (!limit.has_value()) {
-    return CPUAcTMethod::silu_and_mul;
+    return CPUActMethod::silu_and_mul;
   }
-  return alpha.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::clamped_silu_and_mul;
-}
-
-constexpr bool operator==(CPUAcTMethod a, int b) {
-  return static_cast<int>(a) == b;
-}
-
-constexpr bool operator==(int a, CPUAcTMethod b) {
-  return a == static_cast<int>(b);
+  return alpha.has_value() ? CPUActMethod::swiglu : CPUActMethod::clamped_silu_and_mul;
 }
 
 enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };
@@ -106,6 +98,17 @@ constexpr bool operator==(CPUQuantAlgo a, int64_t b) {
 
 constexpr bool operator==(int64_t a, CPUQuantAlgo b) {
   return a == static_cast<int64_t>(b);
+}
+
+inline int64_t get_row_size(CPUQuantMethod quant, int64_t K) {
+  switch (quant) {
+    case CPUQuantMethod::INT8_W8A8:
+      return K + sizeof(int32_t);
+    case CPUQuantMethod::MXFP4:
+      return K >> 1;
+    default:
+      return K;
+  }
 }
 
 inline int64_t get_4bit_block_k_size(int64_t group_size) {
@@ -176,7 +179,7 @@ void fused_experts_fp_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    CPUAcTMethod act_func,
+    CPUActMethod act_func,
     bool with_bias);
 
 // shared expert implementation for int8 w8a8
@@ -251,7 +254,7 @@ void shared_expert_fp_kernel_impl(
     int64_t K,
     float alpha,
     float limit,
-    CPUAcTMethod act_func);
+    CPUActMethod act_func);
 
 // tinygemm interface
 template <typename scalar_t>

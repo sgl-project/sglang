@@ -557,7 +557,7 @@ void fused_experts_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    CPUAcTMethod act_func,
+    CPUActMethod act_func,
     bool with_bias) {
   // handle 2 tiles per block
   constexpr int64_t BLOCK_M = block_size_m();
@@ -636,7 +636,7 @@ void fused_experts_kernel_impl(
 
       } else {
         const int64_t offset = offsets[mb];
-        if (act_func == CPUAcTMethod::swiglu) {
+        if (act_func == CPUActMethod::swiglu) {
           tinygemm_kernel(
               /* A     */ A,
               /* B     */ B0,
@@ -680,11 +680,11 @@ void fused_experts_kernel_impl(
       }
       // 1.d silu and mul
       const int64_t offset = offsets[mb];
-      if (act_func == CPUAcTMethod::silu_and_mul && use_brgemm) {
+      if (act_func == CPUActMethod::silu_and_mul && use_brgemm) {
         silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
-      } else if (act_func == CPUAcTMethod::clamped_silu_and_mul && use_brgemm) {
+      } else if (act_func == CPUActMethod::clamped_silu_and_mul && use_brgemm) {
         clamped_silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N, limit);
-      } else if (act_func == CPUAcTMethod::swiglu) {
+      } else if (act_func == CPUActMethod::swiglu) {
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N, C0, m_size, N, alpha, limit, 0 + nb * BLOCK_N / 2);
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(
             ic1 + offset * N, C1, m_size, N, alpha, limit, N / 2 + nb * BLOCK_N / 2);
@@ -948,28 +948,38 @@ void shared_expert_kernel_impl(
 }  // anonymous namespace
 
 // common checks
+template <CPUQuantMethod quant>
 static inline void check_moe_scales(
-    bool use_int8_w8a8,
-    bool use_fp8_w8a16,
-    bool use_mxfp4,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size) {
-  if (use_int8_w8a8) {
+  if constexpr (quant == CPUQuantMethod::INT8_W8A8) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
-  }
-  if (use_fp8_w8a16) {
+  } else if constexpr (quant == CPUQuantMethod::FP8_W8A16) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
     TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
     TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
-  }
-  if (use_mxfp4) {
+  } else if constexpr (quant == CPUQuantMethod::MXFP4) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for mxfp4.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for mxfp4.");
     TORCH_CHECK(w1_scale.value().scalar_type() == at::kByte, "expect w1_scale to be uint8.");
     TORCH_CHECK(w2_scale.value().scalar_type() == at::kByte, "expect w2_scale to be uint8.");
+  }
+}
+
+static inline void check_moe_scales(
+    int64_t moe_comp_method,
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<std::vector<int64_t>> block_size) {
+  if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
+    check_moe_scales<CPUQuantMethod::INT8_W8A8>(w1_scale, w2_scale, block_size);
+  } else if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
+    check_moe_scales<CPUQuantMethod::FP8_W8A16>(w1_scale, w2_scale, block_size);
+  } else if (moe_comp_method == CPUQuantMethod::MXFP4) {
+    check_moe_scales<CPUQuantMethod::MXFP4>(w1_scale, w2_scale, block_size);
   }
 }
 
@@ -1016,10 +1026,14 @@ at::Tensor fused_experts_cpu(
   constexpr int64_t BLOCK_N = block_size_n();
 
   const auto st = hidden_states.scalar_type();
+  // TODO: fused_topk_torch_native (CPU fallback for models like MiniMax)
+  // returns int64 topk_ids; fused_experts_cpu requires int32. Remove the typecast after topk kernel is provided
+  auto topk_ids_ = topk_ids.scalar_type() == at::kInt ? topk_ids : topk_ids.to(at::kInt);
+
   CHECK_INPUT(hidden_states);
   CHECK_INPUT(w1);
   CHECK_INPUT(w2);
-  CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
+  CHECK_EQ(topk_weights.sizes(), topk_ids_.sizes());
   CHECK_DIM(2, hidden_states);
   if (moe_comp_method == CPUQuantMethod::INT4_W4A8 && is_vnni) {
     CHECK_DIM(4, w1);
@@ -1029,9 +1043,8 @@ at::Tensor fused_experts_cpu(
     CHECK_DIM(3, w2);
   }
   CHECK_DIM(2, topk_weights);
-  CHECK_DIM(2, topk_ids);
-
-  CHECK_EQ(topk_ids.scalar_type(), at::kInt);
+  CHECK_DIM(2, topk_ids_);
+  CHECK_EQ(topk_ids_.scalar_type(), at::kInt);
 
   // TODO: support topk_weights to be bf16 or fp16 in the kernel.
   // The topk_weights of llama4 is computed via Llama4MoE:custom_routing_function and is bf16/fp16
@@ -1047,12 +1060,8 @@ at::Tensor fused_experts_cpu(
   int64_t topk = topk_weights_.size(1);
 
   // we use int32_t compensation for int8 w8a8
-  int64_t packed_K = moe_comp_method == CPUQuantMethod::MXFP4
-                         ? get_row_size<uint8_t>(K)
-                         : get_row_size(K, moe_comp_method == CPUQuantMethod::INT8_W8A8);
-  int64_t packed_N = moe_comp_method == CPUQuantMethod::MXFP4
-                         ? get_row_size<uint8_t>(N)
-                         : get_row_size(N, moe_comp_method == CPUQuantMethod::INT8_W8A8);
+  int64_t packed_K = get_row_size(static_cast<CPUQuantMethod>(moe_comp_method), K);
+  int64_t packed_N = get_row_size(static_cast<CPUQuantMethod>(moe_comp_method), N);
 
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
@@ -1062,13 +1071,7 @@ at::Tensor fused_experts_cpu(
     CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 2 : 1));
   }
   // check scales
-  check_moe_scales(
-      moe_comp_method == CPUQuantMethod::INT8_W8A8,
-      moe_comp_method == CPUQuantMethod::FP8_W8A16,
-      moe_comp_method == CPUQuantMethod::MXFP4,
-      w1_scale,
-      w2_scale,
-      block_size);
+  check_moe_scales(moe_comp_method, w1_scale, w2_scale, block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -1084,7 +1087,7 @@ at::Tensor fused_experts_cpu(
   int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
   auto buffer = at::empty(
       {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
-      topk_ids.options());
+      topk_ids_.options());
 
   int32_t* __restrict__ sorted_ids = buffer.data_ptr<int32_t>();
   int32_t* __restrict__ expert_ids = sorted_ids + max_num_tokens_padded;
@@ -1108,7 +1111,7 @@ at::Tensor fused_experts_cpu(
 
   // align experts index
   int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
-      sorted_ids, expert_ids, topk_ids.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+      sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
 
   // unlike triton kernel, we fuse silu with gemm1 so only need 2 intermediate_caches:
   //   1. intermediate_cache1 : [M * topk, N]
@@ -1404,7 +1407,11 @@ at::Tensor shared_expert_cpu(
   CHECK_EQ(packed_w2.size(1), packed_N);
 
   // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, use_mxfp4, w1_scale, w2_scale, block_size);
+  if (use_int8_w8a8) {
+    check_moe_scales<CPUQuantMethod::INT8_W8A8>(w1_scale, w2_scale, block_size);
+  } else if (use_fp8_w8a16) {
+    check_moe_scales<CPUQuantMethod::FP8_W8A16>(w1_scale, w2_scale, block_size);
+  }
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
