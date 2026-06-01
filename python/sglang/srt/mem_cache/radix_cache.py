@@ -148,18 +148,10 @@ class RadixKey:
 
     @staticmethod
     def _first_mismatch(t0: array[int], t1: array[int]) -> int:
-        """Number of equal leading raw tokens, capped at the shorter length.
-
-        Zero-copy view over the int64 ``array('q')`` buffers, so the per-token
-        comparison runs in C instead of a Python loop with PyLong boxing.
-
-        Precondition: callers must pass ``array('q')`` (int64) buffers. This
-        holds throughout the radix tree -- ``RadixKey.token_ids`` is always an
-        ``array('q')`` (the Scheduler stores token ids this way and every
-        internal producer preserves the type), so ``np.frombuffer`` is safe
-        without a per-call type/itemsize guard on this hot path.
+        """Common prefix token count. Assumes ``array('q')`` (int64) buffers,
+        so it can compare via a zero-copy NumPy view instead of a Python loop.
         """
-        n = len(t0) if len(t0) < len(t1) else len(t1)
+        n = min(len(t0), len(t1))
         if n == 0:
             return 0
         a = np.frombuffer(t0, dtype=np.int64, count=n)
