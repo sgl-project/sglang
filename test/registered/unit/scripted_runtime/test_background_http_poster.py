@@ -140,7 +140,11 @@ class TestBackgroundHttpPosterEnsureSession(CustomTestCase):
         self.addCleanup(poster.close)
         sessions = [MagicMock(closed=False), MagicMock(closed=False)]
         original = bg_poster.aiohttp.ClientSession
+        # _ensure_session builds a TCPConnector(limit=0); stub it so this off-loop
+        # unit test does not construct a real connector (which needs a running loop).
+        original_connector = bg_poster.aiohttp.TCPConnector
         bg_poster.aiohttp.ClientSession = MagicMock(side_effect=sessions)
+        bg_poster.aiohttp.TCPConnector = MagicMock()
         try:
             first = poster._ensure_session()
             self.assertIs(first, sessions[0])
@@ -153,6 +157,7 @@ class TestBackgroundHttpPosterEnsureSession(CustomTestCase):
             self.assertIs(recreated, sessions[1])
         finally:
             bg_poster.aiohttp.ClientSession = original
+            bg_poster.aiohttp.TCPConnector = original_connector
             poster._session = None
 
 

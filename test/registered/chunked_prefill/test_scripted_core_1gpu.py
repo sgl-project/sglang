@@ -71,12 +71,19 @@ class TestScriptedCore(ScriptedTestCase):
         )
         yield from _advance_to_stage(r, stage)
 
-        req = r.req
-        assert req is not None, f"stage={stage}: req vanished before pause"
-        output_tokens_before_pause = len(req.output_ids)
+        assert r.req is not None, f"stage={stage}: req vanished before pause"
 
         t.pause_generation(mode="retract")
         yield
+
+        # The overlap scheduler completes the one forward already in flight when
+        # pause is requested, so output_ids advances by one before generation
+        # halts. At the last_decode stage that final token reaches max_new_tokens,
+        # finishing the req before the retract can park it -- a valid terminal
+        # outcome (only possible one token from the end), so accept it.
+        if r.finished:
+            t.continue_generation()
+            return
 
         req = r.req
         assert req is not None and req in t.scheduler.waiting_queue, (
@@ -84,15 +91,18 @@ class TestScriptedCore(ScriptedTestCase):
             f"waiting_queue; found={req!r}"
         )
 
+        # Snapshot after the retract settles; the paused engine must not advance
+        # the req from here.
+        output_tokens_after_pause = len(req.output_ids)
         for _ in range(3):
             yield
             req = r.req
             assert (
-                req is not None and len(req.output_ids) == output_tokens_before_pause
+                req is not None and len(req.output_ids) == output_tokens_after_pause
             ), (
                 f"stage={stage}: paused engine advanced the req "
                 f"({len(req.output_ids) if req is not None else None} output tokens, "
-                f"expected {output_tokens_before_pause})"
+                f"expected {output_tokens_after_pause})"
             )
 
         t.continue_generation()
