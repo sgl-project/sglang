@@ -33,8 +33,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 import logging
-
 import numpy as np
+
+logger = logging.getLogger(__name__)
+SWA_INT_MAX = 2147483647
 
 
 def _reshape_kv_for_fia_nz(
@@ -42,10 +44,6 @@ def _reshape_kv_for_fia_nz(
 ) -> torch.Tensor:
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
-
-
-logger = logging.getLogger(__name__)
-SWA_INT_MAX = 2147483647
 
 
 @dataclass
