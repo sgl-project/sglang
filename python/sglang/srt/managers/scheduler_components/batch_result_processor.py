@@ -208,6 +208,8 @@ class SchedulerBatchResultProcessor:
             next_token_ids = next_token_ids.tolist()
             self._move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
+            self._validate_pp_skip_output_comm(batch, result)
+
             hidden_state_offset = 0
 
             # Check finish conditions
@@ -414,6 +416,47 @@ class SchedulerBatchResultProcessor:
             )
         logprob_pt += num_input_logprobs
         return logprob_pt
+
+    @staticmethod
+    def _validate_pp_skip_output_comm(
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ):
+        """Validate PP skip output comm correctness.
+
+        - When skip=True: all reqs must be middle chunks (inflight_middle_chunks > 0)
+          so placeholder zeros are never consumed via req.output_ids.append().
+        - When skip=False: at least one req should consume next_token_ids
+          (inflight_middle_chunks <= 0), otherwise warn.
+        """
+        if not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
+            return
+
+        if not getattr(result, "skipped_output_comm", False):
+            if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
+                has_consumed_output = any(
+                    req.inflight_middle_chunks <= 0
+                    for req in batch.reqs
+                    if not req.finished() and not req.is_retracted
+                )
+                if not has_consumed_output and len(batch.reqs) > 0:
+                    chunks = list([r.inflight_middle_chunks for r in batch.reqs])
+                    logger.warning(
+                        f"PP non-skip output comm: no req consumed next_token_ids. "
+                        f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
+                        f"num_reqs={len(batch.reqs)}, all inflight_middle_chunks={chunks}"
+                    )
+            return
+
+        for req in batch.reqs:
+            if not req.finished() and not req.is_retracted:
+                assert req.inflight_middle_chunks > 0, (
+                    f"PP skip output comm invariant violated: req {req.rid} "
+                    f"has inflight_middle_chunks={req.inflight_middle_chunks} "
+                    f"but output was skipped (contains_last_prefill_chunk="
+                    f"{batch.contains_last_prefill_chunk}). "
+                    f"Placeholder zeros would be appended to output_ids."
+                )
 
     def _append_prefill_hidden_states(
         self,
@@ -785,6 +828,11 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
