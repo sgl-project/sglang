@@ -236,16 +236,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         chunk_size: int,
     ) -> torch.Tensor:
         condition_chunks = condition_full.split(chunk_size, dim=2)
-        if chunk_idx < len(condition_chunks):
-            condition = condition_chunks[chunk_idx]
-        else:
-            condition = condition_full.new_zeros(
-                condition_full.shape[0],
-                condition_full.shape[1],
-                chunk_size,
-                condition_full.shape[3],
-                condition_full.shape[4],
-            )
+        condition = condition_chunks[min(chunk_idx, len(condition_chunks) - 1)]
 
         if condition.shape[2] == chunk_size:
             return condition

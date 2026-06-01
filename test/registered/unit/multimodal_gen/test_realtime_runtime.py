@@ -822,7 +822,7 @@ def test_lingbot_realtime_adapter_sends_stale_output_for_client_cutover():
     assert calls[0][3] is batch
 
 
-def test_lingbot_i2v_condition_does_not_repeat_reference_chunk():
+def test_lingbot_i2v_condition_repeats_last_chunk():
     condition_full = torch.ones(1, 20, 3, 2, 2)
 
     first = LingBotWorldCausalDMDDenoisingStage._select_i2v_condition_chunk(
@@ -838,10 +838,10 @@ def test_lingbot_i2v_condition_does_not_repeat_reference_chunk():
 
     assert torch.equal(first, condition_full)
     assert second.shape == condition_full.shape
-    assert torch.count_nonzero(second) == 0
+    assert torch.equal(second, condition_full)
 
 
-def test_lingbot_i2v_condition_pads_tail_without_reusing_reference():
+def test_lingbot_i2v_condition_pads_tail_then_repeats_it():
     condition_full = torch.ones(1, 20, 1, 2, 2)
 
     first = LingBotWorldCausalDMDDenoisingStage._select_i2v_condition_chunk(
@@ -859,7 +859,7 @@ def test_lingbot_i2v_condition_pads_tail_without_reusing_reference():
     assert torch.equal(first[:, :, :1], condition_full)
     assert torch.count_nonzero(first[:, :, 1:]) == 0
     assert second.shape == first.shape
-    assert torch.count_nonzero(second) == 0
+    assert torch.equal(second, first)
 
 
 def test_lingbot_i2v_condition_uses_available_non_initial_chunks():
@@ -880,7 +880,7 @@ def test_lingbot_i2v_condition_uses_available_non_initial_chunks():
 
     assert torch.equal(second, second_chunk)
     assert third.shape == second_chunk.shape
-    assert torch.count_nonzero(third) == 0
+    assert torch.equal(third, second_chunk)
 
 
 def test_realtime_input_validation_reuses_generator_across_chunks():
