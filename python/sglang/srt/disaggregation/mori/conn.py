@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 import dataclasses
 import logging
 import os
@@ -36,6 +35,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
+    FastQueue,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -269,6 +269,16 @@ class TransferTarget:
     peer_info: KVArgsRegisterInfo
 
 
+@dataclasses.dataclass
+class _TransferChunk:
+    sender: "MoriKVSender"
+    kv_indices: npt.NDArray[np.int32]
+    index_slice: slice
+    is_last_chunk: bool
+    aux_index: Optional[int]
+    normalized_state: Optional[List[Optional[npt.NDArray[np.int32]]]]
+
+
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -293,22 +303,26 @@ class MoriKVManager(CommonKVManager):
         self._send_aux_rdma = os.environ.get(
             "SGLANG_MORI_SEND_AUX_RDMA", ""
         ).lower() in ("1", "true")
-        self._use_sync_api = os.environ.get("SGLANG_MORI_USE_SYNC_API", "0") == "1"
-        if (
-            self._use_sync_api
-            and self.disaggregation_mode == DisaggregationMode.PREFILL
-        ):
-            max_workers = get_int_env_var("SGLANG_MORI_WAIT_WORKERS", 16)
-            self._wait_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max_workers,
-                thread_name_prefix=(
-                    f"mori-wait-dp{self.system_dp_rank}-tp{self.attn_tp_rank}"
-                ),
-            )
-        else:
-            self._wait_executor = None
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._num_shards = max(1, get_int_env_var("SGLANG_MORI_TRANSFER_SHARDS", 8))
+            self._transfer_queues: List[FastQueue] = [
+                FastQueue() for _ in range(self._num_shards)
+            ]
+            self._wait_poll_ms = get_int_env_var("SGLANG_MORI_WAIT_POLL_MS", 1000)
+            self._transfer_timeout_ms = get_int_env_var(
+                "SGLANG_MORI_TRANSFER_TIMEOUT_MS", 0
+            )
+            for shard, queue in enumerate(self._transfer_queues):
+                threading.Thread(
+                    target=self._transfer_worker,
+                    args=(queue,),
+                    daemon=True,
+                    name=(
+                        f"mori-xfer-dp{self.system_dp_rank}-"
+                        f"tp{self.attn_tp_rank}-s{shard}"
+                    ),
+                ).start()
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
@@ -415,6 +429,34 @@ class MoriKVManager(CommonKVManager):
             # Failed is terminal — never overwrite with non-Failed.
             return
         super().update_status(bootstrap_room, status)
+
+    def enqueue_transfer(self, task: _TransferChunk) -> None:
+        self._transfer_queues[task.sender.bootstrap_room % self._num_shards].put(task)
+
+    def _transfer_worker(self, queue: FastQueue) -> None:
+        while True:
+            task = queue.get()
+            try:
+                task.sender._run_chunk(task)
+            except Exception as exc:
+                failure_reason = f"transfer worker raised: {exc!r}"
+                try:
+                    logger.exception(
+                        "Mori transfer worker failed for room %s",
+                        task.sender.bootstrap_room,
+                    )
+                except Exception:
+                    pass
+                try:
+                    task.sender._fail_from_worker(failure_reason)
+                except Exception:
+                    try:
+                        logger.exception(
+                            "Mori transfer worker failover failed for room %s",
+                            task.sender.bootstrap_room,
+                        )
+                    except Exception:
+                        pass
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
         """Thread-local ZMQ socket cache with shared Context.
@@ -1289,12 +1331,6 @@ class MoriKVManager(CommonKVManager):
             )
             return result_statuses, target_infos_snapshot
 
-        if is_last_chunk:
-            with self.transfer_lock:
-                # Keep transfer_infos alive until sender.clear() so abort/failure
-                # paths can still recover notification targets after posting.
-                self.update_status(bootstrap_room, KVPoll.Success)
-
         return result_statuses, target_infos_snapshot
 
 
@@ -1310,15 +1346,12 @@ class MoriKVSender(CommonKVSender):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
-        self.sent_last_chunk = False
         self.conclude_state: Optional[KVPoll] = None
         self.status_notified = False
         self.init_time = time.time()
-        self._completion_future: Optional[concurrent.futures.Future] = None
         self._notify_lock = threading.Lock()
         self._notified_status: Optional[KVPoll] = None
         self._notified_reason: Optional[str] = None
-        self._transfer_start_time: Optional[float] = None
 
     def send(
         self,
@@ -1336,29 +1369,17 @@ class MoriKVSender(CommonKVSender):
             if is_last_chunk
             else None
         )
-        if self._transfer_start_time is None and (
-            len(kv_indices) > 0 or normalized_state is not None
-        ):
-            self._transfer_start_time = time.perf_counter()
-        statuses, infos = self.kv_mgr.add_transfer_request(
-            self.bootstrap_room,
-            kv_indices,
-            index_slice,
-            is_last_chunk,
-            aux_index=self.aux_index if is_last_chunk else None,
-            state_indices=normalized_state,
+        self._record_transfer_indices(kv_indices, state_indices)
+        self.kv_mgr.enqueue_transfer(
+            _TransferChunk(
+                sender=self,
+                kv_indices=kv_indices,
+                index_slice=index_slice,
+                is_last_chunk=is_last_chunk,
+                aux_index=self.aux_index if is_last_chunk else None,
+                normalized_state=normalized_state,
+            )
         )
-        self.transfer_statuses.extend(statuses)
-        self._record_transfer_indices(kv_indices, None)
-        if infos is not None:
-            self.pending_infos = infos
-            if is_last_chunk:
-                self.sent_last_chunk = True
-                if self.kv_mgr._use_sync_api and self.kv_mgr._wait_executor is not None:
-                    statuses_snapshot = list(self.transfer_statuses)
-                    self._completion_future = self.kv_mgr._wait_executor.submit(
-                        self._wait_and_notify, statuses_snapshot
-                    )
         self._maybe_finalize_if_room_failed()
 
     def _maybe_finalize_if_room_failed(self) -> None:
@@ -1366,6 +1387,68 @@ class MoriKVSender(CommonKVSender):
             return
         if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
             self._finalize_failure()
+
+    def _run_chunk(self, task: _TransferChunk) -> None:
+        if self.conclude_state is not None:
+            return
+        if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
+            self._finalize_failure()
+            return
+
+        statuses, infos = self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            task.kv_indices,
+            task.index_slice,
+            task.is_last_chunk,
+            aux_index=task.aux_index,
+            state_indices=task.normalized_state,
+        )
+        self.transfer_statuses.extend(statuses)
+        if infos is not None:
+            self.pending_infos = infos
+
+        if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
+            self._finalize_failure()
+            return
+
+        rc = self._wait_chunk(statuses)
+        if self.conclude_state is not None:
+            return
+        if rc != StatusCode.SUCCESS:
+            self._finalize_failure(self._collect_failure_reason())
+            return
+        if task.is_last_chunk:
+            self._notify_decode(KVPoll.Success)
+            with self._notify_lock:
+                if self.conclude_state is None:
+                    self.conclude_state = self._notified_status
+                if self._notified_status == KVPoll.Success:
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+
+    def _wait_chunk(self, statuses: List[TransferStatus]) -> StatusCode:
+        if not statuses:
+            return StatusCode.SUCCESS
+
+        start = time.perf_counter()
+        sla_ms = self.kv_mgr._transfer_timeout_ms
+        sla_tripped = False
+
+        while True:
+            rc = self.kv_mgr.engine.wait_all(
+                statuses, timeout_ms=self.kv_mgr._wait_poll_ms
+            )
+            if rc != StatusCode.IN_PROGRESS:
+                return rc
+            if (
+                sla_ms > 0
+                and not sla_tripped
+                and (time.perf_counter() - start) * 1000 >= sla_ms
+            ):
+                sla_tripped = True
+                self._finalize_failure(f"KV transfer exceeded SLA {sla_ms}ms")
+
+    def _fail_from_worker(self, reason: str) -> None:
+        self._finalize_failure(reason)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -1397,75 +1480,17 @@ class MoriKVSender(CommonKVSender):
             sent_status, _ = self._finalize_failure()
             return sent_status
 
-        if status == KVPoll.Success and self.kv_mgr.is_dummy_cp_rank:
+        if status == KVPoll.Success:
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
 
-        if self.kv_mgr._use_sync_api:
-            if self._completion_future is not None and self._completion_future.done():
-                try:
-                    ok, _ = self._completion_future.result()
-                except Exception as exc:
-                    logger.exception("mori wait-pool waiter raised")
-                    sent_status, _ = self._finalize_failure(
-                        f"mori wait-pool waiter raised: {exc!r}"
-                    )
-                    return sent_status
-                if self.conclude_state is not None:
-                    return self.conclude_state
-                self.conclude_state = KVPoll.Success if ok else KVPoll.Failed
-                return self.conclude_state
-            return KVPoll.Transferring if status == KVPoll.Success else status
-
-        transfers_done = self._all_transfers_finished()
-        if transfers_done:
-            self._record_transfer_completion_metric()
-            if self._has_transfer_error():
-                reason = self._collect_failure_reason()
-                sent_status, _ = self._finalize_failure(reason)
-                return sent_status
-            sent_status, _ = self._notify_decode(KVPoll.Success)
-            if self.conclude_state is None:
-                self.conclude_state = sent_status
-            return self.conclude_state
-        return KVPoll.Transferring if status == KVPoll.Success else status
-
-    def _all_transfers_finished(self) -> bool:
-        if not self.sent_last_chunk:
-            return False
-        if not self.transfer_statuses:
-            return True
-        return all(not status.InProgress() for status in self.transfer_statuses)
-
-    def _has_transfer_error(self) -> bool:
-        return any(status.Failed() for status in self.transfer_statuses)
+        return status
 
     def _collect_failure_reason(self) -> str:
         for status in self.transfer_statuses:
             if status.Failed():
                 return f"KV transfer failed: {status.Message()}"
         return "KV transfer failed due to unknown reason"
-
-    def _record_transfer_completion_metric(self) -> None:
-        if (
-            self._transfer_start_time is not None
-            and self._transfer_metric.transfer_latency_s is None
-        ):
-            self._transfer_metric.transfer_latency_s = (
-                time.perf_counter() - self._transfer_start_time
-            )
-
-    def _wait_and_notify(
-        self, statuses: List[TransferStatus]
-    ) -> Tuple[bool, Optional[str]]:
-        rc = self.kv_mgr.engine.wait_all(statuses, timeout_ms=-1)
-        self._record_transfer_completion_metric()
-        if rc == StatusCode.SUCCESS:
-            sent_status, sent_reason = self._notify_decode(KVPoll.Success)
-        else:
-            reason = self._collect_failure_reason()
-            sent_status, sent_reason = self._finalize_failure(reason)
-        return sent_status == KVPoll.Success, sent_reason
 
     def _terminalize_locked(
         self,
