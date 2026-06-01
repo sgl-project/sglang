@@ -43,9 +43,11 @@ Usage:
 
 import argparse
 import json
+import math
 import os
+import statistics
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import triton
@@ -109,36 +111,95 @@ NUM_STAGES = [1, 2, 3, 4]
 SPLIT_K = [1, 2, 3, 4, 5, 6, 7, 8]
 
 
-def bench(fn, warmup=25, rep=100, cudagraph=True, inner=200):
-    """Per-call milliseconds.
+# --- L2-cold benchmarking (adapted from sgl-project/sglang#26706, which adapts
+# the flashinfer L2-rotation utility). Two effects combined:
+#   1. flush L2 (zero a 5x-L2 buffer) before each timed graph replay, and
+#   2. rotate the read/written buffers within the captured graph so back-to-back
+#      calls don't reuse hot-L2 weights.
+# Without this, capturing N calls into the SAME weight buffer measures L2-HOT
+# latency -- optimistic, especially for small E whose weight fits in L2.
+_L2_SAFE_RATIO = 5
+_L2_BYTES: Dict[int, int] = {}
+_FLUSH_BUFFERS: Dict[int, torch.Tensor] = {}
 
-    With ``cudagraph``, capture ``inner`` back-to-back ``fn()`` calls in ONE graph
-    and divide the measured replay time by ``inner``. A single fn()-per-graph
-    ``do_bench(g.replay)`` floors at ~8-10us for ANY tiny op -- it measures the
-    fixed per-replay launch/dispatch overhead, not the kernel. Amortizing over
-    ``inner`` back-to-back calls drives that overhead to ~0 and exposes the true
-    device time. (Same technique as control_shrink_floor.py.)
+
+def _l2_bytes(device_index: int) -> int:
+    if device_index not in _L2_BYTES:
+        _L2_BYTES[device_index] = torch.cuda.get_device_properties(
+            device_index
+        ).L2_cache_size
+    return _L2_BYTES[device_index]
+
+
+def _flush_buffer(device_index: int) -> torch.Tensor:
+    """Cached 5x-L2 uint8 buffer; zeroing it evicts the L2 cache."""
+    if device_index not in _FLUSH_BUFFERS:
+        size = int(_l2_bytes(device_index) * _L2_SAFE_RATIO)
+        _FLUSH_BUFFERS[device_index] = torch.empty(
+            size, device=f"cuda:{device_index}", dtype=torch.uint8
+        )
+    return _FLUSH_BUFFERS[device_index]
+
+
+def rotation_count(
+    nbytes: int, device_index: int, min_rot: int = 2, cap: int = 100
+) -> int:
+    """Number of buffer copies so the working set exceeds ~5x L2 (cold cache).
+
+    Returns 1 when the buffers already dwarf L2 (cache effects negligible).
     """
+    thresh = _l2_bytes(device_index) * _L2_SAFE_RATIO
+    if nbytes <= 0 or nbytes >= thresh:
+        return 1
+    return min(cap, max(min_rot, math.ceil(thresh / nbytes) + 1))
+
+
+def bench(
+    launch_i: Callable[[int], None],
+    rotate_count: int,
+    device_index: int,
+    target: int = 100,
+    timed_reps: int = 20,
+) -> float:
+    """Per-call milliseconds with a cold L2.
+
+    Captures ``loop_count`` rotated ``launch_i(i % rotate_count)`` calls in ONE
+    CUDA graph (amortizing per-launch overhead), flushes L2 before each timed
+    replay, and divides replay time by ``loop_count``. Returns the median.
+    """
+    loop_count = math.ceil(target / rotate_count) * rotate_count
+    flush = _flush_buffer(device_index)
+    stream = torch.cuda.current_stream()
+
+    # Warm/compile every rotation index on a side stream before capture (capture
+    # cannot trigger Triton compilation).
+    s = torch.cuda.Stream()
+    s.wait_stream(stream)
+    with torch.cuda.stream(s):
+        for i in range(rotate_count):
+            launch_i(i)
+    stream.wait_stream(s)
     torch.cuda.synchronize()
-    if cudagraph:
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                for _ in range(inner):
-                    fn()
-        torch.cuda.current_stream().wait_stream(s)
-        torch.cuda.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(inner):
-                fn()
-        torch.cuda.synchronize()
-        ms = triton.testing.do_bench(g.replay, warmup=warmup, rep=rep) / inner
-    else:
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for i in range(loop_count):
+            launch_i(i % rotate_count)
+    g.replay()  # warm the graph once
     torch.cuda.synchronize()
-    return float(ms)
+
+    times: List[float] = []
+    for _ in range(timed_reps):
+        flush.zero_()  # cold the L2 cache before each measurement
+        torch.cuda.synchronize()
+        tic = torch.cuda.Event(enable_timing=True)
+        toc = torch.cuda.Event(enable_timing=True)
+        tic.record(stream)
+        g.replay()
+        toc.record(stream)
+        stream.synchronize()
+        times.append(tic.elapsed_time(toc) / loop_count)
+    return float(statistics.median(times))
 
 
 def align_routing(
@@ -151,8 +212,25 @@ def align_routing(
     Returns (sorted_token_ids, expert_ids, num_tokens_post_padded). Must be
     recomputed per BLOCK_SIZE_M, since expert_ids / sorted_token_ids are aligned
     to the block size the kernel will be launched with.
+
+    Match the production routing path by trimming the native align helper's
+    worst-case allocation to the tight upper bound used for the launch grid.
     """
-    return moe_align_block_size(topk_ids, block_size_m, num_experts)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, num_experts
+    )
+
+    num_tokens = topk_ids.numel()
+    max_nonempty = min(num_tokens, num_experts)
+    tight_padded = (
+        triton.cdiv(num_tokens + max_nonempty * (block_size_m - 1), block_size_m)
+        * block_size_m
+    )
+    return (
+        sorted_token_ids[:tight_padded],
+        expert_ids[: tight_padded // block_size_m],
+        num_tokens_post_padded,
+    )
 
 
 def benchmark_config(
@@ -184,24 +262,43 @@ def benchmark_config(
     )
     grid = (split_k * base_grid,)
 
-    def launch():
+    device_index = (
+        weight.device.index
+        if weight.device.index is not None
+        else torch.cuda.current_device()
+    )
+    # Rotate the read/written buffers (the weight dominates) so back-to-back graph
+    # calls hit a cold L2. Routing tensors are tiny/read-only and left shared.
+    nbytes = (
+        weight.numel() * weight.element_size()
+        + hidden_states.numel() * hidden_states.element_size()
+        + output.numel() * output.element_size()
+    )
+    rot = rotation_count(nbytes, device_index)
+    weights = [weight] + [weight.clone() for _ in range(rot - 1)]
+    hiddens = [hidden_states] + [hidden_states.clone() for _ in range(rot - 1)]
+    outputs = [output] + [torch.zeros_like(output) for _ in range(rot - 1)]
+    num_valid_tokens = topk_ids.numel()
+
+    def launch(i: int):
+        h, w, o = hiddens[i], weights[i], outputs[i]
         kernel[grid](
-            hidden_states,
-            weight,
-            output,
+            h,
+            w,
+            o,
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
             N,
             K,
-            topk_ids.numel(),
-            hidden_states.stride(0),
-            hidden_states.stride(1),
-            weight.stride(0),
-            weight.stride(1),
-            weight.stride(2),
-            output.stride(0),
-            output.stride(1),
+            num_valid_tokens,
+            h.stride(0),
+            h.stride(1),
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            o.stride(0),
+            o.stride(1),
             top_k=top_k,
             BLOCK_SIZE_M=block_size_m,
             BLOCK_SIZE_N=block_size_n,
@@ -214,10 +311,10 @@ def benchmark_config(
 
     try:
         # Validate the launch (catches SMEM/compile failures), then time it with
-        # the CUDA-graph-amortized bench so tiny-kernel launch overhead is removed.
-        launch()
+        # the L2-cold CUDA-graph bench (rotated buffers + L2 flush per replay).
+        launch(0)
         torch.cuda.synchronize()
-        return bench(launch)
+        return bench(launch, rot, device_index)
     except Exception:
         return None
 
@@ -290,6 +387,60 @@ def sort_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return ordered
 
 
+def config_signature(config: Dict[str, Any]) -> str:
+    """Stable compact representation used to group identical tuned configs."""
+    return json.dumps(sort_config(config), sort_keys=True, separators=(",", ":"))
+
+
+def format_range(start: int, end: int) -> str:
+    """Human-readable inclusive integer range."""
+    return str(start) if start == end else f"{start}-{end}"
+
+
+def routed_counts_to_m_values(
+    name: str,
+    routed_counts: Optional[List[int]],
+    top_k: int,
+) -> Optional[List[int]]:
+    """Convert routed-row counts to input-token counts for runtime-compatible keys."""
+    if routed_counts is None:
+        return None
+
+    invalid = [count for count in routed_counts if count <= 0 or count % top_k != 0]
+    if invalid:
+        raise ValueError(
+            f"{name} values must be positive multiples of top_k={top_k}; "
+            f"invalid values: {invalid}"
+        )
+    return sorted(set(count // top_k for count in routed_counts))
+
+
+def make_balanced_topk_ids(
+    tokens_per_expert: int,
+    active_experts: int,
+    top_k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create routing with exactly tokens_per_expert rows per active expert."""
+    if active_experts < top_k:
+        raise ValueError(
+            f"active_experts={active_experts} must be >= top_k={top_k} to avoid "
+            "duplicate experts within a token"
+        )
+
+    num_routed_tokens = tokens_per_expert * active_experts
+    if num_routed_tokens % top_k != 0:
+        raise ValueError(
+            f"tokens_per_expert * active_experts must be divisible by top_k; "
+            f"got {tokens_per_expert} * {active_experts} for top_k={top_k}"
+        )
+
+    flat = torch.arange(active_experts, dtype=torch.int32, device=device).repeat(
+        tokens_per_expert
+    )
+    return flat.view(num_routed_tokens // top_k, top_k)
+
+
 def save_config(configs: Dict[int, Dict[str, Any]], E: int, N: int, K: int) -> str:
     """Write tuned configs (keyed by M) to the standard config dir. Returns path."""
     filename = get_moe_lora_shrink_config_file_name(E, N, K)
@@ -329,8 +480,11 @@ def tune_one(
     prefill_num_tokens: List[int],
     top_k: int,
     dtype: torch.dtype,
+    output_dtype: torch.dtype,
     device: torch.device,
     seed: int,
+    decode_tokens_per_expert: Optional[List[int]],
+    active_experts: Optional[int],
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[int, Tuple[float, Dict[str, Any]]]]:
     """Tune the shrink kernel for one (experts E, rank N, hidden K).
 
@@ -348,11 +502,23 @@ def tune_one(
     best_configs: Dict[int, Dict[str, Any]] = {}
     results: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 
-    regimes = [(m, True) for m in decode_batch_sizes] + [
-        (m, False) for m in prefill_num_tokens
-    ]
+    controlled_active_experts = min(active_experts or num_experts, num_experts)
+    if decode_tokens_per_expert is None:
+        regimes = [(m, True, None) for m in decode_batch_sizes]
+    else:
+        regimes = []
+        for tokens_per_expert in decode_tokens_per_expert:
+            routed_tokens = tokens_per_expert * controlled_active_experts
+            if routed_tokens % top_k != 0:
+                raise ValueError(
+                    f"tokens_per_expert={tokens_per_expert} with "
+                    f"active_experts={controlled_active_experts} produces "
+                    f"{routed_tokens} routed rows, not divisible by top_k={top_k}"
+                )
+            regimes.append((routed_tokens // top_k, True, tokens_per_expert))
+    regimes += [(m, False, None) for m in prefill_num_tokens]
 
-    for M, is_decode in regimes:
+    for M, is_decode, tokens_per_expert in regimes:
         search = get_search_space(N, K, is_decode, smem_cap, elem_size)
         # Deterministic per-shape routing: the chosen config (esp. split_k) is
         # sensitive to how tokens cluster across experts, so seed per (seed, E, N, M)
@@ -361,12 +527,25 @@ def tune_one(
             (seed * 1_000_003 + num_experts * 9176 + N * 251 + M) & 0x7FFFFFFF
         )
         hidden_states = torch.randn(M, K, device=device, dtype=dtype)
-        output = torch.zeros(M * top_k, N, device=device, dtype=dtype)
+        output = torch.zeros(M * top_k, N, device=device, dtype=output_dtype)
 
-        # Fixed routing per M; only the block-size alignment varies per config.
-        topk_ids = torch.randint(
-            0, num_experts, (M, top_k), dtype=torch.int32, device=device
-        )
+        # Deterministic routing only (no randomness). Default path: balanced
+        # round-robin keyed by M -- token i routes to experts
+        # [i*top_k .. i*top_k+top_k-1] mod E. This covers both the under-saturated
+        # (M*top_k < E -> M*top_k experts, 1 token each) and saturated (all E
+        # experts, evenly loaded) regimes, for decode and prefill alike. The
+        # tokens_per_expert path forces an exact per-expert load instead.
+        if tokens_per_expert is None:
+            topk_ids = (
+                torch.arange(M * top_k, device=device, dtype=torch.int32) % num_experts
+            ).reshape(M, top_k)
+        else:
+            topk_ids = make_balanced_topk_ids(
+                tokens_per_expert,
+                controlled_active_experts,
+                top_k,
+                device,
+            )
         # Cache alignment per BLOCK_SIZE_M to avoid recomputing it for every
         # (num_warps, num_stages, split_k) combination.
         align_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -397,9 +576,16 @@ def tune_one(
                 best_time = t
                 best_config = config
             if (i + 1) % 20 == 0:
+                routing_desc = (
+                    f"tokens/expert={tokens_per_expert}, "
+                    f"active_experts={controlled_active_experts}, "
+                    if tokens_per_expert is not None
+                    else ""
+                )
                 print(
                     f"  M={M} ({'decode' if is_decode else 'prefill'}): "
-                    f"{i+1}/{len(search)} tested, best={best_time*1e3:.2f}us"
+                    f"{routing_desc}{i+1}/{len(search)} tested, "
+                    f"best={best_time*1e3:.2f}us"
                 )
 
         if best_config is None:
@@ -408,24 +594,105 @@ def tune_one(
 
         best_configs[M] = sort_config(best_config)
         results[M] = (best_time, best_configs[M])
+        routing_desc = (
+            f", tokens/expert={tokens_per_expert}, "
+            f"active_experts={controlled_active_experts}"
+            if tokens_per_expert is not None
+            else ""
+        )
         print(
             f"  M={M} ({'decode' if is_decode else 'prefill'}): "
-            f"best={best_time*1e3:.2f}us, config={best_configs[M]}"
+            f"routed={M * top_k}{routing_desc}, best={best_time*1e3:.2f}us, "
+            f"config={best_configs[M]}"
         )
 
     return best_configs, results
 
 
+def print_config_ranges(
+    all_results: List[Tuple[int, int, int, Dict[int, Tuple[float, Dict[str, Any]]]]],
+    top_k: int,
+) -> None:
+    """Print adjacent tested M/routed ranges that share an identical config."""
+    print(f"\n{'='*80}")
+    print("CONFIG RANGES")
+    print(f"{'='*80}")
+    print(
+        f"\n{'E':>5} {'N(rank)':>8} {'K(hidden)':>10} "
+        f"{'M range':>14} {'routed range':>18}  config"
+    )
+    print("-" * 120)
+
+    for E, N, K, results in all_results:
+        current_start = None
+        current_end = None
+        current_sig = None
+        current_cfg = None
+
+        def flush_range():
+            if current_start is None or current_end is None or current_cfg is None:
+                return
+            routed_start = current_start * top_k
+            routed_end = current_end * top_k
+            print(
+                f"{E:>5} {N:>8} {K:>10} "
+                f"{format_range(current_start, current_end):>14} "
+                f"{format_range(routed_start, routed_end):>18}  {current_cfg}"
+            )
+
+        for M in sorted(results.keys()):
+            _, cfg = results[M]
+            sig = config_signature(cfg)
+            if current_sig is None:
+                current_start = current_end = M
+                current_sig = sig
+                current_cfg = cfg
+            elif sig == current_sig:
+                current_end = M
+            else:
+                flush_range()
+                current_start = current_end = M
+                current_sig = sig
+                current_cfg = cfg
+        flush_range()
+
+
 def main(args: argparse.Namespace):
     device = torch.device("cuda:0")
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    output_dtype = torch.float32 if args.fp32_atomic_add else dtype
+    decode_batch_sizes = (
+        routed_counts_to_m_values(
+            "--decode-routed-token-counts",
+            args.decode_routed_token_counts,
+            args.top_k,
+        )
+        or args.decode_batch_sizes
+    )
+    prefill_num_tokens = (
+        routed_counts_to_m_values(
+            "--prefill-routed-token-counts",
+            args.prefill_routed_token_counts,
+            args.top_k,
+        )
+        or args.prefill_num_tokens
+    )
 
     print("MoE LoRA shrink tuning")
     print(f"  num_experts(E)={args.num_experts}")
     print(f"  ranks={args.ranks}, hidden_sizes={args.hidden_sizes}")
-    print(f"  decode batch sizes (M==bs)={args.decode_batch_sizes}")
-    print(f"  prefill num_tokens M={args.prefill_num_tokens}")
-    print(f"  top_k={args.top_k}, dtype={args.dtype}")
+    if args.decode_tokens_per_expert is None:
+        print(f"  decode batch sizes (M==bs)={decode_batch_sizes}")
+        print(f"  decode routed rows={[m * args.top_k for m in decode_batch_sizes]}")
+    else:
+        print(f"  decode tokens/expert={args.decode_tokens_per_expert}")
+        print(f"  decode active_experts={args.active_experts or 'all E'}")
+    print(f"  prefill num_tokens M={prefill_num_tokens}")
+    print(f"  prefill routed rows={[m * args.top_k for m in prefill_num_tokens]}")
+    print(
+        f"  top_k={args.top_k}, dtype={args.dtype}, "
+        f"output_dtype={'float32' if args.fp32_atomic_add else args.dtype}"
+    )
 
     all_results = []  # (E, N, K, results)
     for E in args.num_experts:
@@ -435,29 +702,40 @@ def main(args: argparse.Namespace):
                     E,
                     N,
                     K,
-                    args.decode_batch_sizes,
-                    args.prefill_num_tokens,
+                    decode_batch_sizes,
+                    prefill_num_tokens,
                     args.top_k,
                     dtype,
+                    output_dtype,
                     device,
                     args.seed,
+                    args.decode_tokens_per_expert,
+                    args.active_experts,
                 )
-                if best_configs:
+                if best_configs and not args.no_save:
                     filepath = save_config(best_configs, E, N, K)
                     print(f"  Saved to: {filepath}")
+                elif best_configs:
+                    print("  Skipped saving configs (--no-save)")
                 all_results.append((E, N, K, results))
 
     print(f"\n{'='*80}")
     print("SUMMARY")
     print(f"{'='*80}")
     print(
-        f"\n{'E':>5} {'N(rank)':>8} {'K(hidden)':>10} {'M':>6} {'tuned(us)':>11}  config"
+        f"\n{'E':>5} {'N(rank)':>8} {'K(hidden)':>10} "
+        f"{'M':>6} {'routed':>8} {'tuned(us)':>11}  config"
     )
-    print("-" * 100)
+    print("-" * 112)
     for E, N, K, results in all_results:
         for M in sorted(results.keys()):
             best, cfg = results[M]
-            print(f"{E:>5} {N:>8} {K:>10} {M:>6} {best*1e3:>10.2f}  {cfg}")
+            print(
+                f"{E:>5} {N:>8} {K:>10} {M:>6} {M * args.top_k:>8} "
+                f"{best*1e3:>10.2f}  {cfg}"
+            )
+
+    print_config_ranges(all_results, args.top_k)
 
     print(f"\nTuning completed at {datetime.now().ctime()}")
 
@@ -489,12 +767,46 @@ if __name__ == "__main__":
         "In decode the config key M == batch size (1 token/request).",
     )
     parser.add_argument(
+        "--decode-routed-token-counts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional decode sweep expressed as routed rows instead of input "
+        "batch size. Values must be multiples of top_k and are converted to "
+        "runtime-compatible M keys by dividing by top_k.",
+    )
+    parser.add_argument(
+        "--decode-tokens-per-expert",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional decode sweep with controlled balanced routing. Each value "
+        "is the exact number of routed rows assigned to each active expert. "
+        "The runtime-compatible M key is active_experts * value / top_k.",
+    )
+    parser.add_argument(
+        "--active-experts",
+        type=int,
+        default=None,
+        help="Number of active experts to use with --decode-tokens-per-expert. "
+        "Defaults to all E virtual experts for each tuned shape.",
+    )
+    parser.add_argument(
         "--prefill-num-tokens",
         type=int,
         nargs="*",
         default=[512, 1024, 1536, 2048, 3072, 4096, 8192],
         help="Token counts M tuned in the prefill regime (bm tuned). "
         "Pass with no values to skip the prefill sweep entirely.",
+    )
+    parser.add_argument(
+        "--prefill-routed-token-counts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional prefill sweep expressed as routed rows instead of input "
+        "token count. Values must be multiples of top_k and are converted to "
+        "runtime-compatible M keys by dividing by top_k.",
     )
     parser.add_argument(
         "--num-experts",
@@ -516,6 +828,18 @@ if __name__ == "__main__":
         choices=["float16", "bfloat16"],
         default="bfloat16",
         help="Activation/weight dtype used while benchmarking.",
+    )
+    parser.add_argument(
+        "--fp32-atomic-add",
+        action="store_true",
+        help="Benchmark split-K accumulation with a float32 output buffer, so "
+        "atomic_add operates on fp32 instead of the activation dtype. This is an "
+        "experiment for the shrink stage and should usually be paired with --no-save.",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Run tuning and print results without writing JSON config files.",
     )
     parser.add_argument(
         "--seed",
