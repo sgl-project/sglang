@@ -148,6 +148,9 @@ class ScriptedContext:
     def stream_events(self, rid: str) -> List[object]:
         return queries.stream_events(self, rid)
 
+    def in_flight_other_mb_rids(self) -> List[str]:
+        return queries.in_flight_other_mb_rids(self)
+
     def batch_composition(self) -> Dict[str, List[str]]:
         return queries.batch_composition(self)
 

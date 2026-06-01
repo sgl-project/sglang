@@ -115,6 +115,25 @@ def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
     )
 
 
+def in_flight_other_mb_rids(ctx: "ScriptedContext") -> List[str]:
+    # Under pipeline parallelism the scheduler keeps one ScheduleBatch per
+    # micro-batch slot in running_mbs; the slot it is currently servicing is
+    # running_batch. Reqs sitting in the *other* slots are in flight in another
+    # micro-batch and must be excluded from the local running set by filter_batch.
+    # running_mbs only exists once init_pp_loop_state has run (PP path); without
+    # PP there are no other micro-batches.
+    s = ctx._scheduler
+    if not hasattr(s, "running_mbs"):
+        return []
+    current = s.running_batch
+    rids: List[str] = []
+    for mb in s.running_mbs:
+        if mb is current or mb is None:
+            continue
+        rids.extend(r.rid for r in mb.reqs)
+    return rids
+
+
 def stream_events(ctx: "ScriptedContext", rid: str) -> List[Any]:
     # The streamed batch outputs the scheduler has emitted toward the tokenizer
     # for this rid so far. While a request is still mid-chunk (prefill not done)
