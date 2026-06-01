@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.realtime.session import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldCausalDMDConfig,
     _actions_to_c2ws,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
@@ -680,7 +681,7 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
         RealtimeVideoGenerationsRequest(
             type="init",
             prompt="walk forward",
-            num_frames=3,
+            num_frames=9,
             fps=24,
             realtime_causal_sink_size=3,
             realtime_causal_kv_cache_num_frames=45,
@@ -692,7 +693,10 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
         pipeline_config=SimpleNamespace(
             dit_config=SimpleNamespace(
                 arch_config=SimpleNamespace(num_frames_per_block=3)
-            )
+            ),
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(temporal_compression_ratio=4)
+            ),
         )
     )
     seen = {}
@@ -732,6 +736,7 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
 
     assert seen["request_id"] == chunk.request_id
     assert seen["kwargs"]["prompt"] == "walk forward"
+    assert seen["kwargs"]["num_frames"] == 21
     assert seen["kwargs"]["num_inference_steps"] == 4
     assert seen["kwargs"]["guidance_scale"] == 1.0
     assert seen["kwargs"]["condition_inputs"] == {
@@ -747,6 +752,72 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     assert batch.realtime_event_id == 11
     assert batch.realtime_causal_sink_size == 3
     assert batch.realtime_causal_kv_cache_num_frames == 45
+
+
+def test_lingbot_realtime_condition_horizon_repeats_blank_tail_chunk():
+    config = LingBotWorldCausalDMDConfig()
+    chunk_size = config.dit_config.arch_config.num_frames_per_block
+    latent_channels = config.vae_config.arch_config.z_dim
+    temporal_ratio = config.vae_config.arch_config.temporal_compression_ratio
+    spatial_ratio = config.vae_config.arch_config.spatial_compression_ratio
+    request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="walk forward",
+        num_frames=9,
+    )
+    server_args = SimpleNamespace(pipeline_config=config)
+
+    num_frames = lingbot_realtime.LingBotWorldRealtimeAdapter._condition_num_frames(
+        request=request,
+        server_args=server_args,
+        chunk_size=chunk_size,
+    )
+    latent_frames = (num_frames - 1) // temporal_ratio + 1
+    raw_request_latent_frames = (request.num_frames - 1) // temporal_ratio + 1
+
+    assert raw_request_latent_frames == chunk_size
+    assert latent_frames == chunk_size * 2
+
+    latent_condition = torch.ones(1, latent_channels, latent_frames, 2, 2)
+    batch = SimpleNamespace(
+        height=2 * spatial_ratio,
+        width=2 * spatial_ratio,
+    )
+    condition_full = config.postprocess_image_latent(latent_condition, batch)
+    first_chunk = LingBotWorldCausalDMDDenoisingStage._select_i2v_condition_chunk(
+        condition_full,
+        chunk_idx=0,
+        chunk_size=chunk_size,
+    )
+    tail_chunk = LingBotWorldCausalDMDDenoisingStage._select_i2v_condition_chunk(
+        condition_full,
+        chunk_idx=1,
+        chunk_size=chunk_size,
+    )
+    repeated_tail = LingBotWorldCausalDMDDenoisingStage._select_i2v_condition_chunk(
+        condition_full,
+        chunk_idx=2,
+        chunk_size=chunk_size,
+    )
+
+    assert torch.count_nonzero(first_chunk[:, :temporal_ratio]) > 0
+    assert torch.count_nonzero(tail_chunk[:, :temporal_ratio]) == 0
+    assert not torch.equal(tail_chunk, first_chunk)
+    assert torch.equal(repeated_tail, tail_chunk)
+
+    long_request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="walk forward",
+        num_frames=45,
+    )
+    assert (
+        lingbot_realtime.LingBotWorldRealtimeAdapter._condition_num_frames(
+            request=long_request,
+            server_args=server_args,
+            chunk_size=chunk_size,
+        )
+        == 45
+    )
 
 
 def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():

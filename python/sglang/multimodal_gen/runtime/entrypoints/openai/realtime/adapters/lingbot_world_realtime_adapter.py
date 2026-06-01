@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 
 LINGBOT_REALTIME_DEFAULT_NUM_INFERENCE_STEPS = 4
+LINGBOT_REALTIME_MIN_CONDITION_CHUNKS = 2
 
 
 class LingBotWorldRealtimeState:
@@ -332,16 +333,23 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         chunk: RealtimeChunkContext,
         chunk_inputs: RealtimeChunkInputs,
         chunk_size: int,
+        server_args: ServerArgs,
     ):
         request = session.request
         if request is None:
             raise ValueError("realtime request is not initialized")
 
+        num_frames = self._condition_num_frames(
+            request=request,
+            server_args=server_args,
+            chunk_size=chunk_size,
+        )
+
         return build_sampling_params(
             chunk.request_id,
             prompt=chunk_inputs.prompt,
             size=request.size,
-            num_frames=request.num_frames,
+            num_frames=num_frames,
             fps=request.fps,
             image_path=request.first_frame,
             output_file_name=chunk.request_id,
@@ -375,6 +383,25 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
             realtime_chunk_size=chunk_size,
         )
 
+    @staticmethod
+    def _condition_num_frames(
+        *,
+        request: RealtimeVideoGenerationsRequest,
+        server_args: ServerArgs | None,
+        chunk_size: int,
+    ) -> int:
+        if server_args is None:
+            return int(request.num_frames or 0)
+
+        # encode one extra blank condition chunk so repeat-last never reuses
+        # the first-frame image mask on later realtime chunks
+        temporal_ratio = int(
+            server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
+        )
+        required_latent_frames = chunk_size * LINGBOT_REALTIME_MIN_CONDITION_CHUNKS
+        required_num_frames = (required_latent_frames - 1) * temporal_ratio + 1
+        return max(int(request.num_frames or 0), required_num_frames)
+
     def prepare_next_request(
         self,
         session: GenerateSession,
@@ -390,6 +417,7 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
             chunk,
             chunk_inputs,
             chunk_size,
+            server_args,
         )
         batch = prepare_request(
             server_args=server_args,
