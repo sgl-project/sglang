@@ -1,4 +1,3 @@
-import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -55,11 +54,6 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
-_LINGBOT_REALTIME_CI_ENV = "SGLANG_ENABLE_LINGBOT_REALTIME_CI"
-
-
-def _env_enabled(name: str) -> bool:
-    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
 def _make_lingbot_realtime_plastic_beach_case() -> DiffusionTestCase:
@@ -768,8 +762,7 @@ if not current_platform.is_hip():
         )
     )
 
-if _env_enabled(_LINGBOT_REALTIME_CI_ENV):
-    ONE_GPU_CASES.append(_make_lingbot_realtime_plastic_beach_case())
+ONE_GPU_CASES.append(_make_lingbot_realtime_plastic_beach_case())
 
 ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)

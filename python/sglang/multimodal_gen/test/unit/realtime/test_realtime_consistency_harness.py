@@ -513,20 +513,15 @@ def test_lingbot_realtime_plastic_beach_params_are_lossless_gt_ready():
     assert params.realtime_events[0]["payload"]["mode"] == "state"
 
 
-def test_lingbot_realtime_case_is_env_gated(monkeypatch):
+def test_lingbot_realtime_case_is_registered_by_default():
     from sglang.multimodal_gen.test.server.gpu_cases import (
-        _LINGBOT_REALTIME_CI_ENV,
-        _env_enabled,
         _make_lingbot_realtime_plastic_beach_case,
+        ONE_GPU_CASES,
     )
-
-    monkeypatch.delenv(_LINGBOT_REALTIME_CI_ENV, raising=False)
-    assert not _env_enabled(_LINGBOT_REALTIME_CI_ENV)
-    monkeypatch.setenv(_LINGBOT_REALTIME_CI_ENV, "1")
-    assert _env_enabled(_LINGBOT_REALTIME_CI_ENV)
 
     case = _make_lingbot_realtime_plastic_beach_case()
     assert case.id == "lingbot_world_realtime_plastic_beach"
     assert case.run_consistency_check is True
     assert case.run_perf_check is True
     assert case.sampling_params.realtime_output_format is None
+    assert any(item.id == case.id for item in ONE_GPU_CASES)
