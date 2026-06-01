@@ -12,8 +12,15 @@ register_cuda_ci(est_time=240, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 EPS = 1e-6
-DEVICE = "cuda"
 DTYPES = [torch.float16, torch.bfloat16]
+
+# Determine device: prefer XPU if available, otherwise CUDA
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = "xpu"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+else:
+    DEVICE = None
 
 
 def sglang_jit_rmsnorm(
@@ -40,6 +47,15 @@ def flashinfer_rmsnorm(
     rmsnorm(input, weight, out=output, eps=eps)
 
 
+def pytorch_rmsnorm(
+    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    variance = input.float().pow(2).mean(-1, keepdim=True)
+    return (input.float() * torch.rsqrt(variance + eps) * weight.float()).to(
+        input.dtype
+    )
+
+
 BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
 BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
@@ -47,6 +63,14 @@ SUPPORTED_HIDDEN_SIZE_LIST = get_ci_test_range(
     [64, 128, 256, 512, *range(1024, 8192 + 1, 1024), 2304, 2560, 12288, 16384],
     [256, 1024, 16384],
 )
+
+# Determine device: prefer XPU if available, otherwise CUDA
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = "xpu"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+else:
+    DEVICE = None
 
 
 @pytest.mark.parametrize(
@@ -58,8 +82,22 @@ SUPPORTED_HIDDEN_SIZE_LIST = get_ci_test_range(
 def test_rmsnorm(
     batch_size: int, hidden_size: int, dtype: torch.dtype, specify_out: bool
 ) -> None:
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
     input = torch.randn(batch_size, hidden_size, device=DEVICE, dtype=dtype)
     weight = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
+
+    if DEVICE == "xpu":
+        output_ref = pytorch_rmsnorm(input, weight)
+        if specify_out:
+            output_sglang = torch.empty_like(input)
+            sglang_jit_rmsnorm(input, weight, output=output_sglang)
+        else:
+            output_sglang = input.clone()
+            sglang_jit_rmsnorm(output_sglang, weight, output=output_sglang)
+        torch.testing.assert_close(output_sglang, output_ref, atol=0.1, rtol=0.02)
+        return
 
     input_flashinfer = input.clone()
     output_flashinfer = torch.empty_like(input)
