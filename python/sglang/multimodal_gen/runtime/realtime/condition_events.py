@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -282,7 +283,7 @@ class ControlStateSamplingQueue:
     @staticmethod
     def _copy_item(item: Any) -> Any:
         if isinstance(item, list):
-            return list(item)
+            return copy.deepcopy(item)
         if isinstance(item, dict):
-            return dict(item)
+            return copy.deepcopy(item)
         return item

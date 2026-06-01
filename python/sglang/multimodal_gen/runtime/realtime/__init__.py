@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ControlStateSamplingQueue,
     ControlStateTransition,
 )
+from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
     RealtimeSession,
@@ -24,6 +25,7 @@ __all__ = [
     "ControlSignal",
     "ControlStateSamplingQueue",
     "ControlStateTransition",
+    "RealtimeCausalDiTState",
     "RealtimeSession",
     "RealtimeSessionCache",
 ]

@@ -43,7 +43,7 @@ class RealtimeSession:
         return self._states.get(state_cls)
 
     def dispose(self) -> None:
-        for state in self._states.values():
+        for state in list(self._states.values()):
             state.dispose()
         self._states.clear()
 
