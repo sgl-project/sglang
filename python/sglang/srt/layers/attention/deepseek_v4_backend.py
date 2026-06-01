@@ -60,7 +60,7 @@ from sglang.srt.utils import ceil_align
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
-    from sgl_kernel.flash_mla import FlashMLASchedMeta
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
