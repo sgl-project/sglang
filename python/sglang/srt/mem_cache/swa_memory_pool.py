@@ -631,7 +631,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        if swa_indices.numel() > 0:
+            self.swa_attn_allocator.free(torch.unique(swa_indices))
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
