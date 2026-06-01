@@ -808,14 +808,12 @@ class DeepseekV4AttnBackend(
                 f"local_seq_lens_len={len(seq_lens)}, "
                 f"has_graph={bs in self.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.DECODE_OR_IDLE]}"
             )
-            device = seq_lens.device
-            seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
+            # GPU buffers (seq_lens, req_pool_indices) are already filled
+            # with safe IDLE defaults by populate_from_forward_batch; only
+            # CPU-side state needs fix-up here.
             seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
             seq_lens_sum = bs
-            req_pool_indices = torch.zeros(
-                bs, dtype=req_pool_indices.dtype, device=device
-            )
-            out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
+            out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=seq_lens.device)
 
         assert seq_lens_cpu is not None
         seq_lens = seq_lens[:bs]
