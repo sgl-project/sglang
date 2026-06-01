@@ -4,7 +4,6 @@ from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_STEPS,
     base_engine_kwargs,
     run_until,
     run_until_finished,
@@ -160,15 +159,12 @@ class TestChunkSize1(ScriptedTestCase):
     @staticmethod
     def _script_chunks_done_monotone_under_chunk_size_1(t: ScriptedContext):
         r = t.start_req(prompt_len=16, max_new_tokens=2)
-        prev = 0
-        for _ in range(DEFAULT_MAX_STEPS):
-            cur = r.chunks_done
-            assert cur >= prev, f"chunks_done regressed: prev={prev}, cur={cur}"
-            prev = cur
-            if r.finished:
-                return
-            yield
-        raise AssertionError("req never finished")
+        yield from run_until_finished(r)
+        assert r.finished
+        assert r.chunks_done == 16, (
+            f"chunk_size=1 with prompt_len=16 chunks one token at a time "
+            f"(ceil(16/1)=16), got chunks_done={r.chunks_done}"
+        )
 
     def test_chunk_size_one_long_prompt(self):
         self.server.execute_script(self._script_chunk_size_one_long_prompt)
@@ -344,6 +340,22 @@ class TestChunkSize2048MaxPrefill1024(ScriptedTestCase):
         assert r.finished
         # chunked prefill is governed by chunked_prefill_size (2048), not by
         # max_prefill_tokens (1024): a 512-token prompt stays under the 2048
+        # chunk budget and completes in one non-chunked shot.
+        assert r.chunks_done == 0
+
+    def test_prompt_between_max_prefill_and_chunk_size(self):
+        self.server.execute_script(
+            self._script_prompt_between_max_prefill_and_chunk_size
+        )
+
+    @staticmethod
+    def _script_prompt_between_max_prefill_and_chunk_size(t: ScriptedContext):
+        r = t.start_req(prompt_len=1536, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        # 1536 sits between max_prefill_tokens (1024) and chunked_prefill_size
+        # (2048). Chunked prefill is bounded by rem_chunk_tokens (chunk_size
+        # 2048), not by max_prefill_tokens (1024), so the prompt stays under the
         # chunk budget and completes in one non-chunked shot.
         assert r.chunks_done == 0
 
