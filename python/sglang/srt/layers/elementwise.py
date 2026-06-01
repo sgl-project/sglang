@@ -554,20 +554,25 @@ def _fused_sigmoid_mul_kernel(
 def fused_sigmoid_mul(
     attn_output: torch.Tensor,
     gate: torch.Tensor,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
 
     Equivalent to: attn_output * sigmoid(gate)
+
+    When inplace=True, writes result back to attn_output and returns it.
     """
     assert (
         attn_output.shape == gate.shape
     ), "attn_output and gate must have the same shape"
-    out = torch.empty_like(attn_output)
+    out = attn_output if inplace else torch.empty_like(attn_output)
     n_elements = out.numel()
-    grid = (triton.cdiv(n_elements, 1024),)
+    BLOCK_SIZE = 1024
+    num_warps = min(max(triton.cdiv(BLOCK_SIZE, 256), 4), 16)
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     _fused_sigmoid_mul_kernel[grid](
-        out, attn_output, gate, n_elements, BLOCK_SIZE=1024, num_warps=8
+        out, attn_output, gate, n_elements, BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps
     )
     return out
 
@@ -588,28 +593,22 @@ def _fused_gate_sigmoid_mul_add_kernel(
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < hidden_dim
 
-    # Load static weight first — does not depend on upstream kernel output
     w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
 
-    # Phase 1: dot product in fp32
     h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
-    gate = tl.sum(h * w, axis=0)
-
-    # Sigmoid in fp32
-    gate_val = tl.sigmoid(gate)
-
-    # Phase 2: final_hidden_states += gate_val * shared_output
     s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
     f = tl.load(
         final_hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0
     ).to(tl.float32)
+
+    gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
     result = f + gate_val * s
 
     tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)

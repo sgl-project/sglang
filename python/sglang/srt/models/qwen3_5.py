@@ -971,7 +971,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            attn_output = fused_sigmoid_mul(attn_output, gate)
+            attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
 
         output, _ = self.o_proj(attn_output)
         return output

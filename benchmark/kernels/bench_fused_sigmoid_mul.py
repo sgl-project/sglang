@@ -22,9 +22,9 @@ def make_bench(hidden_dim):
             x_names=["num_tokens"],
             x_vals=[1, 4, 16, 64, 512, 1024, 2048, 8192],
             line_arg="impl",
-            line_vals=["triton", "pytorch"],
-            line_names=["Triton fused", "PyTorch eager"],
-            styles=[("blue", "-"), ("orange", "--")],
+            line_vals=["triton", "triton_inplace", "pytorch"],
+            line_names=["Triton fused", "Triton inplace", "PyTorch eager"],
+            styles=[("blue", "-"), ("green", "-"), ("orange", "--")],
             ylabel="us",
             plot_name=f"fused_sigmoid_mul-hidden{hidden_dim}",
             args={"hidden_dim": hidden_dim},
@@ -36,6 +36,8 @@ def make_bench(hidden_dim):
 
         if impl == "triton":
             fn = lambda: fused_sigmoid_mul(attn_output, gate)
+        elif impl == "triton_inplace":
+            fn = lambda: fused_sigmoid_mul(attn_output, gate, inplace=True)
         else:
             fn = lambda: _pytorch_reference(attn_output, gate)
 
