@@ -62,10 +62,16 @@ class KVCacheEventMixin:
                 if end <= start:
                     continue
                 # Preserve historical event payload: bigram pages expose tuples.
+                # raw is a numpy int64 ndarray; tolist() converts to Python ints
+                # in a single vectorized step (msgspec requires plain int).
                 if is_bigram:
-                    page_tokens = [(raw[j], raw[j + 1]) for j in range(start, end)]
+                    raw_window = raw[start : end + 1].tolist()
+                    page_tokens = [
+                        (raw_window[j - start], raw_window[j + 1 - start])
+                        for j in range(start, end)
+                    ]
                 else:
-                    page_tokens = list(raw[start:end])
+                    page_tokens = raw[start:end].tolist()
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
