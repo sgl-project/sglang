@@ -26,6 +26,10 @@ class ScriptedReqHandle:
         return self.context.is_chunking(self.rid)
 
     @property
+    def chunks_done(self) -> int:
+        return self.context.chunks_done(self.rid)
+
+    @property
     def kv_pages(self) -> int:
         page_size = self.context._scheduler.page_size
         return (self.req.kv_allocated_len + page_size - 1) // page_size

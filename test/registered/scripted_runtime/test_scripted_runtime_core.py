@@ -492,6 +492,39 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             t.batch_composition()["chunked"] == []
         ), "no chunked req should remain after the req finishes"
 
+    def test_chunks_done_zero_for_unchunked_prompt(self):
+        self.server.execute_script(self._script_chunks_done_zero)
+
+    @staticmethod
+    def _script_chunks_done_zero(t: ScriptedContext):
+        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2, ignore_eos=True)
+        yield from run_until_finished(r)
+        assert (
+            r.chunks_done == 0
+        ), f"prompt <= chunk must not chunk; got {r.chunks_done}"
+
+    def test_chunks_done_counts_two_chunks(self):
+        self.server.execute_script(self._script_chunks_done_two)
+
+    @staticmethod
+    def _script_chunks_done_two(t: ScriptedContext):
+        r = t.start_req(prompt_len=_CHUNK_SIZE + 2, max_new_tokens=2, ignore_eos=True)
+        yield from run_until_finished(r)
+        assert (
+            r.chunks_done == 2
+        ), f"chunk_size+2 prompt -> 2 chunks; got {r.chunks_done}"
+
+    def test_chunks_done_scales_with_prompt(self):
+        self.server.execute_script(self._script_chunks_done_five)
+
+    @staticmethod
+    def _script_chunks_done_five(t: ScriptedContext):
+        r = t.start_req(prompt_len=5 * _CHUNK_SIZE, max_new_tokens=2, ignore_eos=True)
+        yield from run_until_finished(r)
+        assert (
+            r.chunks_done == 5
+        ), f"5*chunk_size prompt -> 5 chunks; got {r.chunks_done}"
+
     def test_empty_script_returns_immediately(self):
         self.server.execute_script(self._script_empty_return)
 

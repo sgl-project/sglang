@@ -65,3 +65,11 @@ def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
 def is_chunking(ctx: "ScriptedContext", rid: str) -> bool:
     s = ctx._scheduler
     return s.chunked_req is not None and s.chunked_req.rid == rid
+
+
+def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
+    return sum(
+        1
+        for record in ctx._scheduler_hook._batch_log
+        if record.chunked_rid == rid and rid in record.rids
+    )

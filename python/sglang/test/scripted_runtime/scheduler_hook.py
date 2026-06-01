@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Generator, Optional, Tuple
+from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
 
@@ -35,6 +36,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 RESET_DRAIN_MAX_STEPS: int = 200
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptedBatchRecord:
+    forward_iter: int
+    mode: str
+    rids: Tuple[str, ...]
+    extend_rids: Tuple[str, ...]
+    chunked_rid: Optional[str]
+
+
+def _forward_mode_str(forward_mode) -> str:
+    if forward_mode is None:
+        return "unknown"
+    if forward_mode.is_idle():
+        return "idle"
+    if forward_mode.is_extend():
+        return "extend"
+    if forward_mode.is_decode():
+        return "decode"
+    if forward_mode.is_mixed():
+        return "mixed"
+    return "unknown"
 
 
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
@@ -75,6 +99,7 @@ class ScriptedSchedulerHook:
             and scheduler.ps.tp_rank == 0
             and scheduler.ps.attn_cp_rank == 0
         )
+        self._batch_log: List["ScriptedBatchRecord"] = []
 
         if self._is_driver:
             ensure_script_importable(
@@ -107,6 +132,7 @@ class ScriptedSchedulerHook:
                         fn = resolve_fn(fn_path)
                         ctx = self._context
                         yield from _reset_engine_state(ctx)
+                        self._batch_log.clear()
                         sub_gen = fn(ctx, *args)
                         try:
                             yield from sub_gen
@@ -121,6 +147,20 @@ class ScriptedSchedulerHook:
         finally:
             close_zmq_socket(socket, ctx_zmq)
             self._http_poster.close()
+
+    def on_run_batch(self, batch) -> None:
+        if not self._is_driver:
+            return
+        chunked = self._scheduler.chunked_req
+        self._batch_log.append(
+            ScriptedBatchRecord(
+                forward_iter=batch.forward_iter,
+                mode=_forward_mode_str(batch.forward_mode),
+                rids=tuple(r.rid for r in batch.reqs),
+                extend_rids=tuple(r.rid for r in batch.reqs if r.is_extend_in_batch),
+                chunked_rid=chunked.rid if chunked is not None else None,
+            )
+        )
 
     def step(self) -> None:
         if not self._is_driver:

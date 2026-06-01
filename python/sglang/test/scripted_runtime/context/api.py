@@ -36,6 +36,7 @@ class ScriptedContext:
             scheduler_hook._is_driver
         ), "ScriptedContext only exists on the driver rank"
         self._scheduler = scheduler_hook._scheduler
+        self._scheduler_hook = scheduler_hook
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._http_poster = http_poster
 
@@ -95,6 +96,9 @@ class ScriptedContext:
 
     def list_active_reqs(self) -> List["Req"]:
         return queries.list_active_reqs(self)
+
+    def chunks_done(self, rid: str) -> int:
+        return queries.chunks_done(self, rid)
 
     def batch_composition(self) -> Dict[str, List[str]]:
         return queries.batch_composition(self)

@@ -2982,6 +2982,9 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_run_batch(batch)
+
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
