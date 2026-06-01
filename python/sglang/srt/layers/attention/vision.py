@@ -101,6 +101,9 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
     128 * 1024,
 ]
 
+HOPPER_TMA_ALIGN_BYTE = 16
+RAW_VISION_TOKEN_MAX_NUM = 32768
+
 
 @dataclasses.dataclass
 class SingletonCache:
@@ -389,6 +392,22 @@ class VisionTritonAttention(nn.Module):
         return output
 
 
+def pad_last_dim_to_multiple_zero(x: torch.Tensor, multiple: int):
+    orig_d = x.shape[-1]
+    padded_d = ((orig_d + multiple - 1) // multiple) * multiple
+    if padded_d == orig_d:
+        return x, orig_d
+
+    out = torch.zeros(
+        *x.shape[:-1],
+        padded_d,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    out[..., :orig_d] = x
+    return out, orig_d
+
+
 class VisionFlash3Attention(nn.Module):
     def __init__(
         self,
@@ -419,22 +438,145 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+
+        """
+        use fp8 version FA3:
+        1. per_head quantization is necessary
+        2. due to TMA need 16byte alignment head_size like 72 (for Qwen-VL serialize ) can not use FP8 version FA3
+        3. currently solution: quant to fp8 firstly, then pad zero at Q/K/V's last dim : why this can work: Q*K.T( pad zero is ok) = S S*V (pad zero at head_dim also do not change the result of do slice for output)
+        4. currently dfraft version is : [1] per-tensor quantization [2] the only changed part is root(head_dim) which is now root(aligned_head_dim), we should pass the softmax scale in
+        5. for best performance: should define aligned tensor, use a kernel to do per_head_quant and write in to aligned tensor directly (avoid cat(copy again))
+        """
         window_size = kwargs.get("window_size", (-1, -1))
         s_aux = kwargs.get("s_aux", None)
+        vision_attn_shape = envs.SGLANG_VISION_ATTN_FP8_SHAPE.get()
 
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        if vision_attn_shape:
+            if isinstance(cu_seqlens, list):
+                cu_seqlens_tensor = cu_seqlens[0]
+            else:
+                cu_seqlens_tensor = cu_seqlens
+
+            # Calculate average image length to determine if it is a large image
+            num_images = cu_seqlens_tensor.size(0) - 1
+            avg_len = q.shape[0] / num_images if num_images > 0 else q.shape[0]
+
+            # Use FP8 TMA optimization for thresholds above 2400 (depend on hardware)
+            use_fp8 = avg_len > vision_attn_shape
+        else:
+            use_fp8 = False
+
+        if use_fp8:
+            ori_shape = q.shape
+            ori_shape_v = v.shape
+            ori_headsize = ori_shape_v[2]
+            aligned_headsize = (
+                (ori_headsize - 1) // HOPPER_TMA_ALIGN_BYTE + 1
+            ) * HOPPER_TMA_ALIGN_BYTE
+
+            # Lazy buffer allocation to avoid repeated CUDA allocation
+            if not hasattr(self, "q_quant_pad"):
+                self.q_quant_pad = torch.empty(
+                    (RAW_VISION_TOKEN_MAX_NUM, q.shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.k_quant_pad = torch.empty(
+                    (RAW_VISION_TOKEN_MAX_NUM, k.shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.v_quant_pad = torch.empty(
+                    (RAW_VISION_TOKEN_MAX_NUM, ori_shape_v[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+
+            # [NOTE] exceed currently buffer size will lead reallocation and if during cuda-graph capture, will raise error.
+            # for vit cuagraph, we should capture graph from large size to small size
+            if (
+                hasattr(self, "q_quant_pad")
+                and ori_shape[0] > self.q_quant_pad.shape[0]
+            ):
+                self.q_quant_pad = torch.empty(
+                    (ori_shape[0], q.shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.k_quant_pad = torch.empty(
+                    (ori_shape[0], k.shape[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                self.v_quant_pad = torch.empty(
+                    (ori_shape[0], ori_shape_v[1], aligned_headsize),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+
+            if not hasattr(self, "scale_q_raw"):
+                self.scale_q_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+                self.scale_k_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+                self.scale_v_raw = torch.empty((1), device="cuda", dtype=torch.float32)
+
+            # Use slices of the pre-allocated buffers
+            q_quant_pad = self.q_quant_pad[: ori_shape[0]]
+            k_quant_pad = self.k_quant_pad[: ori_shape[0]]
+            v_quant_pad = self.v_quant_pad[: ori_shape_v[0]]
+            scale_q = self.scale_q_raw
+            scale_k = self.scale_k_raw
+            scale_v = self.scale_v_raw
+
+            # Large image path: always call the TMA version of the quantization kernel
+            from sglang.srt.layers.attention.triton_ops.fused_vision_attn_quant import (
+                fused_qkv_per_tensor_quant_pad,
+            )
+
+            fused_qkv_per_tensor_quant_pad(
+                q,
+                k,
+                v,
+                q_quant_pad,
+                k_quant_pad,
+                v_quant_pad,
+                scale_q,
+                scale_k,
+                scale_v,
+            )
+
+            scale_q = scale_q.expand(cu_seqlens_tensor.size(0) - 1, q.shape[1])
+            scale_k = scale_k.expand(cu_seqlens_tensor.size(0) - 1, k.shape[1])
+            scale_v = scale_v.expand(cu_seqlens_tensor.size(0) - 1, v.shape[1])
+            # use FP8 attention, should use aligned_headsize to recompute softmaxscale
+            attn_softmax_scale = aligned_headsize**-0.5
+
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
             max_seqlen = cu_seqlens[1]
             fa_kwargs = dict(
                 cu_seqlens_q=cu_seqlens[0],
                 cu_seqlens_k=cu_seqlens[0],
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
-                softmax_scale=softmax_scale,
                 window_size=window_size,
             )
+
             if s_aux is not None:
                 fa_kwargs["sinks"] = s_aux
-            output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
+
+            max_seqlen = cu_seqlens[1]
+            if use_fp8:
+                fa_kwargs["q_descale"] = scale_q
+                fa_kwargs["k_descale"] = scale_k
+                fa_kwargs["v_descale"] = scale_v
+                fa_kwargs["softmax_scale"] = attn_softmax_scale
+                output = flash_attn_varlen_func(
+                    q_quant_pad, k_quant_pad, v_quant_pad, **fa_kwargs
+                )
+
+                ret = output[:, :, :ori_headsize]
+            else:
+                fa_kwargs["softmax_scale"] = softmax_scale
+                ret = flash_attn_varlen_func(q, k, v, **fa_kwargs)
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
@@ -446,14 +588,33 @@ class VisionFlash3Attention(nn.Module):
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
-                softmax_scale=softmax_scale,
                 window_size=window_size,
             )
+
             if s_aux is not None:
                 fa_kwargs["sinks"] = s_aux
-            output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
 
-        return output
+            if use_fp8:
+                fa_kwargs["q_descale"] = scale_q
+                fa_kwargs["k_descale"] = scale_k
+                fa_kwargs["v_descale"] = scale_v
+                fa_kwargs["softmax_scale"] = attn_softmax_scale
+                output = flash_attn_varlen_func(
+                    q_quant_pad,
+                    k_quant_pad,
+                    v_quant_pad,
+                    **fa_kwargs,
+                )
+                ret = output[:, :, :ori_headsize]
+            else:
+                fa_kwargs["softmax_scale"] = softmax_scale
+                ret = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    **fa_kwargs,
+                )
+        return ret
 
 
 class VisionFlash4Attention(nn.Module):
