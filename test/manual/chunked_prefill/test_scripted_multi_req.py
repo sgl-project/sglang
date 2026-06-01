@@ -13,6 +13,22 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
+def _drain_flush_then_assert_no_kv_leak(t: ScriptedContext, baseline: dict):
+    # A finished req commits its prompt prefix to the radix tree, so its KV counts
+    # as cached-not-free until the tree is flushed; comparing kv_pool_free without
+    # flushing therefore reads legitimate caching as a leak. Drain the one-step
+    # overlap pipeline lag to idle, flush the now-unreferenced cached KV, then
+    # compare -- mirroring test_engine_stats_tracks_kv in the registered suite.
+    for _ in range(5):
+        yield
+    t.flush_cache()
+    yield
+    final = t.engine_stats()
+    assert (
+        final["kv_pool_free"] >= baseline["kv_pool_free"]
+    ), f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
+
+
 class TestMultiReqBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
@@ -71,10 +87,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         yield from run_until_all_finished(reqs, max_steps=2000)
         for r in reqs:
             assert r.finished
-        final = t.engine_stats()
-        assert (
-            final["kv_pool_free"] >= baseline["kv_pool_free"]
-        ), f"KV leak: {baseline['kv_pool_free']} -> {final['kv_pool_free']}"
+        yield from _drain_flush_then_assert_no_kv_leak(t, baseline)
 
     def test_five_hundred_short_reqs(self):
         self.server.execute_script(self._script_five_hundred_short_reqs)
@@ -86,8 +99,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         yield from run_until_all_finished(reqs, max_steps=20000)
         for r in reqs:
             assert r.finished
-        final = t.engine_stats()
-        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
+        yield from _drain_flush_then_assert_no_kv_leak(t, baseline)
 
     def test_mixed_ten_chunked_ten_short(self):
         self.server.execute_script(self._script_mixed_ten_chunked_ten_short)
@@ -95,9 +107,16 @@ class TestMultiReqBasic(ScriptedTestCase):
     @staticmethod
     def _script_mixed_ten_chunked_ten_short(t: ScriptedContext):
         baseline = t.engine_stats()
+        # Distinct prompt_token per chunked req: identical-length prompts are
+        # byte-identical token streams that dedup in the radix tree, so all but the
+        # first would hit the cache and chunk zero times -- making chunks_done >= 2
+        # unsatisfiable. Distinct fill tokens give each req a non-shared prefix so
+        # each genuinely chunks.
         chunked = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(10)
+            t.start_req(
+                prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=100 + i
+            )
+            for i in range(10)
         ]
         shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(10)]
         all_reqs = chunked + shorts
@@ -112,8 +131,7 @@ class TestMultiReqBasic(ScriptedTestCase):
             raise AssertionError("not all reqs finished")
         for r in chunked:
             assert r.chunks_done >= 2
-        final = t.engine_stats()
-        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
+        yield from _drain_flush_then_assert_no_kv_leak(t, baseline)
 
     def test_submit_during_chunk_mid(self):
         self.server.execute_script(self._script_submit_during_chunk_mid)
@@ -179,8 +197,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         yield from run_until_all_finished(reqs, max_steps=2000)
         for r in reqs:
             assert r.finished
-        final = t.engine_stats()
-        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
+        yield from _drain_flush_then_assert_no_kv_leak(t, baseline)
 
     def test_submit_then_immediate_abort(self):
         self.server.execute_script(self._script_submit_then_immediate_abort)
@@ -205,8 +222,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-rid")
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
-        final = t.engine_stats()
-        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
+        yield from _drain_flush_then_assert_no_kv_leak(t, baseline)
 
     def test_submit_pause_n_resubmit_same_rid(self):
         self.server.execute_script(self._script_submit_pause_n_resubmit_same_rid)
@@ -222,8 +238,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-200")
         yield from run_until_finished(r2)
         assert r2.finished
-        final = t.engine_stats()
-        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
+        yield from _drain_flush_then_assert_no_kv_leak(t, baseline)
 
     def test_submit_during_decode_of_other(self):
         self.server.execute_script(self._script_submit_during_decode_of_other)
@@ -286,9 +301,18 @@ class TestMultiReqBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_multiple_chunked_staggered(t: ScriptedContext):
+        # Distinct prompt_token per req: identical-length prompts dedup in the radix
+        # tree, so later reqs would hit the cache and chunk zero times, breaking the
+        # per-req chunks_done >= 2 assertion below.
         reqs = []
-        for _ in range(4):
-            reqs.append(t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2))
+        for i in range(4):
+            reqs.append(
+                t.start_req(
+                    prompt_len=VERY_LONG_PROMPT_LEN,
+                    max_new_tokens=2,
+                    prompt_token=100 + i,
+                )
+            )
             yield
             assert sum(1 for r in reqs if r.is_chunking) <= 1
             yield
@@ -306,9 +330,13 @@ class TestMultiReqBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_eight_concurrent_chunked(t: ScriptedContext):
+        # Distinct prompt_token per req so identical-length prompts do not dedup in
+        # the radix tree (a cache hit would drop a later req's chunks_done to zero).
         reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(8)
+            t.start_req(
+                prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=100 + i
+            )
+            for i in range(8)
         ]
         finished = False
         for _ in range(DEFAULT_MAX_STEPS * 5):
