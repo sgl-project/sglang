@@ -472,6 +472,30 @@ class _MoriEPDispatcherImplBase:
             if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
                 self.combine_dtype = CombineDtype.fp8
 
+    def _compute_expected_m(self, topk_ids: torch.Tensor) -> int:
+        """Host-side scheduling hint (M) for AITER fused_moe tier lookup.
+
+        Reproduces, without any token truncation, the per-stage sizing the
+        removed SGLANG_MORI_MOE_MAX_INPUT_TOKENS env var used in CI:
+
+          * prefill (extend): MORI_MAX_DISPATCH_TOKENS_PREFILL * dp_ranks / 2,
+            i.e. num_max_dispatch_tokens_per_rank * world_size // 2 -- the exact
+            MORI_MOE_MAX_INPUT_TOKENS_PREFILL formula. Keeps prefill on the same
+            GEMM tier it used before (e.g. 8192 * 8 / 2 = 32768 at TP/EP=8).
+          * decode: reqs_per_rank * topk * 7 // 10. topk_ids.shape[0] already
+            folds in the MTP draft tokens, so this lands on the same small tier
+            the decode-side truncation produced (~356 at conc=128).
+
+        expected_m is only a scheduling hint -- it never drops rows, so this
+        cannot change prefill (or decode) numerics, only the tuned tier picked.
+        """
+        world_size = self.num_experts // self.num_local_experts
+        if get_is_extend_in_batch():
+            # prefill: match MORI_MOE_MAX_INPUT_TOKENS_PREFILL exactly.
+            return (self.num_max_dispatch_tokens_per_rank * world_size) // 2
+        # decode: match the legacy decode-side truncation sizing.
+        return (topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -634,14 +658,9 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
-            # mori intra-node normal dispatch pads recv_topk_ids to the LL
-            # buffer (world_size * num_max_dispatch_tokens_per_rank), so
-            # recv_topk_ids.shape[0] is the padded worst-case M, not the real
-            # recv count. Derive expected_m from the pre-dispatch topk_ids (real
-            # per-rank tokens), synced to the legacy SGLANG_MORI_MOE_MAX_INPUT_
-            # TOKENS sizing (reqs_per_rank * topk * 7/10) so get_padded_M lands
-            # on the same kernel tier the removed truncation env var used.
-            expected_m=(topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10,
+            # Stage-aware expected_m (prefill keeps the legacy 32768-equiv
+            # tier; decode uses the reqs*topk*7/10 sizing). No token dropping.
+            expected_m=self._compute_expected_m(topk_ids),
         )
 
     def _dispatch_core(
@@ -893,17 +912,10 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
 
         self.mori_op.dispatch_recv()
 
-        # Host-side avg #tokens per local expert under uniform routing.
-        # `topk_ids` here is the pre-dispatch (origin) one, so its first dim is
-        # the real per-rank #tokens; the ceil-div +num_experts term gives the
-        # tier lookup a small (~1) margin in the exactly-divisible case.
-        num_tokens = topk_ids.shape[0]
-        topk = topk_ids.shape[1]
-        # Synced with the legacy SGLANG_MORI_MOE_MAX_INPUT_TOKENS sizing:
-        # reqs_per_rank * topk * 7/10. num_tokens already folds in the MTP draft
-        # tokens, so this hits the same get_padded_M tier the removed truncation
-        # env var used (~356 at conc=128 decode).
-        expected_m = (num_tokens * topk * 7) // 10
+        # Stage-aware expected_m: prefill keeps the legacy
+        # MORI_MOE_MAX_INPUT_TOKENS_PREFILL-equivalent tier; decode uses the
+        # reqs*topk*7/10 sizing. Only a scheduling hint -- never drops rows.
+        expected_m = self._compute_expected_m(topk_ids)
 
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
