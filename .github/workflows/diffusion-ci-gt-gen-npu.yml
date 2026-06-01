@@ -142,13 +142,13 @@ jobs:
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
-  
+
   multimodal-diffusion-gen-2npu:
     needs: compute-diffusion-partitions
     if: |
       needs.compute-diffusion-partitions.result == 'success' &&
       needs.compute-diffusion-partitions.outputs.matrix-2npu != '{"include":[]}'
-    runs-on: linux-aarch64-a3-2
+    runs-on: linux-aarch64-a3-16
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2npu) }}
