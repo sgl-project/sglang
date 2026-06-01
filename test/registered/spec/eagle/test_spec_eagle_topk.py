@@ -17,7 +17,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=1040, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=1180, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
@@ -32,12 +32,13 @@ class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogp
     gsm8k_accept_len_thres = 2.4  # EAGLE3 topk16 gsm8k accept ~2.48
 
 
-class TestEagle3Topk16SpecV2(TestEagle3Topk16):
+class TestEagle3Topk16SpecV2(TestEagle3Topk16, SpecFeatureKit):
     """EAGLE3 topk=16 tree on spec v2 (overlap, page1).
 
     topk>1 + page_size==1 stays on the overlap (v2) worker. Exercises the v2
     tree-drafting path: accepted-path compaction to the per-req block front,
     validated by logprob_spec_v2_match (decode logprobs == prefill scoring).
+    SpecFeatureKit adds radix / concurrent-abort / constrained on this path.
     """
 
     disable_overlap = False
