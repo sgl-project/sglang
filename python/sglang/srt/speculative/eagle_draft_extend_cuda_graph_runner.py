@@ -404,10 +404,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
+            # ROCm's argmax tie-breaks differently from CUDA's softmax+max
+            # path on FP8 logits, which corrupts MTP draft selection on AMD.
+            # Keep the fastpath CUDA-only.
             if self.topk == 1 and not _is_hip:
-                # ROCm's argmax tie-breaks differently from CUDA's softmax+max
-                # path on FP8 logits, which corrupts MTP draft selection on AMD.
-                # Keep the fastpath CUDA-only.
                 ret.topk_index = torch.argmax(
                     ret.next_token_logits, dim=-1, keepdim=True
                 )
@@ -415,6 +415,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             else:
                 probs = torch.softmax(ret.next_token_logits, dim=-1)
                 ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
