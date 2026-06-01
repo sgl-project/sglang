@@ -1042,28 +1042,33 @@ class Req(ReqDllmMixin):
         """Whether this req is in the middle of a chunked prefill.
 
         Derived from `scheduled_extend_len`: True iff admission has
-        scheduled a non-empty proper prefix (`0 < scheduled_extend_len <
-        num_prompt_tokens`). A brand-new req that has never been admitted
-        has `scheduled_extend_len == 0` and is not "mid-chunk"; a req whose
-        final chunk was just admitted has `scheduled_extend_len ==
-        num_prompt_tokens` and likewise reports False.
+        scheduled a non-empty proper prefix of the current fill sequence.
+        A brand-new req that has never been admitted has
+        `scheduled_extend_len == 0` and is not "mid-chunk"; a req whose final
+        chunk was just admitted has `scheduled_extend_len == fill length` and
+        likewise reports False.
 
         DLLM uses its own staging concept (DllmManager queues) and never
         reports as having a pending chunk through this property.
         """
         if self.is_dllm():
             return False
-        n = len(self.origin_input_ids)
+        n = self.scheduled_extend_len_bound()
         return 0 < self.scheduled_extend_len < n
+
+    def scheduled_extend_len_bound(self) -> int:
+        """Return the current sequence length that prefill scheduling targets."""
+        if self.full_untruncated_fill_ids:
+            return len(self.full_untruncated_fill_ids)
+        return len(self.origin_input_ids)
 
     def set_scheduled_extend_len(self, value: int) -> None:
         """Update `scheduled_extend_len` with a bounds check.
 
         For normal chunked prefill, plan-time prefill progress must stay
-        within `[0, len(origin_input_ids)]`. Overshoot would silently break
-        the `has_pending_chunk` derivation (which relies on `SE < N` as the
-        upper bound) and indicates a truncation/admission bug worth
-        catching at the source.
+        within the current fill sequence length. A retracted decode req may
+        need to re-prefill `origin_input_ids + output_ids`, so the bound is
+        not always just `len(origin_input_ids)`.
 
         DLLM is exempt from the bounds check: `scheduled_extend_len` is
         audit-only for DLLM (`has_pending_chunk` short-circuits on
@@ -1074,7 +1079,7 @@ class Req(ReqDllmMixin):
         proceeds. The prompt-length bound therefore does not hold for DLLM.
         """
         if not self.is_dllm():
-            n = len(self.origin_input_ids)
+            n = self.scheduled_extend_len_bound()
             assert 0 <= value <= n, (
                 f"scheduled_extend_len {value} out of bounds [0, {n}] "
                 f"for req {self.rid}"
@@ -1604,8 +1609,8 @@ def _decide_output_process_mode(
       this enum is only consulted by filter/merge, where DLLM must never
       be merged into the decode running_batch).
     - Decode / prebuilt forward => DECODE.
-    - Extend whose admission already covers the full prompt
-      (`scheduled_extend_len >= num_prompt_tokens`) => EXTEND_LAST_CHUNK.
+    - Extend whose admission already covers the full fill sequence
+      (`scheduled_extend_len >= fill length`) => EXTEND_LAST_CHUNK.
     - Otherwise the admission left more prompt tokens behind for the next
       iter => EXTEND_MIDDLE_CHUNK.
     """
@@ -1620,8 +1625,8 @@ def _decide_output_process_mode(
         return OutputProcessMode.DECODE
 
     # `scheduled_extend_len` has already been bumped by admission for the
-    # current chunk; comparing to num_prompt_tokens decides last vs middle.
-    if req.scheduled_extend_len >= len(req.origin_input_ids):
+    # current chunk; comparing to fill length decides last vs middle.
+    if req.scheduled_extend_len >= req.scheduled_extend_len_bound():
         return OutputProcessMode.EXTEND_LAST_CHUNK
     return OutputProcessMode.EXTEND_MIDDLE_CHUNK
 
@@ -1679,9 +1684,10 @@ def _compute_chunked_req_next_prompt_token(
     if chunked_req is None:
         return None
     fill_len = chunked_req.fill_len
-    if fill_len >= len(chunked_req.origin_input_ids):
+    fill_ids = chunked_req.full_untruncated_fill_ids
+    if fill_len >= len(fill_ids):
         return None
-    return int(chunked_req.origin_input_ids[fill_len])
+    return int(fill_ids[fill_len])
 
 
 @dataclasses.dataclass
