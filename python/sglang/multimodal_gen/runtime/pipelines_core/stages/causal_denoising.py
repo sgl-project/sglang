@@ -8,7 +8,7 @@ import torch  # type: ignore
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.dits.causal_attention_cache import (
+from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )

@@ -46,7 +46,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.models.dits.causal_attention_cache import (
+from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )

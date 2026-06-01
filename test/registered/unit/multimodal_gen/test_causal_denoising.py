@@ -4,7 +4,7 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
-from sglang.multimodal_gen.runtime.models.dits.causal_attention_cache import (
+from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )

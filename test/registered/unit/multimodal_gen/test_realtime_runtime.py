@@ -29,7 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
+from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ConditionEvent,
     ConditionEventQueue,
     ConditionSamplingParams,
@@ -57,7 +57,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_vae import (
     CausalVaeDecodingStage,
     RealtimeVAEDecodeState,
 )
-from sglang.multimodal_gen.runtime.models.dits.causal_attention_cache import (
+from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CrossAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (

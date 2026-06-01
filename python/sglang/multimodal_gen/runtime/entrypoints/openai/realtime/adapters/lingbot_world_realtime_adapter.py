@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
+from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ConditionEvent,
     ConditionEventQueue,
     ControlSignal,
