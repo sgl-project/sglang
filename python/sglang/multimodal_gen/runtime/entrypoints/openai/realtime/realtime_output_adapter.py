@@ -350,9 +350,11 @@ class RawRGBRealtimeOutputAdapter:
                 [[frame] for frame in frames]
                 if output_format in ENCODED_PREVIEW_FORMATS
                 and content_type == RAW_RGB_CONTENT_TYPE
-                else _split_frame_batch(frames)
-                if content_type == RAW_RGB_CONTENT_TYPE
-                else [frames]
+                else (
+                    _split_frame_batch(frames)
+                    if content_type == RAW_RGB_CONTENT_TYPE
+                    else [frames]
+                )
             )
             num_frame_batches = len(split_batches)
             for frame_batch_index, transport_frames in enumerate(split_batches):
@@ -400,8 +402,7 @@ class RawRGBRealtimeOutputAdapter:
                     "total_size": len(transport_payload.payload),
                     "frame_batch_index": frame_batch_index,
                     "num_frame_batches": num_frame_batches,
-                    "is_final_frame_batch": frame_batch_index
-                    == num_frame_batches - 1,
+                    "is_final_frame_batch": frame_batch_index == num_frame_batches - 1,
                 }
                 if event_id is not None:
                     header["event_id"] = event_id

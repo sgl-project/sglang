@@ -1053,12 +1053,10 @@ def test_lingbot_realtime_attention_cache_uses_bounded_sink_window():
 
     assert stage._get_causal_sink_tokens() == 9 * 10
     assert (
-        stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=False)
-        == 18 * 10
+        stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=False) == 18 * 10
     )
     assert (
-        stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=True)
-        == 18 * 10
+        stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=True) == 18 * 10
     )
 
 
@@ -1080,9 +1078,9 @@ def test_lingbot_realtime_cache_config_overrides_checkpoint_defaults():
     stage._apply_realtime_causal_cache_config(SimpleNamespace(), server_args)
 
     assert stage._get_causal_sink_tokens() == 3 * 10
-    assert stage._get_lingbot_causal_kv_cache_size(
-        sequence_shard_enabled=False
-    ) == 45 * 10
+    assert (
+        stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=False) == 45 * 10
+    )
 
 
 def test_lingbot_realtime_cache_config_uses_request_overrides():
@@ -1107,9 +1105,9 @@ def test_lingbot_realtime_cache_config_uses_request_overrides():
     stage._apply_realtime_causal_cache_config(batch, server_args)
 
     assert stage._get_causal_sink_tokens() == 4 * 10
-    assert stage._get_lingbot_causal_kv_cache_size(
-        sequence_shard_enabled=False
-    ) == 12 * 10
+    assert (
+        stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=False) == 12 * 10
+    )
 
 
 def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
@@ -1232,7 +1230,9 @@ def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready():
         def time_modulation(self, temb):
             return temb + 1.0
 
-        def __call__(self, timestep, encoder_hidden_states, encoder_hidden_states_image):
+        def __call__(
+            self, timestep, encoder_hidden_states, encoder_hidden_states_image
+        ):
             self.full_calls += 1
             return timestep.float(), timestep.float(), encoder_hidden_states, None
 
@@ -1601,9 +1601,7 @@ def test_raw_rgb_frame_batches_preserve_frame_bytes_and_metadata():
     }
     assert len(frame_batches) == 1
     assert frame_batches[0][0] == bytes([1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4])
-    assert frame_batches[0][1] == bytes(
-        [5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19]
-    )
+    assert frame_batches[0][1] == bytes([5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19])
     assert RAW_RGB_CONTENT_TYPE == "application/x-raw-rgb"
 
 
@@ -1698,9 +1696,7 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
             realtime_event_id=3,
         )
         result = OutputBatch(
-            raw_frame_batches=[
-                [frame0, frame1]
-            ],
+            raw_frame_batches=[[frame0, frame1]],
             raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
             raw_frame_metadata={
                 "format": "rgb24",

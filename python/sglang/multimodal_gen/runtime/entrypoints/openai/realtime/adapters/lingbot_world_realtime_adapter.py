@@ -212,8 +212,8 @@ class LingBotWorldRealtimeState:
     def sample_camera_actions(self, chunk_size: int) -> list[list[str]] | None:
         """samples a sequence of camera actions for the chunk with chunk_size frames
 
-            Args:
-                chunk_size: number of frames
+        Args:
+            chunk_size: number of frames
         """
         if self.camera_script_queue:
             return self._sample_camera_script(chunk_size)

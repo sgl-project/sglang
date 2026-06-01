@@ -92,9 +92,7 @@ class CausalSelfAttentionKVCache:
             self.local_end_index_int = local_end_index
         return global_end_index, local_end_index
 
-    def _write_indices(
-        self, *, global_end_index: int, local_end_index: int
-    ) -> None:
+    def _write_indices(self, *, global_end_index: int, local_end_index: int) -> None:
         if (
             self.global_end_index_int == global_end_index
             and self.local_end_index_int == local_end_index
@@ -183,7 +181,6 @@ class CausalSelfAttentionKVCache:
                 #                                            ^ end of previous chunk
                 # after:
                 # [sink tokens, rolled tokens,           remaining space      ]
-
 
                 # 1. keep sink tokens ([0: sink_tokens]) untouched
                 # 2. evict obsolete tokens in: [sink_tokens:sink_tokens + num_evicted_tokens]

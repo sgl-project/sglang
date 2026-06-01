@@ -521,9 +521,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 if (c := self.draft_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            with forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ), canary_index_ctx:
+            with (
+                forward_context(
+                    ForwardContext(
+                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                    )
+                ),
+                canary_index_ctx,
+            ):
                 logits_output = self.draft_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output

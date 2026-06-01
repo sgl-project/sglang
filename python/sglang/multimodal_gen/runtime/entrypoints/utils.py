@@ -160,7 +160,7 @@ def normalize_output_seeds(
             return seeds
         if len(seeds) == total_outputs:
             start = prompt_index * num_outputs_per_prompt
-            return seeds[start: start + num_outputs_per_prompt]
+            return seeds[start : start + num_outputs_per_prompt]
         raise ValueError(
             "seed list length must match num_outputs_per_prompt "
             f"({num_outputs_per_prompt}) or total outputs ({total_outputs}), "

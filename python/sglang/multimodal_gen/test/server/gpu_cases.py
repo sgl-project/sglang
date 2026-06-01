@@ -78,6 +78,7 @@ def _make_lingbot_realtime_plastic_beach_case() -> DiffusionTestCase:
         run_t2v_input_reference_check=False,
     )
 
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [

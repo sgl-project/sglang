@@ -70,7 +70,7 @@ class ConditionSamplingParams:
 class ConditionEventQueue:
     """per-session queue for prompt, camera, audio, and future events
 
-      all events are stored here for per-chunk sampling
+    all events are stored here for per-chunk sampling
     """
 
     def __init__(
@@ -147,9 +147,7 @@ class ConditionEventQueue:
 
         if len(chunk) == 0:
             if params.repeat_last_across_empty_chunks and kind in self._last_payloads:
-                return [
-                    self._last_payloads[kind] for _ in range(params.chunk_size)
-                ]
+                return [self._last_payloads[kind] for _ in range(params.chunk_size)]
             if params.default_item is _MISSING:
                 return None
             return [params.default_item for _ in range(params.chunk_size)]
@@ -254,8 +252,7 @@ class ControlStateSamplingQueue:
             pulse_items = min(self.min_pulse_items, chunk_size)
             chunk = [self._copy_item(pulse.payload) for _ in range(pulse_items)]
             chunk.extend(
-                self._copy_item(final.payload)
-                for _ in range(chunk_size - pulse_items)
+                self._copy_item(final.payload) for _ in range(chunk_size - pulse_items)
             )
             self._latest_sampled_seq_id = (
                 final.seq_id if len(chunk) > pulse_items else pulse.seq_id

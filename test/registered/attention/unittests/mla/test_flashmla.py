@@ -403,8 +403,9 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
         )
 
         fixture = self._build_target_verify_metadata_fixture(case)
-        with torch.no_grad(), forward_context(
-            ForwardContext(attn_backend=fixture.backend)
+        with (
+            torch.no_grad(),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
         ):
             fixture.backend.init_forward_metadata(fixture.forward_batch)
 
