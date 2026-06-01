@@ -2,7 +2,7 @@
 
 import unittest
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 from unittest import mock
 
@@ -41,8 +41,11 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllo
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
+    EvictLayer,
+    TreeComponent,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
+    COMPONENT_REGISTRY,
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
@@ -89,6 +92,7 @@ class CacheConfig:
     head_num: int = 2
     head_dim: int = 64
     dtype: torch.dtype = torch.bfloat16
+    eviction_policy: str = "lru"
 
     @property
     def has_mamba(self) -> bool:
@@ -116,6 +120,52 @@ class CacheConfig:
         ):
             parts.append(f"h{self.head_num}l{self.num_layers}")
         return "_".join(parts)
+
+
+class _FakeFullComponent(TreeComponent):
+    component_type = ComponentType.FULL
+
+    def create_match_validator(self, match_device_only: bool = False):
+        return lambda node: True
+
+    def redistribute_on_node_split(self, new_parent, child):
+        return None
+
+    def evict_component(
+        self, node, target: EvictLayer = EvictLayer.DEVICE
+    ) -> tuple[int, int]:
+        return 0, 0
+
+    def drive_eviction(self, params: EvictParams, tracker: dict[ComponentType, int]):
+        return None
+
+    def acquire_component_lock(self, node, result):
+        return result
+
+    def release_component_lock(self, node, params):
+        return None
+
+
+class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
+    def test_component_registry_override_is_instance_local(self):
+        params = CacheInitParams(
+            req_to_token_pool=ReqToTokenPool(
+                size=2,
+                max_context_len=8,
+                device="cpu",
+                enable_memory_saver=False,
+            ),
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=True,
+            tree_components=(ComponentType.FULL,),
+            component_registry_override={ComponentType.FULL: _FakeFullComponent},
+        )
+
+        tree = UnifiedRadixCache(params=params)
+
+        self.assertIsInstance(tree.components[ComponentType.FULL], _FakeFullComponent)
+        self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
 def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
@@ -233,6 +283,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
+        eviction_policy=cfg.eviction_policy,
     )
     tree = UnifiedRadixCache(params=cache_init_params)
     tree.cache_init_params = cache_init_params
@@ -443,11 +494,11 @@ class UnifiedRadixCacheSuite:
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
 
-    def _insert(self, tree, allocator, req_to_token_pool, tokens):
+    def _insert(self, tree, allocator, req_to_token_pool, tokens, priority=0):
         """Insert tokens, attaching mamba data when the config has mamba."""
         key = RadixKey(array("q", tokens))
         value = self._alloc(allocator, len(tokens))
-        params = InsertParams(key=key, value=value[: len(key)])
+        params = InsertParams(key=key, value=value[: len(key)], priority=priority)
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
@@ -1280,6 +1331,27 @@ class UnifiedRadixCacheSuite:
         m_new = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_new))))
         self.assertEqual(len(m_old.device_indices), 0)
         self.assertEqual(len(m_new.device_indices), len(seq_new))
+        tree.sanity_check()
+
+    def test_evict_respects_priority_policy(self):
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("priority policy ordering is covered on Full-only configs")
+        priority_cfg = replace(self.cfg, eviction_policy="priority")
+        tree, allocator, req_to_token_pool = build_fixture(priority_cfg)
+        seq_high = self._make_seq(1, 2)
+        seq_low = self._make_seq(500, 2)
+
+        self._insert(tree, allocator, req_to_token_pool, seq_high, priority=10)
+        self._insert(tree, allocator, req_to_token_pool, seq_low, priority=0)
+
+        tree.evict(EvictParams(num_tokens=len(seq_low)))
+
+        m_high = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_high)))
+        )
+        m_low = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_low))))
+        self.assertEqual(len(m_high.device_indices), len(seq_high))
+        self.assertEqual(len(m_low.device_indices), 0)
         tree.sanity_check()
 
     def test_evict_multiple_independent_leaves(self):
@@ -2520,6 +2592,93 @@ class UnifiedRadixCacheSuite:
         tree.dec_lock_ref(leaf, load_back_lock.to_dec_params())
         tree.dec_lock_ref(leaf, request_lock.to_dec_params())
         self.assertEqual(cd.lock_ref, 0)
+
+    def test_hicache_swa_load_back_uses_full_pool_capacity(self):
+        """load_back should gate Full KV load on Full pool capacity only."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        if self.cfg.page_size > 1:
+            self.skipTest("page_size==1 for direct swa_attn_allocator access")
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+
+        sw = self.cfg.sliding_window_size
+        kv_tokens = sw + 2
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, kv_tokens)
+        if len(chain) < kv_tokens:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        self._backup_tree(tree)
+        result = tree.evict(EvictParams(num_tokens=kv_tokens))
+        self.assertGreaterEqual(result.num_tokens_evicted, kv_tokens)
+        self.assertIsNone(leaf.component_data[ComponentType.FULL].value)
+
+        kv_xfer = tree.components[ComponentType.FULL].build_hicache_transfers(
+            leaf, CacheTransferPhase.LOAD_BACK
+        )[0]
+        self.assertEqual(int(kv_xfer.host_indices.numel()), kv_tokens)
+
+        swa_xfer = tree.components[ComponentType.SWA].build_hicache_transfers(
+            leaf, CacheTransferPhase.LOAD_BACK
+        )[0]
+        self.assertEqual(int(swa_xfer.host_indices.numel()), sw)
+
+        # Leave tree-owned SWA available for controller-side SWA eviction.
+        unrelated_seq = self._make_seq(100_000, sw)
+        self._insert(tree, allocator, req_to_token_pool, unrelated_seq)
+        self.assertGreaterEqual(tree.swa_evictable_size(), sw)
+
+        # Make raw SWA availability smaller than both load-back transfers.
+        target_swa_avail = sw - 1
+        swa_avail = allocator.swa_attn_allocator.available_size()
+        self.assertGreaterEqual(swa_avail, target_swa_avail)
+        if swa_avail > target_swa_avail:
+            external_swa = allocator.swa_attn_allocator.alloc(
+                swa_avail - target_swa_avail
+            )
+            self.assertIsNotNone(external_swa)
+
+        self.assertGreaterEqual(
+            allocator.full_attn_allocator.available_size(),
+            int(kv_xfer.host_indices.numel()),
+        )
+        self.assertLess(
+            allocator.swa_attn_allocator.available_size(),
+            int(kv_xfer.host_indices.numel()),
+        )
+        self.assertLess(
+            allocator.swa_attn_allocator.available_size(),
+            int(swa_xfer.host_indices.numel()),
+        )
+
+        with mock.patch.object(tree, "evict", wraps=tree.evict) as evict_mock:
+            self.assertTrue(tree.load_back(leaf))
+
+        # Full pre-eviction must not be triggered by SWA pool pressure.
+        full_pre_evict_calls = [
+            call
+            for call in evict_mock.call_args_list
+            if call.args and call.args[0].num_tokens > 0
+        ]
+        self.assertEqual(full_pre_evict_calls, [])
+
+        # SWA shortage is handled by the controller through SWA-only eviction.
+        self.assertTrue(
+            any(
+                call.args
+                and call.args[0].num_tokens == 0
+                and call.args[0].swa_num_tokens > 0
+                for call in evict_mock.call_args_list
+            )
+        )
+
+        self._finish_pending_loads(tree)
+        self.assertIsNotNone(leaf.component_data[ComponentType.FULL].value)
+        self._release_ongoing_load_back_locks(tree)
+        tree.sanity_check()
 
     def test_hicache_full_temp_lock_skips_evicted_anchor_and_mirrors_on_release(
         self,
