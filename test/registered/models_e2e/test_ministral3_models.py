@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
@@ -16,12 +18,14 @@ register_cuda_ci(
 MODEL = "mistralai/Ministral-3-3B-Instruct-2512"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMinistral3TextOnly(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.6
     model = MODEL
     other_args = ["--trust-remote-code"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMinistral3MMMU(MMMUMixin, MMMUServerBase):
     accuracy = 0.3
     model = MODEL

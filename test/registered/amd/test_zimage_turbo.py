@@ -8,35 +8,44 @@ import unittest
 import pytest
 import torch
 
-from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
-    DiffusionServerBase,
-    diffusion_server,
-)
-from sglang.multimodal_gen.test.server.test_server_utils import (
-    ServerContext,
-    get_generate_fn,
-)
-from sglang.multimodal_gen.test.server.testcase_configs import (
-    DiffusionSamplingParams,
-    DiffusionServerArgs,
-    DiffusionTestCase,
-)
+if torch.cuda.is_available():
+    from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
+        DiffusionServerBase,
+        diffusion_server,
+    )
+    from sglang.multimodal_gen.test.server.test_server_utils import (
+        ServerContext,
+        get_generate_fn,
+    )
+    from sglang.multimodal_gen.test.server.testcase_configs import (
+        DiffusionSamplingParams,
+        DiffusionServerArgs,
+        DiffusionTestCase,
+    )
+else:
+    DiffusionServerBase = object
+    AMD_ZIMAGE_CASES = []
+    DiffusionTestCase = None
+    ServerContext = None
 from sglang.test.ci.ci_register import register_amd_ci
 
 logger = logging.getLogger(__name__)
 
 register_amd_ci(est_time=1800, suite="nightly-amd-1-gpu-zimage-turbo", nightly=True)
 
-AMD_ZIMAGE_CASES = [
-    DiffusionTestCase(
-        "zimage_image_t2i",
-        DiffusionServerArgs(model_path="Tongyi-MAI/Z-Image-Turbo", modality="image"),
-        DiffusionSamplingParams(
-            prompt="Doraemon is eating dorayaki",
-            output_size="1024x1024",
+if torch.cuda.is_available():
+    AMD_ZIMAGE_CASES = [
+        DiffusionTestCase(
+            "zimage_image_t2i",
+            DiffusionServerArgs(
+                model_path="Tongyi-MAI/Z-Image-Turbo", modality="image"
+            ),
+            DiffusionSamplingParams(
+                prompt="Doraemon is eating dorayaki",
+                output_size="1024x1024",
+            ),
         ),
-    ),
-]
+    ]
 
 CLIP_SCORE_THRESHOLD = 0.20
 

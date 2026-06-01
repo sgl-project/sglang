@@ -21,6 +21,7 @@ NEMOTRON_3_NANO_THINKING_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotron3Nano30BFP8(LMEvalMixin, DefaultServerBase):
     """Test Nemotron-3-Nano-30B FP8 model with lm-eval GSM8K evaluation."""
 
