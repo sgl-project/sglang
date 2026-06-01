@@ -355,6 +355,7 @@ def test_realtime_perf_stats_summary_and_thresholds():
 
     assert summary["num_chunks"] == 2
     assert summary["total_frames"] == 2
+    assert summary["guarded_chunks"] == 2
     assert summary["avg_scheduler_forward_ms"] == 20.0
     assert summary["p95_chunk_total_ms"] == 40.0
     assert summary["avg_ws_payload_mb"] == 1.5
@@ -373,6 +374,57 @@ def test_realtime_perf_stats_summary_and_thresholds():
             stats,
             {"p95_chunk_total_ms": 35.0},
         )
+
+
+def test_realtime_perf_stats_can_ignore_startup_chunks():
+    stats = [
+        parse_realtime_chunk_stats(
+            unpackb(
+                _packed_realtime_chunk_stats(
+                    0,
+                    scheduler_forward_ms=20000.0,
+                    chunk_total_ms=21000.0,
+                ),
+                raw=False,
+            )
+        ),
+        parse_realtime_chunk_stats(
+            unpackb(
+                _packed_realtime_chunk_stats(
+                    1,
+                    scheduler_forward_ms=7000.0,
+                    chunk_total_ms=7200.0,
+                ),
+                raw=False,
+            )
+        ),
+        parse_realtime_chunk_stats(
+            unpackb(
+                _packed_realtime_chunk_stats(
+                    2,
+                    scheduler_forward_ms=2300.0,
+                    chunk_total_ms=2800.0,
+                ),
+                raw=False,
+            )
+        ),
+    ]
+
+    summary = summarize_realtime_perf_stats(stats, ignore_initial_chunks=2)
+
+    assert summary["num_chunks"] == 3
+    assert summary["ignored_initial_chunks"] == 2
+    assert summary["guarded_chunks"] == 1
+    assert summary["ignored_max_chunk_total_ms"] == 21000.0
+    assert summary["p95_chunk_total_ms"] == 2800.0
+    validate_realtime_perf_stats(
+        "case",
+        stats,
+        {"p95_chunk_total_ms": 5000.0, "p95_scheduler_forward_ms": 4500.0},
+        ignore_initial_chunks=2,
+    )
+    with pytest.raises(ValueError, match="leave at least one"):
+        summarize_realtime_perf_stats(stats, ignore_initial_chunks=3)
 
 
 # Generate function routing
@@ -401,6 +453,7 @@ def test_lingbot_realtime_plastic_beach_params_are_lossless_gt_ready():
     assert params.output_size == "832x480"
     assert params.realtime_num_chunks == 4
     assert params.realtime_output_format is None
+    assert params.realtime_perf_ignore_initial_chunks == 2
     assert params.realtime_perf_thresholds["p95_chunk_total_ms"] == 5000.0
     assert params.realtime_perf_thresholds["p95_scheduler_forward_ms"] == 4500.0
     assert params.realtime_events[0]["kind"] == "camera_actions"

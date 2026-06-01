@@ -251,6 +251,7 @@ class DiffusionSamplingParams:
     realtime_num_chunks: int | None = None
     realtime_events: list[dict[str, Any]] = field(default_factory=list)
     realtime_perf_thresholds: dict[str, float] = field(default_factory=dict)
+    realtime_perf_ignore_initial_chunks: int = 0
     # None keeps the lossless/raw transport used by GT-backed consistency checks.
     realtime_output_format: str | None = None
 
@@ -340,6 +341,7 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
         "p95_scheduler_forward_ms": 4500.0,
         "p95_ws_payload_mb": 16.0,
     },
+    realtime_perf_ignore_initial_chunks=2,
     extras={
         "seed": 42,
         "num_inference_steps": 4,

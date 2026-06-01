@@ -1235,6 +1235,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     case.id,
                     pop_realtime_perf_stats(case.id),
                     case.sampling_params.realtime_perf_thresholds,
+                    ignore_initial_chunks=(
+                        case.sampling_params.realtime_perf_ignore_initial_chunks
+                    ),
                 ),
             )
         else:

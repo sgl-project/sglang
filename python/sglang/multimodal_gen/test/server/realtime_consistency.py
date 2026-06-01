@@ -134,23 +134,43 @@ def parse_realtime_chunk_stats(header: dict[str, Any]) -> RealtimeChunkStats:
 
 def summarize_realtime_perf_stats(
     chunk_stats: list[RealtimeChunkStats],
+    *,
+    ignore_initial_chunks: int = 0,
 ) -> dict[str, float]:
     if not chunk_stats:
         return {}
+    if ignore_initial_chunks < 0:
+        raise ValueError("ignore_initial_chunks must be non-negative")
+    if ignore_initial_chunks >= len(chunk_stats):
+        raise ValueError(
+            "ignore_initial_chunks must leave at least one realtime chunk to guard"
+        )
+
+    ignored_stats = chunk_stats[:ignore_initial_chunks]
+    guarded_stats = chunk_stats[ignore_initial_chunks:]
 
     metrics = {
-        "request_prepare_ms": [s.request_prepare_ms for s in chunk_stats],
-        "scheduler_forward_ms": [s.scheduler_forward_ms for s in chunk_stats],
-        "raw_payload_build_ms": [s.raw_payload_build_ms for s in chunk_stats],
-        "raw_write_ms": [s.raw_write_ms for s in chunk_stats],
-        "ws_write_ms": [s.ws_write_ms for s in chunk_stats],
-        "chunk_total_ms": [s.chunk_total_ms for s in chunk_stats],
-        "ws_payload_mb": [s.ws_payload_bytes / (1024 * 1024) for s in chunk_stats],
+        "request_prepare_ms": [s.request_prepare_ms for s in guarded_stats],
+        "scheduler_forward_ms": [s.scheduler_forward_ms for s in guarded_stats],
+        "raw_payload_build_ms": [s.raw_payload_build_ms for s in guarded_stats],
+        "raw_write_ms": [s.raw_write_ms for s in guarded_stats],
+        "ws_write_ms": [s.ws_write_ms for s in guarded_stats],
+        "chunk_total_ms": [s.chunk_total_ms for s in guarded_stats],
+        "ws_payload_mb": [s.ws_payload_bytes / (1024 * 1024) for s in guarded_stats],
     }
     summary: dict[str, float] = {
         "num_chunks": float(len(chunk_stats)),
         "total_frames": float(sum(s.num_frames for s in chunk_stats)),
+        "ignored_initial_chunks": float(ignore_initial_chunks),
+        "guarded_chunks": float(len(guarded_stats)),
     }
+    if ignored_stats:
+        summary["ignored_max_chunk_total_ms"] = max(
+            s.chunk_total_ms for s in ignored_stats
+        )
+        summary["ignored_max_scheduler_forward_ms"] = max(
+            s.scheduler_forward_ms for s in ignored_stats
+        )
     for name, values in metrics.items():
         sorted_values = sorted(values)
         p95_idx = min(len(sorted_values) - 1, int(len(sorted_values) * 0.95))
@@ -164,10 +184,14 @@ def validate_realtime_perf_stats(
     case_id: str,
     chunk_stats: list[RealtimeChunkStats],
     thresholds: dict[str, float],
+    *,
+    ignore_initial_chunks: int = 0,
 ) -> None:
     if not thresholds:
         return
-    summary = summarize_realtime_perf_stats(chunk_stats)
+    summary = summarize_realtime_perf_stats(
+        chunk_stats, ignore_initial_chunks=ignore_initial_chunks
+    )
     if not summary:
         pytest.fail(f"{case_id}: no realtime chunk stats were received")
 
