@@ -26,7 +26,7 @@
         <button id="enhanceBtn" class="wide">Enhance</button>
         <div class="split">
           <label>Size<input id="size" value="832x480" /></label>
-          <label>FPS<input id="fps" type="number" value="16" min="1" max="60" /></label>
+          <label>FPS<input id="fps" type="number" value="25" min="1" max="60" /></label>
         </div>
         <div class="split">
           <label>Frames<input id="numFrames" type="number" value="9" min="5" step="4" /></label>
@@ -51,6 +51,7 @@
           </label>
           <label>Quality<input id="transportQuality" type="number" value="95" min="1" max="100" /></label>
         </div>
+        <label class="toggle-row"><input id="frameInterpolation" type="checkbox" checked />Smooth 2x frames</label>
         <label class="toggle-row"><input id="continuous" type="checkbox" checked />Continuous session</label>
         <div class="actions">
           <button id="connectBtn" class="primary">Generate</button>
@@ -112,7 +113,7 @@
       <section class="panel presets" aria-label="Presets and camera">
         <div class="section-title">LingBot</div>
         <div class="spec-grid">
-          <span><b>16 fps</b> target</span>
+          <span><b>25 fps</b> target</span>
           <span><b>chunked</b> stream</span>
           <span><b>480p/720p</b></span>
           <span><b>Cam + Act</b></span>
@@ -123,6 +124,6 @@
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-    <script src="./app.js?v=realtime-fixes-v26"></script>
+    <script src="./app.js?v=realtime-fixes-v27"></script>
   </body>
 </html>

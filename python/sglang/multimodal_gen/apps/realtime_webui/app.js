@@ -7,6 +7,9 @@ const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
+const DEFAULT_TARGET_FPS = 25;
+const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
+const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
@@ -52,7 +55,7 @@ const reactorPresets = [
     name: "Dragon Ride",
     tone: "green",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A first-person perspective from the back of a colossal obsidian-black dragon in mid-flight, looking over its horned head and outstretched wings toward an ancient moss-covered castle rising above a dense jungle canopy, with mist, river gorges, and golden humid light.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/dragon-ride.jpg`,
     source: "Reactor LingBot preset",
@@ -61,7 +64,7 @@ const reactorPresets = [
     name: "Misted Kingdom",
     tone: "green",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A third-person over-the-shoulder fantasy view following a sword-slung rider on a brown horse through curling valley mist, wildflower meadows, ruined stone arches, cottages, and a many-spired castle under a ringed gas giant and crescent moon.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/misted-kingdom.jpg`,
     source: "Reactor LingBot preset",
@@ -70,7 +73,7 @@ const reactorPresets = [
     name: "Storm Crossing",
     tone: "blue",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A third-person stern view of a battered grey aluminum work boat pushing through slate-black storm swells, wet wooden deck, warm cabin lamp, orange life rings, salt mist, churning wake, and a pale silver break in the dark horizon.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/storm-crossing.jpg`,
     source: "Reactor LingBot preset",
@@ -79,7 +82,7 @@ const reactorPresets = [
     name: "Citadel Approach",
     tone: "accent",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A third-person rear view of a mud-streaked vintage Defender 4x4 driving along a cobblestone-and-sand track through a coral-lit desert canyon toward a cliff-built sandstone citadel, with cacti, red poppies, ochre dunes, and peach sunset haze.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/citadel-approach.jpg`,
     source: "Reactor LingBot preset",
@@ -88,7 +91,7 @@ const reactorPresets = [
     name: "Spring Valley",
     tone: "green",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A third-person over-the-shoulder view following a golden retriever through a sunlit meadow with a patterned floral rug, stone bench, open book, potted seedling, cherry blossoms, rounded green oaks, soft hills, and a tender watercolor storybook atmosphere.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/spring-valley.jpg`,
     source: "Reactor LingBot preset",
@@ -97,7 +100,7 @@ const reactorPresets = [
     name: "Reef Patrol",
     tone: "blue",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A third-person follow view trailing a large grey reef shark through clear tropical water above a sunlit coral reef, with drifting sediment, shifting sun-ray lattices, clouds of reef fish, a sardine bait ball, and deep blue open-water haze.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/reef-patrol.jpg`,
     source: "Reactor LingBot preset",
@@ -106,7 +109,7 @@ const reactorPresets = [
     name: "Alpine Run",
     tone: "blue",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A third-person rear view of a yellow four-person whitewater raft plunging through churning rapids in an alpine canyon, red lifejackets, yellow helmets, wet paddles, dark boulders, conifer slopes, and a snow-capped mountain at the vanishing point.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/alpine-run.jpg`,
     source: "Reactor LingBot preset",
@@ -115,7 +118,7 @@ const reactorPresets = [
     name: "Ice Kayak",
     tone: "blue",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A centered elevated third-person game camera behind a lone kayaker in a bright red kayak crossing a calm deep blue alpine lake, scattered ice blocks, mirror reflections, huge snow-covered mountain ranges, vivid sky, and crisp cold wilderness scale.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/ice-kayak.jpg`,
     source: "Reactor LingBot preset",
@@ -124,7 +127,7 @@ const reactorPresets = [
     name: "Penguin Colony",
     tone: "green",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A third-person follow view of a single black-and-white penguin waddling across a windswept Antarctic ice shelf toward a distant colony, crystalline snow, small flippers, scattered dark boulders, rocky shoreline, and pale polar sky.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/penguin.jpg`,
     source: "Reactor LingBot preset",
@@ -133,7 +136,7 @@ const reactorPresets = [
     name: "Mars Mountain",
     tone: "accent",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A centered third-person rear view of a six-wheeled Martian rover marked XR-7A P-3317 crossing cracked basalt toward a vast volcanic mountain, dusty rose twilight, ochre wheel plumes, weathered grey panels, and a cold alien horizon.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/mars-rover.jpg`,
     source: "Reactor LingBot preset",
@@ -142,7 +145,7 @@ const reactorPresets = [
     name: "Seaside Adventurer",
     tone: "green",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A centered third-person anime view behind a young girl on a flower-covered coastal hillside overlooking a sparkling blue bay, rolling green hills, sailboats, dramatic cliffs, a small lighthouse, huge fluffy clouds, and warm hand-painted adventure atmosphere.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/anime3.png`,
     source: "Reactor LingBot preset",
@@ -152,7 +155,7 @@ const reactorPresets = [
     name: "Roman Chariot",
     tone: "accent",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A centered elevated third-person game camera behind a Roman warrior riding an ancient chariot pulled by two white horses across an open grassy field, worn stone path, Roman ruins, broken columns, bright midday sky, and epic historical scale.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/chariot.png`,
     source: "Reactor LingBot preset",
@@ -162,7 +165,7 @@ const reactorPresets = [
     name: "Asylum Corridor",
     tone: "accent",
     size: "832x480",
-    fps: 16,
+    fps: 25,
     prompt: "A third-person over-the-shoulder traversal behind a man in a wet leather jacket holding a flashlight down a derelict asylum corridor, standing water, torn vinyl strips, rusted ceiling debris, bloodstains, a toppled wheelchair, and a distant cyan-grey doorway glow.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/horror.jpg`,
     source: "Reactor LingBot preset",
@@ -170,14 +173,14 @@ const reactorPresets = [
 ];
 
 const examplePresets = [
-  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A stable first-person dolly from the same dragon-rider viewpoint, keeping the black dragon head, horns, wings, jungle canopy, and distant castle consistent; slow forward camera motion, natural parallax, no creature morphing, no scene replacement.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
-  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
-  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 16, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
-  { name: "Lake Scout", tone: "green", size: "832x480", fps: 16, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
-  { name: "Ziggy Stardust", tone: "accent", size: "832x480", fps: 16, prompt: "A static night view of a narrow London alley in soft rain, wet pavement reflecting a yellow streetlamp, the blue K. West sign glowing above a doorway, cardboard boxes near the wall, a pale parked car in the distance, and a slender glam-rock figure holding a guitar under the lamp; preserve the album-cover composition, brick storefronts, muted teal and amber colors, subtle rain shimmer only.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/0/01/ZiggyStardust.jpg", source: "David Bowie Ziggy Stardust artwork", mime: "image/jpeg" },
-  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 16, prompt: "A static locked-off view of the back side of Plastic Beach: a pastel toy-like island hotel built from plastic debris and washed-up junk in the open ocean, turquoise water in the foreground, distant horizon, clouds slowly drifting behind the island, tiny stars gently twinkling in the dusk sky, an occasional shooting star, and tiny distant pigeons crossing the sky; subtle water shimmer only, keep the island geometry fixed, no camera orbit, no dolly, no zoom.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
-  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 16, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
-  { name: "Kid A", tone: "accent", size: "832x480", fps: 16, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
+  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 25, prompt: "A stable first-person dolly from the same dragon-rider viewpoint, keeping the black dragon head, horns, wings, jungle canopy, and distant castle consistent; slow forward camera motion, natural parallax, no creature morphing, no scene replacement.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
+  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 25, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
+  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 25, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
+  { name: "Lake Scout", tone: "green", size: "832x480", fps: 25, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
+  { name: "Ziggy Stardust", tone: "accent", size: "832x480", fps: 25, prompt: "A static night view of a narrow London alley in soft rain, wet pavement reflecting a yellow streetlamp, the blue K. West sign glowing above a doorway, cardboard boxes near the wall, a pale parked car in the distance, and a slender glam-rock figure holding a guitar under the lamp; preserve the album-cover composition, brick storefronts, muted teal and amber colors, subtle rain shimmer only.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/0/01/ZiggyStardust.jpg", source: "David Bowie Ziggy Stardust artwork", mime: "image/jpeg" },
+  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 25, prompt: "A static locked-off view of the back side of Plastic Beach: a pastel toy-like island hotel built from plastic debris and washed-up junk in the open ocean, turquoise water in the foreground, distant horizon, clouds slowly drifting behind the island, tiny stars gently twinkling in the dusk sky, an occasional shooting star, and tiny distant pigeons crossing the sky; subtle water shimmer only, keep the island geometry fixed, no camera orbit, no dolly, no zoom.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
+  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 25, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
+  { name: "Kid A", tone: "accent", size: "832x480", fps: 25, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
 ];
 
 const presets = [
@@ -264,7 +267,7 @@ function resetStreamStats() {
   fpsSamples = [];
   chunkWaitStartedAt = 0;
   clearQueueOnClose = false;
-  playbackFps = Number($("fps").value || 16);
+  playbackFps = Number($("fps").value || DEFAULT_TARGET_FPS);
   droppedFrames = 0;
   decodeChain = Promise.resolve();
   pendingDecodeBatches = 0;
@@ -425,7 +428,7 @@ function updateStats(header) {
 }
 
 function trimLiveQueue(latestFrameCount) {
-  const targetFps = Number($("fps").value || 16);
+  const targetFps = Number($("fps").value || DEFAULT_TARGET_FPS);
   const maxQueue = Math.max(
     Number(latestFrameCount || 0),
     Math.round(targetFps * LIVE_QUEUE_SECONDS),
@@ -437,7 +440,7 @@ function trimLiveQueue(latestFrameCount) {
 }
 
 function trimQueueForPendingEvent() {
-  const targetFps = playbackFps || Number($("fps").value || 16);
+  const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
   const keep = Math.max(1, Math.round(targetFps * EVENT_QUEUE_SECONDS));
   if (queue.length <= keep) return;
   const dropCount = queue.length - keep;
@@ -676,7 +679,7 @@ function drawFrame(image) {
 }
 
 function renderLoop(now) {
-  const targetFps = playbackFps || Number($("fps").value || 16);
+  const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
   const queueSeconds = queue.length / Math.max(1, targetFps);
   const catchupFps = queueSeconds > LOW_LATENCY_QUEUE_SECONDS
     ? Math.min(MAX_CATCHUP_FPS, Math.ceil(queue.length / LOW_LATENCY_QUEUE_SECONDS))
@@ -835,12 +838,13 @@ async function connect() {
       return;
     }
     const previewTransportParams = readPreviewTransportParams();
+    const frameInterpolationParams = readFrameInterpolationParams();
     const init = compact({
       type: "init",
       model: $("model").value,
       prompt: $("prompt").value,
       size: $("size").value,
-      fps: Number($("fps").value),
+      fps: Number($("fps").value || DEFAULT_TARGET_FPS),
       num_frames: Number($("numFrames").value),
       seed: Number($("seed").value),
       num_inference_steps: Number($("steps").value),
@@ -850,6 +854,7 @@ async function connect() {
       max_chunks: $("continuous").checked ? undefined : 1,
       first_frame: firstFrame,
       ...previewTransportParams,
+      ...frameInterpolationParams,
     });
     document.activeElement?.blur?.();
     canvas.tabIndex = 0;
@@ -1012,7 +1017,7 @@ function updateServerChunkStats(stats) {
   const wsWrite = Number(stats.ws_write_ms || 0) / 1000;
   const chunkTotal = Number(stats.chunk_total_ms || 0) / 1000;
   const numFrames = Number(stats.num_frames || 0);
-  const requestedFps = Number($("fps").value || 16);
+  const requestedFps = Number($("fps").value || DEFAULT_TARGET_FPS);
   const theoreticalFps = chunkTotal > 0 ? numFrames / chunkTotal : 0;
   const realtimeRatio = requestedFps > 0 ? theoreticalFps / requestedFps : 0;
   $("serverSendText").textContent = `raw ${rawWrite.toFixed(2)}s · ws ${wsWrite.toFixed(2)}s`;
@@ -1041,7 +1046,7 @@ function updatePlaybackPace(header, now, frameCount) {
   const waitSeconds = (now - chunkWaitStartedAt) / 1000;
   if (waitSeconds > 0) {
     const generatedFps = currentReceiveChunkFrames / Math.max(0.001, waitSeconds);
-    const requestedFps = Number($("fps").value || 16);
+    const requestedFps = Number($("fps").value || DEFAULT_TARGET_FPS);
     playbackFps = Math.min(
       requestedFps,
       Math.max(LOW_LATENCY_FPS_FLOOR, generatedFps * 1.05),
@@ -1164,6 +1169,15 @@ function readPreviewTransportParams() {
     params.output_compression = outputQuality;
   }
   return params;
+}
+
+function readFrameInterpolationParams() {
+  if (!$("frameInterpolation").checked) return {};
+  return {
+    enable_frame_interpolation: true,
+    frame_interpolation_exp: DEFAULT_FRAME_INTERPOLATION_EXP,
+    frame_interpolation_scale: DEFAULT_FRAME_INTERPOLATION_SCALE,
+  };
 }
 
 function selectedTransportLabel() {
