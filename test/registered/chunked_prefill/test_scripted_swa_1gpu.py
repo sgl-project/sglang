@@ -3,11 +3,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
-from sglang.test.scripted_runtime_chunked_helpers import (
-    base_engine_kwargs,
-    run_until,
-    run_until_finished,
-)
+from sglang.test.scripted_runtime_chunked_helpers import base_engine_kwargs
 
 register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 
@@ -19,30 +15,38 @@ _SWA_MODEL = "openai/gpt-oss-20b"
 # its already-freed req_pool_idx is double-freed and prefix_indices corrupted,
 # producing an empty/garbage micro-batch that crashes the extend path.
 #
-# The production trigger is a KV-pool-full retraction that jumps new_token_ratio
-# (issue log: "Retract requests. #new_token_ratio: 0.0980 -> 0.7589"). The
-# running batch's reserved-decode offset is sum_running (max_new - output) *
-# new_token_ratio, so a higher ratio inflates that reservation and drives
-# rem_total_tokens <= 0 -- which parks a mid-prefill chunked req.
-#
-# A retraction can only fire on the decode path, and the scripted runtime steps
-# deterministically with overlap scheduling disabled, so decode (hence the
-# retraction and its ratio jump) cannot run while a chunked req is being
-# prefilled. We therefore reproduce the retraction's effect directly: a resident
-# request with a large max_new holds the reservation, r is admitted while the
-# ratio is low (as after decay), then the ratio is jumped up exactly as
-# retract_decode would -- parking r. Restoring the decayed ratio lets r resume,
-# and the test asserts the stash gate left no radix lock refs behind.
+# This reproduces the production trigger directly, with no internal-state pokes.
+# With the overlap scheduler (the production default), decode iterations are
+# pipelined alongside an in-flight chunked prefill, so decode -- and therefore
+# the retraction it can trigger -- runs while a req is mid-chunk. We saturate a
+# small hybrid-SWA pool (swa_full_tokens_ratio=0.1, as in the issue) with a pool
+# of ignore_eos decoders. They drive repeated real "KV cache pool is full.
+# Retract requests." retractions; while a chunked req is mid-prefill, the SWA
+# pool exhausts (and the retract's new_token_ratio jump inflates the running
+# batch's reserved-decode offset), so the chunked req's next add_chunked_req
+# early-returns -- parking it (self.chunked_req set, _chunked_req_scheduled_last_iter
+# False). Which candidate gets parked depends on the exact churn, so we feed
+# chunked candidates until one is observed parked, then assert the stash gate
+# left no radix lock refs after the engine drains. On the un-gated (buggy) code
+# the spurious stash double-frees and crashes the scheduler (KV-canary).
 _MAX_TOTAL_TOKENS = 4096
-_SWA_FULL_TOKENS_RATIO = 0.5
+_SWA_FULL_TOKENS_RATIO = 0.1
 _CHUNK_SIZE = 64
-# CLIP_MAX_NEW_TOKENS: the holder's reserved decode then ~= the full pool at
-# ratio 1.0, so the jumped ratio alone drives rem_total_tokens <= 0.
-_RESERVATION_HOLDER_PROMPT = 64
-_RESERVATION_HOLDER_MAX_NEW = 4096
-_CHUNKED_PROMPT = 512
-_DECAYED_RATIO = 0.01
-_RETRACT_JUMP_RATIO = 1.0
+
+# Decoders that fill the small SWA pool and drive the retraction churn.
+_N_DECODERS = 6
+_DECODER_PROMPT = 64
+_DECODER_MAX_NEW = 512
+_DECODER_WARMUP_RUNNING = 3
+
+# Chunked candidate: long enough to span several chunks (so it is mid-prefill
+# when a retraction fires), short enough to be admitted under memory pressure.
+_CHUNKED_PROMPT = 384
+_CHUNKED_MAX_NEW = 2
+_N_CANDIDATES = 24
+_STEPS_PER_CANDIDATE = 120
+_DECODER_WARMUP_STEPS = 60
+_DRAIN_STEPS = 400
 
 
 class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
@@ -53,7 +57,6 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
         swa_full_tokens_ratio=_SWA_FULL_TOKENS_RATIO,
         page_size=1,
         mem_fraction_static=0.70,
-        disable_piecewise_cuda_graph=True,
     )
 
     def test_swa_chunked_req_early_return_no_double_free(self):
@@ -64,65 +67,68 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
     @staticmethod
     def _script_swa_chunked_req_early_return_no_double_free(t: ScriptedContext):
         s = t._scheduler
-        tracker = s.new_token_ratio_tracker
 
-        # Resident reservation holder: a large remaining max_new means its
-        # reserved-decode offset dominates the prefill budget once the ratio is
-        # high. It never decodes (prefill preempts decode while r is chunked).
-        holder = t.start_req(
-            prompt_len=_RESERVATION_HOLDER_PROMPT,
-            max_new_tokens=_RESERVATION_HOLDER_MAX_NEW,
-            prompt_token=9,
-        )
-        yield from run_until(holder, lambda h: not h.is_chunking)
-
-        # Admit r while new_token_ratio is low (as after decay): the holder's
-        # reserved decode is small, so rem_total_tokens is large and r fits.
-        tracker.current = _DECAYED_RATIO
-        r = t.start_req(prompt_len=_CHUNKED_PROMPT, max_new_tokens=2, prompt_token=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-
-        # The retraction's ratio jump: the holder's reservation balloons and
-        # rem_total_tokens goes <= 0, so r's next add_chunked_req early-returns
-        # and parks r (chunked_req set, _chunked_req_scheduled_last_iter False).
-        tracker.current = _RETRACT_JUMP_RATIO
-
-        observed_early_return = False
-        for _ in range(200):
-            if (
-                s.chunked_req is not None
-                and s.chunked_req.rid == r.rid
-                and not s._chunked_req_scheduled_last_iter
-            ):
-                observed_early_return = True
+        # Sustained memory pressure: ignore_eos decoders that keep the small SWA
+        # pool saturated and trigger repeated real retractions.
+        for i in range(_N_DECODERS):
+            t.start_req(
+                prompt_len=_DECODER_PROMPT,
+                max_new_tokens=_DECODER_MAX_NEW,
+                ignore_eos=True,
+                prompt_token=10 + i,
+            )
+        for _ in range(_DECODER_WARMUP_STEPS):
+            if len(s.running_batch.reqs) >= _DECODER_WARMUP_RUNNING:
                 break
             yield
 
-        assert observed_early_return, (
-            "test must exercise the add_chunked_req early-return branch: r was "
-            "never parked as scheduler.chunked_req while unscheduled after the "
-            "new_token_ratio jump inflated the reserved-decode offset"
+        # Feed chunked candidates until one is parked by the add_chunked_req
+        # hybrid-SWA early-return.
+        parked = False
+        for _ in range(_N_CANDIDATES):
+            r = t.start_req(
+                prompt_len=_CHUNKED_PROMPT,
+                max_new_tokens=_CHUNKED_MAX_NEW,
+                prompt_token=2,
+            )
+            for _ in range(_STEPS_PER_CANDIDATE):
+                if (
+                    s.chunked_req is not None
+                    and s.chunked_req.rid == r.rid
+                    and not s._chunked_req_scheduled_last_iter
+                ):
+                    parked = True
+                    break
+                if r.finished:
+                    break
+                yield
+            if parked:
+                break
+
+        assert parked, (
+            "no chunked candidate was ever parked by add_chunked_req's hybrid-SWA "
+            "early-return; the test never exercised the stash gate"
         )
-        assert not r.finished, "r must still be mid-chunked-prefill while parked"
 
-        # As the ratio decays back after the retraction, the reservation shrinks
-        # and the parked chunk is admitted again.
-        tracker.current = _DECAYED_RATIO
-        yield from run_until_finished(r)
-
-        # Drain the holder so any remaining radix lock ref is a genuine leak.
+        # Drain. On the buggy (un-gated) code the spurious stash of the deferred
+        # chunked req has already double-freed/corrupted state (KV-canary crash)
+        # before we get here; on fixed code the drain must leave no locked nodes.
         t.abort_all()
-        yield from run_until(
-            r,
-            lambda _h: s.chunked_req is None
-            and len(s.waiting_queue) == 0
-            and s.running_batch.is_empty(),
-        )
+        for _ in range(_DRAIN_STEPS):
+            if (
+                s.chunked_req is None
+                and len(s.waiting_queue) == 0
+                and s.running_batch.is_empty()
+            ):
+                break
+            yield
+        for _ in range(20):
+            yield
 
         locked = {nid: lr for nid, lr in t.get_all_node_lock_refs().items() if lr != 0}
         assert not locked, (
-            f"radix nodes left locked after drain {locked} — stash gate let "
-            "an un-scheduled chunked req commit partial KV"
+            f"radix nodes left locked after drain {locked} -- stash gate let an "
+            "un-scheduled chunked req commit partial KV"
         )
 
 
