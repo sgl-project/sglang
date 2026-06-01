@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "3ca3bad088ecc9ef80947d85c551cd335c75b87f"
+SGL_TEST_FILES_CI_DATA_REVISION = "a17a6cd676d16d0f6c93cc80d0144138ab87dca1"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -58,6 +58,7 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
         "ltx_2_3_two_stage_ti2v_2gpus",
     }
 )
+
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
 )
@@ -801,7 +802,10 @@ def get_clip_model() -> tuple[Any, Any]:
             )
         model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # ci server tests keep the generation server alive while consistency runs
+        device = (
+            "cpu" if is_in_ci() else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         model = model.to(device)
         model.eval()
 

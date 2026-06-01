@@ -18,7 +18,9 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 # Reuse common functions and classes from mova_video_dit
@@ -101,7 +103,7 @@ class Conv1dLocalIsland(nn.Conv1d):
             return super().forward(input)
 
 
-class WanAudioModel(CachableDiT, OffloadableDiTMixin):
+class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = MOVAAudioConfig()._fsdp_shard_conditions
     _compile_conditions = MOVAAudioConfig()._compile_conditions
     _supported_attention_backends = MOVAAudioConfig()._supported_attention_backends

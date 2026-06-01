@@ -33,7 +33,9 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -419,7 +421,7 @@ class Conv3dLocalIsland(nn.Conv3d):
             return super().forward(input)
 
 
-class WanModel(CachableDiT, OffloadableDiTMixin):
+class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = MOVAVideoConfig()._fsdp_shard_conditions
     _compile_conditions = MOVAVideoConfig()._compile_conditions
     _supported_attention_backends = MOVAVideoConfig()._supported_attention_backends

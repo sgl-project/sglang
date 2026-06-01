@@ -51,23 +51,16 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
-    if server_args.disaggregation_mode != "null" and server_args.pp_size > 1:
-        # get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized
-        # flat KV ptrs by PP layer range.
-        raise ValueError(
-            f"V4 PD disaggregation requires pp_size=1, got pp_size={server_args.pp_size}."
-        )
-
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
-    if not server_args.enable_nsa_prefill_context_parallel:
+    if not server_args.enable_dsa_prefill_context_parallel:
         return
 
-    if server_args.nsa_prefill_cp_mode != "round-robin-split":
+    if server_args.dsa_prefill_cp_mode != "round-robin-split":
         raise ValueError(
             f"DeepSeekV4 only supports round-robin-split CP mode, "
-            f"got {server_args.nsa_prefill_cp_mode}"
+            f"got {server_args.dsa_prefill_cp_mode}"
         )
 
     server_args.enable_dp_attention = True
