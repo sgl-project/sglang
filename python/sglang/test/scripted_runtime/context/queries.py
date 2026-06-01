@@ -138,9 +138,9 @@ def _send_idx_series(ctx: "ScriptedContext", rid: str) -> List[int]:
 
 def _prompt_len_for_rid(ctx: "ScriptedContext", rid: str) -> Optional[int]:
     for record in ctx._scheduler_hook._batch_log:
-        for record_rid, prompt_len in record.prompt_len_by_rid:
-            if record_rid == rid:
-                return prompt_len
+        origin_input_ids = record.origin_input_ids_of_rid.get(rid)
+        if origin_input_ids is not None:
+            return len(origin_input_ids)
     return None
 
 
