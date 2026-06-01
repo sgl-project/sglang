@@ -12,7 +12,7 @@ from sglang.test.scripted_runtime.context import (
 from sglang.test.scripted_runtime.context.req_starter import ScriptedContextReqStarter
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqLogprob
     from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
     from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -53,6 +53,9 @@ class ScriptedContext:
         priority: Optional[int] = None,
         dp_rank: Optional[int] = None,
         prompt_token: int = 1,
+        return_logprob: bool = False,
+        logprob_start_len: Optional[int] = None,
+        top_logprobs_num: Optional[int] = None,
     ) -> "ScriptedReqHandle":
         return self._req_starter.start_req(
             prompt_len=prompt_len,
@@ -62,6 +65,9 @@ class ScriptedContext:
             priority=priority,
             dp_rank=dp_rank,
             prompt_token=prompt_token,
+            return_logprob=return_logprob,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=top_logprobs_num,
         )
 
     def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:
@@ -85,6 +91,18 @@ class ScriptedContext:
     def get_all_node_lock_refs(self) -> Dict[int, int]:
         return radix.get_all_node_lock_refs(self)
 
+    @property
+    def is_idle(self) -> bool:
+        return queries.is_idle(self)
+
+    @property
+    def is_fully_idle(self) -> bool:
+        return queries.is_fully_idle(self)
+
+    @property
+    def forward_mode(self) -> Optional[str]:
+        return queries.forward_mode(self)
+
     def find_req_by_rid(self, rid: str) -> Optional["Req"]:
         return queries.find_req_by_rid(self, rid)
 
@@ -93,6 +111,18 @@ class ScriptedContext:
 
     def is_chunking(self, rid: str) -> bool:
         return queries.is_chunking(self, rid)
+
+    def status(self, rid: str) -> str:
+        return queries.status(self, rid)
+
+    def remaining_prompt_tokens(self, rid: str) -> int:
+        return queries.remaining_prompt_tokens(self, rid)
+
+    def logprobs(self, rid: str) -> Optional["ReqLogprob"]:
+        return queries.logprobs(self, rid)
+
+    def num_input_logprobs(self, rid: str) -> int:
+        return queries.num_input_logprobs(self, rid)
 
     def list_active_reqs(self) -> List["Req"]:
         return queries.list_active_reqs(self)

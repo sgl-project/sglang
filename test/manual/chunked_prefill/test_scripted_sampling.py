@@ -102,7 +102,7 @@ class TestSamplingBasic(ScriptedTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert r.logprobs is not None
-        assert len(r.logprobs) == 4
+        assert len(r.logprobs.output_token_logprobs_val) == 4
 
     def test_ignore_eos_chunked(self):
         self.server.execute_script(self._script_ignore_eos_chunked)
@@ -220,7 +220,7 @@ class TestSamplingBasic(ScriptedTestCase):
         assert r.finished
         assert r.chunks_done >= 2
         assert r.logprobs is not None
-        top = r.logprobs.output_token_top_logprobs_val
+        top = r.logprobs.output_top_logprobs_val
         assert len(top) == 4, (
             f"top logprobs must be reported once per output token; "
             f"got {len(top)} entries for 4 tokens"

@@ -27,6 +27,9 @@ class ScriptedContextReqStarter:
         priority: Optional[int],
         dp_rank: Optional[int],
         prompt_token: int = 1,
+        return_logprob: bool = False,
+        logprob_start_len: Optional[int] = None,
+        top_logprobs_num: Optional[int] = None,
     ) -> ScriptedReqHandle:
         ctx = self._ctx
 
@@ -41,6 +44,11 @@ class ScriptedContextReqStarter:
             "rid": rid,
             "stream": True,
         }
+        payload["return_logprob"] = return_logprob
+        if logprob_start_len is not None:
+            payload["logprob_start_len"] = logprob_start_len
+        if top_logprobs_num is not None:
+            payload["top_logprobs_num"] = top_logprobs_num
         if priority is not None:
             payload["priority"] = priority
         if dp_rank is not None:

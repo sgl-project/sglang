@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqLogprob
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
@@ -45,6 +45,27 @@ def batch_composition(ctx: "ScriptedContext") -> Dict[str, List[str]]:
     }
 
 
+def is_idle(ctx: "ScriptedContext") -> bool:
+    s = ctx._scheduler
+    return (
+        s.chunked_req is None
+        and len(s.waiting_queue) == 0
+        and (s.running_batch is None or s.running_batch.is_empty())
+    )
+
+
+def is_fully_idle(ctx: "ScriptedContext") -> bool:
+    s = ctx._scheduler
+    return is_idle(ctx) and (s.last_batch is None or s.last_batch.is_empty())
+
+
+def forward_mode(ctx: "ScriptedContext") -> Optional[str]:
+    s = ctx._scheduler
+    if s.last_batch is not None and s.last_batch.forward_mode is not None:
+        return s.last_batch.forward_mode.name
+    return None
+
+
 def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:
     req = next((r for r in _get_all_reqs(ctx) if r.rid == rid), None)
     if req is not None:
@@ -65,6 +86,37 @@ def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
 def is_chunking(ctx: "ScriptedContext", rid: str) -> bool:
     s = ctx._scheduler
     return s.chunked_req is not None and s.chunked_req.rid == rid
+
+
+def status(ctx: "ScriptedContext", rid: str) -> str:
+    s = ctx._scheduler
+    if rid in {r.rid for r in s.waiting_queue}:
+        return "waiting"
+    req = find_req_by_rid(ctx, rid)
+    if req is not None:
+        return "finished" if req.finished() else "running"
+    if rid in ctx._seen_rids:
+        return "finished"
+    return "unknown"
+
+
+def remaining_prompt_tokens(ctx: "ScriptedContext", rid: str) -> int:
+    req = find_req_by_rid(ctx, rid)
+    if req is None:
+        return 0
+    return max(0, len(req.origin_input_ids) - req.kv_committed_len)
+
+
+def logprobs(ctx: "ScriptedContext", rid: str) -> Optional["ReqLogprob"]:
+    req = find_req_by_rid(ctx, rid)
+    return req.logprob if req is not None else None
+
+
+def num_input_logprobs(ctx: "ScriptedContext", rid: str) -> int:
+    lp = logprobs(ctx, rid)
+    if lp is None or lp.input_token_logprobs_val is None:
+        return 0
+    return len(lp.input_token_logprobs_val)
 
 
 def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
