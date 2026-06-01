@@ -26,6 +26,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
+    TI2V_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
 )
@@ -394,6 +395,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
             },
         ),
+        replace(TI2V_sampling_params, output_size="1024x1024"),
         run_component_accuracy_check=False,
     ),
 ]
