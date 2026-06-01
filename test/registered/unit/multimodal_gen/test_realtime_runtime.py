@@ -95,11 +95,19 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
         repo_root
         / "python/sglang/multimodal_gen/apps/realtime_webui/index.html"
     ).read_text()
+    styles_css = (
+        repo_root
+        / "python/sglang/multimodal_gen/apps/realtime_webui/styles.css"
+    ).read_text()
 
     assert "preset.actions" not in app_js
     assert "repeatActions" not in app_js
     assert 'id="eventFrames"' not in index_html
     assert "ControlStateController" in app_js
+    assert "styles.css?v=realtime-fixes-v13" in index_html
+    assert ".stage-controls .camera-pad button.is-key-active:not(:disabled)" in styles_css
+    assert "background: #8c9288;" in styles_css
+    assert "0 0 0 3px rgba(238, 241, 236, 0.2)" in styles_css
 
 
 def test_realtime_session_cache_reuses_and_releases_state():

@@ -315,12 +315,12 @@ button:focus-visible {
 .stage-controls .camera-pad button:active:not(:disabled),
 .stage-controls .camera-pad button.is-pressed:not(:disabled),
 .stage-controls .camera-pad button.is-key-active:not(:disabled) {
-  border-color: #b9543c;
-  background: #b9543c;
+  border-color: #aeb4aa;
+  background: #8c9288;
   color: #fffdf7;
   box-shadow:
     inset 0 0 0 1px rgba(255, 253, 247, 0.22),
-    0 0 0 3px rgba(185, 84, 60, 0.28),
+    0 0 0 3px rgba(238, 241, 236, 0.2),
     0 10px 22px rgba(23, 26, 22, 0.18);
 }
 
