@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -98,89 +97,6 @@ def _unpack_frame_batch_messages(payloads):
         frame_payload = message.pop("payload")
         messages.append((message, frame_payload))
     return messages
-
-
-def test_realtime_webui_presets_do_not_emit_camera_scripts():
-    repo_root = Path(__file__).parents[5]
-    app_js = (
-        repo_root
-        / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
-    ).read_text()
-    index_html = (
-        repo_root
-        / "python/sglang/multimodal_gen/apps/realtime_webui/index.html"
-    ).read_text()
-    styles_css = (
-        repo_root
-        / "python/sglang/multimodal_gen/apps/realtime_webui/styles.css"
-    ).read_text()
-
-    assert "preset.actions" not in app_js
-    assert "repeatActions" not in app_js
-    assert 'id="eventFrames"' not in index_html
-    assert "ControlStateController" in app_js
-    assert 'const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";' in app_js
-    assert 'id="transportFormat"' in index_html
-    assert (
-        'id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate"'
-        in index_html
-    )
-    assert '<option value="webp" selected>WebP preview</option>' in index_html
-    assert 'id="serverSendText"' in index_html
-    assert 'id="theoreticalFpsText"' in index_html
-    assert 'id="renderFps"' in index_html
-    assert 'id="stageRenderFps"' not in index_html
-    assert "sglang-diffusion Realtime Studio" in index_html
-    assert "SGLD" not in index_html
-    assert 'class="tabs"' not in index_html
-    assert "Recordings" not in index_html
-    assert "API" not in index_html
-    assert "Info" not in index_html
-    assert 'id="steps" type="number" value="4"' in index_html
-    assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-fixes-v25" in index_html
-    assert "app.js?v=realtime-fixes-v26" in index_html
-    assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";' in app_js
-    assert 'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";' in app_js
-    assert "Dragon Dolly" in app_js
-    assert "no creature morphing" in app_js
-    assert "A static locked-off view of the back side of Plastic Beach" in app_js
-    assert "clouds slowly drifting behind the island" in app_js
-    assert "occasional shooting star" in app_js
-    assert "tiny distant pigeons" in app_js
-    assert "A slow aerial orbit around a pastel floating island hotel" not in app_js
-    assert app_js.index("Dragon Ride") < app_js.index("Dragon Dolly")
-    assert app_js.index("Dragon Dolly") < app_js.index("Kid A")
-    assert "dragon-ride.jpg" in app_js
-    assert "stageRenderFps" not in app_js
-    assert 'setStatus("Receiving"' not in app_js
-    assert "decodeChain = decodeChain" in app_js
-    assert "receiveChain" not in app_js
-    assert 'message.type === "chunk_stats"' in app_js
-    assert "chunkTotal > 0 ? numFrames / chunkTotal" in app_js
-    assert "encodedImageElementFallback" in app_js
-    assert "handleEncodedPreviewDecodeError" in app_js
-    launch_server_py = (
-        repo_root
-        / "python/sglang/multimodal_gen/runtime/launch_server.py"
-    ).read_text()
-    assert "ws_per_message_deflate=False" in launch_server_py
-    assert "#statusText" in styles_css
-    assert "min-width: 92px" in styles_css
-    assert "if (b === 0xca)" in app_js
-    assert "if (b === 0xcb)" in app_js
-    assert "if (b === 0xc4)" in app_js
-    assert 'message.type === "frame_batch"' in app_js
-    assert "RAW_RGB_FRAMES_PER_WS_MESSAGE = 1" in (
-        repo_root
-        / "python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_output_adapter.py"
-    ).read_text()
-    assert ".stage-controls .camera-pad button.is-key-active:not(:disabled)" in styles_css
-    assert "stage-telemetry" in index_html
-    assert "max-height: min(54vh, 560px);" in styles_css
-    assert ".stage-telemetry" in styles_css
-    assert "--pressed: #8c9288;" in styles_css
-    assert "--pressed-ring: rgba(238, 241, 236, 0.2);" in styles_css
 
 
 def test_realtime_session_cache_reuses_and_releases_state():
