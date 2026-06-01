@@ -67,7 +67,8 @@ def _log_realtime_chunk_timing(
 ) -> None:
     logger.info(
         "realtime chunk timing: session_id=%s request_id=%s "
-        "chunk_idx=%s request_prepare=%.2fms scheduler_forward=%.2fms "
+        "chunk_idx=%s event_id=%s condition_kinds=%s "
+        "request_prepare=%.2fms scheduler_forward=%.2fms "
         "header_pack=%.2fms "
         "header_write=%.2fms raw_payload_build=%.2fms raw_write=%.2fms "
         "ws_write=%.2fms chunk_total=%.2fms batches=%d frames=%d "
@@ -75,6 +76,8 @@ def _log_realtime_chunk_timing(
         session.id,
         chunk.request_id,
         batch.block_idx,
+        getattr(batch, "realtime_event_id", None),
+        sorted(batch.condition_inputs) if batch.condition_inputs else [],
         request_prepare_ms,
         scheduler_forward_ms,
         send_stats["header_pack_ms"],
@@ -97,8 +100,13 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
     if adapter is None:
         raise ValueError("realtime adapter is not initialized")
 
+    pending_send_task = None
     while not session.reached_max_chunks():
         try:
+            if pending_send_task is not None and pending_send_task.done():
+                await pending_send_task
+                pending_send_task = None
+
             # send to scheduler and generate video chunk
             server_args = get_global_server_args()
 
@@ -127,26 +135,39 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
             # finish
             adapter.on_chunk_complete(session, result)
-            await _send_output_and_log(
-                ws,
-                session,
-                chunk,
-                batch,
-                result,
-                request_prepare_ms,
-                scheduler_forward_ms,
-                chunk_started,
+            if pending_send_task is not None:
+                await pending_send_task
+            pending_send_task = asyncio.create_task(
+                _send_output_and_log(
+                    ws,
+                    session,
+                    chunk,
+                    batch,
+                    result,
+                    request_prepare_ms,
+                    scheduler_forward_ms,
+                    chunk_started,
+                )
             )
 
         except asyncio.CancelledError:
+            if pending_send_task is not None:
+                pending_send_task.cancel()
+                await _await_realtime_task(pending_send_task)
             logger.info("generation completed, session_id=%s", session.id)
             break
         except WebSocketDisconnect:
+            if pending_send_task is not None:
+                pending_send_task.cancel()
+                await _await_realtime_task(pending_send_task)
             logger.info(
                 "client disconnected during generation, session_id=%s", session.id
             )
             break
         except Exception as e:
+            if pending_send_task is not None:
+                pending_send_task.cancel()
+                await _await_realtime_task(pending_send_task)
             err_msg = str(e).splitlines()[0]
             logger.error("error during generate loop: %s", err_msg)
             try:
@@ -158,6 +179,8 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 )
             break
     else:
+        if pending_send_task is not None:
+            await pending_send_task
         logger.info(
             "generation reached max chunks, session_id=%s, max_chunks=%s",
             session.id,
@@ -219,9 +242,10 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
             if session.adapter is None:
                 raise ValueError("realtime adapter is not initialized")
             event_log = session.adapter.ingest_event(session, realtime_event)
-            logger.debug(
-                "receive realtime event, session_id=%s, %s",
+            logger.info(
+                "receive realtime event, session_id=%s, event_id=%s, %s",
                 session.id,
+                realtime_event.event_id,
                 event_log,
             )
         except Exception as e:

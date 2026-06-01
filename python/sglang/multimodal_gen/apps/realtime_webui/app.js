@@ -13,7 +13,6 @@ const LOW_LATENCY_FPS_FLOOR = 10;
 const LOW_LATENCY_QUEUE_SECONDS = 0.35;
 const MAX_CATCHUP_FPS = 30;
 const EVENT_QUEUE_SECONDS = 0.25;
-const KEYBOARD_EVENT_INTERVAL_MS = 240;
 const CONTROL_KEY_ACTIONS = new Map([
   ["w", "w"],
   ["a", "a"],
@@ -85,7 +84,6 @@ let decodeRequestId = 1;
 let streamEpoch = 0;
 let lastDecodeMs = 0;
 let lastDisplayLagMs = 0;
-let lastControlKeySentAt = 0;
 let socketHadError = false;
 let socketCloseExpected = false;
 let socketServerError = "";
@@ -763,7 +761,10 @@ function updatePlaybackPace(header, now, frameCount) {
 }
 
 function sendEvent(kind, payload, historyText = null) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    addHistory(`${historyText || `${kind} event`} · socket not open`);
+    return;
+  }
   const eventId = nextEventId++;
   ws.send(pack({ type: "event", kind, payload, event_id: eventId }));
   if (kind === "camera_actions" || kind === "prompt") {
@@ -776,8 +777,8 @@ function sendEvent(kind, payload, historyText = null) {
   addHistory(`${historyText || `${kind} event sent`} · event#${eventId}`);
 }
 
-function sendCameraControl(actions) {
-  const payload = repeatActions([actions]);
+function sendCameraControl(actions, frameCount = 1) {
+  const payload = repeatActions([actions], frameCount);
   sendEvent("camera_actions", payload, describeCameraEvent(actions, payload.length));
 }
 
@@ -976,7 +977,25 @@ document.querySelectorAll("button").forEach((btn) => {
   });
 });
 document.querySelectorAll("[data-action]").forEach((btn) => {
-  btn.onclick = () => sendCameraControl([btn.dataset.action]);
+  const action = btn.dataset.action;
+  const press = (event) => {
+    event.preventDefault();
+    if (activeControlActions.has(action)) return;
+    activeControlActions.add(action);
+    setControlButtonActive(action, true);
+    sendActiveControlState();
+  };
+  const release = (event) => {
+    event.preventDefault();
+    if (!activeControlActions.has(action)) return;
+    activeControlActions.delete(action);
+    setControlButtonActive(action, false);
+    sendActiveControlState();
+  };
+  btn.addEventListener("pointerdown", press);
+  ["pointerup", "pointercancel", "pointerleave", "blur"].forEach((eventName) => {
+    btn.addEventListener(eventName, release);
+  });
 });
 
 function isTypingTarget(target) {
@@ -987,13 +1006,8 @@ function keyboardAction(event) {
   return CONTROL_KEY_ACTIONS.get(event.key.toLowerCase()) || null;
 }
 
-function sendActiveKeyboardActions(force = false) {
-  const now = performance.now();
-  if (!force && now - lastControlKeySentAt < KEYBOARD_EVENT_INTERVAL_MS) return;
-  lastControlKeySentAt = now;
-  if (activeControlActions.size || force) {
-    sendCameraControl(Array.from(activeControlActions));
-  }
+function sendActiveControlState() {
+  sendCameraControl(Array.from(activeControlActions), 1);
 }
 
 function setControlButtonActive(action, active) {
@@ -1009,8 +1023,9 @@ document.addEventListener("keydown", (event) => {
   if (!action) return;
   event.preventDefault();
   setControlButtonActive(action, true);
+  if (activeControlActions.has(action)) return;
   activeControlActions.add(action);
-  sendActiveKeyboardActions(!event.repeat);
+  sendActiveControlState();
 });
 
 document.addEventListener("keyup", (event) => {
@@ -1019,6 +1034,7 @@ document.addEventListener("keyup", (event) => {
   if (!action) return;
   event.preventDefault();
   setControlButtonActive(action, false);
+  if (!activeControlActions.has(action)) return;
   activeControlActions.delete(action);
-  sendActiveKeyboardActions(true);
+  sendActiveControlState();
 });
