@@ -34,6 +34,7 @@ from sglang.multimodal_gen.test.server.realtime_consistency import (
     collect_realtime_output,
     encode_realtime_frames_to_mp4,
     prepare_realtime_first_frame,
+    record_realtime_key_frames,
     realtime_ws_url,
     record_realtime_perf_stats,
 )
@@ -1340,6 +1341,7 @@ def get_generate_fn(
             )
         )
         record_realtime_perf_stats(case_id, realtime_output.chunk_stats)
+        record_realtime_key_frames(case_id, realtime_output.frames)
         fps = int(sampling_params.fps or 24)
         video_bytes = encode_realtime_frames_to_mp4(realtime_output.frames, fps=fps)
         validate_openai_video(video_bytes)

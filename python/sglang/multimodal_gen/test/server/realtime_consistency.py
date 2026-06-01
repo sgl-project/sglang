@@ -53,6 +53,7 @@ class RealtimeCollectionResult:
 
 
 _REALTIME_CHUNK_STATS_BY_CASE: dict[str, list[RealtimeChunkStats]] = {}
+_REALTIME_KEY_FRAMES_BY_CASE: dict[str, list[np.ndarray]] = {}
 
 
 def realtime_ws_url(client: Client) -> str:
@@ -221,6 +222,21 @@ def record_realtime_perf_stats(
 
 def pop_realtime_perf_stats(case_id: str) -> list[RealtimeChunkStats]:
     return _REALTIME_CHUNK_STATS_BY_CASE.pop(case_id, [])
+
+
+def select_realtime_key_frames(frames: list[np.ndarray]) -> list[np.ndarray]:
+    if not frames:
+        return []
+    key_indices = [0, len(frames) // 2, len(frames) - 1]
+    return [frames[idx].copy() for idx in key_indices]
+
+
+def record_realtime_key_frames(case_id: str, frames: list[np.ndarray]) -> None:
+    _REALTIME_KEY_FRAMES_BY_CASE[case_id] = select_realtime_key_frames(frames)
+
+
+def pop_realtime_key_frames(case_id: str) -> list[np.ndarray] | None:
+    return _REALTIME_KEY_FRAMES_BY_CASE.pop(case_id, None)
 
 
 def decode_realtime_raw_rgb_frames(

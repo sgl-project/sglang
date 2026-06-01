@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.realtime_consistency import (
+    pop_realtime_key_frames,
     pop_realtime_perf_stats,
     validate_realtime_perf_stats,
 )
@@ -628,7 +629,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         thresholds = get_consistency_thresholds(case.id, is_video=is_video)
 
         if is_video:
-            output_frames = extract_key_frames_from_video(content)
+            output_frames = pop_realtime_key_frames(case.id)
+            if output_frames is None:
+                output_frames = extract_key_frames_from_video(content)
         else:
             output_frames = [image_bytes_to_numpy(content)]
 
@@ -731,10 +734,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         is_video = case.server_args.modality == "video"
 
         if is_video:
-            # Extract key frames from video
-            frames = extract_key_frames_from_video(
-                content, num_frames=case.sampling_params.num_frames
-            )
+            # realtime consistency uses websocket raw frames to avoid lossy mp4 drift
+            frames = pop_realtime_key_frames(case.id)
+            if frames is None:
+                frames = extract_key_frames_from_video(
+                    content, num_frames=case.sampling_params.num_frames
+                )
 
             if len(frames) != 3:
                 logger.warning(

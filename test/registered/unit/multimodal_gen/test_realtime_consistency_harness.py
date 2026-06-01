@@ -20,8 +20,11 @@ from sglang.multimodal_gen.test.server.realtime_consistency import (
     collect_realtime_output,
     decode_realtime_raw_rgb_frames,
     parse_realtime_chunk_stats,
+    pop_realtime_key_frames,
     prepare_realtime_first_frame,
     realtime_ws_url,
+    record_realtime_key_frames,
+    select_realtime_key_frames,
     summarize_realtime_perf_stats,
     validate_realtime_perf_stats,
 )
@@ -100,6 +103,24 @@ def test_realtime_first_frame_accepts_url_or_file(tmp_path):
         "https://example.com/first.png"
     )
     assert prepare_realtime_first_frame(frame_path) == b"png-bytes"
+
+
+def test_realtime_key_frames_are_selected_from_raw_websocket_frames():
+    frames = [
+        np.full((2, 2, 3), idx, dtype=np.uint8)
+        for idx in range(5)
+    ]
+
+    selected = select_realtime_key_frames(frames)
+    assert [int(frame[0, 0, 0]) for frame in selected] == [0, 2, 4]
+
+    record_realtime_key_frames("unit-raw-frames", frames)
+    frames[2][:] = 99
+    popped = pop_realtime_key_frames("unit-raw-frames")
+
+    assert popped is not None
+    assert [int(frame[0, 0, 0]) for frame in popped] == [0, 2, 4]
+    assert pop_realtime_key_frames("unit-raw-frames") is None
 
 
 def test_realtime_event_payload_strips_test_schedule_metadata():
