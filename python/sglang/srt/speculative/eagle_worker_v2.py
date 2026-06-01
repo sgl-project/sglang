@@ -781,7 +781,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                 )
                 self.adaptive_controller.init_states(
-                    cuda_graph_bs=self.server_args.cuda_graph_bs,
+                    cuda_graph_bs=(
+                        None
+                        if self.server_args.disable_cuda_graph
+                        else self.server_args.cuda_graph_bs
+                    ),
                 )
 
     @property
