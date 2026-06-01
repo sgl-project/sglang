@@ -115,6 +115,14 @@ def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
     )
 
 
+def hisparse_dma_in_flight(ctx: "ScriptedContext", rid: str) -> bool:
+    # Req.hisparse_staging is the real per-request bool the engine sets while this
+    # request's KV is staged for an in-flight hisparse DMA. A finished/aborted req
+    # that has released its staging is absent or has the flag cleared.
+    req = find_req_by_rid(ctx, rid)
+    return req is not None and req.hisparse_staging
+
+
 def eagle_topk_p_captured(ctx: "ScriptedContext", rid: str) -> bool:
     # True if any step where this rid was in the batch carried a populated
     # EagleDraftInput.topk_p, i.e. the eagle draft input was captured during the

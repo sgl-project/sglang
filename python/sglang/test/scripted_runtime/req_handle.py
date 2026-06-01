@@ -50,6 +50,10 @@ class ScriptedReqHandle:
         return self.context.kv_send_last_chunk_events(self.rid)
 
     @property
+    def hisparse_dma_in_flight(self) -> bool:
+        return self.context.hisparse_dma_in_flight(self.rid)
+
+    @property
     def eagle_topk_p_captured(self) -> bool:
         return self.context.eagle_topk_p_captured(self.rid)
 

@@ -169,6 +169,9 @@ class ScriptedContext:
     def kv_send_last_chunk_events(self, rid: str) -> int:
         return queries.kv_send_last_chunk_events(self, rid)
 
+    def hisparse_dma_in_flight(self, rid: str) -> bool:
+        return queries.hisparse_dma_in_flight(self, rid)
+
     def eagle_topk_p_captured(self, rid: str) -> bool:
         return queries.eagle_topk_p_captured(self, rid)
 

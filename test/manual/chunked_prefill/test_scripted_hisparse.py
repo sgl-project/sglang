@@ -32,9 +32,11 @@ class TestHiSparseBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        assert r.hisparse_staging_buffers_held == 0, (
-            f"hisparse + chunked left staging buffers held; got "
-            f"{r.hisparse_staging_buffers_held}"
+        # No per-request staging-buffer count exists; the staging buffers live in
+        # the hisparse allocator pool, gated per request by Req.hisparse_staging.
+        # After finish that flag must be clear (no DMA staging left held).
+        assert not r.hisparse_dma_in_flight, (
+            "hisparse + chunked left staging in flight after finish"
         )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
@@ -51,14 +53,8 @@ class TestHiSparseBasic(ScriptedTestCase):
         yield from run_until_finished(r, max_steps=2000)
         yield from run_until_finished(r2, max_steps=2000)
         assert r.finished and r2.finished
-        assert r.hisparse_staging_buffers_held == 0, (
-            f"r still holding staging buffers after finish; got "
-            f"{r.hisparse_staging_buffers_held}"
-        )
-        assert r2.hisparse_staging_buffers_held == 0, (
-            f"r2 still holding staging buffers after finish; got "
-            f"{r2.hisparse_staging_buffers_held}"
-        )
+        assert not r.hisparse_dma_in_flight, "r still staging in flight after finish"
+        assert not r2.hisparse_dma_in_flight, "r2 still staging in flight after finish"
         assert r.kv_pages == 0 and r2.kv_pages == 0
         assert r.lock_refs == 0 and r2.lock_refs == 0
         assert r.chunks_done >= 2
@@ -77,10 +73,9 @@ class TestHiSparseBasic(ScriptedTestCase):
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.hisparse_staging_buffers_held == 0, (
-            f"abort during DMA must release staging buffers, got "
-            f"{r.hisparse_staging_buffers_held} still held"
-        )
+        assert (
+            not r.hisparse_dma_in_flight
+        ), "abort during DMA must release staging (hisparse_staging cleared)"
 
 
 if __name__ == "__main__":
