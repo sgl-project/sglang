@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -13,8 +14,17 @@ register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
 class TestComputeLaunchCapacities(CustomTestCase):
     @staticmethod
     def _make_server_args(*, max_bs: int) -> SimpleNamespace:
+        # cg-refactor: ``cuda_graph_max_bs`` is now per-phase under
+        # ``cuda_graph_config[Phase.DECODE]['max_bs']``. Build the dict
+        # so ``CanaryLaunchCapacities.from_args`` reads the same value.
         return SimpleNamespace(
-            cuda_graph_max_bs=max_bs,
+            cuda_graph_config={
+                Phase.DECODE: {
+                    "backend": Backend.FULL,
+                    "max_bs": max_bs,
+                    "bs": None,
+                },
+            },
             speculative_num_draft_tokens=0,
             chunked_prefill_size=None,
             max_prefill_tokens=128,
