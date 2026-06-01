@@ -163,9 +163,7 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_unknown_rid_noop(t: ScriptedContext):
-        bogus = ScriptedReqHandle(
-            rid="never-submitted-rid", scheduler_hook=t._scheduler_hook
-        )
+        bogus = ScriptedReqHandle(rid="never-submitted-rid", context=t)
         t.abort(bogus)
         yield
         r = t.start_req(prompt_len=16, max_new_tokens=2)
