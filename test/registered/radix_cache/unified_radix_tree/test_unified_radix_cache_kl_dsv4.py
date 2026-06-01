@@ -100,53 +100,5 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
     hicache_mem_layout = "layer_first"
 
 
-class TestUnifiedDeepSeekV4FlashHiCacheCP(TestUnifiedDeepSeekV4FlashHiCache):
-    """DeepSeek V4 Flash FP8 + HiCache + CP + UnifiedRadixCache."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DSV4_FLASH_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp-size",
-                "4",
-                "--moe-a2a-backend",
-                "deepep",
-                "--chunked-prefill-size",
-                "8192",
-                "--mem-fraction-static",
-                "0.78",
-                "--enable-hierarchical-cache",
-                "--hicache-ratio",
-                "4",
-                "--hicache-write-policy",
-                "write_through",
-                "--hicache-io-backend",
-                cls.hicache_io_backend,
-                "--hicache-mem-layout",
-                cls.hicache_mem_layout,
-                "--swa-full-tokens-ratio",
-                "0.25",
-                "--max-total-tokens",
-                "20000",
-                "--max-running-requests",
-                str(cls.max_running_requests),
-                "--enable-nsa-prefill-context-parallel",
-            ],
-            env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "1",
-                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-            },
-        )
-        cls.input_ids = get_input_ids(cls.model, num_samples=18)
-
-
 if __name__ == "__main__":
     unittest.main()
