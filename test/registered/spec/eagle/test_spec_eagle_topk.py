@@ -1,8 +1,9 @@
 """topk > 1 tree drafting (EAGLE3 topk16 + EAGLE/Llama-2 topk8).
 
 topk > 1 routes to spec v1, except page_size==1 which can also stay on spec v2
-(overlap). flashinfer is pinned (topk > 1 can't use fa3). Runs on the cheap
-(5090) runner -- functional sanity only, no perf/stress.
+(overlap). flashinfer is pinned because this runs on the cheap (5090) runner,
+where fa3 (Hopper-only) isn't available -- functional sanity only, no perf/stress.
+(topk > 1 on fa3 is covered on the Hopper runner in test_spec_eagle_fa3.py.)
 """
 
 import unittest
