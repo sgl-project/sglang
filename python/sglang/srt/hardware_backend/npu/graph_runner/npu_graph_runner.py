@@ -92,7 +92,7 @@ class NPUGraphRunner(CudaGraphRunner):
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "actual_seq_lengths_kv",
-                 "TARGET_VERIFY": "actual_seq_kvlen",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         else:
             self.attr_name: Dict[str, str] = {

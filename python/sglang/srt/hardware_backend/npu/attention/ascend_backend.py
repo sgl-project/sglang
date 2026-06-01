@@ -1715,9 +1715,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen=actual_seq_lengths,
                 actual_seq_kvlen=actual_seq_lengths_kv,
                 sparse_mode=sparse_mode,
-                pre_tokens=(
-                    layer.sliding_window_size if is_swa_layer else SWA_INT_MAX
-                ),
+                pre_tokens=(layer.sliding_window_size if is_swa_layer else SWA_INT_MAX),
                 next_tokens=0 if is_swa_layer else SWA_INT_MAX,
                 learnable_sink=sinks,
             )
@@ -1761,7 +1759,7 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
                 q_rope = q_rope[: forward_batch.num_token_non_padded_cpu]
-                
+
             if (
                 forward_batch.forward_mode.is_draft_extend()
                 or forward_batch.forward_mode.is_draft_extend_v2()
