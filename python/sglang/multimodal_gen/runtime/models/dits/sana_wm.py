@@ -1070,6 +1070,129 @@ def _gdn_scan_forward(
     return num / (den + eps)
 
 
+# ---------------------------------------------------------------------------
+# Streaming (autoregressive) state-carrying scans — the foundation of the
+# SANA-WM streaming `forward_long` path (S1). These mirror the reference
+# `recurrent_gdn_cached` / `recurrent_delta_cached`: a forward-only recurrence
+# that SEEDS its state from a prior chunk and RETURNS the final state, so a long
+# video can be generated chunk-by-chunk while remaining numerically identical to
+# the monolithic forward scan. Additive; #26153's dense path is untouched.
+# ---------------------------------------------------------------------------
+
+
+def _gdn_scan_forward_stateful(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    init_state_kv: Optional[torch.Tensor] = None,
+    init_state_z: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+    return_components: bool = False,
+    return_state: bool = False,
+):
+    """Main-branch GDN causal scan that carries KV/Z state across chunks.
+
+    Identical recurrence to ``_gdn_scan_forward`` but the state is seeded from
+    ``init_state_kv``/``init_state_z`` (None → zeros, i.e. the first chunk) and,
+    when ``return_state`` is set, the final ``(state_kv, state_z)`` is returned so
+    the next chunk continues the recurrence. Tensors are ``(B, H, D, N=T*S)``.
+    """
+    B, H, D, N = q.shape
+    T = beta.shape[2]
+    S = N // T
+
+    def fold(x):
+        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
+
+    q, k, v = fold(q), fold(k), fold(v)
+    q_rot, k_rot = fold(q_rot), fold(k_rot)
+    beta_e = beta.unsqueeze(3) if beta.ndim == 4 else beta.view(B, H, T, 1, 1)
+    decay_e = decay.view(B, H, T, 1, 1)
+
+    state_kv = (
+        torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
+        if init_state_kv is None
+        else init_state_kv.to(device=q.device, dtype=q.dtype).clone()
+    )
+    state_z = (
+        torch.zeros(B, H, D, 1, device=q.device, dtype=q.dtype)
+        if init_state_z is None
+        else init_state_z.to(device=q.device, dtype=q.dtype).clone()
+    )
+    num_list, den_list = [], []
+    target_z = 1.0
+    for t in range(T):
+        qt, kt, vt = q[:, :, t], k[:, :, t], v[:, :, t]
+        qrt, krt = q_rot[:, :, t], k_rot[:, :, t]
+        bt, gt = beta_e[:, :, t], decay_e[:, :, t]
+        state_kv = state_kv * gt
+        state_z = state_z * gt
+        delta_v = (vt - torch.matmul(state_kv, krt)) * bt
+        state_kv = state_kv + torch.matmul(delta_v, krt.transpose(-1, -2))
+        delta_z = (target_z - torch.matmul(state_z.transpose(-1, -2), kt)) * bt
+        state_z = state_z + torch.matmul(kt, delta_z.transpose(-1, -2))
+        num_list.append(torch.matmul(state_kv, qrt))
+        den_list.append(torch.matmul(state_z.transpose(-1, -2), qt))
+
+    num = torch.stack(num_list, dim=2).permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+    den = torch.stack(den_list, dim=2).permute(0, 1, 3, 2, 4).reshape(B, H, 1, N)
+    out = (num, den) if return_components else num / (den + eps)
+    if return_state:
+        return out, (state_kv, state_z)
+    return out
+
+
+def _single_path_delta_scan_forward_stateful(
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    init_state_kv: Optional[torch.Tensor] = None,
+    return_state: bool = False,
+):
+    """Camera-branch (numerator-only) delta-rule scan that carries state across chunks.
+
+    Identical recurrence to ``_single_path_delta_scan_forward`` with a seedable /
+    returnable ``state_kv`` for chunked autoregressive generation.
+    """
+    B, H, D, N = q_rot.shape
+    T = beta.shape[2]
+    S = N // T
+
+    def fold(x):
+        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
+
+    q_rot, k_rot, v = fold(q_rot), fold(k_rot), fold(v)
+    beta_e = beta.unsqueeze(3) if beta.ndim == 4 else beta.view(B, H, T, 1, 1)
+    decay_e = decay.view(B, H, T, 1, 1)
+
+    state_kv = (
+        torch.zeros(B, H, D, D, device=q_rot.device, dtype=q_rot.dtype)
+        if init_state_kv is None
+        else init_state_kv.to(device=q_rot.device, dtype=q_rot.dtype).clone()
+    )
+    out_list = []
+    for t in range(T):
+        qrt, krt, vt = q_rot[:, :, t], k_rot[:, :, t], v[:, :, t]
+        bt, gt = beta_e[:, :, t], decay_e[:, :, t]
+        state_kv = state_kv * gt
+        delta_v = (vt - torch.matmul(state_kv, krt)) * bt
+        state_kv = state_kv + torch.matmul(delta_v, krt.transpose(-1, -2))
+        out_list.append(torch.matmul(state_kv, qrt))
+
+    out = torch.stack(out_list, dim=2).permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+    if return_state:
+        return out, state_kv
+    return out
+
+
 def _gdn_chunk_scan_forward(
     q: torch.Tensor,
     k: torch.Tensor,
