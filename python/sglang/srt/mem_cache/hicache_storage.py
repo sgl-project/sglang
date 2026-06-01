@@ -86,7 +86,11 @@ class PoolName(str, Enum):
             return [f"_{mha_suffix}_temporal"] + [
                 f"_{mha_suffix}_conv_{i}" for i in range(conv_num)
             ]
-        if self == PoolName.SWA and not is_mla_backend and hasattr(host_pool, "v_buffer"):
+        if (
+            self == PoolName.SWA
+            and not is_mla_backend
+            and hasattr(host_pool, "v_buffer")
+        ):
             return [f"_{mha_suffix}_{self}_k", f"_{mha_suffix}_{self}_v"]
         return [f"_{mla_suffix}_{self}"]
 
