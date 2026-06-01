@@ -13,6 +13,7 @@ from sglang.benchmark.datasets.mooncake import MooncakeDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
 from sglang.benchmark.datasets.random import RandomDataset
 from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
+from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
 
 DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "autobench": AutoBenchmarkDataset,
@@ -28,6 +29,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "image": ImageDataset,
     "mooncake": MooncakeDataset,
     "longbench_v2": LongBenchV2Dataset,
+    "speed-bench": SpeedBenchDataset,
 }
 
 
