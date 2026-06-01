@@ -83,7 +83,7 @@ class GSM8KAscendMixin(ABC):
                 model=self.model,
                 eval_name="gsm8k",
                 api="completion",
-                num_examples=200,
+                num_examples=self.num_questions,
                 num_threads=128,
                 num_shots=self.gsm8k_num_shots,
             )
