@@ -1198,13 +1198,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         if not batch.forward_mode.is_idle():
+            # accept_tokens = predict[accept_index] is [bs, spec_steps + 1], so its
+            # per-req stride is spec_steps + 1 (NOT num_draft_tokens, which only
+            # coincides when topk == 1).
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             fill_bonus_tokens[(bs,)](
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
-                self.speculative_num_draft_tokens,
+                self.speculative_num_steps + 1,
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
@@ -1213,6 +1216,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             compute_spec_v2_logprobs(
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
+
+        if not batch.forward_mode.is_idle() and self.topk > 1:
+            # Tree drafting: verify writes `predict` / hidden_states node-indexed
+            # over the whole draft tree, and the accepted path is scattered across
+            # `accept_index`. Compact the accepted path to the contiguous front of
+            # each per-req block (and move the accepted KV to the committed front
+            # slots) so the downstream chain-layout code stays correct: output
+            # slicing in the result processor, draft-extend `select_index`, and the
+            # next decode's committed-KV reads all assume accepted == front chain.
+            # For topk == 1 the accepted path is already the front chain, so this is
+            # an identity transform and is skipped.
+            self.move_accepted_tokens_to_target_kvcache(
+                batch, accept_index, accept_lens - 1
+            )
+            predict = self._compact_accepted_to_front(predict, accept_index, bs)
+            if logits_output.hidden_states is not None:
+                logits_output.hidden_states = self._compact_accepted_to_front(
+                    logits_output.hidden_states, accept_index, bs
+                )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
@@ -1347,6 +1369,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
+
+    def _compact_accepted_to_front(
+        self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
+    ) -> torch.Tensor:
+        """Gather the accepted tree path to the contiguous front of each per-req
+        block of ``speculative_num_draft_tokens``.
+
+        ``x`` is node-indexed over the whole tree (shape ``[bs * num_draft_tokens,
+        ...]``); ``accept_index`` is ``[bs, spec_steps + 1]`` of global node indices
+        (``-1`` padded). The first ``spec_steps + 1`` slots of each block are
+        overwritten with the accepted path; padded (-1) entries clamp to node 0 and
+        land past ``accept_lens``, so they are never read downstream. Trailing slots
+        keep their original (unaccepted) values and are freed as overshoot.
+        """
+        nd = self.speculative_num_draft_tokens
+        s1 = accept_index.shape[1]  # spec_steps + 1
+        safe = accept_index.to(torch.int64).clamp(min=0).reshape(-1)
+        gathered = x[safe]
+        out = x.clone()
+        out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
+        return out
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self._draft_worker.draft_runner.update_weights_from_disk(
