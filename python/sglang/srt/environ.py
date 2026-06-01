@@ -342,6 +342,11 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
+    # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
+    # "use_direct_io": false key in --hicache-storage-backend-extra-config.
+    SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
@@ -735,6 +740,7 @@ class Envs:
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
+    SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
