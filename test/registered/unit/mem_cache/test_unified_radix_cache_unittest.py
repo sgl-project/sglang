@@ -2665,6 +2665,39 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(host_lru.in_list(node))
         tree.sanity_check()
 
+    def test_hicache_swa_host_lock_blocks_host_eviction(self):
+        """A host-locked SWA tombstone survives host eviction pressure, and
+        becomes evictable again once the lock is released."""
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires Full+SWA")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+
+        self._set_aux_host_tombstone(tree, node, ComponentType.SWA)
+        cd = node.component_data[ComponentType.SWA]
+        host_tokens = len(cd.host_value)
+
+        # Lock as load_back does, then drive host eviction under heavy pressure.
+        # The locked tombstone must not be freed.
+        lock_params = tree.inc_host_lock_ref(node).to_dec_params()
+        freed = tree.evict_host(host_tokens * 100, component_type=ComponentType.SWA)
+        self.assertEqual(freed, 0)
+        self.assertIsNotNone(cd.host_value)
+        self.assertEqual(cd.host_lock_ref, 1)
+        tree.sanity_check()
+
+        # After release the tombstone is evictable again.
+        tree.dec_host_lock_ref(node, lock_params)
+        freed = tree.evict_host(host_tokens * 100, component_type=ComponentType.SWA)
+        self.assertEqual(freed, host_tokens)
+        self.assertIsNone(cd.host_value)
+        tree.sanity_check()
+
     def test_match_prefix_best_and_device_node_without_hicache(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
