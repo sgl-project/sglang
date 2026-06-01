@@ -24,12 +24,12 @@ class TestGemma431B(GSM8KAscendMixin, CustomTestCase):
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
-        "0.35",
+        "0.7",
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",
         "--tp-size",
-        "4",
+        "2",
     ]
 
 
