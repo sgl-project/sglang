@@ -72,6 +72,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
+from unittest.case import _ShouldStop
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -102,19 +103,24 @@ logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
 
 
-def flatten_arrays_to_int64_tensor(
-    parts: List[array[int]], device, pin: bool
-) -> torch.Tensor:
-    """Flatten a list of array.array('q') buffers into one int64 tensor.
+def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
+    """Flatten array.array('q') buffers into one int64 CPU tensor.
 
-    Uses NumPy here to speed up the conversion by using memcpy
-    instead of a per-element PyLong-to-int64 walk.
+    NumPy memcpy instead of a per-element PyLong-to-int64 walk. Stays on
+    (optionally pinned) CPU; H2D is the caller's job.
     """
     combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
     cpu_t = torch.from_numpy(combined)
     if pin:
         cpu_t = cpu_t.pin_memory()
-    return cpu_t.to(device, non_blocking=True)
+    return cpu_t
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor on `device`."""
+    return flatten_arrays_to_pinned_cpu(parts, pin).to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -1202,6 +1208,11 @@ def kill_process_tree(
     `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
     for itself -- use `include_parent=False` if child reap must finish first.
     """
+    logger.info(
+        f"kill_process_tree called: parent_pid={parent_pid}, "
+        f"include_parent={include_parent}, pid={os.getpid()}"
+    )
+
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -2353,6 +2364,8 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "sglang.srt.disaggregation.",
+        "sglang.srt.managers.",
         "torch_npu.",
     }
 
@@ -2391,6 +2404,16 @@ class SafeUnpickler(pickle.Unpickler):
 def safe_pickle_load(fp):
     """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
     return SafeUnpickler(fp).load()
+
+
+def safe_pickle_loads(data):
+    """Drop-in replacement for pickle.loads() that blocks unsafe class loading."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        buf = bytes(data)
+    else:
+        # zmq.Frame and other buffer-protocol objects
+        buf = bytes(memoryview(data))
+    return SafeUnpickler(io.BytesIO(buf)).load()
 
 
 def debug_timing(func):
@@ -2771,6 +2794,13 @@ def retry(
         except SkipTest:
             # Do NOT retry skipped tests - used in CI and unittest
             raise
+        except _ShouldStop:
+            # `unittest.case._ShouldStop` is raised by `subTest.__exit__`
+            # when a subtest fails/skips and `result.failfast` is True
+            # (CI invokes `python3 file.py -f`). It signals the outer
+            # `testPartExecutor` to stop the test method cleanly; do
+            # NOT retry, just propagate so unittest handles it.
+            raise
         except Exception as e:
             traceback.print_exc()
 
@@ -2961,6 +2991,7 @@ def is_fa3_default_architecture(hf_config):
         "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
         "StepVLForConditionalGeneration",
+        "Step3p7ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     }
@@ -3089,10 +3120,16 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    # Opt-out for models that manage SP scatter/gather at the model level
+    # and do not consume the upstream gathered_buffer. Without this, the
+    # cuda graph runner pads num_tokens to attn_tp_size, which can cause
+    # autotuners to pick suboptimal kernel variants at small batches.
+    if server_args.disable_attn_tp_gather:
+        return False
+
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    assert server_args.moe_dense_tp_size in [1, None]
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
