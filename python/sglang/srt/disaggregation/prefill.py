@@ -123,8 +123,10 @@ class PrefillBootstrapQueue:
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
-        self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
+        self.max_total_num_tokens = (
+            self.scheduler.tp_worker.model_runner.max_token_pool_size
+        )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
             raise RuntimeError(
