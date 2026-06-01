@@ -32,7 +32,8 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import efrom sglang.srt.layers.attention.dsa.utils import (
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
