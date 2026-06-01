@@ -117,6 +117,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         )
         self.head_size = model_runner.model_config.head_dim
 
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
@@ -183,7 +187,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         metadata.orig_seq_lens_tensor = forward_batch.orig_seq_lens
         metadata.orig_seq_lens = forward_batch.orig_seq_lens.tolist()
 
-        metadata.block_tables = forward_batch.req_to_token_pool.req_to_token[
+        metadata.block_tables = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len
         ]
         # Convert the block table to a strided format.
@@ -346,9 +350,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             assert current_end <= self.max_context_len
 
         # Do multi-head attention
-        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-            layer.layer_id
-        )
+        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache = key_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
         )
@@ -358,7 +360,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
         if key is not None and value is not None:
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
                     key,
@@ -442,9 +444,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         key = k.view(-1, self.num_kv_heads, self.head_size)
         value = v.view(-1, self.num_kv_heads, self.head_size)
 
-        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-            layer.layer_id
-        )
+        key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache = key_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
         )
@@ -454,7 +454,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
         if key is not None and value is not None:
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
                     key,
@@ -532,16 +532,13 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             ),
         }
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _bind_metadata_buffers(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[None],
     ):
+        """Allocate persistent metadata buffers for CUDA graph capture."""
         metadata = DualChunkFlashAttentionMetadata()
 
         if forward_mode.is_decode_or_idle():
@@ -579,6 +576,36 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             self.decode_metadata[bs] = metadata
 
         self.forward_metadata = metadata
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[None],
+    ):
+        self._bind_metadata_buffers(bs, req_pool_indices, forward_mode)
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
+        )
+        # Restore max_seq_len scalars — replay sets actual values but CUDA graph
+        # needs the safe upper bound baked in at capture time.
+        if forward_mode.is_decode_or_idle():
+            md = self.forward_metadata
+            md.max_seq_len = self.max_context_len
+            md.max_seq_len_intra = self.max_context_len
+            md.max_seq_len_succ = self.max_context_len
+            md.max_seq_len_inter = self.max_context_len
 
     def init_forward_metadata_replay_cuda_graph(
         self,
