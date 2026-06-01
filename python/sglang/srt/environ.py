@@ -342,6 +342,11 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
+    # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
+    # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
+    # "use_direct_io": false key in --hicache-storage-backend-extra-config.
+    SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
@@ -550,6 +555,9 @@ class Envs:
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # For pre-tokenized (list[int]) multimodal prompts,
+    # preserve the user's original tokens to avoid retokenization drift.
+    SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
 
     # VLM Item CUDA IPC Transport
