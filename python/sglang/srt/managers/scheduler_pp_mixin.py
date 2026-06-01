@@ -606,9 +606,10 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.fill_ids = req.origin_input_ids
+                req.full_untruncated_fill_ids = req.origin_input_ids
+                req.fill_len = len(req.full_untruncated_fill_ids)
                 req.logprob_start_len = -1
-                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
                 # Profiling forward simulates one full prefill — mark the whole
                 # prompt as scheduled so output_process_mode resolves to
                 # EXTEND_LAST_CHUNK in init_new.
@@ -625,7 +626,7 @@ class SchedulerPPMixin:
                     self.spec_algorithm,
                 )
 
-                current_seq_len = len(req.fill_ids)
+                current_seq_len = req.fill_len
 
                 if is_dp_attention_enabled():
                     # For profiling, we only have one request on PP0
@@ -689,7 +690,7 @@ class SchedulerPPMixin:
                 # Release KV cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : len(req.fill_ids)
+                        req.req_pool_idx, : req.fill_len
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     self.req_to_token_pool.free(req)

@@ -213,7 +213,7 @@ class RadixCacheCpp(BasePrefixCache):
         # Bound row read by kv_committed_len; see radix_cache.py for rationale.
         assert req.kv_committed_len >= req.cache_protected_len
         prefill_len = req.kv_committed_len
-        token_ids = req.fill_ids[:prefill_len]
+        token_ids = req.full_untruncated_fill_ids[:prefill_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ].to(dtype=torch.int64, copy=True)

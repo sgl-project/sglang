@@ -500,7 +500,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = kv_indices
             return
 
-        token_ids = req.fill_ids[:read_len]
+        token_ids = req.full_untruncated_fill_ids[:read_len]
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :read_len]
 
         radix_key = RadixKey(

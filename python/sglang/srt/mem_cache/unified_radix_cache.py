@@ -637,7 +637,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Bound row read by kv_committed_len; see radix_cache.py for rationale.
         assert req.kv_committed_len >= req.cache_protected_len
         read_len = req.kv_committed_len
-        token_ids = req.fill_ids[:read_len]
+        token_ids = req.full_untruncated_fill_ids[:read_len]
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[

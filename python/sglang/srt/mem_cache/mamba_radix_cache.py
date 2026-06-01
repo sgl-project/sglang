@@ -615,7 +615,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        token_ids = req.fill_ids[:read_len]
+        token_ids = req.full_untruncated_fill_ids[:read_len]
         cache_len = (
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
