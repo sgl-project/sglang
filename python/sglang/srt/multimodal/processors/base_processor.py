@@ -1227,6 +1227,58 @@ class BaseMultimodalProcessor(ABC):
             return tensor
         return tensor.cpu()
 
+    def resolve_image_token_counts(self, images: List) -> List[int]:
+        """Per-image expanded token counts, computed without re-tokenizing.
+
+        Default implementation uses the transformers in-tree convention
+        ``_get_num_multimodal_tokens(image_sizes=...)`` (present on the in-tree
+        VLM processors, e.g. Qwen-VL, Gemma3, GLM4V). Models whose processor
+        does not implement it (e.g. Kimi) override this method.
+
+        """
+        assert images is not None
+        image_sizes = [(image.height, image.width) for image in images]
+        num_image_tokens = self._processor._get_num_multimodal_tokens(
+            image_sizes=image_sizes
+        ).num_image_tokens
+        return [int(count) for count in num_image_tokens]
+
+    @staticmethod
+    def _expand_input_ids(
+        original_ids: List[int],
+        counts: List[int],
+        placeholder_token_id: Optional[int],
+    ) -> List[int]:
+        """Rebuild final input_ids for a pre-tokenized (list[int]) prompt.
+
+        Keep the user's ORIGINAL tokens verbatim and expand the i-th image
+        placeholder into ``counts[i]`` copies of ``placeholder_token_id``. The HF
+        processor's re-tokenization is discarded, so non-media tokens cannot
+        drift.
+
+        """
+        if placeholder_token_id is None:
+            raise ValueError("placeholder_token_id is not set for this processor")
+
+        num_placeholders = sum(
+            1 for token_id in original_ids if token_id == placeholder_token_id
+        )
+        if num_placeholders != len(counts):
+            raise ValueError(
+                f"prompt has {num_placeholders} image placeholder token(s) but "
+                f"{len(counts)} image(s) were provided"
+            )
+
+        rebuilt: List[int] = []
+        next_image_idx = 0
+        for token_id in original_ids:
+            if token_id == placeholder_token_id:
+                rebuilt.extend([placeholder_token_id] * counts[next_image_idx])
+                next_image_idx += 1
+            else:
+                rebuilt.append(token_id)
+        return rebuilt
+
     def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
@@ -1276,6 +1328,48 @@ class BaseMultimodalProcessor(ABC):
                 **kwargs,
             )
             all_collected_items = collected_items
+
+            # When SGLANG_MM_AVOID_RETOKENIZE is on, keep the user's exact tokens to avoid retokenize drift.
+            # Drift happens when Retokenization is not identity: Decode(X) => String => Re-tokenize => Y, X != Y.
+            if (
+                envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+                and base_output.input_ids is not None
+                and input_ids is not None
+                and raw_images
+                and not raw_audios
+                and not raw_videos
+            ):
+                assert isinstance(
+                    base_output.input_ids, list
+                ), f"expected list[int] input_ids, got {type(base_output.input_ids)}"
+                try:
+                    counts = self.resolve_image_token_counts(raw_images)
+                    image_placeholder_token_id = mm_tokens.image_token_id
+                    if image_placeholder_token_id is None:
+                        raise ValueError(
+                            "image placeholder token id is not set for this processor"
+                        )
+                    processor_placeholder_count = int(
+                        (input_ids == image_placeholder_token_id).sum().item()
+                    )
+                    if processor_placeholder_count != sum(counts):
+                        raise ValueError(
+                            "processor image placeholder count mismatch: "
+                            f"processor={processor_placeholder_count}, "
+                            f"resolved={sum(counts)}"
+                        )
+                    input_ids = torch.tensor(
+                        self._expand_input_ids(
+                            base_output.input_ids,
+                            counts,
+                            image_placeholder_token_id,
+                        ),
+                        dtype=input_ids.dtype,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Due to {e}, falling back to decode+retokenize, which may change prompt length (token drift)."
+                    )
         else:
             ret = None
 
