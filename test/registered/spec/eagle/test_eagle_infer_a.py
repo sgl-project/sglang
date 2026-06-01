@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=357, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestEAGLEEngine(CustomTestCase):
@@ -197,6 +197,25 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "batch_avg_accept_len": 1.75,
         "accept_len": 3.1,
     }
+
+
+class TestEAGLE3EngineSpecV2Tree(TestEAGLE3Engine):
+    """EAGLE3 topk > 1 tree drafting on the spec-v2 (overlap) worker, page_size=1.
+
+    Reuses TestEAGLE3Engine's config (topk=16, num_draft_tokens=64) and all its
+    assertions -- notably ``_test_single_generation`` (output == non-spec
+    reference, i.e. the lossless-correctness check) and ``_test_acc_length`` --
+    but runs on spec v2 instead of v1. Guards the v2 tree-drafting path
+    (accepted-path compaction to the per-req block front).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(True)
+
+    @classmethod
+    def tearDownClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
 
 if __name__ == "__main__":
