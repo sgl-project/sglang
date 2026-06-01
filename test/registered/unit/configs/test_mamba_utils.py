@@ -104,9 +104,7 @@ class TestMamba2StateDtype(unittest.TestCase):
     def test_text_config_missing_attr_falls_to_root(self):
         # text_config exists but lacks mamba_ssm_dtype -> the `and` is False ->
         # elif reads root mamba_ssm_dtype.
-        cfg = SimpleNamespace(
-            text_config=SimpleNamespace(), mamba_ssm_dtype="bfloat16"
-        )
+        cfg = SimpleNamespace(text_config=SimpleNamespace(), mamba_ssm_dtype="bfloat16")
         with envs.SGLANG_MAMBA_SSM_DTYPE.override(None):
             dt = mamba2_state_dtype(cfg)
         self.assertEqual(dt.temporal, torch.bfloat16)
