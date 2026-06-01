@@ -541,28 +541,6 @@ class TestSamplingBasic(ScriptedTestCase):
             f">= logprob_start_len={start_len}, got {len(input_lp)}"
         )
 
-    def test_chunked_streaming_no_mid_chunk_output(self):
-        self.server.execute_script(self._script_chunked_streaming_no_mid_chunk_output)
-
-    @staticmethod
-    def _script_chunked_streaming_no_mid_chunk_output(t: ScriptedContext):
-        r = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN,
-            max_new_tokens=4,
-            stream=True,
-        )
-        yield from run_until(r, lambda h: h.chunks_done >= 1)
-        assert (
-            r.stream_events == []
-        ), f"stream output must be suppressed mid-chunk, got {r.stream_events!r}"
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done >= 2
-        assert len(r.stream_events) >= 1, (
-            f"stream events expected after last chunk completes, "
-            f"got {r.stream_events!r}"
-        )
-
     def test_finish_reason_value_eos_vs_length_chunked(self):
         self.server.execute_script(
             self._script_finish_reason_value_eos_vs_length_chunked

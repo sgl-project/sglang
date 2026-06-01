@@ -221,18 +221,6 @@ def in_flight_other_mb_rids(ctx: "ScriptedContext") -> List[str]:
     return rids
 
 
-def stream_events(ctx: "ScriptedContext", rid: str) -> List[Any]:
-    # The streamed batch outputs the scheduler has emitted toward the tokenizer
-    # for this rid so far. While a request is still mid-chunk (prefill not done)
-    # the scheduler emits nothing, so this list stays empty; once the request
-    # produces decode tokens each streamed step shows up as one entry.
-    proxy = ctx._tokenizer_recv_proxy
-    assert (
-        proxy is not None
-    ), "stream_events requires the tokenizer recv proxy (start the server with it)"
-    return proxy.buffered_objects_for_rid(rid)
-
-
 def chunked_parks(ctx: "ScriptedContext", rid: str) -> int:
     # The dual of chunks_done: iterations where the scheduler still held this rid
     # as its chunked_req but did NOT run it in the batch -- i.e. add_chunked_req's
