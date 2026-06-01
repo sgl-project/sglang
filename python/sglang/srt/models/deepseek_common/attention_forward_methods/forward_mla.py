@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.compilation_config import (
-    is_graph_dsa_eager_fusion_enabled,
+    is_graph_dsa_split_op_fusion_enabled,
 )
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
@@ -59,7 +59,7 @@ from sglang.srt.utils import BumpAllocator
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
-_enable_graph_dsa_eager_fusion = is_graph_dsa_eager_fusion_enabled(_is_cuda)
+_enable_graph_dsa_split_op_fusion = is_graph_dsa_split_op_fusion_enabled(_is_cuda)
 
 
 @dataclass(frozen=True)
@@ -219,7 +219,7 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
-        if not _enable_graph_dsa_eager_fusion:
+        if not _enable_graph_dsa_split_op_fusion:
             return False
         if not (
             _is_cuda

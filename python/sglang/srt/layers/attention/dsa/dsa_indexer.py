@@ -13,7 +13,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     fused_store_index_k_cache,
 )
 from sglang.srt.compilation.compilation_config import (
-    is_graph_dsa_eager_fusion_enabled,
+    is_graph_dsa_split_op_fusion_enabled,
 )
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
@@ -108,7 +108,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
-_enable_graph_dsa_eager_fusion = is_graph_dsa_eager_fusion_enabled(_is_cuda)
+_enable_graph_dsa_split_op_fusion = is_graph_dsa_split_op_fusion_enabled(_is_cuda)
 
 
 def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
@@ -248,7 +248,7 @@ if _is_cuda:
 
     bcg_dsa_indexer_graph_dispatch = eager_on_graph(True)(dsa_indexer_graph_dispatch)
 
-    def _logits_head_gate_pcg_fake_impl(
+    def _logits_head_gate_graph_fake_impl(
         x: torch.Tensor,
         weight: torch.Tensor,
         n_heads_inv_sqrt: float,
@@ -261,8 +261,8 @@ if _is_cuda:
             device=x.device,
         )
 
-    @register_custom_op(fake_impl=_logits_head_gate_pcg_fake_impl)
-    def logits_head_gate_pcg(
+    @register_custom_op(fake_impl=_logits_head_gate_graph_fake_impl)
+    def logits_head_gate_graph(
         x: torch.Tensor,
         weight: torch.Tensor,
         n_heads_inv_sqrt: float,
@@ -674,12 +674,13 @@ class Indexer(MultiPlatformOp):
         num_tokens: Optional[int] = None,
     ) -> None:
         # `num_tokens` selects between two mutually exclusive call shapes:
-        #   - None (non-PCG): use the full padded `key` and coerce
+        #   - None (eager): use the full padded `key` and coerce
         #     `forward_batch.out_cache_loc` to contiguous (legacy behavior).
-        #   - int  (PCG): slice `key` and `out_cache_loc` to the unpadded
-        #     count so padded slots are not written into the K cache. The PCG
-        #     caller passes a prefix view of its contiguous static out_cache_loc
-        #     buffer, so the legacy contiguity coercion is unnecessary there.
+        #   - int  (graph dispatch, PCG/BCG): slice `key` and `out_cache_loc` to
+        #     the unpadded count so padded slots are not written into the K cache.
+        #     The graph-dispatch caller passes a prefix view of its contiguous
+        #     static out_cache_loc buffer, so the legacy contiguity coercion is
+        #     unnecessary there.
         key = self._get_k_bf16(x, positions, enable_dual_stream)
         out_cache_loc = None
         if num_tokens is not None:
@@ -1506,7 +1507,7 @@ class Indexer(MultiPlatformOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if (
-            _enable_graph_dsa_eager_fusion
+            _enable_graph_dsa_split_op_fusion
             and in_piecewise_or_breakable_cuda_graph
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not self.dsa_enable_prefill_cp
@@ -1628,7 +1629,7 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             if in_piecewise_or_breakable_cuda_graph:
-                weights = logits_head_gate_pcg(
+                weights = logits_head_gate_graph(
                     x_for_gate,
                     self.weights_proj.weight,
                     self.n_heads**-0.5,
