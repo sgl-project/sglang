@@ -199,6 +199,78 @@ def test_condition_event_queue_does_not_persist_last_signal_across_empty_chunks(
     assert second == [[], []]
 
 
+def test_condition_event_queue_can_repeat_last_signal_across_empty_chunks():
+    queue = ConditionEventQueue()
+    queue.push(ConditionEvent(kind="camera_actions", payload=[["w"]]))
+
+    first = queue.sample_chunk(
+        "camera_actions",
+        ConditionSamplingParams(
+            chunk_size=2,
+            default_item=[],
+            repeat_last_across_empty_chunks=True,
+        ),
+    )
+    second = queue.sample_chunk(
+        "camera_actions",
+        ConditionSamplingParams(
+            chunk_size=2,
+            default_item=[],
+            repeat_last_across_empty_chunks=True,
+        ),
+    )
+    queue.push(ConditionEvent(kind="camera_actions", payload=[[]]))
+    third = queue.sample_chunk(
+        "camera_actions",
+        ConditionSamplingParams(
+            chunk_size=2,
+            default_item=[],
+            repeat_last_across_empty_chunks=True,
+        ),
+    )
+
+    assert first == [["w"], ["w"]]
+    assert second == [["w"], ["w"]]
+    assert third == [[], []]
+
+
+def test_condition_event_queue_tracks_sampled_signal_seq_id():
+    queue = ConditionEventQueue()
+    queue.push(
+        ConditionEvent(
+            kind="camera_actions",
+            payload=[
+                ControlSignal(kind="camera_actions", payload=["w"], seq_id=7),
+                ControlSignal(kind="camera_actions", payload=[], seq_id=8),
+            ],
+        )
+    )
+
+    first = queue.sample_chunk(
+        "camera_actions",
+        ConditionSamplingParams(
+            chunk_size=1,
+            default_item=[],
+            repeat_last_across_empty_chunks=True,
+        ),
+    )
+    first_seq_id = queue.last_sampled_seq_id("camera_actions")
+    second = queue.sample_chunk(
+        "camera_actions",
+        ConditionSamplingParams(
+            chunk_size=1,
+            default_item=[],
+            repeat_last_across_empty_chunks=True,
+        ),
+    )
+    second_seq_id = queue.last_sampled_seq_id("camera_actions")
+
+    assert first == [["w"]]
+    assert first_seq_id == 7
+    assert second == [[]]
+    assert second_seq_id == 8
+
+
 def test_condition_event_queue_replace_clears_pending_signals():
     queue = ConditionEventQueue()
     queue.push(
@@ -258,14 +330,14 @@ def test_lingbot_realtime_state_uses_generic_condition_queue():
     assert not state.has_prompt()
 
 
-def test_lingbot_realtime_camera_event_replaces_pending_script():
+def test_lingbot_realtime_camera_events_preserve_short_presses():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
-    state.receive_camera_actions([["w"], ["w"], ["w"], ["w"], ["w"], ["w"]])
-    assert state.sample_camera_actions(3) == [["w"], ["w"], ["w"]]
-    state.receive_camera_actions([["d"]], replace_pending=True)
+    state.receive_camera_actions([["w"]], event_id=7)
+    state.receive_camera_actions([[]], event_id=8)
 
-    assert state.sample_camera_actions(3) == [["d"], ["d"], ["d"]]
+    assert state.sample_camera_actions(3) == [["w"], [], []]
+    assert state.latest_sampled_event_id == 8
     assert state.sample_camera_actions(3) == [[], [], []]
 
 
@@ -295,7 +367,7 @@ def test_lingbot_realtime_adapter_ingests_generic_events():
     state = adapter._state(session)
     assert state.sample_camera_actions(3) == [["w"], ["d"], ["d"]]
     assert state.sample_prompt() == "turn left"
-    assert state.latest_event_id == 8
+    assert state.latest_sampled_event_id == 8
 
 
 def test_generate_session_tracks_active_chunk_context():
@@ -338,7 +410,7 @@ def test_generate_session_respects_max_chunks():
     assert session.reached_max_chunks()
 
 
-def test_generate_loop_waits_for_send_before_next_generation(monkeypatch):
+def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
     events = []
 
     class _Adapter:
@@ -394,7 +466,8 @@ def test_generate_loop_waits_for_send_before_next_generation(monkeypatch):
 
     asyncio.run(realtime_video_api._generate_loop(SimpleNamespace(), session))
 
-    assert events.index("send_end_0") < events.index("generate_start_1")
+    assert events.index("generate_start_1") < events.index("send_end_0")
+    assert events.index("send_end_0") < events.index("send_start_1")
     assert events[-1] == "send_end_1"
 
 

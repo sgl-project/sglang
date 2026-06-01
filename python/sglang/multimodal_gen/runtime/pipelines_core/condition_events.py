@@ -56,6 +56,7 @@ class ConditionSamplingParams:
     chunk_size: int
     default_item: Any = _MISSING
     repeat_last: bool = True
+    repeat_last_across_empty_chunks: bool = False
     expand_payload: bool = True
 
 
@@ -73,6 +74,7 @@ class ConditionEventQueue:
         self._events: dict[str, deque[ConditionEvent]] = {}
         self._pending_signals: dict[str, deque[ControlSignal]] = {}
         self._last_payloads: dict[str, Any] = {}
+        self._last_sampled_seq_ids: dict[str, int | None] = {}
         self._seen_kinds: set[str] = set()
 
     def push(self, event: ConditionEvent) -> None:
@@ -93,6 +95,7 @@ class ConditionEventQueue:
         for signal in queue.pop().iter_signals():
             latest_payload = signal.payload
             has_signal = True
+            self._last_sampled_seq_ids[kind] = signal.seq_id
         queue.clear()
         self._seen_kinds.add(kind)
         if not has_signal:
@@ -136,6 +139,10 @@ class ConditionEventQueue:
             return [params.default_item for _ in range(params.chunk_size)]
 
         if len(chunk) == 0:
+            if params.repeat_last_across_empty_chunks and kind in self._last_payloads:
+                return [
+                    self._last_payloads[kind] for _ in range(params.chunk_size)
+                ]
             if params.default_item is _MISSING:
                 return None
             return [params.default_item for _ in range(params.chunk_size)]
@@ -154,13 +161,18 @@ class ConditionEventQueue:
         self._events.clear()
         self._pending_signals.clear()
         self._last_payloads.clear()
+        self._last_sampled_seq_ids.clear()
         self._seen_kinds.clear()
 
     def clear_kind(self, kind: str) -> None:
         self._events.pop(kind, None)
         self._pending_signals.pop(kind, None)
         self._last_payloads.pop(kind, None)
+        self._last_sampled_seq_ids.pop(kind, None)
         self._seen_kinds.discard(kind)
+
+    def last_sampled_seq_id(self, kind: str) -> int | None:
+        return self._last_sampled_seq_ids.get(kind)
 
     def _queue_for(self, kind: str) -> deque[ConditionEvent]:
         queue = self._events.get(kind)
@@ -184,3 +196,4 @@ class ConditionEventQueue:
             signal = signals.popleft()
             chunk.append(signal.payload)
             self._last_payloads[kind] = signal.payload
+            self._last_sampled_seq_ids[kind] = signal.seq_id

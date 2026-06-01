@@ -52,43 +52,46 @@ class LingBotWorldRealtimeState:
         self.events = ConditionEventQueue(
             max_events={"prompt": 1, "camera_actions": 512}
         )
-        self.latest_event_id: int | None = None
+        self.latest_sampled_event_id: int | None = None
 
     def clear(self) -> None:
         self.events.clear()
-        self.latest_event_id = None
+        self.latest_sampled_event_id = None
 
     def receive_prompt(self, prompt: str, *, event_id: int | None = None) -> None:
         self.events.push(
             ConditionEvent(
                 kind="prompt",
-                payload=ControlSignal(kind="prompt", payload=prompt),
+                payload=ControlSignal(
+                    kind="prompt",
+                    payload=prompt,
+                    seq_id=event_id,
+                ),
             )
         )
-        self.latest_event_id = event_id
 
     def receive_camera_actions(
         self,
         camera_actions: list[list[str]],
         *,
-        replace_pending: bool = False,
         event_id: int | None = None,
     ) -> None:
         signals = [
-            ControlSignal(kind="camera_actions", payload=list(actions))
+            ControlSignal(
+                kind="camera_actions",
+                payload=list(actions),
+                seq_id=event_id,
+            )
             for actions in camera_actions
         ]
         event = ConditionEvent(kind="camera_actions", payload=signals)
-        if replace_pending:
-            self.events.replace(event)
-        else:
-            self.events.push(event)
-        self.latest_event_id = event_id
+        self.events.push(event)
 
     def sample_prompt(self) -> str:
         prompt = self.events.pop_latest("prompt")
         if not isinstance(prompt, str):
             raise ValueError("prompt event payload must be a string")
+        self.latest_sampled_event_id = self.events.last_sampled_seq_id("prompt")
         return prompt
 
     def sample_camera_actions(self, chunk_size: int) -> list[list[str]] | None:
@@ -99,10 +102,17 @@ class LingBotWorldRealtimeState:
         """
         action_list = self.events.sample_chunk(
             "camera_actions",
-            ConditionSamplingParams(chunk_size=chunk_size, default_item=[]),
+            ConditionSamplingParams(
+                chunk_size=chunk_size,
+                default_item=[],
+                repeat_last_across_empty_chunks=True,
+            ),
         )
         if action_list is None:
             return None
+        self.latest_sampled_event_id = self.events.last_sampled_seq_id(
+            "camera_actions"
+        )
         return [list(actions) for actions in action_list]
 
     def has_prompt(self) -> bool:
@@ -175,7 +185,6 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
             camera_actions = self._validate_camera_actions(event.payload)
             state.receive_camera_actions(
                 camera_actions,
-                replace_pending=True,
                 event_id=event.event_id,
             )
             return f"kind=camera_actions, frames={len(camera_actions)}"
@@ -282,7 +291,7 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
         batch.realtime_session_id = session.id
         batch.return_raw_frames = True
         batch.block_idx = chunk.index
-        batch.realtime_event_id = self._state(session).latest_event_id
+        batch.realtime_event_id = self._state(session).latest_sampled_event_id
         if session.request is not None:
             batch.realtime_output_format = session.request.realtime_output_format
             batch.realtime_causal_sink_size = session.request.realtime_causal_sink_size
