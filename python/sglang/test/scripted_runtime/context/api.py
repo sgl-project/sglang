@@ -151,6 +151,12 @@ class ScriptedContext:
     def in_flight_other_mb_rids(self) -> List[str]:
         return queries.in_flight_other_mb_rids(self)
 
+    def load_inquirer_num_pending_tokens(self) -> int:
+        return queries.load_inquirer_num_pending_tokens(self)
+
+    def load_inquirer_snapshot(self) -> Dict[str, object]:
+        return queries.load_inquirer_snapshot(self)
+
     def batch_composition(self) -> Dict[str, List[str]]:
         return queries.batch_composition(self)
 

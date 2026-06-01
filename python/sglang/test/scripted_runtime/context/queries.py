@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -113,6 +113,41 @@ def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
         for record in ctx._scheduler_hook._batch_log
         if record.chunked_rid == rid and rid in record.rids
     )
+
+
+def load_inquirer_num_pending_tokens(ctx: "ScriptedContext") -> int:
+    # The scheduler's own SchedulerLoadInquirer lives on the driver process, so
+    # its pending-token tally is directly readable here. _get_num_pending_tokens
+    # is the exact value the scheduler reports for load balancing; reading it (not
+    # recomputing) keeps the test honest about what the engine actually decides.
+    return ctx._scheduler.load_inquirer._get_num_pending_tokens()
+
+
+def _pending_tokens_count_for_rid(ctx: "ScriptedContext", rid: str) -> int:
+    # Per-rid contribution to the load inquirer's pending-token tally, derived
+    # from the same real state _get_num_pending_tokens sums over: a waiting-queue
+    # req contributes its full seqlen, the single chunked req contributes only
+    # the part not yet committed to its prefix.
+    s = ctx._scheduler
+    chunked = s.chunked_req
+    if chunked is not None and chunked.rid == rid:
+        return chunked.seqlen - len(chunked.prefix_indices)
+    for req in s.waiting_queue:
+        if req.rid == rid:
+            return req.seqlen
+    return 0
+
+
+def load_inquirer_snapshot(ctx: "ScriptedContext") -> Dict[str, Any]:
+    # Read-only derived view of the load inquirer at this instant. Not cached: the
+    # callable re-derives from live scheduler state each time it is invoked.
+    pending_tokens_count_for_rid: Callable[[str], int] = (
+        lambda rid: _pending_tokens_count_for_rid(ctx, rid)
+    )
+    return {
+        "num_pending_tokens": load_inquirer_num_pending_tokens(ctx),
+        "pending_tokens_count_for_rid": pending_tokens_count_for_rid,
+    }
 
 
 def in_flight_other_mb_rids(ctx: "ScriptedContext") -> List[str]:
