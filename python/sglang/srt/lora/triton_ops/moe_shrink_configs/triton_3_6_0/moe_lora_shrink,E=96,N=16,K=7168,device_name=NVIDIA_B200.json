@@ -1,0 +1,30 @@
+{
+    "16": {
+        "BLOCK_SIZE_M": 16,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 3,
+        "SPLIT_K": 7
+    },
+    "32": {
+        "BLOCK_SIZE_M": 16,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "SPLIT_K": 7
+    },
+    "64": {
+        "BLOCK_SIZE_M": 16,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 3,
+        "SPLIT_K": 4
+    },
+    "2048": {
+        "BLOCK_SIZE_M": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "SPLIT_K": 2
+    }
+}

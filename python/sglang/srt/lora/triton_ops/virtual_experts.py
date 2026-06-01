@@ -260,15 +260,14 @@ def _invoke_moe_lora_shrink_splitk(
     N = weight.shape[1]
     K = weight.shape[2]
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
-    BLOCK_SIZE_N = min(config.get("BLOCK_SIZE_N", 64), max(16, N))
-    BLOCK_SIZE_K = config.get("BLOCK_SIZE_K", 64)
+    BLOCK_SIZE_N = triton.next_power_of_2(N)
+    BLOCK_SIZE_K = 256
     GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
 
     num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M)
     num_n_blocks = triton.cdiv(N, BLOCK_SIZE_N)
     base_grid = num_m_blocks * num_n_blocks
-    max_split_k = max(1, K // BLOCK_SIZE_K)
-    SPLIT_K = min(max_split_k, max(1, 128 // base_grid)) if base_grid < 128 else 1
+    SPLIT_K = config.get("SPLIT_K", 4)
 
     grid = (SPLIT_K * base_grid,)
 
@@ -575,6 +574,30 @@ def _merged_experts_fused_moe_lora_add_impl(
             }
         return cfg
 
+    def _get_shrink_stage_config(
+        weight: torch.Tensor,
+        stage_top_k: int,
+        M: int,
+    ) -> dict[str, Any]:
+        """Config for the LoRA A (shrink) stage.
+
+        Prefers an auto-tuned config (keyed by rank N, hidden K, token count M)
+        produced by benchmark/kernels/lora_moe_shrink/tune_lora_moe_shrink.py.
+        Falls back to the shared heuristic when no tuned config is available.
+        """
+        from sglang.srt.lora.triton_ops.moe_lora_shrink_config import (
+            get_moe_lora_shrink_config,
+        )
+
+        # weight: [num_virtual_experts, N(=rank), K(=hidden)]
+        E = weight.shape[0]
+        N = weight.shape[1]
+        K = weight.shape[2]
+        tuned = get_moe_lora_shrink_config(E, N, K, M)
+        if tuned is not None:
+            return tuned
+        return _get_stage_config(weight, stage_top_k)
+
     def _align_block_size(
         topk_ids: torch.Tensor,
         block_size: int,
@@ -652,7 +675,9 @@ def _merged_experts_fused_moe_lora_add_impl(
         device=hidden_states.device,
     )
 
-    a_stage_config = _get_stage_config(lora_a_virtual, input_top_k)
+    a_stage_config = _get_shrink_stage_config(
+        lora_a_virtual, input_top_k, token_lora_mapping.shape[0]
+    )
     (
         sorted_token_ids,
         expert_ids,
