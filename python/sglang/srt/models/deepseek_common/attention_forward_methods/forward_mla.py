@@ -103,7 +103,7 @@ if _is_cuda:
     # into one eager split op. Without this, the bf16 fallback BMM was captured
     # alone in its own single-kernel CUDA graph submodule, paying per-submodule
     # host overhead with no fusion benefit. When this call is strictly adjacent
-    # to `dsa_indexer_pcg_dispatch` in FX, `split_graph` can place both calls in
+    # to `dsa_indexer_graph_dispatch` in FX, `split_graph` can place both calls in
     # one eager submodule. That adjacency currently holds on the trtllm-FP8 DSA
     # path where `_fuse_rope_for_trtllm_mla` skips the Python `rotary_emb` call.
     # Gated by `_can_fuse_bmm_into_attention`.
@@ -220,7 +220,7 @@ class DeepseekMLAForwardMixin:
         ):
             return False
         # Keep this fusion on the same non-speculative extend PCG/BCG surface
-        # as dsa_indexer_pcg_dispatch. This path already goes through
+        # as dsa_indexer_graph_dispatch. This path already goes through
         # unified_attention_with_output via RadixAttention.forward, so bypassing
         # RadixAttention does not change the backend call shape.
         if not forward_batch.forward_mode.is_extend_without_speculative():

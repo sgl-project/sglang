@@ -161,16 +161,18 @@ if _is_cuda:
 
     @register_custom_op(mutates_args=["topk_result"])
     @register_split_op()
-    def dsa_indexer_pcg_dispatch(
+    def dsa_indexer_graph_dispatch(
         layer_id: int,
         x: torch.Tensor,
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         topk_result: torch.Tensor,
     ) -> None:
+        # Shared by piecewise (PCG) and breakable (BCG) CUDA graph capture: both
+        # route the indexer through this eager split op.
         assert (
             _is_cuda
-        ), "Internal error: piecewise CUDA graph is only supported on CUDA"
+        ), "Internal error: indexer graph dispatch is only supported on CUDA"
         from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
         forward_batch = get_forward_context().forward_batch
@@ -215,9 +217,8 @@ if _is_cuda:
             forward_batch=forward_batch,
         )
         q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
-        weights = indexer._weights_proj_bf16_in_fp32_out(x)
-        weights = weights * indexer.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * indexer.softmax_scale
+        # Reuse the compiled head-gate util shared with the eager path.
+        weights = indexer._get_logits_head_gate(x, q_scale)
         indexer._store_index_k_cache(
             forward_batch=forward_batch,
             layer_id=layer_id,
@@ -235,7 +236,7 @@ if _is_cuda:
             topk_result,
         )
 
-    bcg_dsa_indexer_pcg_dispatch = eager_on_graph(True)(dsa_indexer_pcg_dispatch)
+    bcg_dsa_indexer_graph_dispatch = eager_on_graph(True)(dsa_indexer_graph_dispatch)
 
     def _logits_head_gate_pcg_fake_impl(
         x: torch.Tensor,
@@ -1514,8 +1515,8 @@ class Indexer(MultiPlatformOp):
                 )
             )
             call_with_graph_break(
-                bcg_dsa_indexer_pcg_dispatch,
-                dsa_indexer_pcg_dispatch,
+                bcg_dsa_indexer_graph_dispatch,
+                dsa_indexer_graph_dispatch,
                 layer_id=layer_id,
                 x=x,
                 q_lora=q_lora,
