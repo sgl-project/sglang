@@ -139,7 +139,7 @@ class TestScriptedCore(ScriptedTestCase):
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        _assert_prefill_twice_decode_once(t.get_all_node_hit_counts())
+        _assert_prefill_twice_decode_once(t, prompt_len=_PROMPT_LEN)
 
     def test_nonchunked_prefill_radix_hit_count(self):
         # prompt < chunk size -> prefilled in a single forward (not chunked)
@@ -147,23 +147,44 @@ class TestScriptedCore(ScriptedTestCase):
 
     @staticmethod
     def _script_nonchunked_prefill_radix_hit_count(t: ScriptedContext):
-        r = t.start_req(prompt_len=_CHUNK_SIZE - 20, max_new_tokens=2)
+        prompt_len = _CHUNK_SIZE - 20
+        r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-        _assert_prefill_twice_decode_once(t.get_all_node_hit_counts())
+        _assert_prefill_twice_decode_once(t, prompt_len=prompt_len)
 
 
-def _assert_prefill_twice_decode_once(hit_counts: dict) -> None:
-    # A request inserts its prompt prefix into the radix cache twice -- once via
-    # cache_unfinished_req when prefill completes, then again via
-    # cache_finished_req on completion -- while decode-generated nodes are
-    # inserted only once. So prompt/prefill nodes settle at hit_count 2 and
-    # decode nodes at 1. Chunking only splits the prompt into more nodes; it must
-    # not change the counts, so chunked and non-chunked prefill agree here.
-    assert hit_counts, "expected radix nodes after the request finished"
-    assert set(hit_counts.values()) == {1, 2}, (
-        f"prefill nodes must be hit twice and decode nodes once "
-        f"(no 0 = skipped, no >2 = inflated); got {hit_counts}"
+def _assert_prefill_twice_decode_once(t: ScriptedContext, *, prompt_len: int) -> None:
+    # Classify each radix node by its cumulative end position (in tokens) from the
+    # root: nodes ending within the prompt are prefill nodes, nodes beyond it are
+    # decode nodes. A prompt prefix is inserted twice -- via cache_unfinished_req
+    # when prefill completes and via cache_finished_req on finish -- so every
+    # prefill node settles at hit_count 2; decode-generated nodes are inserted only
+    # on finish, so every decode node settles at 1. Chunking only splits the prompt
+    # into more nodes, so chunked and non-chunked prefill produce identical
+    # per-role counts.
+    root = t._scheduler.tree_cache.root_node
+    prefill_hits: list[int] = []
+    decode_hits: list[int] = []
+    stack = [(child, len(child.key)) for child in root.children.values()]
+    while stack:
+        node, end_index = stack.pop()
+        bucket = prefill_hits if end_index <= prompt_len else decode_hits
+        bucket.append(node.hit_count)
+        for child in node.children.values():
+            stack.append((child, end_index + len(child.key)))
+
+    assert prefill_hits and decode_hits, (
+        f"expected both prefill and decode radix nodes; "
+        f"prefill={prefill_hits}, decode={decode_hits}, prompt_len={prompt_len}"
+    )
+    assert all(h == 2 for h in prefill_hits), (
+        f"each prefill node must be hit exactly twice; "
+        f"prefill={prefill_hits}, decode={decode_hits}"
+    )
+    assert all(h == 1 for h in decode_hits), (
+        f"each decode node must be hit exactly once; "
+        f"prefill={prefill_hits}, decode={decode_hits}"
     )
 
 
