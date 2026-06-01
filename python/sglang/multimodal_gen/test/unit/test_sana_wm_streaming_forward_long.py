@@ -15,10 +15,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.sana_wm import (
+    SanaWMArchConfig,
+    SanaWMConfig,
+)
 from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     BidirectionalGDNUCPESinglePathLiteLA,
     SanaWMBlock,
+    SanaWMTransformer3DModel,
     WanRotaryPosEmbed,
     _SLOT_CAM_K,
     _SLOT_FFN_TCONV,
@@ -278,3 +283,94 @@ def test_block_forward_long_reduces_to_dense(_global_args):
     assert cache[_SLOT_K] is not None  # main GDN state
     assert cache[_SLOT_CAM_K] is not None  # cam state
     assert cache[_SLOT_FFN_TCONV] is not None  # FFN temporal tail
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3 — model-level forward_long (tiny CPU model; depth 2 => all-GDN blocks,
+# no softmax/LocalAttention in the main path; cross-attn stubbed)
+# --------------------------------------------------------------------------- #
+
+MB, MC, MT, MH, MW = 1, 8, 4, 2, 2
+
+
+def _tiny_model():
+    arch = SanaWMArchConfig(
+        in_channels=MC,
+        out_channels=MC,
+        num_layers=2,  # blocks 0,1 -> (i+1)%4 != 0 -> no softmax blocks
+        num_attention_heads=2,
+        attention_head_dim=16,
+        linear_head_dim=16,
+        num_cross_attention_heads=2,
+        cross_attention_head_dim=16,
+        cross_attention_dim=32,
+        caption_channels=32,
+        model_max_length=8,
+        softmax_every_n=4,
+        update_rule="torch_recurrent",
+        cam_update_rule="torch_recurrent",
+        chunk_size=None,
+    )
+    m = SanaWMTransformer3DModel(SanaWMConfig(arch_config=arch)).double().eval()
+    for b in m.blocks:
+        b.cross_attn = _ZeroCross()
+    return m
+
+
+def _model_inputs():
+    torch.manual_seed(0)
+    return dict(
+        hidden_states=torch.randn(MB, MC, MT, MH, MW, dtype=torch.float64),
+        encoder_hidden_states=torch.randn(MB, 4, 32, dtype=torch.float64),
+        timestep=torch.randint(1, 1000, (MB, 1, MT)).double(),  # framewise for both paths
+        camera_conditions=torch.randn(MB, MT, 20, dtype=torch.float64),
+        chunk_plucker=torch.randn(MB, 48, MT, MH, MW, dtype=torch.float64),
+    )
+
+
+def test_model_forward_long_single_chunk_reduces_to_dense(_global_args):
+    m = _tiny_model()
+    inp = _model_inputs()
+    with torch.no_grad():
+        dense = m(**inp)
+        out, cache = m.forward_long(
+            **inp, kv_cache=None, save_kv_cache=True, start_f=0, end_f=MT
+        )
+    torch.testing.assert_close(out, dense, atol=1e-9, rtol=0)
+    assert len(cache) == len(m.blocks)
+    assert cache[0][_SLOT_K] is not None
+    assert cache[0][_SLOT_CAM_K] is not None
+    assert cache[0][_SLOT_FFN_TCONV] is not None
+
+
+def test_model_forward_long_two_chunks_runs_and_windows(_global_args):
+    m = _tiny_model()
+    inp = _model_inputs()
+    split = 2
+    with torch.no_grad():
+        o0, c0 = m.forward_long(
+            hidden_states=inp["hidden_states"][:, :, :split],
+            encoder_hidden_states=inp["encoder_hidden_states"],
+            timestep=inp["timestep"][:, :, :split],
+            camera_conditions=inp["camera_conditions"],  # full; sliced internally
+            chunk_plucker=inp["chunk_plucker"],
+            kv_cache=None,
+            save_kv_cache=True,
+            start_f=0,
+            end_f=split,
+        )
+        o1, c1 = m.forward_long(
+            hidden_states=inp["hidden_states"][:, :, split:],
+            encoder_hidden_states=inp["encoder_hidden_states"],
+            timestep=inp["timestep"][:, :, split:],
+            camera_conditions=inp["camera_conditions"],
+            chunk_plucker=inp["chunk_plucker"],
+            kv_cache=c0,
+            save_kv_cache=True,
+            start_f=split,
+            end_f=MT,
+        )
+    assert o0.shape == (MB, MC, split, MH, MW)
+    assert o1.shape == (MB, MC, MT - split, MH, MW)
+    assert torch.isfinite(o0).all() and torch.isfinite(o1).all()
+    assert c1 is not None and len(c1) == len(m.blocks)
