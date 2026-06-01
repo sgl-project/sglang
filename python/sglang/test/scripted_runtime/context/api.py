@@ -60,6 +60,7 @@ class ScriptedContext:
         return_logprob: bool = False,
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
+        stream: bool = True,
     ) -> "ScriptedReqHandle":
         return self._req_starter.start_req(
             prompt_len=prompt_len,
@@ -72,6 +73,7 @@ class ScriptedContext:
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
+            stream=stream,
         )
 
     def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:
@@ -142,6 +144,9 @@ class ScriptedContext:
 
     def chunked_parks(self, rid: str) -> int:
         return queries.chunked_parks(self, rid)
+
+    def stream_events(self, rid: str) -> List[object]:
+        return queries.stream_events(self, rid)
 
     def batch_composition(self) -> Dict[str, List[str]]:
         return queries.batch_composition(self)

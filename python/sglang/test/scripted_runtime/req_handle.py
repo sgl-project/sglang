@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -36,6 +36,10 @@ class ScriptedReqHandle:
     @property
     def remaining_prompt_tokens(self) -> int:
         return self.context.remaining_prompt_tokens(self.rid)
+
+    @property
+    def stream_events(self) -> List[object]:
+        return self.context.stream_events(self.rid)
 
     @property
     def kv_pages(self) -> int:

@@ -30,6 +30,7 @@ class ScriptedContextReqStarter:
         return_logprob: bool = False,
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
+        stream: bool = True,
     ) -> ScriptedReqHandle:
         ctx = self._ctx
 
@@ -42,7 +43,7 @@ class ScriptedContextReqStarter:
             "input_ids": [prompt_token] * prompt_len,
             "sampling_params": sampling_params,
             "rid": rid,
-            "stream": True,
+            "stream": stream,
         }
         payload["return_logprob"] = return_logprob
         if logprob_start_len is not None:

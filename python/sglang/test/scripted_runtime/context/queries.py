@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -113,6 +113,18 @@ def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
         for record in ctx._scheduler_hook._batch_log
         if record.chunked_rid == rid and rid in record.rids
     )
+
+
+def stream_events(ctx: "ScriptedContext", rid: str) -> List[Any]:
+    # The streamed batch outputs the scheduler has emitted toward the tokenizer
+    # for this rid so far. While a request is still mid-chunk (prefill not done)
+    # the scheduler emits nothing, so this list stays empty; once the request
+    # produces decode tokens each streamed step shows up as one entry.
+    proxy = ctx._tokenizer_recv_proxy
+    assert (
+        proxy is not None
+    ), "stream_events requires the tokenizer recv proxy (start the server with it)"
+    return proxy.buffered_objects_for_rid(rid)
 
 
 def chunked_parks(ctx: "ScriptedContext", rid: str) -> int:
