@@ -1,4 +1,5 @@
 import unittest
+from typing import List
 
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
@@ -15,6 +16,20 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 _LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
+
+
+def _in_flight_other_mb_rids(t: ScriptedContext) -> List[str]:
+    # Rids held in pipeline micro-batch slots other than the one currently being
+    # serviced (running_batch). running_mbs only exists on the PP path.
+    s = t.scheduler
+    if not hasattr(s, "running_mbs"):
+        return []
+    rids: List[str] = []
+    for mb in s.running_mbs:
+        if mb is s.running_batch or mb is None:
+            continue
+        rids.extend(r.rid for r in mb.reqs)
+    return rids
 
 
 class TestRegressionLora(ScriptedTestCase):
@@ -162,7 +177,7 @@ class TestRegressionBasic(ScriptedTestCase):
         observed_in_flight_other_mb = False
         observed_excluded_from_running = False
         for _ in range(DEFAULT_MAX_STEPS):
-            in_flight_other_mb = t.in_flight_other_mb_rids()
+            in_flight_other_mb = _in_flight_other_mb_rids(t)
             running = [req.rid for req in t.scheduler.running_batch.reqs]
             if r.rid in in_flight_other_mb:
                 observed_in_flight_other_mb = True
@@ -244,7 +259,7 @@ class TestRegressionBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield
 
-        observed_pending = t.load_inquirer_num_pending_tokens()
+        observed_pending = t.scheduler.load_inquirer._get_num_pending_tokens()
 
         r1_total = len(r1.req.origin_input_ids) + len(r1.req.output_ids)
         r2_total = len(r2.req.origin_input_ids) + len(r2.req.output_ids)
@@ -526,7 +541,7 @@ class TestRegressionPp(ScriptedTestCase):
         long_exclude_engaged = False
         ctrl_exclude_engaged = False
         for _ in range(2000):
-            in_flight_other_mb = t.in_flight_other_mb_rids()
+            in_flight_other_mb = _in_flight_other_mb_rids(t)
             running = [req.rid for req in t.scheduler.running_batch.reqs]
             if r_long.rid in in_flight_other_mb:
                 long_exclude_engaged = True

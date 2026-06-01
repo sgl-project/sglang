@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -157,60 +157,6 @@ def kv_send_last_chunk_events(ctx: "ScriptedContext", rid: str) -> int:
         for prev, curr in zip(series, series[1:])
         if curr > prev and curr == prompt_len
     )
-
-
-def load_inquirer_num_pending_tokens(ctx: "ScriptedContext") -> int:
-    # The scheduler's own SchedulerLoadInquirer lives on the driver process, so
-    # its pending-token tally is directly readable here. _get_num_pending_tokens
-    # is the exact value the scheduler reports for load balancing; reading it (not
-    # recomputing) keeps the test honest about what the engine actually decides.
-    return ctx.scheduler.load_inquirer._get_num_pending_tokens()
-
-
-def _pending_tokens_count_for_rid(ctx: "ScriptedContext", rid: str) -> int:
-    # Per-rid contribution to the load inquirer's pending-token tally, derived
-    # from the same real state _get_num_pending_tokens sums over: a waiting-queue
-    # req contributes its full seqlen, the single chunked req contributes only
-    # the part not yet committed to its prefix.
-    s = ctx.scheduler
-    chunked = s.chunked_req
-    if chunked is not None and chunked.rid == rid:
-        return chunked.seqlen - len(chunked.prefix_indices)
-    for req in s.waiting_queue:
-        if req.rid == rid:
-            return req.seqlen
-    return 0
-
-
-def load_inquirer_snapshot(ctx: "ScriptedContext") -> Dict[str, Any]:
-    # Read-only derived view of the load inquirer at this instant. Not cached: the
-    # callable re-derives from live scheduler state each time it is invoked.
-    pending_tokens_count_for_rid: Callable[[str], int] = (
-        lambda rid: _pending_tokens_count_for_rid(ctx, rid)
-    )
-    return {
-        "num_pending_tokens": load_inquirer_num_pending_tokens(ctx),
-        "pending_tokens_count_for_rid": pending_tokens_count_for_rid,
-    }
-
-
-def in_flight_other_mb_rids(ctx: "ScriptedContext") -> List[str]:
-    # Under pipeline parallelism the scheduler keeps one ScheduleBatch per
-    # micro-batch slot in running_mbs; the slot it is currently servicing is
-    # running_batch. Reqs sitting in the *other* slots are in flight in another
-    # micro-batch and must be excluded from the local running set by filter_batch.
-    # running_mbs only exists once init_pp_loop_state has run (PP path); without
-    # PP there are no other micro-batches.
-    s = ctx.scheduler
-    if not hasattr(s, "running_mbs"):
-        return []
-    current = s.running_batch
-    rids: List[str] = []
-    for mb in s.running_mbs:
-        if mb is current or mb is None:
-            continue
-        rids.extend(r.rid for r in mb.reqs)
-    return rids
 
 
 def chunked_parks(ctx: "ScriptedContext", rid: str) -> int:

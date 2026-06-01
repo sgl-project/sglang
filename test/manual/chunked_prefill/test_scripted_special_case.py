@@ -14,6 +14,20 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
+def _load_inquirer_pending_for_rid(t: ScriptedContext, rid: str) -> int:
+    # Per-rid contribution to the scheduler load inquirer's pending-token tally:
+    # the chunked req counts only its not-yet-committed remainder, a waiting-queue
+    # req counts its full seqlen.
+    s = t.scheduler
+    chunked = s.chunked_req
+    if chunked is not None and chunked.rid == rid:
+        return chunked.seqlen - len(chunked.prefix_indices)
+    for req in s.waiting_queue:
+        if req.rid == rid:
+            return req.seqlen
+    return 0
+
+
 class TestSpecialCaseBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
@@ -422,8 +436,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
                 saw_chunking = True
-                snap = t.load_inquirer_snapshot()
-                pending = snap["pending_tokens_count_for_rid"](r.rid)
+                pending = _load_inquirer_pending_for_rid(t, r.rid)
                 assert pending <= r.remaining_prompt_tokens, (
                     f"load_inquirer tallied {pending} tokens for r but only "
                     f"{r.remaining_prompt_tokens} are still pending — "

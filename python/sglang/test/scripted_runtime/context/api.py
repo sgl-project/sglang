@@ -149,15 +149,6 @@ class ScriptedContext:
     def chunked_parks(self, rid: str) -> int:
         return queries.chunked_parks(self, rid)
 
-    def in_flight_other_mb_rids(self) -> List[str]:
-        return queries.in_flight_other_mb_rids(self)
-
-    def load_inquirer_num_pending_tokens(self) -> int:
-        return queries.load_inquirer_num_pending_tokens(self)
-
-    def load_inquirer_snapshot(self) -> Dict[str, object]:
-        return queries.load_inquirer_snapshot(self)
-
     def kv_send_events(self, rid: str) -> int:
         return queries.kv_send_events(self, rid)
 
