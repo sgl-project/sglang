@@ -22,17 +22,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
 from pathlib import Path
-
-import torch
 
 
 def _parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--prompt", default="A serene mountain lake at golden hour, photorealistic")
+    parser.add_argument(
+        "--prompt", default="A serene mountain lake at golden hour, photorealistic"
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--height", type=int, default=1024)
@@ -58,19 +57,21 @@ def _generate(gen, prompt, seed, steps, height, width, mode, levels, delta, outf
     out_path = str(Path(outfile).parent)
     out_name = Path(outfile).stem
     t0 = time.time()
-    result = gen.generate(sampling_params_kwargs={
-        "prompt": prompt,
-        "seed": seed,
-        "num_inference_steps": steps,
-        "height": height,
-        "width": width,
-        "save_output": True,
-        "output_path": out_path,
-        "output_file_name": out_name,
-        "progressive_mode": mode,
-        "progressive_levels": levels,
-        "progressive_delta": delta,
-    })
+    result = gen.generate(
+        sampling_params_kwargs={
+            "prompt": prompt,
+            "seed": seed,
+            "num_inference_steps": steps,
+            "height": height,
+            "width": width,
+            "save_output": True,
+            "output_path": out_path,
+            "output_file_name": out_name,
+            "progressive_mode": mode,
+            "progressive_levels": levels,
+            "progressive_delta": delta,
+        }
+    )
     elapsed = time.time() - t0
     return result, elapsed
 
@@ -85,9 +86,15 @@ def run_test(args):
     print("\n[1/3] fullres baseline...")
     out_fullres = str(Path(args.output_dir) / "fullres.png")
     result_fr, t_fr = _generate(
-        gen, args.prompt, args.seed, args.steps,
-        args.height, args.width,
-        "fullres", args.levels, args.delta,
+        gen,
+        args.prompt,
+        args.seed,
+        args.steps,
+        args.height,
+        args.width,
+        "fullres",
+        args.levels,
+        args.delta,
         out_fullres,
     )
     assert Path(out_fullres).exists(), "fullres image not saved"
@@ -98,9 +105,15 @@ def run_test(args):
     print(f"\n[2/3] dct_rewind (levels={args.levels}, delta={args.delta})...")
     out_prog = str(Path(args.output_dir) / "dct_rewind.png")
     result_pr, t_pr = _generate(
-        gen, args.prompt, args.seed, args.steps,
-        args.height, args.width,
-        "dct_rewind", args.levels, args.delta,
+        gen,
+        args.prompt,
+        args.seed,
+        args.steps,
+        args.height,
+        args.width,
+        "dct_rewind",
+        args.levels,
+        args.delta,
         out_prog,
     )
     assert Path(out_prog).exists(), "progressive image not saved"
@@ -110,8 +123,8 @@ def run_test(args):
 
     # --- Test 3: outputs differ ---
     print("\n[3/3] Verifying progressive ≠ fullres...")
-    from PIL import Image
     import numpy as np
+    from PIL import Image
 
     img_fr = np.array(Image.open(out_fullres).convert("RGB")).astype(np.float32)
     img_pr = np.array(Image.open(out_prog).convert("RGB")).astype(np.float32)

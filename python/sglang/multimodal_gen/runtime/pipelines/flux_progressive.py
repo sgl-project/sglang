@@ -65,7 +65,9 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
         )
         # Cache freqs_cis per latent resolution (h_lat, w_lat) to avoid
         # redundant rotary embedding recomputation between requests.
-        self._freqs_cis_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._freqs_cis_cache: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     # ------------------------------------------------------------------
     # Pack / Unpack overrides
@@ -128,7 +130,11 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
 
         cached = self._freqs_cis_cache.get(key)
         if cached is None:
-            logger.warning("freqs_cis not available for %dx%d latent; skipping update", new_h_lat, new_w_lat)
+            logger.warning(
+                "freqs_cis not available for %dx%d latent; skipping update",
+                new_h_lat,
+                new_w_lat,
+            )
             return
 
         # Update every CFG branch — this is what _predict_noise_with_cfg reads.
@@ -142,5 +148,9 @@ class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
 
         logger.info(
             "Updated freqs_cis for %dx%d latent (pixel %dx%d) across %d branch(es)",
-            new_h_lat, new_w_lat, new_h_pixel, new_w_pixel, len(ctx.cfg_policy.branches),
+            new_h_lat,
+            new_w_lat,
+            new_h_pixel,
+            new_w_pixel,
+            len(ctx.cfg_policy.branches),
         )

@@ -97,7 +97,9 @@ def reset_scheduler_at_step(scheduler: object, step_index: int) -> None:
     """
     if hasattr(scheduler, "model_outputs"):
         solver_order = getattr(
-            getattr(scheduler, "config", None), "solver_order", len(scheduler.model_outputs)
+            getattr(scheduler, "config", None),
+            "solver_order",
+            len(scheduler.model_outputs),
         )
         scheduler.model_outputs = [None] * solver_order
     if hasattr(scheduler, "lower_order_nums"):
@@ -108,7 +110,9 @@ def reset_scheduler_at_step(scheduler: object, step_index: int) -> None:
         scheduler.this_order = 0
     if hasattr(scheduler, "timestep_list"):
         solver_order = getattr(
-            getattr(scheduler, "config", None), "solver_order", len(scheduler.timestep_list)
+            getattr(scheduler, "config", None),
+            "solver_order",
+            len(scheduler.timestep_list),
         )
         scheduler.timestep_list = [None] * solver_order
     # _begin_index stays at 0 (set by set_begin_index(0) in _before_denoising_loop)

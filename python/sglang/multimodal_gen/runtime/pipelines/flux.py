@@ -98,6 +98,7 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
         Routes to DenoisingStage.forward() when progressive_mode == 'fullres'
         (the default), preserving identical behaviour for non-progressive requests.
         """
+
         def create_stage():
             return FluxProgressiveDenoisingStage(
                 transformer=self.get_module("transformer"),

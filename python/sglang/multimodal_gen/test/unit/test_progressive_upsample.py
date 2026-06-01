@@ -10,7 +10,6 @@ All classes inherit from unittest.TestCase so the test suite integrates with
 both `pytest` and `python -m unittest`.
 """
 
-import math
 import unittest
 from types import SimpleNamespace
 
@@ -42,7 +41,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     apply_upsample,
     dct_upsample_2d,
 )
-
 
 # ---------------------------------------------------------------------------
 # DCT-II / IDCT-II correctness
@@ -97,9 +95,7 @@ class TestDCT(unittest.TestCase):
         """Ortho DCT preserves the L2 norm (Parseval's theorem)."""
         x = torch.randn(32, 32)
         X = dct_2d(x, norm="ortho")
-        torch.testing.assert_close(
-            x.norm() ** 2, X.norm() ** 2, atol=1e-3, rtol=1e-4
-        )
+        torch.testing.assert_close(x.norm() ** 2, X.norm() ** 2, atol=1e-3, rtol=1e-4)
 
     @_skip_no_scipy
     def test_float32_matches_scipy_to_relative_1e6(self):
@@ -226,7 +222,12 @@ class TestSchedulerUtils(unittest.TestCase):
         for levels in (1, 2, 3):
             with self.subTest(levels=levels):
                 stage_sigmas = compute_stage_transitions(
-                    delta=0.01, n_levels=levels, A=203.6, beta=1.915, H_lat=128, W_lat=128
+                    delta=0.01,
+                    n_levels=levels,
+                    A=203.6,
+                    beta=1.915,
+                    H_lat=128,
+                    W_lat=128,
                 )
                 self.assertEqual(len(stage_sigmas), levels + 1)
 
@@ -286,6 +287,7 @@ class TestSchedulerUtils(unittest.TestCase):
 
     def test_reset_scheduler_no_optional_attrs(self):
         """reset_scheduler_at_step must not fail on minimal schedulers (Euler, DDIM)."""
+
         class MinimalScheduler:
             _step_index = 5
 
@@ -306,6 +308,7 @@ class TestProgressiveDenoisingStageBase(unittest.TestCase):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
             ProgressiveDenoisingStage,
         )
+
         return ProgressiveDenoisingStage
 
     def test_get_seed_from_seeds_list(self):
@@ -335,6 +338,7 @@ class TestProgressiveDenoisingStageBase(unittest.TestCase):
             FLUX_SPECTRUM_A,
             FLUX_SPECTRUM_BETA,
         )
+
         self.assertGreater(FLUX_SPECTRUM_A, 0.0)
         self.assertGreater(FLUX_SPECTRUM_BETA, 1.0)
         self.assertLess(FLUX_SPECTRUM_BETA, 4.0)

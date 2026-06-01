@@ -48,7 +48,9 @@ def dct_upsample_2d(
     # per DCT bin, matching the reference's float32 noise path.
     gen = torch.Generator(device=x.device)
     gen.manual_seed(seed)
-    big = torch.randn(*leading, H2, W2, generator=gen, dtype=torch.float32, device=x.device)
+    big = torch.randn(
+        *leading, H2, W2, generator=gen, dtype=torch.float32, device=x.device
+    )
     big = big * sigma_t
 
     # Embed low-res DCT coefficients in the top-left corner (no precision loss).
