@@ -130,23 +130,41 @@ class TestScriptedCore(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished, "single-decode chunked req did not finish"
 
-    def test_chunked_prefill_does_not_inflate_radix_hit_count(self):
-        self.server.execute_script(
-            self._script_chunked_prefill_does_not_inflate_radix_hit_count
-        )
+    def test_chunked_prefill_radix_hit_count(self):
+        # prompt > chunk size -> prefilled across several chunks
+        self.server.execute_script(self._script_chunked_prefill_radix_hit_count)
 
     @staticmethod
-    def _script_chunked_prefill_does_not_inflate_radix_hit_count(t: ScriptedContext):
+    def _script_chunked_prefill_radix_hit_count(t: ScriptedContext):
         r = t.start_req(prompt_len=_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
+        _assert_prefill_twice_decode_once(t.get_all_node_hit_counts())
 
-        hit_counts = t.get_all_node_hit_counts()
-        assert hit_counts, "expected radix nodes after a chunked prefill"
-        assert all(count == 1 for count in hit_counts.values()), (
-            f"chunked prefill must bump each radix node exactly once; "
-            f"got {hit_counts}"
-        )
+    def test_nonchunked_prefill_radix_hit_count(self):
+        # prompt < chunk size -> prefilled in a single forward (not chunked)
+        self.server.execute_script(self._script_nonchunked_prefill_radix_hit_count)
+
+    @staticmethod
+    def _script_nonchunked_prefill_radix_hit_count(t: ScriptedContext):
+        r = t.start_req(prompt_len=_CHUNK_SIZE - 20, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        _assert_prefill_twice_decode_once(t.get_all_node_hit_counts())
+
+
+def _assert_prefill_twice_decode_once(hit_counts: dict) -> None:
+    # A request inserts its prompt prefix into the radix cache twice -- once via
+    # cache_unfinished_req when prefill completes, then again via
+    # cache_finished_req on completion -- while decode-generated nodes are
+    # inserted only once. So prompt/prefill nodes settle at hit_count 2 and
+    # decode nodes at 1. Chunking only splits the prompt into more nodes; it must
+    # not change the counts, so chunked and non-chunked prefill agree here.
+    assert hit_counts, "expected radix nodes after the request finished"
+    assert set(hit_counts.values()) == {1, 2}, (
+        f"prefill nodes must be hit twice and decode nodes once "
+        f"(no 0 = skipped, no >2 = inflated); got {hit_counts}"
+    )
 
 
 if __name__ == "__main__":
