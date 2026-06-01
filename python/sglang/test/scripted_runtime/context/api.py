@@ -12,6 +12,9 @@ from sglang.test.scripted_runtime.context import (
 from sglang.test.scripted_runtime.context.kv_pool_exhauster import (
     ScriptedKvPoolExhauster,
 )
+from sglang.test.scripted_runtime.context.lock_ref_exhauster import (
+    ScriptedLockRefExhauster,
+)
 from sglang.test.scripted_runtime.context.req_starter import ScriptedContextReqStarter
 
 if TYPE_CHECKING:
@@ -45,6 +48,7 @@ class ScriptedContext:
 
         self._seen_rids: set[str] = set()
         self._kv_exhauster = ScriptedKvPoolExhauster(self.scheduler)
+        self._lock_ref_exhauster = ScriptedLockRefExhauster(self.scheduler)
         self._req_starter = ScriptedContextReqStarter(self)
 
     def start_req(
@@ -100,8 +104,12 @@ class ScriptedContext:
     def exhaust_kv(self, *, leave_pages: int) -> None:
         return self._kv_exhauster.exhaust(leave_pages=leave_pages)
 
+    def exhaust_lock_refs(self, *, leave_refs: int) -> None:
+        return self._lock_ref_exhauster.exhaust(leave_refs=leave_refs)
+
     def _release_exhausted_pools(self) -> None:
-        return self._kv_exhauster.release()
+        self._kv_exhauster.release()
+        self._lock_ref_exhauster.release()
 
     def get_all_node_hit_counts(self) -> Dict[int, int]:
         return radix.get_all_node_hit_counts(self)

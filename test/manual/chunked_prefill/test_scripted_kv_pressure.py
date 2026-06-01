@@ -117,6 +117,73 @@ class TestKVPressureBasic(ScriptedTestCase):
             f"{baseline_rows_used}, final used={final_rows_used}"
         )
 
+    def test_lock_refs_tight_concurrent_prefix(self):
+        self.server.execute_script(self._script_lock_refs_tight_concurrent_prefix)
+
+    @staticmethod
+    def _script_lock_refs_tight_concurrent_prefix(t: ScriptedContext):
+        """A long chunked req sharing a pinned warm prefix finishes and leaks no lock_refs."""
+        # GPU validation pending.
+        #
+        # Warm a shared prefix: a short req that finishes leaves cached,
+        # evictable prefix nodes in the radix tree. Use a distinct prompt_token
+        # so the long req below provably hits THIS prefix (not stray nodes).
+        warm_token = 7
+        warm_len = DEFAULT_CHUNK_SIZE
+        r_warm = t.start_req(
+            prompt_len=warm_len, max_new_tokens=1, prompt_token=warm_token
+        )
+        yield from run_until_finished(r_warm)
+        assert r_warm.finished
+        assert r_warm.lock_refs == 0
+
+        # Baseline AFTER warming: this is the global lock_ref state the reset
+        # path must restore to. The warm prefix nodes are present and evictable
+        # (lock_ref == 0) at this point.
+        baseline_lock_refs = t.get_all_node_lock_refs()
+
+        # Pin most evictable nodes via the real inc_lock_ref path, leaving only a
+        # few unlocked. The KV is still present, just protected/non-evictable.
+        t.exhaust_lock_refs(leave_refs=1)
+        yield
+        pinned_lock_refs = t.get_all_node_lock_refs()
+        assert any(
+            pinned_lock_refs.get(node_id, 0) > baseline_lock_refs.get(node_id, 0)
+            for node_id in pinned_lock_refs
+        ), "exhaust_lock_refs(leave_refs=1) must pin at least one warm-prefix node"
+
+        # Run a long chunked req that shares the warm prefix (same prompt_token,
+        # longer prompt). It must really chunk while the cache is pinned.
+        r_long = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=2,
+            prompt_token=warm_token,
+        )
+        yield from run_until(r_long, lambda h: h.is_chunking)
+        yield from run_until_finished(r_long, max_steps=2000)
+        assert r_long.finished
+        # Even with the warm prefix hit, the remaining new tokens span multiple
+        # chunks: (VERY_LONG_PROMPT_LEN - warm_len) / DEFAULT_CHUNK_SIZE == 7.
+        assert r_long.chunks_done >= 2, (
+            f"long req must really chunk under pinned cache; got chunks_done="
+            f"{r_long.chunks_done}"
+        )
+        # The finished req must hold no locks of its own.
+        assert (
+            r_long.lock_refs == 0
+        ), f"req {r_long.rid} leaked {r_long.lock_refs} lock_refs after finish"
+
+        # Release the exhauster's locks (mirrors the reset path) and confirm the
+        # global lock_ref state returns EXACTLY to the post-warm baseline: no
+        # leaked locks from either the exhauster or the chunked req.
+        t._release_exhausted_pools()
+        final_lock_refs = t.get_all_node_lock_refs()
+        for node_id, baseline in baseline_lock_refs.items():
+            assert final_lock_refs.get(node_id, 0) == baseline, (
+                f"node {node_id} lock_ref leaked: baseline={baseline}, "
+                f"final={final_lock_refs.get(node_id, 0)}"
+            )
+
     def test_kv_at_one_page_chunked_completes(self):
         self.server.execute_script(self._script_kv_at_one_page_chunked_completes)
 
