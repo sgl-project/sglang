@@ -370,9 +370,12 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.status == "waiting")
         assert r.req.req_pool_idx is not None and r.kv_pages > 0 and r.lock_refs >= 1
 
-        t.pause_retract_all()
+        t.pause_generation(mode="retract")
         yield
 
+        # pause(retract) releases the row/KV/lock_ref and re-queues the req into
+        # the waiting_queue (it is NOT discarded), so it is back in "waiting" with
+        # its row freed -- the engine is not fully idle here.
         assert r.req.req_pool_idx is None, (
             f"f38e69f87d: pause(retract) must release waiting "
             f"chunked-resume row; got row_idx={r.req.req_pool_idx!r}"
@@ -380,10 +383,19 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         assert not r.is_chunking
-        assert t.is_fully_idle, (
-            f"f38e69f87d: pause(retract) must leave engine fully idle; "
-            f"got is_fully_idle={t.is_fully_idle!r}"
+        assert r.status == "waiting", (
+            f"f38e69f87d: pause(retract) must re-queue the retracted "
+            f"chunked-resume req; got status={r.status!r}"
         )
+        assert t.scheduler.chunked_req is None
+        assert t.scheduler.running_batch.is_empty()
+
+        # Resuming proves the released row/KV were a clean retract, not a leak:
+        # the re-queued req re-prefills from scratch and finishes normally.
+        t.continue_generation()
+        yield from run_until_finished(r)
+        assert r.finished
+        assert len(r.req.output_ids) == 2
 
     def test_retract_all_clears_batch_with_chunked(self):
         self.server.execute_script(self._script_retract_all_clears_batch_with_chunked)
@@ -395,7 +407,7 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
         yield from run_until(r2, lambda h: h.is_chunking)
 
-        t.retract_all()
+        t.pause_generation(mode="retract")
         yield
 
         assert len(t.scheduler.running_batch.reqs) == 0, (
@@ -407,9 +419,11 @@ class TestRegressionBasic(ScriptedTestCase):
         ) is None
         for r in (r1, r2):
             assert r.status == "waiting"
-            assert r.chunks_done == 0
+            assert r.kv_pages == 0
             assert not r.is_chunking
 
+        # pause(retract) also pauses generation; resume so the re-queued reqs run.
+        t.continue_generation()
         yield from run_until_all_finished([r1, r2])
 
 

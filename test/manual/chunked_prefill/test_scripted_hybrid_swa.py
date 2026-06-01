@@ -6,6 +6,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    run_until,
     run_until_finished,
 )
 
@@ -70,6 +71,31 @@ class TestSWABasic(ScriptedTestCase):
             f"baseline={baseline_free}, "
             f"final={t.engine_stats()['kv_pool_free']}"
         )
+
+    def test_swa_chunked_park_on_budget_exhaustion(self):
+        self.server.execute_script(self._script_swa_chunked_park_on_budget_exhaustion)
+
+    @staticmethod
+    def _script_swa_chunked_park_on_budget_exhaustion(t: ScriptedContext):
+        # add_chunked_req hybrid-SWA early-return (schedule_policy.py:679-681):
+        # when _rem_tokens (= rem_swa_tokens - page_size) drops to <= 0 while a
+        # chunked req is in flight, the scheduler returns the req WITHOUT
+        # scheduling its next chunk -- it is parked, not advanced and not dropped.
+        # chunked_parks counts exactly those held-but-not-run iterations. Drive
+        # the SWA pool to exhaustion mid-chunk to force at least one park, then
+        # assert the req still completes with no leaked pages or lock refs (park,
+        # not leak; the non-SWA branch would instead force-admit at line 682).
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        t.exhaust_kv(leave_pages=0)
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
+        assert r.chunked_parks >= 1, (
+            "SWA budget exhaustion mid-chunk must park the chunked req at least "
+            f"once (schedule_policy.py:680-681); got chunked_parks={r.chunked_parks}"
+        )
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
 
     def test_swa_chunked_resume_kv_committed_bound(self):
         self.server.execute_script(self._script_swa_chunked_resume_kv_committed_bound)

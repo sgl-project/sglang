@@ -1,10 +1,12 @@
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -196,21 +198,74 @@ class TestAbortBasic(ScriptedTestCase):
             f"before={kv_pool_free_before} after={kv_pool_free_after}"
         )
 
-    def test_abort_during_waiting_timeout(self):
-        self.server.execute_script(self._script_abort_during_waiting_timeout)
+    def test_waiting_timeout_sweep_aborts_pressured_waiting_req(self):
+        self.server.execute_script(
+            self._script_waiting_timeout_sweep_aborts_pressured_waiting_req
+        )
 
     @staticmethod
-    def _script_abort_during_waiting_timeout(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-        yield from run_until(r, lambda h: h.status == "waiting")
-        t.trigger_abort_on_waiting_timeout()
-        yield
-        yield from run_until_finished(r)
-        assert r.finished, "chunked-resume must survive waiting-timeout sweep"
-        assert len(r.req.output_ids) == 2
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
+    def _script_waiting_timeout_sweep_aborts_pressured_waiting_req(t: ScriptedContext):
+        # NOTE: source-true behavior of the waiting-timeout sweep. The scheduler
+        # runs _abort_on_waiting_timeout() at the top of get_next_batch_to_run on
+        # every NON-paused iteration (only when SGLANG_REQ_WAITING_TIMEOUT > 0).
+        # It scans the WHOLE waiting_queue and aborts every req whose
+        # wait_queue_entry_time is older than the deadline -- there is NO
+        # chunked-resume immunity guard, so a parked chunked-resume req (which
+        # also lives in waiting_queue carrying its original entry_time) is swept
+        # out exactly like any other waiting req. This test drives that sweep
+        # through the REAL event loop -- no pause, no scheduler-private call -- by
+        # holding a req in waiting_queue under real KV pressure and letting the
+        # loop's own sweep abort it.
+        #
+        # The timeout-abort path only notifies the tokenizer and drops the req
+        # from waiting_queue; it does NOT itself release KV/row (the req under
+        # test never held any, since it never got admitted). So the observable
+        # consequence asserted here is removal from waiting_queue + aborted status.
+
+        # Real admission pressure: grab every free KV page so the scheduler can
+        # never admit the req, yet the loop keeps running get_next_batch_to_run
+        # (and thus the sweep) every iteration.
+        t.exhaust_kv(leave_pages=0)
+
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+
+        def waiting_rids():
+            return {req.rid for req in t.scheduler.waiting_queue}
+
+        # The req parks in waiting_queue with a real wait_queue_entry_time set by
+        # _add_request_to_queue; it cannot be admitted because there is no free KV.
+        yield from run_until(r, lambda h: r.rid in waiting_rids())
+        assert r.kv_pages == 0, "pressured waiting req must not own KV before admission"
+
+        # Enable the timeout with a value tiny enough that, after the req has been
+        # queued and a couple of real-time yields pass, entry_time is already past
+        # perf_counter() - timeout_s. The override stays active across the yields
+        # below (the script frame is suspended inside the with-block), so the
+        # scheduler reads it when it runs the sweep at the top of
+        # get_next_batch_to_run on each non-paused iteration.
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-6):
+            # Drive the REAL loop until the scheduler's own sweep removes the req
+            # from waiting_queue.
+            for _ in range(DEFAULT_MAX_STEPS):
+                if r.rid not in waiting_rids():
+                    break
+                yield
+            else:
+                raise AssertionError(
+                    f"waiting-timeout sweep never removed the req from "
+                    f"waiting_queue after {DEFAULT_MAX_STEPS} steps; "
+                    f"waiting_rids={waiting_rids()!r}"
+                )
+
+        assert r.rid not in waiting_rids(), (
+            f"the loop's waiting-timeout sweep must drop the timed-out waiting "
+            f"req from waiting_queue; got {waiting_rids()!r}"
+        )
+        assert r.status in ("finished", "unknown"), (
+            f"swept-out req must be aborted (gone from every live scheduler "
+            f"structure); got status={r.status!r}"
+        )
+        assert r.kv_pages == 0, "timeout-abort of an unadmitted req owns no KV"
 
     def test_abort_chunk_last(self):
         self.server.execute_script(self._script_abort_chunk_last)
@@ -320,6 +375,67 @@ class TestAbortBasic(ScriptedTestCase):
             f"chunks_done went {chunks_after_abort} -> {r.chunks_done}"
         )
         assert r.req is None or r.req.req_pool_idx is None
+
+    def test_abort_in_inter_chunk_gap_skips_stash_no_extra_radix_node(self):
+        self.server.execute_script(
+            self._script_abort_in_inter_chunk_gap_skips_stash_no_extra_radix_node
+        )
+
+    @staticmethod
+    def _script_abort_in_inter_chunk_gap_skips_stash_no_extra_radix_node(
+        t: ScriptedContext,
+    ):
+        """Abort in the inter-chunk waiting gap skips the stash and creates no radix node."""
+        # GPU validation pending.
+        #
+        # Branch under test: scheduler.get_next_batch_to_run, the
+        #   `if self._chunked_req_scheduled_last_iter: stash_chunked_request(...)`
+        # guard. When the chunked req was NOT scheduled last iteration -- the
+        # inter-chunk gap where it sits in the waiting queue while still being
+        # chunked_req -- the flag is False, so stash_chunked_request (which calls
+        # maybe_cache_unfinished_req(..., chunked=True)) is SKIPPED. Aborting here
+        # must therefore not leave behind a freshly cached prefix node for the
+        # unscheduled remainder.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+        # Land in the inter-chunk gap: the req has finished >=1 chunk and is parked
+        # in the waiting queue, so _chunked_req_scheduled_last_iter is False.
+        yield from run_until(
+            r, lambda h: h.status == "waiting" and h.chunks_done >= 1 and h.is_chunking
+        )
+
+        # Snapshot the radix tree before abort. The skipped stash must not add a
+        # node nor bump any node's hit_count for the unscheduled remainder.
+        hit_counts_before = t.get_all_node_hit_counts()
+        node_count_before = len(hit_counts_before)
+        hit_sum_before = sum(hit_counts_before.values())
+        chunks_before = r.chunks_done
+
+        t.abort(r)
+        yield
+        yield
+
+        hit_counts_after = t.get_all_node_hit_counts()
+        node_count_after = len(hit_counts_after)
+        hit_sum_after = sum(hit_counts_after.values())
+
+        # Witnessing the SKIPPED stash: no extra cached-prefix node, no hit-count
+        # growth for the chunked remainder that was never scheduled.
+        assert node_count_after <= node_count_before, (
+            f"skipped stash must not create a radix node; "
+            f"node count {node_count_before} -> {node_count_after}"
+        )
+        assert hit_sum_after <= hit_sum_before, (
+            f"skipped stash must not bump radix hit counts; "
+            f"hit sum {hit_sum_before} -> {hit_sum_after}"
+        )
+        # And the abort itself releases the req and does not revive it.
+        assert r.kv_pages == 0
+        assert r.req is None or r.req.req_pool_idx is None
+        assert r.chunks_done == chunks_before, (
+            f"aborted gap req revived and ran another chunk; "
+            f"chunks_done went {chunks_before} -> {r.chunks_done}"
+        )
 
     def test_abort_then_resubmit_same_rid_same_step(self):
         self.server.execute_script(self._script_abort_then_resubmit_same_rid_same_step)

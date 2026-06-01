@@ -348,6 +348,84 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             saw_chunking
         ), "test must observe the dual-queue chunked state at least once"
 
+    def test_load_inquirer_chunked_contribution_exact_remainder(self):
+        self.server.execute_script(
+            self._script_load_inquirer_chunked_contribution_exact_remainder
+        )
+
+    @staticmethod
+    def _script_load_inquirer_chunked_contribution_exact_remainder(t: ScriptedContext):
+        # load_inquirer.py:70-72 chunked branch: with no waiting-queue reqs, the
+        # entire pending-token tally comes from the in-flight chunked_req and must
+        # equal exactly seqlen - len(prefix_indices) (its not-yet-committed tail),
+        # NOT the full seqlen. Force is_chunking with an otherwise-empty queue and
+        # assert the exact remainder, so a regression that drops the prefix
+        # subtraction (over-counts the committed prefix) is caught.
+        s = t.scheduler
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+        saw_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            chunked = s.chunked_req
+            if r.is_chunking and chunked is not None and chunked.rid == r.rid:
+                assert len(s.waiting_queue) == 0, (
+                    "test requires an empty waiting_queue so the chunked req is "
+                    f"the sole pending-token contributor; got {len(s.waiting_queue)}"
+                )
+                expected = chunked.seqlen - len(chunked.prefix_indices)
+                observed = s.load_inquirer._get_num_pending_tokens()
+                assert observed == expected, (
+                    f"chunked contribution must equal remainder "
+                    f"seqlen - len(prefix_indices) = {expected}, got {observed}; "
+                    f"a value of {chunked.seqlen} would mean the committed prefix "
+                    "is being double-counted"
+                )
+                saw_chunking = True
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert saw_chunking, "test must observe the chunked req mid-flight"
+
+    def test_load_inquirer_chunk_deduct_subtracts_planned_chunk(self):
+        self.server.execute_script(
+            self._script_load_inquirer_chunk_deduct_subtracts_planned_chunk
+        )
+
+    @staticmethod
+    def _script_load_inquirer_chunk_deduct_subtracts_planned_chunk(t: ScriptedContext):
+        # load_inquirer.py:72 chunk_deduct param: at batch-scheduling time the
+        # current chunk is planned but not yet in prefix_indices, so the scheduler
+        # passes chunk_deduct=extend_input_len and the deducted tally must be
+        # exactly extend_input_len less than the default (chunk_deduct=0) tally.
+        # This is the branch that distinguishes the two call sites of
+        # _get_num_pending_tokens (load-reporting vs batch-scheduling).
+        s = t.scheduler
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+        saw_chunking = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            chunked = s.chunked_req
+            if (
+                r.is_chunking
+                and chunked is not None
+                and chunked.rid == r.rid
+                and chunked.extend_input_len > 0
+            ):
+                deduct = chunked.extend_input_len
+                base = s.load_inquirer._get_num_pending_tokens()
+                deducted = s.load_inquirer._get_num_pending_tokens(chunk_deduct=deduct)
+                assert deducted == base - deduct, (
+                    f"chunk_deduct must subtract the planned chunk exactly: "
+                    f"base={base}, deducted={deducted}, expected={base - deduct}"
+                )
+                saw_chunking = True
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert saw_chunking, "test must observe the chunked req with a planned chunk"
+
     def test_chunked_forced_admission_avoids_leak(self):
         self.server.execute_script(self._script_chunked_forced_admission_avoids_leak)
 
@@ -789,6 +867,407 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
             saw_chunking
         ), "test must observe the req mid-chunk (chunks_done >= 1) at least once"
         assert snap is not None, "test must snapshot the cached_tokens_* breakdown"
+
+
+def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
+    # Mirror of the helper in test_scripted_chunk_size.py: the number of prefill
+    # forward passes a chunked prompt takes. 0 when the whole prompt fits one
+    # non-chunked shot; otherwise ceil(prompt_len / chunk_size) with the tail
+    # iteration counted.
+    if prompt_len <= chunk_size:
+        return 0
+    return (prompt_len + chunk_size - 1) // chunk_size
+
+
+class TestSpecialCaseDynamicChunkingPP1(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        enable_dynamic_chunking=True,
+    )
+
+    def test_dynamic_chunking_forced_off_on_pp1(self):
+        self.server.execute_script(self._script_dynamic_chunking_forced_off_on_pp1)
+
+    @staticmethod
+    def _script_dynamic_chunking_forced_off_on_pp1(t: ScriptedContext):
+        # scheduler.py:947-948: enable_dynamic_chunking = server_args.enable_dynamic_chunking
+        # AND ps.pp_size > 1. On a single GPU (pp_size == 1) the conjunct forces it
+        # OFF even though the server arg is True, so the scheduler.py:2612 dynamic
+        # chunk-size predictor is never consulted and the prompt is chunked with the
+        # uniform chunked_prefill_size — exactly _expected_chunks(...) chunks.
+        # GPU validation pending.
+        assert t.scheduler.enable_dynamic_chunking is False, (
+            "pp_size==1 must force enable_dynamic_chunking off even when the "
+            "server arg is True (the 'and ps.pp_size > 1' conjunct)"
+        )
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r)
+        assert r.finished
+        expected = _expected_chunks(VERY_LONG_PROMPT_LEN, DEFAULT_CHUNK_SIZE)
+        assert r.chunks_done == expected, (
+            f"uniform chunked_prefill_size must yield exactly {expected} chunks "
+            f"(no dynamic-size prediction on pp1); got {r.chunks_done}"
+        )
+
+
+class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_add_chunked_req_rem_nonpositive_forces_rem_chunk_tokens(self):
+        self.server.execute_script(
+            self._script_add_chunked_req_rem_nonpositive_forces_rem_chunk_tokens
+        )
+
+    @staticmethod
+    def _script_add_chunked_req_rem_nonpositive_forces_rem_chunk_tokens(
+        t: ScriptedContext,
+    ):
+        # schedule_policy.py:679-682 (non-SWA branch): when a chunked resume sees
+        # _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0, the req must
+        # still be re-added (forced to rem_chunk_tokens at line 682) rather than
+        # silently dropped, otherwise its held row/KV leaks forever. Drive a chunked
+        # req mid-flight, then squeeze KV to one page so rem_total_tokens drives
+        # _rem_tokens <= 0 on the next re-admit; witness continued chunk progress and
+        # a clean finish. A non-SWA model executes line 682 (not the SWA park at 681).
+        # GPU validation pending.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        chunks_before_squeeze = r.chunks_done
+
+        t.exhaust_kv(leave_pages=1)
+
+        progressed_after_squeeze = False
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            if r.chunks_done > chunks_before_squeeze:
+                progressed_after_squeeze = True
+            if r.finished:
+                break
+            yield
+        assert r.finished, (
+            "non-SWA chunked resume must be force-re-added when _rem_tokens <= 0 "
+            "(schedule_policy.py:682); pre-fix it would block forever and leak"
+        )
+        assert progressed_after_squeeze, (
+            "chunks_done must keep advancing after the KV squeeze drove _rem_tokens "
+            "<= 0, witnessing the force-to-rem_chunk_tokens re-add (not a silent drop)"
+        )
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
+
+
+class TestSpecialCaseRetractMerge(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_retract_merges_extend_chunk_batch_before_retract_all(self):
+        self.server.execute_script(
+            self._script_retract_merges_extend_chunk_batch_before_retract_all
+        )
+
+    @staticmethod
+    def _script_retract_merges_extend_chunk_batch_before_retract_all(
+        t: ScriptedContext,
+    ):
+        # scheduler.py:3705-3721: on retract, if last_batch.is_extend() the scheduler
+        # filter_batch(chunked_req_to_exclude=[]) (empty exclude) and merges the just-run
+        # extend/chunk batch into running_batch BEFORE retract_all runs at 3726-3734.
+        # Drive a chunked req until is_chunking so last_batch is the extend chunk batch
+        # and running_batch is empty; pin that pre-state, then retract and witness the
+        # merge-then-retract: last_batch cleared, running_batch drained (the chunk batch
+        # was folded in and retracted, not stranded as a separate batch). GPU validation
+        # pending.
+        s = t.scheduler
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+
+        assert s.last_batch is not None, "last_batch must be set while chunking"
+        assert s.last_batch.forward_mode.is_extend(), (
+            f"last_batch must be the extend/chunk batch; got "
+            f"{s.last_batch.forward_mode!r}"
+        )
+
+        t.pause_generation(mode="retract")
+        yield
+
+        assert (
+            s.last_batch is None
+        ), "retract must clear last_batch after merging the extend chunk batch"
+        assert len(s.running_batch.reqs) == 0, (
+            "the merged extend chunk batch must be retracted out of running_batch, "
+            f"not stranded; got {len(s.running_batch.reqs)} reqs"
+        )
+        assert (
+            r.status == "waiting"
+        ), f"retracted chunked req must return to the waiting queue; got {r.status!r}"
+        assert r.kv_pages == 0
+
+        t.continue_generation()
+        yield from run_until_finished(r)
+        assert r.finished
+        assert len(r.req.output_ids) == 2, (
+            f"resumed req must emit exactly max_new_tokens; got "
+            f"{len(r.req.output_ids)}"
+        )
+
+
+class TestSpecialCaseChunkBudgetDefer(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_co_submitted_waiter_deferred_when_chunk_budget_zero(self):
+        self.server.execute_script(
+            self._script_co_submitted_waiter_deferred_when_chunk_budget_zero
+        )
+
+    @staticmethod
+    def _script_co_submitted_waiter_deferred_when_chunk_budget_zero(
+        t: ScriptedContext,
+    ):
+        # schedule_policy.py:577-578 (budget_state: rem_chunk_tokens is not None and
+        # <= 0 -> OTHER). When the long prompt consumes the full chunk-token budget in
+        # a pass, rem_chunk_tokens hits 0 and budget_state() refuses any further
+        # candidate in that pass. Submit the long chunked prompt plus a second long
+        # waiter that would otherwise admit; on the iters where the chunked rid is
+        # active, witness the second waiter sitting in 'waiting' with no KV — deferred
+        # specifically because the chunk-token budget was driven to 0. Both finish.
+        # GPU validation pending.
+        r_chunk = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r_wait = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE + 8, max_new_tokens=2)
+        yield from run_until(r_chunk, lambda h: h.is_chunking)
+
+        saw_deferred = False
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            comp = t.batch_composition()
+            chunk_active = r_chunk.rid in comp.get("chunked", [])
+            wait_idle = (
+                r_wait.status == "waiting"
+                and r_wait.rid not in comp.get("chunked", [])
+                and r_wait.rid not in comp.get("running", [])
+                and r_wait.rid not in comp.get("decode", [])
+            )
+            if chunk_active and wait_idle:
+                saw_deferred = True
+                assert r_wait.kv_pages == 0, (
+                    f"deferred waiter (rem_chunk_tokens<=0 -> OTHER) must hold no KV; "
+                    f"got kv_pages={r_wait.kv_pages}"
+                )
+            if r_chunk.finished and r_wait.finished:
+                break
+            yield
+        assert r_chunk.finished and r_wait.finished
+        assert saw_deferred, (
+            "second waiter must be deferred for >=1 iter while the chunk-token "
+            "budget was driven to 0 by the in-flight chunked req"
+        )
+
+
+class TestSpecialCaseIgnoreEosNoRadix(ScriptedTestCase):
+    # disable_radix_cache=True is the load-bearing precondition: add_one_req routes to
+    # add_one_req_ignore_eos only when req.sampling_params.ignore_eos AND
+    # getattr(self.tree_cache, "disable", True) (schedule_policy.py:835). With radix
+    # enabled the guard fails and ignore_eos reqs go through add_one_req instead.
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        disable_radix_cache=True,
+    )
+
+    def test_ignore_eos_chunked_truncate_path(self):
+        self.server.execute_script(self._script_ignore_eos_chunked_truncate_path)
+
+    @staticmethod
+    def _script_ignore_eos_chunked_truncate_path(t: ScriptedContext):
+        # schedule_policy.py:798-809 (add_one_req_ignore_eos else: chunked truncate,
+        # new_chunked_req=req). A long ignore_eos prompt with radix disabled routes to
+        # add_one_req_ignore_eos and, exceeding the chunk budget, takes the chunked
+        # truncation path that carries it as new_chunked_req. Witness it goes
+        # is_chunking and completes the expected number of chunks. GPU validation pending.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True
+        )
+        yield from run_until(r, lambda h: h.is_chunking)
+        yield from run_until_finished(r)
+        assert r.finished
+        expected = _expected_chunks(VERY_LONG_PROMPT_LEN, DEFAULT_CHUNK_SIZE)
+        assert r.chunks_done == expected, (
+            f"ignore_eos chunk-truncation path must carry the prompt as new_chunked_req "
+            f"for {expected} chunks; got {r.chunks_done}"
+        )
+
+    def test_ignore_eos_nonchunked_fits_chunk_budget(self):
+        self.server.execute_script(self._script_ignore_eos_nonchunked_fits_chunk_budget)
+
+    @staticmethod
+    def _script_ignore_eos_nonchunked_fits_chunk_budget(t: ScriptedContext):
+        # schedule_policy.py:787-797 (add_one_req_ignore_eos: rem_chunk_tokens is None
+        # or extend_input_len <= rem_chunk_tokens -> non-chunked admit). A short
+        # ignore_eos prompt (<= chunk budget) with radix disabled takes the non-chunked
+        # ignore_eos admit branch: it must never chunk and report zero chunks_done.
+        # GPU validation pending.
+        r = t.start_req(prompt_len=8, max_new_tokens=2, ignore_eos=True)
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert not r.is_chunking, (
+                "a prompt that fits the chunk budget must admit non-chunked via the "
+                "ignore_eos path, never entering is_chunking"
+            )
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert r.chunks_done == 0, (
+            f"prompt fitting the chunk budget completes non-chunked; got "
+            f"chunks_done={r.chunks_done}"
+        )
+
+    def test_ignore_eos_second_long_waiter_deferred_on_chunk_budget_zero(self):
+        self.server.execute_script(
+            self._script_ignore_eos_second_long_waiter_deferred_on_chunk_budget_zero
+        )
+
+    @staticmethod
+    def _script_ignore_eos_second_long_waiter_deferred_on_chunk_budget_zero(
+        t: ScriptedContext,
+    ):
+        # schedule_policy.py:799-800 (add_one_req_ignore_eos nested guard:
+        # rem_chunk_tokens <= 0 -> OTHER). Two long ignore_eos prompts with radix
+        # disabled both route to add_one_req_ignore_eos; once the first occupies the
+        # chunk budget, the second must be deferred (the nested <=0 OTHER guard) sitting
+        # in 'waiting' with no KV. Both finish. GPU validation pending.
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True
+        )
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True
+        )
+        yield from run_until(r1, lambda h: h.is_chunking)
+
+        saw_deferred = False
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            comp = t.batch_composition()
+            r1_active = r1.rid in comp.get("chunked", [])
+            r2_idle = (
+                r2.status == "waiting"
+                and r2.rid not in comp.get("chunked", [])
+                and r2.rid not in comp.get("running", [])
+                and r2.rid not in comp.get("decode", [])
+            )
+            if r1_active and r2_idle:
+                saw_deferred = True
+                assert r2.kv_pages == 0, (
+                    f"deferred ignore_eos waiter must hold no KV; got "
+                    f"kv_pages={r2.kv_pages}"
+                )
+            if r1.finished and r2.finished:
+                break
+            yield
+        assert r1.finished and r2.finished
+        assert saw_deferred, (
+            "second long ignore_eos waiter must be deferred for >=1 iter while the "
+            "chunk-token budget was driven to 0 (nested rem_chunk_tokens<=0 OTHER)"
+        )
+
+
+class TestSpecialCaseRetractedStain(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_retracted_stain_suppresses_cached_token_recount(self):
+        self.server.execute_script(
+            self._script_retracted_stain_suppresses_cached_token_recount
+        )
+
+    @staticmethod
+    def _script_retracted_stain_suppresses_cached_token_recount(t: ScriptedContext):
+        # schedule_batch.py:1916-1918 gated by retracted_stain (set at 1315): on a
+        # post-retract resume, prepare_for_extend must NOT re-add pre_len -
+        # already_computed to cached_tokens, because retracted_stain is True. Drive a
+        # chunked req past >=1 chunk, snapshot cached_tokens, retract+resume, then
+        # witness retracted_stain True AND cached_tokens unchanged across the resume
+        # (no double-count). GPU validation pending.
+        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        cached_before = r.req.cached_tokens
+
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
+
+        req = r.req
+        assert (
+            req.retracted_stain is True
+        ), "retract must set retracted_stain so the cached-token recount is suppressed"
+        assert req.cached_tokens == cached_before, (
+            f"retracted_stain must suppress re-adding pre_len-already_computed on "
+            f"resume; cached_tokens grew from {cached_before} to {req.cached_tokens}"
+        )
+
+
+class TestSpecialCaseResultSkipRetracted(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_result_skip_retracted_emits_no_stray_token(self):
+        self.server.execute_script(
+            self._script_result_skip_retracted_emits_no_stray_token
+        )
+
+    @staticmethod
+    def _script_result_skip_retracted_emits_no_stray_token(t: ScriptedContext):
+        # batch_result_processor.py:218-221: for (req, next_token), if req.finished()
+        # or req.is_retracted -> continue. Retract a chunked req mid-prefill so a
+        # prefill result for it is in flight while it is is_retracted; the skip must
+        # suppress any output append / inflight_middle_chunks decrement on that entry.
+        # ignore_eos pins the resumed req to exactly max_new_tokens, so a stray token
+        # from the skipped retracted entry would show up as output_ids length > 2.
+        # GPU validation pending.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True
+        )
+        yield from run_until(r, lambda h: h.is_chunking)
+
+        t.pause_generation(mode="retract")
+        yield
+        t.continue_generation()
+        yield from run_until_finished(r, max_steps=2000)
+        assert r.finished
+        assert len(r.req.output_ids) == 2, (
+            f"the skipped retracted entry must not append a stray output token; "
+            f"got output_ids len {len(r.req.output_ids)}"
+        )
+
+
+class TestSpecialCaseMiddleChunkNoToken(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_middle_chunk_appends_no_token_no_finish(self):
+        self.server.execute_script(self._script_middle_chunk_appends_no_token_no_finish)
+
+    @staticmethod
+    def _script_middle_chunk_appends_no_token_no_finish(t: ScriptedContext):
+        # batch_result_processor.py:270-289 (else branch, skip_stream_req): a middle
+        # chunk whose prefill is not finished must NOT append an output token nor mark
+        # the req finished. Step the engine while is_chunking and witness at every
+        # middle-chunk iter that output_ids stays empty and status is not finished;
+        # output only grows once is_chunking flips False. GPU validation pending.
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+
+        saw_middle_chunk = False
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            if r.is_chunking:
+                saw_middle_chunk = True
+                assert len(r.req.output_ids) == 0, (
+                    f"middle chunk must not append an output token; got "
+                    f"output_ids len {len(r.req.output_ids)}"
+                )
+                assert (
+                    r.status != "finished"
+                ), "middle chunk must not finish the req (skip_stream_req)"
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert saw_middle_chunk, "test must observe r mid-chunk at least once"
+        assert (
+            len(r.req.output_ids) >= 1
+        ), "output tokens must appear only after the chunked prefill completes"
 
 
 if __name__ == "__main__":

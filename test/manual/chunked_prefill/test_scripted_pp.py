@@ -22,6 +22,14 @@ def _pp_engine_kwargs(*, pp_size: int = 2, **overrides: Any) -> Dict[str, Any]:
     )
 
 
+def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
+    # chunks_done model: 0 if the prompt fits one shot, else ceil(prompt/chunk).
+    # The tail iteration is counted, so prompt 2048 / chunk 256 -> exactly 8.
+    if prompt_len <= chunk_size:
+        return 0
+    return (prompt_len + chunk_size - 1) // chunk_size
+
+
 class TestPPBasic(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs()
 
@@ -50,6 +58,36 @@ class TestPPBasic(ScriptedTestCase):
         assert len(r.req.output_ids) == 8, (
             f"decode must produce all 8 tokens cleanly, got "
             f"len(output_tokens)={len(r.req.output_ids)}"
+        )
+
+    def test_pp_static_chunk_size_predictor_returns_none(self):
+        self.server.execute_script(
+            self._script_pp_static_chunk_size_predictor_returns_none
+        )
+
+    @staticmethod
+    def _script_pp_static_chunk_size_predictor_returns_none(t: ScriptedContext):
+        # With dynamic chunking OFF, predict_next_chunk_size early-returns None
+        # (scheduler_pp_mixin.py:736-741) and the static chunked_prefill_size drives
+        # every chunk, yielding the exact deterministic chunk count.
+        sched = t.scheduler
+        # The branch's controlling flag must be off, so every chunked iteration takes
+        # the early-return at 736-741 instead of computing a dynamic size.
+        assert sched.enable_dynamic_chunking is False
+        # Witness the early-return directly: a non-ready/disabled predictor returns
+        # None for any history length, the precondition for the static path below.
+        assert sched.predict_next_chunk_size(0) is None
+        assert sched.predict_next_chunk_size(VERY_LONG_PROMPT_LEN // 2) is None
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+        # Exact static count (8 for 2048 / 256) witnesses that the fixed chunk size,
+        # not a dynamic prediction, drove every chunk. A dynamic size would shrink
+        # later chunks and change this count, so == is the discriminating assertion.
+        expected = _expected_chunks(VERY_LONG_PROMPT_LEN, DEFAULT_CHUNK_SIZE)
+        assert r.chunks_done == expected, (
+            f"static chunked_prefill_size must produce exactly {expected} chunks, "
+            f"got {r.chunks_done}"
         )
 
     def test_pp_multi_microbatch_chunks_done_aggregation(self):
@@ -146,6 +184,37 @@ class TestPPDynamic(ScriptedTestCase):
         assert r.finished
         assert r.chunks_done >= 2, f"expected >=2 chunks, got {r.chunks_done}"
         assert len(r.req.output_ids) == 4
+
+    def test_pp_dynamic_chunk_size_recompute_branch_taken(self):
+        self.server.execute_script(
+            self._script_pp_dynamic_chunk_size_recompute_branch_taken
+        )
+
+    @staticmethod
+    def _script_pp_dynamic_chunk_size_recompute_branch_taken(t: ScriptedContext):
+        # Prove the dynamic-recompute branch (scheduler.py:2612-2616) actually
+        # consults the predictor and uses its size, rather than predict_next_chunk_size
+        # silently returning None and the static size being used.
+        sched = t.scheduler
+        # Profiling at scheduler init must have produced a ready predictor; on failure
+        # enable_dynamic_chunking is flipped off (scheduler.py:958) and the branch is
+        # dead. Assert it is live so the dynamic path is genuinely reachable.
+        assert sched.enable_dynamic_chunking is True
+        assert sched.length_predictor is not None
+        assert sched.length_predictor.is_ready is True
+        # A ready predictor passes the 736-741 gate and returns a concrete size, so at
+        # scheduler.py:2615 dynamic_size is not None and line 2616 overrides the static
+        # chunk size. Witness the non-None return directly for the branch's history_len.
+        dynamic_size = sched.predict_next_chunk_size(0)
+        assert dynamic_size is not None
+        assert isinstance(dynamic_size, int) and dynamic_size > 0
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+        # The prompt chunked across multiple iterations, so chunked_req was non-None
+        # when scheduler.py:2612 ran -- the branch condition (chunked_req is not None
+        # and enable_dynamic_chunking) held and the dynamic size was applied.
+        assert r.chunks_done >= 2, f"expected >=2 chunks, got {r.chunks_done}"
 
 
 class TestPPSize4(ScriptedTestCase):

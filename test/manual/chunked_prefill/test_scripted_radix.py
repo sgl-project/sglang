@@ -276,6 +276,56 @@ class TestRadixBasic(ScriptedTestCase):
         )
 
 
+class TestRadixNoTailChunked(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_page_size_one_chunked_has_no_partial_page_tail(self):
+        """At page_size=1 chunked caching takes the no-tail else branch every step."""
+        self.server.execute_script(
+            self._script_page_size_one_chunked_has_no_partial_page_tail
+        )
+
+    @staticmethod
+    def _script_page_size_one_chunked_has_no_partial_page_tail(t: ScriptedContext):
+        # GPU validation pending (manual scripted-runtime suite).
+        # Contrast to TestRadixPartialPage (page_size=4 takes the `if` partial-
+        # tail branch at radix_cache.py:517-520, where len(prefix_indices) >
+        # cache_protected_len). At the default page_size=1 every kv index is page
+        # aligned, so cache_unfinished_req always lands on the `else` no-tail
+        # branch at radix_cache.py:521-522 (req.prefix_indices = new_indices),
+        # making len(prefix_indices) == cache_protected_len at every mid-chunk
+        # observation.
+        s = t.scheduler
+        prompt_len: int = 4 * DEFAULT_CHUNK_SIZE
+        r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+
+        observed_mid_chunk: bool = False
+        for _ in range(800):
+            req = s.chunked_req
+            if req is not None and req.rid == r.rid:
+                observed_mid_chunk = True
+                prefix_len: int = len(req.prefix_indices)
+                protected_len: int = req.cache_protected_len
+                assert prefix_len == protected_len, (
+                    f"page_size=1 must take the no-tail else branch: "
+                    f"len(prefix_indices)={prefix_len} != "
+                    f"cache_protected_len={protected_len} (a partial-page tail "
+                    f"was appended, which only happens for page_size > 1)"
+                )
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert observed_mid_chunk, (
+            "test must observe r as the in-flight chunked_req at least once; the "
+            "no-tail else branch was never exercised"
+        )
+        assert (
+            r.kv_pages == 0
+        ), f"finished chunked req must release KV; got {r.kv_pages}"
+
+
 class TestRadixHitCountInvariant(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
@@ -322,6 +372,84 @@ class TestRadixHitCountInvariant(ScriptedTestCase):
         assert observed_chunk_admissions >= 2, (
             f"test must exercise at least 2 chunk admissions after baseline; "
             f"observed {observed_chunk_admissions}"
+        )
+
+
+class TestRadixHitCountNonChunked(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
+
+    def test_non_chunked_prefix_hit_increments_hit_count_by_one(self):
+        """Non-chunked finished req hitting a warm prefix bumps node hit_count by 1."""
+        self.server.execute_script(
+            self._script_non_chunked_prefix_hit_increments_hit_count_by_one
+        )
+
+    @staticmethod
+    def _script_non_chunked_prefix_hit_increments_hit_count_by_one(t: ScriptedContext):
+        # GPU validation pending (manual scripted-runtime suite).
+        # Contrast to TestRadixHitCountInvariant (chunked=True leaves hit_count
+        # untouched): when a NON-chunked finished req re-traverses an existing
+        # warm prefix, _inc_hit_count(chunked=False) at radix_cache.py:672 runs
+        # and bumps the matched ancestor node's hit_count by exactly 1.
+        def _snapshot_hit_counts(root) -> dict:
+            snapshot: dict = {}
+            stack = [root]
+            while stack:
+                node = stack.pop()
+                snapshot[node.id] = node.hit_count
+                stack.extend(node.children.values())
+            return snapshot
+
+        s = t.scheduler
+
+        # Warm a 2-chunk prefix on its own radix branch (prompt_token=11). This
+        # creates the node(s) whose hit_count we then watch.
+        r_warm = t.start_req(
+            prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=1, prompt_token=11
+        )
+        yield from run_until_finished(r_warm)
+        assert r_warm.finished
+
+        baseline = _snapshot_hit_counts(s.tree_cache.root_node)
+
+        # A full-fit re-submission on the same prefix: residual beyond the cached
+        # 2-chunk prefix is a single token (<= chunk_size), so it never chunks
+        # (chunks_done == 0) and finishes via the non-chunked cache_finished_req
+        # -> insert(chunked=False) path.
+        r2 = t.start_req(
+            prompt_len=2 * DEFAULT_CHUNK_SIZE + 1, max_new_tokens=1, prompt_token=11
+        )
+        yield from run_until_finished(r2)
+        assert r2.finished
+        assert r2.chunks_done == 0, (
+            f"residual past the warm prefix is one token and must not chunk; "
+            f"got chunks_done={r2.chunks_done}"
+        )
+        assert r2.req.cached_tokens > 0, (
+            f"r2 must hit the warm 2-chunk prefix to drive the non-chunked "
+            f"hit_count increment; got cached_tokens={r2.req.cached_tokens}"
+        )
+
+        cur = _snapshot_hit_counts(s.tree_cache.root_node)
+        # At least one pre-existing node that r2 traversed must show exactly a +1
+        # increment, and no pre-existing node may move by more than 1 (a single
+        # non-chunked insert visits each matched node once).
+        incremented_by_one = 0
+        for node_id, base_count in baseline.items():
+            if node_id not in cur:
+                continue
+            delta: int = cur[node_id] - base_count
+            assert delta in (0, 1), (
+                f"non-chunked insert moved existing node id={node_id} hit_count "
+                f"by {delta} (expected 0 or 1): baseline={base_count}, "
+                f"now={cur[node_id]}"
+            )
+            if delta == 1:
+                incremented_by_one += 1
+        assert incremented_by_one >= 1, (
+            f"_inc_hit_count(chunked=False) at radix_cache.py:672 must bump at "
+            f"least one matched warm-prefix node by exactly 1; saw "
+            f"{incremented_by_one} such nodes"
         )
 
 
