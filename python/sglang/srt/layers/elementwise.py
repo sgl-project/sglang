@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.triton_ops.softcap import softcap_out as fused_softcap
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
@@ -576,6 +577,7 @@ def _fused_gate_sigmoid_mul_add_kernel(
     final_hidden_states_ptr,  # [num_tokens, hidden_dim]
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0).to(tl.int64)
     row_offset = pid * hidden_dim
@@ -583,11 +585,16 @@ def _fused_gate_sigmoid_mul_add_kernel(
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < hidden_dim
 
+    # Load static weight first — does not depend on upstream kernel output
+    w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     # Phase 1: dot product in fp32
     h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
-    w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     gate = tl.sum(h * w, axis=0)
 
     # Sigmoid in fp32
@@ -603,6 +610,9 @@ def _fused_gate_sigmoid_mul_add_kernel(
     result = f + gate_val * s
 
     tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_gate_sigmoid_mul_add(
@@ -628,6 +638,8 @@ def fused_gate_sigmoid_mul_add(
         ),
     }
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
     _fused_gate_sigmoid_mul_add_kernel[(num_tokens,)](
         hidden_states,
         gate_weight,
@@ -635,4 +647,5 @@ def fused_gate_sigmoid_mul_add(
         final_hidden_states,
         hidden_dim=hidden_dim,
         **config,
+        **pdl_kwargs,
     )

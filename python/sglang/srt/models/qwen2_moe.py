@@ -53,6 +53,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -268,6 +269,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
         )
 
+        # Disable inplace MoE when fused gate will need hidden_states after experts
+        _needs_hidden_after_experts = (
+            config.shared_expert_intermediate_size > 0
+            and not self.enable_shared_expert_fusion
+        )
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=(
@@ -288,6 +294,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
             num_fused_shared_experts=self.num_fused_shared_experts,
+            inplace=not _needs_hidden_after_experts,
         )
 
         self.gate = ReplicatedLinear(
@@ -557,10 +564,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             if use_fused_gate:
-                from sglang.srt.layers.elementwise import (
-                    fused_gate_sigmoid_mul_add,
-                )
-
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
                     self.shared_expert_gate.weight.squeeze(),
