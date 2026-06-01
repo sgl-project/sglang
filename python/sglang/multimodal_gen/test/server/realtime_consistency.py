@@ -369,17 +369,21 @@ async def collect_realtime_output(
                 ws.recv(), timeout=_REALTIME_WS_TIMEOUT_SECS
             )
             header = unpackb(header_payload, raw=False)
-            if header.get("type") == "error":
+            message_type = header.get("type")
+            if message_type == "error":
                 pytest.fail(f"Realtime generation failed: {header.get('content')}")
-            if header.get("type") == "chunk_stats":
+            if message_type == "chunk_stats":
                 chunk_stats.append(parse_realtime_chunk_stats(header))
                 continue
-            if header.get("type") != "frame_batch_header":
+            if message_type == "frame_batch":
+                raw_payload = header.pop("payload", None)
+                header["type"] = "frame_batch_header"
+            elif message_type == "frame_batch_header":
+                raw_payload = await asyncio.wait_for(
+                    ws.recv(), timeout=_REALTIME_WS_TIMEOUT_SECS
+                )
+            else:
                 raise ValueError(f"Unexpected realtime message: {header}")
-
-            raw_payload = await asyncio.wait_for(
-                ws.recv(), timeout=_REALTIME_WS_TIMEOUT_SECS
-            )
             if not isinstance(raw_payload, bytes):
                 raise ValueError("Realtime frame payload must be bytes")
 

@@ -270,6 +270,14 @@ def _packed_realtime_frame_message(chunk_index: int, frame: np.ndarray):
     return packb(header, use_bin_type=True), frame.tobytes()
 
 
+def _packed_realtime_combined_frame_message(chunk_index: int, frame: np.ndarray):
+    header, payload = _packed_realtime_frame_message(chunk_index, frame)
+    message = unpackb(header, raw=False)
+    message["type"] = "frame_batch"
+    message["payload"] = payload
+    return packb(message, use_bin_type=True)
+
+
 def _packed_realtime_chunk_stats(chunk_index: int, **overrides):
     payload = {
         "type": "chunk_stats",
@@ -340,6 +348,32 @@ def test_collect_realtime_output_skips_and_records_chunk_stats(monkeypatch):
             "payload": [["w"]],
         },
     ]
+
+
+def test_collect_realtime_output_accepts_combined_frame_batch(monkeypatch):
+    frame = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+    websocket = _FakeRealtimeWebSocket(
+        [
+            _packed_realtime_combined_frame_message(0, frame),
+        ]
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "websockets",
+        SimpleNamespace(connect=lambda *args, **kwargs: websocket),
+    )
+
+    result = asyncio.run(
+        collect_realtime_output(
+            ws_url="ws://example.test/v1/realtime_video/generate",
+            init_payload={"type": "init", "prompt": "test"},
+            events=[],
+            num_chunks=1,
+        )
+    )
+
+    assert len(result.frames) == 1
+    np.testing.assert_array_equal(result.frames[0], frame)
 
 
 def test_realtime_perf_stats_summary_and_thresholds():
