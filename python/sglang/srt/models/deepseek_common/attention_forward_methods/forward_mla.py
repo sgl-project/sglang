@@ -100,12 +100,19 @@ if _is_cuda:
         return out
 
     # Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
-    # into one eager split op. Without this, the bf16 fallback BMM was captured
-    # alone in its own single-kernel CUDA graph submodule, paying per-submodule
-    # host overhead with no fusion benefit. When this call is strictly adjacent
-    # to `dsa_indexer_graph_dispatch` in FX, `split_graph` can place both calls in
-    # one eager submodule. That adjacency currently holds on the trtllm-FP8 DSA
-    # path where `_fuse_rope_for_trtllm_mla` skips the Python `rotary_emb` call.
+    # into one eager split op (under both PCG and BCG). Without this, the bf16
+    # fallback BMM was captured alone in its own single-kernel CUDA graph
+    # submodule, paying per-submodule host overhead with no fusion benefit.
+    #
+    # The further "module fusion" — coalescing this op with the strictly adjacent
+    # `dsa_indexer_graph_dispatch` into a single eager region (no captured segment
+    # between the two adjacent eager breaks) — is currently BCG-only: breakable
+    # CUDA graph drops the empty segment and chains the adjacent replay fns (see
+    # `breakable_cuda_graph.eager_on_graph`). Under PCG, `split_graph` leaves each
+    # split op in its own eager submodule for now (no merge), so the surrounding
+    # capture stays split into separate CUDA graph islands. The adjacency this
+    # relies on currently holds on the trtllm-FP8 DSA path where
+    # `_fuse_rope_for_trtllm_mla` skips the Python `rotary_emb` call.
     # Gated by `_can_fuse_bmm_into_attention`.
     # `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
     # `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
