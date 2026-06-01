@@ -115,14 +115,6 @@ def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
     )
 
 
-def hisparse_dma_in_flight(ctx: "ScriptedContext", rid: str) -> bool:
-    # Req.hisparse_staging is the real per-request bool the engine sets while this
-    # request's KV is staged for an in-flight hisparse DMA. A finished/aborted req
-    # that has released its staging is absent or has the flag cleared.
-    req = find_req_by_rid(ctx, rid)
-    return req is not None and req.hisparse_staging
-
-
 def _send_idx_series(ctx: "ScriptedContext", rid: str) -> List[int]:
     # Ordered start_send_idx values observed for this rid across every step it
     # appeared in the batch. on_run_batch snapshots at step start, so the final

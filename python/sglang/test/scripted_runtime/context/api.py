@@ -164,9 +164,6 @@ class ScriptedContext:
     def kv_send_last_chunk_events(self, rid: str) -> int:
         return queries.kv_send_last_chunk_events(self, rid)
 
-    def hisparse_dma_in_flight(self, rid: str) -> bool:
-        return queries.hisparse_dma_in_flight(self, rid)
-
     def batch_composition(self) -> Dict[str, List[str]]:
         return queries.batch_composition(self)
 
