@@ -7,6 +7,9 @@
   --accent: #b9543c;
   --green: #4d765f;
   --blue: #3f607c;
+  --pressed: #8c9288;
+  --pressed-border: #aeb4aa;
+  --pressed-ring: rgba(238, 241, 236, 0.2);
   --shadow: 0 18px 60px rgba(23, 26, 22, 0.12);
 }
 
@@ -79,6 +82,13 @@ button:disabled { cursor: wait; opacity: 0.64; transform: none; }
   color: var(--panel);
   background: var(--green);
   border-color: var(--green);
+}
+
+.tabs button:active:not(:disabled),
+.tabs button.is-pressed:not(:disabled) {
+  color: #fffdf7;
+  background: var(--pressed);
+  border-color: var(--pressed-border);
 }
 
 label {
@@ -190,8 +200,8 @@ button:hover:not(:disabled) {
 }
 button:active:not(:disabled),
 button.is-pressed:not(:disabled) {
-  border-color: color-mix(in oklch, var(--accent), var(--ink) 18%);
-  background: var(--accent);
+  border-color: var(--pressed-border);
+  background: var(--pressed);
   color: #fffdf7;
   box-shadow:
     inset 0 0 0 1px rgba(255, 253, 247, 0.18),
@@ -199,12 +209,12 @@ button.is-pressed:not(:disabled) {
   transform: translateY(0);
 }
 button.is-key-active:not(:disabled) {
-  border-color: color-mix(in oklch, var(--accent), var(--ink) 18%);
-  background: var(--accent);
+  border-color: var(--pressed-border);
+  background: var(--pressed);
   color: #fffdf7;
   box-shadow:
     inset 0 0 0 1px rgba(255, 253, 247, 0.22),
-    0 0 0 3px rgba(185, 84, 60, 0.24),
+    0 0 0 3px var(--pressed-ring),
     0 10px 22px rgba(23, 26, 22, 0.18);
   transform: none;
 }
@@ -219,7 +229,8 @@ button:focus-visible {
 }
 .primary:active:not(:disabled),
 .primary.is-pressed:not(:disabled) {
-  background: color-mix(in oklch, var(--ink), var(--accent) 28%);
+  background: var(--pressed);
+  border-color: var(--pressed-border);
   color: var(--panel);
 }
 .wide { width: 100%; margin-top: 10px; }
@@ -315,12 +326,12 @@ button:focus-visible {
 .stage-controls .camera-pad button:active:not(:disabled),
 .stage-controls .camera-pad button.is-pressed:not(:disabled),
 .stage-controls .camera-pad button.is-key-active:not(:disabled) {
-  border-color: #aeb4aa;
-  background: #8c9288;
+  border-color: var(--pressed-border);
+  background: var(--pressed);
   color: #fffdf7;
   box-shadow:
     inset 0 0 0 1px rgba(255, 253, 247, 0.22),
-    0 0 0 3px rgba(238, 241, 236, 0.2),
+    0 0 0 3px var(--pressed-ring),
     0 10px 22px rgba(23, 26, 22, 0.18);
 }
 

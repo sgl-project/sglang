@@ -107,11 +107,11 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "const PREVIEW_OUTPUT_FORMAT = \"\";" in app_js
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-fixes-v14" in index_html
-    assert "app.js?v=realtime-fixes-v14" in index_html
+    assert "styles.css?v=realtime-fixes-v15" in index_html
+    assert "app.js?v=realtime-fixes-v15" in index_html
     assert ".stage-controls .camera-pad button.is-key-active:not(:disabled)" in styles_css
-    assert "background: #8c9288;" in styles_css
-    assert "0 0 0 3px rgba(238, 241, 236, 0.2)" in styles_css
+    assert "--pressed: #8c9288;" in styles_css
+    assert "--pressed-ring: rgba(238, 241, 236, 0.2);" in styles_css
 
 
 def test_realtime_session_cache_reuses_and_releases_state():
