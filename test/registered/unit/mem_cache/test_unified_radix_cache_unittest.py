@@ -1200,7 +1200,8 @@ class UnifiedRadixCacheSuite:
         aux = aux_types[0]
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = self._make_seq(1, 2)
+        # One page stays within a single SWA window (no leaf-cap split).
+        seq = self._make_seq(1, 1)
         self._insert(tree, allocator, req_to_token_pool, seq)
 
         match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -1527,13 +1528,19 @@ class UnifiedRadixCacheSuite:
         return False
 
     def _simulate_backup(self, tree, node):
-        """Simulate D->H backup by setting host_value on each component."""
-        for ct in (ComponentType.FULL, ComponentType.MAMBA, ComponentType.SWA):
-            if ct not in self.cfg.components:
-                continue
-            cd = node.component_data[ct]
-            if cd.value is not None and cd.host_value is None:
-                cd.host_value = cd.value.clone()
+        """Simulate D->H backup over the whole root->node path (parent-first)."""
+        chain = []
+        cur = node
+        while cur is not tree.root_node:
+            chain.append(cur)
+            cur = cur.parent
+        for ancestor in reversed(chain):
+            for ct in (ComponentType.FULL, ComponentType.MAMBA, ComponentType.SWA):
+                if ct not in self.cfg.components:
+                    continue
+                cd = ancestor.component_data[ct]
+                if cd.value is not None and cd.host_value is None:
+                    cd.host_value = cd.value.clone()
 
     def _simulate_backup_tree(self, tree):
         """Backup all non-root nodes (simulates write-through)."""
@@ -1594,9 +1601,21 @@ class UnifiedRadixCacheSuite:
         return fixture
 
     def _backup_node(self, tree, node):
-        backed_up = tree.write_backup(node, write_back=True)
-        self.assertGreater(backed_up, 0)
+        # Parent-first backup over the whole path: one insert can span several
+        # nodes, so a single-node backup would leave an unbacked ancestor.
+        chain = []
+        cur = node
+        while cur is not tree.root_node:
+            chain.append(cur)
+            cur = cur.parent
+        backed_up = 0
+        for ancestor in reversed(chain):
+            if ancestor.backuped:
+                continue
+            backed_up = tree.write_backup(ancestor, write_back=True)
+            self.assertGreater(backed_up, 0)
         tree.writing_check(write_back=True)
+        self.assertTrue(node.backuped)
         return backed_up
 
     def _backup_tree(self, tree):
@@ -1763,22 +1782,36 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         self.assertIs(m.last_device_node, tree.root_node)
 
-        split_parent = node.parent
-        self.assertIsNot(split_parent, tree.root_node)
-        self.assertTrue(split_parent.evicted)
-        self.assertTrue(split_parent.backuped)
-        self.assertEqual(list(split_parent.key.token_ids), expected_prefix)
-        self.assertEqual(list(node.key.token_ids), expected_suffix)
-
+        # Locate the host prefix via last_host_node and rebuild prefix/suffix
+        # from path keys (a leaf may span several nodes).
         if self.cfg.has_mamba:
             self.assertEqual(m.host_hit_length, 0)
             self.assertIs(m.last_host_node, tree.root_node)
-            self.assertIsNone(
-                split_parent.component_data[ComponentType.MAMBA].host_value
-            )
         else:
             self.assertEqual(m.host_hit_length, len(expected_prefix))
-            self.assertIs(m.last_host_node, split_parent)
+            split_parent = m.last_host_node
+            self.assertIsNot(split_parent, tree.root_node)
+            self.assertTrue(split_parent.evicted)
+            self.assertTrue(split_parent.backuped)
+            # root -> split_parent keys reconstruct expected_prefix
+            prefix_tokens: list[int] = []
+            chain = []
+            cur = split_parent
+            while cur is not tree.root_node:
+                chain.append(cur)
+                cur = cur.parent
+            for n in reversed(chain):
+                prefix_tokens.extend(n.key.token_ids)
+            self.assertEqual(prefix_tokens, expected_prefix)
+            # the diverged suffix stays as evicted+backuped descendant(s)
+            suffix_tokens: list[int] = []
+            cur = split_parent
+            while cur.children:
+                self.assertEqual(len(cur.children), 1)
+                cur = next(iter(cur.children.values()))
+                suffix_tokens.extend(cur.key.token_ids)
+            self.assertEqual(suffix_tokens, expected_suffix)
+            self.assertTrue(cur.evicted and cur.backuped)
         tree.sanity_check()
 
     def test_hicache_d_leaf_h_leaf_mutual_exclusion(self):
@@ -1861,9 +1894,13 @@ class UnifiedRadixCacheSuite:
         if original_mamba_indices is not None:
             self._fill_mamba_state(req_to_token_pool, original_mamba_indices, marker=21)
 
-        loaded_indices = self._load_back_node(tree, node)
+        self._load_back_node(tree, node)
         self.assertFalse(node.evicted)
         self.assertIsNotNone(node.component_data[ComponentType.FULL].value)
+        # Gather the whole reloaded prefix via match (a leaf may be split).
+        loaded_indices = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", base)))
+        ).device_indices
         loaded_k, loaded_v = self._snapshot_full_kv(allocator, loaded_indices)
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
@@ -1936,6 +1973,75 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(split_leaf.evicted)
         self.assertTrue(split_leaf.backuped)
         self.assertIn(split_leaf, tree.evictable_host_leaves)
+        tree.sanity_check()
+
+    def test_swa_deep_tree_backup_evict_loadback_stress(self):
+        """Deep multi-node SWA tree (long leaves, decode-evict tombstones,
+        shared-prefix branches) through write-through backup -> evict ->
+        loadback, asserting sanity throughout."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only keeps the deep-tree topology precise")
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        tree.write_through_threshold = 1  # real eager write-through auto-backup
+        ps = self.cfg.page_size
+        # Window in pages; sizes scale with it so the leaf-cap split fires.
+        tail_size = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        wp = max(1, tail_size // ps)
+
+        def insert_swa(tokens, swa_ev):
+            value = self._alloc(allocator, len(tokens))
+            if value is None:
+                return False
+            tree.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens)),
+                    value=value,
+                    swa_evicted_seqlen=swa_ev,
+                )
+            )
+            tree.writing_check()
+            tree.sanity_check()
+            return True
+
+        base = self._make_seq(1, wp + 2)  # long leaf -> cap-split
+        if not insert_swa(base, 0):
+            self.skipTest("kv pool too small for deep-tree stress")
+        # fresh decode-evicted seq: tombstone-prefix + cap-split stacked
+        insert_swa(self._make_seq(20000, wp + 2), ps)
+        insert_swa(base + self._make_seq(70000, 2), 0)  # depth
+        for i in range(2):  # width: branches off the base prefix
+            insert_swa(base[: 2 * ps] + self._make_seq(80000 + 1000 * i, 3), 0)
+
+        self.assertGreaterEqual(len(tree._collect_all_nodes()), 5)
+
+        # Stepwise eviction -> demote to host, sanity after each round.
+        for _ in range(4):
+            full_ev = tree.full_evictable_size()
+            if full_ev == 0:
+                break
+            tree.evict(
+                EvictParams(
+                    num_tokens=max(ps, full_ev // 2),
+                    swa_num_tokens=tree.swa_evictable_size(),
+                )
+            )
+            tree.sanity_check()
+
+        # Load evicted prefixes back from host, sanity after each.
+        for tokens in (base, base[: 2 * ps]):
+            m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+            anchor = m.best_match_node
+            if anchor is not tree.root_node and anchor.evicted:
+                if tree.load_back(anchor):
+                    self._finish_pending_loads(tree)
+                    self._release_ongoing_load_back_locks(tree)
+            tree.sanity_check()
+
         tree.sanity_check()
 
     def test_hicache_evict_to_host_updates_aux_lru(self):
