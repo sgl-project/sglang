@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     NgramEmbeddingInfo,
@@ -68,6 +69,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    rids_int: Optional[torch.Tensor]
+    bootstrap_room_ids_int: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -164,6 +167,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 else None
             )
 
+            if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+                rids_int = torch.zeros((max_bs,), dtype=torch.int64)
+                bootstrap_room_ids_int = torch.full((max_bs,), -1, dtype=torch.int64)
+            else:
+                rids_int = None
+                bootstrap_room_ids_int = None
+
         seq_lens_cpu = torch.full(
             (max_bs,),
             seq_len_fill_value,
@@ -191,6 +201,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
     def populate_from_forward_batch(
@@ -260,6 +272,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if forward_batch.mrope_positions is not None:
             dsts.append(self.mrope_positions[:, :raw_num_token])
             srcs.append(forward_batch.mrope_positions)
+
+        if self.rids_int is not None and forward_batch.rids_int is not None:
+            dsts.append(self.rids_int[:raw_bs])
+            srcs.append(forward_batch.rids_int)
+        if (
+            self.bootstrap_room_ids_int is not None
+            and forward_batch.bootstrap_room_ids_int is not None
+        ):
+            dsts.append(self.bootstrap_room_ids_int[:raw_bs])
+            srcs.append(forward_batch.bootstrap_room_ids_int)
 
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
