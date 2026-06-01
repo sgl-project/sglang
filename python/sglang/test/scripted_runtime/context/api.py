@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 from sglang.test.scripted_runtime.context import (
     engine,
     lifecycle,
+    pools,
     queries,
     radix,
 )
@@ -41,6 +42,8 @@ class ScriptedContext:
         self._http_poster = http_poster
 
         self._seen_rids: set[str] = set()
+        self._held_kv_allocations: list = []
+        self._held_row_slots: List[int] = []
         self._req_starter = ScriptedContextReqStarter(self)
 
     def start_req(
@@ -84,6 +87,21 @@ class ScriptedContext:
 
     def flush_cache(self) -> None:
         return lifecycle.flush_cache(self)
+
+    def evict_radix(self, *, prefix_tokens: Optional[List[int]]) -> None:
+        assert (
+            prefix_tokens is None
+        ), "evict_radix currently supports only full eviction (prefix_tokens=None)"
+        return lifecycle.flush_cache(self)
+
+    def exhaust_kv(self, *, leave_pages: int) -> None:
+        return pools.exhaust_kv(self, leave_pages=leave_pages)
+
+    def exhaust_row_pool(self, *, leave_rows: int) -> None:
+        return pools.exhaust_row_pool(self, leave_rows=leave_rows)
+
+    def _release_exhausted_pools(self) -> None:
+        return pools.release_exhausted(self)
 
     def get_all_node_hit_counts(self) -> Dict[int, int]:
         return radix.get_all_node_hit_counts(self)
