@@ -170,6 +170,12 @@ if _is_cuda:
     ) -> None:
         # Shared by piecewise (PCG) and breakable (BCG) CUDA graph capture: both
         # route the indexer through this eager split op.
+        #
+        # Output contract (differs from the eager `forward` path): a split op
+        # returns None, so results are delivered only by mutating `topk_result`
+        # in place. The call site pre-allocates it at a static, padded shape and a
+        # downstream captured graph reads it at a fixed address; eager code instead
+        # allocates and returns a fresh, naturally-sized tensor each call.
         assert (
             _is_cuda
         ), "Internal error: indexer graph dispatch is only supported on CUDA"
@@ -180,6 +186,8 @@ if _is_cuda:
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         extend_num_tokens = forward_batch.extend_num_tokens
+        # Empty buffer (numel == 0) encodes return_indices=False (MHA): the eager
+        # path passes this as a bool; here it is signaled by the buffer shape.
         if topk_result.numel() == 0:
             indexer._compute_and_store_k_only(
                 x,
@@ -206,6 +214,8 @@ if _is_cuda:
                 num_tokens=extend_num_tokens,
             )
             raw_topk_result = indexer._get_k_only_topk_result(metadata, x.device)
+            # Buffer is padded to the capture shape: fill the valid prefix and
+            # leave padded rows at the -1 sentinel.
             topk_result[: raw_topk_result.shape[0]] = raw_topk_result
             return
 
