@@ -52,13 +52,6 @@ class ScriptedBatchRecord:
     # one kv-chunk send; the increase that reaches prompt_len is the last_chunk send.
     send_idx_by_rid: Tuple[Tuple[str, int], ...]
     prompt_len_by_rid: Tuple[Tuple[str, int], ...]
-    # Whether this step's batch.spec_info (an EagleDraftInput when the draft model
-    # ran) carried each eagle draft tensor populated. spec_info is polymorphic, so
-    # the tensors are read defensively; a per-step bool ORed over the steps a rid
-    # appeared in proves the draft input was captured during that rid's lifetime.
-    eagle_topk_p_present: bool
-    eagle_topk_index_present: bool
-    eagle_hidden_states_present: bool
 
 
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
@@ -153,20 +146,6 @@ class ScriptedSchedulerHook:
         if not self._is_driver:
             return
         chunked = self._scheduler.chunked_req
-        spec_info = batch.spec_info
-        # EagleDraftInput exposes topk_p / topk_index / hidden_states; verify and
-        # idle spec inputs do not, so read defensively rather than isinstance-import
-        # the heavy speculative module into this test-only hook.
-        eagle_topk_p_present = (
-            spec_info is not None and getattr(spec_info, "topk_p", None) is not None
-        )
-        eagle_topk_index_present = (
-            spec_info is not None and getattr(spec_info, "topk_index", None) is not None
-        )
-        eagle_hidden_states_present = (
-            spec_info is not None
-            and getattr(spec_info, "hidden_states", None) is not None
-        )
         self._batch_log.append(
             ScriptedBatchRecord(
                 forward_iter=batch.forward_iter,
@@ -186,9 +165,6 @@ class ScriptedSchedulerHook:
                 prompt_len_by_rid=tuple(
                     (r.rid, len(r.origin_input_ids)) for r in batch.reqs
                 ),
-                eagle_topk_p_present=eagle_topk_p_present,
-                eagle_topk_index_present=eagle_topk_index_present,
-                eagle_hidden_states_present=eagle_hidden_states_present,
             )
         )
 

@@ -123,33 +123,6 @@ def hisparse_dma_in_flight(ctx: "ScriptedContext", rid: str) -> bool:
     return req is not None and req.hisparse_staging
 
 
-def eagle_topk_p_captured(ctx: "ScriptedContext", rid: str) -> bool:
-    # True if any step where this rid was in the batch carried a populated
-    # EagleDraftInput.topk_p, i.e. the eagle draft input was captured during the
-    # request's lifetime (read-only OR over on_run_batch snapshots).
-    return any(
-        record.eagle_topk_p_present
-        for record in ctx._scheduler_hook._batch_log
-        if rid in record.rids
-    )
-
-
-def eagle_topk_index_captured(ctx: "ScriptedContext", rid: str) -> bool:
-    return any(
-        record.eagle_topk_index_present
-        for record in ctx._scheduler_hook._batch_log
-        if rid in record.rids
-    )
-
-
-def eagle_hidden_states_captured(ctx: "ScriptedContext", rid: str) -> bool:
-    return any(
-        record.eagle_hidden_states_present
-        for record in ctx._scheduler_hook._batch_log
-        if rid in record.rids
-    )
-
-
 def _send_idx_series(ctx: "ScriptedContext", rid: str) -> List[int]:
     # Ordered start_send_idx values observed for this rid across every step it
     # appeared in the batch. on_run_batch snapshots at step start, so the final

@@ -110,9 +110,14 @@ class TestSpecDisagg(ScriptedTestCase):
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
         assert r.chunks_done >= 2
-        assert r.eagle_topk_p_captured
-        assert r.eagle_topk_index_captured
-        assert r.eagle_hidden_states_captured
+        # "Eagle draft state was captured" is not an externally observable
+        # invariant -- topk_p/topk_index/hidden_states are non-None by construction
+        # on any draft step. The real, honest signal that eagle ran across the
+        # disagg chunked-prefill handoff is that it actually verified at least once.
+        assert r.req.spec_verify_ct >= 1, (
+            f"expected >=1 spec verify after disagg chunked handoff, got "
+            f"{r.req.spec_verify_ct}"
+        )
 
 
 if __name__ == "__main__":
