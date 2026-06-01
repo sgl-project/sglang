@@ -300,9 +300,7 @@ def test_initial_groupnorm_silu_parity_cuda_local(
         out_fused = apply_group_norm_silu(
             x_after_conv, upsampler.initial_norm, upsampler.initial_activation
         )
-        out_eager = upsampler.initial_activation(
-            upsampler.initial_norm(x_after_conv)
-        )
+        out_eager = upsampler.initial_activation(upsampler.initial_norm(x_after_conv))
 
     atol, rtol = _RESBLOCK_TOL[dtype]
     torch.testing.assert_close(out_fused, out_eager, atol=atol, rtol=rtol)
