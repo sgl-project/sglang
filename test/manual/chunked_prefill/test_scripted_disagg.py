@@ -80,7 +80,7 @@ class TestDisaggBasic(ScriptedTestCase):
             lambda h: h.is_chunking and h.chunks_done >= 1,
             max_steps=DEFAULT_MAX_STEPS,
         )
-        req = t._find_req_by_rid(r.rid)
+        req = t.find_req_by_rid(r.rid)
         assert req is not None, "req must still be live mid-chunk"
         assert req.start_send_idx > 0 or req.tmp_end_idx >= 0, (
             f"setup expected disagg send-side state to have advanced "

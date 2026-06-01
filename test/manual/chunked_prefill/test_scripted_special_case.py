@@ -864,7 +864,7 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         snap: Optional[tuple] = None
         for _ in range(DEFAULT_MAX_STEPS):
-            req = t._find_req_by_rid(r.rid)
+            req = t.find_req_by_rid(r.rid)
             if req is not None:
                 cur = (
                     req.cached_tokens_device,

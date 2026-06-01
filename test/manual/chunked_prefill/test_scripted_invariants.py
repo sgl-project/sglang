@@ -562,7 +562,7 @@ class TestInvariantsBasic(ScriptedTestCase):
         prev_extend_batch_idx: int = -1
         prev_is_retracted: bool = False
         for _ in range(DEFAULT_MAX_STEPS):
-            req = t._find_req_by_rid(r.rid)
+            req = t.find_req_by_rid(r.rid)
             if req is not None:
                 cur_extend_batch_idx = req.extend_batch_idx
                 cur_is_retracted = req.is_retracted
@@ -595,7 +595,7 @@ class TestInvariantsBasic(ScriptedTestCase):
         observed_decrement: bool = False
         for _ in range(DEFAULT_MAX_STEPS):
             s = t._scheduler
-            req = t._find_req_by_rid(r.rid)
+            req = t.find_req_by_rid(r.rid)
             cur_inflight = req.inflight_middle_chunks if req is not None else 0
             cur_is_chunked_slot = (
                 s.chunked_req is not None and s.chunked_req.rid == r.rid

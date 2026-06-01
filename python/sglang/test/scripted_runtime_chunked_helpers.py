@@ -6,6 +6,10 @@ DEFAULT_CHUNK_SIZE: int = 256
 
 DEFAULT_MAX_STEPS: int = 400
 
+# Long enough to span 8 chunks at the default chunk size, which comfortably
+# exceeds every chunks_done lower bound (<= 4) asserted in the manual suite.
+VERY_LONG_PROMPT_LEN: int = 8 * DEFAULT_CHUNK_SIZE
+
 # Qwen3-0.6B ties its word embeddings and already handles the tie correctly
 # under pipeline parallelism (qwen3.py), so the PP scripted-runtime tests can
 # use it without patching the model code.
