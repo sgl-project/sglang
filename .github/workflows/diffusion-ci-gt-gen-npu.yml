@@ -81,7 +81,7 @@ jobs:
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1npu) }}
     timeout-minutes: 150
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
