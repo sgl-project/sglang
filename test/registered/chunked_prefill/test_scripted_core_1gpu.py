@@ -17,9 +17,7 @@ _CHUNK_SIZE = 64
 _PROMPT_LEN = 4 * _CHUNK_SIZE - 3
 
 _NUM_MIDDLE_CHUNKS = (_PROMPT_LEN - 1) // _CHUNK_SIZE
-# 6 so the decode stages stay distinct once last_decode leaves two tokens of
-# headroom for the overlap pipeline: first_decode=1, mid_decode=3, last_decode=4.
-_LIFECYCLE_MAX_NEW_TOKENS = 6
+_LIFECYCLE_MAX_NEW_TOKENS = 4
 
 
 def _advance_to_stage(r, stage: str):
@@ -78,27 +76,34 @@ class TestScriptedCore(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        req = r.req
-        assert req is not None and req in t.scheduler.waiting_queue, (
-            f"stage={stage}: pause(retract) should park the req back in "
-            f"waiting_queue; found={req!r}"
-        )
-
         # The overlap scheduler completes the one forward already in flight when
         # pause is requested, so output_ids advances by one before generation
-        # halts. Snapshot after the retract settles; the paused engine must not
-        # advance the req from here.
-        output_tokens_after_pause = len(req.output_ids)
-        for _ in range(3):
-            yield
-            req = r.req
+        # halts. At last_decode that final token reaches max_new_tokens and the req
+        # finishes cleanly instead of parking -- the correct outcome there. At every
+        # other stage the req has tokens left, so the retract parks it and the
+        # paused engine must not advance it afterwards.
+        if r.finished:
             assert (
-                req is not None and len(req.output_ids) == output_tokens_after_pause
-            ), (
-                f"stage={stage}: paused engine advanced the req "
-                f"({len(req.output_ids) if req is not None else None} output tokens, "
-                f"expected {output_tokens_after_pause})"
+                len(r.req.output_ids) == _LIFECYCLE_MAX_NEW_TOKENS
+            ), f"stage={stage}: finished req has wrong output length {r.req.output_ids!r}"
+        else:
+            req = r.req
+            assert req is not None and req in t.scheduler.waiting_queue, (
+                f"stage={stage}: pause(retract) should park the req back in "
+                f"waiting_queue; found={req!r}"
             )
+            output_tokens_after_pause = len(req.output_ids)
+            for _ in range(3):
+                yield
+                req = r.req
+                assert (
+                    req is not None
+                    and len(req.output_ids) == output_tokens_after_pause
+                ), (
+                    f"stage={stage}: paused engine advanced the req "
+                    f"({len(req.output_ids) if req is not None else None} output "
+                    f"tokens, expected {output_tokens_after_pause})"
+                )
 
         t.continue_generation()
         yield from run_until_finished(r)

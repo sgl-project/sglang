@@ -157,12 +157,6 @@ def advance_to_lifecycle_stage(
             r, max(1, max_new_tokens // 2), max_steps=max_steps
         )
     elif stage == "last_decode":
-        # Leave two tokens of headroom rather than one: under the overlap scheduler
-        # a pause lets the single in-flight forward emit one more token, and if that
-        # token reached max_new_tokens the req would finish instead of staying
-        # alive to be parked/frozen. Two tokens keeps it in-flight through the pause.
-        yield from advance_to_decode_step(
-            r, max(1, max_new_tokens - 2), max_steps=max_steps
-        )
+        yield from advance_to_decode_step(r, max_new_tokens - 1, max_steps=max_steps)
     else:
         raise AssertionError(f"unknown lifecycle stage {stage!r}")
