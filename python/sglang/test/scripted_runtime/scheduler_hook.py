@@ -147,7 +147,11 @@ class ScriptedSchedulerHook:
                     else None
                 ),
                 rids=tuple(r.rid for r in batch.reqs),
-                extend_rids=tuple(r.rid for r in batch.reqs if r.is_extend_in_batch),
+                extend_rids=(
+                    tuple(r.rid for r in batch.reqs)
+                    if batch.forward_mode is not None and batch.forward_mode.is_extend()
+                    else ()
+                ),
                 chunked_rid=chunked.rid if chunked is not None else None,
             )
         )
