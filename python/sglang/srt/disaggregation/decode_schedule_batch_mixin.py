@@ -62,7 +62,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                # Clamp to avoid double-counting: already_computed is seeded from
+                # the prefill-reported cached_tokens in _commit_transfer_to_req, so
+                # a decode-side prefix shorter than the prefill report must not
+                # subtract from cached_tokens.
+                delta = max(0, pre_len - req.already_computed)
+                req.cached_tokens += delta
+                req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
@@ -145,7 +151,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         if spec_info is not None:
             self.spec_info = spec_info
         else:
-            # Non-spec: positive last token feeds decode directly. No FutureMap
-            # bootstrap needed (SB self-maintains seq_lens; resolve_future is
-            # a no-op on positive input_ids).
-            self.input_ids = last_tokens_tensor
+            # Non-spec: stash last token into the relay so the first DECODE's
+            # resolve_forward_inputs gathers it like any other decode iter.
+            future_map.stash(self.req_pool_indices, last_tokens_tensor)
+            self.input_ids = None
