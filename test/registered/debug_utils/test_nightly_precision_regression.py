@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
@@ -417,8 +418,17 @@ def _test_one_model(
             print(f"Comparator output for {model}: {debug_file}")
             report_path = model_baseline_dir / "comparator_report.jsonl"
             report_path.parent.mkdir(parents=True, exist_ok=True)
-            report_path.write_text(result.stdout)
+            report_path.write_text(result.stdout, encoding="utf-8")
             comparator_stats = _parse_comparator_stats(result.stdout)
+            if comparator_stats.get("num_layers_compared", 0) == 0:
+                # A clean returncode with nothing compared means the baseline
+                # and target tensor names never lined up — fail loudly rather
+                # than pass on an empty comparison.
+                return (
+                    model,
+                    "FAILED",
+                    "comparator compared 0 layers (baseline/target name mismatch?)",
+                )
 
             if result.returncode == 0:
                 _update_baseline(model_baseline_dir, today_exp_dir)
@@ -563,11 +573,8 @@ def _run_server_and_dump(
         "DUMPER_SERVER_PORT": "reuse",
         "DUMPER_NON_INTRUSIVE_MODE": "all",
     }
-    # Strip write-scoped HF_TOKEN before launching the server child —
-    # model-download paths only need read access.
-    env.pop("HF_TOKEN", None)
 
-    server_args: list[str] = list(model_setup.extra_args) + [
+    server_args: list[str] = list(model_setup.extra_args or []) + [
         # Below the scheduler's decode-token reservation (default 512) the KV
         # pool clamps max_new_tokens to 0, so decode never runs and max_tokens>1
         # has no effect. Keep it well above that.
@@ -595,6 +602,7 @@ def _run_server_and_dump(
                 "filter": dumper_filter,
                 "cleanup_previous": True,
             },
+            timeout=60,
         ).raise_for_status()
 
         resp = requests.post(
@@ -608,8 +616,10 @@ def _run_server_and_dump(
                 # enter the decode loop, leaving the decode path uncaptured.
                 "ignore_eos": ignore_eos,
             },
+            timeout=600,
         )
-        assert resp.status_code == 200, f"Chat completions failed: {resp.text}"
+        if resp.status_code != 200:
+            raise RuntimeError(f"Chat completions failed: {resp.text}")
     finally:
         kill_process_tree(proc.pid)
 
@@ -618,7 +628,7 @@ def _run_comparator(
     *, baseline: Path, target: Path, threshold: float
 ) -> subprocess.CompletedProcess[str]:
     cmd: list[str] = [
-        "python",
+        sys.executable,
         "-m",
         "sglang.srt.debug_utils.comparator",
         "--baseline-path",
@@ -654,7 +664,9 @@ def _update_baseline(model_baseline_dir: Path, today_exp_dir: Path):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "commit": _get_git_commit(),
     }
-    (staging_dir.parent / "baseline_meta.json").write_text(json.dumps(meta, indent=2))
+    (staging_dir.parent / "baseline_meta.json").write_text(
+        json.dumps(meta, indent=2), encoding="utf-8"
+    )
 
     if final_dir.exists():
         if old_dir.exists():
@@ -702,7 +714,7 @@ def _save_comparator_output(*, stdout: str, stderr: str, prefix: str) -> Path:
     fd, path_str = tempfile.mkstemp(
         prefix=f"nightly_precision_{prefix}_", suffix=".log", dir="/tmp"
     )
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("=== STDOUT ===\n")
         f.write(stdout)
         f.write("\n=== STDERR ===\n")

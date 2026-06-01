@@ -174,7 +174,7 @@ def _read_manifest(config: HfStoreConfig) -> tuple[list[dict[str, Any]], str]:
     except (EntryNotFoundError, RepositoryNotFoundError):
         return [], ""
 
-    text = Path(manifest_local).read_text()
+    text = Path(manifest_local).read_text(encoding="utf-8")
     rows: list[dict[str, Any]] = []
     for line in text.splitlines():
         if not line.strip():
@@ -236,7 +236,7 @@ def push_run(
             for fp in today_tensors_dir.iterdir():
                 if fp.is_file() and fp.suffix == ".pt":
                     shutil.copy2(fp, tensors_out / fp.name)
-        (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         if comparator_report is not None and comparator_report.exists():
             shutil.copy2(comparator_report, run_dir / "comparator_report.jsonl")
 
@@ -268,7 +268,9 @@ def push_run(
 
     new_manifest_path: Optional[str] = None
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tmp_out:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as tmp_out:
             tmp_out.write(existing_text)
             if existing_text and not existing_text.endswith("\n"):
                 tmp_out.write("\n")
@@ -360,7 +362,9 @@ def prune_old_runs(
 
     rewritten: Optional[str] = None
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tmp_out:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as tmp_out:
             for r in kept_rows:
                 tmp_out.write(json.dumps(r) + "\n")
             rewritten = tmp_out.name
