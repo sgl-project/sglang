@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     DEFAULT_VIDEO_SECONDS,
     add_common_data_to_response,
     build_sampling_params,
+    flatten_extra_params,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -77,6 +78,12 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         guidance_scale=request.guidance_scale,
         guidance_scale_2=request.guidance_scale_2,
         negative_prompt=request.negative_prompt,
+        max_sequence_length=request.max_sequence_length,
+        flow_shift=request.flow_shift,
+        use_duration_template=request.use_duration_template,
+        use_resolution_template=request.use_resolution_template,
+        use_system_prompt=request.use_system_prompt,
+        use_guardrails=request.use_guardrails,
         enable_teacache=request.enable_teacache,
         enable_frame_interpolation=request.enable_frame_interpolation,
         frame_interpolation_exp=request.frame_interpolation_exp,
@@ -89,7 +96,35 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_compression=request.output_compression,
         output_quality=request.output_quality,
         perf_dump_path=request.perf_dump_path,
+        diffusers_kwargs=request.diffusers_kwargs,
     )
+
+
+def _reject_unsupported_cosmos3_modes(
+    req: VideoGenerationsRequest, model_path: str | None
+) -> None:
+    if "cosmos3" not in (model_path or "").lower():
+        return
+
+    extra = req.model_extra or {}
+    if req.generate_sound:
+        raise HTTPException(
+            status_code=400,
+            detail="Cosmos3 video-with-sound is not supported by SGLang yet; omit generate_sound for video-only generation.",
+        )
+    if extra.get("action_mode") is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Cosmos3 action generation is not supported by SGLang yet.",
+        )
+    if (
+        extra.get("condition_frame_indexes_vision") is not None
+        or extra.get("condition_video_keep") is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Cosmos3 video-to-video conditioning is not supported by SGLang yet.",
+        )
 
 
 # extract metadata which http_server needs to know
@@ -201,16 +236,26 @@ async def create_video(
     negative_prompt: Optional[str] = Form(None),
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
-    enable_teacache: Optional[bool] = Form(False),
-    enable_frame_interpolation: Optional[bool] = Form(False),
-    frame_interpolation_exp: Optional[int] = Form(1),
-    frame_interpolation_scale: Optional[float] = Form(1.0),
+    max_sequence_length: Optional[int] = Form(None),
+    flow_shift: Optional[float] = Form(None),
+    use_duration_template: Optional[bool] = Form(None),
+    use_resolution_template: Optional[bool] = Form(None),
+    use_system_prompt: Optional[bool] = Form(None),
+    use_guardrails: Optional[bool] = Form(None),
+    generate_sound: Optional[bool] = Form(None),
+    sound_duration: Optional[float] = Form(None),
+    enable_teacache: Optional[bool] = Form(None),
+    enable_frame_interpolation: Optional[bool] = Form(None),
+    frame_interpolation_exp: Optional[int] = Form(None),
+    frame_interpolation_scale: Optional[float] = Form(None),
     frame_interpolation_model_path: Optional[str] = Form(None),
-    enable_upscaling: Optional[bool] = Form(False),
+    enable_upscaling: Optional[bool] = Form(None),
     upscaling_model_path: Optional[str] = Form(None),
-    upscaling_scale: Optional[int] = Form(4),
-    output_quality: Optional[str] = Form("default"),
+    upscaling_scale: Optional[int] = Form(None),
+    output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
+    output_path: Optional[str] = Form(None),
+    extra_params: Optional[str] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
@@ -261,42 +306,85 @@ async def create_video(
         extra_from_form: Dict[str, Any] = {}
         if extra_body:
             try:
-                extra_from_form = json.loads(extra_body)
+                extra_from_form = flatten_extra_params(json.loads(extra_body))
             except Exception:
                 extra_from_form = {}
+        if extra_params:
+            try:
+                extra_from_form.update(
+                    flatten_extra_params({"extra_params": json.loads(extra_params)})
+                )
+            except Exception:
+                pass
 
-        fps_val = fps if fps is not None else extra_from_form.get("fps")
-        num_frames_val = (
-            num_frames if num_frames is not None else extra_from_form.get("num_frames")
-        )
+        def form_value(name: str, value: Any) -> Any:
+            return value if value is not None else extra_from_form.get(name)
+
+        request_field_names = set(VideoGenerationsRequest.model_fields)
+        extra_request_fields = {
+            key: value
+            for key, value in extra_from_form.items()
+            if key not in request_field_names
+        }
+        fps_val = form_value("fps", fps)
+        num_frames_val = form_value("num_frames", num_frames)
 
         req = VideoGenerationsRequest(
             prompt=prompt,
             input_reference=input_path,
-            model=model,
-            n=n,
-            num_outputs_per_prompt=num_outputs_per_prompt,
-            seconds=seconds if seconds is not None else 4,
-            size=size,
+            model=form_value("model", model),
+            n=form_value("n", n),
+            num_outputs_per_prompt=form_value(
+                "num_outputs_per_prompt", num_outputs_per_prompt
+            ),
+            seconds=form_value("seconds", seconds) or 4,
+            size=form_value("size", size),
             fps=fps_val,
             num_frames=num_frames_val,
-            seed=seed,
-            generator_device=generator_device,
-            negative_prompt=negative_prompt,
-            num_inference_steps=num_inference_steps,
-            enable_teacache=enable_teacache,
-            enable_frame_interpolation=enable_frame_interpolation,
-            frame_interpolation_exp=frame_interpolation_exp,
-            frame_interpolation_scale=frame_interpolation_scale,
-            frame_interpolation_model_path=frame_interpolation_model_path,
-            enable_upscaling=enable_upscaling,
-            upscaling_model_path=upscaling_model_path,
-            upscaling_scale=upscaling_scale,
-            output_compression=output_compression,
-            output_quality=output_quality,
-            **(
-                {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
+            seed=form_value("seed", seed),
+            generator_device=form_value("generator_device", generator_device),
+            negative_prompt=form_value("negative_prompt", negative_prompt),
+            num_inference_steps=form_value(
+                "num_inference_steps", num_inference_steps
             ),
+            guidance_scale=form_value("guidance_scale", guidance_scale),
+            max_sequence_length=form_value(
+                "max_sequence_length", max_sequence_length
+            ),
+            flow_shift=form_value("flow_shift", flow_shift),
+            use_duration_template=form_value(
+                "use_duration_template", use_duration_template
+            ),
+            use_resolution_template=form_value(
+                "use_resolution_template", use_resolution_template
+            ),
+            use_system_prompt=form_value("use_system_prompt", use_system_prompt),
+            use_guardrails=form_value("use_guardrails", use_guardrails),
+            generate_sound=form_value("generate_sound", generate_sound),
+            sound_duration=form_value("sound_duration", sound_duration),
+            enable_teacache=form_value("enable_teacache", enable_teacache),
+            enable_frame_interpolation=form_value(
+                "enable_frame_interpolation", enable_frame_interpolation
+            ),
+            frame_interpolation_exp=form_value(
+                "frame_interpolation_exp", frame_interpolation_exp
+            ),
+            frame_interpolation_scale=form_value(
+                "frame_interpolation_scale", frame_interpolation_scale
+            ),
+            frame_interpolation_model_path=form_value(
+                "frame_interpolation_model_path", frame_interpolation_model_path
+            ),
+            enable_upscaling=form_value("enable_upscaling", enable_upscaling),
+            upscaling_model_path=form_value(
+                "upscaling_model_path", upscaling_model_path
+            ),
+            upscaling_scale=form_value("upscaling_scale", upscaling_scale),
+            output_compression=form_value("output_compression", output_compression),
+            output_quality=form_value("output_quality", output_quality),
+            output_path=form_value("output_path", output_path),
+            diffusers_kwargs=form_value("diffusers_kwargs", None),
+            **extra_request_fields,
         )
     else:
         try:
@@ -307,13 +395,17 @@ async def create_video(
             # If client uses extra_body, merge it into the top-level payload
             payload: Dict[str, Any] = dict(body or {})
             extra = payload.pop("extra_body", None)
+            if isinstance(extra, str):
+                extra = json.loads(extra)
             if isinstance(extra, dict):
-                # Shallow-merge: only keys like fps/num_frames are expected
-                payload.update(extra)
+                payload.update(flatten_extra_params(extra))
             # openai may turn extra_body to extra_json
             extra_json = payload.pop("extra_json", None)
+            if isinstance(extra_json, str):
+                extra_json = json.loads(extra_json)
             if isinstance(extra_json, dict):
-                payload.update(extra_json)
+                payload.update(flatten_extra_params(extra_json))
+            flatten_extra_params(payload)
             # Validate image input based on model task type
             has_image_input = payload.get("reference_url") or payload.get(
                 "input_reference"
@@ -355,6 +447,8 @@ async def create_video(
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
+    _reject_unsupported_cosmos3_modes(req, server_args.model_path)
+
     try:
         sampling_params = _build_video_sampling_params(request_id, req)
     except (ValueError, TypeError) as e:
@@ -373,6 +467,22 @@ async def create_video(
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
+        if "max_sequence_length" in req.diffusers_kwargs:
+            batch.max_sequence_length = req.diffusers_kwargs["max_sequence_length"]
+        if "flow_shift" in req.diffusers_kwargs:
+            batch.flow_shift = req.diffusers_kwargs["flow_shift"]
+        extra_params = req.diffusers_kwargs.get("extra_params")
+        if isinstance(extra_params, dict):
+            for key in (
+                "use_duration_template",
+                "use_resolution_template",
+                "use_system_prompt",
+                "use_guardrails",
+            ):
+                if key in extra_params:
+                    setattr(batch, key, extra_params[key])
+            if "guardrails" in extra_params:
+                batch.use_guardrails = extra_params["guardrails"]
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(
         _dispatch_job_async(
@@ -383,6 +493,117 @@ async def create_video(
         )
     )
     return VideoResponse(**job)
+
+
+@router.post("/sync")
+async def create_video_sync(
+    request: Request,
+    prompt: Optional[str] = Form(None),
+    input_reference: Optional[UploadFile] = File(None),
+    reference_url: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+    n: Optional[int] = Form(1),
+    num_outputs_per_prompt: Optional[int] = Form(None),
+    seconds: Optional[int] = Form(None),
+    size: Optional[str] = Form(None),
+    fps: Optional[int] = Form(None),
+    num_frames: Optional[int] = Form(None),
+    seed: Optional[int] = Form(None),
+    generator_device: Optional[str] = Form("cuda"),
+    negative_prompt: Optional[str] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    max_sequence_length: Optional[int] = Form(None),
+    flow_shift: Optional[float] = Form(None),
+    use_duration_template: Optional[bool] = Form(None),
+    use_resolution_template: Optional[bool] = Form(None),
+    use_system_prompt: Optional[bool] = Form(None),
+    use_guardrails: Optional[bool] = Form(None),
+    generate_sound: Optional[bool] = Form(None),
+    sound_duration: Optional[float] = Form(None),
+    enable_teacache: Optional[bool] = Form(None),
+    enable_frame_interpolation: Optional[bool] = Form(None),
+    frame_interpolation_exp: Optional[int] = Form(None),
+    frame_interpolation_scale: Optional[float] = Form(None),
+    frame_interpolation_model_path: Optional[str] = Form(None),
+    enable_upscaling: Optional[bool] = Form(None),
+    upscaling_model_path: Optional[str] = Form(None),
+    upscaling_scale: Optional[int] = Form(None),
+    output_quality: Optional[str] = Form(None),
+    output_compression: Optional[int] = Form(None),
+    output_path: Optional[str] = Form(None),
+    extra_params: Optional[str] = Form(None),
+    extra_body: Optional[str] = Form(None),
+):
+    queued = await create_video(
+        request=request,
+        prompt=prompt,
+        input_reference=input_reference,
+        reference_url=reference_url,
+        model=model,
+        n=n,
+        num_outputs_per_prompt=num_outputs_per_prompt,
+        seconds=seconds,
+        size=size,
+        fps=fps,
+        num_frames=num_frames,
+        seed=seed,
+        generator_device=generator_device,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        max_sequence_length=max_sequence_length,
+        flow_shift=flow_shift,
+        use_duration_template=use_duration_template,
+        use_resolution_template=use_resolution_template,
+        use_system_prompt=use_system_prompt,
+        use_guardrails=use_guardrails,
+        generate_sound=generate_sound,
+        sound_duration=sound_duration,
+        enable_teacache=enable_teacache,
+        enable_frame_interpolation=enable_frame_interpolation,
+        frame_interpolation_exp=frame_interpolation_exp,
+        frame_interpolation_scale=frame_interpolation_scale,
+        frame_interpolation_model_path=frame_interpolation_model_path,
+        enable_upscaling=enable_upscaling,
+        upscaling_model_path=upscaling_model_path,
+        upscaling_scale=upscaling_scale,
+        output_quality=output_quality,
+        output_compression=output_compression,
+        output_path=output_path,
+        extra_params=extra_params,
+        extra_body=extra_body,
+    )
+
+    while True:
+        job = await VIDEO_STORE.get(queued.id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Video not found")
+        if job.get("status") == "failed":
+            detail = (
+                (job.get("error") or {}).get("message")
+                or "Video generation failed"
+            )
+            raise HTTPException(status_code=500, detail=detail)
+        if job.get("status") == "completed":
+            break
+        await asyncio.sleep(1.0)
+
+    accept = request.headers.get("accept", "").lower()
+    if "video/mp4" not in accept:
+        return VideoResponse(**job)
+
+    file_path = job.get("file_path")
+    if not file_path and job.get("file_paths"):
+        file_path = job["file_paths"][0]
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Generated video is not available on local disk; configure output_path or disable cloud cleanup.",
+        )
+    return FileResponse(
+        path=file_path, media_type="video/mp4", filename=os.path.basename(file_path)
+    )
 
 
 @router.get("", response_model=VideoListResponse)

@@ -91,6 +91,8 @@ class Cosmos3TextGuardrailStage(PipelineStage):
         _init_guardrails(offload_to_cpu)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if batch.use_guardrails is False:
+            return batch
         prompt = batch.prompt
         if prompt is None:
             return batch

@@ -9,6 +9,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.registry import get_non_diffusers_pipeline_name
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
 
@@ -207,6 +208,23 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
         params = Cosmos3SamplingParams(prompt="test")
         params._set_output_file_name()
         self.assertEqual(params.data_type, DataType.VIDEO)
+
+
+class TestCosmos3ModelResolution(unittest.TestCase):
+    """Verify Cosmos3 checkpoints resolve to the native SGLang pipeline."""
+
+    def test_hf_checkpoint_resolves_as_non_diffusers_pipeline(self):
+        for model_path in (
+            "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Super",
+            "nvidia/Cosmos3-Super-Text2Image",
+            "nvidia/Cosmos3-Super-Image2Video",
+        ):
+            with self.subTest(model_path=model_path):
+                self.assertEqual(
+                    get_non_diffusers_pipeline_name(model_path),
+                    "Cosmos3OmniDiffusersPipeline",
+                )
 
 
 if __name__ == "__main__":
