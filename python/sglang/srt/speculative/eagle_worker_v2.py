@@ -1388,15 +1388,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _compact_accepted_to_front(
         self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
     ) -> torch.Tensor:
-        """Gather the accepted tree path to the contiguous front of each per-req
-        block of ``speculative_num_draft_tokens``.
+        """Gather the accepted tree path to the front of each per-req block.
 
-        ``x`` is node-indexed over the whole tree (shape ``[bs * num_draft_tokens,
-        ...]``); ``accept_index`` is ``[bs, spec_steps + 1]`` of global node indices
-        (``-1`` padded). The first ``spec_steps + 1`` slots of each block are
-        overwritten with the accepted path; padded (-1) entries clamp to node 0 and
-        land past ``accept_lens``, so they are never read downstream. Trailing slots
-        keep their original (unaccepted) values and are freed as overshoot.
+        ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
+        ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
+        Padded entries clamp to node 0 but land past accept_lens (never read);
+        trailing unaccepted slots stay and are freed as overshoot.
         """
         nd = self.speculative_num_draft_tokens
         s1 = accept_index.shape[1]  # spec_steps + 1
