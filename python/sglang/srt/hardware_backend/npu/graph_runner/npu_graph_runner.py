@@ -81,13 +81,28 @@ def patch_model_npu(
 class NPUGraphRunner(DecodeCudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with NPU graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        *,
+        attn_backend=None,
+        speculative_num_steps: Optional[int] = None,
+        speculative_num_draft_tokens: Optional[int] = None,
+    ):
         # NPU patch_model override: monkey-patch torch_compile_decoration's
         # patch_model with the NPU-specific version.
         from sglang.srt.compilation import torch_compile_decoration
 
         torch_compile_decoration.patch_model = patch_model_npu
-        super().__init__(model_runner)
+        super().__init__(
+            model_runner,
+            attn_backend=attn_backend,
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+        self.update_attr_name = None
+        self.update_attr_type = None
+        self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
 
