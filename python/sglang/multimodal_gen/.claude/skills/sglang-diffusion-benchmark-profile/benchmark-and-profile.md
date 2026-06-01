@@ -99,14 +99,22 @@ Nightly diffusion comparison is server/API based (`sglang serve` plus requests).
 This skill stays on `sglang generate` for local benchmarking and profiling, but
 the nightly-aligned presets in `bench_diffusion_denoise.py` mirror
 `scripts/ci/utils/diffusion/comparison_configs.json` on model, task, prompt,
-reference image, size, frames, seed, GPU count, serve args, and the request
-defaults used by `run_comparison.py` when a case omits steps or guidance.
+reference image, size, frames, seed, GPU count, and SGLang serve args. If
+`comparison_configs.json` omits sampling params such as steps or guidance, the
+nightly-aligned `sglang generate` preset omits them too and relies on the same
+runtime defaults.
 When in doubt, re-check that JSON before trusting this reference.
 
 List the current preset order:
 
 ```bash
 PYTHONPATH=python python3 "$BENCH_PY" --list-models
+```
+
+Check that the nightly presets still match the Nvidia nightly comparison config:
+
+```bash
+PYTHONPATH=python python3 "$BENCH_PY" --validate-nightly-alignment
 ```
 
 Run one preset and save a perf dump:
@@ -168,18 +176,19 @@ Nightly-aligned presets come first; skill-only presets stay available after them
 
 | Preset | Model | Nightly | Notes |
 | --- | --- | --- | --- |
-| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Aligned to nightly prompt plus `--dit-layerwise-offload false` |
-| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Aligned to nightly prompt, 50 steps, guidance 4.0 |
-| `qwen` | `Qwen/Qwen-Image-2512` | Yes: `qwen_image_2512_t2i_1024` | Aligned to nightly prompt and steps |
+| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, `--dit-layerwise-offload false`; no explicit steps/guidance override |
+| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, `--dit-layerwise-offload false`; no explicit steps/guidance override |
+| `qwen` | `Qwen/Qwen-Image-2512` | Yes: `qwen_image_2512_t2i_1024` | Prompt, 1024x1024, seed 42; no explicit steps/guidance override |
 | `qwen-edit` | `Qwen/Qwen-Image-Edit-2511` | Yes: `qwen_image_edit_2511` | Uses the nightly cat image and edit prompt |
-| `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Aligned to nightly prompt and guidance 4.0 |
-| `wan-t2v` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Yes: `wan22_t2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
-| `wan-ti2v` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes: `wan22_ti2v_5b_720p` | Uses the nightly cat image and motion prompt |
-| `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | Uses `LTX2TwoStagePipeline`; 2 GPUs, CFG parallel, 768x512, 121 frames, seed 42 |
-| `ltx23-ti2v-two-stage` | `Lightricks/LTX-2.3` | Yes: `ltx2.3_twostage_ti2v_2gpus` | Uses the nightly cat image, motion prompt, `LTX2TwoStagePipeline`, 2 GPUs, 768x512, 121 frames, seed 42 |
-| `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
+| `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Prompt, 1024x1024, seed 42; no explicit steps/guidance override |
+| `wan-t2v` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Yes: `wan22_t2v_a14b_720p` | 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
+| `wan-ti2v` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes: `wan22_ti2v_5b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, seed 42 |
+| `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | `LTX2TwoStagePipeline`, 2 GPUs, CFG parallel, 768x512, 121 frames, seed 42 |
+| `ltx23-ti2v-two-stage` | `Lightricks/LTX-2.3` | Yes: `ltx2.3_twostage_ti2v_2gpus` | Nightly cat image, motion prompt, `LTX2TwoStagePipeline`, 2 GPUs, `--cfg-parallel-size 2`, 768x512, 121 frames, seed 42 |
+| `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
 | `ltx23-one-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` one-stage baseline; 2 GPUs, 768x512, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution stress preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
+| `ltx23-two-stage-cfg-parallel` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution CFG-parallel stress preset matching `ltx23-two-stage` plus `--cfg-parallel-size 2` |
 | `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only extra preset |
 | `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
 | `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
@@ -203,7 +212,6 @@ sglang generate \
   --prompt="A cat and a dog baking a cake together in a kitchen." \
   --width=768 --height=512 \
   --num-frames=121 \
-  --num-inference-steps=50 --guidance-scale=4.0 \
   --seed=42 --num-gpus=2 --enable-cfg-parallel \
   --save-output --enable-torch-compile --warmup
 ```
@@ -221,8 +229,7 @@ sglang generate \
   --image-path="${ASSET_DIR}/cat.png" \
   --width=768 --height=512 \
   --num-frames=121 \
-  --num-inference-steps=50 --guidance-scale=4.0 \
-  --seed=42 --num-gpus=2 \
+  --seed=42 --num-gpus=2 --cfg-parallel-size=2 \
   --save-output --enable-torch-compile --warmup
 ```
 
@@ -331,8 +338,8 @@ sglang generate \
   --model-path=Wan-AI/Wan2.2-I2V-A14B-Diffusers \
   --prompt="The cat starts walking slowly towards the camera." \
   --image-path="${ASSET_DIR}/cat.png" \
-  --720p --num-inference-steps=2 --num-frames=81 \
-  --guidance-scale=5.0 --seed=42 --save-output \
+  --width=1280 --height=720 --num-frames=81 \
+  --seed=42 --save-output \
   --num-gpus=4 --enable-cfg-parallel --ulysses-degree=2 \
   --text-encoder-cpu-offload --pin-cpu-memory \
   --warmup --enable-torch-compile

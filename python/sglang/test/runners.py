@@ -235,12 +235,12 @@ class HFRunner:
         **kwargs,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.model.model.embed_tokens(input_ids)
+            inputs_embeds = self.model.model.get_input_embeddings()(input_ids)
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.model.visual.get_dtype())
-                image_embeds = self.model.visual(
+                pixel_values = pixel_values.type(self.model.model.visual.get_dtype())
+                image_embeds = self.model.model.visual(
                     pixel_values, grid_thw=image_grid_thw
-                ).to(inputs_embeds.device)
+                ).pooler_output.to(inputs_embeds.device)
                 image_mask = input_ids == self.model.config.image_token_id
                 inputs_embeds[image_mask] = image_embeds
             if attention_mask is not None:
@@ -255,6 +255,7 @@ class HFRunner:
             return_dict=True,
             inputs_embeds=inputs_embeds,
             image_grid_thw=image_grid_thw,
+            **kwargs,
         )
 
         embeddings = outputs.hidden_states[-1][:, -1]
