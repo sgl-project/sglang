@@ -532,7 +532,7 @@ class TestRegressionPriority(ScriptedTestCase):
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
-            priority="low",
+            priority=0,
             ignore_eos=True,
         )
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
@@ -543,7 +543,7 @@ class TestRegressionPriority(ScriptedTestCase):
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
-            priority="high",
+            priority=10,
             ignore_eos=True,
         )
         yield
