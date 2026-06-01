@@ -1650,7 +1650,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 @dataclass
 class CheckWeightsReqInput(BaseReq):
-    action: str
+    action: str = "checksum"
 
 
 @dataclass
