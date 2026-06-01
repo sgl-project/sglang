@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 import torch
 
@@ -37,6 +38,33 @@ from sglang.srt.managers.io_struct import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_draft_model_runner(draft_worker):
+    # EAGLEWorker (v1): draft_model_runner property -> self.model_runner
+    runner = getattr(draft_worker, "draft_model_runner", None)
+    if runner is not None:
+        return runner
+    # EAGLEWorkerV2: _draft_worker.draft_runner
+    inner = getattr(draft_worker, "_draft_worker", None)
+    if inner is not None:
+        runner = getattr(inner, "draft_runner", None)
+        if runner is not None:
+            return runner
+    return None
+
+
+def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
+    merged_checksums = dict(target["checksums"])
+    for name, chk in draft["checksums"].items():
+        merged_checksums[f"draft.{name}"] = chk
+    h = hashlib.sha256()
+    for name in sorted(merged_checksums):
+        h.update(name.encode())
+        h.update(merged_checksums[name].encode())
+    target["checksums"] = merged_checksums
+    target["per_gpu_checksum"] = h.hexdigest()
+    return target
 
 
 @dataclass(kw_only=True, slots=True)
@@ -185,6 +213,21 @@ class SchedulerWeightUpdaterManager:
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
             payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+
+            if self.draft_worker is not None:
+                draft_runner = _get_draft_model_runner(self.draft_worker)
+                if draft_runner is not None:
+                    draft_payload = draft_runner.check_weights(action=recv_req.action)
+                    if payload is not None and draft_payload is not None:
+                        payload = _merge_checksum_payloads(payload, draft_payload)
+
+            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+            if tp_size > 1 and payload is not None:
+                all_payloads = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    all_payloads, payload, group=self.tp_cpu_group
+                )
+                payload = all_payloads
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
