@@ -67,7 +67,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_batch_size = max(
             server_args.chunked_prefill_size * server_args.dp_size,
             max_running_requests * server_args.dp_size,
-            num_tokens,
+            num_tokens * server_args.dp_size,
         )
 
         super().__init__(
