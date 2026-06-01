@@ -167,17 +167,25 @@ class TestInvariantsBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_sustained_long_chunked_load(t: ScriptedContext):
+        # VERY_LONG_PROMPT_LEN == 8 * DEFAULT_CHUNK_SIZE, so each req's prompt is
+        # scheduled across exactly ceil(prompt_len/chunk_size) == 8 chunk iters.
+        expected_chunks_done = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        baseline_kv = t.engine_stats()["kv_pool_free"]
         reqs = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
             for _ in range(30)
         ]
-        for _ in range(DEFAULT_MAX_STEPS * 20):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
-            if all(r.finished for r in reqs):
-                break
-            yield
+        yield from run_until_all_finished(reqs, max_steps=DEFAULT_MAX_STEPS * 20)
         for r in reqs:
             assert r.finished
+            assert r.chunks_done == expected_chunks_done, (
+                f"VERY_LONG_PROMPT_LEN must take exactly {expected_chunks_done} "
+                f"chunks; got chunks_done={r.chunks_done}"
+            )
+        final_kv = t.engine_stats()["kv_pool_free"]
+        assert final_kv >= baseline_kv, (
+            f"KV leak after sustained chunked load: {baseline_kv} -> {final_kv}"
+        )
 
     def test_round_robin_short_and_chunked(self):
         self.server.execute_script(self._script_round_robin_short_and_chunked)
@@ -202,19 +210,29 @@ class TestInvariantsBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_long_decode_then_many_short(t: ScriptedContext):
-        long_decode = t.start_req(prompt_len=16, max_new_tokens=256)
+        # The long req's prompt is VERY_LONG_PROMPT_LEN == 8 * DEFAULT_CHUNK_SIZE,
+        # so it really chunks (ceil(prompt_len/chunk_size) == 8) and then has a
+        # long decode tail while the many short reqs interleave through the batch.
+        expected_chunks_done = VERY_LONG_PROMPT_LEN // DEFAULT_CHUNK_SIZE
+        long_max_new_tokens = 256
+        long_decode = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=long_max_new_tokens,
+            ignore_eos=True,
+        )
         shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(50)]
         all_reqs = [long_decode] + shorts
-        for _ in range(DEFAULT_MAX_STEPS * 20):
-            assert (
-                t.scheduler.chunked_req.rid
-                if t.scheduler.chunked_req is not None
-                else None
-            ) is None
-            if all(r.finished for r in all_reqs):
-                return
-            yield
-        raise AssertionError("not all reqs finished")
+        yield from run_until_all_finished(all_reqs, max_steps=DEFAULT_MAX_STEPS * 20)
+        for r in all_reqs:
+            assert r.finished
+        assert long_decode.chunks_done == expected_chunks_done, (
+            f"long req must chunk across exactly {expected_chunks_done} chunks; "
+            f"got chunks_done={long_decode.chunks_done}"
+        )
+        assert len(long_decode.req.output_ids) == long_max_new_tokens, (
+            f"ignore_eos long req must decode exactly {long_max_new_tokens} "
+            f"tokens; got len(output_ids)={len(long_decode.req.output_ids)}"
+        )
 
     def test_engine_stats_monotone_after_each_batch(self):
         self.server.execute_script(self._script_engine_stats_monotone_after_each_batch)
