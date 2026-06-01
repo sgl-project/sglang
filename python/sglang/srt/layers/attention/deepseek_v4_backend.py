@@ -49,9 +49,9 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.jit_kernel.dsv4.online_c128_mtp import (
-    online_c128_mtp_commit,
-    online_c128_mtp_compute_accept_lens,
+    online_c128_mtp_lazy_commit,
     online_c128_mtp_prepare,
+    online_c128_mtp_write_prefix_states,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -347,12 +347,6 @@ class _GraphBucket(enum.Enum):
 
 
 @dataclass
-class _OnlineC128VerifyLayerState:
-    pre_state: torch.Tensor
-    kv_score_input: Optional[torch.Tensor] = None
-
-
-@dataclass
 class _OnlineC128LayerRuntime:
     layer_id: int
     compressor: Any
@@ -367,7 +361,6 @@ class _OnlineC128LayerRuntime:
 class _OnlineC128VerifyContext:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
-    layer_states: Dict[int, _OnlineC128VerifyLayerState] = field(default_factory=dict)
 
 
 class DeepseekV4AttnBackend(
@@ -423,12 +416,6 @@ class DeepseekV4AttnBackend(
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
         self._online_c128_verify_ctx: Optional[_OnlineC128VerifyContext] = None
-        self._online_c128_capture_key: Optional[Tuple[_GraphBucket, int]] = None
-        self._online_c128_replay_key: Optional[Tuple[_GraphBucket, int]] = None
-        self._online_c128_kv_score_refs: Dict[
-            Tuple[_GraphBucket, int, int], torch.Tensor
-        ] = {}
-        self._online_c128_pre_state_buffers: Dict[int, torch.Tensor] = {}
         self._online_c128_compressors: Optional[List[Tuple[int, Any]]] = None
         self._online_c128_layer_runtimes: Optional[List[_OnlineC128LayerRuntime]] = None
 
@@ -455,36 +442,13 @@ class DeepseekV4AttnBackend(
             return 0
         return self.token_to_kv_pool.get_online_c128_mtp_state_slot_offset()
 
+    def _online_c128_mtp_max_draft_tokens(self) -> int:
+        if not self._online_c128_mtp_enabled():
+            return 0
+        return self.token_to_kv_pool.get_online_c128_mtp_max_draft_tokens()
+
     def _clear_online_c128_verify_context(self) -> None:
         self._online_c128_verify_ctx = None
-
-    def _get_online_c128_kv_score_ref(
-        self, layer_id: int
-    ) -> Optional[torch.Tensor]:
-        graph_key = self._online_c128_replay_key
-        if graph_key is None:
-            return None
-        return self._online_c128_kv_score_refs.get((*graph_key, layer_id))
-
-    def _get_online_c128_pre_state_buffer(
-        self,
-        layer_id: int,
-        bs: int,
-        width: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        buffer = self._online_c128_pre_state_buffers.get(layer_id)
-        if (
-            buffer is None
-            or buffer.shape[0] < bs
-            or buffer.shape[1] != width
-            or buffer.dtype != dtype
-            or buffer.device != device
-        ):
-            buffer = torch.empty((bs, width), dtype=dtype, device=device)
-            self._online_c128_pre_state_buffers[layer_id] = buffer
-        return buffer[:bs]
 
     def _set_online_c128_verify_context(
         self,
@@ -500,18 +464,10 @@ class DeepseekV4AttnBackend(
         )
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
             # Empty DP ranks may still replay a TARGET_VERIFY graph bucket with
-            # padded bs=1. Do not redirect c128 compressor state to the MTP temp
-            # pool when there is no real request state to prepare.
+            # padded bs=1. Do not touch MTP state banks when there is no real
+            # request state to prepare.
             return
         self._prepare_online_c128_verify_layers()
-
-    def _get_online_c128_layer_state(
-        self, layer_id: int
-    ) -> Optional[_OnlineC128VerifyLayerState]:
-        ctx = self._online_c128_verify_ctx
-        if ctx is None:
-            return None
-        return ctx.layer_states.get(layer_id)
 
     def _iter_online_c128_layers(self):
         if self._online_c128_compressors is None:
@@ -557,31 +513,19 @@ class DeepseekV4AttnBackend(
         swa_page_size = token_to_kv_pool.swa_page_size
 
         for runtime in self._iter_online_c128_layer_runtimes():
-            pre_state = self._get_online_c128_pre_state_buffer(
-                runtime.layer_id,
-                bs,
-                runtime.state_width,
-                dtype=runtime.main_state.dtype,
-                device=runtime.main_state.device,
-            )
             online_c128_mtp_prepare(
                 seq_lens=ctx.seq_lens,
                 req_pool_indices=ctx.req_pool_indices,
                 req_to_token=req_to_token,
                 full_to_swa_index_mapping=full_to_swa_index_mapping,
                 main_state=runtime.main_state,
-                pre_state=pre_state,
                 bs=bs,
                 swa_page_size=swa_page_size,
                 temp_state_slot_offset=runtime.temp_state_slot_offset,
                 state_width=runtime.state_width,
             )
-            ctx.layer_states[runtime.layer_id] = _OnlineC128VerifyLayerState(
-                pre_state=pre_state,
-                kv_score_input=self._get_online_c128_kv_score_ref(runtime.layer_id),
-            )
 
-    def capture_online_c128_verify_inputs(
+    def write_online_c128_mtp_prefix_states(
         self,
         layer_id: int,
         compressor,
@@ -596,23 +540,39 @@ class DeepseekV4AttnBackend(
             or compressor.ratio != 128
         ):
             return
-        layer_state = self._get_online_c128_layer_state(layer_id)
-        if layer_state is None:
+        ctx = self._online_c128_verify_ctx
+        if ctx is None or ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
             return
-        graph_key = self._online_c128_capture_key
-        if graph_key is not None and torch.cuda.is_current_stream_capturing():
-            # During CUDA graph capture, kv_score_input is backed by the graph's
-            # static output buffer. Reuse it directly so replay does not need an
-            # extra captured D2D copy into a side buffer.
-            layer_state.kv_score_input = kv_score_input.detach()
-            self._online_c128_kv_score_refs[(*graph_key, layer_id)] = (
-                layer_state.kv_score_input
-            )
-        else:
-            # Non-graph verify commits immediately after target forward. Holding
-            # a detached reference keeps the tensor storage alive and avoids a
-            # per-layer D2D clone/copy in the hot path.
-            layer_state.kv_score_input = kv_score_input.detach()
+        if kv_score_input.numel() == 0:
+            return
+
+        head_dim = compressor.head_dim
+        num_verify_tokens = int(self.speculative_num_draft_tokens)
+        max_draft_tokens = self._online_c128_mtp_max_draft_tokens()
+        if num_verify_tokens <= 0 or num_verify_tokens > max_draft_tokens:
+            return
+
+        token_to_kv_pool = self.token_to_kv_pool
+        state_pool = token_to_kv_pool.get_attention_compress_states(layer_id)
+        total_bs = kv_score_input.numel() // (num_verify_tokens * head_dim * 2)
+        layer_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0], total_bs)
+        if layer_bs <= 0:
+            return
+
+        online_c128_mtp_write_prefix_states(
+            kv_score_input=kv_score_input,
+            seq_lens=ctx.seq_lens,
+            req_pool_indices=ctx.req_pool_indices,
+            req_to_token=self.req_to_token,
+            full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
+            ape=compressor.ape.reshape(128, head_dim),
+            state=state_pool.kv_score_buffer.kv_score,
+            layer_bs=layer_bs,
+            swa_page_size=token_to_kv_pool.swa_page_size,
+            num_verify_tokens=num_verify_tokens,
+            state_slot_stride=state_pool.online_mtp_state_slot_offset,
+            head_dim=head_dim,
+        )
 
     def _commit_pending_online_c128_state(
         self,
@@ -631,97 +591,39 @@ class DeepseekV4AttnBackend(
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
             return
 
-        cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
-        cur_seq_lens = seq_lens.to(ctx.seq_lens.device)
-        matches = ctx.req_pool_indices[:, None] == cur_req_pool_indices[None, :]
-        matched_seq_lens = torch.where(
-            matches,
-            cur_seq_lens[None, :].to(ctx.seq_lens.dtype),
-            ctx.seq_lens[:, None],
-        ).max(dim=1).values
-        delta_lens = matched_seq_lens.to(torch.int64) - ctx.seq_lens.to(torch.int64)
-        accept_lens = torch.clamp(
-            delta_lens, min=0, max=int(self.speculative_num_draft_tokens)
-        )
-        self.update_online_c128_state_after_mtp_verify(
-            accept_lens=accept_lens,
-            model=self.model_runner.model,
-        )
-
-    def update_online_c128_state_after_mtp_verify(
-        self,
-        accept_lens: torch.Tensor,
-        model,
-    ) -> bool:
-        del model
-        if not self._online_c128_mtp_enabled():
-            return False
-
-        ctx = self._online_c128_verify_ctx
-        if ctx is None or accept_lens.numel() == 0:
-            self._clear_online_c128_verify_context()
-            return False
-        if ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
-            self._clear_online_c128_verify_context()
-            return False
-
-        accept_lens_i64 = (
-            accept_lens if accept_lens.dtype == torch.int64 else accept_lens.to(torch.int64)
-        )
-        actual_bs = accept_lens_i64.shape[0]
         num_verify_tokens = int(self.speculative_num_draft_tokens)
+        max_draft_tokens = self._online_c128_mtp_max_draft_tokens()
+        if num_verify_tokens <= 0 or num_verify_tokens > max_draft_tokens:
+            self._clear_online_c128_verify_context()
+            return
 
-        ctx_seq_lens = ctx.seq_lens
-        ctx_req_pool_indices = ctx.req_pool_indices
-        ctx_seq_lens_bs = ctx_seq_lens.shape[0]
-        ctx_req_pool_bs = ctx_req_pool_indices.shape[0]
         req_to_token = self.req_to_token
         token_to_kv_pool = self.token_to_kv_pool
         full_to_swa_index_mapping = token_to_kv_pool.full_to_swa_index_mapping
         swa_page_size = token_to_kv_pool.swa_page_size
-        committed = False
+        cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
+        cur_seq_lens = seq_lens.to(ctx.seq_lens.device)
+        old_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0])
+        cur_bs = min(cur_seq_lens.shape[0], cur_req_pool_indices.shape[0])
 
         for runtime in self._iter_online_c128_layer_runtimes():
-            layer_id = runtime.layer_id
-            layer_state = ctx.layer_states.get(layer_id)
-            if layer_state is None or layer_state.kv_score_input is None:
-                continue
-
-            kv_score_input = layer_state.kv_score_input
-            head_dim = runtime.head_dim
-            if kv_score_input.numel() == 0:
-                continue
-
-            total_bs = kv_score_input.numel() // (num_verify_tokens * head_dim * 2)
-            layer_bs = min(
-                actual_bs,
-                ctx_seq_lens_bs,
-                ctx_req_pool_bs,
-                layer_state.pre_state.shape[0],
-                total_bs,
-            )
-            if layer_bs == 0:
-                continue
-
-            online_c128_mtp_commit(
-                kv_score_input=kv_score_input,
-                pre_state=layer_state.pre_state,
-                accept_lens=accept_lens_i64,
-                seq_lens=ctx_seq_lens,
-                req_pool_indices=ctx_req_pool_indices,
+            online_c128_mtp_lazy_commit(
+                old_seq_lens=ctx.seq_lens,
+                old_req_pool_indices=ctx.req_pool_indices,
+                cur_seq_lens=cur_seq_lens,
+                cur_req_pool_indices=cur_req_pool_indices,
                 req_to_token=req_to_token,
                 full_to_swa_index_mapping=full_to_swa_index_mapping,
-                ape=runtime.ape,
-                main_state=runtime.main_state,
-                layer_bs=layer_bs,
+                state=runtime.main_state,
+                old_bs=old_bs,
+                cur_bs=cur_bs,
                 swa_page_size=swa_page_size,
                 num_verify_tokens=num_verify_tokens,
-                head_dim=head_dim,
+                head_dim=runtime.head_dim,
+                state_slot_stride=runtime.temp_state_slot_offset,
             )
-            committed = True
 
         self._clear_online_c128_verify_context()
-        return committed
 
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(
@@ -1145,11 +1047,6 @@ class DeepseekV4AttnBackend(
         assert seq_lens.size(0) == bs
 
         bucket = _GraphBucket.of(forward_mode)
-        self._online_c128_capture_key = (
-            (bucket, bs)
-            if self._online_c128_mtp_enabled() and bucket == _GraphBucket.TARGET_VERIFY
-            else None
-        )
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             dummy_cache_loc = torch.zeros_like(seq_lens)
         elif bucket == _GraphBucket.TARGET_VERIFY:
@@ -1246,15 +1143,11 @@ class DeepseekV4AttnBackend(
             verify_req_pool_indices = req_pool_indices[:verify_bs]
             verify_seq_lens = seq_lens[:verify_bs]
             if self._online_c128_mtp_enabled() and verify_bs == 0:
-                self._online_c128_replay_key = None
                 self._clear_online_c128_verify_context()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
                     bucket
                 ][bs]
                 return
-            self._online_c128_replay_key = (
-                (bucket, bs) if self._online_c128_mtp_enabled() else None
-            )
             self._commit_pending_online_c128_state(
                 req_pool_indices=verify_req_pool_indices,
                 seq_lens=verify_seq_lens,
@@ -1313,7 +1206,6 @@ class DeepseekV4AttnBackend(
         self.replay_cuda_graph_metadata_from(
             bs=bs, temp_metadata=temp_metadata, bucket=bucket
         )
-        self._online_c128_replay_key = None
 
     def replay_cuda_graph_metadata_from(
         self,

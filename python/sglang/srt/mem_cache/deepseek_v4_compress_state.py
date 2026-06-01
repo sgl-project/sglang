@@ -95,13 +95,19 @@ class CompressStatePool:
         self.swa_page_size = swa_page_size
         self.enable_memory_saver = enable_memory_saver
         self.online_mtp_state_slot_offset = 0
+        self.online_mtp_max_draft_tokens = 0
 
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
             self._logical_size = size + self.ring_size + 1
             if envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+                # Bank 0 is the committed state. Banks 1..8 cache per-draft
+                # prefix states for lazy commit after target verify.
+                self.online_mtp_max_draft_tokens = 8
                 self.online_mtp_state_slot_offset = self._logical_size
-            self._size = self._logical_size + self.online_mtp_state_slot_offset
+            self._size = self._logical_size * (
+                1 + self.online_mtp_max_draft_tokens
+            )
             last_dim = 3 * head_dim
         else:
             self._size = size + self.ring_size + 1

@@ -481,13 +481,6 @@ class CompressorBackendMixin:
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
-        if hasattr(self, "capture_online_c128_verify_inputs"):
-            self.capture_online_c128_verify_inputs(
-                layer_id=layer_id,
-                compressor=compressor,
-                kv_score_input=kv_score_input,
-                forward_batch=forward_batch,
-            )
 
         state_pool = compressor.get_state_pool(self, forward_batch)
         if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
@@ -525,6 +518,13 @@ class CompressorBackendMixin:
                 compress_ratio=compressor.ratio,
                 page_size=page_size,
                 out_loc=out_loc,
+            )
+        if hasattr(self, "write_online_c128_mtp_prefix_states"):
+            self.write_online_c128_mtp_prefix_states(
+                layer_id=layer_id,
+                compressor=compressor,
+                kv_score_input=kv_score_input,
+                forward_batch=forward_batch,
             )
 
     def _forward_unified_hip(

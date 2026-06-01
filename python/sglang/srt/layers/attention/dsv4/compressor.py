@@ -422,7 +422,7 @@ class Compressor(nn.Module):
         kv_score_buffer = self.get_state_pool(
             attn_backend, forward_batch
         ).kv_score_buffer.kv_score
-        return attn_backend.forward_compress(
+        kv_compressed = attn_backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score,
             ape=self.ape.view(-1, self.head_dim),
@@ -434,6 +434,14 @@ class Compressor(nn.Module):
             forward_batch=forward_batch,
             is_paged=True,
         )
+        if hasattr(attn_backend, "write_online_c128_mtp_prefix_states"):
+            attn_backend.write_online_c128_mtp_prefix_states(
+                layer_id=self.layer_id,
+                compressor=self,
+                kv_score_input=kv_score,
+                forward_batch=forward_batch,
+            )
+        return kv_compressed
 
 
 if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():

@@ -648,6 +648,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 return int(pool.online_mtp_state_slot_offset)
         return 0
 
+    def get_online_c128_mtp_max_draft_tokens(self) -> int:
+        for pool in self.compress_state_pools:
+            if pool is not None and pool.ratio == 128:
+                return int(pool.online_mtp_max_draft_tokens)
+        return 0
+
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
