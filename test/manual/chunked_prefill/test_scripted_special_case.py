@@ -140,8 +140,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield
 
         assert (
-            (1 if t._scheduler.chunked_req is not None else 0) == 0
-        ), f"abort must clear in-flight count; got {(1 if t._scheduler.chunked_req is not None else 0)}"
+            1 if t._scheduler.chunked_req is not None else 0
+        ) == 0, f"abort must clear in-flight count; got {(1 if t._scheduler.chunked_req is not None else 0)}"
         assert (
             t._scheduler.chunked_req.rid
             if t._scheduler.chunked_req is not None
@@ -190,11 +190,15 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         saw_chunking_match = False
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking and (
-                t._scheduler.chunked_req.rid
-                if t._scheduler.chunked_req is not None
-                else None
-            ) == r.rid:
+            if (
+                r.is_chunking
+                and (
+                    t._scheduler.chunked_req.rid
+                    if t._scheduler.chunked_req is not None
+                    else None
+                )
+                == r.rid
+            ):
                 saw_chunking_match = True
             if r.finished:
                 break
@@ -456,12 +460,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert (
-            (
-                t._scheduler.req_to_token_pool.size
-                - t._scheduler.req_to_token_pool.available_size()
-            )
-            <= baseline_rows
-        ), f"row leak under forced chunked admission: baseline={baseline_rows}, after={(t._scheduler.req_to_token_pool.size - t._scheduler.req_to_token_pool.available_size())}"
+            t._scheduler.req_to_token_pool.size
+            - t._scheduler.req_to_token_pool.available_size()
+        ) <= baseline_rows, f"row leak under forced chunked admission: baseline={baseline_rows}, after={(t._scheduler.req_to_token_pool.size - t._scheduler.req_to_token_pool.available_size())}"
 
     def test_stage_a_inflight_middle_chunks_sync_invariant(self):
         self.server.execute_script(

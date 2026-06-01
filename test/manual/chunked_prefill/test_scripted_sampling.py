@@ -117,7 +117,8 @@ class TestSamplingBasic(ScriptedTestCase):
         assert r.chunks_done >= 2
         assert len(r.req.output_ids) == 16
         assert r.req.finished_reason == "length", (
-            f"ignore_eos=True must finish via length cap; got " f"{r.req.finished_reason!r}"
+            f"ignore_eos=True must finish via length cap; got "
+            f"{r.req.finished_reason!r}"
         )
 
     def test_stop_str_chunked(self):
@@ -200,7 +201,8 @@ class TestSamplingBasic(ScriptedTestCase):
         assert list(r1.req.output_ids) == list(r2.req.output_ids)
         assert len(r1.req.output_ids) == 4
         assert r2.req.cached_tokens > 0, (
-            f"r2 must hit r1's radix prefix; got cached_tokens=" f"{r2.req.cached_tokens}"
+            f"r2 must hit r1's radix prefix; got cached_tokens="
+            f"{r2.req.cached_tokens}"
         )
 
     def test_return_logprob_top_logprobs_chunked(self):
