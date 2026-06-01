@@ -45,7 +45,7 @@ export const Qwen3CoderDeployment = () => {
       mi300x: { tp: 8 },
       mi325x: { tp: 8 },
       mi355x: { tp: 8 },
-      b200: { tp: 8 },
+      b200: { tp: 8, ep: 8 },
       gb200: { tp: 4, ep: 4 }
     },
     '30b': {
