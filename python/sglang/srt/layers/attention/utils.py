@@ -10,7 +10,9 @@ FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SI
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import concat_mla_absorb_q
+    from sglang.jit_kernel.concat_mla import concat_mla_absorb_q
+
+from sglang.jit_kernel.utils import is_arch_support_pdl
 
 
 @triton.jit
@@ -462,6 +464,7 @@ def mla_quantize_and_rope_for_fp8(
         # Quantization scales (set to 1.0 for no additional scaling)
         quant_scale_q=1.0,
         quant_scale_kv=1.0,
+        enable_pdl=is_arch_support_pdl(),
     )
 
     return q_out, k_nope_out, k_rope_out

@@ -13,7 +13,9 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -58,7 +60,6 @@ logger = init_logger(__name__)
 
 
 class CausalWanSelfAttention(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -251,7 +252,6 @@ class CausalWanSelfAttention(nn.Module):
 
 
 class CausalWanTransformerBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -429,7 +429,7 @@ class CausalWanTransformerBlock(nn.Module):
         return hidden_states
 
 
-class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
+class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -660,10 +660,13 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape
@@ -802,10 +805,13 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape
