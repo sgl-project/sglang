@@ -138,6 +138,11 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "chunkTotal > 0 ? numFrames / chunkTotal" in app_js
     assert "encodedImageElementFallback" in app_js
     assert "handleEncodedPreviewDecodeError" in app_js
+    launch_server_py = (
+        repo_root
+        / "python/sglang/multimodal_gen/runtime/launch_server.py"
+    ).read_text()
+    assert "ws_per_message_deflate=False" in launch_server_py
     assert "if (b === 0xca)" in app_js
     assert "if (b === 0xcb)" in app_js
     assert "if (b === 0xc4)" in app_js
