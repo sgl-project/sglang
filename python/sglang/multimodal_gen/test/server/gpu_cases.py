@@ -171,6 +171,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt="A red cube on a white table, product photo.",
             output_size="832x480",
+            output_format="png",
             extras={
                 "num_inference_steps": 1,
                 "seed": 0,
