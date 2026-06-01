@@ -28,9 +28,9 @@ export const DeepSeekV31Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', default: true, required: true },
-        { id: 'dp', label: 'DP attention', default: false },
-        { id: 'ep', label: 'EP', default: false },
-        { id: 'mtp', label: 'Multi-token Prediction', default: false }
+        { id: 'dp', label: 'DP attention', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
+        { id: 'ep', label: 'EP', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
+        { id: 'mtp', label: 'Multi-token Prediction', default: false, disabledWhen: (v) => v.hardware === 'xeon' }
       ]
     },
     reasoningParser: {
@@ -92,6 +92,16 @@ export const DeepSeekV31Deployment = () => {
         if (m && m.xeonOnly) {
           next.modelname = options.modelname.items.find(i => !i.xeonOnly && i.default)?.id || 'v31';
         }
+      }
+      if (optionName === 'hardware') {
+        const strategyItems = options.strategy.items || [];
+        const current = Array.isArray(next.strategy) ? next.strategy : [];
+        next.strategy = current.filter(id => {
+          const item = strategyItems.find(s => s.id === id);
+          if (!item) return false;
+          if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) return false;
+          return true;
+        });
       }
       return next;
     });
@@ -186,10 +196,11 @@ export const DeepSeekV31Deployment = () => {
             {option.type === 'checkbox' ? (
               option.items.map(item => {
                 const isChecked = (values[option.name] || []).includes(item.id);
-                const isDisabled = item.required;
+                const dynDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
+                const isDisabled = item.required || dynDisabled;
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
+                  <label key={item.id} title={dynDisabled ? 'Not supported on the selected hardware' : ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => !dynDisabled && handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>

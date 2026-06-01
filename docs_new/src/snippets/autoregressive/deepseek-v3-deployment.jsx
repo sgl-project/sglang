@@ -28,9 +28,9 @@ export const DeepSeekV3Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false },
-        { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: false }
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
+        { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
       ]
     },
     thinking: {
@@ -85,7 +85,20 @@ export const DeepSeekV3Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware') {
+        const strategyItems = options.strategy.items || [];
+        const current = Array.isArray(next.strategy) ? next.strategy : [];
+        next.strategy = current.filter(id => {
+          const item = strategyItems.find(s => s.id === id);
+          if (!item) return false;
+          if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) return false;
+          return true;
+        });
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -161,10 +174,11 @@ export const DeepSeekV3Deployment = () => {
             {option.type === 'checkbox' ? (
               option.items.map(item => {
                 const isChecked = (values[option.name] || []).includes(item.id);
-                const isDisabled = item.required;
+                const dynDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
+                const isDisabled = item.required || dynDisabled;
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
+                  <label key={item.id} title={dynDisabled ? 'Not supported on the selected hardware' : ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => !dynDisabled && handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>
