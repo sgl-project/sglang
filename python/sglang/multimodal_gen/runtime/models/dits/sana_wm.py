@@ -1588,6 +1588,146 @@ def _single_path_delta_scan_bidirectional(
     return out_fwd + out_bwd
 
 
+# ---------------------------------------------------------------------------
+# Chunk-causal cached scans — the per-chunk combiners used by the streaming
+# `forward_long` path. They mirror the reference `recurrent_gdn_cached` /
+# `recurrent_delta_cached`: the FORWARD (inclusive) pass carries recurrent state
+# across chunks (via the `_stateful` scans above); the BACKWARD (exclusive) pass
+# is recomputed intra-chunk and stateless (identical `_flip_and_shift` to the
+# bidirectional scans). So a single chunk with no carried state reduces exactly
+# to `_gdn_scan_bidirectional` / `_single_path_delta_scan_bidirectional`, while a
+# sequence processed chunk-by-chunk stays continuous in the forward direction.
+# ---------------------------------------------------------------------------
+
+
+def _gdn_scan_cached(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    init_state_kv: Optional[torch.Tensor] = None,
+    init_state_z: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Chunk-causal main-branch GDN scan for streaming `forward_long`.
+
+    Mirrors the reference ``recurrent_gdn_cached``: the forward pass seeds/returns
+    ``(state_kv, state_z)`` so chunks stay continuous; the backward pass is
+    intra-chunk and stateless (same flip/shift as ``_gdn_scan_bidirectional``).
+    Returns ``(out, (state_kv, state_z))``.
+    """
+    (num_fwd, den_fwd), (state_kv, state_z) = _gdn_scan_forward_stateful(
+        q,
+        k,
+        v,
+        q_rot,
+        k_rot,
+        beta,
+        decay,
+        init_state_kv=init_state_kv,
+        init_state_z=init_state_z,
+        eps=eps,
+        return_components=True,
+        return_state=True,
+    )
+
+    B, H, D, N = q.shape
+    T = beta.shape[2]
+    S = N // T
+
+    def to_time(x, d):
+        return x.view(B, H, d, T, S).permute(0, 1, 3, 2, 4)
+
+    def from_time(x, d):
+        return x.permute(0, 1, 3, 2, 4).reshape(B, H, d, N)
+
+    q_bwd = from_time(torch.flip(to_time(q, D), dims=[2]), D)
+    q_rot_bwd = from_time(torch.flip(to_time(q_rot, D), dims=[2]), D)
+    k_bwd = from_time(_flip_and_shift(to_time(k, D), dim=2, shift_val=0.0), D)
+    v_bwd = from_time(_flip_and_shift(to_time(v, D), dim=2, shift_val=0.0), D)
+    k_rot_bwd = from_time(_flip_and_shift(to_time(k_rot, D), dim=2, shift_val=0.0), D)
+    beta_bwd = _flip_and_shift(beta, dim=2, shift_val=0.0)
+    decay_bwd = _flip_and_shift(decay, dim=2, shift_val=1.0)
+
+    num_bwd_flipped, den_bwd_flipped = _gdn_scan_forward(
+        q_bwd,
+        k_bwd,
+        v_bwd,
+        q_rot_bwd,
+        k_rot_bwd,
+        beta_bwd,
+        decay_bwd,
+        eps=eps,
+        return_components=True,
+    )
+
+    def flip_back(tensor, d):
+        return torch.flip(tensor.view(B, H, d, T, S), dims=[3]).reshape(B, H, d, N)
+
+    num_bwd = flip_back(num_bwd_flipped, D)
+    den_bwd = flip_back(den_bwd_flipped, 1)
+    out = (num_fwd + num_bwd) / (den_fwd + den_bwd + eps)
+    return out, (state_kv, state_z)
+
+
+def _single_path_delta_scan_cached(
+    q_rot: torch.Tensor,
+    k_rot: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    init_state_kv: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunk-causal camera single-path delta scan for streaming `forward_long`.
+
+    Mirrors the reference ``recurrent_delta_cached``: forward pass carries
+    ``state_kv`` across chunks; backward pass is intra-chunk/stateless. Returns
+    ``(out, state_kv)``.
+    """
+    out_fwd, state_kv = _single_path_delta_scan_forward_stateful(
+        q_rot,
+        k_rot,
+        v,
+        beta,
+        decay,
+        init_state_kv=init_state_kv,
+        return_state=True,
+    )
+
+    B, H, D, N = q_rot.shape
+    T = beta.shape[2]
+    S = N // T
+
+    def to_time(x):
+        return x.view(B, H, D, T, S).permute(0, 1, 3, 2, 4)
+
+    def from_time(x):
+        return x.permute(0, 1, 3, 2, 4).reshape(B, H, D, N)
+
+    q_rot_bwd = from_time(torch.flip(to_time(q_rot), dims=[2]))
+    k_rot_bwd = from_time(_flip_and_shift(to_time(k_rot), dim=2, shift_val=0.0))
+    v_bwd = from_time(_flip_and_shift(to_time(v), dim=2, shift_val=0.0))
+    beta_bwd = _flip_and_shift(beta, dim=2, shift_val=0.0)
+    decay_bwd = _flip_and_shift(decay, dim=2, shift_val=1.0)
+
+    out_bwd_flipped = _single_path_delta_scan_forward(
+        q_rot_bwd,
+        k_rot_bwd,
+        v_bwd,
+        beta_bwd,
+        decay_bwd,
+    )
+    out_bwd = torch.flip(out_bwd_flipped.view(B, H, D, T, S), dims=[3]).reshape(
+        B, H, D, N
+    )
+    return out_fwd + out_bwd, state_kv
+
+
 def _downscale_to_reference_rms(
     ref: torch.Tensor,
     transformed: torch.Tensor,
