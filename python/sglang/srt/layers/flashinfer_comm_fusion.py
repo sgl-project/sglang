@@ -75,9 +75,7 @@ if is_flashinfer_available():
             comm, "create_allreduce_fusion_workspace"
         ):
             _flashinfer_comm = comm
-            _create_allreduce_fusion_workspace = (
-                comm.create_allreduce_fusion_workspace
-            )
+            _create_allreduce_fusion_workspace = comm.create_allreduce_fusion_workspace
             workspace_params = inspect.signature(
                 comm.create_allreduce_fusion_workspace
             ).parameters
@@ -202,13 +200,9 @@ def _make_flashinfer_workspace_allocation_prop(cuda_driver):
     from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
     if is_mnnvl_fabric_supported(torch.cuda.current_device()):
-        handle_type = (
-            cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        )
+        handle_type = cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
     else:
-        handle_type = (
-            cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        )
+        handle_type = cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
 
     prop = cuda_driver.CUmemAllocationProp()
     prop.requestedHandleTypes = handle_type

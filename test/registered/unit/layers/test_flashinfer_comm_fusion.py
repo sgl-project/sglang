@@ -118,7 +118,9 @@ class TestFlashInferCommFusion(unittest.TestCase):
                     )
 
                     with (
-                        patch.object(fusion, "is_flashinfer_available", return_value=True),
+                        patch.object(
+                            fusion, "is_flashinfer_available", return_value=True
+                        ),
                         patch.object(
                             fusion,
                             "get_attn_tensor_model_parallel_world_size",
