@@ -89,38 +89,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
             # while other backends remain unchanged.
-            if self.head_dim != self.v_head_dim:
-                self.k_buffer = [
-                    torch.zeros(
-                        (
-                            self.size // self.page_size + 1,
-                            self.page_size,
-                            self.head_num,
-                            self.head_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (
-                            self.size // self.page_size + 1,
-                            self.page_size,
-                            self.head_num,
-                            self.v_head_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-            else:
-                self.kv_buffer = torch.zeros(
+            self.k_buffer = [
+                torch.zeros(
                     (
-                        2,
-                        self.layer_num,
                         self.size // self.page_size + 1,
                         self.page_size,
                         self.head_num,
@@ -129,21 +100,30 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                self.k_buffer = self.kv_buffer[0]
-                self.v_buffer = self.kv_buffer[1]
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        self.head_num,
+                        self.v_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
 
             if self.use_fia:
-                self.k_buffer = []
-                self.v_buffer = []
                 for i in range(self.layer_num):
-                    k_buffer_layer = self.kv_buffer[0][i].view(
+                    self.k_buffer[i] = self.k_buffer[i].view(
                         -1, 1, self.head_num, self.head_dim
                     )
-                    v_buffer_layer = self.kv_buffer[1][i].view(
+                    self.v_buffer[i] = self.v_buffer[i].view(
                         -1, 1, self.head_num, self.v_head_dim
                     )
-                    self.k_buffer.append(k_buffer_layer)
-                    self.v_buffer.append(v_buffer_layer)
 
     # for disagg
     def get_contiguous_buf_infos(self):

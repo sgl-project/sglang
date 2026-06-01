@@ -281,7 +281,7 @@ class MiMoV2MoE(nn.Module):
 
         # todo : implement tbo forward needed
         if (
-            get_moe_a2a_backend().is_deepep() 
+            get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
@@ -301,7 +301,7 @@ class MiMoV2MoE(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() 
+            get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
@@ -1123,16 +1123,13 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            output = self.model(
+            hidden_states, hidden_states_before_norm = self.model(
                 input_ids,
                 positions,
                 forward_batch,
                 input_embeds,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            if isinstance(output, PPProxyTensors):
-                return output
-            hidden_states, hidden_states_before_norm = output[:2]
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
