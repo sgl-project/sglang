@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(

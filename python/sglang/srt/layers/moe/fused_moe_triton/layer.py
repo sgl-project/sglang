@@ -70,6 +70,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    print_info_once,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -82,7 +83,14 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    if (
+        a2a_backend.is_none()
+        or a2a_backend.is_megamoe()
+        or a2a_backend.is_ascend_fuseep()
+    ):
+        # ascend_fuseep bypasses the dispatcher abstraction (see
+        # forward_fuseep in hardware_backend/npu/moe/fuseep.py); a
+        # StandardDispatcher is created but never invoked.
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -106,19 +114,6 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
-    elif a2a_backend.is_ascend_fuseep():
-        from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
-
-        return NpuFuseEPDispatcher(
-            group=get_tp_group().device_group,
-            router_topk=moe_runner_config.top_k,
-            permute_fusion=True,
-            num_experts=moe_runner_config.num_experts,
-            num_local_experts=moe_runner_config.num_local_experts,
-            hidden_size=moe_runner_config.hidden_size,
-            params_dtype=moe_runner_config.params_dtype,
-        )
-
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -223,6 +218,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+
         self.use_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -307,6 +303,17 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
+
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            or get_moe_runner_backend().is_flashinfer_trtllm()
+        ):
+            if self.moe_runner_config.inplace:
+                print_info_once(
+                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
+                )
+            self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
@@ -459,6 +466,8 @@ class FusedMoE(torch.nn.Module):
             start = 0
 
         if self.use_padded_loading:
+            if _is_cpu and is_bias:
+                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -528,6 +537,8 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
 
         if self.use_padded_loading:
+            if _is_cpu and is_bias:
+                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -627,13 +638,25 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        if self._has_fused_shared and expert_id >= self._num_global_routed:
-            # This is a shared expert.
-            physical_expert_ids = [expert_id]
+        require_global_experts = getattr(param, "_sglang_require_global_experts", False)
+        shared_expert_id = (
+            expert_id - global_expert_location_metadata.num_logical_experts
+            if self._has_fused_shared and expert_id is not None
+            else -1
+        )
+        if 0 <= shared_expert_id < self.num_fused_shared_experts:
+            # Checkpoint shared experts start after logical routed experts, while
+            # local fused MoE weights store them after physical routed experts.
+            if require_global_experts and is_deepep_class_backend():
+                physical_expert_ids = [
+                    rank * self.num_local_experts
+                    + self._num_local_routed
+                    + shared_expert_id
+                    for rank in range(self.moe_ep_size)
+                ]
+            else:
+                physical_expert_ids = [self._num_global_routed + shared_expert_id]
         else:
-            require_global_experts = getattr(
-                param, "_sglang_require_global_experts", False
-            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
                     self.layer_id, expert_id, require_global_experts
@@ -1035,6 +1058,10 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if self._use_ascend_fuseep:
+            from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
+
+            return forward_fuseep(self, hidden_states, topk_output)
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(

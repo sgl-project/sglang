@@ -64,6 +64,9 @@ class HiCacheNixl(HiCacheStorage):
         )
 
         self.is_mla_model = storage_config.is_mla_model
+        self.is_zero_copy = False
+        self.storage_config = storage_config
+        self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
 
@@ -284,6 +287,11 @@ class HiCacheNixl(HiCacheStorage):
         target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
+
+        # skip on MLA backup rank
+        if self.backup_skip:
+            return True
+
         if not keys or (not values and (not target_locations or not target_sizes)):
             logger.error("Keys or values were not passed")
             return False
@@ -342,8 +350,8 @@ class HiCacheNixl(HiCacheStorage):
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
             key_denominator = (
-                1 if not self.is_mla_model else 2
-            )  # MLA model only has k buffer, no separate v buffer
+                1 if self.is_mla_model else 2
+            )  # MLA: 1 key per page (_k only), non-MLA: 2 NIXL keys per page (_k + _v)
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
             key_denominator = 1
@@ -602,6 +610,10 @@ class HiCacheNixl(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+
+        # skip on MLA backup rank
+        if self.backup_skip:
+            return [True] * len(keys)
 
         if len(keys) == 0:
             return []
