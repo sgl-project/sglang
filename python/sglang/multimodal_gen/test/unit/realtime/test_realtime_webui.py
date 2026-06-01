@@ -22,7 +22,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";' in app_js
     assert 'id="transportFormat"' in index_html
     assert 'id="fps" type="number" value="25"' in index_html
-    assert 'id="frameInterpolation" type="checkbox" checked' in index_html
+    assert 'id="frameInterpolation" type="checkbox" />' in index_html
     assert (
         'id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate"'
         in index_html
@@ -41,7 +41,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-fixes-v25" in index_html
-    assert "app.js?v=realtime-fixes-v29" in index_html
+    assert "app.js?v=realtime-fixes-v30" in index_html
     assert (
         'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";'
         in app_js
