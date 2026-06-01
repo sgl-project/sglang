@@ -244,15 +244,20 @@ class SpecSlotParams:
 class AdaptiveSpeculativeParams:
     """Routes ``batch_size`` to the correct per-BS ``SpecSlotParams``."""
 
-    def __init__(self, cfg_path: str | None = None):
+    def __init__(
+        self,
+        initial_steps: int,
+        cfg_path: str | None = None,
+    ):
         cfg, bs_entries = _load_adaptive_config(cfg_path)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, SpecSlotParams] = {}
         for bs, entry in sorted(bs_entries.items()):
             merged = {**cfg, **entry}
-            steps = merged["candidate_steps"]
+            # SpecSlotParams handles fallback internally: if initial_steps
+            # is not in this slot's candidate_steps, it snaps to the middle.
             self._slots[bs] = SpecSlotParams(
-                initial_steps=steps[len(steps) // 2],
+                initial_steps=initial_steps,
                 bs_cfg=merged,
             )
         self._cuda_graph_bs: list[int] | None = None

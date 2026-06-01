@@ -1,4 +1,3 @@
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -14,8 +13,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
         EAGLEDraftExtendCudaGraphRunner,
     )
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,13 +74,11 @@ class AdaptiveController:
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
         self.worker = worker
-        self.params = AdaptiveSpeculativeParams(config_path)
-        self._states: dict[int, SpecRuntimeState] = {}
-
-        logger.info(
-            f"AdaptiveController initialized: "
-            f"candidate_steps={self.candidate_steps}"
+        self.params = AdaptiveSpeculativeParams(
+            initial_steps=worker.speculative_num_steps,
+            cfg_path=config_path,
         )
+        self._states: dict[int, SpecRuntimeState] = {}
 
     @property
     def candidate_steps(self) -> list[int]:
