@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
@@ -14,6 +15,12 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 _LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
 _LORA_ADAPTER_B = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test-b"
+
+
+def _expected_lora_id(adapter_path: str) -> str:
+    # Bare-string --lora-paths entries derive their id from (path, path); see
+    # ServerArgs LoRA parsing. The per-request lora_id is this uuid5 hex, not the path.
+    return LoRARef.deterministic_id(adapter_path, adapter_path)
 
 
 class TestLoRAOverlapSingleAdapter(ScriptedTestCase):
@@ -71,8 +78,8 @@ class TestLoRAOverlapH2dDuringChunk(ScriptedTestCase):
         yield from run_until_all_finished(handles=[r_a, r_b], max_steps=1200)
         assert r_a.finished and r_b.finished
         assert r_a.chunks_done >= 2 and r_b.chunks_done >= 2
-        assert r_a.req.lora_id == _LORA_ADAPTER
-        assert r_b.req.lora_id == _LORA_ADAPTER_B
+        assert r_a.req.lora_id == _expected_lora_id(_LORA_ADAPTER)
+        assert r_b.req.lora_id == _expected_lora_id(_LORA_ADAPTER_B)
 
 
 class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
@@ -108,12 +115,15 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
         t.abort(r_b)
         yield
 
-        assert r_b.kv_pages == 0
-        assert r_b.lock_refs == 0
+        # An aborted req may be fully dropped from the scheduler (req is None);
+        # only assert KV/lock release while it is still live to avoid dereferencing None.
+        if r_b.req is not None:
+            assert r_b.kv_pages == 0
+            assert r_b.lock_refs == 0
         # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         yield from run_until_finished(r_a, max_steps=800)
         assert r_a.finished
-        assert r_a.req.lora_id == _LORA_ADAPTER
+        assert r_a.req.lora_id == _expected_lora_id(_LORA_ADAPTER)
 
     def test_lora_overlap_back_to_back_adapters_chunked(self):
         self.server.execute_script(
@@ -131,11 +141,12 @@ class TestLoRAOverlapAdapterRotation(ScriptedTestCase):
             )
             for adapter in adapters
         ]
+        expected_ids = [_expected_lora_id(adapter) for adapter in adapters]
         yield from run_until_all_finished(handles=reqs, max_steps=2400)
         assert all(r.finished for r in reqs)
         assert all(r.chunks_done >= 2 for r in reqs)
-        for r, adapter in zip(reqs, adapters):
-            assert r.req.lora_id == adapter
+        for r, expected_id in zip(reqs, expected_ids):
+            assert r.req.lora_id == expected_id
 
 
 if __name__ == "__main__":
