@@ -56,6 +56,24 @@ logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
 
 
+def apply_token_bitmask_inplace_torch(
+    logits: torch.Tensor,
+    bitmask: torch.Tensor,
+) -> None:
+    """Backend-agnostic torch fallback for packed-bitmask application.
+
+    This path is currently used as a fallback on NPU in xgrammar backend.
+    """
+    vocab_size = logits.shape[-1]
+    bitmask_cpu = bitmask.detach().cpu()
+    token_ids = torch.arange(vocab_size, device="cpu", dtype=torch.int32)
+    word_idx = token_ids // 32
+    bit_idx = token_ids % 32
+    words = bitmask_cpu[:, word_idx].to(torch.int32)
+    allowed = ((words >> bit_idx) & 1).to(torch.bool)
+    allowed = allowed.to(logits.device, non_blocking=True)
+    logits.masked_fill_(~allowed, float("-inf"))
+
 class XGrammarGrammar(BaseGrammarObject):
 
     def __init__(
@@ -119,6 +137,8 @@ class XGrammarGrammar(BaseGrammarObject):
             import sgl_kernel_npu  # noqa: F401
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        elif logits.device.type == "cpu":
+            apply_token_bitmask_inplace_torch(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
