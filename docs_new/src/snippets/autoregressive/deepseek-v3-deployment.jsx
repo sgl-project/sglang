@@ -10,7 +10,8 @@ export const DeepSeekV3Deployment = () => {
         { id: 'b200', label: 'B200', default: true },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     quantization: {
@@ -103,28 +104,35 @@ export const DeepSeekV3Deployment = () => {
     const { hardware, quantization, strategy, thinking, toolcall } = values;
     const strategyArray = Array.isArray(strategy) ? strategy : [];
 
-    // Validation - H100/H200/MI300X/MI325X only supports FP8
-    if (['h100', 'h200', 'mi300x', 'mi325x'].includes(hardware) && quantization === 'fp4') {
-      return '# Error: This hardware only supports FP8 quantization\n# Please select FP8 quantization or use B200/MI355X hardware';
+    // Validation - H100/H200/MI300X/MI325X/XEON only support FP8
+    if (['h100', 'h200', 'mi300x', 'mi325x', 'xeon'].includes(hardware) && quantization === 'fp4') {
+      return '# Error: This hardware does not support FP4 quantization\n# Please select FP8 quantization or use B200/MI355X hardware';
     }
 
     const modelPath = quantization === 'fp4' ? 'nvidia/DeepSeek-V3-0324-NVFP4' : 'deepseek-ai/DeepSeek-V3';
+    const isXeon = hardware === 'xeon';
 
     let cmd = 'python3 -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelPath}`;
 
-    if (strategyArray.includes('tp')) cmd += ' \\\n  --tp 8';
-    if (strategyArray.includes('dp')) cmd += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
-    if (strategyArray.includes('ep')) cmd += ' \\\n  --ep 8';
-    if (strategyArray.includes('mtp')) {
+    if (strategyArray.includes('tp')) cmd += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
+    if (strategyArray.includes('dp')) cmd += isXeon ? ' \\\n  --dp 6 \\\n  --enable-dp-attention' : ' \\\n  --dp 8 \\\n  --enable-dp-attention';
+    if (strategyArray.includes('ep')) cmd += isXeon ? ' \\\n  --ep 6' : ' \\\n  --ep 8';
+    if (strategyArray.includes('mtp') && !isXeon) {
       cmd = 'SGLANG_ENABLE_SPEC_V2=1 ' + cmd;
       cmd += ' \\\n  --speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4';
     }
 
-    cmd += ' \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable';
+    if (!isXeon) {
+      cmd += ' \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable';
+    }
 
     if (hardware === 'b200') {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3 # Optional: enables fp8 kv cache and fp8 attention kernels';
+    }
+
+    if (isXeon) {
+      cmd += ' \\\n  --device cpu \\\n  --disable-overlap-schedule';
     }
 
     if (thinking === 'enabled') cmd += ' \\\n  --reasoning-parser deepseek-v3';

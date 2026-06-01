@@ -10,13 +10,15 @@ export const DeepSeekR1BasicDeployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false },
       ],
     },
     quantization: {
       name: 'quantization',
       title: 'Quantization',
       getDynamicItems: (values) => {
-        const fp4Disabled = values.hardware === 'h100' || values.hardware === 'mi300x';
+        const isXeon = values.hardware === 'xeon';
+        const fp4Disabled = values.hardware === 'h100' || values.hardware === 'mi300x' || isXeon;
         return [
           { id: 'fp8', label: 'FP8', default: true },
           {
@@ -24,7 +26,16 @@ export const DeepSeekR1BasicDeployment = () => {
             label: 'FP4',
             default: false,
             disabled: fp4Disabled,
-            disabledReason: 'H100 and MI300X only support FP8 quantization',
+            disabledReason: isXeon
+              ? 'Intel Xeon CPUs do not support FP4 quantization'
+              : 'H100 and MI300X only support FP8 quantization',
+          },
+          {
+            id: 'int8',
+            label: 'INT8',
+            default: false,
+            disabled: !isXeon,
+            disabledReason: 'INT8 is only available when XEON hardware is selected',
           },
         ];
       },
@@ -88,25 +99,34 @@ export const DeepSeekR1BasicDeployment = () => {
     if ((hardware === 'h100' || hardware === 'mi300x') && quantization === 'fp4') {
       return '# Error: H100 and MI300X only support FP8 quantization';
     }
+    if (hardware === 'xeon' && quantization === 'fp4') {
+      return '# Error: Intel Xeon CPUs do not support FP4 quantization\n# Please select FP8 or INT8 quantization';
+    }
+    if (quantization === 'int8' && hardware !== 'xeon') {
+      return '# Error: INT8 quantization is only supported on Intel Xeon CPUs\n# Please select XEON hardware';
+    }
 
+    const isXeon = hardware === 'xeon';
     const modelPath =
       quantization === 'fp4'
         ? 'nvidia/DeepSeek-R1-0528-FP4-v2'
+        : quantization === 'int8'
+        ? 'Conexis/DeepSeek-R1-0528-Channel-INT8'
         : 'deepseek-ai/DeepSeek-R1-0528';
 
     let command = 'python3 -m sglang.launch_server \\\n';
     command += `  --model-path ${modelPath}`;
 
     if (strategyValues.includes('tp')) {
-      command += ' \\\n  --tp 8';
+      command += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
     }
     if (strategyValues.includes('dp')) {
-      command += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
+      command += isXeon ? ' \\\n  --dp 6 \\\n  --enable-dp-attention' : ' \\\n  --dp 8 \\\n  --enable-dp-attention';
     }
     if (strategyValues.includes('ep')) {
-      command += ' \\\n  --ep 8';
+      command += isXeon ? ' \\\n  --ep 6' : ' \\\n  --ep 8';
     }
-    if (strategyValues.includes('mtp')) {
+    if (strategyValues.includes('mtp') && !isXeon) {
       command = 'SGLANG_ENABLE_SPEC_V2=1 ' + command;
       command +=
         ' \\\n  --speculative-algorithm EAGLE' +
@@ -115,11 +135,17 @@ export const DeepSeekR1BasicDeployment = () => {
         ' \\\n  --speculative-num-draft-tokens 4';
     }
 
-    command += ' \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable';
+    if (!isXeon) {
+      command += ' \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable';
+    }
 
     if (hardware === 'b200' || (hardware === 'mi355x' && quantization === 'fp8')) {
       command +=
         ' \\\n  --kv-cache-dtype fp8_e4m3 # Optional: enables fp8 kv cache and fp8 attention kernels to improve performance';
+    }
+
+    if (isXeon) {
+      command += ' \\\n  --device cpu \\\n  --disable-overlap-schedule';
     }
 
     if (thinking === 'enabled') {
