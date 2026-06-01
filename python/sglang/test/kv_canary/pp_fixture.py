@@ -19,11 +19,11 @@ class CanaryPPFixture(CanaryE2EBase):
     """Single SWA server launched with pp_size=2 and kv-canary enabled."""
 
     model_mode: ClassVar[str] = "swa"
-    # PP advances the SWA-divergence counter per micro-batch and the reporter samples
-    # a single micro-batch's forward, so one batch can leave swa_out_of_window_tokens=0
-    # at the last sample. Drive several sequential batches so a sample lands on a
-    # forward that still holds an out-of-window prefix and the full divergence
-    # assertion fires without being relaxed.
+    # swa_out_of_window_tokens only becomes non-zero once a request decodes past the SWA
+    # window and the window evicts; CanaryE2EBase forces ignore_eos for swa fixtures so
+    # every request reaches that point regardless of PP/eager decode-length numerics. Drive
+    # two sequential batches so the SWA allocator also recycles slots across batches and
+    # swa_full_idx_divergence (the pool-reuse signal) is exercised, not just the window slide.
     workload_n_batches: ClassVar[int] = 2
 
     @classmethod
