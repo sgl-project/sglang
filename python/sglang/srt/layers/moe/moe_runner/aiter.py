@@ -56,6 +56,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     doweight_stage1: bool = False
     hidden_pad: int = 0
     intermediate_pad: int = 0
+    swiglu_limit: float = 0.0
     gate_mode: str = "separated"
 
 
@@ -117,6 +118,7 @@ class AiterRunnerCore(MoeRunnerCore):
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
         from aiter.fused_moe import fused_moe
+        from aiter.ops.flydsl.moe_common import GateMode
 
         a1_scale = (
             runner_input.a1_scale
@@ -129,6 +131,14 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        # Single source of truth for gate_mode. The MXFP4 (GPT-OSS) path sets
+        # quant_info.gate_mode from the activation type; the FP8/DSv4 path drives
+        # it via swiglu_limit. swiglu_limit > 0 implies the interleaved gate/up
+        # layout, so force INTERLEAVE there to preserve the original behavior.
+        gate_mode = quant_info.gate_mode
+        if quant_info.swiglu_limit > 0:
+            gate_mode = GateMode.INTERLEAVE.value
+            extra["swiglu_limit"] = quant_info.swiglu_limit
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -148,7 +158,7 @@ class AiterRunnerCore(MoeRunnerCore):
             doweight_stage1=quant_info.doweight_stage1,
             hidden_pad=quant_info.hidden_pad,
             intermediate_pad=quant_info.intermediate_pad,
-            gate_mode=quant_info.gate_mode,
+            gate_mode=gate_mode,
             **extra,
         )
         return AiterRunnerOutput(hidden_states=output)
