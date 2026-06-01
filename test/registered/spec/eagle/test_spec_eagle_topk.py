@@ -33,13 +33,8 @@ class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogp
 
 
 class TestEagle3Topk16SpecV2(TestEagle3Topk16, SpecFeatureKit):
-    """EAGLE3 topk=16 tree on spec v2 (overlap, page1).
-
-    topk>1 + page_size==1 stays on the overlap (v2) worker. Exercises the v2
-    tree-drafting path: accepted-path compaction to the per-req block front,
-    validated by logprob_spec_v2_match (decode logprobs == prefill scoring).
-    SpecFeatureKit adds radix / concurrent-abort / constrained on this path.
-    """
+    """EAGLE3 topk=16 tree on spec v2 (overlap, page1): guards the v2 tree path's
+    accepted-path compaction, validated by logprob_spec_v2_match."""
 
     disable_overlap = False
 

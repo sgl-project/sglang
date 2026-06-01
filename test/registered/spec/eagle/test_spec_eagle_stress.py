@@ -41,11 +41,8 @@ class TestEagleLlama2Retract(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
 
 
 class TestEagle3Topk16V2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
-    """EAGLE3 topk=16 tree on spec v2 under retract; must not leak KV.
-
-    Directly stresses the accepted-path KV move (move_accepted_tokens_to_target_
-    kvcache) and out_cache_loc fills on the tree-drafting path.
-    """
+    """EAGLE3 topk=16 tree on spec v2 under retract; must not leak KV. Stresses
+    the accepted-path KV move (move_accepted_tokens_to_target_kvcache)."""
 
     spec_topk = 16
     spec_tokens = 64
