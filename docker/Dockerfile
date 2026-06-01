@@ -785,6 +785,9 @@ COPY --from=framework_final /sgl-workspace /sgl-workspace
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
 
+# Copy sglang binary
+COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
+
 # Copy py-spy binary
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
 
