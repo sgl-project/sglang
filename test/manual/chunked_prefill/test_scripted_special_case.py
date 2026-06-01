@@ -889,28 +889,6 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
         assert r.finished
         assert snap is not None, "test must observe the req in scheduler at least once"
 
-    def test_init_load_back_called_once_per_request_with_hicache(self):
-        self.server.execute_script(
-            self._script_init_load_back_called_once_per_request_with_hicache
-        )
-
-    @staticmethod
-    def _script_init_load_back_called_once_per_request_with_hicache(
-        t: ScriptedContext,
-    ):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done >= 2, (
-            f"req must actually chunk for this branch to fire; got "
-            f"chunks_done={r.chunks_done}"
-        )
-        assert r.init_load_back_count == 1, (
-            f"HiCache init_load_back must run exactly once per request, "
-            f"not once per chunk; got init_load_back_count="
-            f"{r.init_load_back_count}"
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

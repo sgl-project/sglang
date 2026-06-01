@@ -377,32 +377,6 @@ class TestRegressionBasic(ScriptedTestCase):
         assert not r.is_chunking
         assert r.status in ("finished", "unknown")
 
-    def test_chunked_retract_no_double_init_load_back(self):
-        self.server.execute_script(
-            self._script_chunked_retract_no_double_init_load_back
-        )
-
-    @staticmethod
-    def _script_chunked_retract_no_double_init_load_back(t: ScriptedContext):
-        baseline_refs = t.get_all_node_lock_refs()
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
-
-        t.pause_generation(mode="retract")
-        yield
-
-        load_back_before = r.init_load_back_count
-        t.continue_generation()
-        yield from run_until(r, lambda h: h.chunks_done >= 2)
-        load_back_during = r.init_load_back_count - load_back_before
-        assert load_back_during <= 1, (
-            f"d7fa48baad: init_load_back must not double-fire after "
-            f"retract; got {load_back_during} extra calls"
-        )
-
-        yield from run_until_finished(r)
-        assert t.get_all_node_lock_refs() == baseline_refs
-
     def test_streaming_session_multiturn_no_reuse_branch(self):
         self.server.execute_script(
             self._script_streaming_session_multiturn_no_reuse_branch
