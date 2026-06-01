@@ -1615,7 +1615,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
-            if poll == KVPoll.Success:
+            elif poll == KVPoll.Success:
                 if (
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING

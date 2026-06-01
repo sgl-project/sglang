@@ -211,6 +211,17 @@ class DecodeHiCacheTransferMixin:
         )
         # Failback: total coverage < required prefix means device alloc likely failed.
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+            logger.warning(
+                "HiCache load_back failed for rid=%s: device_indices=%d, "
+                "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
+                dr.req.rid,
+                len(rematch.device_indices),
+                len(new_indices),
+                pm.decode_prefix_len,
+                pm.l1_prefix_len,
+                pm.l2_host_hit_length,
+                pm.l3_storage_hit_length,
+            )
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
 
