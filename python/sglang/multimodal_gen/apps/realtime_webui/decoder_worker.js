@@ -1,6 +1,8 @@
 const RAW_RGB_CONTENT_TYPE = "application/x-raw-rgb";
 const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
 const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
+const WEBP_FRAME_CONTENT_TYPE = "image/webp";
+const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 
 let lastFrame = null;
 
@@ -78,9 +80,42 @@ function rawFramesToRgbaBuffers(header, payload) {
   return buffers;
 }
 
+async function encodedFrameToRgbaBuffers(header, payload) {
+  if (typeof createImageBitmap === "undefined" || typeof OffscreenCanvas === "undefined") {
+    throw new Error("This browser does not support worker image decoding");
+  }
+
+  const blob = new Blob([payload], { type: header.content_type });
+  const bitmap = await createImageBitmap(blob);
+  const width = bitmap.width;
+  const height = bitmap.height;
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext("2d", { alpha: false });
+  ctx.drawImage(bitmap, 0, 0);
+  const image = ctx.getImageData(0, 0, width, height);
+  bitmap.close?.();
+  return {
+    width,
+    height,
+    frames: [image.data.buffer],
+  };
+}
+
 async function decode(header, payload) {
   let rawPayload;
-  if (header.content_type === RAW_RGB_CONTENT_TYPE) {
+  if (
+    header.content_type === WEBP_FRAME_CONTENT_TYPE ||
+    header.content_type === JPEG_FRAME_CONTENT_TYPE
+  ) {
+    const decoded = await encodedFrameToRgbaBuffers(header, payload);
+    return {
+      id: header.__decode_id,
+      width: decoded.width,
+      height: decoded.height,
+      chunk: Number(header.chunk_index),
+      frames: decoded.frames,
+    };
+  } else if (header.content_type === RAW_RGB_CONTENT_TYPE) {
     rawPayload = new Uint8Array(payload);
     const frameBytes = Number(header.bytes_per_frame);
     const count = Number(header.num_frames);

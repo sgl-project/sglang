@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SGLD Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v8" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v10" />
   </head>
   <body>
     <main class="shell">
@@ -41,6 +41,10 @@
         <div class="split">
           <label>Steps<input id="steps" type="number" value="70" min="1" /></label>
           <label>Guidance<input id="guidance" type="number" value="5" step="0.1" /></label>
+        </div>
+        <div class="split">
+          <label>Sink<input id="sinkSize" type="number" value="9" min="0" /></label>
+          <label>Window<input id="windowFrames" type="number" value="18" min="1" /></label>
         </div>
         <label class="toggle-row"><input id="continuous" type="checkbox" checked />Continuous session</label>
         <div class="actions">
@@ -130,6 +134,6 @@
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-    <script src="./app.js?v=realtime-fixes-v8"></script>
+    <script src="./app.js?v=realtime-fixes-v10"></script>
 </body>
 </html>
