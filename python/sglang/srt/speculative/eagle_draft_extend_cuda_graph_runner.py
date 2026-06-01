@@ -433,10 +433,18 @@ class EAGLEDraftExtendCudaGraphRunner:
                 spec_info=spec_info,
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
-            self._capture_init(run_once)
-            out = self._capture_graph(
-                graph, get_global_graph_memory_pool(), stream, run_once
+
+            canary_ctx = (
+                c.with_active_single_forward_manager(0)
+                if (c := self.model_runner.canary_manager) is not None
+                else contextlib.nullcontext()
             )
+            with canary_ctx:
+                self._capture_init(run_once)
+
+                out = self._capture_graph(
+                    graph, get_global_graph_memory_pool(), stream, run_once
+                )
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out

@@ -562,11 +562,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
+        if self.server_args.tokenizer_worker_num > 1:
+            self._attach_multi_http_worker_info(obj)
         self._init_req_state(obj, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
-        if self.server_args.tokenizer_worker_num > 1:
-            self._attach_multi_http_worker_info(obj)
 
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
@@ -1749,6 +1749,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
+            # Surface scheduler load info on each response so clients can do
+            # response-based flow control without polling /v1/loads. The
+            # scheduler already piggy-backs the per-DP-rank load on
+            # BatchStrOutput / BatchTokenIDOutput via the ``load`` field.
+            load = getattr(recv_obj, "load", None)
+            if load is not None:
+                num_running_reqs = getattr(load, "num_running_reqs", None)
+                num_waiting_reqs = getattr(load, "num_waiting_reqs", None)
+                if num_running_reqs is not None:
+                    meta_info["num_running_reqs"] = num_running_reqs
+                if num_waiting_reqs is not None:
+                    meta_info["num_waiting_reqs"] = num_waiting_reqs
+
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
@@ -1784,7 +1797,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ]
 
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                hidden_states = recv_obj.output_hidden_states[i]
+                if hidden_states is not None:
+                    meta_info["hidden_states"] = hidden_states
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
