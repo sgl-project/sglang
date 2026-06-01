@@ -104,7 +104,9 @@ def organize_draft_results(
         parent_list = torch.cat(parents_list[:-1], dim=1)
     else:
         batch_size = parents_list[0].shape[0]
-        parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+        parent_list = torch.empty(
+            batch_size, 0, dtype=torch.long, device=parents_list[0].device
+        )
 
     return parent_list, top_scores_index, draft_tokens
 

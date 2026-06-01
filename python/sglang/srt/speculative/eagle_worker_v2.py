@@ -58,6 +58,7 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
+    organize_draft_results,
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -602,34 +603,9 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list = self._topk1_parents_prealloc[:bs]
             return parent_list, top_scores_index, draft_tokens
 
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        return organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        maybe_detect_oob(
-            top_scores_index,
-            0,
-            ss_token_list.shape[1],
-            "draft_forward: top_scores_index OOB for gather on ss_token_list",
-        )
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(
-                batch_size, 0, dtype=torch.long, device=parents_list[0].device
-            )
-
-        return parent_list, top_scores_index, draft_tokens
 
     def draft_extend(self):
         pass
