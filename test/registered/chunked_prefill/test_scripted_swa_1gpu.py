@@ -24,11 +24,15 @@ _SWA_MODEL = "openai/gpt-oss-20b"
 # Retract requests." retractions; while a chunked req is mid-prefill, the SWA
 # pool exhausts (and the retract's new_token_ratio jump inflates the running
 # batch's reserved-decode offset), so the chunked req's next add_chunked_req
-# early-returns -- parking it (self.chunked_req set, _chunked_req_scheduled_last_iter
-# False). Which candidate gets parked depends on the exact churn, so we feed
-# chunked candidates until one is observed parked, then assert the stash gate
-# left no radix lock refs after the engine drains. On the un-gated (buggy) code
-# the spurious stash double-frees and crashes the scheduler (KV-canary).
+# early-returns -- parking it (the scheduler keeps it as chunked_req but does not
+# run it in the batch). We detect the park purely from observed batch composition
+# (t.chunked_parks: an iteration whose chunked_rid is this req yet the req is
+# absent from the batch that ran), so the test does not depend on any internal
+# scheduler scheduling flag. Which candidate gets parked depends on the exact
+# churn, so we feed chunked candidates until one is observed parked, then assert
+# the stash gate left no radix lock refs after the engine drains. On the un-gated
+# (buggy) code the spurious stash double-frees and crashes the scheduler
+# (KV-canary).
 _MAX_TOTAL_TOKENS = 4096
 _SWA_FULL_TOKENS_RATIO = 0.1
 _CHUNK_SIZE = 64
@@ -92,11 +96,7 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
                 prompt_token=2,
             )
             for _ in range(_STEPS_PER_CANDIDATE):
-                if (
-                    s.chunked_req is not None
-                    and s.chunked_req.rid == r.rid
-                    and not s._chunked_req_scheduled_last_iter
-                ):
+                if t.chunked_parks(r.rid) > 0:
                     parked = True
                     break
                 if r.finished:
