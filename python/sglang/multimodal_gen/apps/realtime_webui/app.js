@@ -439,6 +439,14 @@ function trimLiveQueue(latestFrameCount) {
   droppedFrames += dropCount;
 }
 
+function liveQueueFrameFloor(header, decodedFrameCount) {
+  const frameBatchCount = Number(header.num_frame_batches || 1);
+  if (!isEncodedPreviewContentType(header.content_type) || frameBatchCount <= 1) {
+    return decodedFrameCount;
+  }
+  return Math.max(decodedFrameCount, frameBatchCount * decodedFrameCount);
+}
+
 function trimQueueForPendingEvent() {
   const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
   const keep = Math.max(1, Math.round(targetFps * EVENT_QUEUE_SECONDS));
@@ -1007,7 +1015,7 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
     awaitedEventSentAt = 0;
   }
   queue.push(...decodedFrames);
-  trimLiveQueue(chunkFrameCount);
+  trimLiveQueue(liveQueueFrameFloor(header, chunkFrameCount));
   frames += chunkFrameCount;
   bytes += payloadBytes;
   $("payloadMode").textContent = header.encoding || "raw RGB";
