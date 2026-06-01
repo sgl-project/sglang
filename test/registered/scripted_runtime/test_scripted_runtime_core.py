@@ -139,9 +139,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=_DECODE_MAX_NEW_TOKENS
         )
         yield from advance_to_decode_step(r, 1)
-        req = r.req
-        assert req is not None, "req vanished before pause(retract)"
-        frozen = len(req.output_ids)
+        assert r.req is not None, "req vanished before pause(retract)"
 
         t.pause_generation(mode="retract")
         yield
@@ -151,6 +149,11 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             req is not None and req in t.scheduler.waiting_queue
         ), f"pause(retract) did not park the req in waiting_queue; found {req!r}"
 
+        # Capture the frozen length only after the retract has settled: the overlap
+        # scheduler completes the one forward already in flight when pause is
+        # requested, so output_ids advances by one before generation halts. From
+        # here on the paused engine must not advance the req any further.
+        frozen = len(req.output_ids)
         for _ in range(3):
             yield
             req = r.req
@@ -543,11 +546,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             max_new_tokens=_DECODE_MAX_NEW_TOKENS,
             ignore_eos=True,
         )
-        # The prefill (extend) batch samples the first output token, so output_len
-        # 1 is reached at end-of-prefill -- one step before the req is merged into
-        # the running batch for decode. Advance to output_len 2 to land in a real
-        # decode step where the engine is unambiguously non-idle.
-        yield from advance_to_decode_step(r, 2)
+        yield from advance_to_decode_step(r, 1)
         assert not t.is_idle, "is_idle True while a req is decoding"
         yield from run_until_finished(r)
         for _ in range(5):
@@ -592,10 +591,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             f"mid-prefill batch should be an extend mode; "
             f"got {t.last_batch_forward_mode!r}"
         )
-        # The prefill (extend) batch samples the first output token, so the last
-        # batch at output_len 1 is still that EXTEND batch. Advance to output_len 2,
-        # by which a real DECODE batch has run and is the last batch.
-        yield from advance_to_decode_step(r, 2)
+        yield from advance_to_decode_step(r, 1)
         assert (
             t.last_batch_forward_mode == "DECODE"
         ), f"decode batch mode should be DECODE; got {t.last_batch_forward_mode!r}"
