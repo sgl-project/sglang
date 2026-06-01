@@ -163,6 +163,15 @@ class ScriptedContext:
     def kv_send_last_chunk_events(self, rid: str) -> int:
         return queries.kv_send_last_chunk_events(self, rid)
 
+    def eagle_topk_p_captured(self, rid: str) -> bool:
+        return queries.eagle_topk_p_captured(self, rid)
+
+    def eagle_topk_index_captured(self, rid: str) -> bool:
+        return queries.eagle_topk_index_captured(self, rid)
+
+    def eagle_hidden_states_captured(self, rid: str) -> bool:
+        return queries.eagle_hidden_states_captured(self, rid)
+
     def batch_composition(self) -> Dict[str, List[str]]:
         return queries.batch_composition(self)
 
