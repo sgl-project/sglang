@@ -1650,6 +1650,13 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, v
                 )
 
+        if self.forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+        else:
+            actual_seq_lengths_kv = (
+                self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+            )
+
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
@@ -1662,13 +1669,6 @@ class AscendAttnBackend(AttentionBackend):
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.num_token_non_padded_cpu]
-
-            if self.forward_metadata.seq_lens_cpu_int is None:
-                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
-            else:
-                actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-                )
 
             if (
                 forward_batch.forward_mode.is_draft_extend()
