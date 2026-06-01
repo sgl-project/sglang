@@ -116,6 +116,10 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "dragon-ride.jpg" in app_js
     assert "decodeChain = decodeChain" in app_js
     assert "receiveChain" not in app_js
+    assert "RAW_RGB_FRAMES_PER_WS_MESSAGE = 1" in (
+        repo_root
+        / "python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_output_adapter.py"
+    ).read_text()
     assert ".stage-controls .camera-pad button.is-key-active:not(:disabled)" in styles_css
     assert "--pressed: #8c9288;" in styles_css
     assert "--pressed-ring: rgba(238, 241, 236, 0.2);" in styles_css
