@@ -300,8 +300,8 @@ def _combine_topk_swa_indices_kernel(
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
-        combined_row = token_idx * combined_indices_stride.to(tl.int64)
-        topk_row = token_idx * topk_indices_stride.to(tl.int64)
+        combined_row = token_idx.to(tl.int64) * combined_indices_stride
+        topk_row = token_idx.to(tl.int64) * topk_indices_stride
 
         offset = tl.arange(0, PADDED_TOP_K)
         mask = offset < topk_len
