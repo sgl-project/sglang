@@ -930,14 +930,31 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Use fully fused kernel that handles masking internally
-        # This avoids separate nonzero() and index_select() calls
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        if mamba_track_indices is not None and intermediate_state_cache is None:
+            raise RuntimeError(
+                "--gdn-mtp-cache-mode=none is not supported with mamba radix "
+                "tracking because tracked prefix states require cached "
+                "intermediate SSM states."
+            )
+
+        # SSM state recovery depends on whether per-draft states were cached.
+        if intermediate_state_cache is not None:
+            # mode=full: h_K is already cached per draft-token position.
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+        else:
+            # mode=none: rerun recurrence from h_0 over the accepted prefix
+            # and write h_K directly without materializing outputs.
+            self._no_cache_mtp_recompute(
+                accepted_steps=last_correct_step_indices,
+                state_indices_tensor=state_indices_tensor,
+            )
+
+        # Conv-state rollback uses cached conv windows in both modes.
         # conv intermediate uses the deduplicated sliding-window (overlapping)
         # layout, so it needs the strided-read scatter variant.
         fused_conv_window_scatter_with_mask(
@@ -947,7 +964,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
         )
 
-        # Track indices used for tracking mamba states for prefix cache
+        # Prefix-cache tracking requires intermediate SSM states, so it runs
+        # only on the full-cache path.
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
             # Use fully fused kernel for track scatter operations
@@ -962,4 +980,63 @@ class HybridLinearAttnBackend(AttentionBackend):
                 intermediate_conv_window_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
+            )
+
+    def _no_cache_mtp_recompute(
+        self,
+        accepted_steps: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+    ):
+        """Recover accepted GDN SSM state for gdn_mtp_cache_mode=none.
+
+        Replays the state-update recurrence over stashed post-conv k/v/a/b and
+        writes h_{accepted_step} directly to the request's SSM state slot.
+        """
+        # Local imports to avoid a circular dependency at module load time.
+        from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_recover_final_state,
+        )
+
+        stash_per_layer: dict = getattr(self.linear_attn_backend, "_no_cache_stash", {})
+        if not stash_per_layer:
+            # No GDN layer ran in cache_mode=none for this batch.
+            return
+
+        pool = self.linear_attn_backend.req_to_token_pool
+
+        # Recovery runs outside the captured graph. Derive per-call sizes from
+        # current tensors because the stash spans multiple batch-size captures.
+        batch_size = accepted_steps.shape[0]
+        draft_token_num = self.linear_attn_backend._no_cache_draft_token_num
+        assert draft_token_num is not None, (
+            "draft_token_num not cached — forward_extend was never called "
+            "in target_verify mode before _mamba_verify_update."
+        )
+        actual_seq_len = batch_size * draft_token_num
+        cache_steps = draft_token_num
+        # The kernel expects int32 state indices.
+        state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
+        accepted_steps_i32 = accepted_steps.to(torch.int32).contiguous()
+
+        # One launch per GDN layer. Slice persistent buffers to the current
+        # batch size instead of storing per-call sizes in the shared stash.
+        for layer_id, stash in stash_per_layer.items():
+            layer_cache = pool.mamba2_layer_cache(layer_id)
+            layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
+
+            fused_sigmoid_gating_delta_rule_recover_final_state(
+                A_log=stash["A_log"],
+                a=stash["a"][:actual_seq_len],
+                dt_bias=stash["dt_bias"],
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                k=stash["k"][:, :actual_seq_len],
+                v=stash["v"][:, :actual_seq_len],
+                b=stash["b"][:actual_seq_len],
+                initial_state_source=layer_ssm_states,
+                initial_state_indices=state_idx_i32,
+                accepted_steps=accepted_steps_i32,
+                cache_steps=cache_steps,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=False,
             )
