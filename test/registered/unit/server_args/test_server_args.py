@@ -623,9 +623,17 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
 class TestCutedslMoeMaxNumTokens(unittest.TestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
-    to exercise the math independently of __post_init__ resolution."""
+    to exercise the math independently of __post_init__ resolution.
+
+    cg-refactor: the legacy ``disable_piecewise_cuda_graph`` /
+    ``piecewise_cuda_graph_max_tokens`` / ``cuda_graph_max_bs`` fields were
+    consolidated into ``cuda_graph_config``; the helper accepts the legacy
+    kwarg names for test readability and translates them to the per-phase dict.
+    """
 
     def _args(self, **overrides):
+        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
         server_args = ServerArgs(model_path="dummy")
         fields = dict(
             speculative_algorithm=None,
@@ -636,8 +644,26 @@ class TestCutedslMoeMaxNumTokens(unittest.TestCase):
             cuda_graph_max_bs=512,
         )
         fields.update(overrides)
+        disable_piecewise = fields.pop("disable_piecewise_cuda_graph")
+        piecewise_max = fields.pop("piecewise_cuda_graph_max_tokens")
+        cg_max_bs = fields.pop("cuda_graph_max_bs")
         for key, value in fields.items():
             setattr(server_args, key, value)
+        server_args.cuda_graph_config = {
+            Phase.DECODE: {
+                "backend": Backend.FULL,
+                "max_bs": cg_max_bs,
+                "bs": None,
+            },
+            Phase.PREFILL: {
+                "backend": (
+                    Backend.DISABLED if disable_piecewise else Backend.TC_PIECEWISE
+                ),
+                "max_bs": piecewise_max,
+                "bs": None,
+                "tc_compiler": "eager",
+            },
+        }
         return server_args
 
     def test_prefill_dominates_in_default_config(self):

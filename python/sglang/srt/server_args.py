@@ -3511,10 +3511,12 @@ class ServerArgs:
         else:
             num_tokens_per_bs = 1
         prefill_tokens = self.max_prefill_tokens
-        prefill_cfg = self.cuda_graph_config[Phase.PREFILL]
-        if prefill_cfg["backend"] == Backend.TC_PIECEWISE:
+        cg_config = self.cuda_graph_config or {}
+        prefill_cfg = cg_config.get(Phase.PREFILL) or {}
+        if prefill_cfg.get("backend") == Backend.TC_PIECEWISE:
             prefill_tokens = max(prefill_tokens, prefill_cfg.get("max_bs") or 0)
-        decode_max_bs = self.cuda_graph_config[Phase.DECODE].get("max_bs") or 0
+        decode_cfg = cg_config.get(Phase.DECODE) or {}
+        decode_max_bs = decode_cfg.get("max_bs") or 0
         decode_tokens = decode_max_bs * num_tokens_per_bs
         return max(prefill_tokens, decode_tokens)
 
