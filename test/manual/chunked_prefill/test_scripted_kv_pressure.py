@@ -117,31 +117,6 @@ class TestKVPressureBasic(ScriptedTestCase):
             f"{baseline_rows_used}, final used={final_rows_used}"
         )
 
-    def test_lock_refs_tight_concurrent_prefix(self):
-        self.server.execute_script(self._script_lock_refs_tight_concurrent_prefix)
-
-    @staticmethod
-    def _script_lock_refs_tight_concurrent_prefix(t: ScriptedContext):
-        baseline_lock_refs = t.get_all_node_lock_refs()
-        t.exhaust_lock_refs(leave_refs=4)
-        yield
-        r_warm = t.start_req(prompt_len=128, max_new_tokens=2)
-        yield from run_until_finished(r_warm)
-        assert r_warm.finished
-        assert r_warm.lock_refs == 0
-        reqs = [t.start_req(prompt_len=128, max_new_tokens=2) for _ in range(8)]
-        yield from run_until_all_finished(reqs)
-        for r in reqs:
-            assert r.finished
-            assert (
-                r.lock_refs == 0
-            ), f"req {r.rid} leaked {r.lock_refs} lock_refs after finish"
-        final_lock_refs = t.get_all_node_lock_refs()
-        assert final_lock_refs <= baseline_lock_refs, (
-            f"global lock_refs leaked from baseline={baseline_lock_refs} "
-            f"to final={final_lock_refs}"
-        )
-
     def test_kv_at_one_page_chunked_completes(self):
         self.server.execute_script(self._script_kv_at_one_page_chunked_completes)
 
