@@ -3820,7 +3820,22 @@ class Scheduler(
         # sender.abort; the abort-side disagg_prefill_inflight_queue scan
         # only sees reqs that completed their last chunk, not mid-prefill
         # ones). The decode peer may wait indefinitely. Fix in a separate PR.
-        for req in list(self.active_reqs.values()):
+        # active_reqs covers sync-mode + disagg PREFILL in-batch and stashed
+        # chunked-resume reqs. But _activate early-returns in disagg DECODE
+        # mode, so active_reqs is ALWAYS empty on the decode worker; its
+        # running reqs live only in running_batch (merged from prebuilt
+        # batches). Union active_reqs with the running/cur batch reqs (as the
+        # base branch scanned) so decode-mode running reqs are covered again.
+        # Setting to_finish is idempotent, so deduping by id() is safe.
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            batch_reqs = self.running_batch.reqs
+        else:
+            batch_reqs = self.running_batch.reqs + self.cur_batch.reqs
+        candidates = {id(req): req for req in self.active_reqs.values()}
+        for req in batch_reqs:
+            candidates.setdefault(id(req), req)
+
+        for req in list(candidates.values()):
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
