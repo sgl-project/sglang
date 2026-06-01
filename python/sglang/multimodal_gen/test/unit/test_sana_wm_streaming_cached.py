@@ -25,10 +25,13 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+    BidirectionalGDNUCPESinglePathLiteLA,
     _gdn_scan_bidirectional,
     _gdn_scan_cached,
+    _ShortConvolution,
     _single_path_delta_scan_bidirectional,
     _single_path_delta_scan_cached,
+    _temporal_short_conv_cached,
 )
 
 B, H, D, T, S = 1, 2, 4, 6, 3
@@ -160,3 +163,52 @@ def test_cam_cached_matches_reference_single_and_chunked():
 
     torch.testing.assert_close(m0, r0, atol=1e-9, rtol=0)
     torch.testing.assert_close(m1, r1, atol=1e-9, rtol=0)
+
+
+# --------------------------------------------------------------------------- #
+# 3. Cached short conv on K (cache slot 4)
+# --------------------------------------------------------------------------- #
+
+C_CONV, KERN = 5, 4
+
+
+def _conv():
+    conv = _ShortConvolution(C_CONV, KERN).double()
+    with torch.no_grad():  # randomize off the identity init for a non-trivial filter
+        conv.weight.copy_(torch.randn(C_CONV, 1, KERN, dtype=torch.float64))
+    return conv
+
+
+def _nslice(x, f0, f1):
+    # x is (B, N=T*S, C), frame-major
+    return x[:, f0 * S : f1 * S, :].contiguous()
+
+
+def test_short_conv_cached_single_chunk_reduces_to_bidirectional():
+    torch.manual_seed(1)
+    x = torch.randn(B, N, C_CONV, dtype=torch.float64)
+    conv = _conv()
+    ref = BidirectionalGDNUCPESinglePathLiteLA._temporal_short_conv(
+        x, conv, (T, S, 1), bidirectional=True
+    )
+    out, prefix = _temporal_short_conv_cached(x, conv, (T, S, 1))
+    torch.testing.assert_close(out, ref, atol=1e-9, rtol=0)
+    assert prefix.shape == (B * S, KERN - 1, C_CONV)
+
+
+def test_short_conv_cached_forward_continuity_across_chunks():
+    # The forward (causal) direction must be chunk-invariant via the prefix carry.
+    torch.manual_seed(2)
+    x = torch.randn(B, N, C_CONV, dtype=torch.float64)
+    conv = _conv()
+    whole, _ = _temporal_short_conv_cached(x, conv, (T, S, 1), bidirectional=False)
+
+    split = 2
+    o0, p0 = _temporal_short_conv_cached(
+        _nslice(x, 0, split), conv, (split, S, 1), bidirectional=False
+    )
+    o1, _ = _temporal_short_conv_cached(
+        _nslice(x, split, T), conv, (T - split, S, 1), prefix=p0, bidirectional=False
+    )
+    chunked = torch.cat([o0, o1], dim=1)  # reassemble frame-major
+    torch.testing.assert_close(chunked, whole, atol=1e-9, rtol=0)

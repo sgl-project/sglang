@@ -131,6 +131,53 @@ def _bidirectional_short_conv(
     return (y_fwd + y_bwd - center).to(x.dtype)
 
 
+def _temporal_short_conv_cached(
+    x: torch.Tensor,  # (B, N=T*S, C)
+    conv: "_ShortConvolution",
+    HW: Tuple[int, int, int],
+    *,
+    prefix: Optional[torch.Tensor] = None,
+    save_prefix: bool = True,
+    bidirectional: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Chunk-causal short conv on K for streaming `forward_long` (cache slot 4).
+
+    Mirrors the reference ``_temporal_conv_cached``: the FORWARD (causal) pass
+    prepends the previous chunk's last ``kernel-1`` frames so it stays continuous
+    across chunks; the BACKWARD pass (when ``bidirectional``) is recomputed
+    intra-chunk; the shared center tap is subtracted. The last ``kernel-1`` input
+    frames are returned as the next chunk's ``prefix``. A single chunk with no
+    prefix reduces to ``_bidirectional_short_conv``.
+    """
+    B, N, C = x.shape
+    T, H, W = HW
+    S = H * W
+    pad = conv.kernel_size - 1
+    # (B, N, C) -> (B*S, T, C), same layout as `_temporal_short_conv`.
+    xt = x.view(B, T, S, C).permute(0, 2, 1, 3).contiguous().reshape(B * S, T, C)
+
+    if prefix is not None:
+        prefix = prefix.to(device=xt.device, dtype=xt.dtype)
+        y_fwd, _ = conv(torch.cat([prefix, xt], dim=1))
+        y_fwd = y_fwd[:, -T:]
+    else:
+        y_fwd, _ = conv(xt)
+
+    if bidirectional:
+        y_bwd, _ = conv(xt.flip(1))
+        y_bwd = y_bwd.flip(1)
+        center = xt * conv.weight[:, 0, -1].view(1, 1, -1)
+        y = (y_fwd + y_bwd - center).to(xt.dtype)
+    else:
+        y = y_fwd.to(xt.dtype)
+
+    new_prefix = (
+        xt[:, -pad:].detach().clone() if (save_prefix and pad > 0) else prefix
+    )
+    y = y.reshape(B, S, T, C).permute(0, 2, 1, 3).reshape(B, N, C)
+    return y, new_prefix
+
+
 # ---------------------------------------------------------------------------
 # 3D RoPE -- ``WanRotaryPosEmbed`` from upstream sana_blocks.py
 # ---------------------------------------------------------------------------
