@@ -8,14 +8,18 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.spec_server_kits import SpecAccuracyKit, SpecFeatureKit
+from sglang.test.kits.spec_server_kits import (
+    SpecAccuracyKit,
+    SpecFeatureKit,
+    SpecLogprobKit,
+)
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=540, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestEagle3Page64(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
-    """EAGLE3 spec v2, page_size=64 (flashinfer)."""
+class TestEagle3Page64(Eagle3Base, SpecAccuracyKit, SpecLogprobKit, SpecFeatureKit):
+    """EAGLE3 spec v2, page_size=64 (flashinfer): + logprob losslessness."""
 
     page_size = 64
     disable_overlap = False

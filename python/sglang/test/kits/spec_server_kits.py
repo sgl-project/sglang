@@ -99,6 +99,23 @@ class SpecCorrectnessKit:
         tokens = self.tokenizer.encode(output, truncation=False)
         self.assertNotIn(self.tokenizer.eos_token_id, tokens)
 
+    def test_first_token_finish(self):
+        # Very short max_new_tokens (1-3): exercise the immediate-finish path,
+        # where a request stops within the first draft window. Just must not crash.
+        prompts = [
+            f"There are {i} apples on the table. How to divide them equally?"
+            for i in range(8)
+        ]
+        sampling_params = [
+            {"temperature": 0, "max_new_tokens": random.randint(1, 3)} for _ in range(8)
+        ]
+        results = requests.post(
+            self.base_url + "/generate",
+            json={"text": prompts, "sampling_params": sampling_params},
+        ).json()
+        for r in results:
+            self.assertIn("text", r, f"Server error: {r}")
+
 
 def _greedy(url, text, max_new_tokens=48):
     return requests.post(

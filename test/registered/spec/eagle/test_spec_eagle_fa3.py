@@ -13,10 +13,11 @@ from sglang.test.kits.spec_server_kits import (
     SpecFeatureKit,
     SpecLogprobKit,
     SpecPenaltyKit,
+    SpecPerfKit,
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestEagle3Fa3(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
@@ -27,7 +28,12 @@ class TestEagle3Fa3(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprob
 
 
 class TestEagleLlama2Fa3Page256(
-    EagleLlama2Base, SpecAccuracyKit, SpecLogprobKit, SpecPenaltyKit, SpecFeatureKit
+    EagleLlama2Base,
+    SpecAccuracyKit,
+    SpecLogprobKit,
+    SpecPenaltyKit,
+    SpecPerfKit,
+    SpecFeatureKit,
 ):
     """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256 (spec v1)."""
 
