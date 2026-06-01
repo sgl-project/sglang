@@ -157,6 +157,12 @@ class ScriptedContext:
     def load_inquirer_snapshot(self) -> Dict[str, object]:
         return queries.load_inquirer_snapshot(self)
 
+    def kv_send_events(self, rid: str) -> int:
+        return queries.kv_send_events(self, rid)
+
+    def kv_send_last_chunk_events(self, rid: str) -> int:
+        return queries.kv_send_last_chunk_events(self, rid)
+
     def batch_composition(self) -> Dict[str, List[str]]:
         return queries.batch_composition(self)
 

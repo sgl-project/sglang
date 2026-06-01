@@ -45,6 +45,13 @@ class ScriptedBatchRecord:
     rids: Tuple[str, ...]
     extend_rids: Tuple[str, ...]
     chunked_rid: Optional[str]
+    # Disagg-prefill send bookkeeping, snapshotted per step from real Req fields.
+    # send_idx_by_rid is each batched req's start_send_idx at the start of this
+    # step (it reflects the send completed in the previous step); prompt_len_by_rid
+    # is len(origin_input_ids). A strict increase of start_send_idx across steps is
+    # one kv-chunk send; the increase that reaches prompt_len is the last_chunk send.
+    send_idx_by_rid: Tuple[Tuple[str, int], ...]
+    prompt_len_by_rid: Tuple[Tuple[str, int], ...]
 
 
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
@@ -154,6 +161,12 @@ class ScriptedSchedulerHook:
                     else ()
                 ),
                 chunked_rid=chunked.rid if chunked is not None else None,
+                send_idx_by_rid=tuple(
+                    (r.rid, r.start_send_idx) for r in batch.reqs
+                ),
+                prompt_len_by_rid=tuple(
+                    (r.rid, len(r.origin_input_ids)) for r in batch.reqs
+                ),
             )
         )
 

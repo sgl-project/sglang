@@ -42,6 +42,14 @@ class ScriptedReqHandle:
         return self.context.stream_events(self.rid)
 
     @property
+    def kv_send_events(self) -> int:
+        return self.context.kv_send_events(self.rid)
+
+    @property
+    def kv_send_last_chunk_events(self) -> int:
+        return self.context.kv_send_last_chunk_events(self.rid)
+
+    @property
     def kv_pages(self) -> int:
         page_size = self.context._scheduler.page_size
         return (self.req.kv_allocated_len + page_size - 1) // page_size
