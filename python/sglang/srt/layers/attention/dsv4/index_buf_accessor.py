@@ -31,6 +31,22 @@ class NopeFp8RopeBf16Pack:
         )
 
 
+@dataclass
+class NopeBf16RopeBf16Pack:
+    k_nope_bf16: torch.Tensor
+    k_rope_bf16: torch.Tensor
+
+    def __post_init__(self):
+        assert self.k_nope_bf16.shape[-1] == 448
+        assert self.k_rope_bf16.shape[-1] == 64
+
+    def slice_pack(self, _slice: Any) -> "NopeBf16RopeBf16Pack":
+        return NopeBf16RopeBf16Pack(
+            k_nope_bf16=self.k_nope_bf16[_slice],
+            k_rope_bf16=self.k_rope_bf16[_slice],
+        )
+
+
 class SetKAndS:
     @classmethod
     def execute(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
@@ -255,3 +271,163 @@ def _set_k_and_s_torch(
         buf_fp8[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
         buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
         buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
+
+
+# ============================================================
+# BF16 KV Cache write path (no scales, nope and rope both bf16)
+# ============================================================
+
+
+class SetKBf16:
+    @classmethod
+    def execute(cls, pool, buf, loc, nope_bf16_rope_bf16_pack: NopeBf16RopeBf16Pack):
+        cls.triton(pool, buf, loc, nope_bf16_rope_bf16_pack)
+
+    @classmethod
+    def torch(cls, pool, buf, loc, nope_bf16_rope_bf16_pack: NopeBf16RopeBf16Pack):
+        _set_k_bf16_torch(buf, loc, nope_bf16_rope_bf16_pack, pool.page_size)
+
+    @classmethod
+    def triton(cls, pool, buf, loc, nope_bf16_rope_bf16_pack: NopeBf16RopeBf16Pack):
+        _set_k_bf16_triton(buf, loc, nope_bf16_rope_bf16_pack, pool.page_size)
+
+
+def _set_k_bf16_triton(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    nope_bf16_rope_bf16_pack: NopeBf16RopeBf16Pack,
+    page_size: int,
+):
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+
+    k_nope = nope_bf16_rope_bf16_pack.k_nope_bf16
+    k_rope = nope_bf16_rope_bf16_pack.k_rope_bf16
+
+    num_tokens_to_write_nope, nope_dim = k_nope.shape
+    num_tokens_to_write_rope, rope_dim = k_rope.shape
+
+    assert num_tokens_to_write == num_tokens_to_write_nope == num_tokens_to_write_rope
+
+    assert buf.dtype == torch.uint8
+    assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
+    assert k_nope.dtype == torch.bfloat16
+    assert k_rope.dtype == torch.bfloat16
+
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    assert k_nope.is_contiguous()
+    assert k_rope.is_contiguous()
+
+    buf_bf16 = buf.view(torch.bfloat16)
+
+    # BF16 layout: nope (448 bf16 = 896 bytes) + rope (64 bf16 = 128 bytes) = 1024 bytes/token
+    # In bf16 view: nope (448 elems) + rope (64 elems) = 512 bf16 elems/token
+    bf16_elems_per_token = nope_dim + rope_dim  # 512
+
+    _set_k_bf16_triton_kernel[(num_tokens_to_write,)](
+        buf_bf16,
+        loc,
+        k_nope,
+        k_rope,
+        k_nope.stride(0),
+        k_rope.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_BF16_NUMEL_PER_PAGE=buf_numel_per_page // 2,
+        NUM_NOPE_ELEMS=nope_dim,
+        NUM_ROPE_ELEMS=rope_dim,
+        BF16_ELEMS_PER_TOKEN=bf16_elems_per_token,
+        BLOCK_NOPE=512,
+        BLOCK_ROPE=64,
+    )
+
+
+@triton.jit
+def _set_k_bf16_triton_kernel(
+    buf_bf16_ptr,
+    loc_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    k_nope_ptr_stride_0,
+    k_rope_ptr_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    BUF_BF16_NUMEL_PER_PAGE: tl.constexpr,
+    NUM_NOPE_ELEMS: tl.constexpr,
+    NUM_ROPE_ELEMS: tl.constexpr,
+    BF16_ELEMS_PER_TOKEN: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(loc_ptr + token_id)
+
+    # Load nope
+    nope_range = tl.arange(0, BLOCK_NOPE)
+    nope_mask = nope_range < NUM_NOPE_ELEMS
+    in_k_nope_offsets = token_id * k_nope_ptr_stride_0 + nope_range
+    k_nope = tl.load(k_nope_ptr + in_k_nope_offsets, mask=nope_mask, other=0.0)
+
+    # Load rope
+    rope_range = tl.arange(0, BLOCK_ROPE)
+    in_k_rope_offsets = token_id * k_rope_ptr_stride_0 + rope_range
+    k_rope = tl.load(k_rope_ptr + in_k_rope_offsets)
+
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+
+    # Write nope (bf16 view)
+    out_k_nope_offsets = (
+        loc_page_index * BUF_BF16_NUMEL_PER_PAGE
+        + loc_token_offset_in_page * BF16_ELEMS_PER_TOKEN
+        + nope_range
+    )
+    tl.store(buf_bf16_ptr + out_k_nope_offsets, k_nope, mask=nope_mask)
+
+    # Write rope (bf16 view, immediately after nope)
+    out_k_rope_offsets = (
+        loc_page_index * BUF_BF16_NUMEL_PER_PAGE
+        + loc_token_offset_in_page * BF16_ELEMS_PER_TOKEN
+        + NUM_NOPE_ELEMS
+        + rope_range
+    )
+    tl.store(buf_bf16_ptr + out_k_rope_offsets, k_rope)
+
+
+def _set_k_bf16_torch(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    nope_bf16_rope_bf16_pack: NopeBf16RopeBf16Pack,
+    page_size: int,
+):
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+
+    k_nope = nope_bf16_rope_bf16_pack.k_nope_bf16
+    k_rope = nope_bf16_rope_bf16_pack.k_rope_bf16
+
+    num_tokens_to_write_nope, nope_dim = k_nope.shape
+    num_tokens_to_write_rope, rope_dim = k_rope.shape
+
+    assert num_tokens_to_write == num_tokens_to_write_nope == num_tokens_to_write_rope
+
+    assert buf.dtype == torch.uint8
+    assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
+    assert k_nope.dtype == torch.bfloat16
+    assert k_rope.dtype == torch.bfloat16
+
+    buf_bf16 = buf.view(torch.bfloat16).flatten()
+    buf_bf16_numel_per_page = buf_numel_per_page // 2
+    bf16_elems_per_token = nope_dim + rope_dim  # 512
+
+    loc_page_index = loc // page_size
+    loc_token_offset_in_page = loc % page_size
+
+    nope_offset = (
+        loc_page_index * buf_bf16_numel_per_page
+        + loc_token_offset_in_page * bf16_elems_per_token
+    )
+    rope_offset = nope_offset + nope_dim
+
+    for i in range(num_tokens_to_write):
+        buf_bf16[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
+        buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
