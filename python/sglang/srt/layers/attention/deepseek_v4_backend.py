@@ -359,7 +359,7 @@ class _OnlineC128LayerRuntime:
     head_dim: int
     state_width: int
     main_state: torch.Tensor
-    temp_state: torch.Tensor
+    temp_state_slot_offset: int
     ape: torch.Tensor
 
 
@@ -450,6 +450,11 @@ class DeepseekV4AttnBackend(
             and self.mtp_enabled
         )
 
+    def _online_c128_mtp_state_slot_offset(self) -> int:
+        if not self._online_c128_mtp_enabled():
+            return 0
+        return self.token_to_kv_pool.get_online_c128_mtp_state_slot_offset()
+
     def _clear_online_c128_verify_context(self) -> None:
         self._online_c128_verify_ctx = None
 
@@ -526,7 +531,6 @@ class DeepseekV4AttnBackend(
             for layer_id, compressor in self._iter_online_c128_layers():
                 head_dim = compressor.head_dim
                 main_pool = token_to_kv_pool.get_attention_compress_states(layer_id)
-                temp_pool = token_to_kv_pool.get_temp_attention_compress_states(layer_id)
                 runtimes.append(
                     _OnlineC128LayerRuntime(
                         layer_id=layer_id,
@@ -534,7 +538,7 @@ class DeepseekV4AttnBackend(
                         head_dim=head_dim,
                         state_width=head_dim * 3,
                         main_state=main_pool.kv_score_buffer.kv_score,
-                        temp_state=temp_pool.kv_score_buffer.kv_score,
+                        temp_state_slot_offset=main_pool.online_mtp_state_slot_offset,
                         ape=compressor.ape.reshape(128, head_dim),
                     )
                 )
@@ -557,8 +561,8 @@ class DeepseekV4AttnBackend(
                 runtime.layer_id,
                 bs,
                 runtime.state_width,
-                dtype=runtime.temp_state.dtype,
-                device=runtime.temp_state.device,
+                dtype=runtime.main_state.dtype,
+                device=runtime.main_state.device,
             )
             online_c128_mtp_prepare(
                 seq_lens=ctx.seq_lens,
@@ -566,48 +570,16 @@ class DeepseekV4AttnBackend(
                 req_to_token=req_to_token,
                 full_to_swa_index_mapping=full_to_swa_index_mapping,
                 main_state=runtime.main_state,
-                temp_state=runtime.temp_state,
                 pre_state=pre_state,
                 bs=bs,
                 swa_page_size=swa_page_size,
+                temp_state_slot_offset=runtime.temp_state_slot_offset,
                 state_width=runtime.state_width,
             )
             ctx.layer_states[runtime.layer_id] = _OnlineC128VerifyLayerState(
                 pre_state=pre_state,
                 kv_score_input=self._get_online_c128_kv_score_ref(runtime.layer_id),
             )
-
-    def get_override_compress_state_pool(
-        self,
-        compressor,
-        token_to_kv_pool: DeepSeekV4TokenToKVPool,
-        forward_batch: ForwardBatch,
-    ):
-        logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        if (
-            not self._online_c128_mtp_enabled()
-            or logical_forward_mode != ForwardMode.TARGET_VERIFY
-            or compressor.is_in_indexer
-            or compressor.ratio != 128
-        ):
-            return None
-
-        ctx = self._online_c128_verify_ctx
-        if ctx is None:
-            self._set_online_c128_verify_context(
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-            )
-            ctx = self._online_c128_verify_ctx
-            assert ctx is not None
-        if ctx.seq_lens.numel() == 0 or ctx.req_pool_indices.numel() == 0:
-            return None
-
-        layer_state = ctx.layer_states.get(compressor.layer_id)
-        temp_pool = token_to_kv_pool.get_temp_attention_compress_states(compressor.layer_id)
-        if layer_state is None:
-            self._prepare_online_c128_verify_layers()
-        return temp_pool
 
     def capture_online_c128_verify_inputs(
         self,
@@ -659,12 +631,17 @@ class DeepseekV4AttnBackend(
         if req_pool_indices.numel() == 0 or seq_lens.numel() == 0:
             return
 
-        accept_lens = online_c128_mtp_compute_accept_lens(
-            ctx_req_pool_indices=ctx.req_pool_indices,
-            ctx_seq_lens=ctx.seq_lens,
-            cur_req_pool_indices=req_pool_indices.to(ctx.req_pool_indices.device),
-            cur_seq_lens=seq_lens.to(ctx.seq_lens.device),
-            max_draft_tokens=int(self.speculative_num_draft_tokens),
+        cur_req_pool_indices = req_pool_indices.to(ctx.req_pool_indices.device)
+        cur_seq_lens = seq_lens.to(ctx.seq_lens.device)
+        matches = ctx.req_pool_indices[:, None] == cur_req_pool_indices[None, :]
+        matched_seq_lens = torch.where(
+            matches,
+            cur_seq_lens[None, :].to(ctx.seq_lens.dtype),
+            ctx.seq_lens[:, None],
+        ).max(dim=1).values
+        delta_lens = matched_seq_lens.to(torch.int64) - ctx.seq_lens.to(torch.int64)
+        accept_lens = torch.clamp(
+            delta_lens, min=0, max=int(self.speculative_num_draft_tokens)
         )
         self.update_online_c128_state_after_mtp_verify(
             accept_lens=accept_lens,
@@ -759,6 +736,7 @@ class DeepseekV4AttnBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
+        online_c128_state_slot_offset: int = 0,
     ) -> Union[DSV4Metadata, DSV4RawDecodeMetadata]:
         assert (
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
@@ -789,6 +767,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            online_state_slot_offset=online_c128_state_slot_offset,
         )
 
         return DSV4Metadata(
@@ -810,6 +789,7 @@ class DeepseekV4AttnBackend(
         extend_seq_lens_cpu: List[int],
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
+        online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -846,6 +826,7 @@ class DeepseekV4AttnBackend(
                 extend_lens=extend_seq_lens,
                 extend_lens_cpu=extend_seq_lens_cpu,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                online_state_slot_offset=online_c128_state_slot_offset,
             )
         return DSV4Metadata(
             core_attn_metadata,
@@ -861,6 +842,7 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        online_c128_state_slot_offset: int = 0,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
@@ -895,6 +877,7 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
 
     def init_forward_metadata_target_verify_old(
@@ -905,6 +888,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu: Optional[List[int]] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         seq_lens = seq_lens + self.speculative_num_draft_tokens
@@ -925,10 +909,13 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            online_c128_state_slot_offset=online_c128_state_slot_offset,
         )
 
     def make_forward_metadata_from_raw_verify(
-        self, raw_metadata: DSV4RawVerifyMetadata
+        self,
+        raw_metadata: DSV4RawVerifyMetadata,
+        online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
@@ -969,6 +956,7 @@ class DeepseekV4AttnBackend(
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
             num_q_tokens=num_draft_tokens * bs,
+            online_state_slot_offset=online_c128_state_slot_offset,
         )
         return DSV4Metadata(
             core_attn_metadata,
@@ -978,7 +966,9 @@ class DeepseekV4AttnBackend(
         )
 
     def make_forward_metadata_from_raw_decode(
-        self, raw_metadata: DSV4RawDecodeMetadata
+        self,
+        raw_metadata: DSV4RawDecodeMetadata,
+        online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
@@ -1001,6 +991,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            online_state_slot_offset=online_c128_state_slot_offset,
         )
 
         return DSV4Metadata(
@@ -1088,11 +1079,13 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=verify_req_pool_indices,
                 seq_lens=verify_seq_lens,
             )
+            online_c128_state_slot_offset = self._online_c128_mtp_state_slot_offset()
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
+                online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
         elif logical_forward_mode.is_prefill(include_draft_extend_v2=True):
             self._commit_pending_online_c128_state(
@@ -1279,6 +1272,9 @@ class DeepseekV4AttnBackend(
                 value=0,
             )
             if self._online_c128_mtp_enabled():
+                online_c128_state_slot_offset = (
+                    self._online_c128_mtp_state_slot_offset()
+                )
                 temp_metadata = self.init_forward_metadata_target_verify_old(
                     max_seq_len=chosen_max_seq_len,
                     req_pool_indices=req_pool_indices,
@@ -1286,6 +1282,7 @@ class DeepseekV4AttnBackend(
                     seq_lens_cpu=seq_lens_cpu.tolist(),
                     out_cache_loc=out_cache_loc_padded,
                     use_prefill_cuda_graph=True,
+                    online_c128_state_slot_offset=online_c128_state_slot_offset,
                 )
             else:
                 temp_metadata = self.init_forward_metadata_target_verify(
@@ -1386,6 +1383,7 @@ class DeepseekV4AttnBackend(
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
+                online_c128_state_slot_offset=self._online_c128_mtp_state_slot_offset(),
             )
         elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(

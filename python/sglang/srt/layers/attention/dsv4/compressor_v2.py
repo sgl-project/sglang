@@ -658,6 +658,7 @@ def create_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]] = None,
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
+    online_state_slot_offset: int = 0,
 ) -> CompressMetadata:
     """Build the paged compress metadata (= the plan).
 
@@ -676,6 +677,7 @@ def create_paged_compressor_data(
             extend_lens_cpu=extend_lens_cpu,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             num_q_tokens=num_q_tokens,
+            online_state_slot_offset=online_state_slot_offset,
         )
 
     swa_page_size = token_to_kv_pool.swa_page_size
@@ -733,6 +735,7 @@ def _create_online_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]],
     use_prefill_cuda_graph: bool,
     num_q_tokens: Optional[int],
+    online_state_slot_offset: int = 0,
 ) -> CompressMetadata:
     swa_page_size = int(token_to_kv_pool.swa_page_size)
     full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
@@ -762,6 +765,7 @@ def _create_online_paged_compressor_data(
             num_q_tokens=int(num_q_tokens_planner),
             swa_page_size=swa_page_size,
             use_cuda_graph=use_prefill_cuda_graph,
+            state_slot_offset=online_state_slot_offset,
         )
     else:
         return CompressorDecodePlan.generate_online(
@@ -770,4 +774,5 @@ def _create_online_paged_compressor_data(
             req_to_token=req_to_token,
             full_to_swa=full_to_swa,
             swa_page_size=swa_page_size,
+            state_slot_offset=online_state_slot_offset,
         )

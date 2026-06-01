@@ -16,14 +16,13 @@ def _online_c128_mtp_prepare_kernel(
     req_to_token_ptr,
     full_to_swa_ptr,
     main_state_ptr,
-    temp_state_ptr,
     pre_state_ptr,
     req_to_token_stride_b: tl.constexpr,
     main_state_stride_b: tl.constexpr,
-    temp_state_stride_b: tl.constexpr,
     pre_state_stride_b: tl.constexpr,
     bs,
     swa_page_size: tl.constexpr,
+    temp_state_slot_offset: tl.constexpr,
     state_width: tl.constexpr,
     block_d: tl.constexpr,
 ):
@@ -47,13 +46,14 @@ def _online_c128_mtp_prepare_kernel(
         tl.int64
     )
     slot = tl.where(has_partial, swa_loc // swa_page_size, 0)
+    temp_slot = slot + temp_state_slot_offset
     value = tl.load(
         main_state_ptr + slot * main_state_stride_b + d,
         mask=d_mask & has_partial,
         other=0.0,
     )
     tl.store(
-        temp_state_ptr + slot * temp_state_stride_b + d,
+        main_state_ptr + temp_slot * main_state_stride_b + d,
         value,
         mask=d_mask & has_partial,
     )
@@ -181,10 +181,10 @@ def _online_c128_mtp_prepare_triton(
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: torch.Tensor,
     main_state: torch.Tensor,
-    temp_state: torch.Tensor,
     pre_state: torch.Tensor,
     bs: int,
     swa_page_size: int,
+    temp_state_slot_offset: int,
     state_width: int,
 ) -> None:
     if bs <= 0:
@@ -197,14 +197,13 @@ def _online_c128_mtp_prepare_triton(
         req_to_token,
         full_to_swa_index_mapping,
         main_state,
-        temp_state,
         pre_state,
         req_to_token.stride(0),
         main_state.stride(0),
-        temp_state.stride(0),
         pre_state.stride(0),
         bs,
         swa_page_size,
+        temp_state_slot_offset,
         state_width,
         block_d,
     )
@@ -217,10 +216,10 @@ def online_c128_mtp_prepare(
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: torch.Tensor,
     main_state: torch.Tensor,
-    temp_state: torch.Tensor,
     pre_state: torch.Tensor,
     bs: int,
     swa_page_size: int,
+    temp_state_slot_offset: int,
     state_width: int,
 ) -> None:
     _online_c128_mtp_prepare_triton(
@@ -229,9 +228,9 @@ def online_c128_mtp_prepare(
         req_to_token=req_to_token,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         main_state=main_state,
-        temp_state=temp_state,
         pre_state=pre_state,
         bs=bs,
         swa_page_size=swa_page_size,
+        temp_state_slot_offset=temp_state_slot_offset,
         state_width=state_width,
     )

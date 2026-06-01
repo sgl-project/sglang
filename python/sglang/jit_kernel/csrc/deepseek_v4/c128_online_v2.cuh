@@ -535,6 +535,7 @@ struct OnlineDecodePlanParams {
   const int64_t* __restrict__ full_to_swa;  // (full_cache_size,) int64
   int64_t stride_r2t;
   int32_t swa_page_size;
+  int32_t state_slot_offset;
   uint32_t batch_size;
 };
 
@@ -546,7 +547,7 @@ __global__ void plan_c128_online_decode_kernel(const OnlineDecodePlanParams para
   const int32_t chunk_start = static_cast<int32_t>((seq_len - 1u) / 128u * 128u);
   const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
   const int32_t swa_loc = static_cast<int32_t>(params.full_to_swa[full_loc]);
-  const int32_t slot = swa_loc / params.swa_page_size;
+  const int32_t slot = swa_loc / params.swa_page_size + params.state_slot_offset;
   params.plan_d[idx] = DecodePlan{
       .seq_len = seq_len,
       .write_loc = slot,
@@ -566,7 +567,8 @@ inline void plan_online_decode(
     const tvm::ffi::TensorView req_to_token,
     const tvm::ffi::TensorView full_to_swa,
     const tvm::ffi::TensorView plan_d_dev_,
-    const int32_t swa_page_size) {
+    const int32_t swa_page_size,
+    const int32_t state_slot_offset) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
   device_.set_options<kDLCUDA>();
@@ -593,6 +595,7 @@ inline void plan_online_decode(
       .with_device(device_)
       .verify(plan_d_dev_);
   RuntimeCheck(swa_page_size > 0);
+  RuntimeCheck(state_slot_offset >= 0);
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
   if (batch_size == 0) return;
@@ -609,6 +612,7 @@ inline void plan_online_decode(
       .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
       .stride_r2t = stride_r2t,
       .swa_page_size = swa_page_size,
+      .state_slot_offset = state_slot_offset,
       .batch_size = batch_size,
   };
   LaunchKernel(num_blocks, kBlockSize, device)(plan_c128_online_decode_kernel, params);
@@ -683,6 +687,7 @@ struct OnlinePrefillStage1Params {
   const int64_t* __restrict__ full_to_swa;       // (full_cache_size,)
   int64_t stride_r2t;
   int32_t swa_page_size;
+  int32_t state_slot_offset;
   uint32_t num_c;
   uint32_t num_w;
 };
@@ -702,7 +707,7 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   const int32_t chunk_start = (position / 128) * 128;
   const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
   const int32_t swa_loc = static_cast<int32_t>(params.full_to_swa[full_loc]);
-  plan.read_page_0 = swa_loc / params.swa_page_size;
+  plan.read_page_0 = swa_loc / params.swa_page_size + params.state_slot_offset;
   *plan_ptr = plan;
 }
 
@@ -719,6 +724,7 @@ inline OnlinePrefillPlan plan_online_prefill(
     const tvm::ffi::TensorView plan_c_dev_,
     const tvm::ffi::TensorView plan_w_dev_,
     const int32_t swa_page_size,
+    const int32_t state_slot_offset,
     const bool use_cuda_graph) {
   auto B = SymbolicSize{"batch_size"};
   auto N = SymbolicSize{"num_q_tokens"};
@@ -754,6 +760,7 @@ inline OnlinePrefillPlan plan_online_prefill(
       .with_device(device_)
       .verify(plan_c_dev_)
       .verify(plan_w_dev_);
+  RuntimeCheck(state_slot_offset >= 0);
 
   const auto stage0_params = OnlinePrefillStage0Params{
       .plan_c = static_cast<CompressPlan*>(plan_c_pin.data_ptr()),
@@ -875,6 +882,7 @@ inline OnlinePrefillPlan plan_online_prefill(
         .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
         .stride_r2t = req_to_token.stride(0),
         .swa_page_size = swa_page_size,
+        .state_slot_offset = state_slot_offset,
         .num_c = num_c_padded,
         .num_w = num_w_padded,
     };

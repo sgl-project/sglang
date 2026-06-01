@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -89,17 +90,23 @@ class CompressStatePool:
         online: bool = False,
         swa_page_size: int = 0,
     ):
+        self.ratio = ratio
         self.ring_size = ring_size
         self.swa_page_size = swa_page_size
         self.enable_memory_saver = enable_memory_saver
+        self.online_mtp_state_slot_offset = 0
 
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
-            self._size = size + self.ring_size + 1
+            self._logical_size = size + self.ring_size + 1
+            if envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+                self.online_mtp_state_slot_offset = self._logical_size
+            self._size = self._logical_size + self.online_mtp_state_slot_offset
             last_dim = 3 * head_dim
         else:
             self._size = size + self.ring_size + 1
             self._size = (self._size + ratio - 1) // ratio * ratio
+            self._logical_size = self._size
             last_dim = 2 * (1 + overlap) * head_dim
 
         if _is_hip:

@@ -254,7 +254,9 @@ def create_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]] = None,
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
+    online_state_slot_offset: int = 0,
 ) -> FusedCompressMetadata:
+    del online_state_slot_offset
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
     # assert ring_size % compress_ratio == 0
@@ -383,17 +385,6 @@ class Compressor(nn.Module):
     ) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        override = None
-        if forward_batch is not None and hasattr(
-            attn_backend, "get_override_compress_state_pool"
-        ):
-            override = attn_backend.get_override_compress_state_pool(
-                compressor=self,
-                token_to_kv_pool=token_to_kv_pool,
-                forward_batch=forward_batch,
-            )
-        if override is not None:
-            return override
         if self.is_in_indexer:
             ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
         else:
