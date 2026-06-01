@@ -486,6 +486,94 @@ class QwenEmbedLayer3DRope(nn.Module):
 
 
 class QwenImageCrossAttention(nn.Module):
+    @staticmethod
+    def _create_qkv_projections(
+        input_dim: int,
+        output_dim: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+        use_fused: bool,
+    ) -> Union[MergedColumnParallelLinear, Dict[str, ColumnParallelLinear]]:
+        """
+        Create Q/K/V projection layers with optional fused mode.
+        
+        Args:
+            input_dim: Input dimension
+            output_dim: Output dimension per projection
+            quant_config: Quantization configuration
+            prefix: Layer name prefix
+            use_fused: Whether to use fused MergedColumnParallelLinear
+        
+        Returns:
+            Fused layer (MergedColumnParallelLinear) or dict of separate layers
+        """
+        if use_fused:
+            return MergedColumnParallelLinear(
+                input_dim,
+                [output_dim] * 3,
+                bias=True,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        else:
+            return {
+                'q': ColumnParallelLinear(
+                    input_dim,
+                    output_dim,
+                    bias=True,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.q",
+                ),
+                'k': ColumnParallelLinear(
+                    input_dim,
+                    output_dim,
+                    bias=True,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.k",
+                ),
+                'v': ColumnParallelLinear(
+                    input_dim,
+                    output_dim,
+                    bias=True,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.v",
+                ),
+            }
+    
+    @staticmethod
+    def _create_output_projection(
+        input_dim: int,
+        output_dim: int,
+        bias: bool,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ) -> RowParallelLinear:
+        """
+        Create output projection layer with RowParallelLinear.
+        
+        Args:
+            input_dim: Input dimension
+            output_dim: Output dimension
+            bias: Whether to include bias
+            quant_config: Quantization configuration
+            prefix: Layer name prefix
+        
+        Returns:
+            RowParallelLinear layer for output projection
+        """
+        return RowParallelLinear(
+            input_dim,
+            output_dim,
+            bias=bias,
+            input_is_parallel=False,
+            reduce_results=True,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    
     def __init__(
         self,
         dim: int,  # query_dim
@@ -520,39 +608,15 @@ class QwenImageCrossAttention(nn.Module):
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
 
+        # Create main Q/K/V projections
+        qkv_layers = self._create_qkv_projections(
+            dim, self.inner_dim, quant_config, f"{prefix}.to", self.use_fused_qkv
+        )
         if self.use_fused_qkv:
-            # Use fused QKV projection for nunchaku quantization
-            self.to_qkv = MergedColumnParallelLinear(
-                dim,
-                [self.inner_dim] * 3,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_qkv",
-            )
+            self.to_qkv = qkv_layers
         else:
-            self.to_q = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                gather_output=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_q",
-            )
-            self.to_k = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                gather_output=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_k",
-            )
-            self.to_v = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                gather_output=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_v",
+            self.to_q, self.to_k, self.to_v = (
+                qkv_layers['q'], qkv_layers['k'], qkv_layers['v']
             )
 
         if self.qk_norm:
@@ -561,49 +625,21 @@ class QwenImageCrossAttention(nn.Module):
 
         if added_kv_proj_dim is not None:
             self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
+            added_qkv_layers = self._create_qkv_projections(
+                added_kv_proj_dim, self.inner_dim, quant_config,
+                f"{prefix}.add", self.use_fused_added_qkv
+            )
             if self.use_fused_added_qkv:
-                self.to_added_qkv = MergedColumnParallelLinear(
-                    added_kv_proj_dim,
-                    [self.inner_dim] * 3,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.to_added_qkv",
-                )
+                self.to_added_qkv = added_qkv_layers
             else:
-                self.add_q_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    gather_output=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_q_proj",
-                )
-                self.add_k_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    gather_output=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_k_proj",
-                )
-                self.add_v_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    gather_output=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_v_proj",
+                self.add_q_proj, self.add_k_proj, self.add_v_proj = (
+                    added_qkv_layers['q'], added_qkv_layers['k'], added_qkv_layers['v']
                 )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = RowParallelLinear(
-                self.inner_dim,
-                self.dim,
-                bias=out_bias,
-                input_is_parallel=False,
-                reduce_results=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_add_out",
+            self.to_add_out = self._create_output_projection(
+                self.inner_dim, self.dim, out_bias, quant_config,
+                f"{prefix}.to_add_out"
             )
         else:
             self.to_add_out = None
@@ -611,14 +647,9 @@ class QwenImageCrossAttention(nn.Module):
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                RowParallelLinear(
-                    self.inner_dim,
-                    self.dim,
-                    bias=out_bias,
-                    input_is_parallel=False,
-                    reduce_results=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.to_out.0",
+                self._create_output_projection(
+                    self.inner_dim, self.dim, out_bias, quant_config,
+                    f"{prefix}.to_out.0"
                 )
             )
         else:
