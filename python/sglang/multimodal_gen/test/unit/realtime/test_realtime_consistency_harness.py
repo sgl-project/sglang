@@ -515,8 +515,8 @@ def test_lingbot_realtime_plastic_beach_params_are_lossless_gt_ready():
 
 def test_lingbot_realtime_case_is_registered_by_default():
     from sglang.multimodal_gen.test.server.gpu_cases import (
-        _make_lingbot_realtime_plastic_beach_case,
         ONE_GPU_CASES,
+        _make_lingbot_realtime_plastic_beach_case,
     )
 
     case = _make_lingbot_realtime_plastic_beach_case()
