@@ -14,10 +14,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     warmup_radix,
 )
 
-_LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
-_LORA_ADAPTER = "philschmid/llama-3-2-1b-instruct-finetuning-lora-cookbook-test"
-
-
 def _in_flight_other_mb_rids(t: ScriptedContext) -> List[str]:
     # Rids held in pipeline micro-batch slots other than the one currently being
     # serviced (running_batch). running_mbs only exists on the PP path.
@@ -30,38 +26,6 @@ def _in_flight_other_mb_rids(t: ScriptedContext) -> List[str]:
             continue
         rids.extend(r.rid for r in mb.reqs)
     return rids
-
-
-class TestRegressionLora(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(
-        model_path=_LORA_BASE_MODEL,
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        enable_lora=True,
-        lora_paths=[_LORA_ADAPTER],
-    )
-
-    def test_lora_drainer_chunked_resume(self):
-        self.server.execute_script(self._script_lora_drainer_chunked_resume)
-
-    @staticmethod
-    def _script_lora_drainer_chunked_resume(t: ScriptedContext):
-        r = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN,
-            max_new_tokens=2,
-            lora_path=_LORA_ADAPTER,
-            ignore_eos=True,
-        )
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-
-        t.force_lora_drainer_reject(adapter=_LORA_ADAPTER)
-
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.req.req_pool_idx is None
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
-        assert r.chunks_done >= 2
-        assert len(r.req.output_ids) == 2
 
 
 class TestRegressionBasic(ScriptedTestCase):

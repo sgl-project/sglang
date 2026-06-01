@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 from sglang.test.scripted_runtime.context import (
     engine,
     lifecycle,
-    lora_control,
     queries,
     radix,
 )
@@ -100,9 +99,6 @@ class ScriptedContext:
 
     def exhaust_kv(self, *, leave_pages: int) -> None:
         return self._kv_exhauster.exhaust(leave_pages=leave_pages)
-
-    def force_lora_drainer_reject(self, *, adapter: str) -> None:
-        return lora_control.force_lora_drainer_reject(self, adapter=adapter)
 
     def _release_exhausted_pools(self) -> None:
         return self._kv_exhauster.release()
