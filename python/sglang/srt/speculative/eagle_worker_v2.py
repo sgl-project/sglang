@@ -704,25 +704,41 @@ class EagleDraftWorker(BaseDraftWorker):
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
         )
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
-        if self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
+        # Reorganize the spec info for the next batch.
+        # When the cuda graph already ran softmax+topk (or argmax for topk==1)
+        # inside run_once, reuse those small [num_extend, k] outputs and just
+        # gather at select_index. Skips a full-vocab index_select + a redundant
+        # argmax/topk over the gathered logits.
+        if (
+            can_cuda_graph
+            and getattr(draft_logits_output, "topk_index", None) is not None
+        ):
+            ret_topk_index = draft_logits_output.topk_index[select_index]
+            ret_topk_p = draft_logits_output.topk_p[select_index]
+            ret_hidden_states = (
+                draft_logits_output.hidden_states[select_index]
+                if draft_logits_output.hidden_states is not None
+                else None
             )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
         else:
-            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_hidden_states = draft_logits_output.hidden_states
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
+            if self.topk == 1 and not _is_hip:
+                # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+                # MTP draft selection on FP8 logits.
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            else:
+                probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
