@@ -96,5 +96,8 @@ class ScriptedContext:
     def list_active_reqs(self) -> List["Req"]:
         return queries.list_active_reqs(self)
 
+    def batch_composition(self) -> Dict[str, List[str]]:
+        return queries.batch_composition(self)
+
     def engine_stats(self) -> Dict[str, int]:
         return engine.engine_stats(self)

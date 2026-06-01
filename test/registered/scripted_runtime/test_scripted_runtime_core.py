@@ -439,6 +439,59 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             after_free >= during_free
         ), f"kv_pool_free should recover after finish; during={during_free} after={after_free}"
 
+    def test_lock_refs_held_during_run_released_after(self):
+        self.server.execute_script(self._script_lock_refs_held_then_released)
+
+    @staticmethod
+    def _script_lock_refs_held_then_released(t: ScriptedContext):
+        t.flush_cache()
+        yield
+        r = t.start_req(
+            prompt_len=_LONG_PROMPT_LEN,
+            max_new_tokens=_DECODE_MAX_NEW_TOKENS,
+            ignore_eos=True,
+        )
+        yield from advance_to_decode_step(r, 1)
+        assert (
+            r.lock_refs >= 1
+        ), f"radix lock_ref must be held mid-run; got {r.lock_refs}"
+        yield from run_until_finished(r)
+        assert (
+            r.lock_refs == 0
+        ), f"lock_refs must be released after finish; got {r.lock_refs}"
+
+    def test_batch_composition_shape_and_disjoint(self):
+        self.server.execute_script(self._script_batch_composition)
+
+    @staticmethod
+    def _script_batch_composition(t: ScriptedContext):
+        r = t.start_req(prompt_len=_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from advance_to_nth_chunk(r, 1)
+        comp = t.batch_composition()
+        assert set(comp) == {
+            "prefill",
+            "decode",
+            "chunked",
+            "running",
+        }, f"unexpected batch_composition keys: {comp!r}"
+        assert (
+            r.rid in comp["chunked"]
+        ), f"chunked req must be in 'chunked'; got {comp!r}"
+        prefill, decode, chunked = (
+            set(comp["prefill"]),
+            set(comp["decode"]),
+            set(comp["chunked"]),
+        )
+        assert (
+            prefill.isdisjoint(decode)
+            and prefill.isdisjoint(chunked)
+            and decode.isdisjoint(chunked)
+        ), f"prefill/decode/chunked subsets must be disjoint; got {comp!r}"
+        yield from run_until_finished(r)
+        assert (
+            t.batch_composition()["chunked"] == []
+        ), "no chunked req should remain after the req finishes"
+
     def test_empty_script_returns_immediately(self):
         self.server.execute_script(self._script_empty_return)
 
