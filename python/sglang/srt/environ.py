@@ -199,6 +199,7 @@ class Envs:
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -236,6 +237,8 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -745,6 +748,24 @@ class Envs:
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+
+    # ===================================================================
+    # KV-Canary / Token-Oracle (testing-only)
+    # ===================================================================
+    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
+    SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
+    SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
+    SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
+    SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
+    SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
 
 envs = Envs()

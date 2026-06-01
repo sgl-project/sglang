@@ -41,6 +41,7 @@ from torch.distributed import barrier
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -450,6 +451,9 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        if (c := self.tp_worker.model_runner.canary_manager) is not None:
+            c.attach_radix_cache(self.tree_cache)
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -552,6 +556,8 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
+
+        maybe_revert_pr_fix()
 
         self.is_initializing = False
 
