@@ -245,7 +245,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
         ),
         DiffusionSamplingParams(
-            prompt="A tiny warehouse robot moves a blue box across a clean floor.",
+            prompt="A blue box slides across a clean warehouse floor.",
             output_size="832x480",
             seconds=1,
             num_frames=9,
