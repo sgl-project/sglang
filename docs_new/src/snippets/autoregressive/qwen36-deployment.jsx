@@ -25,8 +25,8 @@ export const Qwen36Deployment = () => {
       getDynamicItems: (values) => {
         const isXeon = values.hardware === 'xeon';
         return [
-          { id: 'fp8', label: 'FP8', default: !isXeon, disabled: isXeon,
-            disabledReason: isXeon ? 'FP8 is not supported on Xeon' : '' },
+          { id: 'fp8', label: 'FP8', default: true, disabled: false,
+            disabledReason: '' },
           { id: 'bf16', label: 'BF16', default: isXeon },
         ];
       },

@@ -27,7 +27,7 @@ export const Qwen3CoderDeployment = () => {
         const isXeon = values.hardware === 'xeon';
         return [
           { id: 'bf16', label: 'BF16', default: true },
-          { id: 'fp8', label: 'FP8', default: false, disabled: isXeon, disabledReason: isXeon ? 'FP8 is not supported on Xeon' : '' },
+          { id: 'fp8', label: 'FP8', default: false, disabled: false, disabledReason: '' },
           { id: 'nvfp4', label: 'NVFP4', default: false, disabled: isXeon, disabledReason: isXeon ? 'FP4 is not supported on Xeon' : '' }
         ];
       }
@@ -83,11 +83,6 @@ export const Qwen3CoderDeployment = () => {
     // BF16 not verified on NVIDIA
     if (quantization === 'bf16' && isNvidia) {
       return `# BF16 deployment on ${hardware.toUpperCase()} has not been verified yet. Please use FP8 or NVFP4.`;
-    }
-
-    // Xeon only supports BF16
-    if (isXeon && quantization !== 'bf16') {
-      return `# Only BF16 quantization is supported on Intel Xeon CPU.`;
     }
 
     // Build model name

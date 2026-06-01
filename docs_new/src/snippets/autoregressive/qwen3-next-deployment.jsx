@@ -27,7 +27,7 @@ export const Qwen3NextDeployment = () => {
         const isXeon = values.hardware === 'xeon';
         return [
           { id: 'bf16', label: 'BF16', subtitle: 'Full Weights', default: true },
-          { id: 'fp8', label: 'FP8', subtitle: 'High Throughput', default: false, disabled: isXeon, disabledReason: isXeon ? 'FP8 is not supported on Xeon' : '' }
+          { id: 'fp8', label: 'FP8', subtitle: 'High Throughput', default: false, disabled: false, disabledReason: '' }
         ];
       }
     },

@@ -77,8 +77,8 @@ export const Qwen35Deployment = () => {
         const isXeon = values.hardware === 'xeon';
         return [
           { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon },
-          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon,  disabled: !hasFp8 || isXeon,
-            disabledReason: isXeon ? 'FP8 is not supported on Xeon' : 'No FP8 variant available for this model' },
+          { id: 'fp8',  label: 'FP8',  default: hasFp8,  disabled: !hasFp8,
+            disabledReason: 'No FP8 variant available for this model' },
           { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon,
             disabledReason: isXeon ? 'FP4 is not supported on Xeon' : 'FP4 is only available for Qwen3.5-397B-A17B' }
         ];
