@@ -1,5 +1,8 @@
+import time
+
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -27,6 +30,8 @@ class LTX2AVDecodingStage(DecodingStage):
         from diffusers.video_processor import VideoProcessor
 
         self.video_processor = VideoProcessor(vae_scale_factor=32)
+        self._vae_decode_untiled_failed = False
+        self._vae_decode_untiled_logged = False
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -43,6 +48,107 @@ class LTX2AVDecodingStage(DecodingStage):
         arch_config = server_args.pipeline_config.vae_config.arch_config
         return str(getattr(arch_config, "video_decoder_variant", "ltx_2")) != "ltx_2_3"
 
+    def _vae_decode_untiled_mode(self) -> str:
+        """Resolve eager untiled VAE-decode policy: "off" | "auto" | "force"."""
+        mode = str(envs.SGLANG_DIFFUSION_LTX2_UNTILED_VAE_DECODE).strip().lower()
+        if mode in ("0", "off", "false", "no", "disable", "disabled", ""):
+            return "off"
+        if mode in ("1", "on", "true", "yes", "force", "always"):
+            return "force"
+        return "auto"
+
+    @staticmethod
+    def _untiled_decode_fits(latents: torch.Tensor) -> bool:
+        try:
+            free, total = torch.cuda.mem_get_info()
+            channels = int(latents.shape[1]) if latents.dim() >= 2 else 1
+            decoded_numel = latents.numel() / max(channels, 1) * 3
+            decoded_numel *= 32 * 32 * 8  # LTX spatial/temporal expansion.
+            peak_bytes = decoded_numel * 2 * 8  # bf16 plus decoder workspace.
+            return free > peak_bytes * 1.3 and (free / max(total, 1)) > 0.3
+        except Exception:
+            return False
+
+    def _eager_untiled_decode(self, latents: torch.Tensor):
+        try:
+            if hasattr(self.vae, "disable_tiling"):
+                self.vae.disable_tiling()
+        except Exception:
+            pass
+        if not self._vae_decode_untiled_logged:
+            logger.info("Using untiled eager LTX-2 VAE decode.")
+            self._vae_decode_untiled_logged = True
+        return self.vae.decode(latents)
+
+    def _decode_video_latents(self, latents: torch.Tensor, server_args: ServerArgs):
+        untiled_mode = self._vae_decode_untiled_mode()
+        use_untiled_eager = (
+            untiled_mode != "off"
+            and not self._vae_decode_untiled_failed
+            and (untiled_mode == "force" or self._untiled_decode_fits(latents))
+        )
+        if use_untiled_eager:
+            try:
+                return self._eager_untiled_decode(latents)
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(
+                    "Untiled eager VAE decode hit OOM; falling back to tiled "
+                    "eager decode for the rest of this run."
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Untiled eager VAE decode failed (%s); falling back to "
+                    "tiled eager decode.",
+                    type(exc).__name__,
+                )
+            self._vae_decode_untiled_failed = True
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        try:
+            if server_args.pipeline_config.vae_tiling:
+                self.vae.enable_tiling()
+        except Exception:
+            pass
+        return self.vae.decode(latents)
+
+    @staticmethod
+    def _should_profile_decode_substages(batch: Req) -> bool:
+        return bool(batch.perf_dump_path or envs.SGLANG_DIFFUSION_STAGE_LOGGING)
+
+    @staticmethod
+    def _sync_for_decode_substage_profile() -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _record_decode_substage(
+        self,
+        batch: Req,
+        stage_name: str,
+        start_time: float,
+        *,
+        sync: bool,
+    ) -> float:
+        if sync:
+            self._sync_for_decode_substage_profile()
+        now = time.perf_counter()
+        if batch.metrics is not None:
+            batch.metrics.record_stage(stage_name, now - start_time)
+        return now
+
+    @staticmethod
+    def _postprocess_video_to_uint8_np(video: torch.Tensor):
+        """Convert decoded [B, C, T, H, W] video to final uint8 frames."""
+        if not isinstance(video, torch.Tensor) or video.dim() != 5:
+            raise TypeError(
+                "Expected decoded video tensor with shape [B, C, T, H, W], "
+                f"got {type(video)}"
+            )
+        video = ((video / 2 + 0.5).clamp(0, 1) * 255).to(torch.uint8)
+        return video.permute(0, 2, 3, 4, 1).contiguous().cpu().numpy()
+
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
 
@@ -52,6 +158,11 @@ class LTX2AVDecodingStage(DecodingStage):
         ) and not server_args.disable_autocast
 
         original_dtype = vae_dtype
+        profile_decode_substages = self._should_profile_decode_substages(batch)
+        substage_start = time.perf_counter()
+        if profile_decode_substages:
+            self._sync_for_decode_substage_profile()
+            substage_start = time.perf_counter()
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             assert vae is not None
             self.vae = vae
@@ -70,12 +181,7 @@ class LTX2AVDecodingStage(DecodingStage):
                 dtype=vae_dtype,
                 enabled=vae_autocast_enabled,
             ):
-                try:
-                    if server_args.pipeline_config.vae_tiling:
-                        self.vae.enable_tiling()
-                except Exception:
-                    pass
-                decode_output = self.vae.decode(latents)
+                decode_output = self._decode_video_latents(latents, server_args)
                 if isinstance(decode_output, tuple):
                     video = decode_output[0]
                 elif hasattr(decode_output, "sample"):
@@ -83,8 +189,29 @@ class LTX2AVDecodingStage(DecodingStage):
                 else:
                     video = decode_output
 
+            if profile_decode_substages:
+                substage_start = self._record_decode_substage(
+                    batch,
+                    "LTX2AVDecodingStage.video_decode",
+                    substage_start,
+                    sync=True,
+                )
             self.vae.to(original_dtype)
-        video = self.video_processor.postprocess_video(video, output_type="np")
+            if profile_decode_substages:
+                substage_start = self._record_decode_substage(
+                    batch,
+                    "LTX2AVDecodingStage.vae_dtype_restore",
+                    substage_start,
+                    sync=False,
+                )
+        video = self._postprocess_video_to_uint8_np(video)
+        if profile_decode_substages:
+            substage_start = self._record_decode_substage(
+                batch,
+                "LTX2AVDecodingStage.video_postprocess",
+                substage_start,
+                sync=False,
+            )
 
         output_batch = OutputBatch(
             output=video,
@@ -152,6 +279,13 @@ class LTX2AVDecodingStage(DecodingStage):
                     spectrogram = self.audio_vae.decode(
                         audio_latents, return_dict=False
                     )[0]
+                if profile_decode_substages:
+                    substage_start = self._record_decode_substage(
+                        batch,
+                        "LTX2AVDecodingStage.audio_decode",
+                        substage_start,
+                        sync=True,
+                    )
 
             with self.use_declared_component(
                 component_name="vocoder",
@@ -172,7 +306,21 @@ class LTX2AVDecodingStage(DecodingStage):
                 # Decode spectrogram to waveform
                 with torch.no_grad():
                     waveform = self.vocoder(spectrogram)
+                if profile_decode_substages:
+                    substage_start = self._record_decode_substage(
+                        batch,
+                        "LTX2AVDecodingStage.vocoder",
+                        substage_start,
+                        sync=True,
+                    )
             output_batch.audio = waveform.cpu().float()
+            if profile_decode_substages:
+                substage_start = self._record_decode_substage(
+                    batch,
+                    "LTX2AVDecodingStage.audio_to_cpu",
+                    substage_start,
+                    sync=False,
+                )
             try:
                 pipeline_audio_cfg = server_args.pipeline_config.audio_vae_config
             except AttributeError:
