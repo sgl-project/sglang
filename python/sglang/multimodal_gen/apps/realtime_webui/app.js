@@ -685,10 +685,14 @@ function renderLoop(now) {
     ? Math.min(MAX_CATCHUP_FPS, Math.ceil(queue.length / LOW_LATENCY_QUEUE_SECONDS))
     : targetFps;
   const targetMs = 1000 / Math.max(1, catchupFps);
-  if (queue.length && now - lastFrameAt >= targetMs) {
+  const elapsedMs = lastFrameAt ? now - lastFrameAt : targetMs;
+  if (queue.length && elapsedMs >= targetMs) {
     const item = queue.shift();
     drawFrame(item.image);
-    lastFrameAt = now;
+    // preserve remainder so 25fps is not quantized to 20fps on 60Hz rAF
+    lastFrameAt = !lastFrameAt || elapsedMs > targetMs * 4
+      ? now
+      : now - (elapsedMs % targetMs);
     fpsSamples.push(now);
     fpsSamples = fpsSamples.filter((t) => now - t < 1000);
     const renderedFps = String(fpsSamples.length);

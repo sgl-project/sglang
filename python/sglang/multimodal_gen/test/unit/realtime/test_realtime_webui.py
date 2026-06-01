@@ -52,6 +52,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "enable_frame_interpolation: true" in app_js
     assert "frame_interpolation_exp: DEFAULT_FRAME_INTERPOLATION_EXP" in app_js
     assert "frame_interpolation_scale: DEFAULT_FRAME_INTERPOLATION_SCALE" in app_js
+    assert "elapsedMs % targetMs" in app_js
     assert (
         'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";'
         in app_js
