@@ -3234,6 +3234,92 @@ class SanaWMBlock(nn.Module):
             x = x + (gate_mlp * mlp_out).reshape_as(x)
         return x
 
+    def forward_long(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        t: torch.Tensor,
+        HW: Tuple[int, int, int],
+        rotary_emb: Optional[torch.Tensor],
+        prope_fns: Optional[Tuple[Callable, Callable, Callable]],
+        plucker_emb: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+        *,
+        kv_cache: list,
+        save_kv_cache: bool,
+    ) -> Tuple[torch.Tensor, list]:
+        """Streaming counterpart of ``forward``: threads the per-block 10-slot
+        ``kv_cache`` through the cached attention + FFN. Mirrors the reference
+        ``SanaWMBlock.forward`` cache plumbing."""
+        B = x.shape[0]
+        if t.dim() == 2:
+            num_frames = None
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.scale_shift_table[None] + t.reshape(B, 6, -1)
+            ).chunk(6, dim=1)
+        else:
+            num_frames = t.reshape(B, -1, 6, t.shape[-1] // 6).shape[1]
+            t = t.reshape(B, num_frames, 6, -1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.scale_shift_table[None, None, :, :] + t
+            ).chunk(6, dim=2)
+
+        if num_frames is None:
+            x_in = self._modulate(self.norm1(x), shift_msa, scale_msa)
+        else:
+            x_norm, tokens_per_frame = self._reshape_framewise_modulation(
+                self.norm1(x), num_frames
+            )
+            x_in = self._modulate(x_norm, shift_msa, scale_msa).reshape_as(x)
+
+        attn_out, kv_cache = self.attn.forward_long(
+            x_in,
+            HW=HW,
+            rotary_emb=rotary_emb,
+            prope_fns=prope_fns,
+            kv_cache=kv_cache,
+            save_kv_cache=save_kv_cache,
+        )
+        if num_frames is None:
+            x = x + gate_msa * attn_out
+        else:
+            attn_out = attn_out.reshape(B, num_frames, tokens_per_frame, -1)
+            x = x + (gate_msa * attn_out).reshape_as(x)
+
+        if self.plucker_proj is not None and plucker_emb is not None:
+            x = x + self.plucker_proj(plucker_emb)
+
+        x = x + self.cross_attn(x, y, mask=mask)
+
+        if num_frames is None:
+            x_in = self._modulate(self.norm2(x), shift_mlp, scale_mlp)
+        else:
+            x_norm, tokens_per_frame = self._reshape_framewise_modulation(
+                self.norm2(x), num_frames
+            )
+            x_in = self._modulate(x_norm, shift_mlp, scale_mlp).reshape_as(x)
+
+        # GLUMBConvTemp returns a tuple whenever the streaming path is active
+        # (ffn_tail set OR save requested); branch on tuple-ness, never on
+        # save_kv_cache alone (a read-only pass with a populated slot 9 still
+        # returns a tuple).
+        mlp_out = self.mlp(
+            x_in,
+            HW=HW,
+            ffn_tail=kv_cache[_SLOT_FFN_TCONV],
+            save_ffn_tail=save_kv_cache,
+        )
+        if isinstance(mlp_out, tuple):
+            mlp_out, ffn_tail = mlp_out
+            if save_kv_cache:
+                kv_cache[_SLOT_FFN_TCONV] = ffn_tail
+        if num_frames is None:
+            x = x + gate_mlp * mlp_out
+        else:
+            mlp_out = mlp_out.reshape(B, num_frames, tokens_per_frame, -1)
+            x = x + (gate_mlp * mlp_out).reshape_as(x)
+        return x, kv_cache
+
 
 # ---------------------------------------------------------------------------
 # Top-level model
@@ -3647,6 +3733,143 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
         x = x.reshape(B, self.out_channels, T * p_t, H * p_h, W * p_w)
         return x
+
+    def forward_long(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        camera_conditions: Optional[torch.Tensor] = None,
+        chunk_plucker: Optional[torch.Tensor] = None,
+        *,
+        kv_cache: Optional[list] = None,
+        save_kv_cache: bool = True,
+        start_f: Optional[int] = None,
+        end_f: Optional[int] = None,
+        frame_index: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, list]:
+        """Streaming autoregressive forward over a chunk of latent frames.
+
+        Mirrors the reference ``forward_long``: RoPE / camera / plücker are
+        windowed to the chunk's GLOBAL frame range ``[start_f, end_f)`` and a
+        per-block 10-slot ``kv_cache`` carries recurrent state / concat-windows
+        across chunks. Returns ``(out, new_cache)``.
+        """
+        if encoder_hidden_states is None:
+            raise ValueError("SANA-WM forward_long requires encoder_hidden_states.")
+        if timestep is None:
+            raise ValueError("SANA-WM forward_long requires timestep.")
+
+        if kv_cache is None:
+            kv_cache = [[None] * _NUM_STREAM_CACHE_SLOTS for _ in self.blocks]
+
+        B, C, T_raw, H_raw, W_raw = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
+        T = T_raw // p_t
+        H = H_raw // p_h
+        W = W_raw // p_w
+        start = 0 if start_f is None else int(start_f)
+        end = start + T if end_f is None else int(end_f)
+
+        # --- 1. Patch embed ---
+        x = self.x_embedder(hidden_states.to(dtype=self.x_embedder.proj.weight.dtype))
+
+        # --- 2. Timestep AdaLN-single: force the framewise (B, 1, T) path so
+        # blocks always apply per-frame modulation (matches the reference). ---
+        if timestep.dim() == 1:
+            timestep = timestep[:, None, None].expand(-1, 1, T)
+        elif timestep.dim() == 2:
+            timestep = timestep[:, None, :]
+        if self.timestep_norm_scale_factor != 1.0:
+            timestep_for_embed = (
+                timestep.float() / self.timestep_norm_scale_factor
+            ).to(torch.float32)
+        else:
+            timestep_for_embed = timestep.long().to(torch.float32)
+        timestep_shape = tuple(timestep_for_embed.shape)
+        t_flat = self.t_embedder(timestep_for_embed.flatten())
+        t6_flat = self.t_block(t_flat)
+        t_emb = t_flat.unflatten(0, timestep_shape)
+        t6 = t6_flat.unflatten(0, timestep_shape)
+
+        # --- 3. Caption projection + y_norm ---
+        if isinstance(encoder_attention_mask, (list, tuple)):
+            encoder_attention_mask = encoder_attention_mask[0]
+        y = encoder_hidden_states
+        if y.dim() == 3:
+            y = y.unsqueeze(1)
+        y = self.y_embedder(y).squeeze(1)
+        if y.shape[0] != B:
+            y = y.expand(B, -1, -1).contiguous()
+        if self.y_norm:
+            y = self.attention_y_norm(y)
+        if encoder_attention_mask is not None and encoder_attention_mask.shape[0] != B:
+            encoder_attention_mask = encoder_attention_mask.expand(B, -1).contiguous()
+
+        # --- 4. RoPE windowed to global frame positions [start, end) ---
+        freqs = self._get_freqs_window(start, end, H, W, x.device, frame_index=frame_index)
+
+        # --- 5. Camera conditioning: slice to the chunk, co-windowed w/ freqs ---
+        prope_fns = None
+        if camera_conditions is not None:
+            if camera_conditions.shape[1] != T:
+                camera_conditions = camera_conditions[:, start:end]
+            if camera_conditions.shape[0] != B:
+                camera_conditions = camera_conditions.repeat(
+                    B // camera_conditions.shape[0], 1, 1
+                )
+            prope_fns = self._get_ucpe_apply_fns(
+                camera_conditions, HW=(T, H, W), freqs=freqs
+            )
+
+        # Plücker post-attn / input embedding, sliced to the chunk.
+        if chunk_plucker is not None and chunk_plucker.shape[2] != T:
+            chunk_plucker = chunk_plucker[:, :, start:end]
+        if chunk_plucker is not None and chunk_plucker.shape[0] != B:
+            chunk_plucker = chunk_plucker.repeat(
+                B // chunk_plucker.shape[0], 1, 1, 1, 1
+            )
+        plucker_emb = None
+        needs_plucker_emb = (
+            chunk_plucker is not None
+            and self.plucker_embedder is not None
+            and (self.use_chunk_plucker_post_attn or self.use_chunk_plucker_input)
+        )
+        if needs_plucker_emb:
+            plucker_emb = self._get_plucker_emb(
+                chunk_plucker, latent_token_count=x.shape[1]
+            )
+        if self.use_chunk_plucker_input and plucker_emb is not None:
+            x = x + plucker_emb
+        if not self.use_chunk_plucker_post_attn:
+            plucker_emb = None
+
+        # --- 6. Transformer blocks (thread per-block cache) ---
+        HW = (T, H, W)
+        new_cache = []
+        for i, block in enumerate(self.blocks):
+            x, block_cache = block.forward_long(
+                x,
+                y,
+                t6,
+                HW,
+                freqs,
+                prope_fns,
+                plucker_emb,
+                encoder_attention_mask,
+                kv_cache=kv_cache[i],
+                save_kv_cache=save_kv_cache,
+            )
+            new_cache.append(block_cache)
+
+        # --- 7. Final layer + 8. Un-patch ---
+        x = self.final_layer(x, t_emb)
+        x = x.reshape(B, T, H, W, p_t, p_h, p_w, self.out_channels)
+        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
+        x = x.reshape(B, self.out_channels, T * p_t, H * p_h, W * p_w)
+        return x, new_cache
 
 
 EntryClass = SanaWMTransformer3DModel

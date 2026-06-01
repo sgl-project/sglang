@@ -12,10 +12,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     BidirectionalGDNUCPESinglePathLiteLA,
+    SanaWMBlock,
     WanRotaryPosEmbed,
     _SLOT_CAM_K,
     _SLOT_FFN_TCONV,
@@ -28,6 +31,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _slice_rope_to_current_chunk,
     process_camera_conditions_ucpe,
 )
+from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 HEAD_DIM = 112
 H, W = 2, 3
@@ -204,3 +208,73 @@ def test_forward_long_gdn_reduces_to_dense_with_camera():
     cached, _ = attn.forward_long(x, AHW, freqs, prope_fns, kv_cache=cache, save_kv_cache=True)
     torch.testing.assert_close(cached, dense, atol=1e-9, rtol=0)
     assert cache[_SLOT_CAM_K] is not None
+
+
+# --------------------------------------------------------------------------- #
+# Stage 2 — block-level forward_long (cross-attn stubbed; needs server args
+# only to construct the cross-attn's LocalAttention)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def _global_args():
+    prev = _sa_mod._global_server_args
+    set_global_server_args(
+        SimpleNamespace(
+            comfyui_mode=False,
+            enable_cfg_parallel=False,
+            enable_torch_compile=False,
+            attention_backend=None,
+        )
+    )
+    try:
+        yield
+    finally:
+        set_global_server_args(prev)
+
+
+class _ZeroCross(torch.nn.Module):
+    def forward(self, x, y, mask=None):
+        return torch.zeros_like(x)
+
+
+def _block():
+    b = SanaWMBlock(
+        hidden_size=AC,
+        num_heads=AHEADS,
+        head_dim=ADIM,
+        mlp_ratio=2.0,
+        t_kernel_size=3,
+        qk_norm=True,
+        cross_norm=True,
+        conv_kernel_size=4,
+        k_conv_only=True,
+        softmax_main=False,
+        use_chunk_plucker_post_attn=False,
+        update_rule="torch_recurrent",
+        cam_update_rule="torch_recurrent",
+    ).double().eval()
+    # Stub cross-attn (unchanged/uncached in forward_long) to avoid the CUDA
+    # attention backend; both forward and forward_long add the same zero.
+    b.cross_attn = _ZeroCross()
+    return b
+
+
+def test_block_forward_long_reduces_to_dense(_global_args):
+    block = _block()
+    x = _x()
+    y = torch.randn(AB, 4, AC, dtype=torch.float64)
+    t6 = torch.randn(AB, 1, T, 6 * AC, dtype=torch.float64)
+    (apply_q, apply_kv, apply_o), freqs = _prope()
+    prope_fns = (apply_q, apply_kv, apply_o)
+
+    dense = block(x, y, t6, AHW, freqs, prope_fns, None, None)
+    cache = _empty_cache()
+    out, ret = block.forward_long(
+        x, y, t6, AHW, freqs, prope_fns, None, None, kv_cache=cache, save_kv_cache=True
+    )
+    torch.testing.assert_close(out, dense, atol=1e-9, rtol=0)
+    assert ret is cache
+    assert cache[_SLOT_K] is not None  # main GDN state
+    assert cache[_SLOT_CAM_K] is not None  # cam state
+    assert cache[_SLOT_FFN_TCONV] is not None  # FFN temporal tail
