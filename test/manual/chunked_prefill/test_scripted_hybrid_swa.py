@@ -120,9 +120,10 @@ class TestSWAChunkSizeExceedsWindow(ScriptedTestCase):
 
     @staticmethod
     def _script_swa_chunk_size_exceeds_window(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(prompt_len=3 * _SWA_WINDOW, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
+        assert r.chunks_done >= 2
         assert len(r.req.output_ids) == 2
 
 
