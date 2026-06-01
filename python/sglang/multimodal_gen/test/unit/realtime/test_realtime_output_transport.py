@@ -191,41 +191,28 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
 
     payloads, stats, expected_frames = asyncio.run(run())
 
-    (first_header, first_payload), (second_header, second_payload) = (
-        _unpack_frame_batch_messages(payloads)
-    )
+    [(first_header, first_payload)] = _unpack_frame_batch_messages(payloads)
     assert first_header["content_type"] == RAW_RGB_DELTA_GZIP_CONTENT_TYPE
     assert first_header["encoding"] == "delta-gzip"
     assert first_header["event_id"] == 3
     assert first_header["format"] == "rgb24"
     assert first_header["channels"] == 3
     assert first_header["bytes_per_frame"] == 3000
-    assert first_header["raw_size"] == 3000
+    assert first_header["raw_size"] == 6000
     assert first_header["total_size"] == len(first_payload)
-    assert first_header["num_frames"] == 1
-    assert first_header["num_frame_batches"] == 2
+    assert first_header["num_frames"] == 2
+    assert first_header["num_frame_batches"] == 1
     assert first_header["frame_batch_index"] == 0
     assert "delta_reference" not in first_header
-    assert second_header["raw_size"] == 3000
-    assert second_header["num_frames"] == 1
-    assert second_header["num_frame_batches"] == 2
-    assert second_header["frame_batch_index"] == 1
-    assert second_header["delta_reference"] == "previous-frame"
     assert stats["raw_bytes"] == 6000
-    assert stats["num_batches"] == 2
+    assert stats["num_batches"] == 1
     assert stats["num_frames"] == 2
-    first_frame = restore_delta_gzip_raw_rgb_payload(
+    restored_frames = restore_delta_gzip_raw_rgb_payload(
         first_payload,
         bytes_per_frame=3000,
-        num_frames=1,
+        num_frames=2,
     )
-    second_frame = restore_delta_gzip_raw_rgb_payload(
-        second_payload,
-        bytes_per_frame=3000,
-        num_frames=1,
-        reference_frame=first_frame,
-    )
-    assert first_frame + second_frame == expected_frames
+    assert restored_frames == expected_frames
 
 
 def test_raw_rgb_realtime_output_adapter_offloads_delta_payload_build(
@@ -282,26 +269,16 @@ def test_raw_rgb_realtime_output_adapter_offloads_delta_payload_build(
 
     assert [call[0] for call in calls] == [
         realtime_output_adapter._build_transport_payload,
-        realtime_output_adapter._build_transport_payload,
     ]
-    (first_header, first_payload), (second_header, second_payload) = (
-        _unpack_frame_batch_messages(payloads)
-    )
+    [(first_header, first_payload)] = _unpack_frame_batch_messages(payloads)
     assert first_header["encoding"] == "delta-gzip"
     assert "delta_reference" not in first_header
-    assert second_header["delta_reference"] == "previous-frame"
-    first_frame = restore_delta_gzip_raw_rgb_payload(
+    restored_frames = restore_delta_gzip_raw_rgb_payload(
         first_payload,
         bytes_per_frame=3000,
-        num_frames=1,
+        num_frames=2,
     )
-    second_frame = restore_delta_gzip_raw_rgb_payload(
-        second_payload,
-        bytes_per_frame=3000,
-        num_frames=1,
-        reference_frame=first_frame,
-    )
-    assert first_frame + second_frame == expected_frames
+    assert restored_frames == expected_frames
 
 
 def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
@@ -343,24 +320,17 @@ def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
 
     payloads, stats, expected_frames = asyncio.run(run())
 
-    (first_header, first_payload), (second_header, second_payload) = (
-        _unpack_frame_batch_messages(payloads)
-    )
+    [(first_header, first_payload)] = _unpack_frame_batch_messages(payloads)
     assert first_header["content_type"] == RAW_RGB_CONTENT_TYPE
     assert first_header["encoding"] == "raw"
-    assert first_header["raw_size"] == 3000
-    assert first_header["total_size"] == 3000
-    assert first_header["num_frames"] == 1
-    assert first_header["num_frame_batches"] == 2
+    assert first_header["raw_size"] == 6000
+    assert first_header["total_size"] == 6000
+    assert first_header["num_frames"] == 2
+    assert first_header["num_frame_batches"] == 1
     assert first_header["frame_batch_index"] == 0
-    assert second_header["raw_size"] == 3000
-    assert second_header["total_size"] == 3000
-    assert second_header["num_frames"] == 1
-    assert second_header["num_frame_batches"] == 2
-    assert second_header["frame_batch_index"] == 1
-    assert first_payload + second_payload == expected_frames
+    assert first_payload == expected_frames
     assert stats["raw_bytes"] == 6000
-    assert stats["num_batches"] == 2
+    assert stats["num_batches"] == 1
     assert stats["num_frames"] == 2
     assert stats["ws_payload_bytes"] == sum(len(payload) for payload in payloads)
 
@@ -447,7 +417,7 @@ def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
-        frames = [bytes([idx, idx + 1, idx + 2]) for idx in range(7)]
+        frames = [bytes([idx, idx + 1, idx + 2]) for idx in range(17)]
         batch = SimpleNamespace(
             block_idx=4,
             request_id="req-split",
@@ -474,25 +444,16 @@ def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
     payloads, stats = asyncio.run(run())
 
     headers = [header for header, _ in _unpack_frame_batch_messages(payloads)]
-    assert len(headers) == 7
-    assert [header["chunk_index"] for header in headers] == [4] * 7
-    assert [header["frame_batch_index"] for header in headers] == list(range(7))
-    assert [header["num_frame_batches"] for header in headers] == [7] * 7
-    assert [header["num_frames"] for header in headers] == [1] * 7
-    assert [header["is_final_frame_batch"] for header in headers] == [
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        True,
-    ]
+    assert len(headers) == 2
+    assert [header["chunk_index"] for header in headers] == [4, 4]
+    assert [header["frame_batch_index"] for header in headers] == [0, 1]
+    assert [header["num_frame_batches"] for header in headers] == [2, 2]
+    assert [header["num_frames"] for header in headers] == [16, 1]
+    assert [header["is_final_frame_batch"] for header in headers] == [False, True]
     assert "delta_reference" not in headers[0]
-    for header in headers[1:]:
-        assert header["delta_reference"] == "previous-frame"
-    assert stats["num_batches"] == 7
-    assert stats["num_frames"] == 7
+    assert headers[1]["delta_reference"] == "previous-frame"
+    assert stats["num_batches"] == 2
+    assert stats["num_frames"] == 17
 
 
 def test_raw_rgb_realtime_output_adapter_can_send_webp_preview_frames():
