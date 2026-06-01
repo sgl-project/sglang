@@ -285,16 +285,29 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
     def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
         if sana_wm_skip_refiner_enabled():
             return
-        self.add_stage(
-            SanaWMLTX2RefinerStage(
-                transformer=self.get_module("transformer_2"),
-                connectors=self.get_module("connectors"),
-                text_encoder=self.get_module("text_encoder_2"),
-                tokenizer=self.get_module("tokenizer_2"),
-                dtype=default_sana_wm_refiner_dtype(server_args),
-            ),
-            "sana_wm_refiner",
+        pc = server_args.pipeline_config
+        common = dict(
+            transformer=self.get_module("transformer_2"),
+            connectors=self.get_module("connectors"),
+            text_encoder=self.get_module("text_encoder_2"),
+            tokenizer=self.get_module("tokenizer_2"),
+            dtype=default_sana_wm_refiner_dtype(server_args),
         )
+        if getattr(pc, "streaming", False):
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming_refiner import (
+                SanaWMStreamingRefinerStage,
+            )
+
+            stage = SanaWMStreamingRefinerStage(
+                **common,
+                block_size=int(getattr(pc, "refiner_block_size", 3)),
+                kv_max_frames=int(getattr(pc, "refiner_kv_max_frames", 11)),
+                sink_size=int(getattr(pc, "sink_size", 1)),
+                seed=int(getattr(pc, "refiner_seed", 42)),
+            )
+        else:
+            stage = SanaWMLTX2RefinerStage(**common)
+        self.add_stage(stage, "sana_wm_refiner")
 
     def _add_decoding_stage(self, server_args: ServerArgs = None) -> None:
         # Streaming routes to the base, which selects SanaWMStreamingDecodingStage
