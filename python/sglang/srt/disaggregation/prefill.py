@@ -70,14 +70,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def should_force_optimistic_prefill_retry(req: Req) -> bool:
+def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
     retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
     if retry_prob <= 0 or req.time_stats.prefill_retry_count > 0 or req.is_retracted:
         return False
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
-    return retry_prob >= 1 or int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+    return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
 def maybe_release_metadata_buffer(
@@ -843,12 +843,11 @@ class SchedulerDisaggregationPrefillMixin:
                 self.optimistic_release_and_requeue(req)
             return False
         elif poll == KVPoll.WaitingForInput:
-            if should_force_optimistic_prefill_retry(req):
+            if should_force_retry(
+                req
+            ) or not self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req):
                 if not defer_release:
                     self.optimistic_release_and_requeue(req)
-                return False
-            if not self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req):
-                self.disagg_prefill_bootstrap_queue.queue.insert(0, req)
                 return False
             return True
         else:
