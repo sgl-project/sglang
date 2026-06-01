@@ -24,6 +24,7 @@ register_amd_ci(
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_amd_ci(), "Skip DP test for AMD CI, run TP only.")
 class TestDeepseekV32DP(CustomTestCase):
     @classmethod

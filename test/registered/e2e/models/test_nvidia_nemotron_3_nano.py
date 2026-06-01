@@ -47,6 +47,7 @@ BASE_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class _Nemotron35LightningServer:
     speculative_args: list[str] = []
     model = try_cached_model(MODEL)
