@@ -29,7 +29,12 @@ class TestSWABasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 4096, max_new_tokens=4)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done >= 2
+        # prompt_len = 2048 + 4096 = 6144, chunk size = 256, so the prompt needs
+        # at least ceil(6144 / 256) = 24 partial prefill iterations. SWA may add
+        # extra chunked iterations because the sliding window can shrink the
+        # usable budget per chunk, so this is a tight lower bound, not an equality.
+        assert r.chunks_done >= 24
+        assert len(r.req.output_ids) == 4
 
     def test_swa_prompt_equals_window(self):
         self.server.execute_script(self._script_swa_prompt_equals_window)
@@ -120,9 +125,10 @@ class TestSWAChunkSizeExceedsWindow(ScriptedTestCase):
 
     @staticmethod
     def _script_swa_chunk_size_exceeds_window(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(prompt_len=3 * _SWA_WINDOW, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
+        assert r.chunks_done >= 2
         assert len(r.req.output_ids) == 2
 
 

@@ -4,12 +4,12 @@ from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
     run_until_all_finished,
     run_until_finished,
-    warmup_radix,
 )
 
 
@@ -111,6 +111,11 @@ class TestRadixBasic(ScriptedTestCase):
         ]
         yield from run_until_all_finished(reqs)
         for r in reqs:
+            assert r.finished
+            # The shared 4-chunk prefix must actually be hit (this pins that
+            # prefix-sharing happened); the 8-token tail is too short to chunk,
+            # so cached_tokens -- not chunks_done -- is the right witness.
+            assert r.req.cached_tokens > 0
             assert r.lock_refs == 0
 
     def test_radix_partial_hit_exact_chunk_boundary(self):
@@ -124,29 +129,36 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_finished(r2)
         assert r2.chunks_done == 1
 
-    def test_radix_warmup_helper(self):
-        self.server.execute_script(self._script_radix_warmup_helper)
-
-    @staticmethod
-    def _script_radix_warmup_helper(t: ScriptedContext):
-        yield from warmup_radix(t, [1] * (2 * DEFAULT_CHUNK_SIZE))
-
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE + 1, max_new_tokens=1)
-        yield from run_until_finished(r)
-        assert r.chunks_done == 0
-
     def test_radix_two_distinct_prefixes(self):
         self.server.execute_script(self._script_radix_two_distinct_prefixes)
 
     @staticmethod
     def _script_radix_two_distinct_prefixes(t: ScriptedContext):
-        r_a = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
+        # Distinct prompt_token values fork the radix tree into two sibling
+        # branches off the root instead of a single linear chain, so each
+        # re-submission must hit only its own branch's cached prefix.
+        r_a = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=11
+        )
         yield from run_until_finished(r_a)
-        r_b = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 3, max_new_tokens=1)
+        r_b = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=22
+        )
         yield from run_until_finished(r_b)
-        r_a2 = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
+
+        r_a2 = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=11
+        )
         yield from run_until_finished(r_a2)
         assert r_a2.chunks_done == 0
+        assert r_a2.req.cached_tokens > 0
+
+        r_b2 = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=22
+        )
+        yield from run_until_finished(r_b2)
+        assert r_b2.chunks_done == 0
+        assert r_b2.req.cached_tokens > 0
 
     def test_radix_full_prefix_minus_one(self):
         self.server.execute_script(self._script_radix_full_prefix_minus_one)
@@ -226,6 +238,10 @@ class TestRadixBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
+        # The warm prefix was evicted before r was submitted, so r must miss
+        # the cache and re-chunk its whole 6-chunk prompt from scratch.
+        assert r.req.cached_tokens == 0
+        assert r.chunks_done >= 2
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -415,20 +431,47 @@ class TestRadixLpm(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_lpm_policy_chunked_priority(t: ScriptedContext):
-        r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
+        # Warm a 2-chunk prefix on the prompt_token=1 branch.
+        r_warm = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=1
+        )
         yield from run_until_finished(r_warm)
         assert r_warm.finished
 
-        reqs = [
-            t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 3, max_new_tokens=1)
-            for _ in range(3)
-        ]
-        yield from run_until_all_finished(reqs)
-        for r in reqs:
-            assert r.finished
+        # Submit two reqs at once so calc_priority orders the waiting queue:
+        # r_long shares the full 2-chunk warm prefix (longest prefix match),
+        # r_short is on a disjoint branch (zero prefix match). LPM must admit
+        # r_long first, so it is the first rid to enter chunked prefill.
+        r_long = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, prompt_token=1
+        )
+        r_short = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, prompt_token=7
+        )
+
+        first_admitted = None
+        for _ in range(DEFAULT_MAX_STEPS):
+            comp = t.batch_composition()
+            active = (
+                comp.get("chunked", [])
+                + comp.get("prefill", [])
+                + comp.get("running", [])
+            )
+            if first_admitted is None and active:
+                first_admitted = active[0]
+            if r_long.finished and r_short.finished:
+                break
+            yield
+        assert r_long.finished and r_short.finished
+        assert first_admitted == r_long.rid, (
+            f"LPM must admit the longest-prefix-match req first; first admitted "
+            f"rid was {first_admitted!r}, expected r_long={r_long.rid!r}"
+        )
+        assert r_long.req.cached_tokens > 0
+        assert r_short.req.cached_tokens == 0
+        for r in (r_long, r_short):
             assert r.kv_pages == 0
             assert r.lock_refs == 0
-            assert r.req.cached_tokens > 0
 
 
 class TestRadixDfsWeight(ScriptedTestCase):
@@ -442,17 +485,51 @@ class TestRadixDfsWeight(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_dfs_weight_policy_chunked(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r1)
-        assert r1.finished
-        assert r1.chunks_done >= 2
+        # Warm two distinct branches (different prompt_token) so waiting reqs
+        # hang off two different radix nodes.
+        warm_a = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=3
+        )
+        yield from run_until_finished(warm_a)
+        warm_b = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1, prompt_token=4
+        )
+        yield from run_until_finished(warm_b)
 
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r2)
-        assert r2.finished
-        assert r2.req.cached_tokens > 0
-        assert r2.kv_pages == 0
-        assert r2.lock_refs == 0
+        # Branch A carries a heavier subtree weight (3 waiting reqs) than branch
+        # B (1 waiting req). dfs-weight traverses the heavier child subtree
+        # first, so all branch-A reqs must finish before the lone branch-B req.
+        heavy = [
+            t.start_req(
+                prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, prompt_token=3
+            )
+            for _ in range(3)
+        ]
+        light = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, prompt_token=4
+        )
+        all_reqs = heavy + [light]
+
+        finish_order: list = []
+        for _ in range(DEFAULT_MAX_STEPS * 4):
+            for r in all_reqs:
+                if r.finished and r.rid not in finish_order:
+                    finish_order.append(r.rid)
+            if all(r.finished for r in all_reqs):
+                break
+            yield
+        assert all(r.finished for r in all_reqs)
+        assert finish_order[-1] == light.rid, (
+            f"dfs-weight must drain the heavier branch-A subtree before the "
+            f"lighter branch-B req; finish order was {finish_order!r}, "
+            f"light={light.rid!r}"
+        )
+        for r in heavy:
+            assert r.req.cached_tokens > 0
+        assert light.req.cached_tokens > 0
+        for r in all_reqs:
+            assert r.kv_pages == 0
+            assert r.lock_refs == 0
 
 
 class TestRadixPriority(ScriptedTestCase):
@@ -466,31 +543,52 @@ class TestRadixPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_prefix_match_with_priority(t: ScriptedContext):
+        # enable_priority_scheduling forces fcfs+priority sorting; with the
+        # default schedule_low_priority_values_first=False a larger priority
+        # value wins. Both reqs hit the same warm prefix, so priority -- not
+        # prefix length -- decides admission order.
         r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
         yield from run_until_finished(r_warm)
         assert r_warm.finished
 
-        r = t.start_req(
-            prompt_len=DEFAULT_CHUNK_SIZE * 3, max_new_tokens=2, priority="high"
+        r_low = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, priority=0
         )
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.req.cached_tokens > 0
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
+        r_high = t.start_req(
+            prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, priority=10
+        )
+
+        first_admitted = None
+        for _ in range(DEFAULT_MAX_STEPS):
+            comp = t.batch_composition()
+            active = (
+                comp.get("chunked", [])
+                + comp.get("prefill", [])
+                + comp.get("running", [])
+            )
+            if first_admitted is None and active:
+                first_admitted = active[0]
+            if r_low.finished and r_high.finished:
+                break
+            yield
+        assert r_low.finished and r_high.finished
+        assert first_admitted == r_high.rid, (
+            f"higher-priority req must be admitted first; first admitted rid "
+            f"was {first_admitted!r}, expected r_high={r_high.rid!r}"
+        )
+        for r in (r_low, r_high):
+            assert r.req.cached_tokens > 0
+            assert r.kv_pages == 0
+            assert r.lock_refs == 0
 
     def test_radix_calc_priority_skip_chunked_resume(self):
         self.server.execute_script(self._script_radix_calc_priority_skip_chunked_resume)
 
     @staticmethod
     def _script_radix_calc_priority_skip_chunked_resume(t: ScriptedContext):
-        r1 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
-        )
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10)
         yield from run_until(r1, lambda h: h.is_chunking)
-        r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
-        )
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=0)
 
         # The scheduler does not record which admission branch it took. The
         # observable consequence of skipping r1's chunked-resume in the priority

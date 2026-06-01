@@ -37,7 +37,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done <= 1
+        assert r.chunks_done == 0
         assert len(r.req.output_ids) == 16
 
     def test_long_prompt_short_decode(self):
@@ -50,7 +50,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done >= 2
+        assert r.chunks_done == 8
         assert len(r.req.output_ids) == 2
 
     def test_long_prompt_long_decode(self):
@@ -63,7 +63,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         )
         yield from run_until(r, lambda h: h.finished, max_steps=1000)
         assert r.finished
-        assert r.chunks_done >= 2
+        assert r.chunks_done == 8
         assert len(r.req.output_ids) == 64
 
     def test_tiny_prompt_long_decode(self):
@@ -173,7 +173,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r)
         assert r.finished
-        assert r.chunks_done >= 2
+        assert r.chunks_done == 8
         assert len(r.req.output_ids) == 1
 
     def test_kv_pages_consistent_during_run(self):
@@ -261,9 +261,10 @@ class TestLifecycleBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
-        assert r2.chunks_done <= 1
+        assert r2.chunks_done == 0
         assert r2.req.cached_tokens > 0, (
-            f"r2 must hit r1's radix prefix; got cached_tokens=" f"{r2.req.cached_tokens}"
+            f"r2 must hit r1's radix prefix; got cached_tokens="
+            f"{r2.req.cached_tokens}"
         )
         assert len(r2.req.output_ids) == 2
 
@@ -280,7 +281,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 2
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if prompt == VERY_LONG_PROMPT_LEN:
-                assert r.chunks_done >= 2
+                assert r.chunks_done == 8
             else:
                 assert r.chunks_done == 0
 
@@ -296,7 +297,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 1
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
-                assert r.chunks_done >= 2
+                assert (
+                    r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
+                )
             else:
                 assert r.chunks_done == 0
 
@@ -312,7 +315,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 1
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
-                assert r.chunks_done >= 2
+                assert (
+                    r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
+                )
             else:
                 assert r.chunks_done == 0
 
@@ -343,25 +348,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 2
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L == VERY_LONG_PROMPT_LEN:
-                assert r.chunks_done >= 2
+                assert r.chunks_done == 8
             else:
                 assert r.chunks_done == 0
-
-    def test_seq_finish_events_one_each(self):
-        self.server.execute_script(self._script_seq_finish_events_one_each)
-
-    @staticmethod
-    def _script_seq_finish_events_one_each(t: ScriptedContext):
-        reqs = []
-        for _ in range(5):
-            r = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
-            yield from run_until_finished(r)
-            assert r.finished
-            assert len(r.req.output_ids) == 2
-            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
-            reqs.append(r)
-        for r in reqs:
-            assert r.finished
 
     def test_seq_engine_stats_stable(self):
         self.server.execute_script(self._script_seq_engine_stats_stable)

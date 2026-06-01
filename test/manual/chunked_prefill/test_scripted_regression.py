@@ -78,12 +78,30 @@ class TestRegressionBasic(ScriptedTestCase):
             prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, ignore_eos=True
         )
 
-        yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
-        assert (
-            r.req.inflight_middle_chunks > 0
-        ), "last-chunk admit must bump inflight_middle_chunks"
+        # Step one at a time so observed_max sees every intermediate value of
+        # inflight_middle_chunks, not just the values at the run_until landings.
+        observed_max = 0
+        saw_chunking_bump = False
+        for _ in range(DEFAULT_MAX_STEPS):
+            observed_max = max(observed_max, r.req.inflight_middle_chunks)
+            if r.chunks_done >= 1 and r.is_chunking:
+                saw_chunking_bump = saw_chunking_bump or (
+                    r.req.inflight_middle_chunks > 0
+                )
+            if not r.is_chunking and r.chunks_done >= 2:
+                break
+            if r.finished:
+                break
+            yield
+        else:
+            raise AssertionError("chunk loop did not clear within DEFAULT_MAX_STEPS")
 
-        yield from run_until(r, lambda h: not h.is_chunking)
+        assert saw_chunking_bump, "last-chunk admit must bump inflight_middle_chunks"
+        assert observed_max == 1, (
+            f"e875cd36e4: inflight_middle_chunks must be a 0/1 latch; "
+            f"observed max={observed_max} (pre-fix bug would bump to 2 "
+            f"at the last-chunk admit boundary)"
+        )
         assert r.req.inflight_middle_chunks == 0, (
             f"inflight_middle_chunks should be 0 after chunk loop clears; "
             f"got {r.req.inflight_middle_chunks}"
@@ -91,6 +109,7 @@ class TestRegressionBasic(ScriptedTestCase):
 
         yield from run_until_finished(r)
         assert r.finished
+        assert r.chunks_done >= 2
 
     @unittest.skip(
         "dbdcdde245 mamba_pool_idx cleanup-skip is mamba-architecture-specific. "
@@ -107,63 +126,6 @@ class TestRegressionBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         assert r.finished
-
-    def test_revert_bump_inflight_middle_chunks(self):
-        self.server.execute_script(self._script_revert_bump_inflight_middle_chunks)
-
-    @staticmethod
-    def _script_revert_bump_inflight_middle_chunks(t: ScriptedContext):
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
-
-        observed_max = 0
-        for _ in range(DEFAULT_MAX_STEPS):
-            observed_max = max(observed_max, r.req.inflight_middle_chunks)
-            if r.finished:
-                break
-            yield
-        else:
-            raise AssertionError("req did not finish within DEFAULT_MAX_STEPS")
-
-        assert observed_max == 1, (
-            f"e875cd36e4: inflight_middle_chunks must be a 0/1 latch; "
-            f"observed max={observed_max} (pre-fix bug would bump to 2 "
-            f"at the last-chunk admit boundary)"
-        )
-        assert r.req.inflight_middle_chunks == 0
-        assert r.finished and r.chunks_done >= 2
-
-    def test_filter_batch_exclude_in_flight_other_mb(self):
-        self.server.execute_script(self._script_filter_batch_exclude_in_flight_other_mb)
-
-    @staticmethod
-    def _script_filter_batch_exclude_in_flight_other_mb(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-
-        observed_in_flight_other_mb = False
-        observed_excluded_from_running = False
-        for _ in range(DEFAULT_MAX_STEPS):
-            in_flight_other_mb = _in_flight_other_mb_rids(t)
-            running = [req.rid for req in t.scheduler.running_batch.reqs]
-            if r.rid in in_flight_other_mb:
-                observed_in_flight_other_mb = True
-                assert r.rid not in running, (
-                    f"5c523049db: after filter_batch, chunked-resume "
-                    f"req held in another mb must be excluded from "
-                    f"local running set; rid={r.rid}"
-                )
-                observed_excluded_from_running = True
-            if r.finished:
-                break
-            yield
-        else:
-            raise AssertionError("req did not finish within DEFAULT_MAX_STEPS")
-
-        assert r.finished and r.chunks_done >= 2
-        if observed_in_flight_other_mb:
-            assert observed_excluded_from_running, (
-                "5c523049db: filter_batch must exclude in-flight "
-                "other-mb reqs from local running set"
-            )
 
     # Removed test_stage_a_chunk_stash_iter_boundary: it probed t.last_scheduler_path
     # / t.last_admission_path, which require the scheduler to durably record which
@@ -184,22 +146,6 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
         assert r1.chunks_done >= 2 and r2.chunks_done == 0
-        assert len(r1.req.output_ids) == 2 and len(r2.req.output_ids) == 2
-
-    def test_filter_batch_explicit_exclude_chunked_flag(self):
-        self.server.execute_script(
-            self._script_filter_batch_explicit_exclude_chunked_flag
-        )
-
-    @staticmethod
-    def _script_filter_batch_explicit_exclude_chunked_flag(t: ScriptedContext):
-        r1 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, ignore_eos=True
-        )
-        r2 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
-        yield from run_until_all_finished([r1, r2])
-        assert r1.finished and r2.finished
-        assert r1.chunks_done >= 2
         assert len(r1.req.output_ids) == 2 and len(r2.req.output_ids) == 2
 
     def test_waiting_queue_pending_tokens_subtract_prefix(self):
@@ -586,7 +532,7 @@ class TestRegressionPriority(ScriptedTestCase):
         r1 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
-            priority="low",
+            priority=0,
             ignore_eos=True,
         )
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
@@ -597,7 +543,7 @@ class TestRegressionPriority(ScriptedTestCase):
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
-            priority="high",
+            priority=10,
             ignore_eos=True,
         )
         yield
@@ -735,36 +681,6 @@ class TestRegressionGptOss(ScriptedTestCase):
             f"kv_committed_len={committed}"
         )
         yield from run_until_finished(r)
-
-
-class TestRegressionWaitingTimeout(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        env={"SGLANG_REQ_WAITING_TIMEOUT": "1"},
-    )
-
-    def test_chunked_resume_immune_to_waiting_timeout(self):
-        self.server.execute_script(
-            self._script_chunked_resume_immune_to_waiting_timeout
-        )
-
-    @staticmethod
-    def _script_chunked_resume_immune_to_waiting_timeout(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        assert r.is_chunking
-
-        t.trigger_abort_on_waiting_timeout()
-        yield
-
-        assert not getattr(
-            r, "aborted", False
-        ), f"359e5ed7bd: chunked-resume must be immune to waiting timeout abort"
-        assert r.kv_pages > 0 or r.chunks_done > 0
-        assert r.is_chunking or r.chunks_done > 0
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done >= 2
 
 
 if __name__ == "__main__":

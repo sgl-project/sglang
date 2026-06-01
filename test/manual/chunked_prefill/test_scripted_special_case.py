@@ -79,70 +79,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until_finished(r_chunk)
         assert r_small.finished and r_chunk.finished
 
-    def test_new_chunked_req_first_chunk(self):
-        self.server.execute_script(self._script_new_chunked_req_first_chunk)
-
-    @staticmethod
-    def _script_new_chunked_req_first_chunk(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield
-        yield from run_until(r, lambda h: h.chunks_done >= 1)
-        saw_chunking = False
-        for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking:
-                saw_chunking = True
-            if r.finished:
-                break
-            yield
-        assert r.finished
-        assert r.chunks_done >= 1
-        assert saw_chunking, "first-chunk assignment branch must be exercised"
-
-    def test_inflight_middle_chunks_counter(self):
-        self.server.execute_script(self._script_inflight_middle_chunks_counter)
-
-    @staticmethod
-    def _script_inflight_middle_chunks_counter(t: ScriptedContext):
-        r = t.start_req(prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=1)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.req.inflight_middle_chunks >= 1
-
-    def test_chunked_req_passes_through_batch(self):
-        self.server.execute_script(self._script_chunked_req_passes_through_batch)
-
-    @staticmethod
-    def _script_chunked_req_passes_through_batch(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-
-        comp = t.batch_composition()
-        assert r.rid in comp.get("chunked", [])
-
-        yield from run_until_finished(r)
-        assert r.finished
-
-    def test_no_idle_during_chunked(self):
-        self.server.execute_script(self._script_no_idle_during_chunked)
-
-    @staticmethod
-    def _script_no_idle_during_chunked(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-
-        saw_chunking = False
-        for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking:
-                saw_chunking = True
-                assert (
-                    not t.is_idle
-                ), "scheduler must not idle while chunked_req is in flight"
-            if r.finished:
-                break
-            yield
-        assert r.finished
-        assert saw_chunking, "test must observe r.is_chunking at least once"
-
     def test_abort_excludes_chunked_req(self):
         self.server.execute_script(self._script_abort_excludes_chunked_req)
 
@@ -155,11 +91,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield
 
         assert (
-            1 if t.scheduler.chunked_req is not None else 0
-        ) == 0, f"abort must clear in-flight count; got {(1 if t.scheduler.chunked_req is not None else 0)}"
-        assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
-        ) is None
+            t.scheduler.chunked_req is None
+        ), f"abort must clear the chunked slot; got {t.scheduler.chunked_req!r}"
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -189,35 +122,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             yield
         assert r.finished
         assert saw_match, "getter must return r.rid at least once while r.is_chunking"
-        assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
-        ) is None
-
-    def test_chunked_req_reset_to_none(self):
-        self.server.execute_script(self._script_chunked_req_reset_to_none)
-
-    @staticmethod
-    def _script_chunked_req_reset_to_none(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        saw_chunking_match = False
-        for _ in range(DEFAULT_MAX_STEPS):
-            if (
-                r.is_chunking
-                and (
-                    t.scheduler.chunked_req.rid
-                    if t.scheduler.chunked_req is not None
-                    else None
-                )
-                == r.rid
-            ):
-                saw_chunking_match = True
-            if r.finished:
-                break
-            yield
-        assert r.finished
-        assert (
-            saw_chunking_match
-        ), "must observe scheduler.chunked_req == r at least once during chunking"
         assert (
             t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) is None
@@ -261,66 +165,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     def test_nixl_conn_chunked(self):
         pass
 
-    def test_idle_path_chunked_req_none(self):
-        self.server.execute_script(self._script_idle_path_chunked_req_none)
-
-    @staticmethod
-    def _script_idle_path_chunked_req_none(t: ScriptedContext):
-        for _ in range(5):
-            yield
-        assert t.is_idle
-        assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
-        ) is None, (
-            f"with no in-flight reqs, chunked slot must be None; "
-            f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
-        )
-        for _ in range(5):
-            assert t.is_idle, "scheduler must remain idle with no work"
-            assert (
-                t.scheduler.chunked_req.rid
-                if t.scheduler.chunked_req is not None
-                else None
-            ) is None
-            yield
-
-    def test_admission_path_with_chunked_inflight_flag(self):
-        self.server.execute_script(
-            self._script_admission_path_with_chunked_inflight_flag
-        )
-
-    @staticmethod
-    def _script_admission_path_with_chunked_inflight_flag(t: ScriptedContext):
-        r_chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r_chunked, lambda h: h.is_chunking)
-        comp = t.batch_composition()
-        assert r_chunked.rid in comp.get(
-            "chunked", []
-        ), f"r_chunked must occupy chunked slot before admission; got {comp!r}"
-        r_new = t.start_req(prompt_len=16, max_new_tokens=2)
-        yield from run_until_finished(r_chunked)
-        yield from run_until_finished(r_new)
-        assert r_chunked.finished and r_new.finished
-
-    def test_inflight_counter_increments_each_chunk(self):
-        self.server.execute_script(self._script_inflight_counter_increments_each_chunk)
-
-    @staticmethod
-    def _script_inflight_counter_increments_each_chunk(t: ScriptedContext):
-        r = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
-        saw_increment = False
-        last = 0
-        for _ in range(DEFAULT_MAX_STEPS):
-            cur = r.req.inflight_middle_chunks
-            if cur > last:
-                saw_increment = True
-            last = max(last, cur)
-            if r.finished:
-                break
-            yield
-        assert saw_increment, "expected inflight_middle_chunks to increment"
-        assert r.finished
-
     def test_filter_batch_exclude_chunked_flag(self):
         self.server.execute_script(self._script_filter_batch_exclude_chunked_flag)
 
@@ -332,6 +176,13 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS * 2):
             if r1.is_chunking:
                 saw_r1_chunking = True
+                comp = t.batch_composition()
+                assert r1.rid in comp.get(
+                    "chunked", []
+                ), f"mid-chunk r1 must occupy the chunked role; got {comp!r}"
+                assert r1.rid not in comp.get(
+                    "running", []
+                ), f"chunked r1 must be excluded from the running role; got {comp!r}"
             if r1.finished and r2.finished:
                 break
             yield
@@ -414,14 +265,61 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield
 
         assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
-        ) is None, (
-            f"pause(retract) must clear chunked_req; "
-            f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
+            t.scheduler.chunked_req is None
+        ), f"pause(retract) must clear chunked_req; got {t.scheduler.chunked_req!r}"
+        assert not r.finished, "retract must re-queue r, not finish or abort it"
+        assert r.status == "waiting", (
+            f"retracted chunked req must return to the waiting queue; "
+            f"got status={r.status!r}"
         )
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 0
 
         t.continue_generation()
+        yield from run_until_finished(r)
+        assert (
+            r.finished
+        ), "continue_generation must drive the re-queued req to completion"
+
+    def test_retract_during_gap_inflight_middle_chunks_positive(self):
+        self.server.execute_script(
+            self._script_retract_during_gap_inflight_middle_chunks_positive
+        )
+
+    @staticmethod
+    def _script_retract_during_gap_inflight_middle_chunks_positive(t: ScriptedContext):
+        # Retract-side mirror of test_abort_during_gap_inflight_middle_chunks_positive
+        # (test_scripted_abort.py): drive a chunked req into the parked gap state
+        # (inflight_middle_chunks > 0 but chunked_req slot released, so not
+        # is_chunking), then retract there. Unlike abort, retract must re-queue the
+        # req and resume it to completion, while still releasing KV/row and resetting
+        # inflight_middle_chunks in the same transition.
+        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        yield from run_until(
+            r,
+            lambda h: h.req.inflight_middle_chunks > 0 and not h.is_chunking,
+        )
+        assert r.req.inflight_middle_chunks > 0
+        assert not r.is_chunking
+
+        t.pause_generation(mode="retract")
+        yield
+
+        assert (
+            r.kv_pages == 0
+        ), f"retract during gap must release KV; got kv_pages={r.kv_pages}"
+        assert not r.finished, "retract must re-queue r, not finish or abort it"
+        req = t.find_req_by_rid(r.rid)
+        assert req is not None and req.inflight_middle_chunks == 0, (
+            f"retract must reset inflight_middle_chunks; got "
+            f"{req.inflight_middle_chunks if req is not None else None}"
+        )
+
+        t.continue_generation()
+        yield from run_until_finished(r, max_steps=2000)
+        assert (
+            r.finished
+        ), "continue_generation must drive the re-queued req to completion"
+        assert r.kv_pages == 0
+        assert len(r.req.output_ids) == 2
 
     def test_load_inquirer_pending_tokens_dedup_chunked(self):
         self.server.execute_script(
@@ -477,15 +375,30 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_stage_a_inflight_middle_chunks_sync_invariant(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-        for _ in range(DEFAULT_MAX_STEPS):
-            if r.finished:
-                return
-            if r.req.inflight_middle_chunks > 0:
+        def assert_invariant() -> None:
+            req = t.find_req_by_rid(r.rid)
+            if req is not None and req.inflight_middle_chunks > 0:
                 assert r.is_chunking, (
                     f"invariant violated: inflight_middle_chunks="
-                    f"{r.req.inflight_middle_chunks} but is_chunking={r.is_chunking}"
+                    f"{req.inflight_middle_chunks} but is_chunking={r.is_chunking}"
                 )
+
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
+        # Drive a retract/resume mid-chunk: retract clears chunked_req (so
+        # is_chunking flips to False) and must also reset inflight_middle_chunks
+        # in the same transition, otherwise the cross-subsystem invariant breaks.
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
+        assert_invariant()
+
+        t.pause_generation(mode="retract")
+        yield
+        assert_invariant()
+
+        t.continue_generation()
+        for _ in range(DEFAULT_MAX_STEPS):
+            assert_invariant()
+            if r.finished:
+                return
             yield
         raise AssertionError("req did not finish")
 
@@ -628,23 +541,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.lock_refs == 0
 
 
-class TestSpecialCaseDynamicChunking(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        enable_dynamic_chunking=True,
-    )
-
-    def test_dynamic_chunking_history_len(self):
-        self.server.execute_script(self._script_dynamic_chunking_history_len)
-
-    @staticmethod
-    def _script_dynamic_chunking_history_len(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r)
-        assert r.finished
-        assert r.chunks_done >= 2
-
-
 class TestSpecialCaseMixedChunk(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
@@ -772,20 +668,25 @@ class TestSpecialCaseTinyChunk(ScriptedTestCase):
     def _script_chunked_admission_trunc_lt_zero_returns_other(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         saw_deferred_iter = False
-        prev_chunks_done = r.chunks_done
         for _ in range(DEFAULT_MAX_STEPS):
             if r.finished:
                 break
-            cur_chunks_done = r.chunks_done
-            if r.status == "waiting" and cur_chunks_done == prev_chunks_done:
+            if r.status == "waiting":
+                # add_one_req returned OTHER (trunc_len <= 0 because
+                # chunked_prefill_size < page_size), so admission is deferred:
+                # the req must still be sitting in the waiting queue with no KV
+                # allocated to it.
                 saw_deferred_iter = True
-            prev_chunks_done = cur_chunks_done
+                assert r.kv_pages == 0, (
+                    f"deferred (OTHER) chunked req must hold no KV while waiting; "
+                    f"got kv_pages={r.kv_pages}"
+                )
             yield
         assert r.finished
         assert saw_deferred_iter, (
             "expected at least one iter where add_one_req returned OTHER "
-            "(req status == waiting and chunks_done did not advance); "
-            "chunked_prefill_size < page_size must defer admission"
+            "(req status == waiting); chunked_prefill_size < page_size must "
+            "defer admission"
         )
 
 
@@ -829,7 +730,10 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
     def _script_hicache_breakdown_only_first_chunk(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         first_chunk_snap = None
+        saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
+            if r.is_chunking:
+                saw_chunking = True
             if r.is_chunking and r.chunks_done >= 1 and first_chunk_snap is None:
                 first_chunk_snap = r.req.cached_tokens
             if first_chunk_snap is not None and r.is_chunking:
@@ -842,6 +746,10 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
                 break
             yield
         assert r.finished
+        assert saw_chunking, "test must observe r mid-chunk at least once"
+        assert (
+            first_chunk_snap is not None
+        ), "test must snapshot cached_tokens at the first chunk boundary"
 
     def test_hicache_cached_tokens_set_once_invariant(self):
         self.server.execute_script(
@@ -852,9 +760,14 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
     def _script_hicache_cached_tokens_set_once_invariant(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         snap: Optional[tuple] = None
+        saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
             req = t.find_req_by_rid(r.rid)
-            if req is not None:
+            # Only start tracking once the req is actually mid-chunk (chunks_done
+            # >= 1); the set-once invariant is meaningless before the first
+            # chunk boundary writes the cached_tokens_* breakdown.
+            if req is not None and r.is_chunking and r.chunks_done >= 1:
+                saw_chunking = True
                 cur = (
                     req.cached_tokens_device,
                     req.cached_tokens_host,
@@ -872,7 +785,10 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
                 break
             yield
         assert r.finished
-        assert snap is not None, "test must observe the req in scheduler at least once"
+        assert (
+            saw_chunking
+        ), "test must observe the req mid-chunk (chunks_done >= 1) at least once"
+        assert snap is not None, "test must snapshot the cached_tokens_* breakdown"
 
 
 if __name__ == "__main__":

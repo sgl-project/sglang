@@ -16,25 +16,6 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 class TestMultiReqBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
-    def test_at_most_one_chunked_in_flight(self):
-        self.server.execute_script(self._script_at_most_one_chunked_in_flight)
-
-    @staticmethod
-    def _script_at_most_one_chunked_in_flight(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-
-        for _ in range(DEFAULT_MAX_STEPS):
-            in_flight = 1 if t.scheduler.chunked_req is not None else 0
-            assert in_flight <= 1, (
-                f"single-in-flight invariant violated: "
-                f"chunked_in_flight_count()={in_flight}"
-            )
-            if r1.finished and r2.finished:
-                return
-            yield
-        raise AssertionError("r1 and r2 did not both finish within step budget")
-
     def test_second_chunked_waits(self):
         self.server.execute_script(self._script_second_chunked_waits)
 
@@ -113,18 +94,26 @@ class TestMultiReqBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_mixed_ten_chunked_ten_short(t: ScriptedContext):
+        baseline = t.engine_stats()
         chunked = [
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
             for _ in range(10)
         ]
         shorts = [t.start_req(prompt_len=8, max_new_tokens=2) for _ in range(10)]
         all_reqs = chunked + shorts
+        finished = False
         for _ in range(DEFAULT_MAX_STEPS * 20):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
+            assert sum(1 for r in all_reqs if r.is_chunking) <= 1
             if all(r.finished for r in all_reqs):
-                return
+                finished = True
+                break
             yield
-        raise AssertionError("not all reqs finished")
+        if not finished:
+            raise AssertionError("not all reqs finished")
+        for r in chunked:
+            assert r.chunks_done >= 2
+        final = t.engine_stats()
+        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_submit_during_chunk_mid(self):
         self.server.execute_script(self._script_submit_during_chunk_mid)
@@ -136,6 +125,12 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield
         r3 = t.start_req(prompt_len=16, max_new_tokens=2)
+        yield
+
+        assert r1.is_chunking, "r1 must still hold the single chunked slot"
+        assert not r2.is_chunking, "r2 must wait until r1's chunk loop clears"
+        assert not r3.is_chunking, "r3 must wait until r1's chunk loop clears"
+
         yield from run_until_all_finished([r1, r2, r3])
         assert r1.finished and r2.finished and r3.finished
 
@@ -167,6 +162,9 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN + 8, max_new_tokens=2)
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
+        assert (
+            r2.chunks_done < r1.chunks_done
+        ), "r2 reuses r1's cached prefix, so it should chunk fewer times"
 
     def test_trickle_per_yield_50(self):
         self.server.execute_script(self._script_trickle_per_yield_50)
@@ -210,23 +208,6 @@ class TestMultiReqBasic(ScriptedTestCase):
         final = t.engine_stats()
         assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
-    def test_three_long_back_to_back(self):
-        self.server.execute_script(self._script_three_long_back_to_back)
-
-    @staticmethod
-    def _script_three_long_back_to_back(t: ScriptedContext):
-        reqs = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(3)
-        ]
-        for _ in range(DEFAULT_MAX_STEPS * 10):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
-            if all(r.finished for r in reqs):
-                break
-            yield
-        for r in reqs:
-            assert r.finished
-
     def test_submit_pause_n_resubmit_same_rid(self):
         self.server.execute_script(self._script_submit_pause_n_resubmit_same_rid)
 
@@ -252,28 +233,18 @@ class TestMultiReqBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=16, max_new_tokens=16)
         yield from run_until(r1, lambda h: h.status == "running")
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(DEFAULT_MAX_STEPS * 5):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
-            if r1.finished and r2.finished:
-                break
-            yield
+        yield from run_until(r2, lambda h: h.is_chunking)
+
+        comp = t.batch_composition()
+        chunked_set = set(comp.get("chunked", []))
+        prefill_set = set(comp.get("prefill", []))
+        decode_set = set(comp.get("decode", []))
+        assert r2.rid in chunked_set, f"r2 should be the chunked req; got {comp}"
+        assert chunked_set.isdisjoint(prefill_set)
+        assert chunked_set.isdisjoint(decode_set)
+
+        yield from run_until_all_finished([r1, r2], max_steps=DEFAULT_MAX_STEPS * 5)
         assert r1.finished and r2.finished
-
-    def test_unique_rids_distinct(self):
-        self.server.execute_script(self._script_unique_rids_distinct)
-
-    @staticmethod
-    def _script_unique_rids_distinct(t: ScriptedContext):
-        baseline = t.engine_stats()
-        reqs = [
-            t.start_req(prompt_len=16, max_new_tokens=2, rid=f"unique-{i}")
-            for i in range(20)
-        ]
-        yield from run_until_all_finished(reqs)
-        rids = {r.rid for r in reqs}
-        assert len(rids) == 20
-        final = t.engine_stats()
-        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
 
     def test_two_small_parallel(self):
         self.server.execute_script(self._script_two_small_parallel)
@@ -319,15 +290,16 @@ class TestMultiReqBasic(ScriptedTestCase):
         for _ in range(4):
             reqs.append(t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2))
             yield
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
+            assert sum(1 for r in reqs if r.is_chunking) <= 1
             yield
         for _ in range(DEFAULT_MAX_STEPS * 10):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
+            assert sum(1 for r in reqs if r.is_chunking) <= 1
             if all(r.finished for r in reqs):
                 break
             yield
         for r in reqs:
             assert r.finished
+            assert r.chunks_done >= 2
 
     def test_eight_concurrent_chunked(self):
         self.server.execute_script(self._script_eight_concurrent_chunked)
@@ -338,12 +310,17 @@ class TestMultiReqBasic(ScriptedTestCase):
             t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
             for _ in range(8)
         ]
+        finished = False
         for _ in range(DEFAULT_MAX_STEPS * 5):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
+            assert sum(1 for r in reqs if r.is_chunking) <= 1
             if all(r.finished for r in reqs):
-                return
+                finished = True
+                break
             yield
-        raise AssertionError("not all reqs finished")
+        if not finished:
+            raise AssertionError("not all reqs finished")
+        for r in reqs:
+            assert r.chunks_done >= 2
 
     def test_decode_only_batch(self):
         self.server.execute_script(self._script_decode_only_batch)
@@ -368,15 +345,24 @@ class TestMultiReqBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_mixed_prefill_lengths(t: ScriptedContext):
+        # chunked_prefill_size is DEFAULT_CHUNK_SIZE (256): prompts that fit in a
+        # single chunk never become chunked_req, while prompts spanning multiple
+        # chunks must chunk at least twice. 256 sits on the boundary, so it stays
+        # loose.
         lens = [8, 16, 32, 64, 128, 256, 512, 1024]
         reqs = [t.start_req(prompt_len=L, max_new_tokens=2) for L in lens]
+        by_len = dict(zip(lens, reqs))
         for _ in range(DEFAULT_MAX_STEPS * 10):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
+            assert sum(1 for r in reqs if r.is_chunking) <= 1
             if all(r.finished for r in reqs):
                 break
             yield
         for r in reqs:
             assert r.finished
+        for L in (8, 16, 32, 64, 128):
+            assert by_len[L].chunks_done <= 1, f"prompt_len={L} should not chunk"
+        for L in (512, 1024):
+            assert by_len[L].chunks_done >= 2, f"prompt_len={L} should chunk >=2"
 
     def test_chunked_req_exclusive_of_batch_invariant(self):
         self.server.execute_script(
@@ -409,22 +395,19 @@ class TestMultiReqBasic(ScriptedTestCase):
         chunked1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         chunked2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         short = t.start_req(prompt_len=8, max_new_tokens=4)
+        all_reqs = [chunked1, chunked2, short]
         for _ in range(DEFAULT_MAX_STEPS * 10):
-            assert (1 if t.scheduler.chunked_req is not None else 0) <= 1
-            if chunked1.finished and chunked2.finished and short.finished:
+            comp = t.batch_composition()
+            prefill_set = set(comp.get("prefill", []))
+            decode_set = set(comp.get("decode", []))
+            chunked_set = set(comp.get("chunked", []))
+            assert prefill_set.isdisjoint(decode_set)
+            assert prefill_set.isdisjoint(chunked_set)
+            assert decode_set.isdisjoint(chunked_set)
+            if all(r.finished for r in all_reqs):
                 break
             yield
         assert chunked1.finished and chunked2.finished and short.finished
-
-    def test_batch_with_finish_emitted_exactly_once(self):
-        self.server.execute_script(self._script_batch_with_finish_emitted_exactly_once)
-
-    @staticmethod
-    def _script_batch_with_finish_emitted_exactly_once(t: ScriptedContext):
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(6)]
-        yield from run_until_all_finished(reqs)
-        for r in reqs:
-            assert r.finished
 
     def test_batch_state_query_during_run(self):
         self.server.execute_script(self._script_batch_state_query_during_run)
@@ -434,30 +417,13 @@ class TestMultiReqBasic(ScriptedTestCase):
         reqs = [t.start_req(prompt_len=16, max_new_tokens=4) for _ in range(4)]
         for _ in range(DEFAULT_MAX_STEPS):
             comp = t.batch_composition()
-            assert isinstance(comp, dict)
             prefill = set(comp.get("prefill", []))
             decode = set(comp.get("decode", []))
-            chunked = set(comp.get("chunked", []))
             assert prefill & decode == set()
-            assert prefill & chunked == set()
-            assert decode & chunked == set()
             if all(r.finished for r in reqs):
                 return
             yield
         raise AssertionError("not all reqs finished")
-
-    def test_mixed_lengths_then_more_arrivals(self):
-        self.server.execute_script(self._script_mixed_lengths_then_more_arrivals)
-
-    @staticmethod
-    def _script_mixed_lengths_then_more_arrivals(t: ScriptedContext):
-        initial = [t.start_req(prompt_len=16, max_new_tokens=4) for _ in range(3)]
-        yield
-        yield
-        more = [t.start_req(prompt_len=16, max_new_tokens=4) for _ in range(3)]
-        yield from run_until_all_finished(initial + more)
-        for r in initial + more:
-            assert r.finished
 
 
 class TestMultiReqPriority(ScriptedTestCase):
@@ -471,17 +437,89 @@ class TestMultiReqPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_parallel_with_priority(t: ScriptedContext):
-        baseline = t.engine_stats()
-        normal = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(3)]
-        high = [
-            t.start_req(prompt_len=16, max_new_tokens=2, priority="high")
-            for _ in range(2)
+        # schedule_low_priority_values_first defaults to False, so a larger
+        # priority value wins; the preemption threshold defaults to 10, so the
+        # high req's priority must exceed each normal's by more than 10.
+        normal = [
+            t.start_req(
+                prompt_len=16, max_new_tokens=100000, ignore_eos=True, priority=0
+            )
+            for _ in range(4)
         ]
-        yield from run_until_all_finished(normal + high)
-        for r in normal + high:
-            assert r.finished
-        final = t.engine_stats()
-        assert final["kv_pool_free"] >= baseline["kv_pool_free"]
+        yield from run_until(normal[-1], lambda h: h.status == "running")
+
+        # Squeeze the KV pool down to nothing so the incoming high-priority req
+        # cannot be admitted without evicting a running normal req.
+        t.exhaust_kv(leave_pages=0)
+        high = t.start_req(prompt_len=16, max_new_tokens=2, priority=100)
+
+        preempted = False
+        for _ in range(DEFAULT_MAX_STEPS * 5):
+            if any(r.status == "waiting" for r in normal):
+                preempted = True
+            if high.finished:
+                break
+            yield
+        assert high.finished, "high-priority req must run to completion"
+        assert preempted, "a normal req must be preempted back to the waiting queue"
+
+        t.abort_all()
+        for _ in range(DEFAULT_MAX_STEPS):
+            if all(r.finished for r in normal):
+                break
+            yield
+
+
+class TestMultiReqMixedChunk(ScriptedTestCase):
+    # enable_mixed_chunk lets a chunked prefill share its forward batch with
+    # running decode. Only then does the scheduler pass
+    # num_mixed_decode_tokens = running_bs into PrefillAdder, which subtracts it
+    # from rem_chunk_tokens (schedule_policy.py:436-437) so each prefill chunk is
+    # smaller than chunked_prefill_size while a decode is co-running.
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        enable_mixed_chunk=True,
+    )
+
+    def test_long_prefill_chunks_more_with_concurrent_decode(self):
+        self.server.execute_script(
+            self._script_long_prefill_chunks_more_with_concurrent_decode
+        )
+
+    @staticmethod
+    def _script_long_prefill_chunks_more_with_concurrent_decode(t: ScriptedContext):
+        """Concurrent decode steals chunk budget, so a 4-chunk prompt chunks >= 4 times."""
+        # Push a short req into the decoding state first so a decode is in flight
+        # when the long prompt arrives and starts chunking.
+        decoder = t.start_req(prompt_len=16, max_new_tokens=64)
+        yield from run_until(decoder, lambda h: h.status == "running")
+
+        # prompt_len = 4 * chunk_size: without decode-stealing this would chunk
+        # exactly 4 times. With enable_mixed_chunk, the co-running decode consumes
+        # part of rem_chunk_tokens each mixed iteration (rem_chunk_tokens -=
+        # num_mixed_decode_tokens), shrinking each chunk, so the long req needs at
+        # least as many chunks -- and page-aligned truncation plus the timing of
+        # when decode co-runs make the exact count non-deterministic.
+        long_req = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        yield from run_until(long_req, lambda h: h.is_chunking)
+
+        # Confirm the scheduler actually produced a MIXED batch (chunked prefill +
+        # running decode in one forward pass) at least once during the run; this is
+        # the precondition for any decode-stealing to occur.
+        saw_mixed_batch: bool = False
+        for _ in range(DEFAULT_MAX_STEPS * 5):
+            if t.last_batch_forward_mode == "MIXED":
+                saw_mixed_batch = True
+            if long_req.finished and decoder.finished:
+                break
+            yield
+        assert long_req.finished and decoder.finished
+
+        assert saw_mixed_batch, "expected at least one MIXED (prefill+decode) batch"
+        assert long_req.chunks_done >= 4, (
+            f"a 4-chunk prompt must chunk >= 4 times under concurrent decode; "
+            f"got {long_req.chunks_done}"
+        )
 
 
 if __name__ == "__main__":

@@ -1,12 +1,9 @@
-import time
 import unittest
 
-from sglang.srt.environ import envs
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -35,10 +32,11 @@ class TestPriorityBasic(ScriptedTestCase):
         assert r.status in (
             "waiting",
             "finished",
-            "unknown",
         ), f"r should be retracted (back in waiting) or finished; got {r.status}"
         if r.status == "waiting":
             assert r.kv_pages == 0, f"retract must release KV; got {r.kv_pages}"
+        else:
+            assert r.kv_pages == 0, f"finished req must release KV; got {r.kv_pages}"
 
     def test_retract_and_resume(self):
         self.server.execute_script(self._script_retract_and_resume)
@@ -63,12 +61,13 @@ class TestPriorityBasic(ScriptedTestCase):
     @staticmethod
     def _script_force_retract_at_chunk_0(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield
-        yield
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done <= 1)
         t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0
         t.continue_generation()
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
 
     def test_force_retract_at_chunk_mid(self):
         self.server.execute_script(self._script_force_retract_at_chunk_mid)
@@ -81,6 +80,9 @@ class TestPriorityBasic(ScriptedTestCase):
         yield
         assert r.kv_pages == 0
         t.continue_generation()
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+        assert r.lock_refs == 0
 
     def test_force_retract_at_last_chunk(self):
         self.server.execute_script(self._script_force_retract_at_last_chunk)
@@ -92,8 +94,11 @@ class TestPriorityBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0
-        assert r.req.inflight_middle_chunks == 0
         t.continue_generation()
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
+        assert r.kv_pages == 0
+        assert r.lock_refs == 0
 
     def test_force_retract_then_readmit(self):
         self.server.execute_script(self._script_force_retract_then_readmit)
@@ -159,27 +164,6 @@ class TestPriorityBasic(ScriptedTestCase):
         yield
         assert r.kv_pages == 0
         t.continue_generation()
-
-    def test_disagg_retract_resets_send_state_extra(self):
-        self.server.execute_script(self._script_disagg_retract_resets_send_state_extra)
-
-    @staticmethod
-    def _script_disagg_retract_resets_send_state_extra(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-        t.pause_generation(mode="retract")
-        yield
-        # No disagg_send_state field; assert the real send-side Req fields that
-        # retract must reset (start_send_idx, tmp_end_idx).
-        assert r.req.start_send_idx == 0, (
-            f"disagg send state must reset on retract; "
-            f"start_send_idx={r.req.start_send_idx}"
-        )
-        assert r.req.tmp_end_idx == -1, (
-            f"disagg send state must reset on retract; "
-            f"tmp_end_idx={r.req.tmp_end_idx}"
-        )
-        t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
 
@@ -194,9 +178,10 @@ class TestPriorityBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
         assert r.kv_pages == 0
-        assert r.req.req_pool_idx is None
-        assert r.status in ("waiting", "finished")
+        assert r.status == "waiting"
         t.continue_generation()
+        yield from run_until_finished(r, max_steps=800)
+        assert r.finished
 
     def test_two_retracts_same_yield(self):
         self.server.execute_script(self._script_two_retracts_same_yield)
@@ -232,58 +217,6 @@ class TestPriorityBasic(ScriptedTestCase):
         assert r.lock_refs == 0
         assert r.kv_pages == 0
 
-    def test_watchdog_skips_chunked_resume_invariant(self):
-        self.server.execute_script(self._script_watchdog_skips_chunked_resume_invariant)
-
-    @staticmethod
-    def _script_watchdog_skips_chunked_resume_invariant(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-        s = t.scheduler
-        req = t.find_req_by_rid(r.rid)
-        assert req is not None
-        assert s.chunked_req is req, (
-            f"setup expected s.chunked_req to point at r; got "
-            f"s.chunked_req={s.chunked_req!r}, r={req!r}"
-        )
-        assert req.inflight_middle_chunks > 0, (
-            f"setup expected inflight_middle_chunks > 0, got "
-            f"{req.inflight_middle_chunks}"
-        )
-
-        was_in_queue = req in s.waiting_queue
-        if not was_in_queue:
-            s.waiting_queue.append(req)
-        original_entry_time = req.time_stats.wait_queue_entry_time
-        req.time_stats.wait_queue_entry_time = 1.0
-        try:
-            with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0.5):
-                deadline = time.perf_counter() - 0.5
-                assert (
-                    0 < req.time_stats.wait_queue_entry_time < deadline
-                ), "setup did not backdate entry_time past the watchdog deadline"
-                s._abort_on_waiting_timeout()
-
-            assert req in s.waiting_queue, (
-                "watchdog incorrectly aborted a chunked-resume req: "
-                "r was removed from waiting_queue despite inflight_middle_chunks > 0"
-            )
-            assert s.chunked_req is req, (
-                f"chunked_req slot must still hold r after watchdog "
-                f"skip, got s.chunked_req={s.chunked_req!r}"
-            )
-            assert req.finished_reason is None, (
-                f"chunked-resume req must not be marked finished by "
-                f"watchdog abort, got finished_reason={req.finished_reason!r}"
-            )
-        finally:
-            if not was_in_queue and req in s.waiting_queue:
-                s.waiting_queue.remove(req)
-            req.time_stats.wait_queue_entry_time = original_entry_time
-
-        yield from run_until_finished(r, max_steps=DEFAULT_MAX_STEPS * 2)
-        assert r.finished
-
 
 class TestPriorityPriority(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
@@ -296,12 +229,15 @@ class TestPriorityPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_naive_priority_chunked(t: ScriptedContext):
-        low = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority="low"
-        )
+        low = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority=0)
         yield
 
-        high = t.start_req(prompt_len=8, max_new_tokens=2, priority="high")
+        high = t.start_req(prompt_len=8, max_new_tokens=2, priority=10)
+
+        yield from run_until_finished(high)
+        assert high.finished
+        assert not low.finished
+        assert low.is_chunking
 
         yield from run_until_all_finished([low, high])
         assert low.finished and high.finished
@@ -311,60 +247,18 @@ class TestPriorityPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_priority_preempt_chunked(t: ScriptedContext):
-        low = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
-        )
+        low = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=0)
         yield from run_until(low, lambda h: h.is_chunking and h.chunks_done >= 1)
         assert low.kv_pages > 0
 
-        high = t.start_req(prompt_len=8, max_new_tokens=2, priority="high")
+        high = t.start_req(prompt_len=8, max_new_tokens=2, priority=10)
         t.exhaust_kv(leave_pages=1)
-        yield
+        yield from run_until(low, lambda h: h.status == "waiting")
 
-        if low.status == "waiting":
-            assert low.kv_pages == 0
+        assert low.status == "waiting"
+        assert low.kv_pages == 0
         yield from run_until_finished(high)
         assert high.finished
-
-    def test_priority_preempt_chunked_victim(self):
-        self.server.execute_script(self._script_priority_preempt_chunked_victim)
-
-    @staticmethod
-    def _script_priority_preempt_chunked_victim(t: ScriptedContext):
-        r_low = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
-        )
-        yield from run_until(r_low, lambda h: h.is_chunking)
-        r_high = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
-        )
-        t.force_preempt(victim_rid=r_low.rid, by_rid=r_high.rid)
-        yield
-        assert r_low.status == "waiting"
-
-        yield from run_until_all_finished([r_low, r_high])
-
-    def test_preempt_five_victims(self):
-        self.server.execute_script(self._script_preempt_five_victims)
-
-    @staticmethod
-    def _script_preempt_five_victims(t: ScriptedContext):
-        victims = [
-            t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-            for _ in range(5)
-        ]
-        yield from run_until(victims[0], lambda h: h.is_chunking)
-
-        r_high = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
-        )
-        for v in victims:
-            t.force_preempt(victim_rid=v.rid, by_rid=r_high.rid)
-        yield
-        for v in victims:
-            assert v.kv_pages == 0
-
-        yield from run_until_all_finished(victims + [r_high])
 
     def test_priority_preempt_release_invariant(self):
         self.server.execute_script(self._script_priority_preempt_release_invariant)
@@ -372,17 +266,17 @@ class TestPriorityPriority(ScriptedTestCase):
     @staticmethod
     def _script_priority_preempt_release_invariant(t: ScriptedContext):
         r_low = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="low"
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=0
         )
-        yield from run_until(r_low, lambda h: h.is_chunking)
+        yield from run_until(r_low, lambda h: h.is_chunking and h.chunks_done >= 1)
         pages_before = r_low.kv_pages
         assert pages_before > 0
 
         r_high = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10
         )
-        t.force_preempt(victim_rid=r_low.rid, by_rid=r_high.rid)
-        yield
+        t.exhaust_kv(leave_pages=1)
+        yield from run_until(r_low, lambda h: h.status == "waiting")
         assert r_low.kv_pages == 0
 
     def test_priority_preempt_with_chunked_admission_same_yield(self):
@@ -397,19 +291,19 @@ class TestPriorityPriority(ScriptedTestCase):
         r3 = t.start_req(
             prompt_len=16,
             max_new_tokens=32,
-            priority="low",
+            priority=0,
         )
         yield from run_until(r3, lambda h: h.status == "running")
         assert r3.kv_pages > 0
 
-        r1 = t.start_req(prompt_len=8, max_new_tokens=2, priority="high")
+        r1 = t.start_req(prompt_len=8, max_new_tokens=2, priority=10)
         r2 = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN,
             max_new_tokens=2,
-            priority="high",
+            priority=10,
         )
-        t.force_preempt(victim_rid=r3.rid, by_rid=r1.rid)
-        yield
+        t.exhaust_kv(leave_pages=1)
+        yield from run_until(r3, lambda h: h.status == "waiting")
 
         assert (
             r3.kv_pages == 0

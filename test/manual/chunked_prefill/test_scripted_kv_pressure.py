@@ -122,25 +122,67 @@ class TestKVPressureBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_lock_refs_tight_concurrent_prefix(t: ScriptedContext):
-        baseline_lock_refs = t.get_all_node_lock_refs()
-        t.exhaust_lock_refs(leave_refs=4)
-        yield
-        r_warm = t.start_req(prompt_len=128, max_new_tokens=2)
+        """A long chunked req sharing a pinned warm prefix finishes and leaks no lock_refs."""
+        # GPU validation pending.
+        #
+        # Warm a shared prefix: a short req that finishes leaves cached,
+        # evictable prefix nodes in the radix tree. Use a distinct prompt_token
+        # so the long req below provably hits THIS prefix (not stray nodes).
+        warm_token = 7
+        warm_len = DEFAULT_CHUNK_SIZE
+        r_warm = t.start_req(
+            prompt_len=warm_len, max_new_tokens=1, prompt_token=warm_token
+        )
         yield from run_until_finished(r_warm)
         assert r_warm.finished
         assert r_warm.lock_refs == 0
-        reqs = [t.start_req(prompt_len=128, max_new_tokens=2) for _ in range(8)]
-        yield from run_until_all_finished(reqs)
-        for r in reqs:
-            assert r.finished
-            assert (
-                r.lock_refs == 0
-            ), f"req {r.rid} leaked {r.lock_refs} lock_refs after finish"
-        final_lock_refs = t.get_all_node_lock_refs()
-        assert final_lock_refs <= baseline_lock_refs, (
-            f"global lock_refs leaked from baseline={baseline_lock_refs} "
-            f"to final={final_lock_refs}"
+
+        # Baseline AFTER warming: this is the global lock_ref state the reset
+        # path must restore to. The warm prefix nodes are present and evictable
+        # (lock_ref == 0) at this point.
+        baseline_lock_refs = t.get_all_node_lock_refs()
+
+        # Pin most evictable nodes via the real inc_lock_ref path, leaving only a
+        # few unlocked. The KV is still present, just protected/non-evictable.
+        t.exhaust_lock_refs(leave_refs=1)
+        yield
+        pinned_lock_refs = t.get_all_node_lock_refs()
+        assert any(
+            pinned_lock_refs.get(node_id, 0) > baseline_lock_refs.get(node_id, 0)
+            for node_id in pinned_lock_refs
+        ), "exhaust_lock_refs(leave_refs=1) must pin at least one warm-prefix node"
+
+        # Run a long chunked req that shares the warm prefix (same prompt_token,
+        # longer prompt). It must really chunk while the cache is pinned.
+        r_long = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN,
+            max_new_tokens=2,
+            prompt_token=warm_token,
         )
+        yield from run_until(r_long, lambda h: h.is_chunking)
+        yield from run_until_finished(r_long, max_steps=2000)
+        assert r_long.finished
+        # Even with the warm prefix hit, the remaining new tokens span multiple
+        # chunks: (VERY_LONG_PROMPT_LEN - warm_len) / DEFAULT_CHUNK_SIZE == 7.
+        assert r_long.chunks_done >= 2, (
+            f"long req must really chunk under pinned cache; got chunks_done="
+            f"{r_long.chunks_done}"
+        )
+        # The finished req must hold no locks of its own.
+        assert (
+            r_long.lock_refs == 0
+        ), f"req {r_long.rid} leaked {r_long.lock_refs} lock_refs after finish"
+
+        # Release the exhauster's locks (mirrors the reset path) and confirm the
+        # global lock_ref state returns EXACTLY to the post-warm baseline: no
+        # leaked locks from either the exhauster or the chunked req.
+        t._release_exhausted_pools()
+        final_lock_refs = t.get_all_node_lock_refs()
+        for node_id, baseline in baseline_lock_refs.items():
+            assert final_lock_refs.get(node_id, 0) == baseline, (
+                f"node {node_id} lock_ref leaked: baseline={baseline}, "
+                f"final={final_lock_refs.get(node_id, 0)}"
+            )
 
     def test_kv_at_one_page_chunked_completes(self):
         self.server.execute_script(self._script_kv_at_one_page_chunked_completes)
@@ -190,55 +232,51 @@ class TestKVPressureBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
         t.continue_generation()
-        for _ in range(2000):
-            if r.finished:
-                break
-            yield
+        # Force real forward progress past the retract point: the resumed req must
+        # re-chunk and run a strictly later chunk than it had before the retract,
+        # not merely fail to regress (which a finished-or-aborted req satisfies
+        # vacuously). Only then do we drive it to completion.
+        yield from run_until(
+            r,
+            lambda h: h.chunks_done > chunks_before_retract,
+            max_steps=2000,
+        )
+        yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert r.kv_pages == 0
-        assert r.chunks_done >= chunks_before_retract, (
-            f"chunks_done regressed across retract+resume: "
-            f"before={chunks_before_retract}, final={r.chunks_done}"
-        )
         final = t.engine_stats()["kv_pool_free"]
         assert final >= baseline, (
             f"KV pool failed to recover after retract+resume: "
             f"baseline={baseline}, final={final}"
         )
 
-    def test_cumulative_alloc_does_not_grow_unbounded(self):
+    def test_chunked_batch_recovers_pools_to_steady_state(self):
         self.server.execute_script(
-            self._script_cumulative_alloc_does_not_grow_unbounded
+            self._script_chunked_batch_recovers_pools_to_steady_state
         )
 
     @staticmethod
-    def _script_cumulative_alloc_does_not_grow_unbounded(t: ScriptedContext):
-        baseline = t.engine_stats()["kv_pool_free"]
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(50)]
-        yield from run_until_all_finished(reqs)
+    def _script_chunked_batch_recovers_pools_to_steady_state(t: ScriptedContext):
+        before = t.engine_stats()
+        # prompt_len must exceed chunk_size so each req actually walks the chunked
+        # prefill path; prompt_len=16 (< chunk size) never chunks.
+        reqs = [
+            t.start_req(prompt_len=DEFAULT_CHUNK_SIZE + 1, max_new_tokens=2)
+            for _ in range(50)
+        ]
+        yield from run_until_all_finished(reqs, max_steps=2000)
         for r in reqs:
             assert r.finished
-            # Dropped a vacuous `cumulative_kv_alloc_bytes >= 0` probe: it was
-            # always true and the only real invariant here (no KV leak) is already
-            # covered by the per-req kv_pages == 0 check and the kv_pool_free >=
-            # baseline assertion below.
             assert r.kv_pages == 0, f"req {r.rid} kept {r.kv_pages} pages after finish"
-        final = t.engine_stats()["kv_pool_free"]
-        assert (
-            final >= baseline
-        ), f"50-req batch leaked KV: baseline={baseline}, final={final}"
-
-    def test_engine_stats_pool_invariant(self):
-        self.server.execute_script(self._script_engine_stats_pool_invariant)
-
-    @staticmethod
-    def _script_engine_stats_pool_invariant(t: ScriptedContext):
-        before = t.engine_stats()
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
-        yield from run_until_all_finished(reqs)
         after = t.engine_stats()
-        assert after["kv_pool_free"] >= before["kv_pool_free"]
-        assert after["row_pool_free"] >= before["row_pool_free"]
+        assert after["kv_pool_free"] >= before["kv_pool_free"], (
+            f"50 chunked reqs leaked KV: baseline={before['kv_pool_free']}, "
+            f"final={after['kv_pool_free']}"
+        )
+        assert after["req_pool_free"] >= before["req_pool_free"], (
+            f"50 chunked reqs leaked req-pool rows: "
+            f"baseline={before['req_pool_free']}, final={after['req_pool_free']}"
+        )
 
     def test_kv_pressure_with_radix_evict(self):
         self.server.execute_script(self._script_kv_pressure_with_radix_evict)
@@ -269,28 +307,6 @@ class TestKVPressureBasic(ScriptedTestCase):
         assert final >= baseline, (
             f"KV did not recover after evict + re-chunk: baseline={baseline}, "
             f"final={final}"
-        )
-
-    def test_chunked_retract_resume_kv_recovers_exactly(self):
-        self.server.execute_script(
-            self._script_chunked_retract_resume_kv_recovers_exactly
-        )
-
-    @staticmethod
-    def _script_chunked_retract_resume_kv_recovers_exactly(t: ScriptedContext):
-        baseline = t.engine_stats()["kv_pool_free"]
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.pause_generation(mode="retract")
-        yield
-        t.continue_generation()
-        yield from run_until_finished(r, max_steps=2000)
-        assert r.finished
-        assert r.kv_pages == 0
-        final = t.engine_stats()["kv_pool_free"]
-        assert final >= baseline, (
-            f"kv_pool_free did not recover after chunked retract+resume: "
-            f"baseline={baseline}, final={final}"
         )
 
     def test_chunked_retract_at_chunk_first_mid_last(self):
@@ -403,9 +419,7 @@ class TestKVPressurePriority(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
 
-        r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
-        )
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10)
         for _ in range(DEFAULT_MAX_STEPS * 4):
             assert not (r1.is_chunking and r2.is_chunking), (
                 f"two reqs cannot share the chunked slot; "

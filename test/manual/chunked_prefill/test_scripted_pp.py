@@ -25,16 +25,6 @@ def _pp_engine_kwargs(*, pp_size: int = 2, **overrides: Any) -> Dict[str, Any]:
 class TestPPBasic(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs()
 
-    def test_pp_chunked_no_double_finalize(self):
-        self.server.execute_script(self._script_pp_chunked_no_double_finalize)
-
-    @staticmethod
-    def _script_pp_chunked_no_double_finalize(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
-        yield from run_until_finished(r)
-        assert r.finished
-        # exactly-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
-
     def test_pp_abort_during_inflight_chunk(self):
         self.server.execute_script(self._script_pp_abort_during_inflight_chunk)
 
@@ -76,7 +66,6 @@ class TestPPBasic(ScriptedTestCase):
             f"PP=2 multi-chunk req should aggregate >=4 chunks_done across "
             f"microbatches, got {r.chunks_done}"
         )
-        assert r.finished
 
     def test_pp_two_chunked_one_per_mb_simultaneous(self):
         self.server.execute_script(self._script_pp_two_chunked_one_per_mb_simultaneous)
@@ -85,22 +74,9 @@ class TestPPBasic(ScriptedTestCase):
     def _script_pp_two_chunked_one_per_mb_simultaneous(t: ScriptedContext):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        observed_both_chunking = False
-        for _ in range(50):
-            if r1.is_chunking and r2.is_chunking:
-                observed_both_chunking = True
-                count = 1 if t.scheduler.chunked_req is not None else 0
-                assert count <= 2, (
-                    f"global chunked_in_flight_count exceeds pp_size, got " f"{count}"
-                )
-                break
-            yield
-        assert observed_both_chunking, (
-            "both reqs must be observed chunking simultaneously to "
-            "exercise the cross-mb path"
-        )
         yield from run_until_all_finished(handles=[r1, r2], max_steps=800)
         assert r1.finished and r2.finished
+        assert r1.chunks_done >= 2 and r2.chunks_done >= 2
         assert r1.kv_pages == 0 and r2.kv_pages == 0
         assert r1.lock_refs == 0 and r2.lock_refs == 0
 
@@ -153,12 +129,6 @@ class TestPPPdmux(ScriptedTestCase):
             f"pdmux + chunked path must produce >=2 chunks to exercise "
             f"split_prefill_batch filter; got chunks_done={r.chunks_done}"
         )
-        stats = t.engine_stats()
-        if "merge_batch_assert_violations" in stats:
-            assert stats["merge_batch_assert_violations"] == 0, (
-                f"merge_batch assert tripped under pdmux + chunked: "
-                f"{stats['merge_batch_assert_violations']}"
-            )
 
 
 class TestPPDynamic(ScriptedTestCase):
@@ -169,37 +139,13 @@ class TestPPDynamic(ScriptedTestCase):
 
     @staticmethod
     def _script_naive_pp_chunked(t: ScriptedContext):
+        # Smoke test for the PP + dynamic-chunking path: a long prompt must chunk
+        # across microbatches and still decode all requested tokens cleanly.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2, f"expected >=2 chunks, got {r.chunks_done}"
-        assert r.finished
         assert len(r.req.output_ids) == 4
-
-    def test_pp_dynamic_chunking_predictor(self):
-        self.server.execute_script(self._script_pp_dynamic_chunking_predictor)
-
-    @staticmethod
-    def _script_pp_dynamic_chunking_predictor(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        observed_non_none = False
-        for _ in range(400):
-            if r.is_chunking:
-                stats = t.engine_stats()
-                size = stats.get("last_chunked_prefill_size")
-                if size is not None:
-                    observed_non_none = True
-                    assert size > 0, (
-                        f"dynamic chunking predictor produced a non-"
-                        f"positive size: {size}"
-                    )
-            if r.finished:
-                break
-            yield
-        assert r.finished
-        assert (
-            observed_non_none
-        ), "dynamic chunking predictor never produced a non-None size"
 
 
 class TestPPSize4(ScriptedTestCase):

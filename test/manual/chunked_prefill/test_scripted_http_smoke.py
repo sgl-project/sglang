@@ -5,21 +5,11 @@ from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     base_engine_kwargs,
-    run_until_finished,
 )
 
 
 class TestScriptedHttpSmoke(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
-
-    def test_single_short_req_finishes(self):
-        self.server.execute_script(self._script_single_short_req_finishes)
-
-    @staticmethod
-    def _script_single_short_req_finishes(t: ScriptedContext):
-        r = t.start_req(prompt_len=8, max_new_tokens=4)
-        yield from run_until_finished(r)
-        assert r.finished
 
     def test_chunked_req_is_chunking_then_finishes(self):
         self.server.execute_script(self._script_chunked_req_is_chunking_then_finishes)
@@ -52,6 +42,11 @@ class TestScriptedHttpSmoke(ScriptedTestCase):
             yield
         assert r1.finished
         assert r2.finished
+        assert r1.chunks_done == 0
+        # r2's prompt is 2 * DEFAULT_CHUNK_SIZE (512), an exact multiple of the
+        # 256 chunk size, so it chunks into ceil(512 / 256) = 2 partial prefill
+        # iterations regardless of co-batching with r1.
+        assert r2.chunks_done == 2
 
 
 if __name__ == "__main__":
