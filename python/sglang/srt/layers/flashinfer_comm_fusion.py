@@ -202,7 +202,9 @@ def _make_flashinfer_workspace_allocation_prop(cuda_driver):
     if is_mnnvl_fabric_supported(torch.cuda.current_device()):
         handle_type = cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
     else:
-        handle_type = cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        handle_type = (
+            cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
 
     prop = cuda_driver.CUmemAllocationProp()
     prop.requestedHandleTypes = handle_type
