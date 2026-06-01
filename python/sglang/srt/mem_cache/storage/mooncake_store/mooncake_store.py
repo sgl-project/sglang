@@ -670,13 +670,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        qkeys = self._tag_keys(keys)
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
             # usable prefix is determined entirely by required sidecar objects.
             kv_pages = len(keys)
         else:
-            kv_pages = self.batch_exists(qkeys, extra_info)
+            kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -685,8 +684,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if final_pages == 0:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                qkeys, transfer
+                keys, transfer
             )
+            component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
             if key_multiplier > 0:
                 page_exists = [
