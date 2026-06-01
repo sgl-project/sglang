@@ -410,6 +410,43 @@ class TestSwaDivergenceReporterWithCompute(CustomTestCase):
         self.assertEqual(parsed.verify_swa, 3)
 
 
+class TestSwaDivergenceLogFindAll(CustomTestCase):
+    def test_find_all_returns_every_sample_in_order(self) -> None:
+        """find_all parses every emitted swa_divergence line, preserving order."""
+        text = "\n".join(
+            SwaDivergenceLog(
+                forward_ct=ct,
+                verify_full=100 * ct,
+                verify_swa=10 * ct,
+                swa_full_idx_divergence=ct,
+                swa_out_of_window_tokens=0,
+            ).format()
+            for ct in (20, 40, 60)
+        )
+        parsed = SwaDivergenceLog.find_all(text)
+        self.assertEqual([p.forward_ct for p, _ in parsed], [20, 40, 60])
+
+    def test_find_all_peak_survives_trailing_zero_sample(self) -> None:
+        """The peak out-of-window count is recoverable even when the last sample is zero."""
+        text = "\n".join(
+            SwaDivergenceLog(
+                forward_ct=ct,
+                verify_full=1,
+                verify_swa=0,
+                swa_full_idx_divergence=1,
+                swa_out_of_window_tokens=oow,
+            ).format()
+            for ct, oow in ((20, 0), (40, 4080), (60, 0))
+        )
+        parsed = SwaDivergenceLog.find_all(text)
+        self.assertEqual(max(p.swa_out_of_window_tokens for p, _ in parsed), 4080)
+        self.assertEqual(parsed[-1][0].swa_out_of_window_tokens, 0)
+
+    def test_find_all_returns_empty_list_when_no_lines(self) -> None:
+        """find_all returns an empty list when no swa_divergence line is present."""
+        self.assertEqual(SwaDivergenceLog.find_all("nothing here\n"), [])
+
+
 class TestCanaryManagerSwaDivergenceWiring(CanaryManagerTestCase):
     def test_swa_divergence_report_is_none_when_env_disabled(self) -> None:
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(

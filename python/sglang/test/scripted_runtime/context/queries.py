@@ -113,3 +113,17 @@ def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
         for record in ctx._scheduler_hook._batch_log
         if record.chunked_rid == rid and rid in record.rids
     )
+
+
+def chunked_parks(ctx: "ScriptedContext", rid: str) -> int:
+    # The dual of chunks_done: iterations where the scheduler still held this rid
+    # as its chunked_req but did NOT run it in the batch -- i.e. add_chunked_req's
+    # hybrid-SWA early-return parked it instead of scheduling its next chunk.
+    # on_run_batch records chunked_rid right after get_next_batch_to_run in the
+    # same loop iteration, so "chunked_rid set but absent from the batch" is an
+    # exact, refactor-stable signal for a park, independent of any scheduler flag.
+    return sum(
+        1
+        for record in ctx._scheduler_hook._batch_log
+        if record.chunked_rid == rid and rid not in record.rids
+    )

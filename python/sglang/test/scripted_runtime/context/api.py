@@ -124,6 +124,9 @@ class ScriptedContext:
     def chunks_done(self, rid: str) -> int:
         return queries.chunks_done(self, rid)
 
+    def chunked_parks(self, rid: str) -> int:
+        return queries.chunked_parks(self, rid)
+
     def batch_composition(self) -> Dict[str, List[str]]:
         return queries.batch_composition(self)
 

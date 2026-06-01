@@ -19,6 +19,12 @@ class CanaryPPFixture(CanaryE2EBase):
     """Single SWA server launched with pp_size=2 and kv-canary enabled."""
 
     model_mode: ClassVar[str] = "swa"
+    # swa_out_of_window_tokens only becomes non-zero once a request decodes past the SWA
+    # window and the window evicts; CanaryE2EBase forces ignore_eos for swa fixtures so
+    # every request reaches that point regardless of PP/eager decode-length numerics. Drive
+    # two sequential batches so the SWA allocator also recycles slots across batches and
+    # swa_full_idx_divergence (the pool-reuse signal) is exercised, not just the window slide.
+    workload_n_batches: ClassVar[int] = 2
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -36,12 +42,3 @@ class CanaryPPFixture(CanaryE2EBase):
             *cls.extra_server_args,
         )
         super().setUpClass()
-
-    def maybe_assert_swa_divergence_observed(self) -> None:
-        # swa_out_of_window_tokens is sampled from whichever forward batch is live
-        # at the divergence interval. Under PP's micro-batch scheduling that sampled
-        # forward may not contain a request whose in-window prefix has been evicted
-        # to SWA slot 0, so the count is a sampling-instant artifact here. The SWA
-        # path is still proven exercised by verify_swa << verify_full and
-        # swa_full_idx_divergence > 0, so only the out-of-window floor is relaxed.
-        self.assert_swa_divergence_observed(min_swa_out_of_window_tokens=0)
