@@ -233,7 +233,8 @@ def test_scale_cpu_input():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-q"])
+    import sys
+    sys.exit(pytest.main([__file__, "-q"]))
 ```
 
 ---
@@ -326,6 +327,10 @@ After building successfully, run the test and benchmark:
 pytest sgl-kernel/tests/test_scale.py -q
 python sgl-kernel/benchmark/bench_scale.py
 ```
+
+PR CI also runs `pr-test-sgl-kernel.yml`, including the B200 job
+`sgl-kernel-b200-test` when kernel changes are detected. Use that job as the
+Blackwell coverage signal for AOT `sgl-kernel` changes.
 
 ---
 

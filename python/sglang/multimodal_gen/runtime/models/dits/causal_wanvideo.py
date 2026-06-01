@@ -13,7 +13,9 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -58,7 +60,6 @@ logger = init_logger(__name__)
 
 
 class CausalWanSelfAttention(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -251,7 +252,6 @@ class CausalWanSelfAttention(nn.Module):
 
 
 class CausalWanTransformerBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -397,7 +397,7 @@ class CausalWanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeroes(
+        null_shift = null_scale = torch.zeros(
             (1,), device=hidden_states.device, dtype=hidden_states.dtype
         )
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
@@ -429,7 +429,7 @@ class CausalWanTransformerBlock(nn.Module):
         return hidden_states
 
 
-class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
+class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -644,9 +644,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             self.num_attention_heads,
             rope_dim_list,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
             rope_theta=10000,
             start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
@@ -660,10 +660,13 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape
@@ -776,9 +779,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             self.num_attention_heads,
             rope_dim_list,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
             rope_theta=10000,
             start_frame=start_frame,
@@ -802,10 +805,13 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
         )
         timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
             dim=0, sizes=timestep.shape

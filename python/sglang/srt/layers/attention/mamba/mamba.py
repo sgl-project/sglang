@@ -1,3 +1,4 @@
+import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -25,11 +26,17 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_npu,
+    set_weight_attrs,
+)
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -52,6 +59,8 @@ elif is_npu():
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
+logger = logging.getLogger(__name__)
+
 
 def mamba_v2_sharded_weight_loader(
     shard_spec: List[Tuple[int, int, float]],
@@ -60,7 +69,7 @@ def mamba_v2_sharded_weight_loader(
 ) -> LoaderFunction:
     """Create a weight loader for mamba v2. This ensures that the projections
     are correctly sharded so that they can be split into x, B, C. It also
-    ensures the the all the groups corresponding to a head shard is placed
+    ensures that all the groups corresponding to a head shard is placed
     together with it.
     """
 
@@ -80,6 +89,14 @@ def mamba_v2_sharded_weight_loader(
             for full_dim in full_dim_list:
                 weight_full_dim_list.append(
                     int(full_dim / full_dim_sum * loaded_weight.size(0))
+                )
+            assert sum(weight_full_dim_list) == loaded_weight.size(
+                0
+            ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
+            if loaded_weight.size(0) < full_dim_sum and tp_rank == 0:
+                logger.warning(
+                    f"[ZERO-PADDING] Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
+                    f", where original sizes of {weight_full_dim_list} will be updated to {full_dim_list}",
                 )
 
         # - iterate over the shard specs
@@ -110,7 +127,7 @@ def mamba_v2_sharded_weight_loader(
 
             # CPU logic of padding size for qwen3-next
             # TODO : make this common for all mamba.
-            if is_cpu() and loaded_weight.size(0) % tp_size != 0:
+            if is_cpu() and (loaded_weight.size(0) < full_dim_sum):
                 import copy
 
                 loaded_weight_ = copy.deepcopy(loaded_weight)
@@ -394,6 +411,7 @@ class MambaMixer2(torch.nn.Module):
         output: torch.Tensor,
         layer_cache: MambaPool.State,
         metadata: Mamba2Metadata,
+        forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
@@ -404,6 +422,7 @@ class MambaMixer2(torch.nn.Module):
         state_indices_tensor = metadata.mamba_cache_indices
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
+        intermediate_states = None
 
         query_start_loc = metadata.query_start_loc
 
@@ -501,6 +520,14 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
+            if (
+                forward_batch.mamba_track_mask is not None
+                and forward_batch.mamba_track_mask.any()
+                and metadata.track_conv_indices is not None
+            ):
+                x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
+                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                conv_state[forward_batch.mamba_track_indices[mask_indices]] = x_to_track
             ccfn = (
                 causal_conv1d_fn
                 if not use_triton_causal_conv
@@ -530,7 +557,7 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             # NOTE: final output is an in-place update of out tensor
-            varlen_state = mamba_chunk_scan_combined(
+            intermediate_states, varlen_state = mamba_chunk_scan_combined(
                 hidden_states_p.view(
                     1, num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
                 ),
@@ -549,6 +576,7 @@ class MambaMixer2(torch.nn.Module):
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
+                return_intermediate_states=True,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(
@@ -691,6 +719,8 @@ class MambaMixer2(torch.nn.Module):
 
         # 5. Final linear projection
         output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+
+        return intermediate_states
 
     @property
     def mamba_type(self) -> str:

@@ -37,6 +37,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_blackwell,
     is_cuda,
     is_xpu,
     kill_process_tree,
@@ -68,6 +69,8 @@ DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PP = "google/gemma-4-26B-A4B-it"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP = "google/gemma-4-E4B-it"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
@@ -105,6 +108,10 @@ DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
 # EAGLE3 model
 DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+
+# DFLASH model
+DEFAULT_TARGET_MODEL_DFLASH = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_DFLASH = "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
 
 # EAGLE2 with DP-Attention models
 DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
@@ -167,25 +174,6 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
-def flush_cache_with_retry(
-    base_url: str, retries: int = 5, interval: float = 2.0
-) -> bool:
-    """Flush device cache with retry.
-
-    The scheduler may still have in-flight HiCache async ops (GPU↔Host↔L3)
-    that prevent is_fully_idle() from returning True, so we retry.
-    """
-    for _ in range(retries):
-        try:
-            response = requests.post(f"{base_url}/flush_cache", timeout=10)
-            if response.status_code == 200:
-                return True
-        except requests.RequestException:
-            pass
-        time.sleep(interval)
-    return False
-
-
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -197,8 +185,8 @@ def is_in_amd_ci():
 
 
 def is_blackwell_system():
-    """Return whether it is running on a Blackwell (B200) system."""
-    return envs.IS_BLACKWELL.get()
+    """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
+    return is_blackwell()
 
 
 def is_h200_system():
@@ -586,6 +574,41 @@ def popen_with_error_check(command: list[str]):
     return process
 
 
+def start_subprocess_fail_fast_watcher(
+    named_procs: list[tuple[str, subprocess.Popen]],
+) -> threading.Event:
+    """Abort the test runner the moment any watched subprocess exits non-zero.
+
+    Caller must `.set()` the returned Event before intentional teardown."""
+    stop = threading.Event()
+
+    def watcher():
+        while not stop.is_set():
+            for name, proc in named_procs:
+                rc = proc.poll() if proc else None
+                if rc is None or rc == 0:
+                    continue
+                if stop.is_set():
+                    return
+                sys.stderr.write(
+                    f"[FIXTURE FAIL-FAST] {name} (pid={proc.pid}) exited "
+                    f"rc={rc}; aborting.\n"
+                )
+                sys.stderr.flush()
+                for _, sib in named_procs:
+                    if sib and sib is not proc:
+                        try:
+                            kill_process_tree(sib.pid, wait_timeout=10)
+                        except Exception:
+                            pass
+                # POSIX: signal N -> 128+N (os._exit masks negatives via & 0xff).
+                os._exit(rc if rc >= 0 else 128 + (-rc))
+            time.sleep(0.1)
+
+    threading.Thread(target=watcher, daemon=True, name="SubprocFailFastWatcher").start()
+    return stop
+
+
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
 ) -> Optional[str]:
@@ -732,6 +755,43 @@ def _create_clean_subprocess_env(env: dict) -> dict:
     return child_env
 
 
+def _subprocess_popen_with_outputs(
+    command: list,
+    env: Optional[dict],
+    return_stdout_stderr: Optional[tuple],
+) -> subprocess.Popen:
+    if not return_stdout_stderr:
+        return subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+
+    def _dump(src, sinks):
+        for line in iter(src.readline, ""):
+            for sink in sinks:
+                sink.write(line)
+                sink.flush()
+        src.close()
+
+    threading.Thread(
+        target=_dump,
+        args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_dump,
+        args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+        daemon=True,
+    ).start()
+    return process
+
+
 def _launch_server_process(
     command: List[str],
     env: dict,
@@ -754,37 +814,11 @@ def _launch_server_process(
     hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
     print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
 
-    if return_stdout_stderr:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            text=True,
-            bufsize=1,
-        )
-
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
-
-        threading.Thread(
-            target=_dump,
-            args=(proc.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(proc.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
-
-    return proc
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=child_env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def _wait_for_server_health(
@@ -1001,6 +1035,7 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
+    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -1030,9 +1065,17 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+    # Merge with os.environ so caller-supplied env adds to (not replaces)
+    # PATH / PYTHONPATH / HF_HOME / etc. When env is None, Popen inherits
+    # parent's environment automatically.
+    if env is not None:
+        env = {**os.environ, **env}
 
-    return process
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def get_similarities(vec1, vec2):
@@ -1143,12 +1186,26 @@ def run_bench_serving(
         other_args=other_server_args,
     )
 
+    # Resolve tokenizer to local snapshot path when available, so the benchmark
+    # client's AutoTokenizer.from_pretrained uses the local path directly instead
+    # of calling the HF Hub API (which can stall for minutes in CI).
+    bench_tokenizer = tokenizer
+    if bench_tokenizer is None:
+        try:
+            from sglang.srt.utils import find_local_repo_dir
+
+            local_dir = find_local_repo_dir(model, revision=None)
+            if local_dir and os.path.isdir(local_dir):
+                bench_tokenizer = local_dir
+        except Exception:
+            pass
+
     # Run benchmark
     args = get_benchmark_args(
         base_url=base_url,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
-        tokenizer=tokenizer,
+        tokenizer=bench_tokenizer,
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
@@ -2074,7 +2131,74 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
         dist.destroy_process_group()
 
 
+def maybe_stub_sgl_kernel():
+    """Stub sgl_kernel if it cannot be imported (e.g. no GPU).
+
+    Must be called before any import that transitively depends on sgl_kernel.
+    On machines with a working sgl_kernel this is a no-op.
+    """
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return
+    except (ImportError, OSError):
+        pass
+
+    import importlib.abc
+    import importlib.machinery
+
+    class _SglKernelLoader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            from unittest.mock import MagicMock
+
+            module.__getattr__ = lambda name: MagicMock()
+
+    class _SglKernelFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    _SglKernelLoader(),
+                    is_package=True,
+                )
+            return None
+
+    sys.meta_path.insert(0, _SglKernelFinder())
+
+
 class CustomTestCase(unittest.TestCase):
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # Wrap the effective setUpClass so that tearDownClass is called
+        # even when setUpClass fails. Python's unittest skips tearDownClass
+        # if setUpClass raises, which can leak resources (ports, processes).
+        setup = cls.setUpClass
+        if getattr(setup, "_safe_setup_wrapped", False):
+            return
+
+        orig_func = setup.__func__
+
+        def safe_setUpClass(klass):
+            try:
+                orig_func(klass)
+            except Exception:
+                # Best-effort cleanup; suppress teardown errors so the
+                # original setUpClass exception propagates clearly.
+                try:
+                    klass.tearDownClass()
+                except Exception:
+                    pass
+                raise
+
+        # Set sentinel on the raw function so that bound method attribute
+        # lookup (which delegates to __func__) can detect it in subclasses.
+        safe_setUpClass._safe_setup_wrapped = True
+        cls.setUpClass = classmethod(safe_setUpClass)
 
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
@@ -2132,12 +2256,14 @@ class ModelLaunchSettings:
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
         variant: Optional[str] = None,
+        launch_timeout: Optional[float] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
         self.variant = variant
+        self.launch_timeout = launch_timeout
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])

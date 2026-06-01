@@ -52,6 +52,8 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
+from sglang.kernel_api_logging import debug_kernel_api
+
 try:
     from flash_attn.flash_attn_interface import flash_attn_varlen_func
 except ImportError:
@@ -62,9 +64,10 @@ from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_device
 
 
+@debug_kernel_api
 def multihead_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -297,7 +300,7 @@ class Rope2DPosEmb(nn.Module):
     """
 
     def __init__(
-        self, dim: int, max_height: int, max_width: int, theta_base=10000, device="cuda"
+        self, dim: int, max_height: int, max_width: int, theta_base=10000, device=None
     ):
         super().__init__()
         self.dim = dim
@@ -305,7 +308,7 @@ class Rope2DPosEmb(nn.Module):
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
-        self.device = device
+        self.device = device if device is not None else get_device()
 
     def extra_repr(self):
         return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"

@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -183,17 +184,18 @@ def init_distributed_environment(
     rank: int = 0,
     distributed_init_method: str = "env://",
     local_rank: int = 0,
-    backend: str = "nccl",
+    backend: str | None = None,
     device_id: torch.device | None = None,
     timeout: int | None = None,
 ):
     # Determine the appropriate backend based on the platform
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if backend == "nccl" and not current_platform.is_cuda_alike():
-        # Use gloo backend for non-CUDA platforms (MPS, CPU)
-        backend = "gloo"
-        logger.info("Using gloo backend for %s platform", current_platform.device_name)
+    if backend is None:
+        backend = current_platform.get_torch_distributed_backend_str()
+        logger.info(
+            "Using %s backend for %s platform", backend, current_platform.device_name
+        )
 
     logger.debug(
         "world_size=%d rank=%d local_rank=%d "
@@ -211,13 +213,15 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
+        # For MPS, MUSA, and XPU, don't pass device_id as it doesn't support device indices
         extra_args = (
             {}
             if (
                 current_platform.is_mps()
                 or current_platform.is_musa()
                 or current_platform.is_npu()
+                or current_platform.is_cpu()
+                or current_platform.is_xpu()
             )
             else dict(device_id=device_id)
         )
@@ -464,7 +468,7 @@ def get_dp_rank() -> int:
 def maybe_init_distributed_environment_and_model_parallel(
     tp_size: int,
     sp_size: int,
-    enable_cfg_parallel: bool,
+    cfg_degree: int = 1,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     dp_size: int = 1,
@@ -505,7 +509,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,
-        classifier_free_guidance_degree=2 if enable_cfg_parallel else 1,
+        classifier_free_guidance_degree=cfg_degree,
         tensor_parallel_degree=tp_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
