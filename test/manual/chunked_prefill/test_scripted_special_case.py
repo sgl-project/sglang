@@ -144,9 +144,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             1 if t.scheduler.chunked_req is not None else 0
         ) == 0, f"abort must clear in-flight count; got {(1 if t.scheduler.chunked_req is not None else 0)}"
         assert (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) is None
         assert r.kv_pages == 0
         assert r.lock_refs == 0
@@ -178,9 +176,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.finished
         assert saw_match, "getter must return r.rid at least once while r.is_chunking"
         assert (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) is None
 
     def test_chunked_req_reset_to_none(self):
@@ -209,9 +205,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             saw_chunking_match
         ), "must observe scheduler.chunked_req == r at least once during chunking"
         assert (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) is None
 
     @unittest.skip(
@@ -262,9 +256,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             yield
         assert t.is_idle
         assert (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) is None, (
             f"with no in-flight reqs, chunked slot must be None; "
             f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
@@ -408,9 +400,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield
 
         assert (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) is None, (
             f"pause(retract) must clear chunked_req; "
             f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"

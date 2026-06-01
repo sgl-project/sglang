@@ -25,7 +25,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
         for _ in range(DEFAULT_MAX_STEPS):
-            in_flight = (1 if t.scheduler.chunked_req is not None else 0)
+            in_flight = 1 if t.scheduler.chunked_req is not None else 0
             assert in_flight <= 1, (
                 f"single-in-flight invariant violated: "
                 f"chunked_in_flight_count()={in_flight}"
@@ -283,7 +283,11 @@ class TestMultiReqBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=16, max_new_tokens=4)
         r2 = t.start_req(prompt_len=16, max_new_tokens=4)
         for _ in range(DEFAULT_MAX_STEPS):
-            assert (t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None) is None
+            assert (
+                t.scheduler.chunked_req.rid
+                if t.scheduler.chunked_req is not None
+                else None
+            ) is None
             if r1.finished and r2.finished:
                 break
             yield
@@ -349,8 +353,10 @@ class TestMultiReqBasic(ScriptedTestCase):
         reqs = [t.start_req(prompt_len=4, max_new_tokens=8) for _ in range(10)]
         for _ in range(DEFAULT_MAX_STEPS * 3):
             assert (
-                (t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None) is None
-            ), "pure decode workload must never populate chunked_req"
+                t.scheduler.chunked_req.rid
+                if t.scheduler.chunked_req is not None
+                else None
+            ) is None, "pure decode workload must never populate chunked_req"
             assert (1 if t.scheduler.chunked_req is not None else 0) == 0
             if all(r.finished for r in reqs):
                 return

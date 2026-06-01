@@ -320,9 +320,7 @@ class TestRegressionBasic(ScriptedTestCase):
             r.is_chunking
         ), f"is_chunking must be set while mid-chunk; got {r.is_chunking!r}"
         assert (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) is None, (
             f"v2 must not maintain a top-level chunked_req field; "
             f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
@@ -479,9 +477,7 @@ class TestRegressionBasic(ScriptedTestCase):
             f"{len(t.scheduler.running_batch.reqs)}"
         )
         assert (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) is None
         for r in (r1, r2):
             assert r.status == "waiting"

@@ -429,9 +429,7 @@ class TestAbortBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         ) == r1.rid, (
             f"r1 should hold the chunked slot before abort; got "
             f"{(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
@@ -442,9 +440,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield
 
         cur = (
-            t.scheduler.chunked_req.rid
-            if t.scheduler.chunked_req is not None
-            else None
+            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
         )
         assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
         assert r1.kv_pages == 0
