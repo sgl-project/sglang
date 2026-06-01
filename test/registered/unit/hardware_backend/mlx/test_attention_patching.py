@@ -381,6 +381,43 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(calls, [(1, [[7]], ["r0"])])
         self.assertEqual(pending.lazy_tokens.tolist(), [8])
 
+    def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        scheduler = object.__new__(Scheduler)
+        scheduler.device = "cpu"
+        scheduler.draft_worker = None
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=None)
+        )
+        scheduler.server_args = SimpleNamespace(
+            enable_two_batch_overlap=False,
+            disable_piecewise_cuda_graph=True,
+        )
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.req_to_token_pool = ReqToTokenPool(
+            size=4,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        scheduler.enable_overlap = False
+
+        original_use_mlx = scheduler_module.use_mlx
+        scheduler_module.use_mlx = lambda: True
+        try:
+            Scheduler.init_overlap(scheduler)
+        finally:
+            scheduler_module.use_mlx = original_use_mlx
+
+        self.assertIsNotNone(scheduler.future_map)
+        indices = torch.tensor([1], dtype=torch.int64)
+        scheduler.future_map.stash(indices, torch.tensor([7], dtype=torch.int64))
+        self.assertEqual(int(scheduler.future_map.output_tokens_buf[1].item()), 7)
+
     def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
         runner = object.__new__(MlxModelRunner)
         runner._req_token_ids = {"r0": [8]}
