@@ -141,18 +141,15 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            device = free_index.device
-            free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            free_page_indices = free_page_indices.to(device)
+            free_page_indices = torch.unique(free_index // self.page_size)
             # Filter out pages already in the free pool to make free() idempotent.
             # This handles the case where the same SWA page is partially freed by
             # _evict_swa and then fully freed by free_group_end.
-            existing = torch.cat([self.free_pages.cpu(), self.release_pages.cpu()])
-            mask = ~torch.isin(free_page_indices.cpu(), existing)
+            existing = torch.cat([self.free_pages, self.release_pages])
+            mask = ~(free_page_indices[:, None] == existing[None, :]).any(dim=1)
             to_free = free_page_indices[mask]
             if to_free.numel() == 0:
                 return
-            to_free = to_free.to(device)
             if self.need_sort:
                 self.release_pages = torch.cat((to_free, self.release_pages))
             else:
@@ -161,13 +158,4 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.free_group.append(free_index)
 
         if self.debug_mode:
-            all_pages = (
-                torch.cat([self.free_pages, self.release_pages])
-                if len(self.release_pages) > 0
-                else self.free_pages
-            )
-            assert len(torch.unique(all_pages)) == len(all_pages), (
-                f"[ALLOC-DOUBLE-FREE] need_sort={self.need_sort} "
-                f"free_pages={len(self.free_pages)} release_pages={len(self.release_pages)} "
-                f"new_pages={free_page_indices.tolist()[:50]}"
-            )
+            assert len(torch.unique(self.free_pages)) == len(self.free_pages)

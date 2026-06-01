@@ -83,7 +83,10 @@ class NPUGraphRunner(CudaGraphRunner):
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.forward_mode = None
-        self.if_use_v2 = model_runner.model_config.hf_config.architectures[0] in ["MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"]
+        self.if_use_v2 = any(
+            arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+            for arch in (model_runner.model_config.hf_config.architectures or [])
+        )
 
     def _init_arch_map(self):
         if self.is_dllm:
