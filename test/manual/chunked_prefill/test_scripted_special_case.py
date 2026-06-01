@@ -303,9 +303,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        assert r.kv_pages == 0, (
-            f"retract during gap must release KV; got kv_pages={r.kv_pages}"
-        )
+        assert (
+            r.kv_pages == 0
+        ), f"retract during gap must release KV; got kv_pages={r.kv_pages}"
         assert not r.finished, "retract must re-queue r, not finish or abort it"
         req = t.find_req_by_rid(r.rid)
         assert req is not None and req.inflight_middle_chunks == 0, (
@@ -315,7 +315,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
         t.continue_generation()
         yield from run_until_finished(r, max_steps=2000)
-        assert r.finished, "continue_generation must drive the re-queued req to completion"
+        assert (
+            r.finished
+        ), "continue_generation must drive the re-queued req to completion"
         assert r.kv_pages == 0
         assert len(r.req.output_ids) == 2
 

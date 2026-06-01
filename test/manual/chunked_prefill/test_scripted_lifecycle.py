@@ -297,7 +297,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 1
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
-                assert r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
+                assert (
+                    r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
+                )
             else:
                 assert r.chunks_done == 0
 
@@ -313,7 +315,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert len(r.req.output_ids) == 1
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
-                assert r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
+                assert (
+                    r.chunks_done == (L + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
+                )
             else:
                 assert r.chunks_done == 0
 

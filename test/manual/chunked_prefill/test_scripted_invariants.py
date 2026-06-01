@@ -183,9 +183,9 @@ class TestInvariantsBasic(ScriptedTestCase):
                 f"chunks; got chunks_done={r.chunks_done}"
             )
         final_kv = t.engine_stats()["kv_pool_free"]
-        assert final_kv >= baseline_kv, (
-            f"KV leak after sustained chunked load: {baseline_kv} -> {final_kv}"
-        )
+        assert (
+            final_kv >= baseline_kv
+        ), f"KV leak after sustained chunked load: {baseline_kv} -> {final_kv}"
 
     def test_round_robin_short_and_chunked(self):
         self.server.execute_script(self._script_round_robin_short_and_chunked)
