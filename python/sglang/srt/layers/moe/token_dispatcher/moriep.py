@@ -634,8 +634,14 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
-            # Normal dispatch is compact: recv_topk_ids carries the real M.
-            expected_m=recv_topk_ids.shape[0],
+            # mori intra-node normal dispatch pads recv_topk_ids to the LL
+            # buffer (world_size * num_max_dispatch_tokens_per_rank), so
+            # recv_topk_ids.shape[0] is the padded worst-case M, not the real
+            # recv count. Derive expected_m from the pre-dispatch topk_ids (real
+            # per-rank tokens), synced to the legacy SGLANG_MORI_MOE_MAX_INPUT_
+            # TOKENS sizing (reqs_per_rank * topk * 7/10) so get_padded_M lands
+            # on the same kernel tier the removed truncation env var used.
+            expected_m=(topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10,
         )
 
     def _dispatch_core(
@@ -893,10 +899,11 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         # tier lookup a small (~1) margin in the exactly-divisible case.
         num_tokens = topk_ids.shape[0]
         topk = topk_ids.shape[1]
-        world_size = self.num_experts // self.num_local_experts
-        expected_m = (
-            num_tokens * world_size * topk + self.num_experts
-        ) // self.num_experts
+        # Synced with the legacy SGLANG_MORI_MOE_MAX_INPUT_TOKENS sizing:
+        # reqs_per_rank * topk * 7/10. num_tokens already folds in the MTP draft
+        # tokens, so this hits the same get_padded_M tier the removed truncation
+        # env var used (~356 at conc=128 decode).
+        expected_m = (num_tokens * topk * 7) // 10
 
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
