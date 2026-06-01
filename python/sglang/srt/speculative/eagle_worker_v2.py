@@ -220,26 +220,31 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
-        # top_scores_index are runtime-invariant. Pre-allocate them so
-        # draft_forward can skip cat+topk+sort+gather kernels. Must be called
-        # after any change to speculative_num_draft_tokens.
+        # top_scores_index are runtime-invariant. Must be rebuilt after any
+        # change to speculative_num_steps / speculative_num_draft_tokens.
         if self.topk != 1:
             return
-        n_extra = self.speculative_num_draft_tokens - 1
+        # _override_worker_state can set both directly, bypassing the hook that
+        # pins this relation; the fast path is only valid when it holds.
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "topk=1 requires speculative_num_draft_tokens == speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
+        num_steps = self.speculative_num_steps
         sa = self.server_args
         max_bs = max(
             sa.cuda_graph_max_bs or 0,
             sa.max_running_requests or 0,
             1,
         )
-        # The slow path drops the last step's parents, so a single-step chain
-        # has no parent entries. Match that to keep build_tree inputs identical.
-        parent_width = n_extra if self.speculative_num_steps > 1 else 0
+        # A single-step chain has no parent entries (slow path drops the last
+        # step). repeat (not expand): the kernel reads these as contiguous.
+        parent_width = num_steps if num_steps > 1 else 0
         self._topk1_parents_prealloc = torch.arange(
             -1, parent_width - 1, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
         self._topk1_score_indices_prealloc = torch.arange(
-            n_extra, dtype=torch.long, device=self.device
+            num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
 
     def init_token_map(self):
@@ -620,7 +625,9 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list = torch.cat(parents_list[:-1], dim=1)
         else:
             batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+            parent_list = torch.empty(
+                batch_size, 0, dtype=torch.long, device=parents_list[0].device
+            )
 
         return parent_list, top_scores_index, draft_tokens
 
