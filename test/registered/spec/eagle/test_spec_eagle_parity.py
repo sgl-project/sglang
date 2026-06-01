@@ -17,7 +17,8 @@ class TestEagle3Parity(Eagle3Base, SpecParityKit):
     """EAGLE3 spec v2 (flashinfer) greedy output == non-spec reference."""
 
     disable_overlap = False
-    mem_fraction_static = 0.6  # leave room for the reference server
+    # Main 0.5 + reference 0.35 (SpecParityKit) = 0.85, both fit on an 80GB GPU.
+    mem_fraction_static = 0.5
 
 
 if __name__ == "__main__":

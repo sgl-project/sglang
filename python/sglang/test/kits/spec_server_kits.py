@@ -108,11 +108,16 @@ class SpecParityKit:
         "The three primary colors are",
         "def fibonacci(n):",
     ]
+    # Reference server's mem fraction. Must be big enough to hold the target
+    # model + a little KV (0.15 ~ 12GB on an 80GB GPU can't even load an 8B
+    # model). The host class lowers its own mem_fraction_static so the two
+    # coexist on one (large) GPU.
+    parity_ref_mem_fraction = 0.35
 
     def test_parity_vs_reference(self):
         """Spec decoding is lossless: greedy output must equal a non-spec
-        reference. Launch a temporary non-spec server (same target model, low
-        mem so it coexists), compare greedy outputs, then tear it down.
+        reference. Launch a temporary non-spec server (same target model),
+        compare greedy outputs, then tear it down.
         """
         parsed = urlparse(self.base_url)
         ref_port = parsed.port + 137
@@ -123,7 +128,7 @@ class SpecParityKit:
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--mem-fraction-static",
-                "0.15",
+                str(self.parity_ref_mem_fraction),
                 "--attention-backend",
                 self.attention_backend,
                 "--page-size",
