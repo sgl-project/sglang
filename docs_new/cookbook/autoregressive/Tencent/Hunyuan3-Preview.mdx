@@ -78,6 +78,8 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
 
 The `hy3-preview` tag bundles the HYV3 model code, the `hunyuan` tool-call / reasoning parsers, and the MTP draft-module runtime.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -166,6 +168,8 @@ SGLANG_ENABLE_SPEC_V2=1 sglang serve \
 ```
 
 Toggle the "Speculative Decoding (MTP)" option in the generator above to add these flags automatically. Tune `num-steps` / `num-draft-tokens` based on acceptance rate in your workload.
+
+For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
