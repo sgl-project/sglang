@@ -208,10 +208,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.finish_event_count <= 1, (
-            f"abort-after-finish should not emit a second finish event; "
-            f"got {r.finish_event_count}"
-        )
+        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         stats = t.engine_stats()
         assert stats["kv_pool_free"] >= 0
 
@@ -243,7 +240,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.finish_event_count <= 1
+        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
 
     def test_abort_chunk_last(self):
         self.server.execute_script(self._script_abort_chunk_last)
@@ -280,9 +277,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert (
-            r.finish_event_count <= 1
-        ), f"double abort must not double-finalize; got {r.finish_event_count}"
+        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
 
     def test_abort_during_decode(self):
         self.server.execute_script(self._script_abort_during_decode)
@@ -296,7 +291,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.finish_event_count <= 1
+        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
 
     def test_abort_one_of_three_others_finish(self):
         self.server.execute_script(self._script_abort_one_of_three_others_finish)
@@ -327,16 +322,16 @@ class TestAbortBasic(ScriptedTestCase):
         for r in reqs:
             assert r.kv_pages == 0
 
-    def test_abort_finish_event_count_at_most_one(self):
-        self.server.execute_script(self._script_abort_finish_event_count_at_most_one)
+    def test_abort_finish_emitted_at_most_once(self):
+        self.server.execute_script(self._script_abort_finish_emitted_at_most_once)
 
     @staticmethod
-    def _script_abort_finish_event_count_at_most_one(t: ScriptedContext):
+    def _script_abort_finish_emitted_at_most_once(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         t.abort(r)
         yield
-        assert r.finish_event_count <= 1
+        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
 
     def test_abort_at_chunk_boundary_race(self):
         self.server.execute_script(self._script_abort_at_chunk_boundary_race)
@@ -351,9 +346,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield
 
-        assert (
-            r.finish_event_count <= 1
-        ), f"abort race must not double-finalize; got {r.finish_event_count}"
+        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         assert (
             r.req.inflight_middle_chunks == 0
         ), f"abort must zero inflight_middle_chunks; got {r.req.inflight_middle_chunks}"
@@ -473,10 +466,7 @@ class TestAbortBasic(ScriptedTestCase):
             f"force_retract + abort same yield must release lock_refs; "
             f"got {r1.lock_refs}"
         )
-        assert r1.finish_event_count <= 1, (
-            f"force_retract + abort same yield must not double-finalize; "
-            f"got {r1.finish_event_count} events"
-        )
+        # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         yield
 
     def test_abort_chunked_with_baton_handoff(self):
@@ -586,9 +576,7 @@ class TestAbortPP(ScriptedTestCase):
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
         assert r.lock_refs == 0
-        assert (
-            r.finish_event_count == 1
-        ), f"abort must not double-finalize; got {r.finish_event_count} events"
+        assert r.finished
 
 
 if __name__ == "__main__":

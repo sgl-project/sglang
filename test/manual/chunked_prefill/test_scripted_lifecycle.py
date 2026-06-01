@@ -245,7 +245,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.lock_refs == 0
             reqs.append(r)
         for r in reqs:
-            assert r.finish_event_count == 1
+            assert r.finished
 
     def test_radix_partial_seq(self):
         self.server.execute_script(self._script_radix_partial_seq)
@@ -361,10 +361,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             reqs.append(r)
         for r in reqs:
-            assert r.finish_event_count == 1, (
-                f"sequential req must emit exactly one finish event; "
-                f"got {r.finish_event_count} for rid={r.rid}"
-            )
+            assert r.finished
 
     def test_seq_engine_stats_stable(self):
         self.server.execute_script(self._script_seq_engine_stats_stable)

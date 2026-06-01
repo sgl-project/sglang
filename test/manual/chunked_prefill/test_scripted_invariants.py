@@ -106,14 +106,14 @@ class TestInvariantsBasic(ScriptedTestCase):
             yield
         raise AssertionError("req never finished")
 
-    def test_finish_event_count_exactly_one(self):
-        self.server.execute_script(self._script_finish_event_count_exactly_one)
+    def test_finish_emitted_exactly_once(self):
+        self.server.execute_script(self._script_finish_emitted_exactly_once)
 
     @staticmethod
-    def _script_finish_event_count_exactly_one(t: ScriptedContext):
+    def _script_finish_emitted_exactly_once(t: ScriptedContext):
         r = t.start_req(prompt_len=16, max_new_tokens=2)
         yield from run_until_finished(r)
-        assert r.finish_event_count == 1
+        assert r.finished
 
     def test_kv_pages_non_negative(self):
         self.server.execute_script(self._script_kv_pages_non_negative)

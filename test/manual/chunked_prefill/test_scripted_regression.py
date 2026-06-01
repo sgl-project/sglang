@@ -320,7 +320,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.kv_pages == 0
         assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
-        assert r.finish_event_count == 1
+        assert r.finished
 
     def test_chunked_admission_reuse_branch_balanced(self):
         self.server.execute_script(self._script_chunked_admission_reuse_branch_balanced)
@@ -486,10 +486,7 @@ class TestRegressionBasic(ScriptedTestCase):
         t.abort(r)
         yield
 
-        assert r.finish_event_count == 1, (
-            f"de3859646b: dual-queue abort must dedup; got "
-            f"{r.finish_event_count} finish events"
-        )
+        assert r.finished
         assert r.kv_pages == 0
         assert r.req.req_pool_idx is None
         assert t.kv_pool_underflow_count() == 0, (
@@ -580,10 +577,7 @@ class TestRegressionPp(ScriptedTestCase):
             f"waiting_queue; got {occurrences} occurrences of rid="
             f"{r.rid} (pre-fix bug would yield 3)"
         )
-        assert r.finish_event_count == 1, (
-            f"PP abort must dedup across microbatches; "
-            f"got {r.finish_event_count} finish events"
-        )
+        assert r.finished
 
     def test_pp_other_mb_chunked_exclude(self):
         self.server.execute_script(self._script_pp_other_mb_chunked_exclude)

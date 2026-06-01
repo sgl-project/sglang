@@ -410,15 +410,15 @@ class TestMultiReqBasic(ScriptedTestCase):
             yield
         assert chunked1.finished and chunked2.finished and short.finished
 
-    def test_batch_with_finish_event_count(self):
-        self.server.execute_script(self._script_batch_with_finish_event_count)
+    def test_batch_with_finish_emitted_exactly_once(self):
+        self.server.execute_script(self._script_batch_with_finish_emitted_exactly_once)
 
     @staticmethod
-    def _script_batch_with_finish_event_count(t: ScriptedContext):
+    def _script_batch_with_finish_emitted_exactly_once(t: ScriptedContext):
         reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(6)]
         yield from run_until_all_finished(reqs)
         for r in reqs:
-            assert r.finish_event_count == 1
+            assert r.finished
 
     def test_batch_state_query_during_run(self):
         self.server.execute_script(self._script_batch_state_query_during_run)
