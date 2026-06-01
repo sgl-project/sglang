@@ -729,7 +729,7 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
         value=torch.full((1, 3, 1, 1), 2.0),
         current_chunk_start=3,
     )
-    cache.update_and_get_attention_kv(
+    third_view = cache.update_and_get_attention_kv(
         key=torch.full((1, 3, 1, 1), 3.0),
         value=torch.full((1, 3, 1, 1), 3.0),
         current_chunk_start=6,
@@ -741,8 +741,18 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
     assert torch.equal(cache.k[:, :2], torch.ones(1, 2, 1, 1))
     assert torch.equal(cache.k[:, 2:5], torch.full((1, 3, 1, 1), 2.0))
     assert torch.equal(cache.k[:, 5:8], torch.full((1, 3, 1, 1), 3.0))
+    assert third_view.k.flatten().tolist() == [
+        1.0,
+        1.0,
+        2.0,
+        2.0,
+        2.0,
+        3.0,
+        3.0,
+        3.0,
+    ]
 
-    cache.update_and_get_attention_kv(
+    fourth_view = cache.update_and_get_attention_kv(
         key=torch.full((1, 3, 1, 1), 4.0),
         value=torch.full((1, 3, 1, 1), 4.0),
         current_chunk_start=9,
@@ -753,6 +763,16 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
     assert torch.equal(cache.k[:, :2], torch.ones(1, 2, 1, 1))
     assert torch.equal(cache.k[:, 2:5], torch.full((1, 3, 1, 1), 3.0))
     assert torch.equal(cache.k[:, 5:8], torch.full((1, 3, 1, 1), 4.0))
+    assert fourth_view.k.flatten().tolist() == [
+        1.0,
+        1.0,
+        3.0,
+        3.0,
+        3.0,
+        4.0,
+        4.0,
+        4.0,
+    ]
 
 
 def test_lingbot_i2v_model_input_writer_reuses_buffer():
