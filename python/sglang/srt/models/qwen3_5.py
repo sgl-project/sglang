@@ -109,6 +109,11 @@ _is_amx_available = cpu_has_amx_support()
 
 cached_get_processor = lru_cache(get_processor)
 
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+        split_qkvgate_gemma_rmsnorm_rope,
+    )
+
 
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
@@ -143,6 +148,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
         self.activation = config.hidden_act
+        self.output_gate_type = config.output_gate_type
         self.layer_norm_epsilon = config.rms_norm_eps
 
         # Conv1d layer
@@ -237,6 +243,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
             dtype=config.torch_dtype,
+            **(
+                {"activation": self.output_gate_type}
+                if self.output_gate_type is not None
+                else {}
+            ),
         )
 
         self.out_proj = RowParallelLinear(
@@ -320,13 +331,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     module, param, loaded_shard_id
                 )
 
-                if len(loaded_weight.shape) == 0:
-                    # Scalar only makes sense for a single logical shard.
-                    assert len(split_sizes) == 1 and split_sizes[0] == 1, (
-                        f"Unexpected scalar for tuple shard load: "
-                        f"{loaded_shard_id=}, {split_sizes=}"
-                    )
-                    chunks = [loaded_weight.reshape(1)]
+                if loaded_weight.numel() == 1:
+                    # Single-element tensor (scalar or [1]):
+                    # broadcast to each logical shard.
+                    chunks = [loaded_weight.view(-1)] * len(loaded_shard_id)
                 else:
                     split_dim = getattr(param, "output_dim", 0)
                     if _is_cpu:
@@ -464,7 +472,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and not _is_cpu
+            and not _is_npu
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -488,6 +500,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
             )
+            b = b.contiguous()
+            a = a.contiguous()
 
             query, key, value = map(
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
@@ -832,15 +846,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def self_attention(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """Full attention forward pass."""
+    def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
-
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -852,9 +859,55 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
 
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        qkv, _ = self.qkv_proj(hidden_states)
+        # Calculate first full attention layer ID based on config
+        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+            self.rotary_emb.get_cos_sin_with_position(positions)
+
+        q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            int(self.head_dim * self.partial_rotary_factor),
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+        )
+        return q, k, v, gate
+
+    def self_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Full attention forward pass."""
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.attn_output_gate
+        ):
+            q, k, v, gate = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            q, k, v, gate = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
@@ -932,13 +985,71 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = {
-            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-            "gate_up_proj": ["gate_proj", "up_proj"],
-            "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-            "in_proj_ba": ["in_proj_b", "in_proj_a"],
-        }
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
+
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "out_proj",
+        "in_proj_qkvz",
+        "gate_up_proj",
+        "down_proj",
+        "lm_head",
+    ]
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        config = self.config
+        head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
+
+        if module_name == "qkv_proj":
+            attn_output_gate = getattr(config, "attn_output_gate", True)
+            q_heads = config.num_attention_heads * (2 if attn_output_gate else 1)
+            return (
+                config.hidden_size,
+                head_dim * (q_heads + config.num_key_value_heads * 2),
+            )
+        elif module_name == "o_proj":
+            return config.num_attention_heads * head_dim, config.hidden_size
+        elif module_name == "out_proj":
+            value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+            return value_dim, config.hidden_size
+        elif module_name == "in_proj_qkvz":
+            key_dim = config.linear_key_head_dim * config.linear_num_key_heads
+            value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+            return config.hidden_size, key_dim * 2 + value_dim * 2
+        elif module_name == "gate_up_proj":
+            # MoE: shared expert uses shared_expert_intermediate_size
+            # Dense: regular MLP uses intermediate_size
+            is_moe = "moe" in getattr(config, "model_type", "")
+            if is_moe:
+                inter = config.shared_expert_intermediate_size
+            else:
+                inter = config.intermediate_size
+            return config.hidden_size, inter * 2
+        elif module_name == "down_proj":
+            is_moe = "moe" in getattr(config, "model_type", "")
+            if is_moe:
+                inter = config.shared_expert_intermediate_size
+            else:
+                inter = config.intermediate_size
+            return inter, config.hidden_size
+        elif module_name == "gate_up_proj_moe":
+            return config.hidden_size, config.moe_intermediate_size * 2
+        elif module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
+        elif module_name == "embed_tokens":
+            return config.vocab_size, config.hidden_size
+        elif module_name == "lm_head":
+            return config.hidden_size, config.vocab_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
 
     def __init__(
         self,
@@ -1377,9 +1488,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-        hf_to_sglang_mapper = None
+
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    hf_to_sglang_mapper = None
+
+    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
     def __init__(
         self,
@@ -1396,6 +1509,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return module_name.startswith("model.layers.")
 
     @property
     def start_layer(self) -> int:
@@ -1524,9 +1643,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-        hf_to_sglang_mapper = None
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    hf_to_sglang_mapper = None
+
+    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
     def __init__(
         self,
@@ -1547,6 +1667,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        # Accept all language model layer modules (attention, linear_attn, mlp).
+        return module_name.startswith("model.layers.")
 
     def _get_num_fused_shared_experts(self):
         if not (
