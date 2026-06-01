@@ -16,7 +16,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
@@ -45,6 +44,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -126,6 +126,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             return
 
         batch.input_ids = self.draft_token
+        maybe_detect_oob(
+            batch.input_ids,
+            0,
+            batch.model_config.vocab_size,
+            "eagle prepare_for_verify input_ids",
+        )
 
         if page_size == 1:
             batch.out_cache_loc = alloc_token_slots(
@@ -350,18 +356,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (bs * draft_token_num, vocab_size)
+            maybe_detect_nan(target_probs, "verify: target_probs after softmax")
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
+            maybe_detect_nan(target_probs, "verify: target_probs after top_k_renorm")
             if sampling_info.need_top_p_sampling:
                 target_probs = top_p_renorm_prob(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ps, self.draft_token_num, dim=0
                     ),
+                )
+                maybe_detect_nan(
+                    target_probs, "verify: target_probs after top_p_renorm"
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
@@ -418,6 +429,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
+
+        # accept_index values index batch.out_cache_loc (size = bs * draft_token_num);
+        # -1 is the reject sentinel.
+        maybe_detect_oob(
+            accept_index,
+            -1,
+            bs * self.draft_token_num,
+            "eagle verify accept_index post-sampling",
+        )
+        maybe_detect_oob(
+            num_correct_drafts,
+            0,
+            self.draft_token_num + 1,
+            "eagle verify num_correct_drafts post-sampling",
+        )
 
         unfinished_index = []
         unfinished_accept_index = []
@@ -476,6 +502,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
         accept_tokens = predict[accept_index]
+        maybe_detect_oob(
+            accept_tokens,
+            0,
+            batch.model_config.vocab_size,
+            "eagle verify accept_tokens",
+        )
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
         num_correct_drafts_cpu = num_correct_drafts.cpu()
@@ -693,9 +725,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
-    # V2 overlap worker only
-    future_indices: Optional[FutureIndices] = None
-    new_seq_lens: Optional[torch.Tensor] = None
+    # V2 overlap worker only: req_pool_indices used as buf slot keys.
+    future_indices: Optional[torch.Tensor] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
@@ -742,12 +773,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
-            self.future_indices.indices = self.future_indices.indices[new_indices]
+            self.future_indices = self.future_indices[new_indices]
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -777,10 +807,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
-            self.future_indices = FutureIndices(
-                indices=torch.cat(
-                    [self.future_indices.indices, spec_info.future_indices.indices]
-                )
+            self.future_indices = torch.cat(
+                [self.future_indices, spec_info.future_indices]
             )
             return
 

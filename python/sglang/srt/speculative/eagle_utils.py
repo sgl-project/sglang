@@ -23,6 +23,30 @@ if _is_cuda or _is_hip or _is_musa:
     )
 
 
+def per_step_draft_out_cache_loc(
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+    topk: int,
+    num_steps: int,
+) -> torch.Tensor:
+    """Per-step slice of the multi-step EAGLE draft out_cache_loc buffer.
+
+    Single source of truth for the layout shared by EagleWorkerV2.draft_forward
+    (per-step write target) and DeepseekV4AttnBackend (per-step compression
+    write target baked into metadata).
+    """
+    expected = batch_size * topk * num_steps
+    assert out_cache_loc.shape[0] == expected, (
+        f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
+        f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
+    )
+    return (
+        out_cache_loc.view(batch_size, topk, num_steps)
+        .permute(2, 0, 1)
+        .reshape(num_steps, -1)
+    )
+
+
 def apply_eagle_prefill_input_rotation(
     batch: ScheduleBatch, next_token_ids: torch.Tensor
 ) -> None:
@@ -37,13 +61,30 @@ def apply_eagle_prefill_input_rotation(
         return
     assert len(next_token_ids) == len(batch.seq_lens)
     extend_lens = torch.tensor(
-        batch.extend_lens, dtype=torch.int64, device=batch.input_ids.device
+        batch.extend_lens, dtype=torch.int64, device=batch.device
     )
     seg_ends = extend_lens.cumsum(0) - 1
     rotated = torch.empty_like(batch.input_ids)
     rotated[:-1] = batch.input_ids[1:]
+    # TODO: chunked-prefill chain divergence at non-final-chunk seg end; fix per PR #26329.
     rotated[seg_ends] = next_token_ids.to(batch.input_ids.dtype)
     batch.input_ids = rotated
+
+
+def _eagle_prefill_tail_tokens(
+    batch: ScheduleBatch, next_token_ids: torch.Tensor
+) -> torch.Tensor:
+    """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
+    non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
+    tail_tokens = next_token_ids.to(batch.input_ids.dtype)
+    next_prompt_token = batch.chunked_req_next_prompt_token
+    if next_prompt_token is not None:
+        for i, r in enumerate(batch.reqs):
+            if r is batch.chunked_req:
+                tail_tokens = tail_tokens.clone()
+                tail_tokens[i] = next_prompt_token
+                break
+    return tail_tokens
 
 
 def organize_draft_results(
