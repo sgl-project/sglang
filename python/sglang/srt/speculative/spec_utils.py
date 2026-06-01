@@ -589,6 +589,14 @@ def select_top_k_tokens(
 ):
     if i == 0:
         return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
+    if topk == 1:
+        input_ids = topk_index.flatten()
+        tree_info = (
+            topk_p.view(-1, 1, 1),
+            topk_index,
+            topk_index.new_full(topk_index.shape, i),
+        )
+        return input_ids, hidden_states, topk_p, tree_info
     return _select_top_k_tokens_later(
         i, topk_p, topk_index, hidden_states, scores, topk
     )

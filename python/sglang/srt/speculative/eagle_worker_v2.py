@@ -207,6 +207,18 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
+        # Pre-allocate constant buffers for topk=1 fast path (chain topology)
+        self._topk1_parent_proto = None
+        self._topk1_score_idx_proto = None
+        if self.topk == 1:
+            n_extra = self.speculative_num_draft_tokens - 1
+            max_bs = max(1, server_args.cuda_graph_max_bs or 1)
+            # Chain topology: parent_list = [-1, 0, 1, 2, ...], top_scores_index = [0, 1, 2, ...]
+            parents = torch.arange(-1, n_extra - 1, dtype=torch.long).repeat(max_bs, 1)
+            indices = torch.arange(n_extra, dtype=torch.long).repeat(max_bs, 1)
+            self._topk1_parent_proto = parents.to(self.device)
+            self._topk1_score_idx_proto = indices.to(self.device)
+
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     def init_token_map(self):
@@ -534,6 +546,13 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.positions.add_(1)
 
         # Organize the results
+        if self.topk == 1:
+            bs = token_list[0].shape[0]
+            draft_tokens = torch.cat(token_list, dim=1)
+            top_scores_index = self._topk1_score_idx_proto[:bs]
+            parent_list = self._topk1_parent_proto[:bs]
+            return parent_list, top_scores_index, draft_tokens
+
         score_list = torch.cat(score_list, dim=1).flatten(
             1
         )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
