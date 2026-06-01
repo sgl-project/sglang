@@ -5,8 +5,8 @@ export const Nemotron3UltraDeployment = () => {
     nvfp4: 'nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4',
   };
 
-  const isNvfp4HardwareSupported = (hardware) => hardware === 'b200' || hardware === 'gb200';
-  const isBlackwell = (hardware) => hardware === 'b200' || hardware === 'gb200' || hardware === 'b300';
+  const isNvfp4HardwareSupported = (hardware) => hardware === 'b200' || hardware === 'gb200' || hardware === 'gb300';
+  const isBlackwell = (hardware) => hardware === 'b200' || hardware === 'gb200' || hardware === 'b300' || hardware === 'gb300';
 
   const options = {
     model: {
@@ -26,7 +26,8 @@ export const Nemotron3UltraDeployment = () => {
         { id: 'h200',  label: 'H200',         default: false },
         { id: 'b200',  label: 'B200',         default: true  },
         { id: 'gb200', label: 'GB200',        default: false },
-        { id: 'b300',  label: 'B300',         default: false }
+        { id: 'b300',  label: 'B300',         default: false },
+        { id: 'gb300', label: 'GB300',        default: false }
       ]
     },
     tp: {
