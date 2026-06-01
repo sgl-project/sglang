@@ -82,6 +82,9 @@ class SpeculativeAlgorithm(Enum):
             spec_class=spec_class,
         )
 
+    def is_some(self) -> bool:
+        return self != SpeculativeAlgorithm.NONE
+
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
@@ -117,20 +120,30 @@ class SpeculativeAlgorithm(Enum):
 
     def create_future_map(
         self,
-        max_running_requests: int,
-        chunked_prefill_size: int,
-        context_len: int,
         device: torch.device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
-        return FutureMap(
-            max_running_requests,
-            chunked_prefill_size,
-            context_len,
-            device,
-            self,
-        )
+        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+
+    def build_disagg_draft_input(
+        self,
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+        last_tokens_tensor: torch.Tensor,
+        future_map: FutureMap,
+    ) -> Optional[SpecInput]:
+        if self.is_eagle():
+            from sglang.srt.speculative.eagle_disaggregation import (
+                build_eagle_disagg_draft_input,
+            )
+
+            return build_eagle_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
+        return None
 
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()

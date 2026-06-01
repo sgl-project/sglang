@@ -222,6 +222,7 @@ class LlamaAttention(nn.Module):
             self.q_size,
             self.kv_size,
             self.head_dim,
+            is_neox_style=self.rotary_emb.is_neox_style,
         )
         return q, k, v
 
