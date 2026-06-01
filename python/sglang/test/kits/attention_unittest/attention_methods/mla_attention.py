@@ -222,6 +222,7 @@ class MockMLAModelRunner(ModelRunner):
         # does the BF16->FP8 cast on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
         self.gpu_id = 0
+        self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
         self.tp_size = 1
