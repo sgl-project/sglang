@@ -2,6 +2,7 @@
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
+    DcpTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
