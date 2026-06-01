@@ -182,6 +182,14 @@ class MlxModelRunnerStub(ModelRunner):
         self.graph_mem_usage = 0
         self.attn_backend = None
 
+        # No KV canary on the MLX path. The base ModelRunner sets this via
+        # install_canary() in its full initialize(), which this lightweight
+        # override skips. Downstream consumers (scheduler, cuda graph runner,
+        # speculative workers) all guard with `canary_manager is not None`, so
+        # default to None to keep those checks working instead of raising
+        # AttributeError.
+        self.canary_manager = None
+
         logger.info(
             f"MLX stub: initialized minimal pools "
             f"(max_total_num_tokens={self.max_total_num_tokens}, "
