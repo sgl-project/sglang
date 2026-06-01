@@ -1421,7 +1421,7 @@ class HiCacheController:
         xfer_us = self._transfer_elapsed_us(ack)
         ts_us = time.time_ns() // 1000
 
-        logger.info(
+        logger.debug(
             "%s transfer complete ts_us=%d blocks=%d bytes=%d xfer_us=%d "
             "bandwidth=%.2fGB/s "
             'src="%s" dst="%s"',
@@ -1451,7 +1451,7 @@ class HiCacheController:
         totals["bytes"] += ack.byte_count
         totals["xfer_us"] += xfer_us
 
-        logger.info(
+        logger.debug(
             '%s transfer cumulative direction="%s" total_events=%d '
             "total_blocks=%d total_bytes=%d total_xfer_us=%d "
             "bandwidth=%.2fGB/s cumulative "
