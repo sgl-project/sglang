@@ -14,7 +14,7 @@
 """Common utilities."""
 
 import hashlib
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import triton
@@ -22,6 +22,37 @@ import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.evict_policy import (
+    EvictionStrategy,
+    FIFOStrategy,
+    FILOStrategy,
+    LFUStrategy,
+    LRUStrategy,
+    MRUStrategy,
+    PriorityStrategy,
+    SLRUStrategy,
+)
+
+_EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
+    "lru": LRUStrategy,
+    "lfu": LFUStrategy,
+    "fifo": FIFOStrategy,
+    "mru": MRUStrategy,
+    "filo": FILOStrategy,
+    "priority": PriorityStrategy,
+    "slru": SLRUStrategy,
+}
+
+
+def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+    policy = eviction_policy.lower()
+    try:
+        return _EVICTION_POLICY_FACTORIES[policy]()
+    except KeyError:
+        supported = "', '".join(_EVICTION_POLICY_FACTORIES)
+        raise ValueError(
+            f"Unknown eviction policy: {policy}. Supported policies: '{supported}'."
+        ) from None
 
 
 @triton.jit

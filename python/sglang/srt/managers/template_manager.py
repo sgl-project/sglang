@@ -173,14 +173,15 @@ class TemplateManager:
         if tokenizer_manager.tokenizer:
             template = tokenizer_manager.tokenizer.chat_template
             self._run_template_detection(template, tokenizer_manager.tokenizer)
+            parts = []
+            if self._reasoning_config:
+                parts.append(f"reasoning_config={self._reasoning_config}")
             if self._suggested_reasoning_parser:
-                logger.info(
-                    f"Auto-detected reasoning parser: {self._suggested_reasoning_parser}"
-                )
+                parts.append(f"reasoning_parser={self._suggested_reasoning_parser}")
             if self._suggested_tool_call_parser:
-                logger.info(
-                    f"Auto-detected tool-call parser: {self._suggested_tool_call_parser}"
-                )
+                parts.append(f"tool_call_parser={self._suggested_tool_call_parser}")
+            if parts:
+                logger.info(f"Auto-detected template features: {', '.join(parts)}")
 
     def _load_explicit_chat_template(
         self, tokenizer_manager: TokenizerManager, chat_template_arg: str
