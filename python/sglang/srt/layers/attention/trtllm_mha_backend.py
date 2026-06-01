@@ -124,15 +124,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
 
-        # Sliding Window Attention(SWA) hybrid model support.
-        # For hybrid SWA models, the KV cache is split into two pools (full and SWA)
-        # with separate index spaces. We maintain a translated page_table for SWA
-        # layers so the trtllm kernel reads from the correct pool.
-        kv_pool = model_runner.token_to_kv_pool
-        self.use_sliding_window_kv_pool = isinstance(kv_pool, SWAKVPool)
-        self._swa_kv_pool: Optional[SWAKVPool] = (
-            kv_pool if self.use_sliding_window_kv_pool else None
-        )
+        # SWA hybrid models split the KV cache into full and SWA pools with
+        # separate index spaces; SWA layers need a translated page_table. Resolve
+        # the pool from the allocator (stable at construction), not from
+        # token_to_kv_pool, which FROZEN_KV MTP swaps per forward call.
+        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
@@ -147,11 +143,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+    @staticmethod
+    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
+        """Return the SWAKVPool to translate against, or None for non-SWA models.
+
+        Read it from the allocator: in FROZEN_KV MTP the draft shares the
+        target's SWA allocator while its own token_to_kv_pool stays non-SWA
+        until swapped per call. The getattr only tolerates the minimal
+        allocator stub used by attention test fixtures.
+        """
+        allocator = model_runner.token_to_kv_pool_allocator
+        get_kvcache = getattr(allocator, "get_kvcache", None)
+        kvcache = get_kvcache() if get_kvcache is not None else None
+        return kvcache if isinstance(kvcache, SWAKVPool) else None
+
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
         """Translate full-pool token indices to SWA-pool indices, or return None."""
-        if not self.use_sliding_window_kv_pool:
+        if self._swa_kv_pool is None:
             return None
         shape = token_indices.shape
         return self._swa_kv_pool.translate_loc_from_full_to_swa(
@@ -162,7 +172,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self, max_bs: int, max_num_pages: int
     ) -> Optional[torch.Tensor]:
         """Allocate a SWA page_table buffer, or return None for non-SWA models."""
-        if not self.use_sliding_window_kv_pool:
+        if self._swa_kv_pool is None:
             return None
         return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
 
@@ -184,7 +194,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Return cache locations in the correct index space for the given layer."""
-        if self.use_sliding_window_kv_pool:
+        if self._swa_kv_pool is not None:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
                 return self._swa_kv_pool.translate_loc_from_full_to_swa(
