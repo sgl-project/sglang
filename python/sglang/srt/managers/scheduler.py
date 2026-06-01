@@ -417,6 +417,7 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+        self.validate_benchmark_target_batch_size()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -846,6 +847,28 @@ class Scheduler(
                 num_pages=self.max_total_num_tokens // self.page_size,
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
+            )
+
+    def validate_benchmark_target_batch_size(self):
+        target_bs = envs.SGLANG_BENCHMARK_TARGET_BATCH_SIZE.get()
+        if target_bs is None:
+            return
+        if target_bs <= 0:
+            raise ValueError("SGLANG_BENCHMARK_TARGET_BATCH_SIZE must be positive")
+
+        effective_max_running_requests = self.max_running_requests
+        if not self.server_args.enable_dp_attention:
+            effective_max_running_requests = (
+                effective_max_running_requests + self.ps.dp_size - 1
+            ) // self.ps.dp_size
+
+        if target_bs > effective_max_running_requests:
+            raise ValueError(
+                "SGLANG_BENCHMARK_TARGET_BATCH_SIZE must be less than or equal "
+                "to the effective max running requests per DP rank "
+                f"({effective_max_running_requests}), but got {target_bs}. "
+                "Increase --max-running-requests or lower "
+                "SGLANG_BENCHMARK_TARGET_BATCH_SIZE."
             )
 
     def init_running_status(self):
@@ -2854,19 +2877,18 @@ class Scheduler(
     def maybe_prepare_decode_batch_for_profile(
         self, batch: Optional[ScheduleBatch]
     ) -> Optional[ScheduleBatch]:
+        local_batch_size = batch.batch_size() if batch is not None else 0
         target_bs = envs.SGLANG_BENCHMARK_TARGET_BATCH_SIZE.get()
         if target_bs is not None:
             if target_bs <= 0:
                 raise ValueError("SGLANG_BENCHMARK_TARGET_BATCH_SIZE must be positive")
             if self._should_delay_decode_for_target_batch(
-                local_batch_size=batch.batch_size() if batch is not None else 0,
+                local_batch_size=local_batch_size,
                 target_batch_size=target_bs,
             ):
                 return None
 
-        if batch is None:
-            return None
-        if batch.is_empty():
+        if local_batch_size == 0:
             return None
         batch.prepare_for_decode()
         return batch
