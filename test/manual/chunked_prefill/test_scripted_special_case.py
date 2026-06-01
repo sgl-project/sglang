@@ -988,16 +988,16 @@ class TestSpecialCaseRetractMerge(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        assert s.last_batch is None, (
-            "retract must clear last_batch after merging the extend chunk batch"
-        )
+        assert (
+            s.last_batch is None
+        ), "retract must clear last_batch after merging the extend chunk batch"
         assert len(s.running_batch.reqs) == 0, (
             "the merged extend chunk batch must be retracted out of running_batch, "
             f"not stranded; got {len(s.running_batch.reqs)} reqs"
         )
-        assert r.status == "waiting", (
-            f"retracted chunked req must return to the waiting queue; got {r.status!r}"
-        )
+        assert (
+            r.status == "waiting"
+        ), f"retracted chunked req must return to the waiting queue; got {r.status!r}"
         assert r.kv_pages == 0
 
         t.continue_generation()
@@ -1191,9 +1191,9 @@ class TestSpecialCaseRetractedStain(ScriptedTestCase):
         assert r.finished
 
         req = r.req
-        assert req.retracted_stain is True, (
-            "retract must set retracted_stain so the cached-token recount is suppressed"
-        )
+        assert (
+            req.retracted_stain is True
+        ), "retract must set retracted_stain so the cached-token recount is suppressed"
         assert req.cached_tokens == cached_before, (
             f"retracted_stain must suppress re-adding pre_len-already_computed on "
             f"resume; cached_tokens grew from {cached_before} to {req.cached_tokens}"
@@ -1237,9 +1237,7 @@ class TestSpecialCaseMiddleChunkNoToken(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
     def test_middle_chunk_appends_no_token_no_finish(self):
-        self.server.execute_script(
-            self._script_middle_chunk_appends_no_token_no_finish
-        )
+        self.server.execute_script(self._script_middle_chunk_appends_no_token_no_finish)
 
     @staticmethod
     def _script_middle_chunk_appends_no_token_no_finish(t: ScriptedContext):
@@ -1259,17 +1257,17 @@ class TestSpecialCaseMiddleChunkNoToken(ScriptedTestCase):
                     f"middle chunk must not append an output token; got "
                     f"output_ids len {len(r.req.output_ids)}"
                 )
-                assert r.status != "finished", (
-                    "middle chunk must not finish the req (skip_stream_req)"
-                )
+                assert (
+                    r.status != "finished"
+                ), "middle chunk must not finish the req (skip_stream_req)"
             if r.finished:
                 break
             yield
         assert r.finished
         assert saw_middle_chunk, "test must observe r mid-chunk at least once"
-        assert len(r.req.output_ids) >= 1, (
-            "output tokens must appear only after the chunked prefill completes"
-        )
+        assert (
+            len(r.req.output_ids) >= 1
+        ), "output tokens must appear only after the chunked prefill completes"
 
 
 if __name__ == "__main__":

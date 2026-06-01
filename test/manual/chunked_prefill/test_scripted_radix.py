@@ -321,7 +321,9 @@ class TestRadixNoTailChunked(ScriptedTestCase):
             "test must observe r as the in-flight chunked_req at least once; the "
             "no-tail else branch was never exercised"
         )
-        assert r.kv_pages == 0, f"finished chunked req must release KV; got {r.kv_pages}"
+        assert (
+            r.kv_pages == 0
+        ), f"finished chunked req must release KV; got {r.kv_pages}"
 
 
 class TestRadixHitCountInvariant(ScriptedTestCase):

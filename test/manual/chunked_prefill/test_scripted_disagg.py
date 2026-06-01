@@ -195,9 +195,9 @@ class TestDisaggInflightQueue(ScriptedTestCase):
             if r.finished:
                 break
             yield
-        assert appended_once, (
-            "final chunk must append rid to disagg_prefill_inflight_queue exactly once"
-        )
+        assert (
+            appended_once
+        ), "final chunk must append rid to disagg_prefill_inflight_queue exactly once"
 
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
@@ -221,7 +221,9 @@ class TestDisaggPartialPage(ScriptedTestCase):
     )
 
     def test_partial_page_deferred_on_non_final_chunk(self):
-        self.server.execute_script(self._script_partial_page_deferred_on_non_final_chunk)
+        self.server.execute_script(
+            self._script_partial_page_deferred_on_non_final_chunk
+        )
 
     @staticmethod
     def _script_partial_page_deferred_on_non_final_chunk(t: ScriptedContext):
