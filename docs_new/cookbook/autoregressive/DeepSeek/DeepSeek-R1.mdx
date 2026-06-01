@@ -22,6 +22,11 @@ import { DeepSeekR1AdvancedDeployment } from '/src/snippets/autoregressive/deeps
 
 - **FP8 (8-bit quantized)**: [deepseek-ai/DeepSeek-R1-0528](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) - Recommended for H200 and MI300X
 - **FP4 (4-bit quantized)**: [nvidia/DeepSeek-R1-0528-FP4-v2](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2) - Recommended for B200 and MI355X
+- **BF16 (upcast from FP8)**: [unsloth/DeepSeek-R1-0528-BF16](https://huggingface.co/unsloth/DeepSeek-R1-0528-BF16)
+- **INT8 (channel-wise)**: [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+- **W4A8**: [novita/Deepseek-R1-0528-W4AFP8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8)
+- **AWQ (4-bit)**: [QuixiAI/DeepSeek-R1-0528-AWQ](https://huggingface.co/QuixiAI/DeepSeek-R1-0528-AWQ)
+- **MXFP4**: [amd/DeepSeek-R1-MXFP4](https://huggingface.co/amd/DeepSeek-R1-MXFP4)
 
 **License:**
 To use DeepSeek-R1, you must agree to DeepSeek's Community License. See [LICENSE](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528/blob/main/LICENSE) for details.
@@ -334,7 +339,7 @@ print(final_response.choices[0].message.content)
 
 #### 4.2.3 Multi-Token Prediction (EAGLE Speculative Decoding)
 
-DeepSeek-R1 supports EAGLE-based Multi-Token Prediction (MTP), the same mechanism as DeepSeek-V3. Refer to [DeepSeek-V3 §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3#multi-token-prediction-eagle-speculative-decoding) for the complete launch command, flag reference, tuning guidance (`--speculative-num-steps`, `--speculative-eagle-topk`, `--max-running-requests`), and `bench_speculative.py` link. R1's speed benchmark commands that include `--speculative-*` flags use this mechanism.
+DeepSeek-R1 supports EAGLE-based Multi-Token Prediction (MTP), the same mechanism as DeepSeek-V3. Refer to [DeepSeek-V3 §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3#4-2-3-multi-token-prediction-eagle-speculative-decoding) for the complete launch command, flag reference, tuning guidance (`--speculative-num-steps`, `--speculative-eagle-topk`, `--max-running-requests`), and `bench_speculative.py` link. R1's speed benchmark commands that include `--speculative-*` flags use this mechanism.
 
 #### 4.2.4 Thinking Budget
 

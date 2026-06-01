@@ -10,7 +10,7 @@ GLM-4.6V series model includes two versions: GLM-4.6V (106B), a foundation model
 
 Beyond achieves SoTA performance across major multimodal benchmarks at comparable model scales. GLM-4.6V introduces several key features:
 
-- **Native Multimodal Function Calling** Enables native vision-driven tool use. Images, screenshots, and document pages can be passed directly as tool inputs without text conversion, while visual outputs (charts, search images, rendered pages) are interpreted and integrated into the reasoning chain. This closes the loop from perception to understanding to execution. Please refer to this [example](#423-tool-calling).
+- **Native Multimodal Function Calling** Enables native vision-driven tool use. Images, screenshots, and document pages can be passed directly as tool inputs without text conversion, while visual outputs (charts, search images, rendered pages) are interpreted and integrated into the reasoning chain. This closes the loop from perception to understanding to execution. Please refer to this [example](#4-2-3-tool-calling).
 - **Interleaved Image-Text Content Generation** Supports high-quality mixed media creation from complex multimodal inputs. GLM-4.6V takes a multimodal context—spanning documents, user inputs, and tool-retrieved images—and synthesizes coherent, interleaved image-text content tailored to the task. During generation it can actively call search and retrieval tools to gather and curate additional text and visuals, producing rich, visually grounded content.
 - **Multimodal Document Understanding** GLM-4.6V can process up to 128K tokens of multi-document or long-document input, directly interpreting richly formatted pages as images. It understands text, layout, charts, tables, and figures jointly, enabling accurate comprehension of complex, image-heavy documents without requiring prior conversion to plain text.
 - **Frontend Replication & Visual Editing** Reconstructs pixel-accurate HTML/CSS from UI screenshots and supports natural-language-driven edits. It detects layout, components, and styles visually, generates clean code, and applies iterative visual modifications through simple user instructions.
@@ -207,7 +207,7 @@ python -m sglang.launch_server \
   --reasoning-parser glm45 \
   --tp 8 \
   --host 0.0.0.0 \
-  --port 8000
+  --port 30000
 ```
 
 **Streaming with Thinking Process:**
@@ -216,7 +216,7 @@ python -m sglang.launch_server \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:30000/v1",
     api_key="EMPTY"
 )
 
@@ -364,7 +364,7 @@ Yes, the tool returned an image (the SGL logo).
 
 #### 4.2.4 Thinking Budget
 
-Beyond the reasoning parser, you can cap the number of thinking tokens using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor` and pass `Glm4MoeThinkingBudgetLogitProcessor` in the request — same as the [GLM-4.6 text model approach](./GLM-4.6#thinking-budget):
+Beyond the reasoning parser, you can cap the number of thinking tokens using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor` and pass `Glm4MoeThinkingBudgetLogitProcessor` in the request — same as the [GLM-4.6 text model approach](./GLM-4.6#4-2-3-thinking-budget):
 
 ```python Example
 import openai

@@ -738,6 +738,27 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
     Output throughput: 965.919 token/s
     ```
 
+- **Full GSM8K (1319 questions)** — for a stricter accuracy check, run the full set 8-shot:
+
+```shell Command
+python3 benchmark/gsm8k/bench_sglang.py --num-shots 8 --num-questions 1319 --parallel 1319
+```
+
+  - 8-shot:
+    ```
+    Accuracy: 0.956
+    Invalid: 0.000
+    Latency: 25.109 s
+    Output throughput: 5226.235 token/s
+    ```
+  - 20-shot (long-context; stays close to the 8-shot result):
+    ```
+    Accuracy: 0.956
+    Invalid: 0.000
+    Latency: 29.545 s
+    Output throughput: 4418.617 token/s
+    ```
+
 #### 5.2.2 MMLU Benchmark
 
 - **Benchmark Command:**
@@ -822,6 +843,27 @@ Results on AIME 2025 (8×B200), evaluated with [NeMo-Skills](https://github.com/
     </tr>
   </tbody>
 </table>
+
+**Reproduction.** Install [NeMo-Skills](https://github.com/NVIDIA/NeMo-Skills), launch the server with the tool-call and reasoning parsers, then run `ns eval`:
+
+```bash Command
+pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
+
+export NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1
+ns prepare_data aime25
+
+ns eval \
+  --benchmarks=aime25:4 \
+  --server_type=sglang \
+  --model=deepseek-ai/DeepSeek-V3.2-Exp \
+  --server_address=http://localhost:30000/v1 \
+  --output_dir=nemo_skills_aime25_output \
+  ++chat_template_kwargs.thinking=true \
+  ++inference.temperature=1.0 \
+  ++inference.top_p=0.95 \
+  ++inference.tokens_to_generate=64000
+  # Use ++inference.tokens_to_generate=120000 for the DeepSeek-V3.2-Speciale model
+```
 
 ### 5.3 Speed Benchmark on Hopper
 
