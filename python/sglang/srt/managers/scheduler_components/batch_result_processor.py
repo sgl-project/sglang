@@ -844,9 +844,12 @@ class SchedulerBatchResultProcessor:
                 if callable(prepare_release):
                     prepare_release(req)
                 release_kv_cache(req, self.tree_cache)
-                # Non-offload path. The DECODE offload branch does not call
-                # _deactivate — disagg DECODE is not in active_reqs.
-                self.deactivate_req(req)
+
+            # The scheduler no longer owns this req's lifecycle. Fires for both
+            # offload and non-offload paths: _deactivate only pops active_reqs
+            # (no KV release), so it is independent of the async offload's
+            # deferred release_kv_cache timing.
+            self.deactivate_req(req)
 
             req.time_stats.set_completion_time()
 

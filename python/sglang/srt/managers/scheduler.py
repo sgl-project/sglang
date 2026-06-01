@@ -891,25 +891,27 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
-        # `active_reqs`: sync-mode reqs the scheduler currently owns the
-        # lifecycle of (admitted, not finished, not retracted, not aborted-
-        # released). by-rid indexed.
+        # `active_reqs`: every req whose lifecycle the scheduler currently
+        # owns (admitted, not finished, not retracted, not aborted-released).
+        # by-rid indexed. Spans sync mode, disagg PREFILL, and disagg DECODE;
+        # only DLLM is excluded (it has its own DllmManager.staging_queue).
         #
-        # Definition: admitted via `_get_new_batch_prefill_raw` and not yet
-        # released through finish/retract/abort. Includes normal decode reqs
-        # AND mid-prefill chunked-resume reqs AND PP cross-mb in-flight reqs
-        # (the last two: NOT in running_batch.reqs but still holding row +
-        # KV + lock_ref).
+        # Definition: admitted via `_get_new_batch_prefill_raw` (sync /
+        # disagg PREFILL) or `get_new_prebuilt_batch` (disagg DECODE) and not
+        # yet released through finish/retract/abort. Includes normal decode
+        # reqs AND mid-prefill chunked-resume reqs AND PP cross-mb in-flight
+        # reqs (the last two: NOT in running_batch.reqs but still holding
+        # row + KV + lock_ref).
         #
         # Invariants:
-        # * `waiting_queue ∩ active_reqs == ∅` (sync mode; disagg modes use
-        #    their own ownership managers).
-        # * `set(running_batch.reqs) ⊆ active_reqs` (in-batch always active).
+        # * `waiting_queue ∩ active_reqs == ∅`.
+        # * `set(running_batch.reqs) - dllm ⊆ active_reqs` (non-DLLM in-batch
+        #    reqs are always active).
         # * `set(chunked_reqs()) ⊆ active_reqs` (by definition).
         # * `len(list(chunked_reqs())) <= 1` (single-flight; asserted at
         #    inline chunked admission entry).
         # * `active_reqs` keys are in 1:1 correspondence with allocated
-        #    `req_to_token_pool` rows (sync mode).
+        #    `req_to_token_pool` rows (modulo DLLM).
         #
         # Maintained at: `_activate` / `_deactivate` (only entry points).
         self.active_reqs: Dict[str, Req] = {}
@@ -933,12 +935,17 @@ class Scheduler(
     def _activate(self, req: Req) -> None:
         """Mark req as entering active lifecycle.
 
-        Gated: only sync mode + disagg PREFILL + non-DLLM reqs enter
-        active_reqs. Disagg DECODE has its own prealloc/transfer queue
-        ownership; DLLM has its own staging_queue.
+        active_reqs tracks every req whose lifecycle the scheduler owns,
+        across sync mode, disagg PREFILL, and disagg DECODE. The entry
+        points differ by mode:
+        - sync / disagg PREFILL: `_get_new_batch_prefill_raw` admission.
+        - disagg DECODE: `get_new_prebuilt_batch` admission (the prefill
+          happened on the remote peer; locally the req is admitted when it
+          is pulled from the waiting_queue into the prebuilt decode batch).
+
+        Only DLLM is excluded: it has its own `staging_queue` ownership in
+        DllmManager and never enters active_reqs.
         """
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            return
         if req.is_dllm():
             return
         assert req.rid not in self.active_reqs, f"already active: {req.rid}"

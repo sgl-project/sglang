@@ -1733,6 +1733,11 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
+                # Decode-side admission point: the scheduler now owns this
+                # req's lifecycle (it leaves waiting_queue below and runs in
+                # running_batch until finish/retract/abort). Mirror the
+                # prefill-side `_activate` in `_get_new_batch_prefill_raw`.
+                self._activate(req)
                 # Decode-radix path: do NOT re-match prefix here.
                 # `pop_preallocated` already took a tree snapshot and used it
                 # to (1) pre-allocate KV, (2) choose delta pages for transfer,
