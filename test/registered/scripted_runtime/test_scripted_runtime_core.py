@@ -525,6 +525,42 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             r.chunks_done == 5
         ), f"5*chunk_size prompt -> 5 chunks; got {r.chunks_done}"
 
+    def test_forward_ct_advances_once_per_yield(self):
+        self.server.execute_script(self._script_forward_ct_advances_once_per_yield)
+
+    @staticmethod
+    def _script_forward_ct_advances_once_per_yield(t: ScriptedContext):
+        # Each `yield` hands control back for exactly one scheduler event-loop
+        # iteration, and a steady decode runs exactly one forward pass per
+        # iteration; so forward_ct must advance by the number of yields.
+        sched = t._scheduler
+
+        before_no_yield = sched.forward_ct
+        r = t.start_req(
+            prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=128, ignore_eos=True
+        )
+        assert (
+            sched.forward_ct == before_no_yield
+        ), f"forward_ct moved without a yield: {before_no_yield} -> {sched.forward_ct}"
+
+        yield from advance_to_decode_step(r, 1)
+
+        for n in (1, 3, 5):
+            before = sched.forward_ct
+            for _ in range(n):
+                yield
+            advanced = sched.forward_ct - before
+            assert advanced == n, (
+                f"forward_ct advanced by {advanced} over {n} yields "
+                f"(before={before} after={sched.forward_ct})"
+            )
+
+        t.abort_all()
+        for _ in range(8):
+            yield
+            if r.finished:
+                break
+
     def test_empty_script_returns_immediately(self):
         self.server.execute_script(self._script_empty_return)
 

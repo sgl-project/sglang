@@ -20,12 +20,7 @@ def base_engine_kwargs(
 ) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = dict(
         model_path=model_path,
-        tp_size=1,
-        dp_size=1,
-        pp_size=1,
         chunked_prefill_size=chunked_prefill_size,
-        disable_overlap_schedule=True,
-        disable_cuda_graph=True,
     )
     kwargs.update(overrides)
     return kwargs
