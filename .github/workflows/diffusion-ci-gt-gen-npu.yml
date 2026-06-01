@@ -46,7 +46,6 @@ jobs:
     outputs:
       matrix-1npu: ${{ steps.compute.outputs.matrix-1npu }}
       matrix-2npu: ${{ steps.compute.outputs.matrix-2npu }}
-      matrix-8npu: ${{ steps.compute.outputs.matrix-8npu }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
