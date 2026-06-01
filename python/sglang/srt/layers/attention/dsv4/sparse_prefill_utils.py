@@ -127,13 +127,6 @@ def combine_topk_swa_indices(
         assert out_indices.dtype == torch.int32
         combined_indices = out_indices
     if out_lens is None:
-        # zeros, not empty: the kernel only writes combined_lens for query
-        # tokens covered by query_start_loc ([0, sum(extend_seq_lens))). When the
-        # buffer is larger (padding tokens, e.g. EAGLE draft/speculative +1 and
-        # chunked multi-request prefill), unwritten entries must read as length 0
-        # (attend to nothing); uninitialized garbage is passed as topk_length to
-        # flash_mla_sparse_fwd and causes an out-of-bounds access. Mirrors
-        # combined_indices, which is already -1-padded.
         combined_lens = torch.zeros(
             num_tokens, dtype=torch.int32, device=topk_indices.device
         )
@@ -576,10 +569,6 @@ class SparsePrefillChunkCache:
                 dtype=torch.int32,
                 device=device,
             )
-            # zeros, not empty: padding query tokens beyond sum(extend_seq_lens)
-            # are never written by the combine kernel and must read as length 0
-            # (see combine_topk_swa_indices); garbage is passed as topk_length to
-            # flash_mla_sparse_fwd and causes an out-of-bounds access.
             self.c4_combined_lens = torch.zeros(
                 self.num_qo_tokens, dtype=torch.int32, device=device
             )
