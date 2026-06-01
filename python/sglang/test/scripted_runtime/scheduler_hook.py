@@ -41,7 +41,7 @@ RESET_DRAIN_MAX_STEPS: int = 200
 @dataclass(frozen=True, slots=True)
 class ScriptedBatchRecord:
     forward_iter: int
-    mode: str
+    mode: Optional[str]
     rids: Tuple[str, ...]
     extend_rids: Tuple[str, ...]
     chunked_rid: Optional[str]
@@ -144,7 +144,7 @@ class ScriptedSchedulerHook:
                 mode=(
                     batch.forward_mode.name.lower()
                     if batch.forward_mode is not None
-                    else "unknown"
+                    else None
                 ),
                 rids=tuple(r.rid for r in batch.reqs),
                 extend_rids=tuple(r.rid for r in batch.reqs if r.is_extend_in_batch),
