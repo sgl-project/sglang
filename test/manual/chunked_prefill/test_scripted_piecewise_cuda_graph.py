@@ -38,11 +38,10 @@ class TestPiecewiseBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        # prompt_len=4*256+1=1025 at chunk_size=256: the four truncated chunks
-        # (256/512/768/1024) each hold the req as chunked_req; the tiny 1-token
-        # tail is the non-truncated final chunk, so chunked_req clears before it
-        # runs and it is not counted -> chunks_done is exactly 4.
-        assert r.chunks_done == 4
+        # prompt_len=4*256+1=1025 at chunk_size=256: ceil(1025/256)=5. All five
+        # chunk iterations (256/512/768/1024 plus the 1-token tail) are counted;
+        # the final tail iteration counts too -> chunks_done is exactly 5.
+        assert r.chunks_done == 5
 
 
 class TestPiecewiseRetractResume(ScriptedTestCase):
