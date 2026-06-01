@@ -824,7 +824,7 @@ class Step3VLForConditionalGeneration(nn.Module):
             if num_patches is None:
                 raise ValueError("Step3-VL image item is missing num_patches.")
             if isinstance(num_patches, torch.Tensor):
-                num_patches = [int(x) for x in num_patches.flatten().tolist()]
+                num_patches = [int(x) for x in num_patches.flatten().cpu().tolist()]
             elif isinstance(num_patches, (list, tuple)):
                 num_patches = [
                     int(x.item()) if isinstance(x, torch.Tensor) else int(x)
