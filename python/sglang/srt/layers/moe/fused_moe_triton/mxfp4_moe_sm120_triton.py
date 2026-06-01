@@ -48,10 +48,17 @@ def _dequant_fp4_lut(nibble):
 
 @triton.autotune(
     configs=[
+        # Original configs
         triton.Config({"BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_N": 32, "BLOCK_K": 64}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+        # Deeper pipeline — SM120 has 99 KB SMEM, can afford 3 stages for small tiles
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 32, "BLOCK_K": 64}, num_warps=4, num_stages=3),
+        # More warps for larger tiles
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=3),
     ],
     key=["N", "K"],
 )
@@ -123,19 +130,18 @@ def _mxfp4_slot_gemv_kernel(
         val_lo = _dequant_fp4_lut(b_u8 & 0x0F)  # even K indices
         val_hi = _dequant_fp4_lut((b_u8 >> 4) & 0x0F)  # odd K indices
 
-        # ── Load and apply scales: [BLOCK_N, BLOCK_K//2] ──
-        group_ids = tl.arange(0, BLOCK_K // 2) // 16  # 32 values per group, 2 per byte
+        # ── Load E8M0 scales and decode: value = 2^(raw - 127) ──
+        group_ids = tl.arange(0, BLOCK_K // 2) // 16  # 32 vals/group, 2 per byte
         s_mask = n_mask[:, None] & ((k_start // 32 + group_ids[None, :]) < K // 32)
-        scales = tl.load(
+        scale_raw = tl.load(
             B_scale_ptr
             + s_base
             + offs_n[:, None] * stride_bsn
             + (k_start // 32 + group_ids[None, :]) * stride_bsk32,
             mask=s_mask,
-            other=1.0,
+            other=127,  # 2^(127-127) = 1.0
         )
-        val_lo = val_lo * scales
-        val_hi = val_hi * scales
+        scales = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
 
         # ── Load A even/odd: [BLOCK_K//2] each ──
         offs_k_even = k_start + tl.arange(0, BLOCK_K // 2) * 2
@@ -152,9 +158,10 @@ def _mxfp4_slot_gemv_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        # ── Dot product: acc[n] += sum_k(a_even[k]*B_lo[n,k] + a_odd[k]*B_hi[n,k]) ──
-        acc += tl.sum(a_even[None, :] * val_lo, axis=1)
-        acc += tl.sum(a_odd[None, :] * val_hi, axis=1)
+        # ── Fused dot product: single reduction ──
+        # acc[n] += sum_k( a_even[k]*val_lo[n,k] + a_odd[k]*val_hi[n,k] ) * scale
+        weighted = (a_even[None, :] * val_lo + a_odd[None, :] * val_hi) * scales
+        acc += tl.sum(weighted, axis=1)
 
     # ── Store output ──
     tl.store(
@@ -235,14 +242,15 @@ def _mxfp4_gemm_kernel(
         val_hi = _dequant_fp4_lut((b_u8 >> 4) & 0x0F)
 
         group_ids = tl.arange(0, BLOCK_K // 2) // 16
-        scales_per_byte = tl.load(
+        scale_raw = tl.load(
             B_scale_ptr
             + offs_n[:, None] * stride_bsn
             + (k_start // 32 + group_ids[None, :]) * stride_bsk32,
             mask=(offs_n[:, None] < N)
             & ((k_start // 32 + group_ids[None, :]) < K // 32),
-            other=1.0,
+            other=127,  # 2^(127-127) = 1.0
         )
+        scales_per_byte = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
         val_lo = val_lo * scales_per_byte
         val_hi = val_hi * scales_per_byte
 
@@ -288,10 +296,12 @@ def mxfp4_gemm_triton(
     N = B_packed.shape[0]
     K = K_full
 
-    if B_scale.dtype == torch.float8_e8m0fnu:
-        B_scale = B_scale.to(torch.float32)
-    elif B_scale.dtype != torch.float32:
-        B_scale = B_scale.float()
+    # Ensure uint8 view for E8M0 in-kernel decode
+    if B_scale.dtype != torch.uint8:
+        if B_scale.dtype == torch.float8_e8m0fnu:
+            B_scale = B_scale.view(torch.uint8)
+        else:
+            B_scale = B_scale.to(torch.uint8)
 
     C = torch.empty(M, N, dtype=torch.bfloat16, device=A.device)
     A = A.contiguous()
@@ -369,11 +379,8 @@ def mxfp4_moe_forward_triton(
         .contiguous()
     )  # [M*topk]
 
-    # ── Ensure scales are float32 ──
-    if w13_scale.dtype != torch.float32:
-        w13_scale = w13_scale.to(torch.float32)
-    if w2_scale.dtype != torch.float32:
-        w2_scale = w2_scale.to(torch.float32)
+    # Scales stored as uint8 E8M0 — decoded in-kernel via exp2(x - 127).
+    # Zero host-side conversion, minimal memory footprint (1 byte/scale).
 
     # ── GEMM1: gate_up projection ──
     # hidden_states[token] @ w13[expert].T → [num_slots, 2*I]

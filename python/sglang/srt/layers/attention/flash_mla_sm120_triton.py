@@ -42,6 +42,12 @@ _SCALE_STRIDE = 8  # bytes per token in scale section
         triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_T": 16}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=2),
+        # Deeper pipeline for SM120 (99 KB SMEM can accommodate 3 stages)
+        triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_T": 16}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=3),
+        # Smaller tile for short sequences / less SMEM pressure
+        triton.Config({"BLOCK_T": 8}, num_warps=4, num_stages=2),
     ],
     key=["topk_rounded"],
 )
