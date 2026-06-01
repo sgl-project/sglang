@@ -177,12 +177,12 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             if r1.is_chunking:
                 saw_r1_chunking = True
                 comp = t.batch_composition()
-                assert r1.rid in comp.get("chunked", []), (
-                    f"mid-chunk r1 must occupy the chunked role; got {comp!r}"
-                )
-                assert r1.rid not in comp.get("running", []), (
-                    f"chunked r1 must be excluded from the running role; got {comp!r}"
-                )
+                assert r1.rid in comp.get(
+                    "chunked", []
+                ), f"mid-chunk r1 must occupy the chunked role; got {comp!r}"
+                assert r1.rid not in comp.get(
+                    "running", []
+                ), f"chunked r1 must be excluded from the running role; got {comp!r}"
             if r1.finished and r2.finished:
                 break
             yield
@@ -275,7 +275,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
         t.continue_generation()
         yield from run_until_finished(r)
-        assert r.finished, "continue_generation must drive the re-queued req to completion"
+        assert (
+            r.finished
+        ), "continue_generation must drive the re-queued req to completion"
 
     def test_load_inquirer_pending_tokens_dedup_chunked(self):
         self.server.execute_script(
@@ -741,9 +743,9 @@ class TestSpecialCaseHiCache(ScriptedTestCase):
                 break
             yield
         assert r.finished
-        assert saw_chunking, (
-            "test must observe the req mid-chunk (chunks_done >= 1) at least once"
-        )
+        assert (
+            saw_chunking
+        ), "test must observe the req mid-chunk (chunks_done >= 1) at least once"
         assert snap is not None, "test must snapshot the cached_tokens_* breakdown"
 
 

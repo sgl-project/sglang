@@ -377,9 +377,7 @@ class TestKVPressurePriority(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking)
 
-        r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10
-        )
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10)
         for _ in range(DEFAULT_MAX_STEPS * 4):
             assert not (r1.is_chunking and r2.is_chunking), (
                 f"two reqs cannot share the chunked slot; "

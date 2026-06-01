@@ -500,9 +500,7 @@ class TestMultiReqMixedChunk(ScriptedTestCase):
         # num_mixed_decode_tokens), shrinking each chunk, so the long req needs at
         # least as many chunks -- and page-aligned truncation plus the timing of
         # when decode co-runs make the exact count non-deterministic.
-        long_req = t.start_req(
-            prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2
-        )
+        long_req = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(long_req, lambda h: h.is_chunking)
 
         # Confirm the scheduler actually produced a MIXED batch (chunked prefill +

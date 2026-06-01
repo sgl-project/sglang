@@ -229,9 +229,7 @@ class TestPriorityPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_naive_priority_chunked(t: ScriptedContext):
-        low = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority=0
-        )
+        low = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4, priority=0)
         yield
 
         high = t.start_req(prompt_len=8, max_new_tokens=2, priority=10)
@@ -249,9 +247,7 @@ class TestPriorityPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_priority_preempt_chunked(t: ScriptedContext):
-        low = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=0
-        )
+        low = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=0)
         yield from run_until(low, lambda h: h.is_chunking and h.chunks_done >= 1)
         assert low.kv_pages > 0
 

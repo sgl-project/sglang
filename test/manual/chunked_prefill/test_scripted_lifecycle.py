@@ -263,7 +263,8 @@ class TestLifecycleBasic(ScriptedTestCase):
         assert r1.finished and r2.finished
         assert r2.chunks_done == 0
         assert r2.req.cached_tokens > 0, (
-            f"r2 must hit r1's radix prefix; got cached_tokens=" f"{r2.req.cached_tokens}"
+            f"r2 must hit r1's radix prefix; got cached_tokens="
+            f"{r2.req.cached_tokens}"
         )
         assert len(r2.req.output_ids) == 2
 

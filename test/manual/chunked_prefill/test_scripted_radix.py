@@ -586,13 +586,9 @@ class TestRadixPriority(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_calc_priority_skip_chunked_resume(t: ScriptedContext):
-        r1 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10
-        )
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10)
         yield from run_until(r1, lambda h: h.is_chunking)
-        r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=0
-        )
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=0)
 
         # The scheduler does not record which admission branch it took. The
         # observable consequence of skipping r1's chunked-resume in the priority
