@@ -1,4 +1,4 @@
-"""Nightly accuracy + performance test for Google Gemma-4-26B-A4B on CPU.
+"""Nightly accuracy + performance test for Google Gemma-4-26B-A4B-it on CPU.
 
 26B MoE model with 4B active params, TP=6 on Xeon.
 
@@ -16,19 +16,17 @@ from sglang.test.test_utils import ModelLaunchSettings
 
 register_cpu_ci(est_time=3600, suite="nightly-xeon-models", nightly=True)
 
-MODEL_PATH = "google/gemma-4-26B-A4B"
+MODEL_PATH = "google/gemma-4-26B-A4B-it"
 
 BASE_ARGS = CPU_BASE_ARGS + [
     "--context-length",
     "4096",
     "--skip-server-warmup",
-    "--torch-compile-max-bs",
-    "8",
 ]
 
 
 class TestGemma4_26BCPU(unittest.TestCase):
-    """Google Gemma-4-26B-A4B on Xeon."""
+    """Google Gemma-4-26B-A4B-it on Xeon."""
 
     def test_gemma4_26b(self):
         models = [
@@ -44,8 +42,7 @@ class TestGemma4_26BCPU(unittest.TestCase):
             test_name="Gemma-4-26B-A4B (Xeon)",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                baseline_accuracy=0.71,
-                api="completion",
+                baseline_accuracy=0.95,
                 num_threads=64,
             ),
             performance_params=PerformanceTestParams(
