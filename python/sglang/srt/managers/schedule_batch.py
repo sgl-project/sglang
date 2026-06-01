@@ -888,6 +888,9 @@ class Req(ReqDllmMixin):
         # KV pool entry, so the next admission re-prefills from scratch.
         # On abort, the req is finalized without touching the counter.
         self.scheduled_extend_len: int = 0
+        # Frozen target length for the current chunked prefill plan. This
+        # stays stable while output_ids grow during later decode steps.
+        self.scheduled_extend_target_len: int = 0
 
         # For retraction
         self.is_retracted = False
@@ -1058,9 +1061,22 @@ class Req(ReqDllmMixin):
 
     def scheduled_extend_len_bound(self) -> int:
         """Return the current sequence length that prefill scheduling targets."""
-        if self.full_untruncated_fill_ids:
-            return len(self.full_untruncated_fill_ids)
+        scheduled_extend_target_len = getattr(self, "scheduled_extend_target_len", 0)
+        if scheduled_extend_target_len:
+            return scheduled_extend_target_len
         return len(self.origin_input_ids)
+
+    def _scheduled_extend_len_bound_for_value(self, value: int) -> int:
+        origin_len = len(self.origin_input_ids)
+        if (
+            self.retracted_stain
+            and self.full_untruncated_fill_ids
+            and len(self.full_untruncated_fill_ids) > origin_len
+        ):
+            return len(self.full_untruncated_fill_ids)
+        if self.full_untruncated_fill_ids and value > origin_len:
+            return len(self.full_untruncated_fill_ids)
+        return origin_len
 
     def set_scheduled_extend_len(self, value: int) -> None:
         """Update `scheduled_extend_len` with a bounds check.
@@ -1079,11 +1095,12 @@ class Req(ReqDllmMixin):
         proceeds. The prompt-length bound therefore does not hold for DLLM.
         """
         if not self.is_dllm():
-            n = self.scheduled_extend_len_bound()
+            n = self._scheduled_extend_len_bound_for_value(value)
             assert 0 <= value <= n, (
                 f"scheduled_extend_len {value} out of bounds [0, {n}] "
                 f"for req {self.rid}"
             )
+            self.scheduled_extend_target_len = n
         self.scheduled_extend_len = value
 
     @property
@@ -1440,6 +1457,7 @@ class Req(ReqDllmMixin):
         # has_pending_chunk view will then read False until the first new
         # chunk admit bumps the counter again.
         self.scheduled_extend_len = 0
+        self.scheduled_extend_target_len = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -1684,6 +1702,8 @@ def _compute_chunked_req_next_prompt_token(
     if chunked_req is None:
         return None
     fill_len = chunked_req.fill_len
+    if fill_len >= chunked_req.scheduled_extend_len_bound():
+        return None
     fill_ids = chunked_req.full_untruncated_fill_ids
     if fill_len >= len(fill_ids):
         return None

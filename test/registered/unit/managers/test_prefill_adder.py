@@ -126,7 +126,10 @@ class TestPrefillAdder(CustomTestCase):
         req.output_ids = array("q", range(origin_len, origin_len + output_len))
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
         req.fill_len = scheduled_extend_len
-        req.scheduled_extend_len = scheduled_extend_len
+        req.scheduled_extend_len = 0
+        req.scheduled_extend_target_len = 0
+        req.retracted_stain = True
+        req.set_scheduled_extend_len(scheduled_extend_len)
         return req
 
     def test_retracted_decode_req_pending_bound_uses_full_fill_sequence(self):
@@ -149,6 +152,28 @@ class TestPrefillAdder(CustomTestCase):
         req.fill_len = 805
 
         self.assertFalse(req.has_pending_chunk)
+        self.assertEqual(
+            _decide_output_process_mode(req, dllm_config=None, forward_mode=None),
+            OutputProcessMode.EXTEND_LAST_CHUNK,
+        )
+        self.assertIsNone(_compute_chunked_req_next_prompt_token(req))
+
+    def test_decoded_req_output_ids_do_not_extend_chunked_prefill_bound(self):
+        """Decoded output tokens do not make a completed prompt pending again."""
+        req = Req.__new__(Req)
+        req.rid = "decoded-req"
+        req.dllm_config = None
+        req.origin_input_ids = array("q", range(128))
+        req.output_ids = array("q", range(128, 132))
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        req.fill_len = len(req.origin_input_ids)
+        req.scheduled_extend_len = 0
+        req.scheduled_extend_target_len = 0
+        req.retracted_stain = False
+        req.set_scheduled_extend_len(len(req.origin_input_ids))
+
+        self.assertFalse(req.has_pending_chunk)
+        self.assertEqual(req.scheduled_extend_len_bound(), len(req.origin_input_ids))
         self.assertEqual(
             _decide_output_process_mode(req, dllm_config=None, forward_mode=None),
             OutputProcessMode.EXTEND_LAST_CHUNK,
