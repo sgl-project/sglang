@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SGLD Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v20" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v21" />
   </head>
   <body>
     <main class="shell">
@@ -104,6 +104,15 @@
           <span id="frameText">frames 0</span>
           <span id="byteText">0 MB</span>
         </div>
+        <div class="telemetry stage-telemetry">
+          <span>Render FPS<b id="renderFps">0</b></span>
+          <span>Payload<b id="payloadMode">webp</b></span>
+          <span>Server send<b id="serverSendText">-</b></span>
+          <span>Chunk bytes<b id="chunkPayloadText">-</b></span>
+          <span>Chunk wait<b id="latencyText">-</b></span>
+          <span>Decode<b id="decodeText">-</b></span>
+          <span>Display lag<b id="displayLagText">-</b></span>
+        </div>
       </section>
 
       <section class="panel presets" aria-label="Presets and camera">
@@ -116,19 +125,10 @@
         </div>
         <div class="section-title">Presets</div>
         <div id="presetList" class="preset-list"></div>
-        <div class="telemetry">
-          <span>Render FPS<b id="renderFps">0</b></span>
-          <span>Payload<b id="payloadMode">webp</b></span>
-          <span>Server send<b id="serverSendText">-</b></span>
-          <span>Chunk bytes<b id="chunkPayloadText">-</b></span>
-          <span>Chunk wait<b id="latencyText">-</b></span>
-          <span>Decode<b id="decodeText">-</b></span>
-          <span>Display lag<b id="displayLagText">-</b></span>
-        </div>
         <div class="section-title">History</div>
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-    <script src="./app.js?v=realtime-fixes-v20"></script>
+    <script src="./app.js?v=realtime-fixes-v21"></script>
   </body>
 </html>

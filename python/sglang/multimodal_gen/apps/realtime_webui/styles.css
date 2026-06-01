@@ -238,7 +238,7 @@ button:focus-visible {
 .stage {
   position: relative;
   display: grid;
-  grid-template-rows: auto auto auto auto;
+  grid-template-rows: auto auto auto auto auto;
   align-self: start;
   justify-self: center;
   width: 100%;
@@ -419,7 +419,8 @@ button:focus-visible {
 .preset-list {
   display: grid;
   gap: 7px;
-  max-height: min(24vh, 190px);
+  min-height: 320px;
+  max-height: min(54vh, 560px);
   margin-bottom: 12px;
   overflow: auto;
   padding-right: 3px;
@@ -474,6 +475,30 @@ button:focus-visible {
 }
 .telemetry b { color: var(--ink); font-weight: 650; }
 
+.stage-telemetry {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  margin-top: 0;
+  border-top: 1px solid rgba(232, 234, 223, 0.12);
+  background: #11140f;
+}
+
+.stage-telemetry span {
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  border-right: 1px solid rgba(232, 234, 223, 0.1);
+  border-bottom: 1px solid rgba(232, 234, 223, 0.1);
+  padding: 0 14px;
+  color: rgba(232, 234, 223, 0.62);
+  font-size: 11px;
+}
+
+.stage-telemetry b {
+  color: #fffdf7;
+  font-size: 12px;
+}
+
 .history-list {
   display: grid;
   gap: 7px;
@@ -493,9 +518,10 @@ button:focus-visible {
 @media (max-width: 980px) {
   .shell { grid-template-columns: 1fr; }
   .presets { position: static; max-height: none; overflow: visible; }
-  .preset-list { max-height: 260px; }
+  .preset-list { min-height: 260px; max-height: 420px; }
   #viewport { max-height: 420px; }
   .stage-controls { grid-template-columns: 1fr; }
+  .stage-telemetry { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topbar { flex-wrap: wrap; height: auto; min-height: 44px; padding: 10px 14px; }
   .topbar-spacer { display: none; }
 }

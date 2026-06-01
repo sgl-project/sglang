@@ -112,8 +112,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="serverSendText"' in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-fixes-v20" in index_html
-    assert "app.js?v=realtime-fixes-v20" in index_html
+    assert "styles.css?v=realtime-fixes-v21" in index_html
+    assert "app.js?v=realtime-fixes-v21" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v5";' in app_js
     assert 'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";' in app_js
     assert "Dragon Dolly" in app_js
@@ -128,6 +128,9 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
         / "python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/realtime_output_adapter.py"
     ).read_text()
     assert ".stage-controls .camera-pad button.is-key-active:not(:disabled)" in styles_css
+    assert "stage-telemetry" in index_html
+    assert "max-height: min(54vh, 560px);" in styles_css
+    assert ".stage-telemetry" in styles_css
     assert "--pressed: #8c9288;" in styles_css
     assert "--pressed-ring: rgba(238, 241, 236, 0.2);" in styles_css
 
