@@ -1055,7 +1055,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
-            self.norm = PPMissingLayer()
+            self.norm = PPMissingLayer(return_tuple=True)
 
         self.layers_to_capture = []
 
@@ -1182,6 +1182,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
+                continue
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+            if "lm_head" in name and not self.pp_group.is_last_rank:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1319,6 +1323,17 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+            ):
+                continue
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+            if "lm_head" in name and not self.pp_group.is_last_rank:
+                continue
 
             layer_id = get_layer_id(name)
             if (
@@ -1433,8 +1448,19 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
-
+        if not hasattr(self, "_routed_experts_weights_of_layer"):
+            self._routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(len(self.layers))
+                    if isinstance(self.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
+                }
+            )
         return loaded_params
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
@@ -1537,6 +1563,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
+                continue
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+            if "lm_head" in name and not self.pp_group.is_last_rank:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1787,6 +1817,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ):
                 continue
 
+            if "embed_tokens" in name and not self.pp_group.is_first_rank:
+                continue
+            if "lm_head" in name and not self.pp_group.is_last_rank:
+                continue
+
             if self.enable_shared_expert_fusion:
                 if "mlp.shared_expert." in name:
                     # Firstly map mlp.shared_expert.xx_proj to mlp.experts.512.xx_proj
@@ -1952,14 +1987,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
-        self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
-            }
-        )
-
+        if not hasattr(self, "_routed_experts_weights_of_layer"):
+            self._routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if hasattr(layer, "mlp")
+                    and isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+                }
+            )
         return loaded_params
 
     @property

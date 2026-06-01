@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING
 
@@ -500,6 +501,7 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                total_mamba_layer_ids = list(config.mamba2_cache_params.layers)
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -518,12 +520,27 @@ class ModelRunnerKVCacheMixin:
                             if self.start_layer <= i < self.end_layer
                         ]
                     ),
+                    total_mamba_layer_ids=total_mamba_layer_ids,
+                    mamba_layer_ids=(
+                        []
+                        if self.is_draft_worker
+                        else [
+                            i
+                            for i, layer_id in enumerate(total_mamba_layer_ids)
+                            if self.start_layer <= layer_id < self.end_layer
+                        ]
+                    ),
                     enable_kvcache_transpose=False,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
-                    start_layer=self.start_layer,
+                    start_layer=bisect.bisect_left(
+                        config.full_attention_layer_ids, self.start_layer
+                    ),
+                    end_layer=bisect.bisect_left(
+                        config.full_attention_layer_ids, self.end_layer
+                    ),
                     **extra_args,
                 )
             else:

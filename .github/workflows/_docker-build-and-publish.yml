@@ -51,6 +51,11 @@ on:
         required: false
         type: string
         default: ""
+      image_tag_override:
+        description: "Optional fully resolved image tag to publish instead of generating one"
+        required: false
+        type: string
+        default: ""
       variant_suffix:
         description: "Optional variant suffix appended before CUDA suffix"
         required: false
@@ -101,6 +106,7 @@ jobs:
       SGL_VERSION: ${{ inputs.sgl_version }}
       TAG_MODE: ${{ inputs.tag_mode }}
       TAG_VALUE: ${{ inputs.tag_value }}
+      IMAGE_TAG_OVERRIDE: ${{ inputs.image_tag_override }}
       VARIANT_SUFFIX: ${{ inputs.variant_suffix }}
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
@@ -166,10 +172,14 @@ jobs:
           }
 
           IMAGE_TAGS=()
-          if [ "${PUBLISH_DEFAULT_CUDA_ALIAS}" = "true" ]; then
+          if [ -n "${IMAGE_TAG_OVERRIDE}" ]; then
+            IMAGE_TAGS+=("${IMAGE_TAG_OVERRIDE}")
+          elif [ "${PUBLISH_DEFAULT_CUDA_ALIAS}" = "true" ]; then
             IMAGE_TAGS+=("$(resolve_tag "")")
+            IMAGE_TAGS+=("$(resolve_tag "${CUDA_SUFFIX}")")
+          else
+            IMAGE_TAGS+=("$(resolve_tag "${CUDA_SUFFIX}")")
           fi
-          IMAGE_TAGS+=("$(resolve_tag "${CUDA_SUFFIX}")")
 
           {
             echo "image-tags<<EOF"

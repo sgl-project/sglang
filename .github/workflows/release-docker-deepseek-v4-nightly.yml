@@ -1,0 +1,166 @@
+name: Build DeepSeek V4 Nightly CUDA 13 Docker Image
+
+# NOTE:
+# - GitHub Actions schedule runs from the default branch workflow definition.
+# - This workflow should eventually live on ep_main/default-branch, but always
+#   checks out bytedance/deepseek_v4 (or the manually selected ref) explicitly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Git ref to build. Leave empty to use the default bytedance/deepseek_v4 branch."
+        required: false
+        default: ""
+      compile_kernel:
+        description: "Build sgl-kernel from source before building the image"
+        required: false
+        type: boolean
+        default: true
+      image_repo:
+        description: "Optional full Volcengine CR image repo override. Leave empty to use repo variables like release-docker-dev.yml."
+        required: false
+        default: ""
+  schedule:
+    # UTC+8 02:00
+    - cron: "0 18 * * *"
+
+concurrency:
+  group: release-docker-deepseek-v4-nightly-${{ github.event_name == 'workflow_dispatch' && (inputs.target_ref || 'default-target-ref') || 'default-target-ref' }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-target-ref:
+    if: ${{ github.repository == 'bytedance-iaas/sglang' }}
+    runs-on: ubuntu-22.04
+    outputs:
+      target_ref: ${{ steps.resolve.outputs.target_ref }}
+    steps:
+      - name: Resolve target ref
+        id: resolve
+        run: |
+          set -euo pipefail
+          target_ref="${{ inputs.target_ref || 'bytedance/deepseek_v4' }}"
+          echo "target_ref=${target_ref}" >> "${GITHUB_OUTPUT}"
+
+  resolve-image-metadata:
+    needs: [resolve-target-ref]
+    if: ${{ github.repository == 'bytedance-iaas/sglang' }}
+    environment: prod
+    runs-on: ubuntu-22.04
+    outputs:
+      image_repo: ${{ steps.resolve.outputs.image_repo }}
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+      image_ref: ${{ steps.resolve.outputs.image_ref }}
+      target_ref: ${{ steps.resolve.outputs.target_ref }}
+    env:
+      IMAGE_REPO: ${{ inputs.image_repo || '' }}
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-target-ref.outputs.target_ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve image metadata
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          target_ref="${{ needs.resolve-target-ref.outputs.target_ref }}"
+          image_repo="${IMAGE_REPO}"
+          if [ -z "${image_repo}" ]; then
+            if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
+              echo "::error::Volcengine CR variables are required: VOLCENGINE_CR_REGISTRY and VOLCENGINE_CR_NAMESPACE"
+              exit 1
+            fi
+            image_repo="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY:-sglang}"
+          fi
+
+          if [ -z "${image_repo}" ] || [[ "${image_repo}" == /* ]] || [[ "${image_repo}" == *'//'* ]]; then
+            echo "::error::Invalid image repository: '${image_repo}'"
+            exit 1
+          fi
+
+          tag_mode="manual"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            tag_mode="nightly"
+          fi
+          version="$(python3 python/tools/get_version_tag.py --tag-only)"
+          version="${version#v}"
+          timestamp="$(TZ=Asia/Shanghai date +%Y%m%d%H%M)"
+          if [ "${tag_mode}" = "nightly" ]; then
+            image_tag="v${version}.iaas.nightly.${timestamp}"
+          else
+            image_tag="v${version}.iaas.dev.${timestamp}"
+          fi
+          image_tag="${image_tag}-deepseek-v4-cu130"
+
+          echo "image_repo=${image_repo}" >> "${GITHUB_OUTPUT}"
+          echo "image_tag=${image_tag}" >> "${GITHUB_OUTPUT}"
+          echo "image_ref=${image_repo}:${image_tag}" >> "${GITHUB_OUTPUT}"
+          echo "target_ref=${target_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Write image metadata artifact
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/deepseek-v4-image-metadata
+          jq -n \
+            --arg image_repo "${{ steps.resolve.outputs.image_repo }}" \
+            --arg image_tag "${{ steps.resolve.outputs.image_tag }}" \
+            --arg image_ref "${{ steps.resolve.outputs.image_ref }}" \
+            --arg target_ref "${{ steps.resolve.outputs.target_ref }}" \
+            --arg sglang_commit "$(git rev-parse HEAD)" \
+            --arg workflow_run_id "${GITHUB_RUN_ID}" \
+            --arg workflow_run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{image_repo:$image_repo,image_tag:$image_tag,image_ref:$image_ref,target_ref:$target_ref,sglang_commit:$sglang_commit,workflow_run_id:$workflow_run_id,workflow_run_url:$workflow_run_url}' \
+            > /tmp/deepseek-v4-image-metadata/image-metadata.json
+
+      - name: Upload image metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-v4-image-metadata
+          path: /tmp/deepseek-v4-image-metadata/image-metadata.json
+          retention-days: 30
+
+  build-kernel-wheel:
+    needs: [resolve-target-ref]
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
+    uses: ./.github/workflows/release-whl-kernel.yml
+    with:
+      checkout_ref: ${{ needs.resolve-target-ref.outputs.target_ref }}
+      cuda_version: "13.0"
+      artifact_name: sgl-kernel-deepseek-v4-cu13
+
+  build-nightly:
+    needs: [resolve-image-metadata, build-kernel-wheel]
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && always() && needs.resolve-image-metadata.result == 'success' && (needs.build-kernel-wheel.result == 'success' || needs.build-kernel-wheel.result == 'skipped') }}
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      checkout_ref: ${{ needs.resolve-image-metadata.outputs.target_ref }}
+      cuda_key: cu130
+      cuda_version: 13.0.1
+      cuda_suffix: cu130
+      publish_default_cuda_alias: false
+      variant_suffix: deepseek-v4
+      tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
+      image_tag_override: ${{ needs.resolve-image-metadata.outputs.image_tag }}
+      use_environment: prod
+      image_repo: ${{ inputs.image_repo || '' }}
+      artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && 'sgl-kernel-deepseek-v4-cu13' || '' }}
+      extra_build_args: >-
+        --build-arg BRANCH_TYPE=local
+        --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+    secrets: inherit

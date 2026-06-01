@@ -506,7 +506,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-
+        if envs.SGLANG_ENABLE_SPEC_V2.get() and not enable_mamba_extra_buffer:
+            raise ValueError(
+                "Spec v2 requires mamba scheduler strategy `extra_buffer` for mamba models. "
+                "Please set `--mamba-scheduler-strategy extra_buffer`."
+            )
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
@@ -1278,6 +1282,8 @@ class HybridLinearKVPool(KVCache):
         head_num: int,
         head_dim: int,
         full_attention_layer_ids: List[int],
+        total_mamba_layer_ids: List[int],
+        mamba_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
         mamba_pool: MambaPool,
@@ -1287,13 +1293,17 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
         self.device = device
         self.full_layer_nums = len(full_attention_layer_ids)
+        self.total_mamba_layer_ids = total_mamba_layer_ids
+        self.mamba_layer_ids = mamba_layer_ids
         self.page_size = page_size
         self.start_layer = start_layer if start_layer is not None else 0
+        self.end_layer = end_layer
         self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim
