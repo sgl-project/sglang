@@ -188,17 +188,11 @@ def _spawn_server_process(
     launch_kwargs: Dict[str, Any] = dict(
         host=SERVER_HOST,
         port=get_free_port(),
+        kv_canary="raise",
+        kv_canary_real_data="partial",
+        kv_canary_sweep_interval=100,
         disable_piecewise_cuda_graph=True,
     )
-    # The kv-canary SingleForwardManager assumes one forward pass at a time;
-    # pipeline parallelism keeps several micro-batches in flight, which breaks
-    # its phase checker, so the canary is only enabled for non-PP configs.
-    if engine_kwargs.get("pp_size", 1) == 1:
-        launch_kwargs.update(
-            kv_canary="raise",
-            kv_canary_real_data="partial",
-            kv_canary_sweep_interval=100,
-        )
     launch_kwargs.update(engine_kwargs)
     server_process = mp_ctx.Process(
         target=_launch_scripted_http_server,
