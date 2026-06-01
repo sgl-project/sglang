@@ -22,9 +22,7 @@ class TestInvariantsBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_status_unknown_before_submit(t: ScriptedContext):
-        bogus = ScriptedReqHandle(
-            rid="never-submitted", scheduler_hook=t._scheduler_hook
-        )
+        bogus = ScriptedReqHandle(rid="never-submitted", context=t)
         assert bogus.status == "unknown"
         yield
 
