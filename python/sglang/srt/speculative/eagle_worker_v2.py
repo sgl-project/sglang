@@ -1346,11 +1346,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
         """
         bs = len(batch.seq_lens)
-        # Size everything to accept_index's element count (bs * (spec_steps + 1)).
-        # NOT bs * num_draft_tokens: for topk > 1 the draft tree is larger than the
-        # accepted chain, which would over-read accept_index (illegal memory) and
-        # over-allocate the packed cache-loc buffers (assign_extend / fill_accepted
-        # both write at cumulative offsets, total <= bs * (spec_steps + 1)).
+        # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
+        # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
         size = bs * accept_index.shape[1]
 
         # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
