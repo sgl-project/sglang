@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SGLD Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v13" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v14" />
   </head>
   <body>
     <main class="shell">
@@ -39,8 +39,8 @@
           <label>Seed<input id="seed" type="number" value="42" /></label>
         </div>
         <div class="split">
-          <label>Steps<input id="steps" type="number" value="70" min="1" /></label>
-          <label>Guidance<input id="guidance" type="number" value="5" step="0.1" /></label>
+          <label>Steps<input id="steps" type="number" value="4" min="1" /></label>
+          <label>Guidance<input id="guidance" type="number" value="1" step="0.1" /></label>
         </div>
         <div class="split">
           <label>Sink<input id="sinkSize" type="number" value="9" min="0" /></label>
@@ -116,6 +116,6 @@
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-    <script src="./app.js?v=realtime-fixes-v12"></script>
+    <script src="./app.js?v=realtime-fixes-v14"></script>
 </body>
 </html>

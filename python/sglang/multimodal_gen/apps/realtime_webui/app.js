@@ -5,7 +5,7 @@ const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v4";
-const PREVIEW_OUTPUT_FORMAT = "jpeg";
+const PREVIEW_OUTPUT_FORMAT = "";
 const PREVIEW_OUTPUT_QUALITY = 95;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;

@@ -104,7 +104,11 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "repeatActions" not in app_js
     assert 'id="eventFrames"' not in index_html
     assert "ControlStateController" in app_js
-    assert "styles.css?v=realtime-fixes-v13" in index_html
+    assert "const PREVIEW_OUTPUT_FORMAT = \"\";" in app_js
+    assert 'id="steps" type="number" value="4"' in index_html
+    assert 'id="guidance" type="number" value="1"' in index_html
+    assert "styles.css?v=realtime-fixes-v14" in index_html
+    assert "app.js?v=realtime-fixes-v14" in index_html
     assert ".stage-controls .camera-pad button.is-key-active:not(:disabled)" in styles_css
     assert "background: #8c9288;" in styles_css
     assert "0 0 0 3px rgba(238, 241, 236, 0.2)" in styles_css
@@ -727,6 +731,8 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
 
     assert seen["request_id"] == chunk.request_id
     assert seen["kwargs"]["prompt"] == "walk forward"
+    assert seen["kwargs"]["num_inference_steps"] == 4
+    assert seen["kwargs"]["guidance_scale"] == 1.0
     assert seen["kwargs"]["condition_inputs"] == {
         "camera_actions": [["w"], ["w"], ["w"]]
     }

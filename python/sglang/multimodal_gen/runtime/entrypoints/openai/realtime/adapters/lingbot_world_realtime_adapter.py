@@ -49,6 +49,9 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
+LINGBOT_REALTIME_DEFAULT_NUM_INFERENCE_STEPS = 4
+
+
 class LingBotWorldRealtimeState:
     def __init__(self):
         self.events = ConditionEventQueue(max_events={"prompt": 1})
@@ -345,7 +348,10 @@ class LingBotWorldRealtimeAdapter(RealtimeModelAdapter):
             save_output=False,
             seed=request.seed,
             generator_device=request.generator_device,
-            num_inference_steps=request.num_inference_steps,
+            num_inference_steps=(
+                request.num_inference_steps
+                or LINGBOT_REALTIME_DEFAULT_NUM_INFERENCE_STEPS
+            ),
             guidance_scale=request.guidance_scale,
             guidance_scale_2=request.guidance_scale_2,
             negative_prompt=request.negative_prompt,
