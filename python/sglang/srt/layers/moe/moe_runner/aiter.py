@@ -119,6 +119,8 @@ class AiterRunnerCore(MoeRunnerCore):
         from aiter.fused_moe import fused_moe
         from aiter.ops.flydsl.moe_common import GateMode
 
+        from sglang.srt.environ import envs
+
         a1_scale = (
             runner_input.a1_scale
             if runner_input.a1_scale is not None
@@ -131,7 +133,16 @@ class AiterRunnerCore(MoeRunnerCore):
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
         if quant_info.swiglu_limit > 0:
-            extra["gate_mode"] = GateMode.INTERLEAVE.value
+            # Default to SEPARATED so we match the layout produced by the
+            # SGLang Mxfp4MoEMethod weight shuffle (is_guinterleave=False) and
+            # the gptoss_fp4 tuned FlyDSL kernels. Opt into INTERLEAVE only
+            # when the weights were prepared with the gate/up-interleaved
+            # layout (ATOM_MOE_GU_ITLV-equivalent path).
+            extra["gate_mode"] = (
+                GateMode.INTERLEAVE.value
+                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                else GateMode.SEPARATED.value
+            )
             extra["swiglu_limit"] = quant_info.swiglu_limit
 
         output = fused_moe(
