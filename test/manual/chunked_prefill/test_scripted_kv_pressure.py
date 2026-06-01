@@ -218,7 +218,10 @@ class TestKVPressureBasic(ScriptedTestCase):
         yield from run_until_all_finished(reqs)
         for r in reqs:
             assert r.finished
-            assert r.cumulative_kv_alloc_bytes >= 0
+            # Dropped a vacuous `cumulative_kv_alloc_bytes >= 0` probe: it was
+            # always true and the only real invariant here (no KV leak) is already
+            # covered by the per-req kv_pages == 0 check and the kv_pool_free >=
+            # baseline assertion below.
             assert r.kv_pages == 0, f"req {r.rid} kept {r.kv_pages} pages after finish"
         final = t.engine_stats()["kv_pool_free"]
         assert (
