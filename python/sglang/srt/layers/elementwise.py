@@ -560,6 +560,9 @@ def fused_sigmoid_mul(
 
     Equivalent to: attn_output * sigmoid(gate)
     """
+    assert (
+        attn_output.shape == gate.shape
+    ), "attn_output and gate must have the same shape"
     out = torch.empty_like(attn_output)
     n_elements = out.numel()
     grid = (triton.cdiv(n_elements, 1024),)
@@ -628,7 +631,15 @@ def fused_gate_sigmoid_mul_add(
         gate = hidden_states @ gate_weight
         final_hidden_states += sigmoid(gate).unsqueeze(1) * shared_output
     """
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
+    assert shared_output.is_contiguous(), "shared_output must be contiguous"
+    assert final_hidden_states.is_contiguous(), "final_hidden_states must be contiguous"
+
     num_tokens, hidden_dim = hidden_states.shape
+    assert gate_weight.shape == (hidden_dim,)
+    assert shared_output.shape == (num_tokens, hidden_dim)
+    assert final_hidden_states.shape == (num_tokens, hidden_dim)
 
     max_warps = 16 if _is_hip else 32
     config = {
