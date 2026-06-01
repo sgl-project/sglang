@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
+import importlib.util
 import unittest
+from unittest import mock
 
 from fastapi import HTTPException
 
@@ -23,6 +25,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _reject_unsupported_cosmos3_modes,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
+    is_cosmos_guardrail_available,
+)
 
 
 def _apply(mapping_fn, key):
@@ -269,6 +274,26 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         req = VideoGenerationsRequest(prompt="test", generate_sound=True)
         with self.assertRaises(HTTPException):
             _reject_unsupported_cosmos3_modes(req, "nvidia/Cosmos3-Nano")
+
+
+class TestCosmos3Guardrails(unittest.TestCase):
+    """Verify optional guardrail dependency handling."""
+
+    def setUp(self):
+        is_cosmos_guardrail_available.cache_clear()
+
+    def tearDown(self):
+        is_cosmos_guardrail_available.cache_clear()
+
+    def test_guardrail_availability_matches_package_spec(self):
+        self.assertEqual(
+            is_cosmos_guardrail_available(),
+            importlib.util.find_spec("cosmos_guardrail") is not None,
+        )
+
+    @mock.patch("importlib.util.find_spec", return_value=None)
+    def test_missing_guardrail_package_reports_unavailable(self, _):
+        self.assertFalse(is_cosmos_guardrail_available())
 
 
 if __name__ == "__main__":

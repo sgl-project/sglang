@@ -32,7 +32,7 @@ Cosmos3 guardrails are enabled by default when the package is available:
 pip install "cosmos-guardrail==0.3.1"
 ```
 
-`cosmos-guardrail` downloads gated NVIDIA guardrail weights, so pass a Hugging Face token if your environment needs one. To disable Cosmos3 guardrails for local experiments, set `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` before starting the server.
+`cosmos-guardrail` downloads gated NVIDIA guardrail weights, so pass a Hugging Face token if your environment needs one. If the package is not installed, SGLang skips Cosmos3 guardrails and logs a warning. To disable Cosmos3 guardrails for local experiments, set `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` before starting the server.
 
 ## 3. Serve Cosmos3
 
