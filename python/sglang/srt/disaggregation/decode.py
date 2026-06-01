@@ -1436,6 +1436,13 @@ class DecodeTransferQueue:
         # Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
+        # The prefill node already reported its prefix-cache hit in
+        # cached_tokens[0]. Seed already_computed with it so that
+        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
+        # only adds decode-side reuse *beyond* what prefill counted, instead of
+        # double-counting the shared prompt prefix (which would make
+        # cached_tokens exceed prompt_tokens when decode radix cache is on).
+        decode_req.req.already_computed = decode_req.req.cached_tokens
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
@@ -1622,7 +1629,8 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            self.schedule_stream.wait_stream(self.forward_stream)
+            if self._war_barrier_enabled:
+                self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
