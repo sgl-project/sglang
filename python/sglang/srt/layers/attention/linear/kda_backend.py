@@ -134,9 +134,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # KDA conv layout is (num_layers, num_slots, conv_width, qkv_dim),
         # but _init_track_conv_indices expects shape[-1] = conv_width.
         # Swap last two dims to match the base class expectation.
-        raw_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        raw_shape = model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         self.conv_states_shape = raw_shape[:-2] + (raw_shape[-1], raw_shape[-2])
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
@@ -219,7 +217,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         # KDA conv layout: (num_slots, conv_width, qkv_dim)
         conv_states_raw = mamba_cache_params.conv[0]
-        conv_states = conv_states_raw.transpose(-1, -2)  # → (num_slots, qkv_dim, conv_width)
+        conv_states = conv_states_raw.transpose(
+            -1, -2
+        )  # → (num_slots, qkv_dim, conv_width)
 
         ssm_states = mamba_cache_params.temporal
 
@@ -236,7 +236,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # KDA conv layout is (num_slots, conv_width, qkv_dim), so permute accordingly
             mixed_qkv_to_track = mixed_qkv_t[
                 :, forward_metadata.track_conv_indices
-            ].permute(1, 2, 0)  # → [num_tracked, conv_width, qkv_dim]
+            ].permute(
+                1, 2, 0
+            )  # → [num_tracked, conv_width, qkv_dim]
             conv_states_raw[forward_metadata.conv_states_mask_indices] = (
                 mixed_qkv_to_track
             )
