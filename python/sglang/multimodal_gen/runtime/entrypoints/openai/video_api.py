@@ -524,6 +524,8 @@ async def create_video_sync(
     extra_params: Optional[str] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
+    # sync endpoint shares parsing and scheduling with the async video API,
+    # then waits so simple clients can fetch a completed MP4 in one request
     queued = await create_video(
         request=request,
         prompt=prompt,
@@ -558,6 +560,8 @@ async def create_video_sync(
         extra_body=extra_body,
     )
 
+    # polling stops when the client disconnects to avoid keeping long-running
+    # request coroutines alive after the response can no longer be delivered
     while True:
         if await request.is_disconnected():
             raise HTTPException(status_code=499, detail="Client closed connection")

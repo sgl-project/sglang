@@ -221,6 +221,8 @@ class SamplingParams:
     diffusers_kwargs: dict | None = None
     max_sequence_length: int | None = None
     flow_shift: float | None = None
+
+    # cosmos-related
     use_duration_template: bool | None = None
     use_resolution_template: bool | None = None
     use_system_prompt: bool | None = None
