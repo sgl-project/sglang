@@ -169,7 +169,16 @@ class TestPriorityBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         t.pause_generation(mode="retract")
         yield
-        assert r.disagg_send_state in (None, "idle")
+        # No disagg_send_state field; assert the real send-side Req fields that
+        # retract must reset (start_send_idx, tmp_end_idx).
+        assert r.req.start_send_idx == 0, (
+            f"disagg send state must reset on retract; "
+            f"start_send_idx={r.req.start_send_idx}"
+        )
+        assert r.req.tmp_end_idx == -1, (
+            f"disagg send state must reset on retract; "
+            f"tmp_end_idx={r.req.tmp_end_idx}"
+        )
         t.continue_generation()
         yield from run_until_finished(r)
         assert r.finished
@@ -435,10 +444,16 @@ class TestPriorityDisagg(ScriptedTestCase):
 
         assert r.status == "waiting"
         assert r.kv_pages == 0
-        assert r.disagg_send_state in (
-            None,
-            "idle",
-        ), f"disagg send state must reset on retract, got {r.disagg_send_state}"
+        # No disagg_send_state field; assert the real send-side Req fields that
+        # retract must reset (start_send_idx, tmp_end_idx).
+        assert r.req.start_send_idx == 0, (
+            f"disagg send state must reset on retract; "
+            f"start_send_idx={r.req.start_send_idx}"
+        )
+        assert r.req.tmp_end_idx == -1, (
+            f"disagg send state must reset on retract; "
+            f"tmp_end_idx={r.req.tmp_end_idx}"
+        )
 
         t.continue_generation()
         yield from run_until_finished(r)
