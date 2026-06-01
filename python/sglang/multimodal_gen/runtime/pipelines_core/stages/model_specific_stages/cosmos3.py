@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_world_group,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -614,7 +615,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
-            disable=batch.is_warmup,
+            disable=batch.is_warmup or get_world_group().local_rank != 0,
         )
 
         for i, t in progress_bar:
