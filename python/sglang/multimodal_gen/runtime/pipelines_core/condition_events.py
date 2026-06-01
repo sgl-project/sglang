@@ -19,6 +19,13 @@ class ControlSignal:
 
 
 @dataclass(frozen=True)
+class ControlStateTransition:
+    payload: Any
+    timestamp_ms: int | None = None
+    seq_id: int | None = None
+
+
+@dataclass(frozen=True)
 class ConditionEvent:
     """transport envelope for one or more same-kind control signals"""
 
@@ -197,3 +204,88 @@ class ConditionEventQueue:
             chunk.append(signal.payload)
             self._last_payloads[kind] = signal.payload
             self._last_sampled_seq_ids[kind] = signal.seq_id
+
+
+class ControlStateSamplingQueue:
+    """state-based control sampler for realtime inputs"""
+
+    def __init__(
+        self,
+        *,
+        default_item: Any,
+        min_pulse_items: int = 1,
+        max_transitions: int = 512,
+    ) -> None:
+        self.default_item = default_item
+        self.min_pulse_items = min_pulse_items
+        self._pending: deque[ControlStateTransition] = deque(maxlen=max_transitions)
+        self._current_item = default_item
+        self._current_seq_id: int | None = None
+        self._latest_sampled_seq_id: int | None = None
+
+    def clear(self) -> None:
+        self._pending.clear()
+        self._current_item = self.default_item
+        self._current_seq_id = None
+        self._latest_sampled_seq_id = None
+
+    def push(self, transition: ControlStateTransition) -> None:
+        self._pending.append(transition)
+
+    def push_many(self, transitions: Sequence[ControlStateTransition]) -> None:
+        for transition in transitions:
+            self.push(transition)
+
+    def sample_chunk(self, chunk_size: int) -> list[Any] | None:
+        if chunk_size <= 0:
+            return None
+
+        transitions = self._drain_pending()
+        if not transitions:
+            self._latest_sampled_seq_id = self._current_seq_id
+            return [self._copy_item(self._current_item) for _ in range(chunk_size)]
+
+        pulse = self._latest_non_default_transition(transitions)
+        final = transitions[-1]
+        self._current_item = final.payload
+        self._current_seq_id = final.seq_id
+
+        if pulse is not None and pulse.payload != final.payload:
+            pulse_items = min(self.min_pulse_items, chunk_size)
+            chunk = [self._copy_item(pulse.payload) for _ in range(pulse_items)]
+            chunk.extend(
+                self._copy_item(final.payload)
+                for _ in range(chunk_size - pulse_items)
+            )
+            self._latest_sampled_seq_id = (
+                final.seq_id if len(chunk) > pulse_items else pulse.seq_id
+            )
+            return chunk
+
+        self._latest_sampled_seq_id = final.seq_id
+        return [self._copy_item(final.payload) for _ in range(chunk_size)]
+
+    def latest_sampled_seq_id(self) -> int | None:
+        return self._latest_sampled_seq_id
+
+    def _drain_pending(self) -> list[ControlStateTransition]:
+        transitions = list(self._pending)
+        self._pending.clear()
+        return transitions
+
+    def _latest_non_default_transition(
+        self,
+        transitions: Sequence[ControlStateTransition],
+    ) -> ControlStateTransition | None:
+        for transition in reversed(transitions):
+            if transition.payload != self.default_item:
+                return transition
+        return None
+
+    @staticmethod
+    def _copy_item(item: Any) -> Any:
+        if isinstance(item, list):
+            return list(item)
+        if isinstance(item, dict):
+            return dict(item)
+        return item

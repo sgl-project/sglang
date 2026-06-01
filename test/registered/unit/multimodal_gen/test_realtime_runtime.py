@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -31,6 +32,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.condition_events import (
     ConditionEventQueue,
     ConditionSamplingParams,
     ControlSignal,
+    ControlStateSamplingQueue,
+    ControlStateTransition,
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
@@ -80,6 +83,23 @@ class _State(BaseRealtimeState):
 
     def dispose(self) -> None:
         self.disposed = True
+
+
+def test_realtime_webui_presets_do_not_emit_camera_scripts():
+    repo_root = Path(__file__).parents[4]
+    app_js = (
+        repo_root
+        / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
+    ).read_text()
+    index_html = (
+        repo_root
+        / "python/sglang/multimodal_gen/apps/realtime_webui/index.html"
+    ).read_text()
+
+    assert "preset.actions" not in app_js
+    assert "repeatActions" not in app_js
+    assert 'id="eventFrames"' not in index_html
+    assert "ControlStateController" in app_js
 
 
 def test_realtime_session_cache_reuses_and_releases_state():
@@ -316,13 +336,48 @@ def test_condition_event_queue_empty_event_switches_to_default_item():
     assert chunk == [[], [], []]
 
 
+def test_control_state_sampling_queue_preserves_short_pulse():
+    queue = ControlStateSamplingQueue(default_item=[], min_pulse_items=1)
+    queue.push(ControlStateTransition(payload=["w"], seq_id=7))
+    queue.push(ControlStateTransition(payload=[], seq_id=8))
+
+    chunk = queue.sample_chunk(3)
+
+    assert chunk == [["w"], [], []]
+    assert queue.latest_sampled_seq_id() == 8
+    assert queue.sample_chunk(3) == [[], [], []]
+
+
+def test_control_state_sampling_queue_holds_current_state_without_backlog():
+    queue = ControlStateSamplingQueue(default_item=[], min_pulse_items=1)
+    queue.push(ControlStateTransition(payload=["w"], seq_id=7))
+
+    assert queue.sample_chunk(3) == [["w"], ["w"], ["w"]]
+    assert queue.latest_sampled_seq_id() == 7
+    assert queue.sample_chunk(3) == [["w"], ["w"], ["w"]]
+    assert queue.latest_sampled_seq_id() == 7
+
+
+def test_control_state_sampling_queue_compacts_many_transitions():
+    queue = ControlStateSamplingQueue(default_item=[], min_pulse_items=1)
+    queue.push(ControlStateTransition(payload=["w"], seq_id=7))
+    queue.push(ControlStateTransition(payload=["w", "d"], seq_id=8))
+    queue.push(ControlStateTransition(payload=["d"], seq_id=9))
+
+    chunk = queue.sample_chunk(3)
+
+    assert chunk == [["d"], ["d"], ["d"]]
+    assert queue.latest_sampled_seq_id() == 9
+
+
 def test_lingbot_realtime_state_uses_generic_condition_queue():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
     assert state.sample_camera_actions(3) == [[], [], []]
     state.receive_camera_actions([["w"], ["a"], ["s"], ["d"]])
     assert state.sample_camera_actions(3) == [["w"], ["a"], ["s"]]
-    assert state.sample_camera_actions(3) == [["d"], ["d"], ["d"]]
+    assert state.sample_camera_actions(3) == [["d"], [], []]
+    assert state.sample_camera_actions(3) == [[], [], []]
 
     state.receive_prompt("turn left")
     assert state.has_prompt()
@@ -333,12 +388,41 @@ def test_lingbot_realtime_state_uses_generic_condition_queue():
 def test_lingbot_realtime_camera_events_preserve_short_presses():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
-    state.receive_camera_actions([["w"]], event_id=7)
-    state.receive_camera_actions([[]], event_id=8)
+    state.receive_camera_state(["w"], event_id=7)
+    state.receive_camera_state([], event_id=8)
 
     assert state.sample_camera_actions(3) == [["w"], [], []]
     assert state.latest_sampled_event_id == 8
     assert state.sample_camera_actions(3) == [[], [], []]
+
+
+def test_lingbot_realtime_camera_state_holds_until_release():
+    state = lingbot_realtime.LingBotWorldRealtimeState()
+
+    state.receive_camera_state(["w"], event_id=7)
+
+    assert state.sample_camera_actions(3) == [["w"], ["w"], ["w"]]
+    assert state.latest_sampled_event_id == 7
+    assert state.sample_camera_actions(3) == [["w"], ["w"], ["w"]]
+
+    state.receive_camera_state([], event_id=8)
+
+    assert state.sample_camera_actions(3) == [[], [], []]
+    assert state.latest_sampled_event_id == 8
+
+
+def test_lingbot_realtime_camera_state_compacts_multiple_pending_updates():
+    state = lingbot_realtime.LingBotWorldRealtimeState()
+    state.receive_camera_state_transitions(
+        [
+            ControlStateTransition(payload=["w"], seq_id=7),
+            ControlStateTransition(payload=["w", "d"], seq_id=8),
+            ControlStateTransition(payload=["d"], seq_id=9),
+        ]
+    )
+
+    assert state.sample_camera_actions(3) == [["d"], ["d"], ["d"]]
+    assert state.latest_sampled_event_id == 9
 
 
 def test_lingbot_realtime_adapter_ingests_generic_events():
@@ -361,13 +445,40 @@ def test_lingbot_realtime_adapter_ingests_generic_events():
 
     assert (
         adapter.ingest_event(session, camera_event)
-        == "kind=camera_actions, frames=2"
+        == "kind=camera_actions, mode=script, frames=2"
     )
     assert adapter.ingest_event(session, prompt_event) == "kind=prompt, prompt_len=9"
     state = adapter._state(session)
-    assert state.sample_camera_actions(3) == [["w"], ["d"], ["d"]]
+    assert state.sample_camera_actions(3) == [["w"], ["d"], []]
     assert state.sample_prompt() == "turn left"
     assert state.latest_sampled_event_id == 8
+
+
+def test_lingbot_realtime_adapter_ingests_state_camera_events():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+
+    camera_event = RealtimeEvent(
+        type="event",
+        kind="camera_actions",
+        payload={
+            "mode": "state",
+            "transitions": [
+                {"actions": ["w"], "client_ts_ms": 100},
+                {"actions": [], "client_ts_ms": 120},
+            ],
+        },
+        event_id=11,
+    )
+
+    assert (
+        adapter.ingest_event(session, camera_event)
+        == "kind=camera_actions, mode=state, transitions=2"
+    )
+    state = adapter._state(session)
+    assert state.sample_camera_actions(3) == [["w"], [], []]
+    assert state.latest_sampled_event_id == 11
 
 
 def test_generate_session_tracks_active_chunk_context():
@@ -563,7 +674,7 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
         )
     )
     state = adapter._state(session)
-    state.receive_camera_actions([["w"], ["d"]], event_id=11)
+    state.receive_camera_state(["w"], event_id=11)
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
             dit_config=SimpleNamespace(
@@ -609,10 +720,10 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     assert seen["request_id"] == chunk.request_id
     assert seen["kwargs"]["prompt"] == "walk forward"
     assert seen["kwargs"]["condition_inputs"] == {
-        "camera_actions": [["w"], ["d"], ["d"]]
+        "camera_actions": [["w"], ["w"], ["w"]]
     }
     assert batch.request_id == chunk.request_id
-    assert batch.condition_inputs == {"camera_actions": [["w"], ["d"], ["d"]]}
+    assert batch.condition_inputs == {"camera_actions": [["w"], ["w"], ["w"]]}
     assert batch.realtime_chunk_size == 3
     assert batch.session is session.realtime_session
     assert batch.realtime_session_id == session.id
@@ -638,7 +749,8 @@ def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():
     asyncio.run(adapter.on_init(session, request))
 
     assert state.sample_camera_actions(3) == [["w"], ["d"], ["a"]]
-    assert state.sample_camera_actions(3) == [["s"], ["s"], ["s"]]
+    assert state.sample_camera_actions(3) == [["s"], [], []]
+    assert state.sample_camera_actions(3) == [[], [], []]
 
 
 def test_realtime_video_request_accepts_raw_lossless_output_format():

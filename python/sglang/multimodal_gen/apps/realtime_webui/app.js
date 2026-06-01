@@ -13,6 +13,7 @@ const LOW_LATENCY_FPS_FLOOR = 10;
 const LOW_LATENCY_QUEUE_SECONDS = 0.35;
 const MAX_CATCHUP_FPS = 30;
 const EVENT_QUEUE_SECONDS = 0.25;
+const CONTROL_BUFFERED_AMOUNT_LIMIT = 1 << 20;
 const CONTROL_KEY_ACTIONS = new Map([
   ["w", "w"],
   ["a", "a"],
@@ -45,13 +46,13 @@ const CONTROL_ACTION_META = {
 };
 
 const presets = [
-  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth first-person dolly toward the castle, natural parallax, stable fantasy scene detail.", actions: [["w"], ["w"], ["w"], ["w"], ["w"], ["w"], [], []], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
-  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", actions: [["j"], ["j"], [], ["l"], ["l"], [], ["i"], ["k"]], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
-  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 16, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", actions: [["i"], ["i"], ["w"], ["w"], ["d"], [], ["j"], []], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
-  { name: "Lake Scout", tone: "green", size: "832x480", fps: 16, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", actions: [["w"], ["w"], ["d"], ["d"], ["w", "l"], ["w"], ["a"], []], referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
-  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 16, prompt: "A slow aerial orbit around a pastel floating island hotel in the open ocean, hazy sunlight, turquoise water, toy-like architectural detail, clean horizon, cinematic but playful.", actions: [["w"], ["d"], ["d"], ["l"], ["l"], [], ["i"], []], referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
-  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 16, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", actions: [[], ["w"], ["w"], ["j"], [], ["l"], [], []], referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
-  { name: "Kid A", tone: "accent", size: "832x480", fps: 16, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", actions: [["d"], ["d"], ["l"], [], ["w"], ["w"], ["j"], []], referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
+  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth first-person dolly toward the castle, natural parallax, stable fantasy scene detail.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
+  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
+  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 16, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
+  { name: "Lake Scout", tone: "green", size: "832x480", fps: 16, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
+  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 16, prompt: "A slow aerial orbit around a pastel floating island hotel in the open ocean, hazy sunlight, turquoise water, toy-like architectural detail, clean horizon, cinematic but playful.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
+  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 16, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
+  { name: "Kid A", tone: "accent", size: "832x480", fps: 16, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
 ];
 
 let ws = null;
@@ -88,7 +89,7 @@ let socketHadError = false;
 let socketCloseExpected = false;
 let socketServerError = "";
 const decodeRequests = new Map();
-const activeControlActions = new Set();
+let controlStateController = null;
 
 const canvas = $("viewport");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -140,8 +141,7 @@ function resetStreamStats() {
   chunkReceiveStartedAt = 0;
   currentReceiveChunk = null;
   currentReceiveChunkFrames = 0;
-  activeControlActions.clear();
-  lastControlKeySentAt = 0;
+  controlStateController?.reset({ sendRelease: false });
   resetDecoderState();
   updateStats();
   $("renderFps").textContent = "0";
@@ -542,21 +542,39 @@ function showError(error) {
   addHistory(error.message || "reference load failed");
 }
 
-function closeSession(reason = "session closed by client", clearFrames = true) {
+function abortCurrentSession(reason = "session closed by client", {
+  clearFrames = true,
+  expectedClose = true,
+  keepConnectDisabled = false,
+} = {}) {
+  const socket = ws;
+  ws = null;
+  streamEpoch++;
   clearQueueOnClose = clearFrames;
-  socketCloseExpected = true;
+  socketCloseExpected = expectedClose;
+  controlStateController?.reset({ sendRelease: false });
+  pendingHeader = null;
+  rejectPendingDecodes("session aborted");
+  resetDecoderState();
   if (clearFrames) {
     queue = [];
     updateStats();
   }
-  if (!ws) {
+  if (!socket) {
     clearQueueOnClose = false;
+    if (!keepConnectDisabled) $("connectBtn").disabled = false;
     setStatus("Closed");
-    return;
+    return null;
   }
-  setStatus("Closing");
+  if (!keepConnectDisabled) $("connectBtn").disabled = false;
+  setStatus(expectedClose ? "Closing" : "Aborting");
   addHistory(reason);
-  ws.close(1000, "client close");
+  socket.close(expectedClose ? 1000 : 1011, reason.slice(0, 120));
+  return socket;
+}
+
+function closeSession(reason = "session closed by client", clearFrames = true) {
+  abortCurrentSession(reason, { clearFrames, expectedClose: true });
 }
 
 function waitForSocketClose(socket, timeoutMs = RECONNECT_CLOSE_TIMEOUT_MS) {
@@ -577,18 +595,19 @@ function waitForSocketClose(socket, timeoutMs = RECONNECT_CLOSE_TIMEOUT_MS) {
 }
 
 async function connect() {
-  const epoch = ++streamEpoch;
   $("connectBtn").disabled = true;
   setStatus("Preparing");
   addHistory("preparing session");
   try {
     if (ws && ws.readyState !== WebSocket.CLOSED) {
-      socketCloseExpected = true;
       setStatus("Replacing");
-      addHistory("closing previous socket before reconnect");
-      await waitForSocketClose(ws);
+      const oldSocket = abortCurrentSession("closing previous socket before reconnect", {
+        keepConnectDisabled: true,
+      });
+      await waitForSocketClose(oldSocket);
     }
     resetStreamStats();
+    const epoch = ++streamEpoch;
     if (!$("firstFrame").files[0] && !selectedReferenceBytes) {
       await setPresetReference(presets[0]);
     }
@@ -621,23 +640,27 @@ async function connect() {
       first_frame: firstFrame,
       ...previewTransportParams,
     });
-    ws = new WebSocket($("serverUrl").value);
-    ws.binaryType = "arraybuffer";
+    document.activeElement?.blur?.();
+    canvas.tabIndex = 0;
+    canvas.focus();
+    const socket = new WebSocket($("serverUrl").value);
+    ws = socket;
+    socket.binaryType = "arraybuffer";
     socketHadError = false;
     socketCloseExpected = false;
     socketServerError = "";
-    ws.onopen = () => {
+    socket.onopen = () => {
       if (epoch !== streamEpoch) return;
       chunkWaitStartedAt = performance.now();
-      ws.send(pack(init));
+      socket.send(pack(init));
       setStatus("Starting", "live");
       addHistory(
         `session started with ${selectedReferenceLabel || "uploaded reference"}`
       );
     };
-    ws.onclose = (event) => {
+    socket.onclose = (event) => {
       if (epoch !== streamEpoch) return;
-      ws = null;
+      if (ws === socket) ws = null;
       $("connectBtn").disabled = false;
       if (clearQueueOnClose) {
         queue = [];
@@ -659,14 +682,14 @@ async function connect() {
       }
       socketCloseExpected = false;
     };
-    ws.onerror = () => {
+    socket.onerror = () => {
       if (epoch !== streamEpoch) return;
       if (!socketCloseExpected) {
         socketHadError = true;
         $("connectBtn").disabled = false;
       }
     };
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
       receiveChain = receiveChain
         .then(() => {
           if (epoch !== streamEpoch) return undefined;
@@ -676,6 +699,10 @@ async function connect() {
           if (epoch !== streamEpoch) return;
           setStatus("Receive failed", "error");
           addHistory(error.message || "receive failed");
+          abortCurrentSession(error.message || "receive failed", {
+            clearFrames: false,
+            expectedClose: false,
+          });
         });
     };
   } catch (error) {
@@ -763,7 +790,7 @@ function updatePlaybackPace(header, now, frameCount) {
 function sendEvent(kind, payload, historyText = null) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     addHistory(`${historyText || `${kind} event`} · socket not open`);
-    return;
+    return null;
   }
   const eventId = nextEventId++;
   ws.send(pack({ type: "event", kind, payload, event_id: eventId }));
@@ -775,16 +802,23 @@ function sendEvent(kind, payload, historyText = null) {
     setStatus("Updating", "live");
   }
   addHistory(`${historyText || `${kind} event sent`} · event#${eventId}`);
+  return eventId;
 }
 
-function sendCameraControl(actions, frameCount = 1) {
-  const payload = repeatActions([actions], frameCount);
-  sendEvent("camera_actions", payload, describeCameraEvent(actions, payload.length));
-}
-
-function repeatActions(actions, frameCount) {
-  const n = Math.max(1, Number(frameCount || $("eventFrames").value || 3));
-  return Array.from({ length: n }, (_, i) => actions[i % actions.length] || []);
+function sendCameraControlTransitions(transitions) {
+  if (!transitions.length) return null;
+  const payload = {
+    mode: "state",
+    transitions: transitions.map((transition) => ({
+      actions: transition.actions,
+      client_ts_ms: transition.clientTsMs,
+    })),
+  };
+  return sendEvent(
+    "camera_actions",
+    payload,
+    describeCameraStateEvent(transitions),
+  );
 }
 
 async function applyPreset(preset, options = {}) {
@@ -797,40 +831,19 @@ async function applyPreset(preset, options = {}) {
   await setPresetReference(preset);
   if (sendRuntimeEvents) {
     sendEvent("prompt", preset.prompt, `prompt update · ${preset.name}`);
-    const payload = repeatActions(preset.actions, 24);
-    sendEvent(
-      "camera_actions",
-      payload,
-      describeCameraScript(preset.name, preset.actions, payload.length),
-    );
   }
   addHistory(`preset ${preset.name}`);
 }
 
-function describeCameraEvent(actions, samples) {
-  const parts =
-    actions.map((action) => describeControlAction(action, samples)).join(" + ") ||
-    "No-op";
-  return `camera · ${parts} · duration=${samples} frames`;
+function describeCameraStateEvent(transitions) {
+  const parts = transitions
+    .map((transition) => describeControlActions(transition.actions))
+    .join(" -> ");
+  return `camera state · ${parts} · transitions=${transitions.length}`;
 }
 
-function describeCameraScript(name, script, samples) {
-  const actionCounts = countRepeatedActions(script, samples);
-  const parts =
-    Array.from(actionCounts.entries())
-      .map(([action, count]) => describeControlAction(action, count))
-      .join(" + ") ||
-    "No-op";
-  return `camera preset · ${name} · ${parts} · duration=${samples} frames`;
-}
-
-function countRepeatedActions(script, samples) {
-  const counts = new Map();
-  for (let i = 0; i < samples; i++) {
-    const actions = script[i % script.length] || [];
-    actions.forEach((action) => counts.set(action, (counts.get(action) || 0) + 1));
-  }
-  return counts;
+function describeControlActions(actions) {
+  return actions.map((action) => describeControlAction(action)).join(" + ") || "No-op";
 }
 
 function describeControlAction(action, samples = 1) {
@@ -978,23 +991,15 @@ document.querySelectorAll("button").forEach((btn) => {
 });
 document.querySelectorAll("[data-action]").forEach((btn) => {
   const action = btn.dataset.action;
-  const press = (event) => {
+  btn.addEventListener("pointerdown", (event) => {
     event.preventDefault();
-    if (activeControlActions.has(action)) return;
-    activeControlActions.add(action);
-    setControlButtonActive(action, true);
-    sendActiveControlState();
-  };
-  const release = (event) => {
-    event.preventDefault();
-    if (!activeControlActions.has(action)) return;
-    activeControlActions.delete(action);
-    setControlButtonActive(action, false);
-    sendActiveControlState();
-  };
-  btn.addEventListener("pointerdown", press);
+    controlStateController.setAction(action, true);
+  });
   ["pointerup", "pointercancel", "pointerleave", "blur"].forEach((eventName) => {
-    btn.addEventListener(eventName, release);
+    btn.addEventListener(eventName, (event) => {
+      event.preventDefault();
+      controlStateController.setAction(action, false);
+    });
   });
 });
 
@@ -1006,10 +1011,6 @@ function keyboardAction(event) {
   return CONTROL_KEY_ACTIONS.get(event.key.toLowerCase()) || null;
 }
 
-function sendActiveControlState() {
-  sendCameraControl(Array.from(activeControlActions), 1);
-}
-
 function setControlButtonActive(action, active) {
   document.querySelectorAll(`[data-action="${action}"]`).forEach((btn) => {
     btn.classList.toggle("is-key-active", active);
@@ -1017,15 +1018,109 @@ function setControlButtonActive(action, active) {
   });
 }
 
+class ControlStateController {
+  constructor() {
+    this.activeActions = new Set();
+    this.pendingTransitions = [];
+    this.flushScheduled = false;
+  }
+
+  reset({ sendRelease = false } = {}) {
+    const hadActions = this.activeActions.size > 0;
+    this.activeActions.clear();
+    this.pendingTransitions = [];
+    this.flushScheduled = false;
+    this.updateButtons();
+    if (sendRelease && hadActions) {
+      this.enqueueTransition();
+    }
+  }
+
+  setAction(action, active) {
+    const hadAction = this.activeActions.has(action);
+    if (active === hadAction) return;
+    if (active) {
+      this.activeActions.add(action);
+    } else {
+      this.activeActions.delete(action);
+    }
+    this.updateButtons();
+    this.enqueueTransition();
+  }
+
+  releaseAll() {
+    this.reset({ sendRelease: true });
+  }
+
+  enqueueTransition() {
+    const actions = Array.from(this.activeActions).sort();
+    const last = this.pendingTransitions[this.pendingTransitions.length - 1];
+    if (last && this.sameActions(last.actions, actions)) return;
+    this.pendingTransitions.push({
+      actions,
+      clientTsMs: Math.round(performance.now()),
+    });
+    this.compactPendingIfNeeded();
+    this.scheduleFlush();
+  }
+
+  scheduleFlush() {
+    if (this.flushScheduled) return;
+    this.flushScheduled = true;
+    queueMicrotask(() => {
+      this.flushScheduled = false;
+      this.flush();
+    });
+  }
+
+  flush() {
+    if (!this.pendingTransitions.length) return;
+    if (ws && ws.bufferedAmount > CONTROL_BUFFERED_AMOUNT_LIMIT) {
+      this.compactPendingToLatestPulse();
+    }
+    const transitions = this.pendingTransitions;
+    this.pendingTransitions = [];
+    sendCameraControlTransitions(transitions);
+  }
+
+  compactPendingIfNeeded() {
+    if (this.pendingTransitions.length <= 8) return;
+    this.compactPendingToLatestPulse();
+  }
+
+  compactPendingToLatestPulse() {
+    const final = this.pendingTransitions[this.pendingTransitions.length - 1];
+    const latestPulse = [...this.pendingTransitions]
+      .reverse()
+      .find((transition) => transition.actions.length > 0);
+    if (latestPulse && !this.sameActions(latestPulse.actions, final.actions)) {
+      this.pendingTransitions = [latestPulse, final];
+    } else {
+      this.pendingTransitions = [final];
+    }
+  }
+
+  updateButtons() {
+    CONTROL_ACTION_META_KEYS.forEach((action) => {
+      setControlButtonActive(action, this.activeActions.has(action));
+    });
+  }
+
+  sameActions(left, right) {
+    return left.length === right.length && left.every((item, idx) => item === right[idx]);
+  }
+}
+
+const CONTROL_ACTION_META_KEYS = Object.keys(CONTROL_ACTION_META);
+controlStateController = new ControlStateController();
+
 document.addEventListener("keydown", (event) => {
   if (isTypingTarget(event.target)) return;
   const action = keyboardAction(event);
   if (!action) return;
   event.preventDefault();
-  setControlButtonActive(action, true);
-  if (activeControlActions.has(action)) return;
-  activeControlActions.add(action);
-  sendActiveControlState();
+  if (event.repeat) return;
+  controlStateController.setAction(action, true);
 });
 
 document.addEventListener("keyup", (event) => {
@@ -1033,8 +1128,15 @@ document.addEventListener("keyup", (event) => {
   const action = keyboardAction(event);
   if (!action) return;
   event.preventDefault();
-  setControlButtonActive(action, false);
-  if (!activeControlActions.has(action)) return;
-  activeControlActions.delete(action);
-  sendActiveControlState();
+  controlStateController.setAction(action, false);
+});
+
+window.addEventListener("blur", () => {
+  controlStateController.releaseAll();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    controlStateController.releaseAll();
+  }
 });
