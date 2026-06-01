@@ -369,14 +369,15 @@ class TestLifecycleBasic(ScriptedTestCase):
             final >= baseline - 1
         ), f"KV pool drift: baseline={baseline}, final={final}"
 
-    def test_engine_shutdown_during_chunked(self):
-        self.server.execute_script(self._script_engine_shutdown_during_chunked)
+    def test_abort_all_during_chunked(self):
+        self.server.execute_script(self._script_abort_all_during_chunked)
 
     @staticmethod
-    def _script_engine_shutdown_during_chunked(t: ScriptedContext):
+    def _script_abort_all_during_chunked(t: ScriptedContext):
+        # abort_all terminates an in-flight chunked req and releases its KV/row.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.shutdown()
+        t.abort_all()
 
         def _error_message(h):
             if h.req is None:
@@ -393,7 +394,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield
         else:
             raise AssertionError(
-                "chunked req did not terminate after shutdown within DEFAULT_MAX_STEPS"
+                "chunked req did not terminate after abort_all within DEFAULT_MAX_STEPS"
             )
         assert r.finished or _error_message(r) is not None
         assert r.kv_pages == 0
