@@ -16,11 +16,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
     GenerateSession,
     RealtimeChunkContext,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
-    get_realtime_model_adapter,
-)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RealtimeFrameSendStats,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
+    get_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timing import (
     RealtimeStageTimer,

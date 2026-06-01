@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from sglang.multimodal_gen.runtime.realtime.session import (
-    BaseRealtimeState,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.realtime.session import (
+    BaseRealtimeState,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -80,9 +80,7 @@ class RealtimeInputValidationStage(InputValidationStage):
             and batch.width in (None, state.width)
         )
 
-    def _cache_generator(
-        self, batch: Req, state: RealtimeInputValidationState
-    ) -> None:
+    def _cache_generator(self, batch: Req, state: RealtimeInputValidationState) -> None:
         state.generator = batch.generator
         state.seeds = batch.seeds
         state.generator_seed = batch.seed

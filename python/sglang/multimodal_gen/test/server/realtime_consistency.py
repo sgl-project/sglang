@@ -17,8 +17,8 @@ from msgpack import packb, unpackb
 from openai import Client
 
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     RAW_RGB_CONTENT_TYPE,
+    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
     restore_delta_gzip_raw_rgb_payload,
 )
@@ -205,7 +205,9 @@ def validate_realtime_perf_stats(
             )
         actual = summary[metric_name]
         if actual > threshold:
-            failures.append(f"{metric_name}: actual={actual:.2f}, limit={threshold:.2f}")
+            failures.append(
+                f"{metric_name}: actual={actual:.2f}, limit={threshold:.2f}"
+            )
 
     if failures:
         pytest.fail(
@@ -250,9 +252,7 @@ def decode_realtime_raw_rgb_frames(
         RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
         RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
     ):
-        raise ValueError(
-            f"Unsupported realtime frame content type: {content_type}"
-        )
+        raise ValueError(f"Unsupported realtime frame content type: {content_type}")
 
     width = int(header["width"])
     height = int(header["height"])

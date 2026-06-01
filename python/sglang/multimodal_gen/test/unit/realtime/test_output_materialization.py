@@ -4,11 +4,11 @@ import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     build_raw_rgb_frame_batches,

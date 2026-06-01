@@ -6,9 +6,6 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     unpatchify as wan_unpatchify,
 )
-from sglang.multimodal_gen.runtime.realtime.session import (
-    BaseRealtimeState,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     DecodingStage,
@@ -18,6 +15,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.realtime.session import (
+    BaseRealtimeState,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 

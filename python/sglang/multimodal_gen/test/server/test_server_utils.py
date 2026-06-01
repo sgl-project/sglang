@@ -34,8 +34,8 @@ from sglang.multimodal_gen.test.server.realtime_consistency import (
     collect_realtime_output,
     encode_realtime_frames_to_mp4,
     prepare_realtime_first_frame,
-    record_realtime_key_frames,
     realtime_ws_url,
+    record_realtime_key_frames,
     record_realtime_perf_stats,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (

@@ -17,12 +17,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.realtime_states import (
+    RealtimeCausalDiTState,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.realtime_states import (
-    RealtimeCausalDiTState,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -57,9 +57,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         self.causal_kv_cache = None
         self.crossattn_cache = None
 
-    def _get_lingbot_causal_kv_cache_size(
-        self, *, sequence_shard_enabled: bool
-    ) -> int:
+    def _get_lingbot_causal_kv_cache_size(self, *, sequence_shard_enabled: bool) -> int:
         if self.local_attn_size != -1:
             return self.local_attn_size * self.num_token_per_frame
 
@@ -88,9 +86,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             kv_cache_num_frames = pipeline_config.realtime_causal_kv_cache_num_frames
         if kv_cache_num_frames is not None:
             if kv_cache_num_frames <= 0:
-                raise ValueError(
-                    "realtime_causal_kv_cache_num_frames must be positive"
-                )
+                raise ValueError("realtime_causal_kv_cache_num_frames must be positive")
             self.sliding_window_num_frames = int(kv_cache_num_frames)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -161,9 +157,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             device=device,
             use_int_indices=True,
             sink_tokens=sink_tokens,
-            attention_window_size=self._get_causal_attention_window_size(
-                kv_cache_size
-            ),
+            attention_window_size=self._get_causal_attention_window_size(kv_cache_size),
             allow_growth=False,
         )
 

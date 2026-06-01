@@ -27,6 +27,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
+    CausalSelfAttentionKVCache,
+    CrossAttentionKVCache,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
@@ -60,10 +64,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
-    CausalSelfAttentionKVCache,
-    CrossAttentionKVCache,
-)
 from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
     CausalWanSelfAttention,
     CausalWanTransformer3DModel,

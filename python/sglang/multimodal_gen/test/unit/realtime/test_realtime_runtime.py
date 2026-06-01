@@ -7,19 +7,23 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
-    lingbot_world_realtime_adapter as lingbot_realtime,
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldCausalDMDConfig,
+    _actions_to_c2ws,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
     RealtimeVideoGenerationsRequest,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
-    GenerateSession,
-)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     realtime_output_adapter,
     realtime_video_api,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
+    lingbot_world_realtime_adapter as lingbot_realtime,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
+    GenerateSession,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
@@ -27,6 +31,24 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
+)
+from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
+    CrossAttentionKVCache,
+)
+from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
+    CausalLingBotWorldTransformer3DModel,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
+    LingBotWorldCausalDMDDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
+    RealtimeInputValidationStage,
+    RealtimeInputValidationState,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_vae import (
+    CausalVaeDecodingStage,
+    RealtimeVAEDecodeState,
 )
 from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ConditionEvent,
@@ -40,35 +62,13 @@ from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
     RealtimeSessionCache,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
-    LingBotWorldCausalDMDConfig,
-    _actions_to_c2ws,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
-    LingBotWorldCausalDMDDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
-    RealtimeInputValidationStage,
-    RealtimeInputValidationState,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_vae import (
-    CausalVaeDecodingStage,
-    RealtimeVAEDecodeState,
-)
-from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
-    CrossAttentionKVCache,
-)
-from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
-    CausalLingBotWorldTransformer3DModel,
-)
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     JPEG_FRAME_CONTENT_TYPE,
-    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     RAW_RGB_CONTENT_TYPE,
+    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     WEBP_FRAME_CONTENT_TYPE,
-    build_raw_rgb_frame_batches,
     build_delta_gzip_raw_rgb_payload,
+    build_raw_rgb_frame_batches,
     restore_delta_gzip_raw_rgb_payload,
 )
 
@@ -1453,8 +1453,9 @@ def test_sampling_params_apply_condition_inputs_to_req():
 
 
 def test_realtime_chunk_latent_preparation_uses_chunk_spec():
-    import torch
     from unittest.mock import patch
+
+    import torch
 
     from sglang.multimodal_gen.runtime.pipelines_core.stages import (
         RealtimeChunkLatentPreparationStage,

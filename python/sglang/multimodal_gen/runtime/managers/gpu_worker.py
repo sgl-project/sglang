@@ -52,11 +52,11 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     Req,
     build_pipeline,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSessionCache,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -562,8 +562,10 @@ class GPUWorker:
             dynamic_output_paths = None
 
         if dynamic_output_paths is not None:
+
             def build_output_path(idx: int) -> str:
                 return dynamic_output_paths[idx]
+
         else:
             num_outputs = len(output_batch.output)
 

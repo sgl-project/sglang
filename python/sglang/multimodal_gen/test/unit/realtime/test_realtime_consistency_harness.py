@@ -4,13 +4,13 @@ import asyncio
 import sys
 from types import SimpleNamespace
 
-from msgpack import packb, unpackb
 import numpy as np
 import pytest
+from msgpack import packb, unpackb
 
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     RAW_RGB_CONTENT_TYPE,
+    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
     build_delta_gzip_raw_rgb_payload,
 )
@@ -34,17 +34,13 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     LINGBOT_WORLD_REALTIME_sampling_params,
 )
 
-
 # Request construction
 
 
 def test_realtime_ws_url_uses_existing_openai_base_url():
     client = SimpleNamespace(base_url="http://127.0.0.1:30000/v1")
 
-    assert (
-        realtime_ws_url(client)
-        == "ws://127.0.0.1:30000/v1/realtime_video/generate"
-    )
+    assert realtime_ws_url(client) == "ws://127.0.0.1:30000/v1/realtime_video/generate"
 
 
 def test_realtime_init_payload_uses_sampling_params_and_extras():
@@ -106,10 +102,7 @@ def test_realtime_first_frame_accepts_url_or_file(tmp_path):
 
 
 def test_realtime_key_frames_are_selected_from_raw_websocket_frames():
-    frames = [
-        np.full((2, 2, 3), idx, dtype=np.uint8)
-        for idx in range(5)
-    ]
+    frames = [np.full((2, 2, 3), idx, dtype=np.uint8) for idx in range(5)]
 
     selected = select_realtime_key_frames(frames)
     assert [int(frame[0, 0, 0]) for frame in selected] == [0, 2, 4]

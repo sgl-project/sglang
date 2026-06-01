@@ -7,11 +7,11 @@ from typing import Any
 import torch  # type: ignore
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
@@ -678,12 +678,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         dtype=dtype,
                         device=device,
                     ),
-                    global_end_index=torch.zeros(
-                        1, dtype=torch.long, device=device
-                    ),
-                    local_end_index=torch.zeros(
-                        1, dtype=torch.long, device=device
-                    ),
+                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
                     global_end_index_int=int_index,
                     local_end_index_int=int_index,
                     cache_size=kv_cache_size,
@@ -860,7 +856,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
     def _initialize_kv_cache(self, batch_size, dtype, device) -> None:
         """
-            Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
+        Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
         """
         num_attention_heads = self.transformer.num_attention_heads
         attention_head_dim = self.transformer.attention_head_dim
@@ -873,16 +869,14 @@ class CausalDMDDenoisingStage(DenoisingStage):
             dtype=dtype,
             device=device,
             sink_tokens=self._get_causal_sink_tokens(),
-            attention_window_size=self._get_causal_attention_window_size(
-                kv_cache_size
-            ),
+            attention_window_size=self._get_causal_attention_window_size(kv_cache_size),
         )
 
     def _initialize_crossattn_cache(
         self, batch_size, max_text_len, dtype, device
     ) -> None:
         """
-            Initialize a Per-GPU cross-attention cache aligned with the Wan model assumptions.
+        Initialize a Per-GPU cross-attention cache aligned with the Wan model assumptions.
         """
         crossattn_cache = []
         num_attention_heads = self.transformer.num_attention_heads
