@@ -201,7 +201,7 @@ def _build_transport_payload(
     content_type: str,
     metadata: dict[str, int | str],
     output_format: str | None,
-    output_quality: int | None,
+    transport_quality: int | None,
     reference_frame: bytes | None,
     event_id: int | None,
 ) -> _TransportPayload:
@@ -219,7 +219,7 @@ def _build_transport_payload(
                 transport_frames[0],
                 width=int(metadata["width"]),
                 height=int(metadata["height"]),
-                quality=int(output_quality or WEBP_DEFAULT_QUALITY),
+                quality=int(transport_quality or WEBP_DEFAULT_QUALITY),
             )
             payload_content_type = WEBP_FRAME_CONTENT_TYPE
         else:
@@ -227,7 +227,7 @@ def _build_transport_payload(
                 transport_frames[0],
                 width=int(metadata["width"]),
                 height=int(metadata["height"]),
-                quality=int(output_quality or JPEG_DEFAULT_QUALITY),
+                quality=int(transport_quality or JPEG_DEFAULT_QUALITY),
             )
             payload_content_type = JPEG_FRAME_CONTENT_TYPE
         payload_metadata = {
@@ -324,7 +324,7 @@ class RawRGBRealtimeOutputAdapter:
             event_id=getattr(batch, "realtime_event_id", None),
             frame_metadata=frame_metadata,
             output_format=output_format,
-            output_quality=getattr(batch, "output_compression", None),
+            transport_quality=getattr(batch, "output_compression", None),
         )
         stats["frame_shape"] = _frame_shape_from_metadata(frame_metadata)
         return stats
@@ -340,7 +340,7 @@ class RawRGBRealtimeOutputAdapter:
         event_id: int | None = None,
         frame_metadata: dict[str, int | str] | None = None,
         output_format: str | None = None,
-        output_quality: int | None = None,
+        transport_quality: int | None = None,
     ) -> RealtimeFrameSendStats:
         chunk_index = chunk_index_start
         metadata = frame_metadata or {}
@@ -374,7 +374,7 @@ class RawRGBRealtimeOutputAdapter:
                         content_type=content_type,
                         metadata=metadata,
                         output_format=output_format,
-                        output_quality=output_quality,
+                        transport_quality=transport_quality,
                         reference_frame=reference_frame,
                         event_id=event_id,
                     )
@@ -384,7 +384,7 @@ class RawRGBRealtimeOutputAdapter:
                         content_type=content_type,
                         metadata=metadata,
                         output_format=output_format,
-                        output_quality=output_quality,
+                        transport_quality=transport_quality,
                         reference_frame=reference_frame,
                         event_id=event_id,
                     )

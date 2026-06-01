@@ -45,6 +45,10 @@ _ACTIVE_SESSION_WAIT_SECONDS = 15.0
 _ACTIVE_SESSION_WAIT_INTERVAL_SECONDS = 0.1
 
 
+def _transport_ms(value: float) -> int:
+    return max(0, int(value + 0.5))
+
+
 async def _wait_for_active_session_slot(
     *,
     timeout_s: float = _ACTIVE_SESSION_WAIT_SECONDS,
@@ -113,13 +117,15 @@ async def _send_realtime_chunk_stats(
                 "request_id": chunk.request_id,
                 "chunk_index": batch.block_idx,
                 "event_id": getattr(batch, "realtime_event_id", None),
-                "request_prepare_ms": request_prepare_ms,
-                "scheduler_forward_ms": scheduler_forward_ms,
-                "header_write_ms": send_stats["header_write_ms"],
-                "raw_payload_build_ms": send_stats["raw_payload_build_ms"],
-                "raw_write_ms": send_stats["raw_write_ms"],
-                "ws_write_ms": send_stats["ws_write_ms"],
-                "chunk_total_ms": chunk_total_ms,
+                "request_prepare_ms": _transport_ms(request_prepare_ms),
+                "scheduler_forward_ms": _transport_ms(scheduler_forward_ms),
+                "header_write_ms": _transport_ms(send_stats["header_write_ms"]),
+                "raw_payload_build_ms": _transport_ms(
+                    send_stats["raw_payload_build_ms"]
+                ),
+                "raw_write_ms": _transport_ms(send_stats["raw_write_ms"]),
+                "ws_write_ms": _transport_ms(send_stats["ws_write_ms"]),
+                "chunk_total_ms": _transport_ms(chunk_total_ms),
                 "num_batches": send_stats["num_batches"],
                 "num_frames": send_stats["num_frames"],
                 "raw_bytes": send_stats["raw_bytes"],

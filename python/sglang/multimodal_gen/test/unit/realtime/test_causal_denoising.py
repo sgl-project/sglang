@@ -339,7 +339,7 @@ def test_causal_cache_helpers_reset_and_forward_model_specific_kwargs():
     ]
 
 
-def test_causal_kv_cache_block_supports_dict_access_and_in_place_reset():
+def test_causal_kv_cache_block_resets_indices_in_place():
     stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
     k = torch.ones(1, 4, 2, 3)
     v = torch.ones(1, 4, 2, 3)
@@ -354,10 +354,10 @@ def test_causal_kv_cache_block_supports_dict_access_and_in_place_reset():
         local_end_index_int=4,
     )
 
-    assert cache["k"] is k
-    assert cache.get("global_end_index_int") == 7
+    assert cache.k is k
+    assert cache.global_end_index_int == 7
     detached_k = k.detach()
-    cache["k"] = detached_k
+    cache.k = detached_k
     assert cache.k is detached_k
 
     stage._reset_kv_cache([cache])
@@ -476,17 +476,17 @@ def test_causal_kv_cache_update_grows_without_rolling_when_enabled():
     assert view.k.flatten().tolist() == [1.0, 2.0, 3.0, 4.0]
 
 
-def test_crossattn_cache_block_supports_dict_access_and_reset():
+def test_crossattn_cache_block_stores_detached_tensors_and_resets():
     stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
     stage.num_transformer_blocks = 1
     k = torch.ones(1, 8, 2, 3)
     v = torch.ones(1, 8, 2, 3)
     cache = CrossAttentionKVCache(k=k, v=v, is_init=True)
 
-    assert cache["k"] is k
-    assert cache.get("is_init") is True
+    assert cache.k is k
+    assert cache.is_init is True
     detached_v = v.detach()
-    cache["v"] = detached_v
+    cache.v = detached_v
     assert cache.v is detached_v
     new_k = torch.full_like(k, 2.0, requires_grad=True)
     new_v = torch.full_like(v, 3.0, requires_grad=True)

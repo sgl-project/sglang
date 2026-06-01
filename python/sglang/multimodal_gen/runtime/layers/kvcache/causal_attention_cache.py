@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
 
 import torch
 
@@ -34,45 +33,11 @@ class CausalSelfAttentionKVCache:
     attention_window_size: int = 0
     allow_growth: bool = False
 
-    _FIELD_NAMES: ClassVar[frozenset[str]] = frozenset(
-        {
-            "k",
-            "v",
-            "global_end_index",
-            "local_end_index",
-            "global_end_index_int",
-            "local_end_index_int",
-            "cache_size",
-            "sink_tokens",
-            "attention_window_size",
-            "allow_growth",
-        }
-    )
-
     def __post_init__(self) -> None:
         if self.cache_size == 0:
             self.cache_size = self.k.shape[1]
         if self.attention_window_size == 0:
             self.attention_window_size = self.cache_size
-
-    def __getitem__(self, key: str) -> Any:
-        if key not in self._FIELD_NAMES:
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key not in self._FIELD_NAMES:
-            raise KeyError(key)
-        setattr(self, key, value)
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._FIELD_NAMES and getattr(self, key) is not None
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if key not in self._FIELD_NAMES:
-            return default
-        value = getattr(self, key)
-        return default if value is None else value
 
     def reset_indices(self) -> None:
         self.global_end_index.zero_()
@@ -263,26 +228,6 @@ class CrossAttentionKVCache:
     k: torch.Tensor
     v: torch.Tensor
     is_init: bool = False
-
-    _FIELD_NAMES: ClassVar[frozenset[str]] = frozenset({"k", "v", "is_init"})
-
-    def __getitem__(self, key: str) -> Any:
-        if key not in self._FIELD_NAMES:
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key not in self._FIELD_NAMES:
-            raise KeyError(key)
-        setattr(self, key, value)
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._FIELD_NAMES
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if key not in self._FIELD_NAMES:
-            return default
-        return getattr(self, key)
 
     def store(self, k: torch.Tensor, v: torch.Tensor) -> None:
         self.k = k.detach()

@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -50,6 +52,25 @@ class CausalDMDForwardContext:
     num_frames: int
     height: int
     width: int
+
+
+@dataclass(slots=True)
+class CausalDMDCachePolicy:
+    sequence_shard_enabled: bool
+    num_attention_heads: int
+    expected_cache_tokens: int
+    expected_sink_tokens: int
+    kv_cache_kwargs: dict[str, Any]
+
+
+@dataclass(slots=True)
+class CausalDMDRealtimeCacheContext:
+    cache_state: RealtimeCausalDiTState
+    persist_state: bool
+    kv_cache: list[CausalSelfAttentionKVCache]
+    crossattn_cache: list[CrossAttentionKVCache]
+    current_start_frame: int
+    chunk_idx: int
 
 
 class CausalDMDDenoisingStage(DenoisingStage):
@@ -213,6 +234,205 @@ class CausalDMDDenoisingStage(DenoisingStage):
             height=h,
             width=w,
         )
+
+    def _apply_causal_cache_overrides(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        pipeline_config = server_args.pipeline_config
+        sink_size = getattr(batch, "realtime_causal_sink_size", None)
+        if sink_size is None:
+            sink_size = getattr(pipeline_config, "realtime_causal_sink_size", None)
+        if sink_size is not None:
+            if sink_size < 0:
+                raise ValueError("realtime_causal_sink_size must be non-negative")
+            self.sink_size = int(sink_size)
+
+        kv_cache_num_frames = getattr(
+            batch,
+            "realtime_causal_kv_cache_num_frames",
+            None,
+        )
+        if kv_cache_num_frames is None:
+            kv_cache_num_frames = getattr(
+                pipeline_config,
+                "realtime_causal_kv_cache_num_frames",
+                None,
+            )
+        if kv_cache_num_frames is not None:
+            if kv_cache_num_frames <= 0:
+                raise ValueError(
+                    "realtime_causal_kv_cache_num_frames must be positive"
+                )
+            self.sliding_window_num_frames = int(kv_cache_num_frames)
+
+    def _causal_sequence_shard_enabled(self, batch: Req) -> bool:
+        return False
+
+    def _num_causal_cache_attention_heads(
+        self,
+        *,
+        sequence_shard_enabled: bool,
+    ) -> int:
+        return self.transformer.num_attention_heads
+
+    def _causal_kv_cache_kwargs(
+        self,
+        policy: CausalDMDCachePolicy,
+    ) -> dict[str, Any]:
+        return {}
+
+    def _use_causal_cache_int_indices(
+        self,
+        *,
+        sequence_shard_enabled: bool,
+    ) -> bool:
+        return False
+
+    def _build_realtime_causal_cache_policy(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> CausalDMDCachePolicy:
+        self._apply_causal_cache_overrides(batch, server_args)
+        sequence_shard_enabled = self._causal_sequence_shard_enabled(batch)
+        policy = CausalDMDCachePolicy(
+            sequence_shard_enabled=sequence_shard_enabled,
+            num_attention_heads=self._num_causal_cache_attention_heads(
+                sequence_shard_enabled=sequence_shard_enabled
+            ),
+            expected_cache_tokens=self._get_causal_kv_cache_size(
+                sequence_shard_enabled=sequence_shard_enabled
+            ),
+            expected_sink_tokens=self._get_causal_sink_tokens(),
+            kv_cache_kwargs={},
+        )
+        policy.kv_cache_kwargs = self._causal_kv_cache_kwargs(policy)
+        return policy
+
+    def _get_realtime_causal_cache_state(
+        self,
+        batch: Req,
+    ) -> tuple[RealtimeCausalDiTState, bool]:
+        if batch.session is not None:
+            state = batch.session.get_or_create_state(RealtimeCausalDiTState)
+            return state, True
+        return RealtimeCausalDiTState(), False
+
+    def _clear_stage_causal_cache_refs(self) -> None:
+        self.causal_kv_cache = None
+        self.crossattn_cache = None
+
+    def _should_reset_realtime_causal_caches(
+        self,
+        batch: Req,
+        *,
+        cache_state: RealtimeCausalDiTState,
+        policy: CausalDMDCachePolicy,
+    ) -> bool:
+        causal_kv_cache = cache_state.kv_cache
+        crossattn_cache = cache_state.crossattn_cache
+        return (
+            batch.block_idx == 0
+            or causal_kv_cache is None
+            or crossattn_cache is None
+            or len(causal_kv_cache) != self.num_transformer_blocks
+            or len(crossattn_cache) != self.num_transformer_blocks
+            or causal_kv_cache[0].k.shape[1] != policy.expected_cache_tokens
+            or causal_kv_cache[0].k.shape[2] != policy.num_attention_heads
+            or causal_kv_cache[0].sink_tokens != policy.expected_sink_tokens
+        )
+
+    def _prepare_realtime_causal_caches(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        ctx: CausalDMDForwardContext,
+    ) -> CausalDMDRealtimeCacheContext:
+        policy = self._build_realtime_causal_cache_policy(batch, server_args)
+        cache_state, persist_state = self._get_realtime_causal_cache_state(batch)
+
+        if self._should_reset_realtime_causal_caches(
+            batch,
+            cache_state=cache_state,
+            policy=policy,
+        ):
+            causal_kv_cache, crossattn_cache = self._initialize_causal_caches(
+                batch_size=ctx.batch_size,
+                max_text_len=self._get_max_text_len(server_args),
+                dtype=ctx.target_dtype,
+                device=ctx.device,
+                kv_cache_kwargs=policy.kv_cache_kwargs,
+            )
+            cache_state.kv_cache = causal_kv_cache
+            cache_state.crossattn_cache = crossattn_cache
+            self._clear_stage_causal_cache_refs()
+            cache_state.current_chunk_start_frame = 0
+            cache_state.chunk_idx = 0
+        else:
+            causal_kv_cache = cache_state.kv_cache
+            crossattn_cache = cache_state.crossattn_cache
+
+        assert causal_kv_cache is not None
+        assert crossattn_cache is not None
+        return CausalDMDRealtimeCacheContext(
+            cache_state=cache_state,
+            persist_state=persist_state,
+            kv_cache=causal_kv_cache,
+            crossattn_cache=crossattn_cache,
+            current_start_frame=cache_state.current_chunk_start_frame,
+            chunk_idx=cache_state.chunk_idx,
+        )
+
+    def _advance_realtime_causal_cache(
+        self,
+        cache_ctx: CausalDMDRealtimeCacheContext,
+        *,
+        num_frames: int,
+    ) -> None:
+        cache_ctx.cache_state.current_chunk_start_frame += num_frames
+        cache_ctx.cache_state.chunk_idx += 1
+
+    def _realtime_causal_progress_bar(self, batch: Req, timesteps: torch.Tensor):
+        if batch.session is not None:
+            return nullcontext(None)
+        return self.progress_bar(total=len(timesteps))
+
+    def _denoise_realtime_causal_chunk(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        ctx: CausalDMDForwardContext,
+        cache_ctx: CausalDMDRealtimeCacheContext,
+        chunk_latents: torch.Tensor,
+        prepare_model_input: Callable[[torch.Tensor], torch.Tensor],
+        prepare_context_input: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        current_start_frame = cache_ctx.current_start_frame
+        with self._realtime_causal_progress_bar(batch, ctx.timesteps) as progress_bar:
+            return self._denoise_and_update_causal_block(
+                batch,
+                server_args,
+                chunk_latents=chunk_latents,
+                scheduler=ctx.scheduler,
+                timesteps=ctx.timesteps,
+                prompt_embeds=ctx.prompt_embeds,
+                kv_cache=cache_ctx.kv_cache,
+                crossattn_cache=cache_ctx.crossattn_cache,
+                current_start_tokens=current_start_frame * self.num_token_per_frame,
+                start_frame=current_start_frame,
+                image_kwargs=ctx.image_kwargs,
+                pos_cond_kwargs=ctx.pos_cond_kwargs,
+                target_dtype=ctx.target_dtype,
+                autocast_enabled=ctx.autocast_enabled,
+                device=ctx.device,
+                attn_raw_latent_shape=(ctx.num_frames, ctx.height, ctx.width),
+                prepare_model_input=prepare_model_input,
+                prepare_context_input=prepare_context_input,
+                progress_bar=progress_bar,
+            )
 
     def _build_causal_attn_metadata(
         self,
@@ -626,7 +846,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
         for cache_block in kv_cache:
             cache_block.reset_indices()
 
-    def _get_causal_kv_cache_size(self) -> int:
+    def _get_causal_kv_cache_size(
+        self,
+        *,
+        sequence_shard_enabled: bool = False,
+    ) -> int:
         if self.local_attn_size != -1:
             return self.local_attn_size * self.num_token_per_frame
         return self.num_token_per_frame * self.sliding_window_num_frames
@@ -854,13 +1078,24 @@ class CausalDMDDenoisingStage(DenoisingStage):
         batch.latents = latents
         return batch
 
-    def _initialize_kv_cache(self, batch_size, dtype, device) -> None:
+    def _initialize_kv_cache(
+        self,
+        batch_size,
+        dtype,
+        device,
+        *,
+        sequence_shard_enabled: bool = False,
+    ) -> None:
         """
         Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
         """
-        num_attention_heads = self.transformer.num_attention_heads
+        num_attention_heads = self._num_causal_cache_attention_heads(
+            sequence_shard_enabled=sequence_shard_enabled
+        )
         attention_head_dim = self.transformer.attention_head_dim
-        kv_cache_size = self._get_causal_kv_cache_size()
+        kv_cache_size = self._get_causal_kv_cache_size(
+            sequence_shard_enabled=sequence_shard_enabled
+        )
         self.causal_kv_cache = self._allocate_causal_kv_cache(
             batch_size=batch_size,
             kv_cache_size=kv_cache_size,
@@ -868,6 +1103,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             attention_head_dim=attention_head_dim,
             dtype=dtype,
             device=device,
+            use_int_indices=self._use_causal_cache_int_indices(
+                sequence_shard_enabled=sequence_shard_enabled
+            ),
             sink_tokens=self._get_causal_sink_tokens(),
             attention_window_size=self._get_causal_attention_window_size(kv_cache_size),
         )

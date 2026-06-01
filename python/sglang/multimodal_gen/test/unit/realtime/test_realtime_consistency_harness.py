@@ -280,15 +280,20 @@ def _packed_realtime_chunk_stats(chunk_index: int, **overrides):
         "num_frames": 1,
         "raw_bytes": 12,
         "ws_payload_bytes": 128,
-        "request_prepare_ms": 1.0,
-        "scheduler_forward_ms": 20.0,
-        "raw_payload_build_ms": 2.0,
-        "raw_write_ms": 3.0,
-        "ws_write_ms": 4.0,
-        "chunk_total_ms": 30.0,
+        "request_prepare_ms": 1,
+        "scheduler_forward_ms": 20,
+        "raw_payload_build_ms": 2,
+        "raw_write_ms": 3,
+        "ws_write_ms": 4,
+        "chunk_total_ms": 30,
     }
     payload.update(overrides)
-    return packb(payload, use_bin_type=True)
+    for key, value in list(payload.items()):
+        if key.endswith("_ms"):
+            payload[key] = max(0, int(value + 0.5))
+    packed = packb(payload, use_bin_type=True)
+    assert bytes([0xCB]) not in packed
+    return packed
 
 
 def test_collect_realtime_output_skips_and_records_chunk_stats(monkeypatch):
@@ -300,10 +305,10 @@ def test_collect_realtime_output_skips_and_records_chunk_stats(monkeypatch):
         [
             chunk0_header,
             chunk0_payload,
-            _packed_realtime_chunk_stats(0, chunk_total_ms=31.0),
+            _packed_realtime_chunk_stats(0, chunk_total_ms=31),
             chunk1_header,
             chunk1_payload,
-            _packed_realtime_chunk_stats(1, chunk_total_ms=32.0),
+            _packed_realtime_chunk_stats(1, chunk_total_ms=32),
         ]
     )
     monkeypatch.setitem(
