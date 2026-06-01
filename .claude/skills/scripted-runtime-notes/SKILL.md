@@ -1,11 +1,11 @@
 ---
 name: scripted-runtime-notes
-description: Requirements for the SGLang scripted runtime, chiefly when to add (vs not add) a harness API. Use for anything related to the scripted runtime — any code under python/sglang/test/scripted_runtime/, python/sglang/test/scripted_runtime_chunked_helpers.py, or the scripted chunked tests test/{manual,registered}/chunked_prefill/test_scripted_*.py.
+description: Requirements for the SGLang scripted runtime, chiefly when to add (vs not add) a harness API. Use for anything related to the scripted runtime.
 ---
 
 # Scripted Runtime — Notes
 
-Notes for the SGLang scripted runtime: `python/sglang/test/scripted_runtime/`, `scripted_runtime_chunked_helpers.py`, and the scripted chunked tests `test/{manual,registered}/chunked_prefill/test_scripted_*.py`.
+Notes for anything related to the SGLang scripted runtime.
 
 ## When to Add an API
 
