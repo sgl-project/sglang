@@ -148,7 +148,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
         req = r.req
         assert (
-            req is not None and req in t._scheduler.waiting_queue
+            req is not None and req in t.scheduler.waiting_queue
         ), f"pause(retract) did not park the req in waiting_queue; found {req!r}"
 
         for _ in range(3):
@@ -181,7 +181,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
         req = r.req
         assert (
-            req is not None and req not in t._scheduler.waiting_queue
+            req is not None and req not in t.scheduler.waiting_queue
         ), f"pause(in_place) should not retract the req to waiting_queue; found {req!r}"
 
         for _ in range(3):
@@ -433,9 +433,14 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             f"baseline={baseline_free} during={during_free}"
         )
         yield from run_until_finished(r)
-        t.flush_cache()
+        # The finished req lingers in the running batch for one more iteration; let
+        # it drain so the engine is idle before flushing. flush_cache only evicts
+        # the now-cached KV (committed to the radix tree on finish) when idle, so
+        # flushing first would be a no-op and the pool would never recover.
         for _ in range(5):
             yield
+        t.flush_cache()
+        yield
         after_free = t.engine_stats()["kv_pool_free"]
         assert (
             after_free >= during_free
@@ -538,7 +543,11 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             max_new_tokens=_DECODE_MAX_NEW_TOKENS,
             ignore_eos=True,
         )
-        yield from advance_to_decode_step(r, 1)
+        # The prefill (extend) batch samples the first output token, so output_len
+        # 1 is reached at end-of-prefill -- one step before the req is merged into
+        # the running batch for decode. Advance to output_len 2 to land in a real
+        # decode step where the engine is unambiguously non-idle.
+        yield from advance_to_decode_step(r, 2)
         assert not t.is_idle, "is_idle True while a req is decoding"
         yield from run_until_finished(r)
         for _ in range(5):
@@ -583,7 +592,10 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             f"mid-prefill batch should be an extend mode; "
             f"got {t.last_batch_forward_mode!r}"
         )
-        yield from advance_to_decode_step(r, 1)
+        # The prefill (extend) batch samples the first output token, so the last
+        # batch at output_len 1 is still that EXTEND batch. Advance to output_len 2,
+        # by which a real DECODE batch has run and is the last batch.
+        yield from advance_to_decode_step(r, 2)
         assert (
             t.last_batch_forward_mode == "DECODE"
         ), f"decode batch mode should be DECODE; got {t.last_batch_forward_mode!r}"
@@ -706,7 +718,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         # Each `yield` hands control back for exactly one scheduler event-loop
         # iteration, and a steady decode runs exactly one forward pass per
         # iteration; so forward_ct must advance by the number of yields.
-        sched = t._scheduler
+        sched = t.scheduler
 
         before_no_yield = sched.forward_ct
         r = t.start_req(
