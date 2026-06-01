@@ -1249,7 +1249,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             init_mooncake_transfer_engine(
                 hostname=get_mooncake_transfer_engine_hostname(
-                    self.server_args.disaggregation_mode,
                     self.server_args.host,
                 ),
                 gpu_id=self.gpu_id,
