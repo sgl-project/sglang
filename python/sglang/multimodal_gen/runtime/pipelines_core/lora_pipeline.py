@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import json
 import os
 from collections import defaultdict
 from collections.abc import Hashable
@@ -48,6 +49,8 @@ class LoRAPipeline(ComposedPipelineBase):
     # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
     lora_adapters: dict[str, dict[str, torch.Tensor]]
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
+    loaded_adapter_alphas: dict[str, int | None]
+    # nickname -> adapter_config lora_alpha
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
     cur_adapter_name: dict[str, str]
     cur_adapter_path: dict[str, str]
@@ -77,6 +80,7 @@ class LoRAPipeline(ComposedPipelineBase):
         # Initialize all mutable instance attributes to avoid sharing across instances
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
+        self.loaded_adapter_alphas = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
         self.cur_adapter_strength = {}
@@ -524,10 +528,13 @@ class LoRAPipeline(ComposedPipelineBase):
                         self.lora_adapters[nickname][lora_A_name].shape[0]
                     )
                     alpha_key = name + ".alpha"
+                    adapter_lora_alpha = self.loaded_adapter_alphas.get(nickname)
                     if alpha_key in self.lora_adapters[nickname]:
                         inferred_alpha = int(
                             self.lora_adapters[nickname][alpha_key].item()
                         )
+                    elif adapter_lora_alpha is not None:
+                        inferred_alpha = adapter_lora_alpha
                     else:
                         # Some distilled LoRAs omit per-layer alpha and rely on the
                         # default LoRA scale of alpha == rank. Falling back to rank
@@ -705,6 +712,15 @@ class LoRAPipeline(ComposedPipelineBase):
 
         raw_state_dict = load_file(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
+        adapter_lora_alpha = None
+        adapter_config_path = os.path.join(
+            os.path.dirname(lora_local_path), "adapter_config.json"
+        )
+        if os.path.isfile(adapter_config_path):
+            with open(adapter_config_path, encoding="utf-8") as f:
+                adapter_config = json.load(f)
+            if adapter_config.get("lora_alpha") is not None:
+                adapter_lora_alpha = int(adapter_config["lora_alpha"])
 
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
@@ -749,6 +765,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 )
             self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
         self.loaded_adapter_paths[lora_nickname] = lora_path
+        self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
     def set_lora(
@@ -824,7 +841,10 @@ class LoRAPipeline(ComposedPipelineBase):
                 continue
 
             tgt_nicknames = [lora_nicknames[i] for i in idx_list]
-            tgt_paths = [lora_paths[i] for i in idx_list]
+            tgt_paths = [
+                lora_paths[i] or self.loaded_adapter_paths.get(lora_nicknames[i])
+                for i in idx_list
+            ]
             tgt_strengths = [strengths[i] for i in idx_list]
 
             merged_name = (
