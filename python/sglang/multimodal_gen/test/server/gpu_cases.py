@@ -184,7 +184,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         run_perf_check=False,
-        run_consistency_check=False,
+        run_consistency_check=True,
         run_component_accuracy_check=False,
     ),
     # === Text and Image to Image (TI2I) ===
