@@ -176,6 +176,13 @@ def dequantize_k_cache_paged_ref(
     )
     scale_u8 = flat_u8[scale_byte].to(torch.int32)
     scale_pow2 = torch.exp2((scale_u8 - 127).to(torch.float32))
+    # The Triton kernel evaluates the scale with tl.exp2, which flushes subnormal
+    # results to zero (FTZ). A ue8m0 byte of 0 maps to exp2(-127) = 2**-127, an
+    # fp32 subnormal that is flushed to 0 on-device, zeroing the dequantized
+    # value. Mirror that here so this reference stays bit-identical to the kernel.
+    scale_pow2 = torch.where(
+        scale_pow2 < (2.0**-126), torch.zeros_like(scale_pow2), scale_pow2
+    )
     scale_full = scale_pow2.repeat_interleave(TILE_SIZE, dim=1)
     nope = nope_fp8 * scale_full
 
