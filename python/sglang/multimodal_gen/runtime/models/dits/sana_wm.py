@@ -23,6 +23,22 @@ _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = False
 _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON: Optional[str] = None
 _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED = False
 
+# Streaming per-block cache: a 10-slot list per block (mirrors the reference
+# SANA-WM forward_long). GDN blocks store recurrent state (0/1 main, 2 cam),
+# the K short-conv prefix (4), and a STATE type flag (6); softmax blocks store
+# a K/V concat-window (0/1 main, 2/3 cam) and a CONCAT type flag (6); all blocks
+# store the FFN temporal-conv tail (9). Slots 5/7/8 are unused.
+_NUM_STREAM_CACHE_SLOTS = 10
+_SLOT_K = 0
+_SLOT_V = 1
+_SLOT_CAM_K = 2
+_SLOT_CAM_V = 3
+_SLOT_SHORTCONV = 4
+_SLOT_TYPE_FLAG = 6
+_SLOT_FFN_TCONV = 9
+_CACHE_TYPE_CONCAT = 0.0
+_CACHE_TYPE_STATE = 1.0
+
 
 def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
     return (
@@ -2671,6 +2687,334 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         gate = F.silu(self.output_gate(x).to(torch.float32))
         combined = combined * gate
         return self.proj(combined.to(self.proj.weight.dtype))
+
+    # ------------------------------------------------------------------ #
+    # Streaming `forward_long`: chunk-causal cached variants of the four
+    # dense branch methods + a dispatcher. Each takes a per-block 10-slot
+    # `kv_cache` list (mutated in place) + `save_kv_cache`. GDN/cam scans carry
+    # recurrent state (slots 0/1/2); softmax blocks use a concat-window (slots
+    # 0/1 main, 2/3 cam); short-conv prefix (slot 4); type flag (slot 6). A
+    # single chunk with an empty cache reduces to the dense bidirectional path.
+    # ------------------------------------------------------------------ #
+
+    def _main_branch_gdn_cached(
+        self,
+        x: torch.Tensor,
+        HW: Tuple[int, int, int],
+        rotary_emb: Optional[torch.Tensor],
+        kv_cache: list,
+        save_kv_cache: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, N, C = x.shape
+        T, H_sp, W_sp = HW
+        S = H_sp * W_sp
+
+        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim).contiguous()
+        q, k, v = qkv.unbind(2)
+
+        # Short conv on K (cached forward prefix + intra-chunk backward).
+        if self.conv_k is not None:
+            k, new_prefix = _temporal_short_conv_cached(
+                k.reshape(B, N, C),
+                self.conv_k,
+                HW,
+                prefix=kv_cache[_SLOT_SHORTCONV],
+                save_prefix=save_kv_cache,
+                bidirectional=True,
+            )
+            k = k.reshape(B, N, self.heads, self.dim)
+            if save_kv_cache:
+                kv_cache[_SLOT_SHORTCONV] = new_prefix
+
+        beta, decay = _compute_frame_gates(
+            x, HW, self.heads, self.beta_proj, self.gate_proj, self.dt_bias, self.A_log
+        )
+
+        # Bypass the Triton fast path -- it carries no state.
+        q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        q = F.relu(q)
+        k = F.relu(k)
+        k = k * ((self.dim**-0.5) * (S**-0.5))
+
+        q = q.permute(0, 2, 3, 1)
+        k = k.permute(0, 2, 3, 1)
+        v = v.permute(0, 2, 3, 1)
+
+        rotary_emb = _slice_rope_to_current_chunk(rotary_emb, N)
+        if rotary_emb is not None:
+            q_rot = _apply_rotary_emb_dn(q, rotary_emb)
+            k_rot = _apply_rotary_emb_dn(k, rotary_emb)
+        else:
+            q_rot = q
+            k_rot = k
+
+        dtype = q.dtype
+        out, (state_kv, state_z) = _gdn_scan_cached(
+            q.float(),
+            k.float(),
+            v.float(),
+            q_rot.float(),
+            k_rot.float(),
+            beta.float(),
+            decay.float(),
+            init_state_kv=kv_cache[_SLOT_K],
+            init_state_z=kv_cache[_SLOT_V],
+            eps=self.eps,
+        )
+        out = out.to(dtype)
+        if save_kv_cache:
+            kv_cache[_SLOT_K] = state_kv.detach().clone()
+            kv_cache[_SLOT_V] = state_z.detach().clone()
+            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor(
+                [_CACHE_TYPE_STATE], device=x.device
+            )
+
+        out = out.permute(0, 3, 1, 2).reshape(B, N, C)
+        return out, beta, decay
+
+    def _main_branch_softmax_cached(
+        self,
+        x: torch.Tensor,
+        HW: Tuple[int, int, int],
+        rotary_emb: Optional[torch.Tensor],
+        kv_cache: list,
+        save_kv_cache: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
+        q, k, v = qkv.unbind(2)
+        if self.conv_k is not None:  # softmax blocks have conv_k=None, kept for safety
+            k, new_prefix = _temporal_short_conv_cached(
+                k.reshape(B, N, C),
+                self.conv_k,
+                HW,
+                prefix=kv_cache[_SLOT_SHORTCONV],
+                save_prefix=save_kv_cache,
+                bidirectional=True,
+            )
+            k = k.reshape(B, N, self.heads, self.dim)
+            if save_kv_cache:
+                kv_cache[_SLOT_SHORTCONV] = new_prefix
+        q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        q = q.permute(0, 2, 1, 3)  # (B, H, N, D)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        rotary_emb = _slice_rope_to_current_chunk(rotary_emb, N)
+        if rotary_emb is not None:
+            q = _apply_rotary_emb_bhnd(q, rotary_emb)
+            k = _apply_rotary_emb_bhnd(k, rotary_emb)
+        q_in = q.transpose(1, 2).contiguous()  # (B, N_cur, H, D)
+        k_in = k.transpose(1, 2).contiguous()
+        v_in = v.transpose(1, 2).contiguous()
+
+        # Concat-window: store the CURRENT chunk K/V (RoPE'd at absolute
+        # positions), then prepend the cached prefix. Q stays current-chunk.
+        cached_k = kv_cache[_SLOT_K]
+        cached_v = kv_cache[_SLOT_V]
+        if save_kv_cache:
+            kv_cache[_SLOT_K] = k_in.detach().clone()
+            kv_cache[_SLOT_V] = v_in.detach().clone()
+            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor(
+                [_CACHE_TYPE_CONCAT], device=x.device
+            )
+        if cached_k is not None:
+            k_in = torch.cat([cached_k.to(k_in.dtype), k_in], dim=1)
+            v_in = torch.cat([cached_v.to(v_in.dtype), v_in], dim=1)
+
+        out = _sana_wm_sdpa(
+            q_in, k_in, v_in, softmax_scale=self.softmax_attn.softmax_scale
+        )
+        out = out.reshape(B, N, C)
+
+        beta, decay = _compute_frame_gates(
+            x, HW, self.heads, self.beta_proj, self.gate_proj, self.dt_bias, self.A_log
+        )
+        return out, beta, decay
+
+    def _cam_branch_cached(
+        self,
+        x: torch.Tensor,
+        HW: Tuple[int, int, int],
+        apply_q: Callable,
+        apply_kv: Callable,
+        apply_o: Callable,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        kv_cache: list,
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        B, N, C = x.shape
+        T, H_sp, W_sp = HW
+        S = H_sp * W_sp
+
+        q, k, v = self._cam_qkv(x)
+        q = q.reshape(B, N, self.heads, self.dim)
+        k = k.reshape(B, N, self.heads, self.dim)
+        v = v.reshape(B, N, self.heads, self.dim)
+
+        # Cam K short conv stays bidirectional/uncached (matches the reference,
+        # whose cam branch uses the non-cached temporal conv; slot 4 is main-K).
+        if self.conv_k_cam is not None:
+            k = self._temporal_short_conv(
+                k.reshape(B, N, C), self.conv_k_cam, HW, bidirectional=True
+            )
+            k = k.reshape(B, N, self.heads, self.dim)
+
+        q = self.q_norm_cam(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        k = self.k_norm_cam(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        q = F.relu(q)
+        k = F.relu(k)
+        k = k * ((self.dim**-0.5) * (S**-0.5))
+
+        q_bhnd = q.permute(0, 2, 1, 3)
+        k_bhnd = k.permute(0, 2, 1, 3)
+        v_bhnd = v.permute(0, 2, 1, 3)
+
+        q_proj = apply_q(q_bhnd)
+        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
+        k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
+
+        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
+        q_dn = q_proj.permute(0, 1, 3, 2)
+        k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
+        k_dn = k_proj.permute(0, 1, 3, 2)
+        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
+        v_dn = v_proj.permute(0, 1, 3, 2)
+
+        q_dn = _downscale_to_reference_rms(q_pre_dn, q_dn)
+        k_dn = _downscale_to_reference_rms(k_pre_dn, k_dn)
+        v_dn = _downscale_to_reference_rms(v_pre_dn, v_dn)
+
+        pre_ucpe_k_norm = torch.linalg.vector_norm(
+            k_pre_dn.float(), dim=2, keepdim=True
+        ).clamp_min(1e-6)
+        post_ucpe_k_norm = torch.linalg.vector_norm(
+            k_dn.float(), dim=2, keepdim=True
+        ).clamp_min(1e-6)
+        inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2
+        frame_inflation_sq = inflation_sq.view(B, self.heads, T, S).mean(dim=-1)
+        if beta.ndim == 3:
+            beta = beta / frame_inflation_sq.clamp_min(1.0)
+        elif beta.ndim == 4:
+            beta = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
+
+        dtype = q_dn.dtype
+        # Bypass the Triton cam scan -- it carries no state.
+        out, cam_state = _single_path_delta_scan_cached(
+            q_dn.float(),
+            k_dn.float(),
+            v_dn.float(),
+            beta.float(),
+            decay.float(),
+            init_state_kv=kv_cache[_SLOT_CAM_K],
+        )
+        out = out.to(dtype)
+        if save_kv_cache:
+            kv_cache[_SLOT_CAM_K] = cam_state.detach().clone()
+
+        out_bhnd = out.permute(0, 1, 3, 2)
+        out_bhnd = apply_o(out_bhnd)
+        return out_bhnd.permute(0, 2, 1, 3).reshape(B, N, C)
+
+    def _cam_branch_softmax_cached(
+        self,
+        x: torch.Tensor,
+        HW: Tuple[int, int, int],
+        apply_q: Callable,
+        apply_kv: Callable,
+        apply_o: Callable,
+        kv_cache: list,
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        B, N, C = x.shape
+
+        q, k, v = self._cam_qkv(x)
+        q = q.reshape(B, N, self.heads, self.dim)
+        k = k.reshape(B, N, self.heads, self.dim)
+        v = v.reshape(B, N, self.heads, self.dim)
+
+        if self.conv_k_cam is not None:
+            k = self._temporal_short_conv(
+                k.reshape(B, N, C), self.conv_k_cam, HW, bidirectional=True
+            )
+            k = k.reshape(B, N, self.heads, self.dim)
+
+        q = self.q_norm_cam(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        k = self.k_norm_cam(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+
+        q_bhnd = q.permute(0, 2, 1, 3)
+        k_bhnd = k.permute(0, 2, 1, 3)
+        v_bhnd = v.permute(0, 2, 1, 3)
+
+        q_proj = apply_q(q_bhnd)
+        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
+        k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
+
+        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
+        k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
+        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
+        q_dn = _downscale_to_reference_rms(q_pre_dn, q_proj.permute(0, 1, 3, 2))
+        k_dn = _downscale_to_reference_rms(k_pre_dn, k_proj.permute(0, 1, 3, 2))
+        v_dn = _downscale_to_reference_rms(v_pre_dn, v_proj.permute(0, 1, 3, 2))
+
+        q_in = q_dn.permute(0, 3, 1, 2).contiguous()  # (B, N_cur, H, D)
+        k_in = k_dn.permute(0, 3, 1, 2).contiguous()
+        v_in = v_dn.permute(0, 3, 1, 2).contiguous()
+
+        cached_cam_k = kv_cache[_SLOT_CAM_K]
+        cached_cam_v = kv_cache[_SLOT_CAM_V]
+        if save_kv_cache:
+            kv_cache[_SLOT_CAM_K] = k_in.detach().clone()
+            kv_cache[_SLOT_CAM_V] = v_in.detach().clone()
+        if cached_cam_k is not None:
+            k_in = torch.cat([cached_cam_k.to(k_in.dtype), k_in], dim=1)
+            v_in = torch.cat([cached_cam_v.to(v_in.dtype), v_in], dim=1)
+
+        out = _sana_wm_sdpa(
+            q_in, k_in, v_in, softmax_scale=self.softmax_attn.softmax_scale
+        )  # (B, N_cur, H, D)
+        out_bhnd = out.transpose(1, 2).contiguous()
+        out_bhnd = apply_o(out_bhnd)
+        return out_bhnd.transpose(1, 2).reshape(B, N, C)
+
+    def forward_long(
+        self,
+        x: torch.Tensor,
+        HW: Tuple[int, int, int],
+        rotary_emb: Optional[torch.Tensor] = None,
+        prope_fns: Optional[Tuple[Callable, Callable, Callable]] = None,
+        *,
+        kv_cache: list,
+        save_kv_cache: bool,
+    ) -> Tuple[torch.Tensor, list]:
+        if self.softmax_main:
+            main_raw, beta, decay = self._main_branch_softmax_cached(
+                x, HW, rotary_emb, kv_cache, save_kv_cache
+            )
+        else:
+            main_raw, beta, decay = self._main_branch_gdn_cached(
+                x, HW, rotary_emb, kv_cache, save_kv_cache
+            )
+
+        if prope_fns is not None:
+            apply_q, apply_kv, apply_o = prope_fns
+            if self.softmax_main:
+                cam_raw = self._cam_branch_softmax_cached(
+                    x, HW, apply_q, apply_kv, apply_o, kv_cache, save_kv_cache
+                )
+            else:
+                cam_raw = self._cam_branch_cached(
+                    x, HW, apply_q, apply_kv, apply_o, beta, decay, kv_cache, save_kv_cache
+                )
+            combined = main_raw + self.out_proj_cam(cam_raw)
+        else:
+            combined = main_raw
+
+        gate = F.silu(self.output_gate(x).to(torch.float32))
+        combined = combined * gate
+        return self.proj(combined.to(self.proj.weight.dtype)), kv_cache
 
 
 # ---------------------------------------------------------------------------
