@@ -82,14 +82,14 @@ class TestAbortBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
-        assert r.pending_middle_outputs > 0
+        assert r.req.inflight_middle_chunks > 0
 
         t.abort(r)
         yield
 
-        assert r.pending_middle_outputs == 0, (
-            f"abort must zero pending_middle_outputs to prevent revival; "
-            f"got {r.pending_middle_outputs}"
+        assert r.req.inflight_middle_chunks == 0, (
+            f"abort must zero inflight_middle_chunks to prevent revival; "
+            f"got {r.req.inflight_middle_chunks}"
         )
 
     def test_abort_one_does_not_disturb_other(self):
@@ -255,7 +255,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield
         assert r.kv_pages == 0
-        assert r.pending_middle_outputs == 0
+        assert r.req.inflight_middle_chunks == 0
 
     def test_abort_penultimate_chunk(self):
         self.server.execute_script(self._script_abort_penultimate_chunk)
@@ -355,8 +355,8 @@ class TestAbortBasic(ScriptedTestCase):
             r.finish_event_count <= 1
         ), f"abort race must not double-finalize; got {r.finish_event_count}"
         assert (
-            r.pending_middle_outputs == 0
-        ), f"abort must zero pending_middle_outputs; got {r.pending_middle_outputs}"
+            r.req.inflight_middle_chunks == 0
+        ), f"abort must zero inflight_middle_chunks; got {r.req.inflight_middle_chunks}"
         assert r.kv_pages == 0
         assert r.chunks_done >= chunks_at_abort
 
@@ -384,27 +384,27 @@ class TestAbortBasic(ScriptedTestCase):
         assert r1.req is None or r1.req.req_pool_idx is None
         assert r1.lock_refs == 0
 
-    def test_abort_during_gap_pending_middle_outputs_positive(self):
+    def test_abort_during_gap_inflight_middle_chunks_positive(self):
         self.server.execute_script(
-            self._script_abort_during_gap_pending_middle_outputs_positive
+            self._script_abort_during_gap_inflight_middle_chunks_positive
         )
 
     @staticmethod
-    def _script_abort_during_gap_pending_middle_outputs_positive(t: ScriptedContext):
+    def _script_abort_during_gap_inflight_middle_chunks_positive(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(
             r,
-            lambda h: h.pending_middle_outputs > 0 and not h.is_chunking,
+            lambda h: h.req.inflight_middle_chunks > 0 and not h.is_chunking,
         )
-        assert r.pending_middle_outputs > 0
+        assert r.req.inflight_middle_chunks > 0
         assert not r.is_chunking
 
         t.abort(r)
         yield
 
-        assert r.pending_middle_outputs == 0, (
-            f"abort in gap must zero pending_middle_outputs to block "
-            f"Stage A revival; got {r.pending_middle_outputs}"
+        assert r.req.inflight_middle_chunks == 0, (
+            f"abort in gap must zero inflight_middle_chunks to block "
+            f"Stage A revival; got {r.req.inflight_middle_chunks}"
         )
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None

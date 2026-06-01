@@ -89,7 +89,7 @@ class TestPriorityBasic(ScriptedTestCase):
         t.force_retract(r)
         yield
         assert r.kv_pages == 0
-        assert r.pending_middle_outputs == 0
+        assert r.req.inflight_middle_chunks == 0
 
     def test_force_retract_then_readmit(self):
         self.server.execute_script(self._script_force_retract_then_readmit)

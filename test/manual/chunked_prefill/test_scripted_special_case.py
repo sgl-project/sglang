@@ -221,10 +221,10 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     @unittest.skip(
         "requires DLLM model + staging mixin — single-engine cannot drive "
         "both DLLM staging AND chunked admission incrementing "
-        "pending_middle_outputs from two sources. Belongs in DLLM-specific "
+        "inflight_middle_chunks from two sources. Belongs in DLLM-specific "
         "test file."
     )
-    def test_dllm_staging_double_pending_middle_outputs(self):
+    def test_dllm_staging_double_inflight_middle_chunks(self):
         pass
 
     @unittest.skip(
@@ -463,21 +463,21 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             <= baseline_rows
         ), f"row leak under forced chunked admission: baseline={baseline_rows}, after={(t._scheduler.req_to_token_pool.size - t._scheduler.req_to_token_pool.available_size())}"
 
-    def test_stage_a_pending_middle_outputs_sync_invariant(self):
+    def test_stage_a_inflight_middle_chunks_sync_invariant(self):
         self.server.execute_script(
-            self._script_stage_a_pending_middle_outputs_sync_invariant
+            self._script_stage_a_inflight_middle_chunks_sync_invariant
         )
 
     @staticmethod
-    def _script_stage_a_pending_middle_outputs_sync_invariant(t: ScriptedContext):
+    def _script_stage_a_inflight_middle_chunks_sync_invariant(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         for _ in range(DEFAULT_MAX_STEPS):
             if r.finished:
                 return
-            if r.pending_middle_outputs > 0:
+            if r.req.inflight_middle_chunks > 0:
                 assert r.is_chunking, (
-                    f"invariant violated: pending_middle_outputs="
-                    f"{r.pending_middle_outputs} but is_chunking={r.is_chunking}"
+                    f"invariant violated: inflight_middle_chunks="
+                    f"{r.req.inflight_middle_chunks} but is_chunking={r.is_chunking}"
                 )
             yield
         raise AssertionError("req did not finish")

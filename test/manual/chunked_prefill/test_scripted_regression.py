@@ -67,7 +67,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
         assert not r.is_chunking
-        assert r.pending_middle_outputs == 0
+        assert r.req.inflight_middle_chunks == 0
 
     def test_pause_covers_waiting_chunked(self):
         self.server.execute_script(self._script_pause_covers_waiting_chunked)
@@ -86,24 +86,24 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.lock_refs == 0
         assert not r.is_chunking
 
-    def test_pending_middle_outputs_invariant(self):
-        self.server.execute_script(self._script_pending_middle_outputs_invariant)
+    def test_inflight_middle_chunks_invariant(self):
+        self.server.execute_script(self._script_inflight_middle_chunks_invariant)
 
     @staticmethod
-    def _script_pending_middle_outputs_invariant(t: ScriptedContext):
+    def _script_inflight_middle_chunks_invariant(t: ScriptedContext):
         r = t.start_req(
             prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4, ignore_eos=True
         )
 
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
         assert (
-            r.pending_middle_outputs > 0
-        ), "last-chunk admit must bump pending_middle_outputs"
+            r.req.inflight_middle_chunks > 0
+        ), "last-chunk admit must bump inflight_middle_chunks"
 
         yield from run_until(r, lambda h: not h.is_chunking)
-        assert r.pending_middle_outputs == 0, (
-            f"pending_middle_outputs should be 0 after chunk loop clears; "
-            f"got {r.pending_middle_outputs}"
+        assert r.req.inflight_middle_chunks == 0, (
+            f"inflight_middle_chunks should be 0 after chunk loop clears; "
+            f"got {r.req.inflight_middle_chunks}"
         )
 
         yield from run_until_finished(r)
@@ -125,16 +125,16 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
 
-    def test_revert_bump_pending_middle_outputs(self):
-        self.server.execute_script(self._script_revert_bump_pending_middle_outputs)
+    def test_revert_bump_inflight_middle_chunks(self):
+        self.server.execute_script(self._script_revert_bump_inflight_middle_chunks)
 
     @staticmethod
-    def _script_revert_bump_pending_middle_outputs(t: ScriptedContext):
+    def _script_revert_bump_inflight_middle_chunks(t: ScriptedContext):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
 
         observed_max = 0
         for _ in range(DEFAULT_MAX_STEPS):
-            observed_max = max(observed_max, r.pending_middle_outputs)
+            observed_max = max(observed_max, r.req.inflight_middle_chunks)
             if r.finished:
                 break
             yield
@@ -142,11 +142,11 @@ class TestRegressionBasic(ScriptedTestCase):
             raise AssertionError("req did not finish within DEFAULT_MAX_STEPS")
 
         assert observed_max == 1, (
-            f"e875cd36e4: pending_middle_outputs must be a 0/1 latch; "
+            f"e875cd36e4: inflight_middle_chunks must be a 0/1 latch; "
             f"observed max={observed_max} (pre-fix bug would bump to 2 "
             f"at the last-chunk admit boundary)"
         )
-        assert r.pending_middle_outputs == 0
+        assert r.req.inflight_middle_chunks == 0
         assert r.finished and r.chunks_done >= 2
 
     def test_filter_batch_exclude_in_flight_other_mb(self):
@@ -197,7 +197,7 @@ class TestRegressionBasic(ScriptedTestCase):
             scheduler_path = t.last_scheduler_path()
             admission_path = t.last_admission_path()
 
-            if r.pending_middle_outputs > 0:
+            if r.req.inflight_middle_chunks > 0:
                 assert r.is_chunking
 
             if (
@@ -456,7 +456,7 @@ class TestRegressionBasic(ScriptedTestCase):
             r.lock_refs == 0
         ), f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
         assert not r.is_chunking
-        assert r.pending_middle_outputs == 0
+        assert r.req.inflight_middle_chunks == 0
         assert t.get_all_node_lock_refs() == baseline_refs
 
     def test_abort_chunked_resume_dual_queue_no_double_release(self):

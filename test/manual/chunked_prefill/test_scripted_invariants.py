@@ -128,19 +128,6 @@ class TestInvariantsBasic(ScriptedTestCase):
             yield
         raise AssertionError("req never finished")
 
-    def test_pending_middle_outputs_non_negative(self):
-        self.server.execute_script(self._script_pending_middle_outputs_non_negative)
-
-    @staticmethod
-    def _script_pending_middle_outputs_non_negative(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        for _ in range(DEFAULT_MAX_STEPS):
-            assert r.pending_middle_outputs >= 0
-            if r.finished:
-                return
-            yield
-        raise AssertionError("req never finished")
-
     def test_inflight_middle_chunks_non_negative(self):
         self.server.execute_script(self._script_inflight_middle_chunks_non_negative)
 
@@ -422,18 +409,18 @@ class TestInvariantsBasic(ScriptedTestCase):
             yield
         raise AssertionError("req never finished")
 
-    def test_pending_middle_outputs_caps_at_one(self):
-        self.server.execute_script(self._script_pending_middle_outputs_caps_at_one)
+    def test_inflight_middle_chunks_caps_at_one(self):
+        self.server.execute_script(self._script_inflight_middle_chunks_caps_at_one)
 
     @staticmethod
-    def _script_pending_middle_outputs_caps_at_one(t: ScriptedContext):
+    def _script_inflight_middle_chunks_caps_at_one(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        running_max = r.pending_middle_outputs
+        running_max = r.req.inflight_middle_chunks
         running_max_post_finish = 0
         post_finish_samples = 0
         for _ in range(DEFAULT_MAX_STEPS):
             yield
-            cur = r.pending_middle_outputs
+            cur = r.req.inflight_middle_chunks
             running_max = max(running_max, cur)
             if r.finished:
                 running_max_post_finish = max(running_max_post_finish, cur)
@@ -442,11 +429,11 @@ class TestInvariantsBasic(ScriptedTestCase):
                     break
         assert r.finished, "req never finished"
         assert running_max == 1, (
-            f"pending_middle_outputs must reach exactly 1 across the chunked "
+            f"inflight_middle_chunks must reach exactly 1 across the chunked "
             f"lifecycle (the cap from revert e875cd36e4); observed max={running_max}"
         )
         assert running_max_post_finish == 0, (
-            f"pending_middle_outputs must be reset to 0 after finish; "
+            f"inflight_middle_chunks must be reset to 0 after finish; "
             f"observed max post-finish={running_max_post_finish}"
         )
 
@@ -550,20 +537,20 @@ class TestInvariantsBasic(ScriptedTestCase):
                 f"{(1 if t._scheduler.chunked_req is not None else 0)}"
             )
 
-    def test_pending_middle_outputs_zero_at_idle_yields(self):
+    def test_inflight_middle_chunks_zero_at_idle_yields(self):
         self.server.execute_script(
-            self._script_pending_middle_outputs_zero_at_idle_yields
+            self._script_inflight_middle_chunks_zero_at_idle_yields
         )
 
     @staticmethod
-    def _script_pending_middle_outputs_zero_at_idle_yields(t: ScriptedContext):
+    def _script_inflight_middle_chunks_zero_at_idle_yields(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r)
         for _ in range(5):
             yield
-            assert r.pending_middle_outputs == 0, (
-                f"pending_middle_outputs must be 0 at idle yields after "
-                f"finish; got {r.pending_middle_outputs}"
+            assert r.req.inflight_middle_chunks == 0, (
+                f"inflight_middle_chunks must be 0 at idle yields after "
+                f"finish; got {r.req.inflight_middle_chunks}"
             )
 
     def test_extend_batch_idx_monotonic_invariant(self):
