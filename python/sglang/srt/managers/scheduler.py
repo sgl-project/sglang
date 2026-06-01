@@ -2575,6 +2575,12 @@ class Scheduler(
             assert not any(
                 m.is_intermediate() for m in modes
             ), "running_batch contains intermediate-mode reqs in is_prefill_only branch"
+            # Drop finished prefill-only reqs (e.g. max_new_tokens==0 / embeddings)
+            # since they never reach a decode step. In overlap mode they would
+            # otherwise accumulate forever, inflating load reporting and tripping
+            # admission throttling / DEBUG_INVARIANTS. filter_batch() with no args
+            # drops req.finished() reqs.
+            self.running_batch.filter_batch()
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
