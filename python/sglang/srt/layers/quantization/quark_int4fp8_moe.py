@@ -25,12 +25,14 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
-
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+else:
+    ON_GFX950 = False
+    shuffle_weight = None
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +146,11 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         if not _is_hip:
             raise NotImplementedError(
                 "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
+            )
+
+        if not _use_aiter:
+            raise NotImplementedError(
+                "The quark_int4fp8_moe online quantization scheme requires SGLANG_USE_AITER=1."
             )
 
     def get_weight_loader(self, layer, original_weight_loader):

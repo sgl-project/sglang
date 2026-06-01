@@ -30,6 +30,9 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
     def __init__(
         self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
     ):
+        if not _use_aiter:
+            raise NotImplementedError("QuarkW4A4MXFP4 requires SGLANG_USE_AITER=1.")
+
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
