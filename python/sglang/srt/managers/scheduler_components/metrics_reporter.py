@@ -684,7 +684,7 @@ class SchedulerMetricsReporter:
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
 
         self.num_generated_tokens = 0
-        if self.server_args.disaggregation_decode_enable_radix_cache:
+        if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
             num_decode_cached_tokens = sum(r.cached_tokens for r in batch.reqs)
         else:
             num_decode_cached_tokens = 0

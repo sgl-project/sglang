@@ -122,16 +122,6 @@ def match_prefix_for_req(
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
 
-    if tree_cache.supports_mamba():
-        logger.info(
-            "[MAMBADBG] match rid=%s matched_prefix=%d input_len=%d mamba_branching_seqlen=%d cached_protected_len=%d",
-            req.rid,
-            len(req.prefix_indices),
-            len(req.origin_input_ids),
-            req.mamba_branching_seqlen or 0,
-            req.cache_protected_len or 0,
-        )
-
     return match_result
 
 

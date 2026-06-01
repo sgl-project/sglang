@@ -517,16 +517,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
-        logger.info(
-            "[MAMBADBG] cache_finished rid=%s is_insert=%s extra_buf=%s last_track_seqlen=%s kv_committed=%s mamba_evict=%d full_evict=%d",
-            req.rid,
-            is_insert,
-            self.enable_mamba_extra_buffer,
-            req.mamba_last_track_seqlen,
-            kv_committed_len,
-            self.mamba_evictable_size(),
-            self.full_evictable_size(),
-        )
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -629,17 +619,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
             else len(token_ids)
-        )
-        logger.info(
-            "[MAMBADBG] cache_unfinished rid=%s extra_buf=%s last_track_seqlen=%s fill=%d cache_len=%s decision=%s mamba_evict=%d full_evict=%d",
-            req.rid,
-            self.enable_mamba_extra_buffer,
-            req.mamba_last_track_seqlen,
-            len(token_ids),
-            cache_len,
-            "SKIP_EMPTY" if (self.disable or cache_len is None) else "INSERT",
-            self.mamba_evictable_size(),
-            self.full_evictable_size(),
         )
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
