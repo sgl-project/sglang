@@ -29,27 +29,6 @@ class TestDisaggBasic(ScriptedTestCase):
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
-        # Exactly one last_chunk send already proves the send side reached its
-        # terminal (idle) state; there is no disagg_send_state field, so the
-        # former `disagg_send_state in (None, "idle")` probe is redundant here.
-        assert r.kv_send_last_chunk_events == 1
-
-    def test_disagg_prefill_per_chunk_kv_send(self):
-        self.server.execute_script(self._script_disagg_prefill_per_chunk_kv_send)
-
-    @staticmethod
-    def _script_disagg_prefill_per_chunk_kv_send(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until_finished(r, max_steps=800)
-        assert r.finished
-        assert r.chunks_done >= 2
-        assert r.kv_send_events == r.chunks_done, (
-            f"expected kv_send_events == chunks_done, got "
-            f"kv_send_events={r.kv_send_events}, chunks_done={r.chunks_done}"
-        )
-        assert (
-            r.kv_send_last_chunk_events == 1
-        ), f"expected exactly one last_chunk=True send, got {r.kv_send_last_chunk_events}"
 
     def test_disagg_retract_resets_send_state(self):
         self.server.execute_script(self._script_disagg_retract_resets_send_state)

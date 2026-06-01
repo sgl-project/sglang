@@ -5,7 +5,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Generator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
 
@@ -45,8 +45,6 @@ class ScriptedBatchRecord:
     rids: Tuple[str, ...]
     extend_rids: Tuple[str, ...]
     chunked_rid: Optional[str]
-    send_idx_of_rid: Dict[str, int]
-    origin_input_ids_of_rid: Dict[str, Tuple[int, ...]]
 
 
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
@@ -156,10 +154,6 @@ class ScriptedSchedulerHook:
                     else ()
                 ),
                 chunked_rid=chunked.rid if chunked is not None else None,
-                send_idx_of_rid={r.rid: r.start_send_idx for r in batch.reqs},
-                origin_input_ids_of_rid={
-                    r.rid: tuple(r.origin_input_ids) for r in batch.reqs
-                },
             )
         )
 

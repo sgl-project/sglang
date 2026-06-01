@@ -115,49 +115,6 @@ def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
     )
 
 
-def _send_idx_series(ctx: "ScriptedContext", rid: str) -> List[int]:
-    # Ordered start_send_idx values observed for this rid across every step it
-    # appeared in the batch. on_run_batch snapshots at step start, so the final
-    # last_chunk send (done in the prefill step's result processing) is captured
-    # by the subsequent decode step that still carries the req.
-    series: List[int] = []
-    for record in ctx._scheduler_hook._batch_log:
-        if rid in record.send_idx_of_rid:
-            series.append(record.send_idx_of_rid[rid])
-    return series
-
-
-def _prompt_len_for_rid(ctx: "ScriptedContext", rid: str) -> Optional[int]:
-    for record in ctx._scheduler_hook._batch_log:
-        origin_input_ids = record.origin_input_ids_of_rid.get(rid)
-        if origin_input_ids is not None:
-            return len(origin_input_ids)
-    return None
-
-
-def kv_send_events(ctx: "ScriptedContext", rid: str) -> int:
-    # Number of kv-chunk sends = number of strict increases of start_send_idx
-    # across the snapshotted series. Each successful send advances start_send_idx
-    # to the just-sent end index (disagg prefill send_kv_chunk).
-    series = _send_idx_series(ctx, rid)
-    return sum(1 for prev, curr in zip(series, series[1:]) if curr > prev)
-
-
-def kv_send_last_chunk_events(ctx: "ScriptedContext", rid: str) -> int:
-    # The last_chunk send is the one whose end index reaches the full prompt
-    # length; it advances start_send_idx to len(origin_input_ids). Count the
-    # increases that land exactly on that value (expected to happen once).
-    prompt_len = _prompt_len_for_rid(ctx, rid)
-    if prompt_len is None:
-        return 0
-    series = _send_idx_series(ctx, rid)
-    return sum(
-        1
-        for prev, curr in zip(series, series[1:])
-        if curr > prev and curr == prompt_len
-    )
-
-
 def chunked_parks(ctx: "ScriptedContext", rid: str) -> int:
     # The dual of chunks_done: iterations where the scheduler still held this rid
     # as its chunked_req but did NOT run it in the batch -- i.e. add_chunked_req's
