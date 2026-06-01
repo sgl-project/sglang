@@ -1059,17 +1059,26 @@ class Req(ReqDllmMixin):
     def set_scheduled_extend_len(self, value: int) -> None:
         """Update `scheduled_extend_len` with a bounds check.
 
-        Plan-time prefill progress must stay within
-        `[0, len(origin_input_ids)]`. Overshoot would silently break the
-        `has_pending_chunk` derivation (which relies on `SE < N` as the
+        For normal chunked prefill, plan-time prefill progress must stay
+        within `[0, len(origin_input_ids)]`. Overshoot would silently break
+        the `has_pending_chunk` derivation (which relies on `SE < N` as the
         upper bound) and indicates a truncation/admission bug worth
         catching at the source.
+
+        DLLM is exempt from the bounds check: `scheduled_extend_len` is
+        audit-only for DLLM (`has_pending_chunk` short-circuits on
+        `is_dllm()` and last-vs-middle chunk is decided unconditionally),
+        and DLLM fill_ids include a trailing mask block
+        (`origin_input_ids + output_ids + [mask] * block_size`), so `value`
+        legitimately grows past `len(origin_input_ids)` as denoising
+        proceeds. The prompt-length bound therefore does not hold for DLLM.
         """
-        n = len(self.origin_input_ids)
-        assert 0 <= value <= n, (
-            f"scheduled_extend_len {value} out of bounds [0, {n}] "
-            f"for req {self.rid}"
-        )
+        if not self.is_dllm():
+            n = len(self.origin_input_ids)
+            assert 0 <= value <= n, (
+                f"scheduled_extend_len {value} out of bounds [0, {n}] "
+                f"for req {self.rid}"
+            )
         self.scheduled_extend_len = value
 
     @property
