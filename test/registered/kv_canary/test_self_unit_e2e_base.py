@@ -95,7 +95,9 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
                 max_retries=1,
             )
 
-    def test_assert_swa_divergence_observed_checks_verify_lag_on_latest_line(self) -> None:
+    def test_assert_swa_divergence_observed_checks_verify_lag_on_latest_line(
+        self,
+    ) -> None:
         """verify_swa<verify_full reads the final sample because the counters are monotonic totals."""
         lagging = SwaDivergenceLog(
             forward_ct=120,
