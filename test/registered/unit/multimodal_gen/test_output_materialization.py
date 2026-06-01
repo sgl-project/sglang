@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.utils.realtime_video import (
+    build_raw_rgb_frame_batches,
+)
 
 
 def test_materialize_output_sample_converts_tensor_to_uint8_frames():
@@ -73,3 +76,41 @@ def test_file_path_transport_clears_in_memory_outputs():
     assert output_batch.output is None
     assert output_batch.audio is None
     assert output_batch.audio_sample_rate is None
+
+
+def test_raw_rgb_frame_batches_convert_batched_video_tensor_to_thwc_bytes():
+    output = torch.zeros(1, 3, 2, 2, 2)
+    output[0, 0] = 1.0
+    output[0, 1] = 0.5
+    req = type(
+        "Req",
+        (),
+        {
+            "enable_frame_interpolation": False,
+            "enable_upscaling": False,
+            "request_id": "req",
+            "block_idx": 0,
+        },
+    )()
+    output_batch = OutputBatch(audio_sample_rate=None)
+
+    frame_batches, metadata = build_raw_rgb_frame_batches(
+        output,
+        req,
+        output_batch,
+        post_process_sample_fn=lambda *args, **kwargs: None,
+    )
+
+    assert metadata == {
+        "format": "rgb24",
+        "width": 2,
+        "height": 2,
+        "channels": 3,
+        "bytes_per_frame": 12,
+    }
+    assert len(frame_batches) == 1
+    assert len(frame_batches[0]) == 2
+    first = np.frombuffer(frame_batches[0][0], dtype=np.uint8).reshape(2, 2, 3)
+    assert np.all(first[..., 0] == 255)
+    assert np.all(first[..., 1] == 127)
+    assert np.all(first[..., 2] == 0)

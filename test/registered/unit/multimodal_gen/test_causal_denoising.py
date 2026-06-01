@@ -247,6 +247,19 @@ def test_causal_context_warmup_uses_context_cache_update_path():
     assert seen["attn_metadata"] is None
 
 
+def test_causal_dmd_timestep_expansion_preserves_fractional_dtype():
+    timestep = torch.tensor(996.3375, dtype=torch.float32)
+
+    expanded = CausalDMDDenoisingStage._expand_timestep(
+        timestep,
+        batch_size=3,
+        device=torch.device("cpu"),
+    )
+
+    assert expanded.dtype == torch.float32
+    assert torch.equal(expanded, torch.tensor([996.3375, 996.3375, 996.3375]))
+
+
 def test_causal_cache_helpers_reset_and_forward_model_specific_kwargs():
     stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
     stage.num_transformer_blocks = 2

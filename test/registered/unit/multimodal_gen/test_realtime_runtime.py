@@ -43,6 +43,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
+    RealtimeInputValidationStage,
+    RealtimeInputValidationState,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_vae import (
     CausalVaeDecodingStage,
     RealtimeVAEDecodeState,
@@ -334,7 +338,7 @@ def test_generate_session_respects_max_chunks():
     assert session.reached_max_chunks()
 
 
-def test_generate_loop_overlaps_previous_send_with_next_generation(monkeypatch):
+def test_generate_loop_waits_for_send_before_next_generation(monkeypatch):
     events = []
 
     class _Adapter:
@@ -390,7 +394,7 @@ def test_generate_loop_overlaps_previous_send_with_next_generation(monkeypatch):
 
     asyncio.run(realtime_video_api._generate_loop(SimpleNamespace(), session))
 
-    assert events.index("generate_start_1") < events.index("send_end_0")
+    assert events.index("send_end_0") < events.index("generate_start_1")
     assert events[-1] == "send_end_1"
 
 
@@ -481,6 +485,8 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
             prompt="walk forward",
             num_frames=3,
             fps=24,
+            realtime_causal_sink_size=3,
+            realtime_causal_kv_cache_num_frames=45,
         )
     )
     state = adapter._state(session)
@@ -540,6 +546,8 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     assert batch.block_idx == 0
     assert batch.return_raw_frames is True
     assert batch.realtime_event_id == 11
+    assert batch.realtime_causal_sink_size == 3
+    assert batch.realtime_causal_kv_cache_num_frames == 45
 
 
 def test_lingbot_realtime_adapter_ingests_initial_condition_inputs():
@@ -565,9 +573,13 @@ def test_realtime_video_request_accepts_raw_lossless_output_format():
         type="init",
         prompt="walk forward",
         realtime_output_format="raw",
+        realtime_causal_sink_size=3,
+        realtime_causal_kv_cache_num_frames=45,
     )
 
     assert request.realtime_output_format == "raw"
+    assert request.realtime_causal_sink_size == 3
+    assert request.realtime_causal_kv_cache_num_frames == 45
 
 
 def test_lingbot_realtime_adapter_does_not_wait_for_idle_chunks():
@@ -625,8 +637,8 @@ def test_lingbot_i2v_condition_does_not_repeat_reference_chunk():
     )
 
     assert torch.equal(first, condition_full)
-    assert torch.count_nonzero(second) == 0
     assert second.shape == condition_full.shape
+    assert torch.count_nonzero(second) == 0
 
 
 def test_lingbot_i2v_condition_pads_tail_without_reusing_reference():
@@ -648,6 +660,55 @@ def test_lingbot_i2v_condition_pads_tail_without_reusing_reference():
     assert torch.count_nonzero(first[:, :, 1:]) == 0
     assert second.shape == first.shape
     assert torch.count_nonzero(second) == 0
+
+
+def test_lingbot_i2v_condition_uses_available_non_initial_chunks():
+    first_chunk = torch.ones(1, 20, 3, 2, 2)
+    second_chunk = first_chunk * 2
+    condition_full = torch.cat([first_chunk, second_chunk], dim=2)
+
+    second = LingBotWorldCausalDMDDenoisingStage._select_i2v_condition_chunk(
+        condition_full,
+        chunk_idx=1,
+        chunk_size=3,
+    )
+    third = LingBotWorldCausalDMDDenoisingStage._select_i2v_condition_chunk(
+        condition_full,
+        chunk_idx=2,
+        chunk_size=3,
+    )
+
+    assert torch.equal(second, second_chunk)
+    assert third.shape == second_chunk.shape
+    assert torch.count_nonzero(third) == 0
+
+
+def test_realtime_input_validation_reuses_generator_across_chunks():
+    stage = RealtimeInputValidationStage.__new__(RealtimeInputValidationStage)
+    state = RealtimeInputValidationState()
+    generator = torch.Generator(device="cpu").manual_seed(123)
+
+    first = SimpleNamespace(
+        block_idx=0,
+        generator=generator,
+        seeds=None,
+        seed=123,
+        generator_device="cpu",
+        num_outputs_per_prompt=1,
+    )
+    second = SimpleNamespace(
+        block_idx=1,
+        generator=torch.Generator(device="cpu").manual_seed(123),
+        seeds=None,
+        seed=123,
+        generator_device="cpu",
+        num_outputs_per_prompt=1,
+    )
+
+    stage._cache_generator(first, state)
+    stage._reuse_or_cache_generator(second, state)
+
+    assert second.generator is generator
 
 
 def test_lingbot_denoising_stage_does_not_own_realtime_cache_refs():
@@ -676,12 +737,62 @@ def test_lingbot_realtime_attention_cache_uses_bounded_sink_window():
     assert stage._get_causal_sink_tokens() == 9 * 10
     assert (
         stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=False)
-        == (9 + 18) * 10
+        == 18 * 10
     )
     assert (
         stage._get_lingbot_causal_kv_cache_size(sequence_shard_enabled=True)
-        == (9 + 18) * 10
+        == 18 * 10
     )
+
+
+def test_lingbot_realtime_cache_config_overrides_checkpoint_defaults():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.sliding_window_num_frames = 18
+    stage.num_token_per_frame = 10
+
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            realtime_causal_sink_size=3,
+            realtime_causal_kv_cache_num_frames=45,
+        )
+    )
+    stage._apply_realtime_causal_cache_config(SimpleNamespace(), server_args)
+
+    assert stage._get_causal_sink_tokens() == 3 * 10
+    assert stage._get_lingbot_causal_kv_cache_size(
+        sequence_shard_enabled=False
+    ) == 45 * 10
+
+
+def test_lingbot_realtime_cache_config_uses_request_overrides():
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    stage.local_attn_size = -1
+    stage.sink_size = 9
+    stage.sliding_window_num_frames = 18
+    stage.num_token_per_frame = 10
+
+    batch = SimpleNamespace(
+        realtime_causal_sink_size=4,
+        realtime_causal_kv_cache_num_frames=12,
+    )
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            realtime_causal_sink_size=3,
+            realtime_causal_kv_cache_num_frames=45,
+        )
+    )
+    stage._apply_realtime_causal_cache_config(batch, server_args)
+
+    assert stage._get_causal_sink_tokens() == 4 * 10
+    assert stage._get_lingbot_causal_kv_cache_size(
+        sequence_shard_enabled=False
+    ) == 12 * 10
 
 
 def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
@@ -712,7 +823,7 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
     assert stage.causal_kv_cache is not None
     cache = stage.causal_kv_cache[0]
     assert cache.allow_growth is False
-    assert cache.cache_size == 8
+    assert cache.cache_size == 6
     assert cache.sink_tokens == 2
 
     cache.update_and_get_attention_kv(
@@ -735,17 +846,15 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
         current_chunk_start=6,
     )
 
-    assert cache.cache_size == 8
-    assert cache.local_end_index_int == 8
+    assert cache.cache_size == 6
+    assert cache.local_end_index_int == 6
     assert cache.global_end_index_int == 9
     assert torch.equal(cache.k[:, :2], torch.ones(1, 2, 1, 1))
-    assert torch.equal(cache.k[:, 2:5], torch.full((1, 3, 1, 1), 2.0))
-    assert torch.equal(cache.k[:, 5:8], torch.full((1, 3, 1, 1), 3.0))
+    assert torch.equal(cache.k[:, 2:3], torch.full((1, 1, 1, 1), 2.0))
+    assert torch.equal(cache.k[:, 3:6], torch.full((1, 3, 1, 1), 3.0))
     assert third_view.k.flatten().tolist() == [
         1.0,
         1.0,
-        2.0,
-        2.0,
         2.0,
         3.0,
         3.0,
@@ -758,16 +867,14 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
         current_chunk_start=9,
     )
 
-    assert cache.local_end_index_int == 8
+    assert cache.local_end_index_int == 6
     assert cache.global_end_index_int == 12
     assert torch.equal(cache.k[:, :2], torch.ones(1, 2, 1, 1))
-    assert torch.equal(cache.k[:, 2:5], torch.full((1, 3, 1, 1), 3.0))
-    assert torch.equal(cache.k[:, 5:8], torch.full((1, 3, 1, 1), 4.0))
+    assert torch.equal(cache.k[:, 2:3], torch.full((1, 1, 1, 1), 3.0))
+    assert torch.equal(cache.k[:, 3:6], torch.full((1, 3, 1, 1), 4.0))
     assert fourth_view.k.flatten().tolist() == [
         1.0,
         1.0,
-        3.0,
-        3.0,
         3.0,
         4.0,
         4.0,

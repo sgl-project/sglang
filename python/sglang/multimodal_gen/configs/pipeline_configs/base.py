@@ -812,6 +812,18 @@ class PipelineConfig:
             default=PipelineConfig.dmd_denoising_steps,
             help="Comma-separated list of denoising steps (e.g., '1000,757,522')",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-sink-size",
+            type=int,
+            default=None,
+            help="Override the number of sink frames kept by realtime causal DiT pipelines that support it.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-kv-cache-num-frames",
+            type=int,
+            default=None,
+            help="Override the total frame capacity of realtime causal DiT KV cache for pipelines that support it.",
+        )
 
         # Add VAE configuration arguments
         from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
