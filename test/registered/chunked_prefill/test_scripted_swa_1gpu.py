@@ -61,12 +61,6 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
         swa_full_tokens_ratio=_SWA_FULL_TOKENS_RATIO,
         page_size=1,
         mem_fraction_static=0.70,
-        # This regression specifically needs the overlap scheduler: decode
-        # iterations pipelined alongside an in-flight chunked prefill are what
-        # drive the retraction-while-mid-chunk that triggers add_chunked_req's
-        # hybrid-SWA early-return. The scripted harness defaults to the
-        # non-overlap loop, so opt back in here.
-        disable_overlap_schedule=False,
     )
 
     def test_swa_chunked_req_early_return_no_double_free(self):
