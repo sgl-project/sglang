@@ -101,7 +101,7 @@ def _unpack_frame_batch_messages(payloads):
 
 
 def test_realtime_webui_presets_do_not_emit_camera_scripts():
-    repo_root = Path(__file__).parents[4]
+    repo_root = Path(__file__).parents[5]
     app_js = (
         repo_root
         / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
