@@ -1189,9 +1189,8 @@ def _run_eagle_draft_extend_eager(
     model_runner = (
         worker.model_runner if hasattr(worker, "model_runner") else worker.draft_runner
     )
-    with (
-        torch.no_grad(),
-        forward_context(ForwardContext(attn_backend=worker.draft_extend_attn_backend)),
+    with torch.no_grad(), forward_context(
+        ForwardContext(attn_backend=worker.draft_extend_attn_backend)
     ):
         worker.draft_extend_attn_backend.init_forward_metadata(batch)
         ret = model_runner.model.forward(
