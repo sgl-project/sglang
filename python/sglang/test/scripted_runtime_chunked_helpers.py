@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-
 DEFAULT_CHUNK_SIZE: int = 256
 
 DEFAULT_MAX_STEPS: int = 400
 
-SMALL_MODEL: str = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+# Qwen3-0.6B ties its word embeddings and already handles the tie correctly
+# under pipeline parallelism (qwen3.py), so the PP scripted-runtime tests can
+# use it without patching the model code.
+SMALL_MODEL: str = "Qwen/Qwen3-0.6B"
 
 
 def base_engine_kwargs(
