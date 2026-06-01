@@ -121,6 +121,10 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "ControlStateController" in app_js
     assert 'const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";' in app_js
     assert 'id="transportFormat"' in index_html
+    assert (
+        'id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate"'
+        in index_html
+    )
     assert '<option value="webp" selected>WebP preview</option>' in index_html
     assert 'id="serverSendText"' in index_html
     assert 'id="theoreticalFpsText"' in index_html
