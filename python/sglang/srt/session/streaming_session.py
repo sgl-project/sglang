@@ -110,7 +110,16 @@ class SessionSlot:
 
 
 def _is_streaming(req: Optional[Req]) -> bool:
-    return req is not None and req.session is not None and req.session.streaming
+    # Only ISOLATED sessions use a pinned slot. SHARED sessions (admission-full
+    # at open, or pin-capped at save) flow through the evictable radix path.
+    from sglang.srt.session.session_controller import Residency
+
+    return (
+        req is not None
+        and req.session is not None
+        and req.session.streaming
+        and req.session.residency == Residency.ISOLATED
+    )
 
 
 class StreamingSession(BasePrefixCache):
@@ -316,6 +325,14 @@ class StreamingSession(BasePrefixCache):
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
+
+        # Pin-budget growth cap: this slot just grew. If it pushed the pinned
+        # tier over budget, flip this session to SHARED so its future turns ride
+        # the evictable radix (bounds per-session pin growth). Tag-only, at this
+        # safe turn boundary -- no mid-stream slot release.
+        ctrl = getattr(self, "session_controller", None)
+        if ctrl is not None:
+            ctrl.on_slot_saved(session_id)
 
         self._mark_kv_freed(req)
         return True

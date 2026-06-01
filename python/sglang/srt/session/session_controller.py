@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import enum
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Dict, Optional
@@ -30,6 +32,21 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
+
+
+class Residency(enum.IntEnum):
+    """How a streaming session's KV is held.
+
+    ISOLATED -- pinned in a streaming slot, invisible to eviction. The pinned
+                set is bounded by admission so it always fits.
+    SHARED   -- a normal evictable radix-tree entry. Eviction (incl. priority
+                policy / HiCache) is the radix cache's job; SHARED sessions
+                simply ride it. Used when admission is full (open) or when a
+                session would grow the pinned tier past budget (save).
+    """
+
+    ISOLATED = 0
+    SHARED = 1
 
 
 class SessionReqNode:
@@ -85,11 +102,19 @@ class Session:
         session_id: Optional[str] = None,
         streaming: bool = False,
         timeout: Optional[float] = None,
+        residency: "Residency" = Residency.ISOLATED,
     ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
         self.streaming = streaming
         self.timeout = timeout
+        # KV residency tier; see Residency. ISOLATED pins a slot, SHARED rides
+        # the evictable radix. Set by SessionController admission / pin-budget.
+        self.residency: "Residency" = residency
+        # Open-time footprint reservation (tokens), counted against the pinned
+        # budget while ISOLATED and no slot has materialized yet (in-flight
+        # prefill). Measured slot size supersedes it once the slot exists.
+        self._reserved_est: int = 0
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
@@ -270,16 +295,77 @@ class Session:
 
 
 class SessionController:
+    # Fraction of the KV pool the pinned (ISOLATED) tier may hold. The remainder
+    # stays available for active generation + the evictable radix tree, so the
+    # worker cannot deadlock on non-evictable held KV. Override via env.
+    SESSION_KV_FRACTION = float(os.environ.get("SGLANG_SESSION_KV_FRACTION", "0.5"))
+
     def __init__(self, tree_cache: BasePrefixCache):
         self.sessions: Dict[str, Session] = {}
         self._last_reap_time: float = 0.0
         self.tree_cache = tree_cache
+        # Budget (tokens) the pinned tier may hold, derived from the pool size.
+        # None disables the budget (legacy unbounded behavior).
+        self.max_session_tokens: Optional[int] = None
+        try:
+            pool = self.tree_cache.token_to_kv_pool_allocator.size
+            self.max_session_tokens = int(self.SESSION_KV_FRACTION * pool)
+        except Exception:
+            logger.warning("SessionController: could not size KV pool; budget off")
+        # Back-reference so the cache can invoke the pin-budget check after a
+        # slot grows (turn save). See StreamingSession.cache_finished_req.
+        try:
+            self.tree_cache.session_controller = self
+        except Exception:
+            pass
 
     def __contains__(self, session_id: str) -> bool:
         return session_id in self.sessions
 
     def get(self, session_id: str) -> Optional[Session]:
         return self.sessions.get(session_id)
+
+    # -- Pin-budget admission + growth cap ----------------------------------
+    #
+    # Invariant: KV pinned by ISOLATED sessions stays <= max_session_tokens.
+    # Enforced only at the two SAFE boundaries -- open (admission) and slot save
+    # (growth cap) -- and only by tagging SHARED, never by releasing a live
+    # slot (mid-stream release corrupts the lock structure). SHARED sessions are
+    # ordinary evictable radix entries, so eviction stays the radix cache's job.
+
+    def _slot_held(self, session_id: str) -> int:
+        slots = getattr(self.tree_cache, "slots", None)
+        slot = slots.get(session_id) if slots else None
+        if slot is None or not getattr(slot, "is_holding_kv", False):
+            return 0
+        return int(getattr(slot, "kv_allocated_len", 0) or 0)
+
+    def pinned_tokens(self) -> int:
+        # Measured slot size once a slot exists, else the open-time reservation
+        # (covers the in-flight prefill burst before any slot saves).
+        total = 0
+        for sid, s in self.sessions.items():
+            if s.residency != Residency.ISOLATED:
+                continue
+            total += self._slot_held(sid) or s._reserved_est
+        return total
+
+    def on_slot_saved(self, session_id: str) -> None:
+        """Called by the cache after a session's slot grows (turn save). If the
+        pinned tier now exceeds budget, flip this session to SHARED so its
+        FUTURE turns ride the evictable radix -- bounding per-session pin growth.
+        The current slot stays (bounded) and is freed at the session's clean
+        close; no unsafe mid-stream release."""
+        if self.max_session_tokens is None:
+            return
+        s = self.sessions.get(session_id)
+        if s is None or s.residency != Residency.ISOLATED:
+            return
+        if self.pinned_tokens() > self.max_session_tokens:
+            s.residency = Residency.SHARED
+            log_info_on_rank0(
+                logger, f"Session pin-capped ISOLATED->SHARED: {session_id}"
+            )
 
     def open(self, recv_req: OpenSessionReqInput) -> OpenSessionReqOutput:
         session_id = recv_req.session_id
@@ -290,14 +376,31 @@ class SessionController:
             logger.warning("session id is None, cannot open.")
             return OpenSessionReqOutput(session_id, False)
         else:
-            self.sessions[session_id] = Session(
+            # Admission: reserve this session's footprint against the pinned
+            # budget. Over budget -> open SHARED (evictable radix), so a burst of
+            # opens can't all pin and saturate the pool. The session still
+            # exists, so its generate requests are served normally.
+            est = max(1, recv_req.capacity_of_str_len // 4)  # chars -> ~tokens
+            residency = Residency.ISOLATED
+            if (
+                self.max_session_tokens is not None
+                and self.pinned_tokens() + est > self.max_session_tokens
+            ):
+                residency = Residency.SHARED
+            session = Session(
                 recv_req.capacity_of_str_len,
                 session_id,
                 streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
+                residency=residency,
             )
+            session._reserved_est = est if residency == Residency.ISOLATED else 0
+            self.sessions[session_id] = session
             log_info_on_rank0(
-                logger, f"Session opened: {session_id} (active={len(self.sessions)})"
+                logger,
+                f"Session opened: {session_id} (active={len(self.sessions)}, "
+                f"residency={residency.name}, "
+                f"pinned={self.pinned_tokens()}/{self.max_session_tokens})",
             )
             return OpenSessionReqOutput(session_id, True)
 
