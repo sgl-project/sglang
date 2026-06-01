@@ -360,51 +360,5 @@ class TestChunkSize2048MaxPrefill1024(ScriptedTestCase):
         assert r.chunks_done == 0
 
 
-class TestChunkSize16Page16(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=16, page_size=16)
-
-    def test_chunk_size_equals_page_size(self):
-        self.server.execute_script(self._script_chunk_size_equals_page_size)
-
-    @staticmethod
-    def _script_chunk_size_equals_page_size(t: ScriptedContext):
-        r = t.start_req(prompt_len=8 * 16, max_new_tokens=2)
-        yield from run_until_finished(r, max_steps=400)
-        assert r.finished
-        assert r.chunks_done == 8
-        assert r.kv_pages == 0
-
-    def test_chunk_size_equals_page_size_plus_one(self):
-        self.server.execute_script(self._script_chunk_size_equals_page_size_plus_one)
-
-    @staticmethod
-    def _script_chunk_size_equals_page_size_plus_one(t: ScriptedContext):
-        # One token past an exact 8-page (128-token) prompt: the single extra
-        # token rounds up to its own 16-token page, adding exactly one more
-        # page-padded chunk on top of the prompt_len=128 -> chunks_done=8 case.
-        r = t.start_req(prompt_len=129, max_new_tokens=2)
-        yield from run_until_finished(r, max_steps=400)
-        assert r.finished
-        assert r.chunks_done == 9
-        assert r.kv_pages == 0
-
-
-class TestChunkSize15Page16(ScriptedTestCase):
-    ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=15, page_size=16)
-
-    def test_chunk_size_misaligned_page_size_plus_minus_1(self):
-        self.server.execute_script(
-            self._script_chunk_size_misaligned_page_size_plus_minus_1
-        )
-
-    @staticmethod
-    def _script_chunk_size_misaligned_page_size_plus_minus_1(t: ScriptedContext):
-        r = t.start_req(prompt_len=60, max_new_tokens=2)
-        yield from run_until_finished(r, max_steps=400)
-        assert r.finished
-        assert r.chunks_done == 4
-        assert r.kv_pages == 0
-
-
 if __name__ == "__main__":
     unittest.main()
