@@ -1219,23 +1219,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         if not batch.forward_mode.is_idle() and self.topk > 1:
-            # Tree drafting: verify writes `predict` / hidden_states node-indexed
-            # over the whole draft tree, and the accepted path is scattered across
-            # `accept_index`. Compact the accepted path to the contiguous front of
-            # each per-req block (and move the accepted KV to the committed front
-            # slots) so the downstream chain-layout code stays correct: output
-            # slicing in the result processor, draft-extend `select_index`, and the
-            # next decode's committed-KV reads all assume accepted == front chain.
-            # For topk == 1 the accepted path is already the front chain, so this is
-            # an identity transform and is skipped.
-            self.move_accepted_tokens_to_target_kvcache(
-                batch, accept_index, accept_lens - 1
+            # topk == 1 needs nothing here: the accepted path is already the front
+            # chain, so the whole compaction is an identity transform.
+            predict = self._finalize_accepted_tree_path(
+                batch, accept_index, accept_lens, predict, logits_output, bs
             )
-            predict = self._compact_accepted_to_front(predict, accept_index, bs)
-            if logits_output.hidden_states is not None:
-                logits_output.hidden_states = self._compact_accepted_to_front(
-                    logits_output.hidden_states, accept_index, bs
-                )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
@@ -1317,6 +1305,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=self.target_worker.model_runner.model,
             )
+
+    def _finalize_accepted_tree_path(
+        self,
+        batch: ScheduleBatch,
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+        predict: torch.Tensor,
+        logits_output,
+        bs: int,
+    ) -> torch.Tensor:
+        """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
+        hidden_states -- to the contiguous front of each per-req block, which the
+        downstream chain-layout code (draft-extend select_index, committed-KV reads)
+        assumes. Returns compacted predict; mutates logits_output.hidden_states
+        (moved only when present)."""
+        self.move_accepted_tokens_to_target_kvcache(
+            batch, accept_index, accept_lens - 1
+        )
+        predict = self._compact_accepted_to_front(predict, accept_index, bs)
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = self._compact_accepted_to_front(
+                logits_output.hidden_states, accept_index, bs
+            )
+        return predict
 
     def move_accepted_tokens_to_target_kvcache(
         self,
