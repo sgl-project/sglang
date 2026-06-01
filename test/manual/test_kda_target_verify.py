@@ -133,16 +133,16 @@ def test_kda_target_verify_equivalence():
             state_diff = (cached_state - decode_state).abs().max().item()
             status = "OK" if state_diff < 1e-5 else "FAIL"
             print(f"  step={step} req={req_idx}: diff={state_diff:.6e} [{status}]")
-            assert state_diff < 1e-5, (
-                f"Intermediate state mismatch at step={step}, req={req_idx}: {state_diff}"
-            )
+            assert (
+                state_diff < 1e-5
+            ), f"Intermediate state mismatch at step={step}, req={req_idx}: {state_diff}"
 
     # --- Verify SSM states are NOT modified in-place ---
     ssm_unchanged_diff = (ssm_states_verify - ssm_states_base).abs().max().item()
     print(f"SSM state in-place change (should be 0): {ssm_unchanged_diff:.6e}")
-    assert ssm_unchanged_diff == 0.0, (
-        f"target_verify modified ssm_states in-place! diff: {ssm_unchanged_diff}"
-    )
+    assert (
+        ssm_unchanged_diff == 0.0
+    ), f"target_verify modified ssm_states in-place! diff: {ssm_unchanged_diff}"
 
     print("\nPASSED: KDA target_verify matches sequential decode!")
 
@@ -185,10 +185,19 @@ def test_kda_target_verify_bf16():
         step_b = b[:, step_indices].contiguous()
         decode_qsl = torch.arange(0, B + 1, dtype=torch.int32, device=device)
         out = fused_sigmoid_gating_delta_rule_update(
-            A_log=A_log, dt_bias=dt_bias, q=step_q, k=step_k, v=step_v,
-            a=step_a, b=step_b, initial_state_source=ssm_states_decode,
-            initial_state_indices=cache_indices, cu_seqlens=decode_qsl,
-            use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=step_q,
+            k=step_k,
+            v=step_v,
+            a=step_a,
+            b=step_b,
+            initial_state_source=ssm_states_decode,
+            initial_state_indices=cache_indices,
+            cu_seqlens=decode_qsl,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
             is_kda=True,
         )
         outputs_decode.append(out)
@@ -200,12 +209,24 @@ def test_kda_target_verify_bf16():
     )
     intermediate_indices = torch.arange(B, dtype=torch.int32, device=device)
     out_verify = fused_sigmoid_gating_delta_rule_update(
-        A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
-        initial_state_source=ssm_states_verify, initial_state_indices=cache_indices,
-        cu_seqlens=query_start_loc, use_qk_l2norm_in_kernel=True,
-        softplus_beta=1.0, softplus_threshold=20.0, is_kda=True,
-        disable_state_update=True, intermediate_states_buffer=intermediate_buffer,
-        intermediate_state_indices=intermediate_indices, cache_steps=N,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        initial_state_source=ssm_states_verify,
+        initial_state_indices=cache_indices,
+        cu_seqlens=query_start_loc,
+        use_qk_l2norm_in_kernel=True,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        is_kda=True,
+        disable_state_update=True,
+        intermediate_states_buffer=intermediate_buffer,
+        intermediate_state_indices=intermediate_indices,
+        cache_steps=N,
         retrieve_parent_token=None,
     )
 
