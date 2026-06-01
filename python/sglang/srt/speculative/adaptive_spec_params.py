@@ -19,12 +19,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CANDIDATE_STEPS: list[int] = [1, 3, 7]
-
 # TODO: add step=0 (nospec fallback) for BS>=8 once supported.
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
-        "candidate_steps": _DEFAULT_CANDIDATE_STEPS,
+        "candidate_steps": [1, 3, 7],
         "up_hysteresis": 0.0,
         "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
@@ -97,7 +95,7 @@ def _load_adaptive_config(
         if not key.isdigit():
             continue
 
-        steps = entry.setdefault("candidate_steps", _DEFAULT_CANDIDATE_STEPS)
+        steps = entry.get("candidate_steps")
         if (
             not isinstance(steps, list)
             or not steps
@@ -142,38 +140,26 @@ class AdaptiveStepSlot:
     - num_steps can be selected from different candidate sets on different batch_sizes
     """
 
-    def __init__(self, initial_steps: int, bs_cfg: dict):
-        candidates = sorted(set(bs_cfg["candidate_steps"]))
+    def __init__(self, initial_steps: int, cfg: dict):
+        candidates = sorted(set(cfg["candidate_steps"]))
         assert len(candidates) >= 1, "candidate_steps must have at least 1 value"
         self.candidate_steps = candidates
 
-        self.ema_alpha = bs_cfg.get("ema_alpha", 0.2)
-        self.update_interval = bs_cfg.get("update_interval", 5)
-        self.warmup_batches = bs_cfg.get("warmup_batches", 10)
-        self.down_hysteresis = bs_cfg.get("down_hysteresis", -0.25)
-        self.up_hysteresis = bs_cfg.get("up_hysteresis", 0.0)
-        self.ceiling_coeff = bs_cfg.get("ceiling_coeff", 0)
+        self.ema_alpha = cfg.get("ema_alpha", 0.2)
+        self.update_interval = cfg.get("update_interval", 5)
+        self.warmup_batches = cfg.get("warmup_batches", 10)
+        self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
+        self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
+        self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
 
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
         else:
             self.current_steps = self.candidate_steps[len(self.candidate_steps) // 2]
-            log_info_on_rank0(
-                logger,
-                f"initial_steps={initial_steps} not in "
-                f"candidate_steps={self.candidate_steps}, "
-                f"snapping to middle entry {self.current_steps}",
-            )
 
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
         self._batch_count = 0
-
-        log_info_on_rank0(
-            logger,
-            f"AdaptiveStepSlot initialized: "
-            f"steps={self.current_steps}, candidate_steps={self.candidate_steps}",
-        )
 
     def update(self, num_correct_drafts_per_req: list[int]) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
@@ -203,6 +189,7 @@ class AdaptiveStepSlot:
         old_steps = self.current_steps
         current_idx = self.candidate_steps.index(old_steps)
 
+        # TODO: Consider limiting step changes to avoid overshooting.
         while current_idx > 0:
             prev_step = self.candidate_steps[current_idx - 1]
             drop_threshold = prev_step - 0.5 + self.down_hysteresis
@@ -219,10 +206,9 @@ class AdaptiveStepSlot:
             else:
                 break
 
-        # EMA ceiling: cap num_steps proportionally to observed draft quality.
-        # Only applied as a downward cap — never blocks step-ups that hysteresis
-        # allows, so the system can explore higher steps and let the EMA catch up.
         target = self.candidate_steps[current_idx]
+        # EMA ceiling: only caps downward — never blocks step-ups, so the
+        # system can explore higher steps and let the EMA catch up.
         if self.ceiling_coeff > 0:
             ceiling = max(1, math.ceil(self.ema_accept_len * self.ceiling_coeff))
             if target > ceiling and target <= old_steps:
@@ -261,9 +247,17 @@ class AdaptiveSpeculativeParams:
             # is not in this slot's candidate_steps, it snaps to the middle.
             self._slots[bs] = AdaptiveStepSlot(
                 initial_steps=initial_steps,
-                bs_cfg=merged,
+                cfg=merged,
             )
         self._cuda_graph_bs: list[int] | None = None
+
+        first_slot = self._slots[self._bs_list[0]]
+        log_info_on_rank0(
+            logger,
+            f"AdaptiveSpeculativeParams initialized: "
+            f"steps={first_slot.current_steps}, "
+            f"candidate_steps={first_slot.candidate_steps}",
+        )
 
     @cached_property
     def candidate_steps(self) -> list[int]:
