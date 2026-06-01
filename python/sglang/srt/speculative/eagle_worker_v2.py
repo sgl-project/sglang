@@ -1334,12 +1334,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
         """
         bs = len(batch.seq_lens)
-        size = bs * self.speculative_num_draft_tokens
-        # accept_index is [bs, spec_steps + 1]; fill_accepted_out_cache_loc must
-        # iterate exactly over its elements (one program per node slot). Using
-        # `size` (bs * num_draft_tokens) here over-reads accept_index whenever
-        # num_draft_tokens > spec_steps + 1 (i.e. topk > 1) -> illegal memory access.
-        ai_size = bs * (self.speculative_num_steps + 1)
+        # Size everything to accept_index's element count (bs * (spec_steps + 1)).
+        # NOT bs * num_draft_tokens: for topk > 1 the draft tree is larger than the
+        # accepted chain, which would over-read accept_index (illegal memory) and
+        # over-allocate the packed cache-loc buffers (assign_extend / fill_accepted
+        # both write at cumulative offsets, total <= bs * (spec_steps + 1)).
+        size = bs * accept_index.shape[1]
 
         # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
         maybe_detect_oob(
@@ -1366,11 +1366,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
-        fill_accepted_out_cache_loc[(ai_size,)](
+        fill_accepted_out_cache_loc[(size,)](
             accept_index,
             batch.out_cache_loc,
             accepted_out_cache_loc,
-            next_power_of_2(ai_size),
+            next_power_of_2(size),
         )
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
