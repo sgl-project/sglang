@@ -284,6 +284,42 @@ def _should_build_payload_off_loop(
     return output_format in ENCODED_PREVIEW_FORMATS or output_format is None
 
 
+def _is_encoded_preview_transport(
+    *,
+    content_type: str,
+    output_format: str | None,
+) -> bool:
+    return output_format in ENCODED_PREVIEW_FORMATS and content_type == RAW_RGB_CONTENT_TYPE
+
+
+async def _build_encoded_preview_payloads(
+    split_batches: list[list[bytes]],
+    *,
+    content_type: str,
+    metadata: dict[str, int | str],
+    output_format: str,
+    transport_quality: int | None,
+    event_id: int | None,
+) -> list[_TransportPayload]:
+    return list(
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    _build_transport_payload,
+                    transport_frames,
+                    content_type=content_type,
+                    metadata=metadata,
+                    output_format=output_format,
+                    transport_quality=transport_quality,
+                    reference_frame=None,
+                    event_id=event_id,
+                )
+                for transport_frames in split_batches
+            )
+        )
+    )
+
+
 class RawRGBRealtimeOutputAdapter:
     """send raw RGB over WebSocket using lossless transport compression"""
 
@@ -348,8 +384,10 @@ class RawRGBRealtimeOutputAdapter:
         for frames in frame_batches:
             split_batches = (
                 [[frame] for frame in frames]
-                if output_format in ENCODED_PREVIEW_FORMATS
-                and content_type == RAW_RGB_CONTENT_TYPE
+                if _is_encoded_preview_transport(
+                    content_type=content_type,
+                    output_format=output_format,
+                )
                 else (
                     _split_frame_batch(frames)
                     if content_type == RAW_RGB_CONTENT_TYPE
@@ -357,41 +395,59 @@ class RawRGBRealtimeOutputAdapter:
                 )
             )
             num_frame_batches = len(split_batches)
+            encoded_preview_payloads: list[_TransportPayload] | None = None
+            if _is_encoded_preview_transport(
+                content_type=content_type,
+                output_format=output_format,
+            ):
+                timer = RealtimeStageTimer()
+                encoded_preview_payloads = await _build_encoded_preview_payloads(
+                    split_batches,
+                    content_type=content_type,
+                    metadata=metadata,
+                    output_format=output_format,
+                    transport_quality=transport_quality,
+                    event_id=event_id,
+                )
+                stats["raw_payload_build_ms"] += timer.mark_ms()
             for frame_batch_index, transport_frames in enumerate(split_batches):
                 timer = RealtimeStageTimer()
                 transport_metadata = metadata
-                reference_frame = self._last_raw_rgb_frame
-                if event_id != self._last_event_id:
-                    reference_frame = None
-                if _should_build_payload_off_loop(
-                    content_type=content_type,
-                    output_format=output_format,
-                    transport_frames=transport_frames,
-                ):
-                    transport_payload = await asyncio.to_thread(
-                        _build_transport_payload,
-                        transport_frames,
-                        content_type=content_type,
-                        metadata=metadata,
-                        output_format=output_format,
-                        transport_quality=transport_quality,
-                        reference_frame=reference_frame,
-                        event_id=event_id,
-                    )
+                if encoded_preview_payloads is not None:
+                    transport_payload = encoded_preview_payloads[frame_batch_index]
                 else:
-                    transport_payload = _build_transport_payload(
-                        transport_frames,
+                    reference_frame = self._last_raw_rgb_frame
+                    if event_id != self._last_event_id:
+                        reference_frame = None
+                    if _should_build_payload_off_loop(
                         content_type=content_type,
-                        metadata=metadata,
                         output_format=output_format,
-                        transport_quality=transport_quality,
-                        reference_frame=reference_frame,
-                        event_id=event_id,
-                    )
-                if transport_payload.last_raw_rgb_frame is not None:
-                    self._last_raw_rgb_frame = transport_payload.last_raw_rgb_frame
-                    self._last_event_id = transport_payload.last_event_id
-                stats["raw_payload_build_ms"] += timer.mark_ms()
+                        transport_frames=transport_frames,
+                    ):
+                        transport_payload = await asyncio.to_thread(
+                            _build_transport_payload,
+                            transport_frames,
+                            content_type=content_type,
+                            metadata=metadata,
+                            output_format=output_format,
+                            transport_quality=transport_quality,
+                            reference_frame=reference_frame,
+                            event_id=event_id,
+                        )
+                    else:
+                        transport_payload = _build_transport_payload(
+                            transport_frames,
+                            content_type=content_type,
+                            metadata=metadata,
+                            output_format=output_format,
+                            transport_quality=transport_quality,
+                            reference_frame=reference_frame,
+                            event_id=event_id,
+                        )
+                    if transport_payload.last_raw_rgb_frame is not None:
+                        self._last_raw_rgb_frame = transport_payload.last_raw_rgb_frame
+                        self._last_event_id = transport_payload.last_event_id
+                    stats["raw_payload_build_ms"] += timer.mark_ms()
 
                 header: RealtimeFrameBatchHeader = {
                     "type": "frame_batch_header",
