@@ -128,14 +128,27 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert '<option value="webp" selected>WebP preview</option>' in index_html
     assert 'id="serverSendText"' in index_html
     assert 'id="theoreticalFpsText"' in index_html
+    assert 'id="renderFps"' in index_html
+    assert 'id="stageRenderFps"' not in index_html
+    assert "sglang-diffusion Realtime Studio" in index_html
+    assert "SGLD" not in index_html
+    assert 'class="tabs"' not in index_html
+    assert "Recordings" not in index_html
+    assert "API" not in index_html
+    assert "Info" not in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-fixes-v23" in index_html
-    assert "app.js?v=realtime-fixes-v23" in index_html
+    assert "styles.css?v=realtime-fixes-v25" in index_html
+    assert "app.js?v=realtime-fixes-v25" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";' in app_js
     assert 'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";' in app_js
     assert "Dragon Dolly" in app_js
+    assert "no creature morphing" in app_js
+    assert app_js.index("Dragon Ride") < app_js.index("Dragon Dolly")
+    assert app_js.index("Dragon Dolly") < app_js.index("Kid A")
     assert "dragon-ride.jpg" in app_js
+    assert "stageRenderFps" not in app_js
+    assert 'setStatus("Receiving"' not in app_js
     assert "decodeChain = decodeChain" in app_js
     assert "receiveChain" not in app_js
     assert 'message.type === "chunk_stats"' in app_js
@@ -147,6 +160,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
         / "python/sglang/multimodal_gen/runtime/launch_server.py"
     ).read_text()
     assert "ws_per_message_deflate=False" in launch_server_py
+    assert "#statusText" in styles_css
+    assert "min-width: 92px" in styles_css
     assert "if (b === 0xca)" in app_js
     assert "if (b === 0xcb)" in app_js
     assert "if (b === 0xc4)" in app_js

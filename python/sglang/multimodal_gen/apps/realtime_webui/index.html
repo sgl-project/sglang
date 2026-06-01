@@ -3,21 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>SGLD Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v23" />
+    <title>sglang-diffusion Realtime Studio</title>
+    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v25" />
   </head>
   <body>
     <main class="shell">
       <section class="panel controls" aria-label="Session controls">
         <div class="brand">
-          <span>SGLD</span>
+          <span>sglang-diffusion</span>
           <strong>Realtime Studio</strong>
-        </div>
-        <div class="tabs">
-          <button class="active">Playground</button>
-          <button>Recordings</button>
-          <button>API</button>
-          <button>Info</button>
         </div>
         <label>Server<input id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate" /></label>
         <label>Model<input id="model" value="robbyant/lingbot-world-fast-diffusers" /></label>
@@ -71,7 +65,8 @@
           <span id="statusText">Idle</span>
           <span id="chunkText">chunk -</span>
           <span class="topbar-spacer"></span>
-          <span class="stage-stat">render <b id="stageRenderFps">0</b> fps</span>
+          <span class="stage-stat">render <b id="renderFps">0</b> fps</span>
+          <span class="stage-stat">theoretical <b id="theoreticalFpsText">-</b></span>
           <span class="stage-stat">wait <b id="stageLatencyText">-</b></span>
         </div>
         <canvas id="viewport" width="1280" height="720"></canvas>
@@ -105,9 +100,7 @@
           <span id="byteText">0 MB</span>
         </div>
         <div class="telemetry stage-telemetry">
-          <span>Render FPS<b id="renderFps">0</b></span>
           <span>Payload<b id="payloadMode">webp</b></span>
-          <span>Theoretical FPS<b id="theoreticalFpsText">-</b></span>
           <span>Server send<b id="serverSendText">-</b></span>
           <span>Chunk bytes<b id="chunkPayloadText">-</b></span>
           <span>Chunk wait<b id="latencyText">-</b></span>
@@ -130,6 +123,6 @@
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-    <script src="./app.js?v=realtime-fixes-v23"></script>
+    <script src="./app.js?v=realtime-fixes-v25"></script>
   </body>
 </html>

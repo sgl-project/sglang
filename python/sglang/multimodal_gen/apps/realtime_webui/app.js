@@ -47,14 +47,7 @@ const CONTROL_ACTION_META = {
 
 const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";
 
-const presets = [
-  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A smooth first-person dolly toward the castle, natural parallax, stable fantasy scene detail.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
-  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
-  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 16, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
-  { name: "Lake Scout", tone: "green", size: "832x480", fps: 16, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
-  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 16, prompt: "A slow aerial orbit around a pastel floating island hotel in the open ocean, hazy sunlight, turquoise water, toy-like architectural detail, clean horizon, cinematic but playful.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
-  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 16, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
-  { name: "Kid A", tone: "accent", size: "832x480", fps: 16, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
+const reactorPresets = [
   {
     name: "Dragon Ride",
     tone: "green",
@@ -176,6 +169,21 @@ const presets = [
   },
 ];
 
+const examplePresets = [
+  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A stable first-person dolly from the same dragon-rider viewpoint, keeping the black dragon head, horns, wings, jungle canopy, and distant castle consistent; slow forward camera motion, natural parallax, no creature morphing, no scene replacement.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
+  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
+  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 16, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
+  { name: "Lake Scout", tone: "green", size: "832x480", fps: 16, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
+  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 16, prompt: "A slow aerial orbit around a pastel floating island hotel in the open ocean, hazy sunlight, turquoise water, toy-like architectural detail, clean horizon, cinematic but playful.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
+  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 16, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
+  { name: "Kid A", tone: "accent", size: "832x480", fps: 16, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
+];
+
+const presets = [
+  ...reactorPresets,
+  ...examplePresets,
+];
+
 let ws = null;
 const referenceCache = new Map();
 let selectedPreset = null;
@@ -240,7 +248,7 @@ function drawIdle() {
   ctx.fillRect(0, 0, w, h);
   ctx.fillStyle = "rgba(238,241,236,.82)";
   ctx.font = "600 46px Avenir Next, sans-serif";
-  ctx.fillText("SGLD Realtime", 56, 86);
+  ctx.fillText("sglang-diffusion", 56, 86);
   for (let i = 0; i < 18; i++) {
     ctx.fillStyle = `rgba(238,241,236,${0.05 + i * 0.015})`;
     ctx.fillRect(56 + i * 64, h - 86 - i * 7, 42, 42 + i * 4);
@@ -269,7 +277,6 @@ function resetStreamStats() {
   resetDecoderState();
   updateStats();
   $("renderFps").textContent = "0";
-  $("stageRenderFps").textContent = "0";
   $("latencyText").textContent = "-";
   $("stageLatencyText").textContent = "-";
   $("decodeText").textContent = "-";
@@ -682,7 +689,6 @@ function renderLoop(now) {
     fpsSamples = fpsSamples.filter((t) => now - t < 1000);
     const renderedFps = String(fpsSamples.length);
     $("renderFps").textContent = renderedFps;
-    $("stageRenderFps").textContent = renderedFps;
     $("chunkText").textContent = `chunk ${item.chunk}`;
     lastDisplayLagMs = now - (item.receivedAt || now);
     $("decodeText").textContent = `${Math.round(item.decodeMs || lastDecodeMs)} ms`;
@@ -942,11 +948,11 @@ function receive(data, epoch) {
         .finally(() => {
           pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
         });
-      setStatus("Receiving", "live");
+      setStatus("Live", "live");
       return;
     }
     pendingHeader = message;
-    if (pendingHeader) setStatus("Receiving", "live");
+    if (pendingHeader) setStatus("Live", "live");
     return;
   }
   const header = pendingHeader;

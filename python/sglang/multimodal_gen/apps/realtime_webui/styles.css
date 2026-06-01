@@ -59,37 +59,10 @@ button:disabled { cursor: wait; opacity: 0.64; transform: none; }
   border-radius: 4px;
   padding: 3px 7px;
   font-size: 12px;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
 }
 
 .brand strong { font-size: 18px; font-weight: 650; }
-
-.tabs {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 6px;
-  margin-bottom: 18px;
-}
-
-.tabs button {
-  min-height: 30px;
-  padding: 0 6px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.tabs .active {
-  color: var(--panel);
-  background: var(--green);
-  border-color: var(--green);
-}
-
-.tabs button:active:not(:disabled),
-.tabs button.is-pressed:not(:disabled) {
-  color: #fffdf7;
-  background: var(--pressed);
-  border-color: var(--pressed-border);
-}
 
 label {
   display: grid;
@@ -262,6 +235,14 @@ button:focus-visible {
 }
 
 .topbar-spacer { flex: 1; }
+#statusText {
+  display: inline-block;
+  min-width: 92px;
+}
+#chunkText {
+  display: inline-block;
+  min-width: 70px;
+}
 .stage-stat {
   display: inline-flex;
   align-items: baseline;
@@ -476,7 +457,7 @@ button:focus-visible {
 .telemetry b { color: var(--ink); font-weight: 650; }
 
 .stage-telemetry {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0;
   margin-top: 0;
   border-top: 1px solid rgba(232, 234, 223, 0.12);
