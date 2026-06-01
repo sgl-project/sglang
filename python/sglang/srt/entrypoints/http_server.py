@@ -1300,15 +1300,21 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.post("/weights_checker")
+@app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message, ranks = await _global_state.tokenizer_manager.check_weights(
-        obj, request
+async def check_weights(
+    obj: Optional[CheckWeightsReqInput] = None, request: Request = None
+):
+    if obj is None:
+        obj = CheckWeightsReqInput()
+    success, message, ranks, per_engine_checksum = (
+        await _global_state.tokenizer_manager.check_weights(obj, request)
     )
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
+    if per_engine_checksum is not None:
+        body["per_engine_checksum"] = per_engine_checksum
     return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 

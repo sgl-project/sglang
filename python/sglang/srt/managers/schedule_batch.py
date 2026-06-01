@@ -1463,6 +1463,17 @@ def set_mamba_track_indices_from_reqs(batch):
     )
 
 
+def _compute_chunked_req_next_prompt_token(
+    chunked_req: Optional[Req],
+) -> Optional[int]:
+    if chunked_req is None:
+        return None
+    fill_len = len(chunked_req.fill_ids)
+    if fill_len >= len(chunked_req.origin_input_ids):
+        return None
+    return int(chunked_req.origin_input_ids[fill_len])
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1494,6 +1505,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
+    chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
 
     # For DP attention
@@ -1537,7 +1549,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Read by ForwardBatch ngram embedding init
     ne_token_table: torch.Tensor = None
 
-    token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
 
@@ -1582,12 +1593,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
-    # For matryoshka embeddings
-    dimensions: Optional[list[int]] = None
-
-    # Whether to return pooled hidden states (pre-head transformer output)
-    return_pooled_hidden_states: bool = False
-
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -1614,9 +1619,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
     encoder_lens_cpu: Optional[List[int]] = None
-
-    # Multi-item scoring delimiter indices (set during prepare_for_extend)
-    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
     # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
@@ -1669,6 +1671,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
+                chunked_req
+            ),
             dllm_config=dllm_config,
         )
         return batch
@@ -1818,25 +1823,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
-        # For matryoshka embeddings
-        if self.model_config.is_matryoshka and any(
-            r.dimensions is not None for r in reqs
-        ):
-            self.dimensions = [
-                r.dimensions if r.dimensions else self.model_config.hidden_size
-                for r in reqs
-            ]
-
-        # OR across the batch so ForwardBatch matches a single fused forward; requests
-        # that did not ask for PHS still skip attaching it in the output processor.
-        self.return_pooled_hidden_states = any(
-            r.return_pooled_hidden_states for r in reqs
-        )
-
-        token_type_ids = [
-            r.token_type_ids for r in reqs if r.token_type_ids is not None
-        ]
-
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
         # resolve_forward_inputs.
@@ -1848,12 +1834,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens_tensor = torch.tensor(
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
-
-        token_type_ids_tensor = None
-        if len(token_type_ids) > 0:
-            token_type_ids_tensor = torch.tensor(
-                sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin
-            ).to(self.device, non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -2049,25 +2029,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.device, non_blocking=True
                 )
         self.multimodal_inputs = multimodal_inputs
-        self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
-
-        # Pre-compute delimiter indices as CPU tensors for MIS.
-        # When --enable-mis is on, every request in the batch is expected to
-        # carry delimiter indices (the score endpoint always produces MIS-structured
-        # requests). Consumers index this list without None-checking.
-        if get_global_server_args().enable_mis and any(
-            r.multi_item_delimiter_indices is not None for r in reqs
-        ):
-            assert all(
-                r.multi_item_delimiter_indices is not None for r in reqs
-            ), "MIS batch must have delimiter indices on every request"
-            self.multi_item_delimiter_indices = [
-                torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
-                for r in reqs
-            ]
-        else:
-            self.multi_item_delimiter_indices = None
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
