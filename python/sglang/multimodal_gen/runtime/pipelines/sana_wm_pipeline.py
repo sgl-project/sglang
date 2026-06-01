@@ -115,11 +115,21 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         # between denoising and VAE decoding.
         self._maybe_add_refiner_stage(server_args)
 
-        self._add_decoding_stage()
+        self._add_decoding_stage(server_args)
 
-    def _add_decoding_stage(self) -> None:
+    def _add_decoding_stage(self, server_args: ServerArgs = None) -> None:
+        if server_args is not None and getattr(
+            server_args.pipeline_config, "streaming", False
+        ):
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming import (
+                SanaWMStreamingDecodingStage,
+            )
+
+            DecodeStage = SanaWMStreamingDecodingStage
+        else:
+            DecodeStage = SanaWMDecodingStage
         self.add_stage(
-            SanaWMDecodingStage(
+            DecodeStage(
                 vae=self.get_module("vae"),
                 pipeline=self,
                 component_name="vae",

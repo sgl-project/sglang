@@ -47,6 +47,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     log_sana_wm_tensor_stats,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -366,3 +368,58 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
         )
         batch.latents = pcfg.post_denoising_loop(latents, batch)
         return batch
+
+
+class SanaWMStreamingDecodingStage(DecodingStage):
+    """Streaming causal-VAE decode.
+
+    Decodes the latents chunk-by-chunk over the SAME autoregressive grid the
+    denoise stage used, carrying a per-conv decoder cache across chunks so the
+    causal LTX-2 VAE produces seam-free frames as generation proceeds (the
+    `decode_per_frame_with_cache` equivalent at chunk granularity). Subclasses
+    DecodingStage directly (NOT SanaWMDecodingStage, whose long-video config
+    re-enables the stateless tiled decode). `forward` is inherited; only `decode`
+    is overridden.
+    """
+
+    @torch.no_grad()
+    def decode(
+        self,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        *,
+        vae_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not hasattr(self.vae, "decode_chunk"):
+            raise ValueError(
+                "SANA-WM streaming decode requires AutoencoderKLCausalLTX2Video "
+                "(decode_chunk). Point --component_paths.vae at the ltx2_causal_vae "
+                "weights when streaming."
+            )
+        device = get_local_torch_device()
+        latents = latents.to(device)
+        pcfg = server_args.pipeline_config
+        num_frame_per_block = int(getattr(pcfg, "num_frame_per_block", 3))
+        total_frames = latents.shape[2]
+        segments = SanaWMStreamingDenoisingStage._autoregressive_segments(
+            total_frames, num_frame_per_block
+        )
+        vae_autocast = (vae_dtype != torch.float32) and not server_args.disable_autocast
+
+        conv_cache = self.vae.reset_decoder_cache()
+        chunks = []
+        for i in range(len(segments) - 1):
+            s, e = segments[i], segments[i + 1]
+            z = self.scale_and_shift(latents[:, :, s:e].to(vae_dtype), server_args)
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast,
+            ):
+                pixel = self.vae.decode_chunk(z, conv_cache)
+            pixel = (pixel / 2 + 0.5).clamp(0, 1)
+            chunks.append(pixel.float().cpu())
+
+        frames = torch.cat(chunks, dim=2)
+        log_sana_wm_tensor_stats("stream.decode.frames", frames)
+        return frames
