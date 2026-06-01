@@ -681,8 +681,6 @@ CPU_BASE_ARGS = [
     "--disable-overlap-schedule",
     "--mem-fraction-static",
     "0.8",
-    "--max-total-tokens",
-    "65536",
     "--enable-torch-compile",
     "--torch-compile-max-bs",
     "1",
