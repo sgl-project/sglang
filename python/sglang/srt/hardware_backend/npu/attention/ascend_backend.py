@@ -1041,6 +1041,7 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                sinks=sinks,
             )
 
         if not self.use_mla:
@@ -1635,6 +1636,7 @@ class AscendAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -1656,16 +1658,22 @@ class AscendAttnBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.num_token_non_padded_cpu]
+
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_lengths_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
-            if forward_batch.forward_mode.is_draft_extend():
+
+            if (
+                forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 actual_seq_lengths = (
                     np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
                 )
@@ -1675,27 +1683,43 @@ class AscendAttnBackend(AttentionBackend):
                     self.speculative_num_draft_tokens + query.shape[0],
                     self.speculative_num_draft_tokens,
                 )
+
+            is_swa_layer = layer.sliding_window_size != -1
+            if (
+                is_swa_layer
+                and self.is_hybrid_swa
+                and hasattr(self.forward_metadata, "block_tables_swa")
+            ):
+                block_table = self.forward_metadata.block_tables_swa
+            else:
+                block_table = self.forward_metadata.block_tables
+
             if layer.attn_type == AttentionType.ENCODER_ONLY:
                 mask = None
                 sparse_mode = 0
             else:
                 mask = self.mtp_mask
-                sparse_mode = 3
+                sparse_mode = 4 if is_swa_layer else 3
 
-            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score_v2(
                 query,
                 k_cache,
                 v_cache,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 block_size=self.page_size,
-                num_heads=layer.tp_q_head_num,
+                num_query_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 atten_mask=mask,
-                scale=layer.scaling,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                softmax_scale=layer.scaling,
+                actual_seq_qlen=actual_seq_lengths,
+                actual_seq_kvlen=actual_seq_lengths_kv,
                 sparse_mode=sparse_mode,
+                pre_tokens=(
+                    layer.sliding_window_size if is_swa_layer else SWA_INT_MAX
+                ),
+                next_tokens=0 if is_swa_layer else SWA_INT_MAX,
+                learnable_sink=sinks,
             )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
@@ -1737,13 +1761,11 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
                 q_rope = q_rope[: forward_batch.num_token_non_padded_cpu]
-            if self.forward_metadata.seq_lens_cpu_int is None:
-                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
-            else:
-                actual_seq_lengths_kv = (
-                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-                )
-            if forward_batch.forward_mode.is_draft_extend():
+                
+            if (
+                forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 actual_seq_lengths = (
                     np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
                 )
