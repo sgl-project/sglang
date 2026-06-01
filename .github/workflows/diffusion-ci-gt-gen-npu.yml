@@ -19,7 +19,7 @@ on:
         default: ''
         type: string
       publish_target_dir:
-        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use sglang_generated/ascend.'
+        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use diffusion-ci/consistency_gt/sglang_generated/ascend.'
         required: false
         default: ''
         type: string
@@ -46,6 +46,10 @@ jobs:
     outputs:
       matrix-1npu: ${{ steps.compute.outputs.matrix-1npu }}
       matrix-2npu: ${{ steps.compute.outputs.matrix-2npu }}
+      partition-count-1npu: ${{ steps.compute.outputs['partition-count-1npu'] }}
+      partition-count-2npu: ${{ steps.compute.outputs['partition-count-2npu'] }}
+      plan-1npu: ${{ steps.compute.outputs.plan-1npu }}
+      plan-2npu: ${{ steps.compute.outputs.plan-2npu }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -128,6 +132,76 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.OUTPUT_NAME }}-1npu-part${{ matrix.part }}
+          path: python/${{ env.OUTPUT_NAME }}
+          retention-days: 7
+
+      - name: Publish GT images to sgl-project/ci-data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+  
+  multimodal-diffusion-gen-2npu:
+    needs: compute-diffusion-partitions
+    if: |
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-2npu != '{"include":[]}'
+    runs-on: linux-aarch64-a3-2
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2npu) }}
+    timeout-minutes: 150
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+
+      - name: Generate outputs
+        env:
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2npu }}
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd python
+          python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
+            --suite 2-npu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-2npu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
+            --out-dir ./${{ env.OUTPUT_NAME }} \
+            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_NAME }}-2npu-part${{ matrix.part }}
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
