@@ -757,6 +757,22 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             output_path.write_bytes(content)
             logger.info(f"Saved GT image: {output_path} (format: {detected_format})")
 
+    def _validate_lora_consistency(
+        self, case: DiffusionTestCase, content: bytes, operation: str
+    ) -> None:
+        if not case.run_consistency_check:
+            logger.info(
+                "[LoRA Consistency] Skipping %s consistency for %s: disabled for case",
+                operation,
+                case.id,
+            )
+            return
+
+        logger.info(
+            "[LoRA Consistency] Validating %s output for %s", operation, case.id
+        )
+        self._validate_consistency(case, content)
+
     def _test_lora_api_functionality(
         self,
         ctx: ServerContext,
@@ -792,10 +808,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
 
         logger.info("[LoRA E2E] Verifying generation after re-merge for %s", case.id)
-        rid_after_merge, _ = self._run_generation_with_server_watchdog(
-            ctx, case.id, generate_fn, client
+        rid_after_merge, content_after_merge = (
+            self._run_generation_with_server_watchdog(ctx, case.id, generate_fn, client)
         )
         assert rid_after_merge is not None, "Generation after merge failed"
+        self._validate_lora_consistency(case, content_after_merge, "merge_lora_weights")
         logger.info("[LoRA E2E] Generation after merge succeeded")
 
         # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
@@ -808,10 +825,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 200, f"set_lora failed: {resp.text}"
 
         logger.info("[LoRA E2E] Verifying generation after set_lora for %s", case.id)
-        rid_after_set, _ = self._run_generation_with_server_watchdog(
+        rid_after_set, content_after_set = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
         assert rid_after_set is not None, "Generation after set_lora failed"
+        self._validate_lora_consistency(case, content_after_set, "set_lora")
         logger.info("[LoRA E2E] Generation after set_lora succeeded")
 
         # Test 4: list_loras - API should return the expected list of LoRA adapters
@@ -850,10 +868,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         logger.info(
             "[LoRA Switch E2E] Testing generation with initial LoRA for %s", case.id
         )
-        rid_initial, _ = self._run_generation_with_server_watchdog(
+        rid_initial, content_initial = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
         assert rid_initial is not None, "Generation with initial LoRA failed"
+        self._validate_lora_consistency(
+            case, content_initial, "dynamic switch initial LoRA"
+        )
         logger.info("[LoRA Switch E2E] Generation with initial LoRA succeeded")
 
         # Test 2: Switch to second LoRA and generate
@@ -891,10 +912,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             "[LoRA Switch E2E] Verifying generation after switching back for %s",
             case.id,
         )
-        rid_switched_back, _ = self._run_generation_with_server_watchdog(
-            ctx, case.id, generate_fn, client
+        rid_switched_back, content_switched_back = (
+            self._run_generation_with_server_watchdog(ctx, case.id, generate_fn, client)
         )
         assert rid_switched_back is not None, "Generation after switching back failed"
+        self._validate_lora_consistency(
+            case, content_switched_back, "dynamic switch default LoRA"
+        )
         logger.info("[LoRA Switch E2E] Generation after switching back succeeded")
 
         logger.info(
@@ -952,7 +976,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "lora_nickname": ["default", "lora2"],
                 "lora_path": [first_lora_path, second_lora_path],
                 "target": "all",
-                "strength": [1.0, 1.0],
+                "strength": [0.5, 0.5],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
@@ -971,7 +995,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "lora_nickname": ["default", "lora2"],
                 "lora_path": [first_lora_path, second_lora_path],
                 "target": "all",
-                "strength": [0.8, 0.5],
+                "strength": [0.6, 0.35],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
@@ -995,7 +1019,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "lora_nickname": ["default", "lora2"],
                 "lora_path": [first_lora_path, second_lora_path],
                 "target": ["transformer", "transformer_2"],
-                "strength": [0.8, 0.5],
+                "strength": [0.6, 0.35],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
@@ -1016,10 +1040,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert (
             resp.status_code == 200
         ), f"set_lora back to single adapter failed: {resp.text}"
-        rid, _ = self._run_generation_with_server_watchdog(
+        rid, content = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
         assert rid is not None
+        self._validate_lora_consistency(case, content, "multi-LoRA default adapter")
 
         logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
 
