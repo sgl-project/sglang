@@ -4,9 +4,9 @@ const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
 const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
-const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v3";
-const PREVIEW_OUTPUT_FORMAT = "raw";
-const PREVIEW_OUTPUT_QUALITY = null;
+const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v4";
+const PREVIEW_OUTPUT_FORMAT = "jpeg";
+const PREVIEW_OUTPUT_QUALITY = 95;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
@@ -80,6 +80,7 @@ let currentReceiveChunkFrames = 0;
 let lastRawRgbFrame = null;
 let decoderWorker = null;
 let decodeWorkerUnavailable = false;
+let encodedWorkerDecodeUnavailable = false;
 let decodeRequestId = 1;
 let streamEpoch = 0;
 let lastDecodeMs = 0;
@@ -195,7 +196,7 @@ function resetDecoderState() {
 
 async function decodeFrameBatch(header, data) {
   const decodeStartedAt = performance.now();
-  if (!isWorkerDecodableRawContentType(header.content_type)) {
+  if (!isWorkerDecodableContentType(header.content_type)) {
     const items = await framePayloadToImageData(header, data);
     const decodedAt = performance.now();
     lastDecodeMs = decodedAt - decodeStartedAt;
@@ -223,31 +224,58 @@ async function decodeFrameBatch(header, data) {
   const payload = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
   const id = decodeRequestId++;
   const decodeHeader = { ...header, __decode_id: id };
-  return new Promise((resolve, reject) => {
-    decodeRequests.set(id, {
-      resolve: (message) => {
-        const decodedAt = performance.now();
-        lastDecodeMs = decodedAt - decodeStartedAt;
-        resolve(message.frames.map((buffer) => ({
-          image: new ImageData(new Uint8ClampedArray(buffer), message.width, message.height),
-          chunk: message.chunk,
-          receivedAt: header.__received_at,
-          decodedAt,
-          decodeMs: lastDecodeMs,
-        })));
-      },
-      reject,
+  const useTransfer = isWorkerDecodableRawContentType(header.content_type);
+  try {
+    return await new Promise((resolve, reject) => {
+      decodeRequests.set(id, {
+        resolve: (message) => {
+          const decodedAt = performance.now();
+          lastDecodeMs = decodedAt - decodeStartedAt;
+          resolve(message.frames.map((buffer) => ({
+            image: new ImageData(new Uint8ClampedArray(buffer), message.width, message.height),
+            chunk: message.chunk,
+            receivedAt: header.__received_at,
+            decodedAt,
+            decodeMs: lastDecodeMs,
+          })));
+        },
+        reject,
+      });
+      try {
+        decoderWorker.postMessage(
+          { type: "decode", header: decodeHeader, payload },
+          useTransfer ? [payload] : [],
+        );
+      } catch (error) {
+        decodeRequests.delete(id);
+        reject(error);
+      }
     });
-    try {
-      decoderWorker.postMessage(
-        { type: "decode", header: decodeHeader, payload },
-        [payload],
-      );
-    } catch (error) {
-      decodeRequests.delete(id);
-      reject(error);
+  } catch (error) {
+    if (!useTransfer && isEncodedPreviewContentType(header.content_type)) {
+      encodedWorkerDecodeUnavailable = true;
+      const items = await framePayloadToImageData(header, payload);
+      const decodedAt = performance.now();
+      lastDecodeMs = decodedAt - decodeStartedAt;
+      return items.map((item) => ({
+        ...item,
+        receivedAt: header.__received_at,
+        decodedAt,
+        decodeMs: lastDecodeMs,
+      }));
     }
-  });
+    throw error;
+  }
+}
+
+function isWorkerDecodableContentType(contentType) {
+  return (
+    isWorkerDecodableRawContentType(contentType) ||
+    (
+      isEncodedPreviewContentType(contentType) &&
+      !encodedWorkerDecodeUnavailable
+    )
+  );
 }
 
 function isWorkerDecodableRawContentType(contentType) {
@@ -255,6 +283,13 @@ function isWorkerDecodableRawContentType(contentType) {
     contentType === RAW_RGB_CONTENT_TYPE ||
     contentType === RAW_RGB_DELTA_GZIP_CONTENT_TYPE ||
     contentType === RAW_RGBA_DELTA_GZIP_CONTENT_TYPE
+  );
+}
+
+function isEncodedPreviewContentType(contentType) {
+  return (
+    contentType === WEBP_FRAME_CONTENT_TYPE ||
+    contentType === JPEG_FRAME_CONTENT_TYPE
   );
 }
 
@@ -582,6 +617,8 @@ async function connect() {
       seed: Number($("seed").value),
       num_inference_steps: Number($("steps").value),
       guidance_scale: Number($("guidance").value),
+      realtime_causal_sink_size: readOptionalInteger("sinkSize"),
+      realtime_causal_kv_cache_num_frames: readOptionalInteger("windowFrames"),
       max_chunks: $("continuous").checked ? undefined : 1,
       first_frame: firstFrame,
       ...previewTransportParams,
@@ -827,6 +864,12 @@ function compact(obj) {
   return Object.fromEntries(
     Object.entries(obj).filter(([, v]) => v !== undefined && v !== "" && v !== null)
   );
+}
+
+function readOptionalInteger(id) {
+  const value = $(id).value;
+  if (value === "") return undefined;
+  return Number(value);
 }
 
 function renderPresets() {
