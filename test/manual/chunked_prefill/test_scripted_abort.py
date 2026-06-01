@@ -6,6 +6,7 @@ from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
     run_until,
@@ -197,63 +198,74 @@ class TestAbortBasic(ScriptedTestCase):
             f"before={kv_pool_free_before} after={kv_pool_free_after}"
         )
 
-    def test_waiting_timeout_sweeps_parked_chunked_resume(self):
+    def test_waiting_timeout_sweep_aborts_pressured_waiting_req(self):
         self.server.execute_script(
-            self._script_waiting_timeout_sweeps_parked_chunked_resume
+            self._script_waiting_timeout_sweep_aborts_pressured_waiting_req
         )
 
     @staticmethod
-    def _script_waiting_timeout_sweeps_parked_chunked_resume(t: ScriptedContext):
-        # NOTE: the original intent was to prove a parked chunked-resume req is
-        # IMMUNE to the waiting-timeout sweep. Source reading shows it is NOT:
-        # a chunked-resume req lives in scheduler.waiting_queue (status=="waiting")
-        # carrying its original wait_queue_entry_time, and
-        # _abort_on_waiting_timeout() scans the whole waiting_queue with no
-        # chunked-resume guard. So the sweep aborts a parked chunked-resume req
-        # exactly like any other waiting req. This test asserts that ACTUAL
-        # behavior, with a plain waiting req as a positive control.
-        r_chunked = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r_chunked, lambda h: h.is_chunking)
-        yield from run_until(r_chunked, lambda h: h.status == "waiting")
+    def _script_waiting_timeout_sweep_aborts_pressured_waiting_req(t: ScriptedContext):
+        # NOTE: source-true behavior of the waiting-timeout sweep. The scheduler
+        # runs _abort_on_waiting_timeout() at the top of get_next_batch_to_run on
+        # every NON-paused iteration (only when SGLANG_REQ_WAITING_TIMEOUT > 0).
+        # It scans the WHOLE waiting_queue and aborts every req whose
+        # wait_queue_entry_time is older than the deadline -- there is NO
+        # chunked-resume immunity guard, so a parked chunked-resume req (which
+        # also lives in waiting_queue carrying its original entry_time) is swept
+        # out exactly like any other waiting req. This test drives that sweep
+        # through the REAL event loop -- no pause, no scheduler-private call -- by
+        # holding a req in waiting_queue under real KV pressure and letting the
+        # loop's own sweep abort it.
+        #
+        # The timeout-abort path only notifies the tokenizer and drops the req
+        # from waiting_queue; it does NOT itself release KV/row (the req under
+        # test never held any, since it never got admitted). So the observable
+        # consequence asserted here is removal from waiting_queue + aborted status.
 
-        # Pause in place so the event loop stops admitting: the chunked-resume req
-        # keeps its row/KV and stays in waiting_queue, and a freshly submitted
-        # plain req also parks in waiting_queue instead of being admitted.
-        t.pause_generation(mode="in_place")
-        r_plain = t.start_req(prompt_len=16, max_new_tokens=2)
-        yield
+        # Real admission pressure: grab every free KV page so the scheduler can
+        # never admit the req, yet the loop keeps running get_next_batch_to_run
+        # (and thus the sweep) every iteration.
+        t.exhaust_kv(leave_pages=0)
 
-        def _waiting_rids():
+        r = t.start_req(prompt_len=16, max_new_tokens=2)
+
+        def waiting_rids():
             return {req.rid for req in t.scheduler.waiting_queue}
 
-        assert (
-            r_chunked.rid in _waiting_rids()
-        ), "chunked-resume must be parked in waiting_queue"
-        assert r_plain.rid in _waiting_rids(), (
-            f"plain control req must park in waiting_queue while paused; "
-            f"got waiting_rids={_waiting_rids()!r}"
-        )
+        # The req parks in waiting_queue with a real wait_queue_entry_time set by
+        # _add_request_to_queue; it cannot be admitted because there is no free KV.
+        yield from run_until(r, lambda h: r.rid in waiting_rids())
+        assert r.kv_pages == 0, "pressured waiting req must not own KV before admission"
 
-        # Drive the real sweep with a tiny timeout so every waiting req is past
-        # its deadline. The immediate, in-process consequence of the sweep is
-        # removal from waiting_queue (the timeout-abort path notifies the
-        # tokenizer and drops the req from the queue). Both the plain control AND
-        # the chunked-resume are removed -- the chunked-resume is NOT immune.
+        # Enable the timeout with a value tiny enough that, after the req has been
+        # queued and a couple of real-time yields pass, entry_time is already past
+        # perf_counter() - timeout_s. The override stays active across the yields
+        # below (the script frame is suspended inside the with-block), so the
+        # scheduler reads it when it runs the sweep at the top of
+        # get_next_batch_to_run on each non-paused iteration.
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1e-6):
-            t.trigger_abort_on_waiting_timeout()
+            # Drive the REAL loop until the scheduler's own sweep removes the req
+            # from waiting_queue.
+            for _ in range(DEFAULT_MAX_STEPS):
+                if r.rid not in waiting_rids():
+                    break
+                yield
+            else:
+                raise AssertionError(
+                    f"waiting-timeout sweep never removed the req from "
+                    f"waiting_queue after {DEFAULT_MAX_STEPS} steps; "
+                    f"waiting_rids={waiting_rids()!r}"
+                )
 
-        after_sweep = _waiting_rids()
-        assert r_plain.rid not in after_sweep, (
-            f"positive control: plain waiting req must be swept out of "
-            f"waiting_queue by the waiting-timeout abort; got {after_sweep!r}"
+        assert r.rid not in waiting_rids(), (
+            f"the loop's waiting-timeout sweep must drop the timed-out waiting "
+            f"req from waiting_queue; got {waiting_rids()!r}"
         )
-        assert r_chunked.rid not in after_sweep, (
-            f"chunked-resume is NOT immune to the waiting-timeout sweep: it "
-            f"sits in waiting_queue with no guard and is dropped like any "
-            f"other waiting req; got {after_sweep!r}"
+        assert r.status in ("finished", "unknown"), (
+            f"swept-out req must be aborted (gone from every live scheduler "
+            f"structure); got status={r.status!r}"
         )
-
-        t.continue_generation()
+        assert r.kv_pages == 0, "timeout-abort of an unadmitted req owns no KV"
 
     def test_abort_chunk_last(self):
         self.server.execute_script(self._script_abort_chunk_last)
