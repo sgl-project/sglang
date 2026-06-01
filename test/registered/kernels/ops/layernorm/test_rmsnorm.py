@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -15,8 +15,14 @@ register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
 
 
 EPS = 1e-6
-DEVICE = "cuda"
 DTYPES = [torch.float16, torch.bfloat16]
+
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = "xpu"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+else:
+    DEVICE = None
 
 
 def sglang_jit_rmsnorm(
@@ -63,8 +69,8 @@ def reference_rmsnorm(
     eps: float = EPS,
 ) -> None:
     # NVIDIA uses flashinfer (the bitwise reference); flashinfer is CUDA-only,
-    # so on ROCm fall back to the torch reference (matches flashinfer math).
-    if is_hip():
+    # so on ROCm and XPU fall back to the torch reference (matches flashinfer math).
+    if is_hip() or is_xpu():
         torch_rmsnorm(input, weight, output=output, eps=eps)
     else:
         flashinfer_rmsnorm(input, weight, output=output, eps=eps)
@@ -108,6 +114,9 @@ RMSNORM_CASES = get_ci_test_range(
 def test_rmsnorm(
     batch_size: int, hidden_size: int, dtype: torch.dtype, specify_out: bool
 ) -> None:
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
     input = torch.randn(batch_size, hidden_size, device=DEVICE, dtype=dtype)
     weight = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
 

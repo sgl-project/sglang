@@ -39,6 +39,14 @@ DTYPES = get_ci_test_range(
 )
 SCALES = get_ci_test_range([1, 0.01], [1, 0.01])
 
+# Determine device: prefer XPU if available, otherwise CUDA
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = "xpu"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+else:
+    DEVICE = None
+
 
 def get_timestep_embedding_reference(
     timesteps: torch.Tensor,
@@ -77,15 +85,21 @@ def get_timestep_embedding_reference(
 @pytest.mark.parametrize("dim", CORRECTNESS_DIMS)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
-    device = "cuda"
-    t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
+    t = torch.randint(low=0, high=1000, size=(batch_size,), device=DEVICE).to(dtype)
     torch_output = get_timestep_embedding_reference(
         t, dim, flip_sin_to_cos=True, downscale_freq_shift=0
     )
     cuda_output = timestep_embedding_cuda(
         t, dim, flip_sin_to_cos=True, downscale_freq_shift=0
     )
-    torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
+    # XPU has slightly lower precision due to SYCL math functions
+    if DEVICE == "xpu":
+        torch.testing.assert_close(torch_output, cuda_output, atol=1e-2, rtol=1e-2)
+    else:
+        torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", DIFFUSERS_BATCH_SIZES)
@@ -97,8 +111,10 @@ def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
 def test_timestep_embedding_correctness_with_diffusers(
     batch_size, dim, flip_sin_to_cos, downscale_freq_shift, scale, dtype
 ):
-    device = "cuda"
-    t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
+    t = torch.randint(low=0, high=1000, size=(batch_size,), device=DEVICE).to(dtype)
     torch_output = get_timestep_embedding_reference(
         t,
         dim,
@@ -115,7 +131,10 @@ def test_timestep_embedding_correctness_with_diffusers(
         scale=scale,
         max_period=10000,
     )
-    torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
+    if DEVICE == "xpu":
+        torch.testing.assert_close(torch_output, cuda_output, atol=1e-2, rtol=1e-2)
+    else:
+        torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
 
 
 def test_timestep_embedding_perf():
@@ -123,6 +142,8 @@ def test_timestep_embedding_perf():
         pytest.skip("Perf test disabled by default")
     if tabulate is None:
         pytest.skip("Optional dependency 'tabulate' is not installed")
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
 
     NUM_BATCH = [1, 2, 8, 63, 256, 512, 613, 1024, 1536]
     NUM_DIM = [32, 64, 128, 256, 512, 1024, 2048, 4096]
@@ -130,12 +151,13 @@ def test_timestep_embedding_perf():
     def perf_kernel_fn(kernel_fn: callable, *args, **kwargs):
         warmup_times = 4
         repeat_times = 20
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        torch_device = getattr(torch, DEVICE)
+        start = torch_device.Event(enable_timing=True)
+        end = torch_device.Event(enable_timing=True)
 
         for _ in range(warmup_times):
             output_fn = kernel_fn(*args, **kwargs)
-        torch.cuda.synchronize()
+        torch_device.synchronize()
 
         start.record()
         for _ in range(repeat_times):
@@ -144,13 +166,12 @@ def test_timestep_embedding_perf():
         end.synchronize()
         return start.elapsed_time(end) / repeat_times
 
-    device = "cuda"
     results = []
 
     cuda_speedups = []
     for B in NUM_BATCH:
         for dim in NUM_DIM:
-            t = torch.linspace(0, max(100000, B), steps=B, device=device).to(
+            t = torch.linspace(0, max(100000, B), steps=B, device=DEVICE).to(
                 torch.float32
             )
             time_torch = perf_kernel_fn(get_timestep_embedding_reference, t, dim)
