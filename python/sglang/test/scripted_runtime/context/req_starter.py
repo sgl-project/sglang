@@ -31,6 +31,7 @@ class ScriptedContextReqStarter:
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
         stream: bool = True,
+        lora_path: Optional[str] = None,
     ) -> ScriptedReqHandle:
         ctx = self._ctx
 
@@ -54,6 +55,8 @@ class ScriptedContextReqStarter:
             payload["priority"] = priority
         if dp_rank is not None:
             payload["routed_dp_rank"] = dp_rank
+        if lora_path is not None:
+            payload["lora_path"] = lora_path
         _http_post_and_await_recv_msg(
             ctx,
             path="/generate",

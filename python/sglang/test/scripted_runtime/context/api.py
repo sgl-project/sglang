@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 from sglang.test.scripted_runtime.context import (
     engine,
     lifecycle,
+    lora_control,
     queries,
     radix,
 )
@@ -61,6 +62,7 @@ class ScriptedContext:
         logprob_start_len: Optional[int] = None,
         top_logprobs_num: Optional[int] = None,
         stream: bool = True,
+        lora_path: Optional[str] = None,
     ) -> "ScriptedReqHandle":
         return self._req_starter.start_req(
             prompt_len=prompt_len,
@@ -74,6 +76,7 @@ class ScriptedContext:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             stream=stream,
+            lora_path=lora_path,
         )
 
     def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:
@@ -99,6 +102,9 @@ class ScriptedContext:
 
     def exhaust_kv(self, *, leave_pages: int) -> None:
         return self._kv_exhauster.exhaust(leave_pages=leave_pages)
+
+    def force_lora_drainer_reject(self, *, adapter: str) -> None:
+        return lora_control.force_lora_drainer_reject(self, adapter=adapter)
 
     def _release_exhausted_pools(self) -> None:
         return self._kv_exhauster.release()
