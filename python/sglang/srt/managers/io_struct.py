@@ -706,6 +706,7 @@ class GenerateReqInput(BaseReq):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,

@@ -609,7 +609,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
             result = MessageProcessingResult(
-                prompt=self.tokenizer_manager.tokenizer.decode(request.input_ids),
+                prompt="",
                 prompt_ids=request.input_ids,
                 image_data=None,
                 audio_data=None,
