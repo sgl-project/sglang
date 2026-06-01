@@ -108,9 +108,14 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "const PREVIEW_OUTPUT_FORMAT = \"\";" in app_js
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-fixes-v16" in index_html
-    assert "app.js?v=realtime-fixes-v16" in index_html
+    assert "styles.css?v=realtime-fixes-v17" in index_html
+    assert "app.js?v=realtime-fixes-v17" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v5";' in app_js
+    assert 'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";' in app_js
+    assert "dragon-ride.jpg" in app_js
+    assert "Dragon Dolly" not in app_js
+    assert "dolly toward" not in app_js.lower()
+    assert "slow aerial orbit" not in app_js.lower()
     assert ".stage-controls .camera-pad button.is-key-active:not(:disabled)" in styles_css
     assert "--pressed: #8c9288;" in styles_css
     assert "--pressed-ring: rgba(238, 241, 236, 0.2);" in styles_css
