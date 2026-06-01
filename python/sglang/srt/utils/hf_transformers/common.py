@@ -138,6 +138,28 @@ try:
 except ImportError:
     pass
 
+# Gemma 4 assistant draft model for Frozen-KV MTP speculative decoding.
+# The draft checkpoint uses model_type "gemma4_assistant" which is not
+# registered in transformers, so AutoConfig.from_pretrained fails without
+# this shim. We subclass the nearest text config to inherit all field defs.
+try:
+    from transformers import Gemma4TextConfig as _Gemma4TextConfig
+
+    class _Gemma4AssistantConfig(_Gemma4TextConfig):
+        model_type = "gemma4_assistant"
+
+    _CONFIG_REGISTRY["gemma4_assistant"] = _Gemma4AssistantConfig
+except ImportError:
+    try:
+        from transformers import Gemma4Config as _Gemma4Config
+
+        class _Gemma4AssistantConfig(_Gemma4Config):
+            model_type = "gemma4_assistant"
+
+        _CONFIG_REGISTRY["gemma4_assistant"] = _Gemma4AssistantConfig
+    except ImportError:
+        pass
+
 for name, cls in _CONFIG_REGISTRY.items():
     try:
         AutoConfig.register(name, cls)
