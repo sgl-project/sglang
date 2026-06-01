@@ -1,6 +1,6 @@
 import unittest
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -27,9 +27,11 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
         scheduler.running_batch.batch_is_full = False
+        scheduler.active_reqs = {}
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
+        scheduler.hisparse_coordinator = None
         scheduler.result_queue = deque()
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
@@ -105,22 +107,25 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         """retract mode should retract all requests from running_batch."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = None
-        scheduler.running_batch.reqs = [MagicMock(), MagicMock()]
+        req_a = MagicMock(rid="req-a", has_pending_chunk=False)
+        req_b = MagicMock(rid="req-b", has_pending_chunk=False)
+        scheduler.running_batch.reqs = [req_a, req_b]
         scheduler.running_batch.__len__ = lambda self: len(self.reqs)
         scheduler.running_batch.is_empty.return_value = False
+        scheduler.active_reqs = {req_a.rid: req_a, req_b.rid: req_b}
         scheduler.waiting_queue = []
         scheduler._add_request_to_queue = MagicMock()
 
-        retracted = [MagicMock(), MagicMock()]
-        scheduler.running_batch.retract_all.return_value = retracted
         scheduler.running_batch.filter_batch = MagicMock()
         scheduler.server_args = MagicMock()
 
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        with patch("sglang.srt.managers.scheduler.release_req") as mock_release_req:
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
-        scheduler.running_batch.retract_all.assert_called_once()
+        self.assertEqual(mock_release_req.call_count, 2)
         self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
+        self.assertEqual(scheduler.active_reqs, {})
         self.assertIsNone(scheduler.chunked_req)
 
     def test_abort_drains_overlap_queue(self):
