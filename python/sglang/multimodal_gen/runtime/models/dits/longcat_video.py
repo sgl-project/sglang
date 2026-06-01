@@ -18,6 +18,7 @@ from einops import rearrange, repeat
 
 from sglang.multimodal_gen.configs.models.dits import LongCatVideoConfig
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import FP32LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -326,45 +327,19 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
         self.proj = nn.Linear(dim, dim)
         self.rope_3d = RotaryPositionalEmbedding(self.head_dim)
+        self.attn = USPAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            softmax_scale=self.scale,
+            causal=False,
+        )
 
-    def _process_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, shape):
-        if self.enable_flashattn3:
-            from flash_attn_interface import flash_attn_func
-
-            q = rearrange(q, "B H S D -> B S H D").contiguous()
-            k = rearrange(k, "B H S D -> B S H D").contiguous()
-            v = rearrange(v, "B H S D -> B S H D").contiguous()
-            x, *_ = flash_attn_func(q, k, v, softmax_scale=self.scale)
-            return rearrange(x, "B S H D -> B H S D")
-        if self.enable_flashattn2:
-            try:
-                from flash_attn import flash_attn_func
-
-                q = rearrange(q, "B H S D -> B S H D")
-                k = rearrange(k, "B H S D -> B S H D")
-                v = rearrange(v, "B H S D -> B S H D")
-                x = flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=self.scale)
-                return rearrange(x, "B S H D -> B H S D")
-            except (ImportError, Exception) as e:
-                if not getattr(self, "_fa2_warned", False):
-                    logger.warning(
-                        "FlashAttention2 unavailable (%s), falling back to SDPA. "
-                        "Install flash-attn for faster attention.",
-                        type(e).__name__,
-                    )
-                    self._fa2_warned = True
-        if self.enable_xformers:
-            import xformers.ops
-
-            q = rearrange(q, "B H M K -> B M H K")
-            k = rearrange(k, "B H M K -> B M H K")
-            v = rearrange(v, "B H M K -> B M H K")
-            x = xformers.ops.memory_efficient_attention(
-                q, k, v, attn_bias=None, op=None
-            )
-            return rearrange(x, "B M H K -> B H M K")
-
-        return F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+    def _process_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        q = rearrange(q, "B H S D -> B S H D").contiguous()
+        k = rearrange(k, "B H S D -> B S H D").contiguous()
+        v = rearrange(v, "B H S D -> B S H D").contiguous()
+        x = self.attn(q, k, v)
+        return rearrange(x, "B S H D -> B H S D").contiguous()
 
     def forward(
         self, x: torch.Tensor, shape=None, num_cond_latents=None, return_kv=False
@@ -387,12 +362,12 @@ class Attention(nn.Module):
             q_cond = q[:, :, :num_cond_latents_thw].contiguous()
             k_cond = k[:, :, :num_cond_latents_thw].contiguous()
             v_cond = v[:, :, :num_cond_latents_thw].contiguous()
-            x_cond = self._process_attn(q_cond, k_cond, v_cond, shape)
+            x_cond = self._process_attn(q_cond, k_cond, v_cond)
             q_noise = q[:, :, num_cond_latents_thw:].contiguous()
-            x_noise = self._process_attn(q_noise, k, v, shape)
+            x_noise = self._process_attn(q_noise, k, v)
             x = torch.cat([x_cond, x_noise], dim=2).contiguous()
         else:
-            x = self._process_attn(q, k, v, shape)
+            x = self._process_attn(q, k, v)
 
         x = x.transpose(1, 2).reshape(bsz, n_tokens, channels)
         x = self.proj(x)
@@ -432,7 +407,7 @@ class Attention(nn.Module):
             )
             q = q_padding[:, :, -n_tokens:].contiguous()
 
-        x = self._process_attn(q, k_full, v_full, shape)
+        x = self._process_attn(q, k_full, v_full)
         x = x.transpose(1, 2).reshape(bsz, n_tokens, channels)
         return self.proj(x)
 

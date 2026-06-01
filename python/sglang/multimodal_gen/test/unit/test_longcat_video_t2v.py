@@ -20,12 +20,23 @@ def _longcat_pipeline_config_cls():
 
 
 def _longcat_helpers():
-    return import_module("sglang.multimodal_gen.runtime.pipelines.longcat_video")
+    return import_module(
+        "sglang.multimodal_gen.runtime.pipelines.longcat_video_pipeline"
+    )
 
 
 def _longcat_cfg_helpers():
     return import_module(
         "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longcat_video"
+    )
+
+
+def _mock_longcat_server_args():
+    return SimpleNamespace(
+        attention_backend=None,
+        pipeline_config=SimpleNamespace(
+            dit_config=SimpleNamespace(hidden_size=4096, num_attention_heads=32),
+        ),
     )
 
 
@@ -249,3 +260,148 @@ def test_longcat_synthesize_model_index_structure(tmp_path):
         index.keys()
     ), f"Missing keys: {required_keys - set(index.keys())}"
     assert index["_class_name"] == "LongCatVideoPipeline"
+
+
+def test_longcat_predict_noise_with_cfg_sets_forward_context_for_non_cfg():
+    helpers = _longcat_cfg_helpers()
+    fc_mod = import_module("sglang.multimodal_gen.runtime.managers.forward_context")
+    base_mod = import_module("sglang.multimodal_gen.runtime.pipelines_core.stages.base")
+    selector_mod = import_module(
+        "sglang.multimodal_gen.runtime.layers.attention.selector"
+    )
+
+    original_get_global_server_args = base_mod.get_global_server_args
+    original_selector_get_global_server_args = selector_mod.get_global_server_args
+    base_mod.get_global_server_args = _mock_longcat_server_args
+    selector_mod.get_global_server_args = base_mod.get_global_server_args
+
+    try:
+        stage = helpers.LongCatVideoDenoisingStage(
+            transformer=None,
+            scheduler=None,
+            vae=None,
+            pipeline=None,
+        )
+        batch = SimpleNamespace(
+            do_classifier_free_guidance=False,
+            guidance_rescale=0.0,
+            cfg_normalization=0.0,
+        )
+        latents = torch.randn(1, 16, 7, 60, 104)
+        latent_model_input = latents.clone()
+        timestep = torch.tensor([1.0])
+        encoder_hidden_states = torch.randn(1, 1, 8, 16)
+        encoder_attention_mask = torch.ones(1, 8, dtype=torch.long)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(slice_noise_pred=lambda noise, _: noise)
+        )
+        seen = {}
+
+        def fake_model(**kwargs):
+            ctx = fc_mod.get_forward_context()
+            seen["current_timestep"] = ctx.current_timestep
+            seen["attn_metadata"] = ctx.attn_metadata
+            seen["forward_batch"] = ctx.forward_batch
+            return kwargs["hidden_states"] + 1
+
+        noise_pred = stage._predict_noise_with_cfg(
+            current_model=fake_model,
+            latent_model_input=latent_model_input,
+            timestep=timestep,
+            batch=batch,
+            timestep_index=3,
+            attn_metadata={"meta": "non_cfg"},
+            target_dtype=torch.bfloat16,
+            current_guidance_scale=4.0,
+            image_kwargs={},
+            pos_cond_kwargs={
+                "encoder_hidden_states": encoder_hidden_states,
+                "encoder_attention_mask": encoder_attention_mask,
+            },
+            neg_cond_kwargs={},
+            server_args=server_args,
+            guidance=torch.tensor([4.0]),
+            latents=latents,
+        )
+
+        assert seen["current_timestep"] == 3
+        assert seen["attn_metadata"] == {"meta": "non_cfg"}
+        assert seen["forward_batch"] is batch
+        assert torch.allclose(noise_pred, -(latent_model_input + 1))
+    finally:
+        base_mod.get_global_server_args = original_get_global_server_args
+        selector_mod.get_global_server_args = original_selector_get_global_server_args
+
+
+def test_longcat_predict_noise_with_cfg_sets_forward_context_for_cfg():
+    helpers = _longcat_cfg_helpers()
+    fc_mod = import_module("sglang.multimodal_gen.runtime.managers.forward_context")
+    base_mod = import_module("sglang.multimodal_gen.runtime.pipelines_core.stages.base")
+    selector_mod = import_module(
+        "sglang.multimodal_gen.runtime.layers.attention.selector"
+    )
+
+    original_get_global_server_args = base_mod.get_global_server_args
+    original_selector_get_global_server_args = selector_mod.get_global_server_args
+    base_mod.get_global_server_args = _mock_longcat_server_args
+    selector_mod.get_global_server_args = base_mod.get_global_server_args
+
+    try:
+        stage = helpers.LongCatVideoDenoisingStage(
+            transformer=None,
+            scheduler=None,
+            vae=None,
+            pipeline=None,
+        )
+        batch = SimpleNamespace(
+            do_classifier_free_guidance=True,
+            guidance_rescale=0.0,
+            cfg_normalization=0.0,
+        )
+        latents = torch.randn(1, 16, 7, 60, 104)
+        latent_model_input = latents.clone()
+        timestep = torch.tensor([1.0])
+        encoder_hidden_states = torch.randn(1, 1, 8, 16)
+        encoder_attention_mask = torch.ones(1, 8, dtype=torch.long)
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(slice_noise_pred=lambda noise, _: noise)
+        )
+        seen = {}
+
+        def fake_model(**kwargs):
+            ctx = fc_mod.get_forward_context()
+            seen["current_timestep"] = ctx.current_timestep
+            seen["attn_metadata"] = ctx.attn_metadata
+            seen["forward_batch"] = ctx.forward_batch
+            return torch.zeros_like(kwargs["hidden_states"])
+
+        noise_pred = stage._predict_noise_with_cfg(
+            current_model=fake_model,
+            latent_model_input=latent_model_input,
+            timestep=timestep,
+            batch=batch,
+            timestep_index=5,
+            attn_metadata={"meta": "cfg"},
+            target_dtype=torch.bfloat16,
+            current_guidance_scale=4.0,
+            image_kwargs={},
+            pos_cond_kwargs={
+                "encoder_hidden_states": encoder_hidden_states,
+                "encoder_attention_mask": encoder_attention_mask,
+            },
+            neg_cond_kwargs={
+                "encoder_hidden_states": encoder_hidden_states,
+                "encoder_attention_mask": encoder_attention_mask,
+            },
+            server_args=server_args,
+            guidance=torch.tensor([4.0]),
+            latents=latents,
+        )
+
+        assert seen["current_timestep"] == 5
+        assert seen["attn_metadata"] == {"meta": "cfg"}
+        assert seen["forward_batch"] is batch
+        assert noise_pred.shape == latents.shape
+    finally:
+        base_mod.get_global_server_args = original_get_global_server_args
+        selector_mod.get_global_server_args = original_selector_get_global_server_args

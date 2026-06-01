@@ -28,6 +28,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_LONGCAT_VIDEO_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
@@ -273,6 +274,24 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path="FastVideo/FastHunyuan-diffusers",
         ),
         T2V_sampling_params,
+    ),
+    DiffusionTestCase(
+        "longcat_video_t2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_LONGCAT_VIDEO_MODEL_NAME_FOR_TEST,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="832x480",
+            num_frames=25,
+            extras={
+                "num_inference_steps": 10,
+                "guidance_scale": 4.0,
+                "seed": 0,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(

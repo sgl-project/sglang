@@ -5,6 +5,9 @@ from typing import Any, Literal, overload
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
@@ -79,6 +82,9 @@ class LongCatVideoDenoisingStage(DenoisingStage):
         current_model,
         latent_model_input,
         timestep,
+        timestep_index: int,
+        attn_metadata,
+        batch: Req,
         target_dtype,
         guidance: torch.Tensor,
         **kwargs,
@@ -91,11 +97,16 @@ class LongCatVideoDenoisingStage(DenoisingStage):
         kwargs = {
             key: self._assert_single_encoder(value) for key, value in kwargs.items()
         }
-        return current_model(
-            hidden_states=latent_model_input,
-            timestep=timestep,
-            **kwargs,
-        )
+        with set_forward_context(
+            current_timestep=timestep_index,
+            attn_metadata=attn_metadata,
+            forward_batch=batch,
+        ):
+            return current_model(
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                **kwargs,
+            )
 
     def _predict_noise_with_cfg(
         self,
@@ -141,6 +152,9 @@ class LongCatVideoDenoisingStage(DenoisingStage):
                 current_model=current_model,
                 latent_model_input=latent_model_input,
                 timestep=timestep,
+                timestep_index=timestep_index,
+                attn_metadata=attn_metadata,
+                batch=batch,
                 target_dtype=target_dtype,
                 guidance=guidance,
                 **pos_cond_kwargs,
@@ -174,9 +188,15 @@ class LongCatVideoDenoisingStage(DenoisingStage):
             dim=0,
         )
 
-        noise_pred = current_model(
-            hidden_states=latent_model_input,
+        noise_pred = self._predict_noise(
+            current_model=current_model,
+            latent_model_input=latent_model_input,
             timestep=timestep,
+            timestep_index=timestep_index,
+            attn_metadata=attn_metadata,
+            batch=batch,
+            target_dtype=target_dtype,
+            guidance=guidance,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
         )
