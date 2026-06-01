@@ -96,8 +96,16 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
             "sana_wm_before_denoising",
         )
 
+        if getattr(server_args.pipeline_config, "streaming", False):
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming import (
+                SanaWMStreamingDenoisingStage,
+            )
+
+            DenoiseStage = SanaWMStreamingDenoisingStage
+        else:
+            DenoiseStage = SanaWMDenoisingStage
         self.add_stage(
-            SanaWMDenoisingStage(
+            DenoiseStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),

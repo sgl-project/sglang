@@ -78,6 +78,19 @@ class SanaWMPipelineConfig(PipelineConfig):
     # --- Autocast ---
     enable_autocast: bool = False
 
+    # --- Streaming self-forcing (S1c) ---
+    # When ``streaming`` is set, the pipeline uses the autoregressive
+    # SanaWMStreamingDenoisingStage (forward_long, chunk-by-chunk) instead of the
+    # one-shot bidirectional denoise. ``num_frame_per_block`` is the streaming
+    # chunk size in LATENT frames (distinct from the DiT's intra-attention
+    # ``arch.chunk_size``). ``denoising_step_list`` must end in 0.
+    streaming: bool = False
+    num_frame_per_block: int = 3
+    num_cached_blocks: int = 2
+    sink_token: bool = True
+    denoising_step_list: tuple = (1000, 960, 889, 727, 0)
+    streaming_cfg_scale: float = 1.0
+
     # --- DiT ---
     dit_config: DiTConfig = field(default_factory=SanaWMConfig)
 
