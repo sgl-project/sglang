@@ -66,7 +66,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.kv_pages == 0
         assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
-        assert not r.has_pending_chunk
+        assert not r.is_chunking
         assert r.pending_middle_outputs == 0
 
     def test_pause_covers_waiting_chunked(self):
@@ -84,7 +84,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.kv_pages == 0
         assert r.req.req_pool_idx is None
         assert r.lock_refs == 0
-        assert not r.has_pending_chunk
+        assert not r.is_chunking
 
     def test_pending_middle_outputs_invariant(self):
         self.server.execute_script(self._script_pending_middle_outputs_invariant)
@@ -357,10 +357,9 @@ class TestRegressionBasic(ScriptedTestCase):
             f"between chunks the chunked-resume req must hold in "
             f"waiting_queue; got status={r.status!r}"
         )
-        assert r.has_pending_chunk, (
-            f"has_pending_chunk must be set while mid-chunk; got "
-            f"{r.has_pending_chunk!r}"
-        )
+        assert (
+            r.is_chunking
+        ), f"is_chunking must be set while mid-chunk; got {r.is_chunking!r}"
         assert (
             t._scheduler.chunked_req.rid
             if t._scheduler.chunked_req is not None
@@ -371,7 +370,7 @@ class TestRegressionBasic(ScriptedTestCase):
         )
 
         yield from run_until_finished(r)
-        assert not r.has_pending_chunk
+        assert not r.is_chunking
         assert r.status in ("finished", "unknown")
 
     def test_chunked_retract_no_double_init_load_back(self):
@@ -421,7 +420,7 @@ class TestRegressionBasic(ScriptedTestCase):
         )
         yield from run_until_finished(r2)
 
-        assert not r2.has_pending_chunk
+        assert not r2.is_chunking
         assert t.get_all_node_lock_refs() == baseline_refs, (
             f"streaming-session turn N>1 must not take chunked reuse "
             f"branch; lock_refs drifted from {baseline_refs} to "
@@ -456,7 +455,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert (
             r.lock_refs == 0
         ), f"96d4749094: abort must release lock_ref; got lock_refs={r.lock_refs}"
-        assert not r.has_pending_chunk
+        assert not r.is_chunking
         assert r.pending_middle_outputs == 0
         assert t.get_all_node_lock_refs() == baseline_refs
 
@@ -519,7 +518,7 @@ class TestRegressionBasic(ScriptedTestCase):
         )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert not r.has_pending_chunk
+        assert not r.is_chunking
         assert t.is_fully_idle, (
             f"f38e69f87d: pause(retract) must leave engine fully idle; "
             f"got is_fully_idle={t.is_fully_idle!r}"
@@ -550,7 +549,7 @@ class TestRegressionBasic(ScriptedTestCase):
         for r in (r1, r2):
             assert r.status == "waiting"
             assert r.chunks_done == 0
-            assert not r.has_pending_chunk
+            assert not r.is_chunking
 
         yield from run_until_all_finished([r1, r2])
 
@@ -833,7 +832,7 @@ class TestRegressionWaitingTimeout(ScriptedTestCase):
     def _script_chunked_resume_immune_to_waiting_timeout(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        assert r.has_pending_chunk
+        assert r.is_chunking
 
         t.trigger_abort_on_waiting_timeout()
         yield
@@ -842,7 +841,7 @@ class TestRegressionWaitingTimeout(ScriptedTestCase):
             r, "aborted", False
         ), f"359e5ed7bd: chunked-resume must be immune to waiting timeout abort"
         assert r.kv_pages > 0 or r.chunks_done > 0
-        assert r.has_pending_chunk or r.chunks_done > 0
+        assert r.is_chunking or r.chunks_done > 0
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
