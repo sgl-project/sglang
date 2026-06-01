@@ -33,9 +33,7 @@ class HiSparseDynamicMixin:
         self._set_host_backed_len(req.req_pool_idx, host_backed_len)
         self._set_residency(req, HISPARSE_RESIDENCY_RESIDENT_BACKED)
 
-    def _mark_hisparse_swap(
-        self, req, host_backed_len: Optional[int] = None
-    ) -> None:
+    def _mark_hisparse_swap(self, req, host_backed_len: Optional[int] = None) -> None:
         if host_backed_len is not None:
             self._set_host_backed_len(req.req_pool_idx, host_backed_len)
         self._set_residency(req, HISPARSE_RESIDENCY_SWAP)
@@ -54,7 +52,7 @@ class HiSparseDynamicMixin:
         return {
             "req_to_token": self.req_to_token_pool.req_to_token,
             "full_to_hisparse_device_index_mapping": (
-                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                self.mem_pool_device.full_to_hisparse_device_index_mapping
             ),
             "req_is_swap": self.req_is_swap,
         }
@@ -212,7 +210,9 @@ class HiSparseDynamicMixin:
             :, swap_req_pool_indices, self.device_buffer_size
         ] = reserved_buffer_loc.to(torch.int32)
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
-            out_cache_loc[pos_tensor]
+            self.token_to_kv_pool_allocator.get_last_loc_compressed(
+                out_cache_loc[pos_tensor]
+            )
         ] = reserved_buffer_loc
 
     def _get_batch_positions_by_residency(
@@ -270,7 +270,9 @@ class HiSparseDynamicMixin:
                 resident_req_pool_indices, prev_token_pos
             ]
             prev_device_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
-                prev_logical_locs
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    prev_logical_locs
+                )
             )
             hisparse_indices = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc_decode(
@@ -291,7 +293,9 @@ class HiSparseDynamicMixin:
                 continue
 
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                out_cache_loc[pos_tensor]
+                self.token_to_kv_pool_allocator.get_last_loc_compressed(
+                    out_cache_loc[pos_tensor]
+                )
             ] = hisparse_indices
             return
 
@@ -303,7 +307,12 @@ class HiSparseDynamicMixin:
         for req_idx, token_pos in zip(req_indices, token_positions):
             if self.req_residency[req_idx] == HISPARSE_RESIDENCY_RESIDENT_BACKED:
                 logical_loc = self.req_to_token_pool.req_to_token[req_idx, token_pos]
-                device_locs.append(mapping[logical_loc])
+                compressed_loc = (
+                    self.mem_pool_device.translate_loc_from_full_to_compressed(
+                        logical_loc
+                    )
+                )
+                device_locs.append(mapping[compressed_loc])
             else:
                 buffer_slot = min(token_pos, self.device_buffer_size)
                 device_locs.append(self.req_to_device_buffer[req_idx, buffer_slot])
@@ -326,16 +335,18 @@ class HiSparseDynamicMixin:
         device_locs = self._device_locs_for_token_positions(
             filtered_req_indices, filtered_token_positions
         )
-        host_locs = self.mem_pool_host.alloc(len(device_locs))
-        if host_locs is None:
-            logger.error(
-                "HiSparse: host mem pool alloc failed for %d backup tokens",
-                len(device_locs),
+        host_locs_list = []
+        for req_idx, token_pos in zip(filtered_req_indices, filtered_token_positions):
+            host_locs_list.append(
+                self.mem_pool_host.alloc_paged_token_slots(
+                    self.req_to_host_pool,
+                    self.req_to_host_pool_allocated_len,
+                    req_idx,
+                    token_pos,
+                    1,
+                )
             )
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {len(device_locs)} backup tokens"
-            )
-        host_locs = host_locs.to(device=self.device)
+        host_locs = torch.cat(host_locs_list)
 
         backup_req_indices = torch.tensor(
             filtered_req_indices, dtype=torch.int64, device=self.device
@@ -343,8 +354,8 @@ class HiSparseDynamicMixin:
         actual_token_pos = torch.tensor(
             filtered_token_positions, dtype=torch.int64, device=self.device
         )
-        self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
 
+        self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
             self.decode_backup_stream.wait_stream(schedule_stream)
@@ -449,9 +460,7 @@ class HiSparseDynamicMixin:
                 return True
         return allocator.available_size() >= need_tokens
 
-    def demote_request_to_swap(
-        self, req, host_backed_len: Optional[int] = None
-    ) -> int:
+    def demote_request_to_swap(self, req, host_backed_len: Optional[int] = None) -> int:
         req_idx = req.req_pool_idx
         if self.req_residency[req_idx] != HISPARSE_RESIDENCY_RESIDENT_BACKED:
             return 0
@@ -489,12 +498,17 @@ class HiSparseDynamicMixin:
         ]
         self.write_staging_stream.synchronize()
 
-        host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
-        host_indices = host_indices[host_indices >= 0]
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool,
+            req.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.req_pool_idx],
+        )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.host_backed_len[req.req_pool_idx] = 0
+        self._skip_first_backup[req.req_pool_idx] = False
         self._set_residency(req, HISPARSE_RESIDENCY_NONE)
         req.hisparse_staging = False
 
@@ -513,12 +527,20 @@ class HiSparseDynamicMixin:
             allocated_locs = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.kv_allocated_len
             ]
-            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
-                allocated_locs
+            compressed_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    allocated_locs
+                )
+            )
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
             ] = 0
 
-        host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
-        host_indices = host_indices[host_indices >= 0]
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool,
+            req.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.req_pool_idx],
+        )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
@@ -527,6 +549,8 @@ class HiSparseDynamicMixin:
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self.host_backed_len[req.req_pool_idx] = 0
+        self._skip_first_backup[req.req_pool_idx] = False
         self._set_residency(req, HISPARSE_RESIDENCY_NONE)

@@ -31,7 +31,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
+ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -41,7 +41,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
+ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
 
 # ===============================
 # Base image 950 and args
@@ -51,7 +51,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
+ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -61,7 +61,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
+ENV AITER_COMMIT_DEFAULT="46e6c92b3eb33f64823aaa1ff39a14586b059ef5"
 
 # ===============================
 # Chosen arch and args
@@ -104,12 +104,35 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="v1.1.1"
+ARG MORI_COMMIT="96ffa169710f214e76e07abe5008d686fe54522b"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38
 ARG UBUNTU_CODENAME=jammy
+
+# Optional Ubuntu mirror override + apt hardening.
+# - UBUNTU_MIRROR is empty by default (no behaviour change for local builds).
+#   When set (typically in CI), all http://*archive.ubuntu.com and
+#   http://*security.ubuntu.com entries in /etc/apt/sources.list are rewritten
+#   to point at the given base URL, e.g.
+#     --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com
+#     --build-arg UBUNTU_MIRROR=https://tw.archive.ubuntu.com
+#     --build-arg UBUNTU_MIRROR=http://internal-cache.example.com
+#   This mirrors the pattern already used in docker/Dockerfile (NVIDIA) and
+#   docker/npu.Dockerfile, and lets CI runners that cannot reach Canonical's
+#   port-80 mirror IPs still complete `apt-get update`.
+# - The 80-net-hardening apt config adds retries + per-request timeout so that
+#   transient mirror flakes don't immediately fail a build (apt's default is 0
+#   retries).
+ARG UBUNTU_MIRROR=
 USER root
+
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+        sed -i "s|http://[^[:space:]/]*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
+        sed -i "s|http://[^[:space:]/]*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    fi && \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80-net-hardening
 
 # Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
 # The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
@@ -176,16 +199,26 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
+
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
+# Keep the base image's Torch-compatible Triton by default. Override with
+# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
+ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
+# Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
+# AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
+# block switching to commits that predate that rule (e.g. the current default
+# AITER_COMMIT_DEFAULT). The working tree was just produced by a fresh
+# `git clone` above, so there are no real user changes to preserve.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
- && git checkout ${AITER_COMMIT} \
+ && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
+     && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \

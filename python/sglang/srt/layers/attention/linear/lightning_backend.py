@@ -38,6 +38,10 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # lightning attn does not need conv cache, but to keep the interface for mamba cache
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -85,9 +89,15 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=None,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -279,8 +289,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         save_kv_cache=True,
         **kwargs,
     ):
-        q_rope = kwargs["q_rope"] if "q_rope" in kwargs else None
-        k_rope = kwargs["k_rope"] if "k_rope" in kwargs else None
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
 
         metadata = self.forward_metadata
@@ -288,7 +296,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
             q = q.to(self.kv_cache_dtype)
 
-        query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
@@ -332,6 +339,18 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             raise ValueError(
                 f"linear backend: {self.linear_backend} is not support for now"
             )
+
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.mamba_track_mask is not None
+        ):
+            # save mamba cache for extra buffer
+            mamba_track_mask = forward_batch.mamba_track_mask
+            mamba_track_indices = forward_batch.mamba_track_indices
+            dst_masked = mamba_track_indices[mamba_track_mask]
+            src_masked = metadata.mamba_cache_indices[mamba_track_mask]
+            ssm_states[dst_masked] = ssm_states[src_masked]
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -344,8 +363,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         save_kv_cache=True,
         **kwargs,
     ) -> torch.Tensor:
-        q_rope = kwargs["q_rope"] if "q_rope" in kwargs else None
-        k_rope = kwargs["k_rope"] if "k_rope" in kwargs else None
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
 
         # Use precomputed metadata across all layers
@@ -355,7 +372,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             q = q.to(self.kv_cache_dtype)
 
         # Do linear attention
-        query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
