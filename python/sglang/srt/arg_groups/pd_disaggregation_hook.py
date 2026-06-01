@@ -71,6 +71,11 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                     f"write_policy={server_args.hicache_write_policy})"
                 )
         else:
+            if server_args.disaggregation_decode_enable_hicache:
+                raise ValueError(
+                    "--disaggregation-decode-enable-hicache requires "
+                    "--disaggregation-decode-enable-radix-cache to be enabled."
+                )
             server_args.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
             if server_args.enable_mamba_extra_buffer():
