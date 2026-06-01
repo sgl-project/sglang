@@ -28,6 +28,7 @@ from sglang.multimodal_gen.test.server.realtime_consistency import (
 from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
+    LINGBOT_WORLD_REALTIME_sampling_params,
 )
 
 
@@ -72,6 +73,23 @@ def test_realtime_init_payload_uses_sampling_params_and_extras():
         "seed": 7,
         "num_inference_steps": 4,
     }
+
+
+def test_realtime_init_payload_can_request_preview_transport():
+    params = DiffusionSamplingParams(
+        prompt="preview transport",
+        realtime_num_chunks=1,
+        realtime_output_format="webp",
+    )
+
+    payload = build_realtime_init_payload(
+        model_path="robbyant/lingbot-world-fast-diffusers",
+        sampling_params=params,
+        output_size="832x480",
+        first_frame=None,
+    )
+
+    assert payload["realtime_output_format"] == "webp"
 
 
 def test_realtime_first_frame_accepts_url_or_file(tmp_path):
@@ -373,3 +391,36 @@ def test_realtime_sampling_params_route_to_realtime_video_generator():
     )
 
     assert generate_fn.__name__ == "generate_realtime_video"
+
+
+def test_lingbot_realtime_plastic_beach_params_are_lossless_gt_ready():
+    params = LINGBOT_WORLD_REALTIME_sampling_params
+
+    assert "floating island hotel" in params.prompt
+    assert "825646291038" in str(params.image_path)
+    assert params.output_size == "832x480"
+    assert params.realtime_num_chunks == 4
+    assert params.realtime_output_format is None
+    assert params.realtime_perf_thresholds["p95_chunk_total_ms"] == 5000.0
+    assert params.realtime_perf_thresholds["p95_scheduler_forward_ms"] == 4500.0
+    assert params.realtime_events[0]["kind"] == "camera_actions"
+    assert params.realtime_events[0]["payload"]["mode"] == "state"
+
+
+def test_lingbot_realtime_case_is_env_gated(monkeypatch):
+    from sglang.multimodal_gen.test.server.gpu_cases import (
+        _LINGBOT_REALTIME_CI_ENV,
+        _env_enabled,
+        _make_lingbot_realtime_plastic_beach_case,
+    )
+
+    monkeypatch.delenv(_LINGBOT_REALTIME_CI_ENV, raising=False)
+    assert not _env_enabled(_LINGBOT_REALTIME_CI_ENV)
+    monkeypatch.setenv(_LINGBOT_REALTIME_CI_ENV, "1")
+    assert _env_enabled(_LINGBOT_REALTIME_CI_ENV)
+
+    case = _make_lingbot_realtime_plastic_beach_case()
+    assert case.id == "lingbot_world_realtime_plastic_beach"
+    assert case.run_consistency_check is True
+    assert case.run_perf_check is True
+    assert case.sampling_params.realtime_output_format is None

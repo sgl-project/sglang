@@ -251,6 +251,8 @@ class DiffusionSamplingParams:
     realtime_num_chunks: int | None = None
     realtime_events: list[dict[str, Any]] = field(default_factory=list)
     realtime_perf_thresholds: dict[str, float] = field(default_factory=dict)
+    # None keeps the lossless/raw transport used by GT-backed consistency checks.
+    realtime_output_format: str | None = None
 
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
@@ -305,6 +307,47 @@ class DiffusionTestCase:
             raise ValueError(
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
+
+
+LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "A slow aerial orbit around a pastel floating island hotel in the open "
+        "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
+        "clean horizon, cinematic but playful."
+    ),
+    image_path=(
+        "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/"
+        "b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg"
+    ),
+    output_size="832x480",
+    num_frames=9,
+    fps=16,
+    realtime_num_chunks=4,
+    realtime_events=[
+        {
+            "after_chunk": 0,
+            "kind": "camera_actions",
+            "payload": {"mode": "state", "transitions": [{"actions": ["w"]}]},
+        },
+        {
+            "after_chunk": 2,
+            "kind": "camera_actions",
+            "payload": {"mode": "state", "transitions": [{"actions": []}]},
+        },
+    ],
+    realtime_perf_thresholds={
+        "p95_chunk_total_ms": 5000.0,
+        "p95_scheduler_forward_ms": 4500.0,
+        "p95_ws_payload_mb": 16.0,
+    },
+    extras={
+        "seed": 42,
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "realtime_causal_sink_size": 9,
+        "realtime_causal_kv_cache_num_frames": 18,
+    },
+)
 
 
 def sample_step_indices(

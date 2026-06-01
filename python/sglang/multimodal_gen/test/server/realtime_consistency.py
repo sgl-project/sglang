@@ -97,6 +97,7 @@ def build_realtime_init_payload(
     optional_fields = {
         "fps": sampling_params.fps,
         "num_frames": sampling_params.num_frames,
+        "realtime_output_format": sampling_params.realtime_output_format,
     }
     payload.update({k: v for k, v in optional_fields.items() if v is not None})
     payload.update(dict(sampling_params.extras))
