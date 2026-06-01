@@ -16,7 +16,7 @@ on:
         required: false
         type: string
         default: ''
-      skip_stage_health_check:
+      skip_pr_test_health_check:
         required: false
         type: boolean
         default: false
@@ -27,7 +27,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
 
 jobs:
   sgl-kernel-unit-test:
@@ -38,7 +38,7 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -73,7 +73,7 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 
@@ -120,7 +120,7 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
+      - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
 

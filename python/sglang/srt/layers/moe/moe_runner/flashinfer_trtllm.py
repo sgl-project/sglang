@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_tensor_in_symmetric_mempool,
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_wrapper,
@@ -508,18 +509,26 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     layer.intermediate_size_per_partition = intermediate_size
 
 
-def get_activation_type(activation: str) -> int:
+def get_activation_type(activation: str, is_gated: bool = True) -> int:
     """Map SGLang activation string to FlashInfer ActivationType int value."""
     from flashinfer.fused_moe.core import ActivationType
 
-    _ACTIVATION_STR_TO_TYPE = {
-        "silu": ActivationType.Swiglu,
-        "relu2": ActivationType.Relu2,
-    }
+    if is_gated:
+        _ACTIVATION_STR_TO_TYPE = {
+            "silu": ActivationType.Swiglu,
+            "gelu": ActivationType.Geglu,
+        }
+    else:
+        _ACTIVATION_STR_TO_TYPE = {
+            "silu": ActivationType.Silu,
+            "gelu": ActivationType.Gelu,
+            "relu2": ActivationType.Relu2,
+        }
     act = _ACTIVATION_STR_TO_TYPE.get(activation)
     if act is None:
         raise ValueError(
-            f"Unsupported activation '{activation}' for TRTLLM MoE. "
+            f"Unsupported activation '{activation}' for TRTLLM MoE "
+            f"(is_gated={is_gated}). "
             f"Expected one of {list(_ACTIVATION_STR_TO_TYPE.keys())}."
         )
     return act.value
@@ -689,11 +698,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
             output = trtllm_fp8_block_scale_moe_wrapper(
-                routing_logits=(
-                    router_logits.to(torch.float32)
-                    if routing_method_type == RoutingMethodType.DeepSeekV3
-                    else router_logits
-                ),
+                routing_logits=router_logits,
                 routing_bias=correction_bias,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
@@ -749,11 +754,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
 
-        # The DeepSeekV3 routing method requires float32 router logits.
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
-        else:
-            router_logits = router_logits.to(torch.bfloat16)
+        router_logits = router_logits.to(torch.bfloat16)
 
         output = trtllm_fp8_per_tensor_scale_moe_wrapper(
             routing_logits=router_logits,
@@ -862,7 +863,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2"}
+    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu"}
     assert runner_config.activation in _SUPPORTED_FP4_ACTIVATIONS, (
         f"Only {_SUPPORTED_FP4_ACTIVATIONS} are supported for FP4 MoE, "
         f"got '{runner_config.activation}'."
@@ -872,13 +873,44 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
-        hidden_states, quant_info.w13_input_scale_quant
-    )
+    if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
+            hidden_states,
+            1.0 / (448.0 * 6.0),
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+        )
+
+        seq_len, hidden_size = hidden_states.shape
+        hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
+        hs_scale_linear = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // 16
+        )
+    else:
+        per_token_scale = None
+        hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
+            hidden_states, quant_info.w13_input_scale_quant
+        )
     hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
         *hs_scale_linear.shape[:-1], -1
     )
-    activation_type = get_activation_type(runner_config.activation)
+    activation_type = get_activation_type(
+        runner_config.activation, is_gated=runner_config.is_gated
+    )
+
+    # Build per-expert clamp-limit tensor from the per-layer scalar.
+    _clamp_val = runner_config.gemm1_clamp_limit
+    if _clamp_val is not None:
+        gemm1_clamp_limit = torch.full(
+            (quant_info.local_num_experts,),
+            _clamp_val,
+            dtype=torch.float32,
+            device=hs_fp4.device,
+        )
+    else:
+        gemm1_clamp_limit = None
 
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
@@ -904,6 +936,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
             )
 
+    # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
+    if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
+        use_routed_topk = True
+
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
 
@@ -920,13 +956,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
+            per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
             top_k=topk_output.topk_ids.shape[1],
             n_group=0,
@@ -948,10 +985,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         topk_config = topk_output.topk_config
         routing_method_type = quant_info.routing_method_type
 
-        # DeepSeekV3 style routing requires float32 router logits
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
-
         correction_bias = (
             None
             if topk_config.correction_bias is None
@@ -967,13 +1000,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
+            per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
             top_k=topk_config.top_k,
             n_group=topk_config.num_expert_group,
@@ -1050,7 +1084,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     assert (
         runner_config.num_fused_shared_experts == 0
     ), "Fused shared experts are not supported for flashinfer trtllm moe"
-    activation_type = get_activation_type(runner_config.activation)
+    activation_type = get_activation_type(
+        runner_config.activation, is_gated=runner_config.is_gated
+    )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output

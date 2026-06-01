@@ -5,12 +5,12 @@ Usage:
 
 pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py
 # for a single testcase, look for the name of the testcase in ONE_GPU_CASES,
-# ONE_GPU_MODELOPT_CASES, or TWO_GPU_CASES
+# ONE_GPU_MODELOPT_FP8_CASES, ONE_GPU_B200_CASES, or TWO_GPU_CASES
 pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_image_t2i
 
 
 To add a new testcase:
-1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_CASES`, or `TWO_GPU_CASES`
+1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_FP8_CASES`, `ONE_GPU_B200_CASES`, or `TWO_GPU_CASES`
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import statistics
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -28,7 +29,10 @@ from pathlib import Path
 from typing import Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.registry import get_model_info
+from sglang.multimodal_gen.registry import (
+    get_model_info,
+    get_pipeline_config_classes,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
@@ -186,7 +190,6 @@ class DiffusionServerArgs:
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
-    enable_warmup: bool = True
 
     extras: list[str] = field(default_factory=lambda: [])
     env_vars: dict[str, str] = field(default_factory=dict)
@@ -254,7 +257,7 @@ class DiffusionTestCase:
 
     id: str  # pytest test id and scenario name
     server_args: DiffusionServerArgs
-    sampling_params: DiffusionSamplingParams
+    sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
@@ -266,6 +269,13 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
 
     def __post_init__(self) -> None:
+        if self.sampling_params is None:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                get_default_sampling_params_for_server_args(self.server_args),
+            )
+
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
         has_second_lora = self.server_args.second_lora_path is not None
@@ -439,9 +449,65 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
 
+
+def _get_extra_arg_value(extras: Sequence[str], option_name: str) -> str | None:
+    tokens: list[str] = []
+    for item in extras:
+        tokens.extend(shlex.split(item))
+
+    option_prefix = f"{option_name}="
+    for index, token in enumerate(tokens):
+        if token.startswith(option_prefix):
+            return token[len(option_prefix) :]
+        if token == option_name and index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+def get_model_task_type_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> ModelTaskType:
+    pipeline_class_name = _get_extra_arg_value(
+        server_args.extras, "--pipeline-class-name"
+    )
+    if pipeline_class_name:
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            pipeline_config_cls, _ = config_classes
+            return pipeline_config_cls.task_type
+
+    model_info = get_model_info(server_args.model_path)
+    if model_info is None:
+        raise ValueError(f"Could not resolve model info for {server_args.model_path!r}")
+    return model_info.pipeline_config_cls.task_type
+
+
+def get_default_sampling_params_for_model_task(
+    task_type: ModelTaskType,
+) -> DiffusionSamplingParams:
+    if task_type == ModelTaskType.T2I:
+        return T2I_sampling_params
+    if task_type in (ModelTaskType.I2I, ModelTaskType.TI2I):
+        return TI2I_sampling_params
+    if task_type == ModelTaskType.T2V:
+        return T2V_sampling_params
+    if task_type in (ModelTaskType.I2V, ModelTaskType.TI2V):
+        return TI2V_sampling_params
+    if task_type == ModelTaskType.I2M:
+        return HUNYUAN3D_SHAPE_sampling_params
+    raise ValueError(f"No default sampling params for model task {task_type!r}")
+
+
+def get_default_sampling_params_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> DiffusionSamplingParams:
+    task_type = get_model_task_type_for_server_args(server_args)
+    return get_default_sampling_params_for_model_task(task_type)
+
+
 MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
-MODELOPT_WAN22_FP8_TRANSFORMER = "lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
+MODELOPT_WAN22_FP8_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8"
 MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
     "lmsys/hunyuanvideo-modelopt-fp8-sglang-transformer"
 )
@@ -451,10 +517,9 @@ MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
 )
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
-MODELOPT_WAN22_NVFP4_TRANSFORMER = (
-    "lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
-)
-MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
+MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
+MODELOPT_NVFP4_B200_ENV_VARS = {}
+MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {}
 
 
 def _make_modelopt_ci_case(
@@ -465,19 +530,19 @@ def _make_modelopt_ci_case(
     sampling_params: DiffusionSamplingParams,
     extras: list[str],
     env_vars: dict[str, str] | None = None,
+    run_consistency_check: bool = False,
 ) -> DiffusionTestCase:
     return DiffusionTestCase(
         case_id,
         DiffusionServerArgs(
             model_path=model_path,
             modality=modality,
-            enable_warmup=False,
             extras=extras,
             env_vars=env_vars or {},
         ),
         sampling_params,
         run_perf_check=False,
-        run_consistency_check=False,
+        run_consistency_check=run_consistency_check,
         run_component_accuracy_check=False,
     )
 

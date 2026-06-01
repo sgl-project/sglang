@@ -403,7 +403,7 @@ class DFlashVerifyInput(SpecInput):
                 token_id = int(token_id)
                 req.output_ids.append(token_id)
                 appended += 1
-                req.check_finished()
+                req.update_finish_state()
                 if req.finished():
                     break
                 if req.grammar is not None:

@@ -7,10 +7,11 @@ RadixCache.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 import unittest.mock
+from array import array
 
 import torch
 
@@ -27,8 +28,8 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
 class _StubReq:
     def __init__(self, token_ids):
-        self.origin_input_ids = list(token_ids)
-        self.output_ids = []
+        self.origin_input_ids = array("q", token_ids)
+        self.output_ids = array("q")
         self.extra_key = None
         self.prefix_indices = None
         self.last_node = None
@@ -42,9 +43,9 @@ class _StubReq:
 class TestZeroMatchResult(unittest.TestCase):
     def test_zero_replaces_indices_and_nodes(self):
         tree = RadixCache.create_simulated()
-        tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3, 4, 5])))
+        tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 3, 4, 5]))))
         match = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 9]))
+            MatchPrefixParams(key=RadixKey(token_ids=array("q", [1, 2, 3, 9])))
         )
         self.assertGreater(len(match.device_indices), 0)
         zeroed = zero_match_result(tree, match)
@@ -76,7 +77,9 @@ class TestMatchPrefixForReqForceMiss(unittest.TestCase):
     def test_force_miss_zeros_req_prefix(self):
         tree = RadixCache.create_simulated()
         tree.insert(
-            InsertParams(key=RadixKey(token_ids=[10, 11, 12, 13, 14, 15, 16, 17]))
+            InsertParams(
+                key=RadixKey(token_ids=array("q", [10, 11, 12, 13, 14, 15, 16, 17]))
+            )
         )
 
         # Sanity: without the flag, the same lookup hits.
