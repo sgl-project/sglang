@@ -749,7 +749,64 @@ def retrieve_topk_via_labels(
             selected_tokens=selected_tokens,
             total_valid_tokens=total_valid_tokens,
         )
+        # Flag-gated recall oracle (off by default). Records on the live
+        # all-reduced ``scores`` (the authoritative tensor consumed by the top-K
+        # above) for the harness-registered NIAH trial. Guarded by the same
+        # capture check as the metrics call: the oracle does host syncs
+        # (``.item()``/dict build) that are illegal during CUDA-graph capture.
+        _maybe_record_recall_oracle(scores, indices, layer_id, max_top_k)
     return indices, valid_lengths
+
+
+def _maybe_record_recall_oracle(
+    scores: torch.Tensor,
+    selected_indices: torch.Tensor,
+    layer_id: int,
+    max_top_k: int,
+) -> None:
+    """Record one recall-oracle sample for the active NIAH trial, if enabled.
+
+    Pure no-op (single env lookup, immediate return) when the oracle flag is off
+    or no trial is registered — so production selection is byte-for-byte
+    unchanged. NIAH trials are single-request; the active context carries the
+    harness-provided needle span. Best-effort: a diagnostic failure must never
+    break selection.
+    """
+    from sglang.srt.layers.attention.double_sparsity import oracle_artifact_sink as _sink
+
+    if not _sink.oracle_enabled():
+        return
+    trial = _sink.get_active_trial()
+    if trial is None:
+        return
+    try:
+        from sglang.srt.layers.attention.double_sparsity.selection_recall_oracle import (
+            oracle_payload_for_row,
+        )
+
+        max_tokens = int(scores.shape[-1])
+        span = [p for p in trial.needle_positions if 0 <= p < max_tokens]
+        if not span:
+            return  # needle outside this request's token domain; nothing to record
+        needle = torch.as_tensor(span, dtype=torch.int64, device=scores.device)
+        sample_idx = _sink.next_sample_index()
+        payload = oracle_payload_for_row(
+            scores[0],
+            needle,
+            selected_indices_row=selected_indices[0],
+            stride=1,
+            index_topk=int(max_top_k),
+        )
+        _sink.record_oracle_sample(
+            request_id=trial.request_id,
+            trial_id=trial.trial_id,
+            layer_id=int(layer_id),
+            decode_step=int(sample_idx),
+            payload=payload,
+        )
+    except Exception:
+        # Diagnostic must not perturb serving; swallow and continue.
+        return
 
 
 def _logical_score_triton(

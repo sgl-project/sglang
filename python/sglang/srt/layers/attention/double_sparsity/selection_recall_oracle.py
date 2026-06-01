@@ -244,3 +244,139 @@ def needle_positions_from_spans(
             raise ValueError("each needle span must be non-empty (no guessing).")
         out.append(t)
     return out
+
+
+def dense_within_window_replace(
+    selected_indices: torch.Tensor,
+    token_scores: torch.Tensor,
+    needle_positions: torch.Tensor,
+    pad_value: int = _SELECTED_PAD_VALUE,
+) -> torch.Tensor:
+    """AC-1.1 dense-within-window force: insert the needle by POST-TOPK replacement.
+
+    Forces every needle token into the already-selected set WITHOUT touching the
+    scorer or the budget: for each request, evict the lowest-scoring *non-needle*
+    selected positions and insert the missing needle tokens, preserving exactly
+    the original per-row selected count, then re-sort ascending. The result goes
+    through the existing logical→physical path unchanged.
+
+    This is the ONLY sanctioned force mechanism. It does NOT boost scores, does
+    NOT rewrite labels, and does NOT grow the budget — any of which would either
+    corrupt the scorer under diagnosis or break the fixed selection budget.
+
+    ``selected_indices``: ``[bs, budget]`` int, ascending logical positions,
+    ``pad_value``-padded (the selector output).
+    ``token_scores``:     ``[bs, max_tokens]`` fp32 (to pick the lowest-scoring
+                          non-needle evictions — the live all-reduced scores).
+
+    Returns a new ``[bs, budget]`` int32 tensor (input is not mutated). Raises
+    when a request's needle span cannot fit within its budget.
+    """
+
+    if selected_indices.dim() != 2 or token_scores.dim() != 2:
+        raise ValueError("selected_indices and token_scores must both be 2-D [bs, *].")
+    bs, budget = selected_indices.shape
+    if token_scores.shape[0] != bs:
+        raise ValueError(
+            f"batch mismatch: selected_indices bs={bs} vs token_scores bs={int(token_scores.shape[0])}."
+        )
+    if not isinstance(needle_positions, torch.Tensor):
+        needle_positions = torch.as_tensor(needle_positions, dtype=torch.int64)
+    pos = needle_positions.to(torch.int64)
+    if pos.dim() == 1:
+        pos = pos.unsqueeze(0).expand(bs, -1)
+    if pos.shape[-1] == 0:
+        raise ValueError("needle_positions is empty (no guessing).")
+
+    out = selected_indices.to(torch.int32).clone()
+    scores = token_scores.to(torch.float32)
+
+    for b in range(bs):
+        row = out[b]
+        real_mask = row != pad_value
+        real = row[real_mask].tolist()
+        real_set = set(real)
+        needle = [int(p) for p in pos[b].tolist()]
+        needle_set = set(needle)
+        missing = [p for p in needle if p not in real_set]
+        if not missing:
+            continue
+        if len(needle_set) > budget:
+            raise ValueError(
+                f"request {b}: needle span ({len(needle_set)}) exceeds the selection "
+                f"budget ({budget}); cannot force the needle in-window."
+            )
+        # Evictable = currently-selected non-needle positions, lowest score first.
+        evictable = [p for p in real if p not in needle_set]
+        evictable.sort(key=lambda p: float(scores[b, p].item()))  # ascending score
+        if len(evictable) < len(missing):
+            raise ValueError(
+                f"request {b}: only {len(evictable)} evictable non-needle slots for "
+                f"{len(missing)} missing needle tokens; needle cannot fit the budget."
+            )
+        keep = [p for p in real if p not in set(evictable[: len(missing)])]
+        new_real = sorted(set(keep) | set(missing))
+        # Preserve the original real count (do not grow or shrink the selection).
+        if len(new_real) != len(real):
+            # Defensive: keep/insert math should preserve count exactly.
+            new_real = sorted(new_real)[: len(real)]
+        filled = torch.full((budget,), pad_value, dtype=torch.int32, device=out.device)
+        filled[: len(new_real)] = torch.tensor(new_real, dtype=torch.int32, device=out.device)
+        out[b] = filled
+    return out
+
+
+def oracle_payload_for_row(
+    token_scores_row: torch.Tensor,
+    needle_positions_row: torch.Tensor,
+    *,
+    selected_indices_row: torch.Tensor = None,
+    stride: int = 1,
+    index_topk: int = 2048,
+    k_values: Iterable[int] = DEFAULT_RECALL_K_VALUES,
+) -> Dict[str, object]:
+    """Build one host-resident oracle payload for a single request row.
+
+    All values are extracted to plain Python (``int`` / ``bool`` / ``list``) so
+    the caller may hand the payload straight to the artifact sink without
+    holding a live device tensor. ``token_scores_row`` is ``[max_tokens]`` (the
+    live all-reduced score row); ``needle_positions_row`` is ``[n_needle]``.
+
+    The ``stride`` (oracle sampling stride) is recorded as an explicit field.
+    ``recall@K`` for ``K > index_topk`` is score-only and is tagged as such so a
+    consumer never mistakes it for a decode result.
+    """
+    scores = token_scores_row.reshape(1, -1)
+    span = needle_positions_row.reshape(-1)
+    ranks = needle_ranks(scores, span)[0]
+    worst = int(ranks.amax().item())
+    best = int(ranks.amin().item())
+    # Always include index_topk so the AC-1 invariant key (recall@index_topk)
+    # is present even when the K grid does not list it.
+    k_set = sorted({int(k) for k in k_values} | {int(index_topk)})
+    all_in_topk = {k: bool(worst < k) for k in k_set}
+    payload: Dict[str, object] = {
+        "stride": int(stride),
+        "needle_span": [int(p) for p in span.tolist()],
+        "num_needle_tokens": int(span.numel()),
+        "needle_worst_rank": worst,
+        "needle_best_rank": best,
+        "needle_all_tokens_in_topK": all_in_topk,
+        # recall@K uses the all-needle-tokens-in-top-K rule; K>index_topk is
+        # score-only (a ranking property), never a decode outcome.
+        "recall_at_k": all_in_topk,
+        "recall_at_k_score_only_above_index_topk": [
+            int(k) for k in all_in_topk if int(k) > int(index_topk)
+        ],
+        "index_topk": int(index_topk),
+    }
+    if selected_indices_row is not None:
+        contains = bool(
+            selected_contains_needle(selected_indices_row.reshape(1, -1), span)[0].item()
+        )
+        payload["selected_contains_needle"] = contains
+        # AC-1 invariant: recall@index_topk must equal selected_contains_needle.
+        payload["recall_at_index_topk_matches_selected"] = bool(
+            all_in_topk.get(int(index_topk), worst < int(index_topk)) == contains
+        )
+    return payload
