@@ -1,7 +1,6 @@
 export const Nemotron3UltraDeployment = () => {
   const MODEL_PATHS = {
     bf16: 'nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16',
-    fp8: 'nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8',
     nvfp4: 'nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4',
   };
 
@@ -14,7 +13,6 @@ export const Nemotron3UltraDeployment = () => {
       title: 'Model',
       items: [
         { id: 'bf16',   label: 'BF16',   default: true  },
-        { id: 'fp8',    label: 'FP8',    default: false },
         { id: 'nvfp4',  label: 'NVFP4',  default: false, subtitle: 'Blackwell only' },
       ]
     },
