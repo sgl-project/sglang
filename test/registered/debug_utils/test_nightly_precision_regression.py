@@ -13,6 +13,7 @@ Env knobs:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -49,7 +50,13 @@ register_cuda_ci(est_time=3600, suite="nightly-precision-8-gpu-h200", nightly=Tr
 
 DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.1-FP8"
 DEFAULT_DIFF_THRESHOLD = 1e-3
-DUMPER_FILTER = r"match(r'^non_intrusive__model\.layers\.\d+\.inputs\.1$', name)"
+# Fallback when the layer count can't be resolved: never silently shrink coverage.
+DUMPER_FILTER_ALL_LAYERS = (
+    r"match(r'^non_intrusive__model\.layers\.\d+\.inputs\.1$', name)"
+)
+LAYER_CAPTURE_STRIDE = 8
+MAX_TOKENS = 2
+SCHEMA_VERSION = 3
 EXP_NAME = "nightly_precision"
 PROMPT = "The capital of France is"
 NIGHTLY_PRECISION_SERVER_TIMEOUT = 3600
@@ -57,6 +64,91 @@ NIGHTLY_PRECISION_SERVER_TIMEOUT = 3600
 
 def _sanitize_model_name(model: str) -> str:
     return model.replace("/", "__").replace(" ", "_")
+
+
+def _select_capture_layers(
+    num_layers: int, stride: int = LAYER_CAPTURE_STRIDE
+) -> list[int]:
+    # First + last + every stride-th: the residual stream is cumulative, so the
+    # last layer still reflects drift originating in any earlier layer.
+    layers = set(range(0, num_layers, stride))
+    layers.add(0)
+    layers.add(num_layers - 1)
+    return sorted(i for i in layers if 0 <= i < num_layers)
+
+
+def _build_dumper_filter(capture_layers: Optional[list[int]]) -> str:
+    if not capture_layers:
+        return DUMPER_FILTER_ALL_LAYERS
+    # The dumper evals this with builtins stripped (no int()/arithmetic), so the
+    # layer subset is baked into the regex; longest-first avoids ambiguous matches.
+    alt = "|".join(
+        str(i) for i in sorted(capture_layers, key=lambda x: (-len(str(x)), x))
+    )
+    return rf"match(r'^non_intrusive__model\.layers\.({alt})\.inputs\.1$', name)"
+
+
+def _resolve_num_layers(model_path: str) -> Optional[int]:
+    # None on any failure -> caller captures every layer rather than a wrong subset.
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except Exception as e:
+        warnings.warn(f"could not load config for {model_path}: {e}")
+        return None
+    text_config = getattr(config, "text_config", None)  # VL configs nest LM dims here
+    for obj in (text_config, config):
+        if obj is None:
+            continue
+        for attr in ("num_hidden_layers", "num_layers"):
+            n = getattr(obj, attr, None)
+            if isinstance(n, int) and n > 0:
+                return n
+    warnings.warn(f"could not read layer count from config for {model_path}")
+    return None
+
+
+def _assert_decode_captured(exp_dir: Path, *, tp_size: int) -> None:
+    # One dump per (layer, rank) == prefill only: decode never ran, which would
+    # pass the comparison while silently halving coverage. Fail loudly instead.
+    pts = list(exp_dir.glob("*.pt"))
+    if not pts:
+        raise AssertionError(f"no .pt dumps produced in {exp_dir}")
+    layers: set[str] = set()
+    steps: set[str] = set()
+    for p in pts:
+        for kv in p.stem.split("___"):
+            if kv.startswith("layer_id="):
+                layers.add(kv[len("layer_id=") :])
+            elif kv.startswith("step="):
+                steps.add(kv[len("step=") :])
+    prefill_only = len(layers) * tp_size
+    if len(pts) <= prefill_only:
+        raise AssertionError(
+            f"decode path not captured: {len(pts)} .pt files for {len(layers)} "
+            f"layers x {tp_size} tp (== {prefill_only}, prefill-only); "
+            f"steps={sorted(steps)}. The model generated no decode tokens "
+            f"(check --max-total-tokens vs the decode reservation, max_tokens, "
+            f"and ignore_eos)."
+        )
+
+
+def _capture_signature(dump_cfg: dict[str, Any], tp_size: int) -> str:
+    # Identifies the dump shape; fetch only compares against baselines with the
+    # same signature, so changing layers/forwards/tp re-establishes cleanly
+    # instead of erroring against incompatible tensors.
+    raw = "|".join(
+        str(x)
+        for x in (
+            SCHEMA_VERSION,
+            dump_cfg["max_tokens"],
+            dump_cfg["ignore_eos"],
+            tp_size,
+            dump_cfg["dumper_filter"],
+        )
+    )
+    return hashlib.sha1(raw.encode()).hexdigest()[:12]
 
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
@@ -277,7 +369,25 @@ def _test_one_model(
     model_baseline_dir = baseline_dir / model_dir_name
     baseline_exp_dir = model_baseline_dir / EXP_NAME
 
-    _maybe_hf_fetch(hf_cfg=hf_cfg, model=model, baseline_exp_dir=baseline_exp_dir)
+    # Resolve the capture shape once and reuse it for the dump request and every
+    # meta push, so the manifest always reflects exactly what was dumped.
+    num_layers = _resolve_num_layers(model)
+    capture_layers = _select_capture_layers(num_layers) if num_layers else None
+    dump_cfg = {
+        "max_tokens": MAX_TOKENS,
+        "ignore_eos": True,
+        "dumper_filter": _build_dumper_filter(capture_layers),
+        "num_hidden_layers": num_layers,
+        "capture_layers": capture_layers,
+    }
+    dump_cfg["capture_signature"] = _capture_signature(dump_cfg, model_setup.tp_size)
+
+    _maybe_hf_fetch(
+        hf_cfg=hf_cfg,
+        model=model,
+        baseline_exp_dir=baseline_exp_dir,
+        capture_signature=dump_cfg["capture_signature"],
+    )
 
     with tempfile.TemporaryDirectory() as today_tmp:
         today_dump_dir = Path(today_tmp)
@@ -285,8 +395,12 @@ def _test_one_model(
             model_setup=model_setup,
             dump_dir=today_dump_dir,
             base_url=base_url,
+            dumper_filter=dump_cfg["dumper_filter"],
+            max_tokens=dump_cfg["max_tokens"],
+            ignore_eos=dump_cfg["ignore_eos"],
         )
         today_exp_dir = today_dump_dir / EXP_NAME
+        _assert_decode_captured(today_exp_dir, tp_size=model_setup.tp_size)
 
         has_baseline = baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt"))
 
@@ -314,6 +428,7 @@ def _test_one_model(
                     tensors_dir=baseline_exp_dir,
                     pass_label="passed",
                     diff_threshold=diff_threshold,
+                    dump_cfg=dump_cfg,
                     comparator_report=report_path,
                     comparator_stats=comparator_stats,
                 )
@@ -327,6 +442,7 @@ def _test_one_model(
                 tensors_dir=today_exp_dir,
                 pass_label="failed",
                 diff_threshold=diff_threshold,
+                dump_cfg=dump_cfg,
                 comparator_report=report_path,
                 comparator_stats=comparator_stats,
             )
@@ -341,6 +457,7 @@ def _test_one_model(
                 tensors_dir=baseline_exp_dir,
                 pass_label="baseline_established",
                 diff_threshold=diff_threshold,
+                dump_cfg=dump_cfg,
                 comparator_report=None,
                 comparator_stats=None,
             )
@@ -348,14 +465,19 @@ def _test_one_model(
             return (model, "BASELINE_ESTABLISHED", reason)
 
 
-def _maybe_hf_fetch(*, hf_cfg, model: str, baseline_exp_dir: Path) -> None:
+def _maybe_hf_fetch(
+    *, hf_cfg, model: str, baseline_exp_dir: Path, capture_signature: str
+) -> None:
     if hf_cfg is None or _hfs is None:
         return
     if baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt")):
         return
     try:
         src = _hfs.fetch_latest_baseline(
-            config=hf_cfg, model=model, target_tensors_dir=baseline_exp_dir
+            config=hf_cfg,
+            model=model,
+            target_tensors_dir=baseline_exp_dir,
+            capture_signature=capture_signature,
         )
         if src is not None:
             print(f"[hf-store] restored baseline for {model} from {src}", flush=True)
@@ -374,6 +496,7 @@ def _maybe_hf_push(
     tensors_dir: Path,
     pass_label: str,
     diff_threshold: float,
+    dump_cfg: dict[str, Any],
     comparator_report: Optional[Path] = None,
     comparator_stats: Optional[dict[str, Any]] = None,
 ) -> None:
@@ -386,16 +509,20 @@ def _maybe_hf_push(
         return
     try:
         meta: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": SCHEMA_VERSION,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "model": model,
             "sglang_commit": _get_git_commit(),
             "tp_size": model_setup.tp_size,
             "prompt": PROMPT,
-            "max_tokens": 1,
+            "max_tokens": dump_cfg["max_tokens"],
+            "ignore_eos": dump_cfg["ignore_eos"],
             "temperature": 0,
             "diff_threshold": diff_threshold,
-            "dumper_filter": DUMPER_FILTER,
+            "dumper_filter": dump_cfg["dumper_filter"],
+            "num_hidden_layers": dump_cfg.get("num_hidden_layers"),
+            "capture_layers": dump_cfg.get("capture_layers"),
+            "capture_signature": dump_cfg.get("capture_signature"),
             "num_tensor_files": len(pt_files),
             "pass_label": pass_label,
             "source": "test_nightly_precision_regression.py",
@@ -424,7 +551,13 @@ def _maybe_hf_push(
 
 
 def _run_server_and_dump(
-    *, model_setup: ModelLaunchSettings, dump_dir: Path, base_url: str
+    *,
+    model_setup: ModelLaunchSettings,
+    dump_dir: Path,
+    base_url: str,
+    dumper_filter: str,
+    max_tokens: int,
+    ignore_eos: bool,
 ):
     env: dict[str, str] = {
         **os.environ,
@@ -438,8 +571,11 @@ def _run_server_and_dump(
     env.pop("HF_TOKEN", None)
 
     server_args: list[str] = list(model_setup.extra_args) + [
+        # Below the scheduler's decode-token reservation (default 512) the KV
+        # pool clamps max_new_tokens to 0, so decode never runs and max_tokens>1
+        # has no effect. Keep it well above that.
         "--max-total-tokens",
-        "128",
+        "4096",
         "--mem-fraction-static",
         "0.9",
         "--disable-cuda-graph",
@@ -459,7 +595,7 @@ def _run_server_and_dump(
             f"{base_url}/dumper/configure",
             json={
                 "enable": True,
-                "filter": DUMPER_FILTER,
+                "filter": dumper_filter,
                 "cleanup_previous": True,
             },
         ).raise_for_status()
@@ -469,8 +605,11 @@ def _run_server_and_dump(
             json={
                 "model": model_setup.model_path,
                 "messages": [{"role": "user", "content": PROMPT}],
-                "max_tokens": 1,
+                "max_tokens": max_tokens,
                 "temperature": 0,
+                # Without this the model may EOS on the first token and never
+                # enter the decode loop, leaving the decode path uncaptured.
+                "ignore_eos": ignore_eos,
             },
         )
         assert resp.status_code == 200, f"Chat completions failed: {resp.text}"

@@ -86,47 +86,51 @@ def _row_recency_key(row: dict[str, Any], fallback_index: int) -> tuple[int, int
     return (explicit_i, fallback_index)
 
 
+def _select_latest_run(
+    rows: list[dict[str, Any]],
+    *,
+    model: str,
+    capture_signature: Optional[str] = None,
+) -> Optional[str]:
+    # A baseline is only comparable to a target with the same capture shape, so
+    # when a signature is given, mismatched (incl. legacy unsigned) rows are
+    # skipped — fetch then returns None and the caller establishes a fresh one
+    # instead of erroring on incompatible tensors.
+    candidates: list[tuple[tuple[int, int], dict[str, Any]]] = []
+    for idx, row in enumerate(rows):
+        if row.get("model") != model:
+            continue
+        if (
+            capture_signature is not None
+            and row.get("capture_signature") != capture_signature
+        ):
+            continue
+        if "run_path" not in row:
+            continue
+        candidates.append((_row_recency_key(row, idx), row))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda kv: kv[0])
+    return candidates[-1][1]["run_path"]
+
+
 def fetch_latest_baseline(
     *,
     config: HfStoreConfig,
     model: str,
     target_tensors_dir: Path,
+    capture_signature: Optional[str] = None,
 ) -> Optional[str]:
     # Tensors land flat in target_tensors_dir (no enclosing tensors/) so the
     # caller can treat it like a fresh dump dir.
-    from huggingface_hub import hf_hub_download, snapshot_download
-    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
+    from huggingface_hub import snapshot_download
 
-    try:
-        manifest_local = _with_retries(
-            lambda: hf_hub_download(
-                repo_id=config.repo,
-                repo_type="dataset",
-                filename="manifest.jsonl",
-                revision=config.revision,
-            ),
-            what="manifest fetch",
-        )
-    except (EntryNotFoundError, RepositoryNotFoundError):
+    rows, _ = _read_manifest(config)
+    run_path = _select_latest_run(
+        rows, model=model, capture_signature=capture_signature
+    )
+    if run_path is None:
         return None
-
-    candidates: list[tuple[tuple[int, int], dict[str, Any]]] = []
-    with open(manifest_local) as f:
-        for idx, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("model") != model:
-                continue
-            candidates.append((_row_recency_key(row, idx), row))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda kv: kv[0])
-    run_path: str = candidates[-1][1]["run_path"]
 
     snapshot_root = _with_retries(
         lambda: snapshot_download(
@@ -182,6 +186,7 @@ _MANIFEST_PROMOTE_KEYS = (
     "hardware",
     "tp_size",
     "pass_label",
+    "capture_signature",
     "num_layers_compared",
     "num_layers_passed",
     "num_layers_failed",
