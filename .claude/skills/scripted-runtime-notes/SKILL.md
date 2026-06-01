@@ -22,4 +22,4 @@ Else: don't. Read `r.req.X` / `t._scheduler.X` in the test; inline single-use ac
 Never:
 
 - Weaken an assertion to fit a missing probe.
-- Probe implementation details ("field non-None", "which branch ran") — assert the consequence, or delete the test.
+- Probe implementation details ("field non-None", "which branch ran") — assert the consequence.
