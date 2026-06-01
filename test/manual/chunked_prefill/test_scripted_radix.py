@@ -9,6 +9,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_all_finished,
     run_until_finished,
+    warmup_radix,
 )
 
 
@@ -128,8 +129,7 @@ class TestRadixBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_radix_warmup_helper(t: ScriptedContext):
-        t.warmup_radix(prompt_tokens=[1] * (2 * DEFAULT_CHUNK_SIZE))
-        yield
+        yield from warmup_radix(t, [1] * (2 * DEFAULT_CHUNK_SIZE))
 
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE + 1, max_new_tokens=1)
         yield from run_until_finished(r)

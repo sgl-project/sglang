@@ -10,6 +10,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_all_finished,
     run_until_finished,
+    warmup_radix,
 )
 
 _LORA_BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
@@ -731,7 +732,7 @@ class TestRegressionLpm(ScriptedTestCase):
 
     @staticmethod
     def _script_lpm_skips_chunked_resume_prefix_match(t: ScriptedContext):
-        t.warmup_radix(prompt_tokens=[1] * (2 * DEFAULT_CHUNK_SIZE))
+        yield from warmup_radix(t, [1] * (2 * DEFAULT_CHUNK_SIZE))
 
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.chunks_done >= 1 and h.is_chunking)
@@ -761,7 +762,7 @@ class TestRegressionLpm(ScriptedTestCase):
     @staticmethod
     def _script_chunked_resume_priority_under_lpm(t: ScriptedContext):
         long_prefix_tokens = [1] * (3 * DEFAULT_CHUNK_SIZE)
-        t.warmup_radix(prompt_tokens=long_prefix_tokens)
+        yield from warmup_radix(t, long_prefix_tokens)
 
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
