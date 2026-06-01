@@ -7,7 +7,7 @@ on Arm64 via aarch64/moe.cpp (PR #16045). Additional quantization paths
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="per-commit-cpu-arm64")
+register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 import itertools
 import math
