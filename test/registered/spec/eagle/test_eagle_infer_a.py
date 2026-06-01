@@ -16,6 +16,7 @@ from sglang.test.kits.spec_server_kits import (
     SpecCorrectnessKit,
     SpecFeatureKit,
     SpecLogprobKit,
+    SpecParityKit,
     SpecPenaltyKit,
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import SpecEagleServerBase
@@ -35,11 +36,12 @@ class _Eagle3Standard(SpecEagleServerBase):
     chunked_prefill_size = 1024
     mem_fraction_static = 0.6  # leave room for the parity reference server
 
-    # Kit thresholds (EAGLE3 topk=1; tune against CI if needed).
-    acc_length_thres = 1.8
-    batch_accept_len_thres = 1.5
+    # Kit thresholds (EAGLE3 topk=1 accepts modestly; smoke measured
+    # acc_length~2.05, batch avg accept~1.50, so leave margin below those).
+    acc_length_thres = 1.6
+    batch_accept_len_thres = 1.3
     gsm8k_score_thres = 0.7
-    gsm8k_accept_len_thres = 1.8
+    gsm8k_accept_len_thres = 1.3
 
     # Busy-time pool accounting check (topk=1 only).
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
@@ -55,8 +57,9 @@ _KITS = (
 )
 
 
-class TestEagle3SpecOverlap(_Eagle3Standard, *_KITS):
-    """Spec v2 (overlap scheduler on)."""
+class TestEagle3SpecOverlap(_Eagle3Standard, *_KITS, SpecParityKit):
+    """Spec v2 (overlap scheduler on). Also runs the lossless output-parity
+    check (the one place the heavy 2nd-server parity is exercised)."""
 
     disable_overlap = False
 
@@ -65,6 +68,22 @@ class TestEagle3SpecNoOverlap(_Eagle3Standard, *_KITS):
     """Spec v1 (overlap scheduler off)."""
 
     disable_overlap = True
+
+
+class TestEagle3Topk16NoOverlap(SpecEagleServerBase, SpecCorrectnessKit, SpecParityKit):
+    """EAGLE3 topk>1 tree drafting on spec v1 (preserves the old TestEAGLE3Engine
+    correctness coverage: acc-length + EOS + output==reference parity)."""
+
+    spec_algo = "EAGLE3"
+    spec_steps = 5
+    spec_topk = 16
+    spec_tokens = 64
+    attention_backend = "flashinfer"
+    disable_overlap = True  # topk>1 runs on spec v1
+    cuda_graph_max_bs = 5
+    mem_fraction_static = 0.6  # room for the parity reference server
+    acc_length_thres = 3.1
+    batch_accept_len_thres = 1.75
 
 
 if __name__ == "__main__":

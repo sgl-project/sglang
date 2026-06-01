@@ -30,17 +30,11 @@ from sglang.test.test_utils import (
 
 
 class SpecCorrectnessKit:
-    """Losslessness + acceptance-quality checks (server-based)."""
+    """Acceptance-quality + EOS checks (single server, cheap)."""
 
     # Tunable thresholds (override per config class).
     acc_length_thres = 3.1
     batch_accept_len_thres = 1.75
-    parity_prompts = [
-        "The capital of France is",
-        "Once upon a time, there was a",
-        "The three primary colors are",
-        "def fibonacci(n):",
-    ]
 
     def test_acc_length(self):
         prompt = [
@@ -98,6 +92,22 @@ class SpecCorrectnessKit:
         output = res["text"]
         tokens = self.tokenizer.encode(output, truncation=False)
         self.assertNotIn(self.tokenizer.eos_token_id, tokens)
+
+
+class SpecParityKit:
+    """Lossless output parity vs a non-spec reference (launches a 2nd server).
+
+    Heavy: spins a temporary non-spec server. Apply to one representative class,
+    not every config. The host class must keep ``mem_fraction_static`` low enough
+    for the reference server to coexist.
+    """
+
+    parity_prompts = [
+        "The capital of France is",
+        "Once upon a time, there was a",
+        "The three primary colors are",
+        "def fibonacci(n):",
+    ]
 
     def test_parity_vs_reference(self):
         """Spec decoding is lossless: greedy output must equal a non-spec

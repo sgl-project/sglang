@@ -17,6 +17,7 @@ from sglang.test.kits.abort_timeout_kit import (
 )
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
+    SpecCorrectnessKit,
     SpecFeatureKit,
     SpecLogprobKit,
     SpecPenaltyKit,
@@ -49,13 +50,30 @@ class _EagleLlama2(SpecEagleServerBase):
 
 
 class TestEagleLlama2Suite(
-    _EagleLlama2, SpecAccuracyKit, SpecLogprobKit, SpecPenaltyKit, SpecFeatureKit
+    _EagleLlama2,
+    SpecCorrectnessKit,
+    SpecAccuracyKit,
+    SpecLogprobKit,
+    SpecPenaltyKit,
+    SpecFeatureKit,
 ):
-    """Full feature coverage on EAGLE/Llama-2: gsm8k, logprobs, penalty, radix,
-    abort, constrained decoding."""
+    """Full coverage on EAGLE/Llama-2: correctness (acc-length + EOS), gsm8k,
+    logprobs, penalty, radix, abort, constrained decoding."""
+
+    # Llama-2 EAGLE topk=8 accepts well; see old TestEAGLEEngine thresholds.
+    acc_length_thres = 3.0
+    batch_accept_len_thres = 1.8
 
 
-class TestEagleLlama2Fa3Page256(_EagleLlama2, SpecAccuracyKit):
+class TestEagleLlama2Chunked4(_EagleLlama2, SpecCorrectnessKit):
+    """Correctness under tiny chunked prefill (old TestEAGLEEngine 2nd config)."""
+
+    chunked_prefill_size = 4
+    acc_length_thres = 3.0
+    batch_accept_len_thres = 1.8
+
+
+class TestEagleLlama2Fa3Page256(_EagleLlama2, SpecAccuracyKit, SpecFeatureKit):
     spec_topk = 5
     spec_steps = 8
     attention_backend = "fa3"
@@ -63,7 +81,7 @@ class TestEagleLlama2Fa3Page256(_EagleLlama2, SpecAccuracyKit):
     cuda_graph_max_bs = 5
 
 
-class TestEagleLlama2PageTopk1(_EagleLlama2, SpecAccuracyKit):
+class TestEagleLlama2PageTopk1(_EagleLlama2, SpecAccuracyKit, SpecFeatureKit):
     # topk=1 + page>1; busy-time pool accounting check (topk=1 only).
     spec_topk = 1
     spec_tokens = 6
@@ -74,7 +92,7 @@ class TestEagleLlama2PageTopk1(_EagleLlama2, SpecAccuracyKit):
     )
 
 
-class TestEagleLlama2PageTopk(_EagleLlama2, SpecAccuracyKit):
+class TestEagleLlama2PageTopk(_EagleLlama2, SpecAccuracyKit, SpecFeatureKit):
     # topk>1 + page>1 (v1 tree path).
     page_size = 4
 
