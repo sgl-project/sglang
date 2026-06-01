@@ -387,6 +387,7 @@ def prepare_extend_inputs_for_correctness_test(
         req.full_untruncated_fill_ids += input_ids[i][bench_args.cut_len :]
         req.fill_len = len(req.full_untruncated_fill_ids)
         if model_runner is not None:
+            # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
