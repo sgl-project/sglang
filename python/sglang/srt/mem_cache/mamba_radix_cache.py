@@ -976,7 +976,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
             if node.mamba_value is not None:
@@ -1134,7 +1134,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)

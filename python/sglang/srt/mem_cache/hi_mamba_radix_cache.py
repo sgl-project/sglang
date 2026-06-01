@@ -853,7 +853,7 @@ class HiMambaRadixCache(MambaRadixCache):
         child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
 
@@ -958,7 +958,7 @@ class HiMambaRadixCache(MambaRadixCache):
         best_value_len = 0
         best_last_node = node
 
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
 
             if child.evicted and not child.backuped:
@@ -1871,7 +1871,7 @@ class HiMambaRadixCache(MambaRadixCache):
         child_key = key.child_key(self.page_size)
 
         matched_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             if node != self.root_node and node.mamba_value is not None:

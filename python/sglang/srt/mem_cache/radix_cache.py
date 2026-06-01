@@ -30,6 +30,7 @@ from array import array
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -145,37 +146,38 @@ class RadixKey:
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
-    # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        n0, n1 = len(t0), len(t1)
+        n = min(n0, n1)
+
+        if n == 0:
+            return 0
+
+        # Vectorized comparison with numpy to avoid per-element PyLong boxing.
+        # array('q') stores signed 64-bit integers; we interpret the buffer
+        # directly as int64 to avoid copying when possible.
+        a0 = np.frombuffer(t0, dtype=np.int64, count=n)
+        a1 = np.frombuffer(t1, dtype=np.int64, count=n)
+
+        # Find first mismatch: argmax on the inequality mask returns the
+        # index of the first True (mismatch). If all equal, argmax returns 0,
+        # so we check .any() to distinguish "all equal" from "mismatch at 0".
+        neq = a0 != a1
+        first_mismatch = np.argmax(neq) if neq.any() else n
 
         if self.is_bigram:
             # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            matched = max(0, min(i - 1, len(self), len(other)))
+            matched = max(0, min(first_mismatch - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
         if page_size == 1:
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            return i
+            return first_mismatch
 
-        min_len = min(len(self), len(other))
-        i = 0
-        while i < min_len:
-            if t0[i : i + page_size] != t1[i : i + page_size]:
-                break
-            i += page_size
-        return i
+        # page_size > 1: round down to nearest multiple of page_size
+        return (first_mismatch // page_size) * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -650,7 +652,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         value = []
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
             child.last_access_time = access_time
             prefix_len = child.key.match(key, page_size=self.page_size)
@@ -720,7 +722,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             node.last_access_time = access_time
             prefix_len = node.key.match(key, page_size=self.page_size)
