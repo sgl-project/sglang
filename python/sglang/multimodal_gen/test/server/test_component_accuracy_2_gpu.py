@@ -15,6 +15,15 @@ from sglang.multimodal_gen.test.server.accuracy_utils import (
 )
 from sglang.multimodal_gen.test.server.component_accuracy import AccuracyEngine
 
+VAE_CHANNELS_LAST_3D_PARITY_CASE_IDS = {
+    "wan2_2_i2v_a14b_2gpu",
+}
+VAE_CHANNELS_LAST_3D_PARITY_CASES = [
+    case
+    for case in ACCURACY_TWO_GPU_CASES
+    if case.id in VAE_CHANNELS_LAST_3D_PARITY_CASE_IDS
+]
+
 
 @pytest.mark.parametrize("case", ACCURACY_TWO_GPU_CASES, ids=lambda case: case.id)
 class TestComponentAccuracy2GPU:
@@ -60,6 +69,19 @@ class TestComponentAccuracy2GPU:
             pytest.skip(duplicate_reason)
         run_text_encoder_accuracy_case(
             AccuracyEngine,
+            case,
+            case.server_args.num_gpus,
+        )
+
+
+@pytest.mark.parametrize(
+    "case", VAE_CHANNELS_LAST_3D_PARITY_CASES, ids=lambda case: case.id
+)
+class TestVAEChannelsLast3DParity2GPU:
+    """2-GPU VAE guard for channels_last_3d drift."""
+
+    def test_vae_channels_last_3d_parity(self, case):
+        AccuracyEngine.run_vae_channels_last_3d_parity(
             case,
             case.server_args.num_gpus,
         )

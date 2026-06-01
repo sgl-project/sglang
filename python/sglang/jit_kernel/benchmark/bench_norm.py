@@ -11,7 +11,7 @@ from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="stage-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=30, suite="base-b-kernel-benchmark-1-gpu-large")
 
 
 DTYPE = torch.bfloat16

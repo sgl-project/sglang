@@ -328,9 +328,6 @@ class Req:
 
         self.metrics = RequestMetrics(request_id=self.request_id)
 
-    def adjust_size(self, server_args: ServerArgs):
-        pass
-
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
 
@@ -383,7 +380,7 @@ class OutputBatch:
     Final output (after pipeline completion)
     """
 
-    output: torch.Tensor | None = None
+    output: Any | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
@@ -400,3 +397,13 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+
+    def drop_payload_for_warmup(self) -> None:
+        self.output = None
+        self.audio = None
+        self.trajectory_timesteps = None
+        self.trajectory_latents = None
+        self.rollout_trajectory_data = None
+        self.trajectory_decoded = None
+        self.output_file_paths = None
+        self.noise_pred = None

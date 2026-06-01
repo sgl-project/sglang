@@ -23,6 +23,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
@@ -124,6 +125,7 @@ class SchedulerStats:
 
     # Utilization
     utilization: float = 0.0
+    fwd_occupancy: float = float("nan")
 
     # Scheduler policy
     new_token_ratio: float = 0.0
@@ -181,7 +183,54 @@ class DPCooperationInfo:
         return dataclasses.asdict(self)
 
 
-class SchedulerMetricsCollector:
+# Role keys used by ServerArgs.stat_loggers to look up collector overrides.
+# Embedded-use callers (e.g. Ray Serve LLM) pass {"scheduler": MyClass, ...} on
+# ServerArgs and the five collector instantiation sites pick the right class.
+STAT_LOGGER_ROLE_SCHEDULER = "scheduler"
+STAT_LOGGER_ROLE_TOKENIZER = "tokenizer"
+STAT_LOGGER_ROLE_STORAGE = "storage"
+STAT_LOGGER_ROLE_RADIX_CACHE = "radix_cache"
+STAT_LOGGER_ROLE_EXPERT_DISPATCH = "expert_dispatch"
+
+
+def resolve_collector_class(
+    server_args: Optional["ServerArgs"], role: str, default_cls: type
+) -> type:
+    """Return the subclass registered for `role` on `server_args.stat_loggers`,
+    or `default_cls` if none is registered. Tolerates `server_args=None` and
+    `stat_loggers=None`."""
+    if server_args is None:
+        return default_cls
+    stat_loggers = getattr(server_args, "stat_loggers", None)
+    if not stat_loggers:
+        return default_cls
+    return stat_loggers.get(role, default_cls)
+
+
+class _StatLoggerDIMixin:
+    """Shared DI override hooks for all *MetricsCollector classes.
+
+    Subclasses (e.g. a Ray-backed wrapper) replace these class attributes with
+    classes that mirror the prometheus_client API but emit through a different
+    backend. ``None`` keeps the prometheus_client default.
+    """
+
+    _counter_cls = None
+    _gauge_cls = None
+    _histogram_cls = None
+    _summary_cls = None
+
+
+@dataclass(kw_only=True, frozen=True, slots=True)
+class SchedulerMetricsCollectorContext:
+    enable_metrics: bool
+    is_stats_logging_rank: bool
+    current_scheduler_metrics_enabled: bool
+    enable_kv_cache_events: bool
+    collector: Optional["SchedulerMetricsCollector"]
+
+
+class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def __init__(
         self,
@@ -192,7 +241,15 @@ class SchedulerMetricsCollector:
         server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Gauge, Histogram, Summary
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
+        from prometheus_client import Histogram as _PromHistogram
+        from prometheus_client import Summary as _PromSummary
+
+        Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
+        Histogram = self._histogram_cls or _PromHistogram
+        Summary = self._summary_cls or _PromSummary
 
         self.labels = labels
         self.enable_lora = enable_lora
@@ -468,6 +525,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.fwd_occupancy = Gauge(
+            name="sglang:fwd_occupancy",
+            documentation="Forward pass GPU occupancy percentage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         # =================================================================
         # Scheduler policy
@@ -582,10 +645,14 @@ class SchedulerMetricsCollector:
             documentation="Histogram of queueing time in seconds.",
             labelnames=labels.keys(),
             buckets=[
-                0.0,
-                0.1,
-                0.2,
-                0.5,
+                0.000,
+                0.001,
+                0.005,
+                0.010,
+                0.050,
+                0.100,
+                0.200,
+                0.500,
                 1,
                 2,
                 3,
@@ -927,6 +994,65 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+    @classmethod
+    def init_new(
+        cls,
+        *,
+        server_args: "ServerArgs",
+        ps: Any,
+        tp_rank: int,
+        pp_rank: int,
+        dp_rank: Optional[int],
+        enable_priority_scheduling: bool,
+        enable_lora: bool,
+        enable_hierarchical_cache: bool,
+    ) -> "SchedulerMetricsCollectorContext":
+        enable_metrics = server_args.enable_metrics
+        is_stats_logging_rank = ps.attn_tp_rank == 0
+        current_scheduler_metrics_enabled = enable_metrics and (
+            is_stats_logging_rank or server_args.enable_metrics_for_all_schedulers
+        )
+        enable_kv_cache_events = bool(
+            server_args.kv_events_config
+            and ps.attn_tp_rank == 0
+            and ps.attn_cp_rank == 0
+        )
+        collector: Optional["SchedulerMetricsCollector"] = None
+        if enable_metrics:
+            engine_type = DisaggregationMode.to_engine_type(
+                server_args.disaggregation_mode
+            )
+            labels = {
+                "model_name": server_args.served_model_name,
+                "engine_type": engine_type,
+                "tp_rank": tp_rank,
+                "pp_rank": pp_rank,
+                "moe_ep_rank": ps.moe_ep_rank,
+            }
+            if enable_priority_scheduling:
+                labels["priority"] = ""
+            if dp_rank is not None:
+                labels["dp_rank"] = dp_rank
+            if server_args.extra_metric_labels:
+                labels.update(server_args.extra_metric_labels)
+            scheduler_collector_cls = resolve_collector_class(
+                server_args, STAT_LOGGER_ROLE_SCHEDULER, cls
+            )
+            collector = scheduler_collector_cls(
+                labels=labels,
+                enable_lora=enable_lora,
+                enable_hierarchical_cache=enable_hierarchical_cache,
+                enable_streaming_session=server_args.enable_streaming_session,
+                server_args=server_args,
+            )
+        return SchedulerMetricsCollectorContext(
+            enable_metrics=enable_metrics,
+            is_stats_logging_rank=is_stats_logging_rank,
+            current_scheduler_metrics_enabled=current_scheduler_metrics_enabled,
+            enable_kv_cache_events=enable_kv_cache_events,
+            collector=collector,
+        )
+
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
@@ -1147,6 +1273,7 @@ class SchedulerMetricsCollector:
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
+        self._log_gauge(self.fwd_occupancy, stats.fwd_occupancy)
 
         # Scheduler policy
         self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
@@ -1240,7 +1367,7 @@ class SchedulerMetricsCollector:
         )
 
 
-class TokenizerMetricsCollector:
+class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
         server_args: Optional[ServerArgs] = None,
@@ -1250,7 +1377,11 @@ class TokenizerMetricsCollector:
         bucket_e2e_request_latency: Optional[List[float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Histogram as _PromHistogram
+
+        Counter = self._counter_cls or _PromCounter
+        Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
 
@@ -1262,6 +1393,11 @@ class TokenizerMetricsCollector:
         self.generation_tokens_total = Counter(
             name="sglang:generation_tokens_total",
             documentation="Number of generation tokens processed.",
+            labelnames=labels.keys(),
+        )
+        self.spec_verify_calls_total = Counter(
+            name="sglang:spec_verify_calls_total",
+            documentation="Number of speculative decoding verification calls.",
             labelnames=labels.keys(),
         )
 
@@ -1310,6 +1446,14 @@ class TokenizerMetricsCollector:
                 server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
             ),
         )
+        self.uncached_prompt_tokens_histogram = Histogram(
+            name="sglang:uncached_prompt_tokens_histogram",
+            documentation="Histogram of uncached (compute) prompt token length.",
+            labelnames=labels.keys(),
+            buckets=generate_buckets(
+                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+            ),
+        )
         self.generation_tokens_histogram = Histogram(
             name="sglang:generation_tokens_histogram",
             documentation="Histogram of generation token length.",
@@ -1330,6 +1474,13 @@ class TokenizerMetricsCollector:
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
             labelnames=labels.keys(),
+        )
+
+        self.get_loads_duration_seconds = Histogram(
+            name="sglang:get_loads_duration_seconds",
+            documentation="Time spent serving /v1/loads requests (seconds).",
+            labelnames=labels.keys(),
+            buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
         )
 
         self.num_so_requests_total = Counter(
@@ -1449,9 +1600,12 @@ class TokenizerMetricsCollector:
         e2e_latency: float,
         has_grammar: bool,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
+        spec_verify_ct: int = 0,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+        if spec_verify_ct > 0:
+            self.spec_verify_calls_total.labels(**labels).inc(spec_verify_ct)
 
         # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:
@@ -1483,6 +1637,9 @@ class TokenizerMetricsCollector:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
+        self.uncached_prompt_tokens_histogram.labels(**labels).observe(
+            float(prompt_tokens - cached_tokens)
+        )
         self.generation_tokens_histogram.labels(**labels).observe(
             float(generation_tokens)
         )
@@ -1530,12 +1687,16 @@ class StorageMetrics:
     backup_bandwidth: List[float] = field(default_factory=list)
 
 
-class StorageMetricsCollector:
+class StorageMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
         labels: Dict[str, str],
     ):
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Histogram as _PromHistogram
+
+        Counter = self._counter_cls or _PromCounter
+        Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
 
@@ -1624,9 +1785,11 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_backup_bandwidth, v)
 
 
-class ExpertDispatchCollector:
+class ExpertDispatchCollector(_StatLoggerDIMixin):
     def __init__(self, ep_size: int) -> None:
-        from prometheus_client import Histogram
+        from prometheus_client import Histogram as _PromHistogram
+
+        Histogram = self._histogram_cls or _PromHistogram
 
         ep_size_buckets = [i for i in range(ep_size)]
         self.eplb_gpu_physical_count = Histogram(
@@ -1637,13 +1800,17 @@ class ExpertDispatchCollector:
         )
 
 
-class RadixCacheMetricsCollector:
+class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
         labels: Dict[str, str],
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Histogram as _PromHistogram
+
+        Counter = self._counter_cls or _PromCounter
+        Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
 

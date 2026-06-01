@@ -56,15 +56,19 @@ After local matching, for the parts not found in L1 or L2, the system queries L3
 
 After prefetching stops, the data already fetched is used together with the local data for the prefill computation.
 
-For **timeout** strategy, HiCache introduces two configuration parameters to support fine-grained control over prefetch timeout conditions:
+For **timeout** strategy, HiCache introduces three configuration parameters to support fine-grained control over prefetch timeout conditions:
 
-* `prefetch_timeout_base`: the base timeout, representing overhead unrelated to the number of tokens (e.g., scheduling and synchronization).
-* `prefetch_timeout_per_ki_token`: the incremental timeout per thousand tokens.
+* `prefetch_timeout_base`: the base timeout, representing overhead unrelated to the number of tokens (e.g., scheduling and synchronization). Default: `2` seconds.
+* `prefetch_timeout_per_ki_token`: the incremental timeout per thousand tokens. Default: `0.1` seconds per 1024 tokens.
+* `prefetch_timeout_max`: the upper bound applied to the linear timeout, preventing very long prompts from waiting unboundedly. Default: `30` seconds.
 
 The timeout is computed as:
 
 ```python Example
-timeout = prefetch_timeout_base + prefetch_timeout_per_ki_token * num_token_to_fetch / 1024
+timeout = min(
+    prefetch_timeout_max,
+    prefetch_timeout_base + prefetch_timeout_per_ki_token * num_token_to_fetch / 1024,
+)
 ```
 
 ### Data Write-back
@@ -158,6 +162,8 @@ Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM 
 - **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
 
 - **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution.
+
+- **`--lmcache-config-file`**: Path to the LMCache YAML configuration file.
 
 - **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: the extra config can be either
   - a JSON string containing extra configuration for the storage backend, e.g., `--hicache-storage-backend-extra-config '{"prefetch_threshold":512, "prefetch_timeout_base": 0.5, "prefetch_timeout_per_ki_token": 0.25}' `, or

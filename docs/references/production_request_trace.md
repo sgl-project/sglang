@@ -52,9 +52,14 @@ This section explains how to configure the request tracing and export the trace 
     0: disable tracing
     1: Trace important slices
     2: Trace all slices except nested ones
-    3: Trace all slices
+    3: Trace all slices (default)
     ```
-    The trace level can be dynamically set via HTTP API, for example:
+    **At startup** — set `SGLANG_TRACE_LEVEL` before launching the server:
+    ```bash
+    SGLANG_TRACE_LEVEL=2 python -m sglang.launch_server --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other options>
+    ```
+
+    **At runtime** — dynamically adjust via HTTP API without restarting:
     ```bash
     curl http://0.0.0.0:30000/set_trace_level?level=2
     ```
