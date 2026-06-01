@@ -33,9 +33,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.utils import (
-    is_nsa_enable_prefill_cp,
-    nsa_use_prefill_cp,
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -64,6 +64,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
+from sglang.srt.layers.utils.cp_utils import (
+    is_mla_prefill_cp_enabled,
+    mla_use_prefill_cp,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -202,7 +206,7 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
-        if is_nsa_enable_prefill_cp():
+        if is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled():
             return ScatterMode.SCATTERED
 
         return ScatterMode.TP_ATTN_FULL
@@ -256,15 +260,15 @@ class AttnTpContext:
         self.allow_input_scattered = False
         self.input_scattered_ = False
         self.attn_inputs_: Optional[AttentionInputs] = None
-        self.is_nsa = False
+        self.is_dsa = False
 
-    def init_context(self, q_lora_rank, is_nsa):
-        self.is_nsa = is_nsa
+    def init_context(self, q_lora_rank, is_dsa):
+        self.is_dsa = is_dsa
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
-            and not is_nsa
+            and not is_dsa
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
@@ -304,6 +308,9 @@ class AttnTpContext:
     def fetch_hidden_states(self):
         assert self.attn_inputs_ is not None
         return self.attn_inputs_.fetch_hidden_states()
+
+    def clear_attn_inputs(self) -> None:
+        self.attn_inputs_ = None
 
     @contextmanager
     def maybe_input_scattered(self, forward_batch: ForwardBatch):
@@ -376,8 +383,10 @@ class LayerScatterModes:
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
             ):
                 return ScatterMode.SCATTERED
-            # NSA CP doesn't support MOE_FULL yet; fall back to FULL
-            if is_enable_moe_cp_allgather() and not is_nsa_enable_prefill_cp():
+            # DSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
+            if is_enable_moe_cp_allgather() and not (
+                is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+            ):
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
         else:
@@ -548,10 +557,10 @@ class LayerCommunicator:
                         )
                     elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
-                        # When NSA is active, also preserve the unquantized bf16
-                        # output as a 3-tuple (fp8, scale, bf16) so the NSA
+                        # When DSA is active, also preserve the unquantized bf16
+                        # output as a 3-tuple (fp8, scale, bf16) so the DSA
                         # indexer can skip redundant FP8 dequantization.
-                        _nsa_needs_bf16 = get_attn_tp_context().is_nsa
+                        _dsa_needs_bf16 = get_attn_tp_context().is_dsa
                         hidden_states, _unq_bf16, _, _res = fused_rms_fp8_group_quant(
                             hidden_states,
                             self.input_layernorm.weight,
@@ -562,9 +571,9 @@ class LayerCommunicator:
                             group_size=128,
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
-                            output_unquantized_inp1=_nsa_needs_bf16,
+                            output_unquantized_inp1=_dsa_needs_bf16,
                         )
-                        if _nsa_needs_bf16:
+                        if _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
                                 hidden_states[1],
@@ -593,9 +602,9 @@ class LayerCommunicator:
                         )
                     elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
-                        # with residual addition. When NSA is active, pack
+                        # with residual addition. When DSA is active, pack
                         # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
-                        _nsa_needs_bf16 = get_attn_tp_context().is_nsa
+                        _dsa_needs_bf16 = get_attn_tp_context().is_dsa
                         hidden_states, _unq_bf16, _, residual = (
                             fused_rms_fp8_group_quant(
                                 hidden_states,
@@ -607,10 +616,10 @@ class LayerCommunicator:
                                 group_size=128,
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
-                                output_unquantized_inp1=_nsa_needs_bf16,
+                                output_unquantized_inp1=_dsa_needs_bf16,
                             )
                         )
-                        if _nsa_needs_bf16:
+                        if _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
                                 hidden_states[1],
@@ -706,7 +715,7 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
@@ -738,6 +747,11 @@ class LayerCommunicator:
             if hasattr(forward_batch, "input_ids")
             else 0
         )
+
+        # When mlp_mode is SCATTERED, the MLP runs on scattered data with no TP
+        # all-reduce, so there is nothing to fuse with the next layer.
+        if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+            return False
 
         return (
             (
@@ -929,6 +943,23 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 residual_input_mode=residual_input_mode,
             )
 
+        if (
+            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
+            and (hidden_states_output_mode == ScatterMode.TP_ATTN_FULL)
+            and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
+            and context.attn_tp_size > 1
+        ):
+            # Used when the dense MLP is tensor-parallelized along the
+            # attention TP group (``moe_dense_tp_size > 1``): hidden states
+            # need an all-reduce inside the attention TP group before the
+            # next layernorm, while staying in TP_ATTN_FULL on both sides.
+            return (
+                CommunicateWithAllReduceAndLayerNormFn._tp_attn_all_reduce_and_layernorm
+            )
+
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
         )
@@ -942,6 +973,25 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _tp_attn_all_reduce_and_layernorm(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+    ):
+        """All-reduce hidden states inside the attention TP group, then layernorm.
+
+        Used when the dense MLP shares the attention TP group
+        (``moe_dense_tp_size > 1``): both hidden states and residual stay in
+        ``TP_ATTN_FULL`` across the boundary.
+        """
+        hidden_states = get_attention_tp_group().all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
@@ -1301,8 +1351,12 @@ class CommunicateSummableTensorPairFn:
 
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
+            if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+                group = get_tp_group()
+            else:
+                group = get_attention_tp_group()
             hidden_states_output, global_hidden_states = (
-                get_local_dp_buffer(),
+                get_local_dp_buffer(group),
                 hidden_states,
             )
             dp_scatter(hidden_states_output, global_hidden_states, forward_batch)

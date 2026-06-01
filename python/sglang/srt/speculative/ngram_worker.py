@@ -267,13 +267,12 @@ class NGRAMWorker:
 
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
 
-        model_worker_batch = batch.get_model_worker_batch()
-        spec_info = model_worker_batch.spec_info
+        spec_info = batch.spec_info
         num_correct_drafts = 0
         accept_lens = None
         num_correct_drafts_per_req_cpu = None
 
-        if model_worker_batch.forward_mode.is_target_verify():
+        if batch.forward_mode.is_target_verify():
             if batch.has_grammar:
                 retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
                 retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
@@ -284,14 +283,14 @@ class NGRAMWorker:
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
             batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True
+                batch, is_verify=True
             )
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
 
-            verify_input: NgramVerifyInput = model_worker_batch.spec_info
+            verify_input: NgramVerifyInput = batch.spec_info
             vocab_mask = None
             if batch.has_grammar:
                 # Generate the logit mask for structured output.
@@ -349,9 +348,7 @@ class NGRAMWorker:
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch
-            )
+            batch_result = self.target_worker.forward_batch_generation(batch)
             logits_output, next_token_ids, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

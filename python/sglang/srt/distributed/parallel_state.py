@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/parallel_state.py
 
 # Copyright 2023 The vLLM team.
@@ -385,7 +387,10 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                CAClass = dispatch_custom_allreduce()
+                CAClass = dispatch_custom_allreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
                 self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,

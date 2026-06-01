@@ -46,7 +46,11 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
-from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_STORAGE,
+    StorageMetricsCollector,
+    resolve_collector_class,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -345,7 +349,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self,
         params: InitLoadBackParams,
     ):
-        last_node = params.last_host_node
+        last_node = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req
         if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):
@@ -932,6 +936,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                best_match_node=self.root_node,
                 host_hit_length=0,
             )
 
@@ -1048,13 +1053,9 @@ class HiMambaRadixCache(MambaRadixCache):
                     lock_node=mamba_node,
                     error_message="Can not alloc mamba cache",
                 )
-                src_index = mamba_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
-            else:
-                src_index = mamba_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+            req.mamba_cow_src_index = mamba_node.mamba_value
+            req.mamba_needs_clear = False
 
         value = value[:best_value_len]
         if value:
@@ -1066,6 +1067,8 @@ class HiMambaRadixCache(MambaRadixCache):
             device_indices=value,
             last_device_node=last_device_node,
             last_host_node=last_host_node,
+            # TODO(ispobock): use best_match_node as start node for load_back
+            best_match_node=last_host_node,
             host_hit_length=host_hit_length,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
@@ -1253,7 +1256,14 @@ class HiMambaRadixCache(MambaRadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            storage_metrics_collector = StorageMetricsCollector(labels=labels)
+            from sglang.srt.server_args import get_global_server_args
+
+            storage_cls = resolve_collector_class(
+                get_global_server_args(),
+                STAT_LOGGER_ROLE_STORAGE,
+                StorageMetricsCollector,
+            )
+            storage_metrics_collector = storage_cls(labels=labels)
 
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
