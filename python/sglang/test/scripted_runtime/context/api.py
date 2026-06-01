@@ -38,6 +38,15 @@ class ScriptedContext:
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._http_poster = http_poster
 
+        # Captured before any request runs, so the pools are fully free here. A
+        # successful flush_cache must restore both pools to these baselines; this
+        # sidesteps page-rounding / padding-slot conventions that make the raw
+        # pool `size` an unreliable "fully free" reference.
+        self._fully_free_kv_size = (
+            self._scheduler.token_to_kv_pool_allocator.available_size()
+        )
+        self._fully_free_req_slots = self._scheduler.req_to_token_pool.available_size()
+
         self._seen_rids: set[str] = set()
         self._req_starter = ScriptedContextReqStarter(self)
 

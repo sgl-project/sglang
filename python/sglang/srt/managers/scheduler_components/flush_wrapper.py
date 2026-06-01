@@ -20,9 +20,6 @@ class SchedulerFlushWrapper:
         self._is_fully_idle = is_fully_idle
         self._ipc_channels = ipc_channels
         self._pending: Optional[Tuple[FlushCacheReqInput, float]] = None
-        # Result of the most recently executed flush, exposed for observability
-        # (e.g. the scripted runtime asserts the flush actually succeeded).
-        self.last_success: Optional[bool] = None
 
     def handle(self, recv_req: FlushCacheReqInput) -> Optional[FlushCacheReqOutput]:
         if self._pending is not None:
@@ -32,15 +29,14 @@ class SchedulerFlushWrapper:
             )
 
         timeout_s = float(recv_req.timeout_s or 0.0)
-        if timeout_s <= 0.0 or self._is_fully_idle():
-            return self._run_flush()
+        if timeout_s <= 0.0:
+            return FlushCacheReqOutput(success=self._flush_cache())
+
+        if self._is_fully_idle():
+            return FlushCacheReqOutput(success=self._flush_cache())
 
         self._pending = (recv_req, time.monotonic() + timeout_s)
         return None
-
-    def _run_flush(self) -> FlushCacheReqOutput:
-        self.last_success = self._flush_cache()
-        return FlushCacheReqOutput(success=self.last_success)
 
     def check_pending(self) -> None:
         if self._pending is None:
@@ -49,9 +45,11 @@ class SchedulerFlushWrapper:
         pending_req, deadline = self._pending
 
         if self._is_fully_idle():
-            result = self._run_flush()
+            success = self._flush_cache()
             self._pending = None
-            self._ipc_channels.send_to_tokenizer.send_output(result, pending_req)
+            self._ipc_channels.send_to_tokenizer.send_output(
+                FlushCacheReqOutput(success=success), pending_req
+            )
             return
 
         if time.monotonic() >= deadline:
