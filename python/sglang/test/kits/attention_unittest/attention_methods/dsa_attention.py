@@ -1069,7 +1069,8 @@ def run_dsa_sparse_attention_case(
 # DSA exposes multiple kernel implementations selectable via
 # `--dsa-prefill-backend` and `--dsa-decode-backend`. Production picks one of:
 #
-#   `flashmla_sparse`, `flashmla_kv`, `fa3`, `tilelang`, `trtllm`, `aiter`
+#   `flashmla_sparse`, `flashmla_kv`, `flashinfer_sparse_mla`, `fa3`,
+#   `tilelang`, `trtllm`, `aiter`
 #
 # (`flashmla_auto` resolves to `flashmla_sparse` or `flashmla_kv` per the
 # `dsa_kv_cache_store_fp8` flag; see `set_dsa_prefill_impl`.) Each impl maps
@@ -1109,6 +1110,21 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
             return False, f"sgl_kernel.flash_mla unavailable: {exc}"
         if major < 9:
             return False, f"{impl} requires SM>=9.0, got SM{major}.x"
+        return True, ""
+
+    if impl == "flashinfer_sparse_mla":
+        try:
+            import flashinfer
+        except ImportError as exc:
+            return False, f"flashinfer unavailable: {exc}"
+        if not hasattr(flashinfer, "BatchSparseMLAPagedAttentionWrapper"):
+            return (
+                False,
+                "flashinfer_sparse_mla requires FlashInfer with "
+                "BatchSparseMLAPagedAttentionWrapper",
+            )
+        if major != 12:
+            return False, f"flashinfer_sparse_mla requires SM12.x, got SM{major}.x"
         return True, ""
 
     if impl == "fa3":

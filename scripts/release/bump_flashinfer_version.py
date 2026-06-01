@@ -20,7 +20,8 @@ def read_current_flashinfer_version(repo_root: Path) -> str:
     pyproject = repo_root / "python" / "pyproject.toml"
     content = pyproject.read_text()
     match = re.search(
-        r"flashinfer_python==(\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)", content
+        r"flashinfer_python(?:\[[^\]]+\])?==(\d+\.\d+\.\d+(?:rc\d+|\.post\d+)?)",
+        content,
     )
     if not match:
         raise ValueError(f"Could not find flashinfer_python version in {pyproject}")
@@ -39,11 +40,15 @@ def replace_flashinfer_version(
 
     name = file_path.name
     if name == "pyproject.toml":
-        new_content = new_content.replace(
-            f"flashinfer_python=={old_version}", f"flashinfer_python=={new_version}"
+        new_content = re.sub(
+            rf"(flashinfer_python(?:\[[^\]]+\])?==){re.escape(old_version)}",
+            rf"\g<1>{new_version}",
+            new_content,
         )
-        new_content = new_content.replace(
-            f"flashinfer_cubin=={old_version}", f"flashinfer_cubin=={new_version}"
+        new_content = re.sub(
+            rf"(flashinfer_cubin==){re.escape(old_version)}",
+            rf"\g<1>{new_version}",
+            new_content,
         )
     elif name == "Dockerfile":
         new_content = re.sub(

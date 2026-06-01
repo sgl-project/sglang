@@ -274,6 +274,7 @@ DSA_CHOICES = [
     "flashmla_sparse",
     "flashmla_kv",
     "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
     "aiter",
@@ -1740,7 +1741,12 @@ class ServerArgs:
             self.dsa_prefill_backend = "tilelang"
             self.dsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            if major >= 10:
+            if major == 12:
+                if not user_set_prefill:
+                    self.dsa_prefill_backend = "flashinfer_sparse_mla"
+                if not user_set_decode:
+                    self.dsa_decode_backend = "flashinfer_sparse_mla"
+            elif major >= 10:
                 if not user_set_prefill:
                     self.dsa_prefill_backend = "trtllm"
                 if not user_set_decode:
