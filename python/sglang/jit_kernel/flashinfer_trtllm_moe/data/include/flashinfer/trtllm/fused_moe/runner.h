@@ -206,7 +206,7 @@ class Runner {
                   batchedGemm::trtllm::gen::Dtype dtypeOutput, bool useDeepSeekFp8,
                   int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
                   batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling,
-                  bool usePerChannelScaling);
+                  bool usePerChannelScaling, bool forceUnfusedAct = false);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -395,6 +395,9 @@ struct MoEWorkspace {
   // Activation intermediate outputs:
   void* activation_output = nullptr;
   float* activation_output_scale = nullptr;
+  // Unfused FP4 LoRA: bf16 [max_padded_tokens, intermediate_size] activation output written by the
+  // standalone activation kernel (gate_up LoRA added pre-SwiGLU), then NvFP4-quantized for GEMM2.
+  void* activated_lora_bf16 = nullptr;
 
   // Gemm2 intermediate outputs:
   void* gemm2_output = nullptr;
@@ -425,7 +428,8 @@ class Runner {
          ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
          bool usePerTokenScalingGemm1 = false, bool usePerTokenScalingGemm2 = false,
-         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
+         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false,
+         bool unfuseActForLora = false);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
@@ -459,6 +463,10 @@ class Runner {
   bool mUsePerTokenScalingGemm2;
   bool mUsePerChannelScalingGemm1;
   bool mUsePerChannelScalingGemm2;
+  // When true (FP4 LoRA path), GEMM1 emits the raw gate_up projection (fusedAct=false) so the
+  // standalone activation kernel can inject the gate_up LoRA delta pre-SwiGLU and capture the
+  // post-activation input for the down LoRA — mirroring the DeepSeek-FP8 unfused activation.
+  bool mUnfuseActForLora;
   PermuteGemm1::Runner mPermuteGemm1;
   Gemm2::Runner mGemm2;
 

@@ -811,6 +811,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 # Re-export so existing import sites continue to resolve; the body was
 # moved to keep this file focused on the non-LoRA trtllm paths.
 from sglang.srt.lora.trtllm_moe.lora_dispatch import (  # noqa: E402,F401
+    fused_experts_none_to_sgl_flashinfer_trtllm_fp4_lora,
     fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora,
 )
 

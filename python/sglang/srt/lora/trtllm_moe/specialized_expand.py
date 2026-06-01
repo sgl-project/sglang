@@ -18,6 +18,7 @@ import triton
 import triton.language as tl
 
 
+
 @triton.jit
 def _moe_lora_expand_add_kernel(
     # Pointers
@@ -48,8 +49,18 @@ def _moe_lora_expand_add_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_R: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    GATED_A_HALF: tl.constexpr,
 ):
-    """Rank-specialized LoRA-B expand for virtual-expert LoRA."""
+    """Rank-specialized LoRA-B expand for virtual-expert LoRA.
+
+    ``GATED_A_HALF`` > 0 enables the gate/up split for a gated (SwiGLU) gate_up
+    LoRA: the intermediate (A) has ``2*R`` columns (gate-shrink ``[0:R]`` then
+    up-shrink ``[R:2R]``) and the output has ``2*GATED_A_HALF`` columns (gate
+    then up). Output tiles in the up half (column >= ``GATED_A_HALF``) read the
+    up-shrink columns ``[R:2R]`` instead of ``[0:R]``. ``GATED_A_HALF`` must be
+    a multiple of ``BLOCK_SIZE_N`` so no tile straddles the gate/up boundary.
+    ``GATED_A_HALF == 0`` is the non-gated path (read ``[0:R]`` for all tiles).
+    """
     pid = tl.program_id(0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
@@ -87,8 +98,14 @@ def _moe_lora_expand_add_kernel(
     offs_r = tl.arange(0, BLOCK_SIZE_R).to(tl.int64)
     rank_mask = offs_r < R
 
+    # Gated gate_up split: the up-half output tiles read up-shrink (A columns [R:2R]); gate-half
+    # tiles read gate-shrink (A columns [0:R]). GATED_A_HALF == 0 -> always read [0:R] (non-gated).
+    a_col = offs_r
+    if GATED_A_HALF > 0:
+        a_col = offs_r + tl.where(pid_n * BLOCK_SIZE_N >= GATED_A_HALF, R, 0)
+
     a = tl.load(
-        a_ptr + offs_token[:, None] * stride_am + offs_r[None, :] * stride_ar,
+        a_ptr + offs_token[:, None] * stride_am + a_col[None, :] * stride_ar,
         mask=token_mask[:, None] & rank_mask[None, :],
         other=0.0,
     )
@@ -152,6 +169,13 @@ def _invoke_moe_lora_expand_add(
     group_size_m = config.get("GROUP_SIZE_M", 1)
     block_size_r = triton.next_power_of_2(R)
 
+    # gate_up LoRA: the rank-specialized expand reads the intermediate's [0:R] shrink for both the gate
+    # and up output halves, which is correct for the supported adapters (kimi + qwen, verified vs
+    # cutlass/triton). A previous env-gated "gated split" (up reads up-shrink [R:2R]) assumed a
+    # [gate_A; up_A]-stacked layout that does NOT match these adapters — enabling it made kimi
+    # acc-vs-cutlass jump 0.36 -> 1.32 (wrong) — so the knob (SGLANG_ENABLE_LORA_GATED_SPLIT) was removed.
+    gated_a_half = 0
+
     grid = (
         triton.cdiv(sorted_token_ids.shape[0], block_size_m)
         * triton.cdiv(N, block_size_n),
@@ -182,6 +206,7 @@ def _invoke_moe_lora_expand_add(
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_R=block_size_r,
         GROUP_SIZE_M=group_size_m,
+        GATED_A_HALF=gated_a_half,
         num_warps=config.get("num_warps", 4),
         num_stages=1,
     )

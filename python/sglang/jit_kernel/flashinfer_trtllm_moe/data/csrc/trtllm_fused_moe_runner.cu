@@ -345,7 +345,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOutput, int32_t tileTokensDim,
     bool useDeepSeekFp8, ActivationType activationType, bool useShuffledMatrix,
     batchedGemm::gemm::MatrixLayout weightLayout, bool usePerTokenScaling,
-    bool usePerChannelScaling) {
+    bool usePerChannelScaling, bool forceUnfusedAct = false) {
   int64_t actTypeInt = static_cast<int64_t>(activationType);
   FLASHINFER_CHECK(
       0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
@@ -360,7 +360,8 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .dtypeC = dtypeOutput,
         .actType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
-        .fusedAct = !useDeepSeekFp8,
+        // FP4 LoRA forces unfused activation so the gate_up LoRA delta can be added pre-SwiGLU.
+        .fusedAct = !useDeepSeekFp8 && !forceUnfusedAct,
         .routeAct = true,
         .staticBatch = false,
         .transposeMmaOutput = true,
@@ -398,14 +399,15 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOutput,
                bool useDeepSeekFp8, int tileTokensDim, ActivationType activationType,
                bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
-               bool usePerTokenScaling, bool usePerChannelScaling)
+               bool usePerTokenScaling, bool usePerChannelScaling, bool forceUnfusedAct)
     : mDtypeAct(dtypeAct),
       mDtypeWeights(dtypeWeights),
       mDtypeOutput(dtypeOutput),
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(getOptions(
           mDtypeAct, mDtypeWeights, mDtypeOutput, mTileTokensDim, useDeepSeekFp8, activationType,
-          useShuffledMatrix, weightLayout, usePerTokenScaling, usePerChannelScaling))),
+          useShuffledMatrix, weightLayout, usePerTokenScaling, usePerChannelScaling,
+          forceUnfusedAct))),
       mActType(activationType) {}
 
 void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void* weightsScale,
@@ -569,15 +571,16 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
                int32_t tileTokensDim, ActivationType activationType, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout, bool usePerTokenScalingGemm1,
                bool usePerTokenScalingGemm2, bool usePerChannelScalingGemm1,
-               bool usePerChannelScalingGemm2)
+               bool usePerChannelScalingGemm2, bool unfuseActForLora)
     : mUsePerTokenScalingGemm1(usePerTokenScalingGemm1),
       mUsePerTokenScalingGemm2(usePerTokenScalingGemm2),
       mUsePerChannelScalingGemm1(usePerChannelScalingGemm1),
       mUsePerChannelScalingGemm2(usePerChannelScalingGemm2),
+      mUnfuseActForLora(unfuseActForLora),
       mPermuteGemm1(PermuteGemm1::Runner(
           dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
-          usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
+          usePerTokenScalingGemm1, usePerChannelScalingGemm1, unfuseActForLora)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
                            tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
                            usePerChannelScalingGemm2)) {

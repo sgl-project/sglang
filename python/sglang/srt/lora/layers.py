@@ -868,6 +868,23 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     rather than computed independently and added at the end.
     """
 
+    def __getattr__(self, name: str):
+        # Transparent-wrapper fallback: delegate any attribute not defined on this
+        # wrapper to the wrapped base ``FusedMoE`` so model code that treats
+        # ``experts`` as a plain FusedMoE works (e.g. DeepSeek-V2/V3 reads
+        # ``experts.moe_runner_config`` / ``.dispatcher``). The actual MoE compute
+        # still flows through this wrapper's ``forward``/``run`` (LoRA applied) —
+        # the model's standard paths call ``self.experts(...)``, not
+        # ``experts.run_moe_core`` directly (that is the DeepEP/TBO path).
+        # nn.Module.__getattr__ resolves registered params/buffers/submodules first.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            modules = self.__dict__.get("_modules")
+            if modules is not None and "base_layer" in modules:
+                return getattr(modules["base_layer"], name)
+            raise
+
     def __init__(
         self,
         base_layer: FusedMoE,
@@ -974,6 +991,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         moe_lora_info = batch_info.moe_lora_info
         assert moe_lora_info is not None
 
+        # Disable rank-0 (dummy/inactive) adapters so the virtual-experts kernel
+        # adds no delta for them — critical during cuda-graph capture where no
+        # real adapter is active (otherwise a garbage gate_up_delta corrupts the
+        # captured decode). In-place on the stable per-batch buffer (cuda-graph
+        # safe; idempotent across layers). Matches the NVFP4 GB200 cookbook fix.
+        rank_enabled = (lora_ranks > 0).to(
+            device=moe_lora_info.adapter_enabled.device,
+            dtype=moe_lora_info.adapter_enabled.dtype,
+        )
+        moe_lora_info.adapter_enabled.mul_(rank_enabled)
+
         # Single source of truth: lora_manager precomputes this per-batch from
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
@@ -989,7 +1017,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             adapter_enabled=moe_lora_info.adapter_enabled,
             token_lora_mapping=moe_lora_info.token_lora_mapping,
             max_lora_rank=max_lora_rank,
-            num_experts=self.base_layer.num_experts,
+            # Local (per-rank) expert count the LoRA buffers are indexed by — not
+            # the global num_experts — so virtual-experts indexing matches the
+            # buffers under EP. Matches the NVFP4 GB200 cookbook fix.
+            num_experts=(
+                self.down_lora_a_weights.shape[1]
+                if self.down_lora_a_weights is not None
+                else self.base_layer.num_local_experts
+            ),
             has_active_lora=has_active_lora,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,

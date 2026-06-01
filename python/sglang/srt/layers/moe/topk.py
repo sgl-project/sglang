@@ -1221,7 +1221,13 @@ def biased_grouped_topk_gpu(
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
             return kimi_k2_moe_fused_gate(
                 gating_output.to(dtype=torch.float32),
-                correction_bias,
+                # kimi_k2_moe_fused_gate requires input and bias to share a dtype;
+                # gating_output is upcast to fp32 above, so match the bias too.
+                (
+                    correction_bias.to(dtype=torch.float32)
+                    if correction_bias is not None
+                    else correction_bias
+                ),
                 topk=topk,
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,
