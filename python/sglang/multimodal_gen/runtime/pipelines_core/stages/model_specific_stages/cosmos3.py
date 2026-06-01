@@ -190,8 +190,16 @@ class Cosmos3TokenizationStage(PipelineStage):
 
         # Get parameters
         max_sequence_length = getattr(batch, "max_sequence_length", None) or 512
-        use_duration_template = getattr(batch, "use_duration_template", True)
-        use_system_prompt = getattr(batch, "use_system_prompt", False)
+        use_duration_template = getattr(batch, "use_duration_template", None)
+        if use_duration_template is None:
+            use_duration_template = getattr(
+                server_args.pipeline_config, "use_duration_template", True
+            )
+        use_system_prompt = getattr(batch, "use_system_prompt", None)
+        if use_system_prompt is None:
+            use_system_prompt = getattr(
+                server_args.pipeline_config, "use_system_prompt", False
+            )
         fps = batch.fps or 24.0
         num_frames = batch.num_frames
         is_image_gen = batch.data_type == DataType.IMAGE
@@ -349,16 +357,28 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
     def __init__(self, scheduler):
         super().__init__()
         self.scheduler = scheduler
+        self.default_flow_shift = getattr(
+            getattr(scheduler, "config", None), "flow_shift", None
+        )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
+        flow_shift = getattr(batch, "flow_shift", None)
+        if flow_shift is None:
+            flow_shift = server_args.pipeline_config.flow_shift
+        if flow_shift is None:
+            flow_shift = self.default_flow_shift
+        if flow_shift is not None and hasattr(self.scheduler, "set_shift"):
+            self.scheduler.set_shift(float(flow_shift))
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         batch.timesteps = self.scheduler.timesteps
 
-        self.log_info(f"Prepared {len(batch.timesteps)} timesteps")
+        self.log_info(
+            f"Prepared {len(batch.timesteps)} timesteps (flow_shift={flow_shift})"
+        )
         return batch
 
 
@@ -865,7 +885,7 @@ class Cosmos3DecodingStage(PipelineStage):
             output = self.video_processor.postprocess_video(decoded, output_type="np")
             self.log_info(f"Postprocessed video shape: {output.shape}")
 
-        if self._guardrails:
+        if self._guardrails and batch.use_guardrails is not False:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 check_video_safety,
             )
