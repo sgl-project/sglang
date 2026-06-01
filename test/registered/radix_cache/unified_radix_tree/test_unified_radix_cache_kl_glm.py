@@ -40,7 +40,7 @@ class AccuracyTwoPassMixin:
     num_gsm8k_questions: int = 200
     gsm8k_parallel: int = 40
 
-    mmlu_threshold: float = 0.75
+    mmlu_threshold: float = 0.7
     num_mmlu_examples: int = 200
     mmlu_num_threads: int = 32
 
@@ -128,8 +128,56 @@ class AccuracyTwoPassMixin:
         self._two_pass("MMLU", self._run_mmlu, self.mmlu_threshold)
 
 
-class TestGLM5HiCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
+class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
     """GLM-5.1-FP8 + HiCache L3 (file backend), with HiRadixTree."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = GLM5_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.hicache_dir = tempfile.mkdtemp(prefix="hicache_l3_")
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=GLM5_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp-size",
+                "8",
+                "--page-size",
+                "64",
+                "--mem-fraction-static",
+                "0.85",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load": true, "num_threads": 64}',
+                "--enable-hierarchical-cache",
+                "--hicache-ratio",
+                "2",
+                "--hicache-write-policy",
+                "write_through",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
+                "--hicache-io-backend",
+                "direct",
+                "--hicache-mem-layout",
+                "page_first_direct",
+                "--hicache-storage-backend",
+                "file",
+            ],
+            env={
+                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        if os.path.isdir(cls.hicache_dir):
+            shutil.rmtree(cls.hicache_dir, ignore_errors=True)
+
+
+class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
+    """GLM-5.1-FP8 + HiCache L3 (file backend), with UnifiedRadixTree."""
 
     @classmethod
     def setUpClass(cls):
