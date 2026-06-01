@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 __all__ = [
     "BaseTokenToKVPoolAllocator",
     "PagedTokenToKVPoolAllocator",
+    "DcpTokenToKVPoolAllocator",
     "TokenToKVPoolAllocator",
     "alloc_extend_naive",
 ]
