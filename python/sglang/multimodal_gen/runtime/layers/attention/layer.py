@@ -757,6 +757,7 @@ class USPAttention(nn.Module):
         v_prefix: torch.Tensor,
         k_suffix: torch.Tensor,
         v_suffix: torch.Tensor,
+        kv_prefix_head_sharded: bool = False,
     ) -> torch.Tensor:
         """attention with replicated K/V prefix supplied separately"""
         forward_context: ForwardContext = get_forward_context()
@@ -773,7 +774,13 @@ class USPAttention(nn.Module):
             return self(q, k, v)
 
         return self._forward_with_replicated_kv_prefix_split(
-            q, k_prefix, v_prefix, k_suffix, v_suffix, ctx_attn_metadata
+            q,
+            k_prefix,
+            v_prefix,
+            k_suffix,
+            v_suffix,
+            ctx_attn_metadata,
+            kv_prefix_head_sharded,
         )
 
     def _forward_with_replicated_kv_prefix(
@@ -812,6 +819,7 @@ class USPAttention(nn.Module):
         k_shard: torch.Tensor,
         v_shard: torch.Tensor,
         ctx_attn_metadata,
+        kv_prefix_head_sharded: bool = False,
     ) -> torch.Tensor:
         """split form avoids materializing full K/V before Ulysses all-to-all"""
         sp_rank = get_sp_parallel_rank()
@@ -820,11 +828,12 @@ class USPAttention(nn.Module):
         k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
         v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
-        h_kv_local = k_shard.shape[2]
-        h_start = sp_rank * h_kv_local
-        h_end = h_start + h_kv_local
-        k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
-        v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
+        if not kv_prefix_head_sharded:
+            h_kv_local = k_shard.shape[2]
+            h_start = sp_rank * h_kv_local
+            h_end = h_start + h_kv_local
+            k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
+            v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
 
         k = torch.cat([k_rep, k_shard], dim=1)
         v = torch.cat([v_rep, v_shard], dim=1)

@@ -526,13 +526,16 @@ class Cosmos3CrossAttention(nn.Module):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        kv_prefix_head_sharded: bool = False,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
         Args:
             hidden_states: [B, S_gen_local, hidden_size] visual tokens (may be sharded)
-            k_und: [B, S_und, H_kv, D] pre-computed UND keys (always full/replicated)
-            v_und: [B, S_und, H_kv, D] pre-computed UND values (always full/replicated)
+            k_und: [B, S_und, H_kv, D] pre-computed UND keys
+                (full/replicated unless ``kv_prefix_head_sharded`` is true)
+            v_und: [B, S_und, H_kv, D] pre-computed UND values
+                (full/replicated unless ``kv_prefix_head_sharded`` is true)
             freqs_cos: [B, S_gen_local, 1, D] cosine part of RoPE (for local shard)
             freqs_sin: [B, S_gen_local, 1, D] sine part of RoPE (for local shard)
         """
@@ -566,7 +569,14 @@ class Cosmos3CrossAttention(nn.Module):
         # K/V = [text (replicated full on every SP rank) | image (sharded same as Q)].
         # USPAttention routes through the registered attention backend (FA, sage,
         # …) and handles the Ulysses all-to-all when SP > 1.
-        out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
+        out = self.attn.forward_with_replicated_kv_prefix(
+            q,
+            k_und,
+            v_und,
+            k,
+            v,
+            kv_prefix_head_sharded=kv_prefix_head_sharded,
+        )
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
@@ -686,6 +696,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
         residual: torch.Tensor | None = None,
+        kv_prefix_head_sharded: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
         # collapses the residual add and RMSNorm into one kernel. The
@@ -698,7 +709,12 @@ class Cosmos3GenDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.cross_attention(
-            hidden_states, k_und, v_und, freqs_cos, freqs_sin
+            hidden_states,
+            k_und,
+            v_und,
+            freqs_cos,
+            freqs_sin,
+            kv_prefix_head_sharded=kv_prefix_head_sharded,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -918,6 +934,9 @@ class Cosmos3OmniTransformer(CachableDiT):
         # This allows maintaining separate caches for conditional and unconditional
         # prompts, avoiding recomputation on every denoising step
         self.cached_kv: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        self.cached_kv_head_sharded: dict[
+            str, list[tuple[torch.Tensor, torch.Tensor]]
+        ] = {}
         self.cached_freqs_gen: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.__post_init__()
@@ -1029,11 +1048,14 @@ class Cosmos3OmniTransformer(CachableDiT):
         if cache_key is None:
             # Reset all caches
             self.cached_kv = {}
+            self.cached_kv_head_sharded = {}
             self.cached_freqs_gen = {}
         else:
             # Reset specific cache
             if cache_key in self.cached_kv:
                 del self.cached_kv[cache_key]
+            if cache_key in self.cached_kv_head_sharded:
+                del self.cached_kv_head_sharded[cache_key]
             if cache_key in self.cached_freqs_gen:
                 del self.cached_freqs_gen[cache_key]
 
@@ -1041,8 +1063,32 @@ class Cosmos3OmniTransformer(CachableDiT):
         """Ensure cache dictionaries exist (for backwards compatibility)."""
         if not isinstance(self.cached_kv, dict):
             self.cached_kv = {}
+        if not isinstance(self.cached_kv_head_sharded, dict):
+            self.cached_kv_head_sharded = {}
         if not isinstance(self.cached_freqs_gen, dict):
             self.cached_freqs_gen = {}
+
+    def _can_use_head_sharded_kv_cache(self) -> bool:
+        return (
+            self.sp_group is not None
+            and self.sp_group.ulysses_world_size > 1
+            and self.sp_group.ring_world_size == 1
+            and self.num_key_value_heads % self.sp_group.ulysses_world_size == 0
+        )
+
+    def _build_head_sharded_kv_cache(
+        self, cached_kv: list[tuple[torch.Tensor, torch.Tensor]]
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        h_kv_local = self.num_key_value_heads // self.sp_group.ulysses_world_size
+        h_start = self.sp_rank * h_kv_local
+        h_end = h_start + h_kv_local
+        return [
+            (
+                k[:, :, h_start:h_end, :].contiguous(),
+                v[:, :, h_start:h_end, :].contiguous(),
+            )
+            for k, v in cached_kv
+        ]
 
     def forward(
         self,
@@ -1163,6 +1209,10 @@ class Cosmos3OmniTransformer(CachableDiT):
             self.cached_kv[cache_key] = self.language_model(
                 text_ids, text_mask, freqs_und[0], freqs_und[1]
             )
+            if self._can_use_head_sharded_kv_cache():
+                self.cached_kv_head_sharded[cache_key] = (
+                    self._build_head_sharded_kv_cache(self.cached_kv[cache_key])
+                )
             self.cached_freqs_gen[cache_key] = freqs_gen
 
         freqs_gen = self.cached_freqs_gen[cache_key]
@@ -1185,7 +1235,11 @@ class Cosmos3OmniTransformer(CachableDiT):
         # Run GEN layers. `residual` is threaded so each layer's
         # input_layernorm and post_attention_layernorm can use the
         # fused add+rmsnorm path instead of separate add + norm kernels.
-        cached_kv_for_key = self.cached_kv[cache_key]
+        kv_prefix_head_sharded = cache_key in self.cached_kv_head_sharded
+        if kv_prefix_head_sharded:
+            cached_kv_for_key = self.cached_kv_head_sharded[cache_key]
+        else:
+            cached_kv_for_key = self.cached_kv[cache_key]
         residual: torch.Tensor | None = None
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
@@ -1196,6 +1250,7 @@ class Cosmos3OmniTransformer(CachableDiT):
                 cos_gen,
                 sin_gen,
                 residual=residual,
+                kv_prefix_head_sharded=kv_prefix_head_sharded,
             )
 
         # Collapse the trailing residual carry. RMSNorm and the linear
