@@ -4,6 +4,7 @@ https://github.com/vllm-project/vllm/blob/020f58abcdea65302225663130d08fd8f4dd75
 """
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility functions used for tests and benchmarks"""
 
 from typing import Optional

@@ -11,11 +11,12 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import scattered_to_tp_attn_full
-from sglang.srt.layers.attention.nsa.utils import (
-    nsa_use_prefill_cp,
+from sglang.srt.layers.attention.dsa.dsa_indexer import scattered_to_tp_attn_full
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -43,9 +44,9 @@ def forward_mha_prepare_npu(
             )
         )
 
-        # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+        # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
-        if m.use_nsa:
+        if m.use_dsa:
             q_lora = m.q_a_layernorm(q)
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
             _ = m.indexer(
@@ -88,9 +89,7 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-            m.layer_id
-        )
+        ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
         _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
@@ -115,7 +114,7 @@ def forward_mha_prepare_npu(
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         # this is for model kimi-vl-a3B-instruct
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        get_token_to_kv_pool().set_kv_buffer(
             m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
         )
 
@@ -206,7 +205,7 @@ def forward_mla_prepare_npu(
             k_nope = m.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
-            if m.use_nsa:
+            if m.use_dsa:
                 q_lora = q
 
             k_nope = k_nope.unsqueeze(1)
@@ -226,7 +225,7 @@ def forward_mla_prepare_npu(
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -359,7 +358,7 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535 and not nsa_use_prefill_cp(
+            if fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
                 forward_batch
             ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
@@ -398,7 +397,7 @@ def forward_dsa_prepare_npu(
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe

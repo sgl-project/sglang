@@ -22,13 +22,18 @@ from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 
-register_cuda_ci(est_time=847, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=847, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestEAGLEServerBasic(EagleServerBase):
     """Core tests that run on every server config variant."""
 
     extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            super().setUpClass()
 
     # FIXME(lsyin): move the test methods to kits
     def test_request_abort(self):
@@ -176,7 +181,6 @@ class TestEAGLEServerAdditional(TestEAGLEServerBasic):
                     "return_logprob": return_logprob,
                     "return_text_in_logprobs": True,
                     "logprob_start_len": logprob_start_len,
-                    "temp_scaled_logprobs": True,
                 },
             )
             return response.json()

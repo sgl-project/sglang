@@ -60,6 +60,13 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         use_thumbnail: bool = True,
         **kwargs,
     ):
+        # Round-trip: `to_dict()` emits `raw_vision_config` (V2's storage
+        # name) but `from_dict()` rebuilds via this `vision_config` kwarg.
+        # Without this alias, the V3->V2 alias rebuild in `get_config` loses
+        # the vision config across the round-trip.
+        if vision_config is None:
+            vision_config = kwargs.pop("raw_vision_config", None)
+
         super().__init__(**kwargs)
 
         # Handle both cases: when loading from JSON (llm_config is dict) and when called internally by transformers (llm_config; vision_config are None)
@@ -150,3 +157,12 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             video_maintain_aspect_ratio=self.video_maintain_aspect_ratio,
         )
         return radio_config
+
+
+class NemotronH_Nano_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
+    model_type = "NemotronH_Nano_Omni_Reasoning_V3"
+
+    def __init__(self, *args, **kwargs):
+        # Explicit __init__ prevents PretrainedConfig.__init_subclass__ from
+        # replacing the parent's custom __init__ with a dataclass-generated one.
+        super().__init__(*args, **kwargs)

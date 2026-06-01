@@ -69,6 +69,9 @@ if _is_npu:
     from sgl_kernel_npu.fla.utils import (
         fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
     )
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+        split_qkvgate_gemma_rmsnorm_rope,
+    )
 
     fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
 
@@ -106,6 +109,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
         self.activation = config.hidden_act
+        self.output_gate_type = config.output_gate_type
         self.layer_norm_epsilon = config.rms_norm_eps
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -186,12 +190,21 @@ class Qwen3GatedDeltaNet(nn.Module):
                 norm_before_gate=True,
                 device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
+                **(
+                    {"activation": self.output_gate_type}
+                    if self.output_gate_type is not None
+                    else {}
+                ),
             )
             if not get_global_server_args().disable_piecewise_cuda_graph
             else FusedRMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
-                activation=self.activation,
+                activation=(
+                    self.output_gate_type
+                    if self.output_gate_type is not None
+                    else self.activation
+                ),
                 device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
             )
@@ -445,6 +458,48 @@ class Qwen3GatedDeltaNet(nn.Module):
         return output
 
 
+def _apply_qwen3_next_mlp(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    hidden_states, residual = layer.layer_communicator.prepare_mlp(
+        hidden_states, residual, forward_batch
+    )
+    use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
+        forward_batch
+    )
+    should_allreduce_fusion = (
+        layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            forward_batch
+        )
+    )
+
+    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        hidden_states = layer.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        )
+    else:
+        hidden_states = layer.mlp(
+            hidden_states,
+            should_allreduce_fusion=should_allreduce_fusion,
+            use_reduce_scatter=use_reduce_scatter,
+        )
+
+    if should_allreduce_fusion:
+        hidden_states._sglang_needs_allreduce_fusion = True
+    else:
+        hidden_states, residual = layer.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+    return hidden_states, residual
+
+
 class Qwen3HybridLinearDecoderLayer(nn.Module):
 
     def __init__(
@@ -527,18 +582,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
             )
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = _apply_qwen3_next_mlp(
+            self, hidden_states, residual, forward_batch
         )
 
         return hidden_states, residual
@@ -709,14 +754,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def self_attention(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
-
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -728,10 +767,54 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
 
         q, k = self._apply_qk_norm(q, k)
-
         q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        qkv, _ = self.qkv_proj(hidden_states)
+        # Calculate first full attention layer ID based on config
+        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+            self.rotary_emb.get_cos_sin_with_position(positions)
+
+        q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            int(self.head_dim * self.partial_rotary_factor),
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+        )
+        return q, k, v, gate
+
+    def self_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Full attention forward pass."""
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.attn_output_gate
+        ):
+            q, k, v, gate = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            q, k, v, gate = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -767,17 +850,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = _apply_qwen3_next_mlp(
+            self, hidden_states, residual, forward_batch
         )
 
         return hidden_states, residual
