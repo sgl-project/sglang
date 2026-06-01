@@ -190,55 +190,51 @@ class TestKVPressureBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
         t.continue_generation()
-        for _ in range(2000):
-            if r.finished:
-                break
-            yield
+        # Force real forward progress past the retract point: the resumed req must
+        # re-chunk and run a strictly later chunk than it had before the retract,
+        # not merely fail to regress (which a finished-or-aborted req satisfies
+        # vacuously). Only then do we drive it to completion.
+        yield from run_until(
+            r,
+            lambda h: h.chunks_done > chunks_before_retract,
+            max_steps=2000,
+        )
+        yield from run_until_finished(r, max_steps=2000)
         assert r.finished
         assert r.kv_pages == 0
-        assert r.chunks_done >= chunks_before_retract, (
-            f"chunks_done regressed across retract+resume: "
-            f"before={chunks_before_retract}, final={r.chunks_done}"
-        )
         final = t.engine_stats()["kv_pool_free"]
         assert final >= baseline, (
             f"KV pool failed to recover after retract+resume: "
             f"baseline={baseline}, final={final}"
         )
 
-    def test_cumulative_alloc_does_not_grow_unbounded(self):
+    def test_chunked_batch_recovers_pools_to_steady_state(self):
         self.server.execute_script(
-            self._script_cumulative_alloc_does_not_grow_unbounded
+            self._script_chunked_batch_recovers_pools_to_steady_state
         )
 
     @staticmethod
-    def _script_cumulative_alloc_does_not_grow_unbounded(t: ScriptedContext):
-        baseline = t.engine_stats()["kv_pool_free"]
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(50)]
-        yield from run_until_all_finished(reqs)
+    def _script_chunked_batch_recovers_pools_to_steady_state(t: ScriptedContext):
+        before = t.engine_stats()
+        # prompt_len must exceed chunk_size so each req actually walks the chunked
+        # prefill path; prompt_len=16 (< chunk size) never chunks.
+        reqs = [
+            t.start_req(prompt_len=DEFAULT_CHUNK_SIZE + 1, max_new_tokens=2)
+            for _ in range(50)
+        ]
+        yield from run_until_all_finished(reqs, max_steps=2000)
         for r in reqs:
             assert r.finished
-            # Dropped a vacuous `cumulative_kv_alloc_bytes >= 0` probe: it was
-            # always true and the only real invariant here (no KV leak) is already
-            # covered by the per-req kv_pages == 0 check and the kv_pool_free >=
-            # baseline assertion below.
             assert r.kv_pages == 0, f"req {r.rid} kept {r.kv_pages} pages after finish"
-        final = t.engine_stats()["kv_pool_free"]
-        assert (
-            final >= baseline
-        ), f"50-req batch leaked KV: baseline={baseline}, final={final}"
-
-    def test_engine_stats_pool_invariant(self):
-        self.server.execute_script(self._script_engine_stats_pool_invariant)
-
-    @staticmethod
-    def _script_engine_stats_pool_invariant(t: ScriptedContext):
-        before = t.engine_stats()
-        reqs = [t.start_req(prompt_len=16, max_new_tokens=2) for _ in range(10)]
-        yield from run_until_all_finished(reqs)
         after = t.engine_stats()
-        assert after["kv_pool_free"] >= before["kv_pool_free"]
-        assert after["row_pool_free"] >= before["row_pool_free"]
+        assert after["kv_pool_free"] >= before["kv_pool_free"], (
+            f"50 chunked reqs leaked KV: baseline={before['kv_pool_free']}, "
+            f"final={after['kv_pool_free']}"
+        )
+        assert after["req_pool_free"] >= before["req_pool_free"], (
+            f"50 chunked reqs leaked req-pool rows: "
+            f"baseline={before['req_pool_free']}, final={after['req_pool_free']}"
+        )
 
     def test_kv_pressure_with_radix_evict(self):
         self.server.execute_script(self._script_kv_pressure_with_radix_evict)
@@ -269,28 +265,6 @@ class TestKVPressureBasic(ScriptedTestCase):
         assert final >= baseline, (
             f"KV did not recover after evict + re-chunk: baseline={baseline}, "
             f"final={final}"
-        )
-
-    def test_chunked_retract_resume_kv_recovers_exactly(self):
-        self.server.execute_script(
-            self._script_chunked_retract_resume_kv_recovers_exactly
-        )
-
-    @staticmethod
-    def _script_chunked_retract_resume_kv_recovers_exactly(t: ScriptedContext):
-        baseline = t.engine_stats()["kv_pool_free"]
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.pause_generation(mode="retract")
-        yield
-        t.continue_generation()
-        yield from run_until_finished(r, max_steps=2000)
-        assert r.finished
-        assert r.kv_pages == 0
-        final = t.engine_stats()["kv_pool_free"]
-        assert final >= baseline, (
-            f"kv_pool_free did not recover after chunked retract+resume: "
-            f"baseline={baseline}, final={final}"
         )
 
     def test_chunked_retract_at_chunk_first_mid_last(self):
@@ -404,7 +378,7 @@ class TestKVPressurePriority(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.is_chunking)
 
         r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority="high"
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, priority=10
         )
         for _ in range(DEFAULT_MAX_STEPS * 4):
             assert not (r1.is_chunking and r2.is_chunking), (
