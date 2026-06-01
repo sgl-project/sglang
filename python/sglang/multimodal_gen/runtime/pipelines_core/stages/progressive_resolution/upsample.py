@@ -12,7 +12,6 @@ tensor (..., 2H, 2W).  The rewind variant also returns t_eff.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.spectral_ops import (
     dct_2d,
