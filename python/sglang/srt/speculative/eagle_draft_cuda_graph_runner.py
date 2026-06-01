@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -27,16 +28,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.spec_utils import (
-    maybe_detect_nan,
-    maybe_detect_oob,
-)
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -49,6 +47,8 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
+    rids_int: Optional[torch.Tensor]
+    bootstrap_room_ids_int: Optional[torch.Tensor]
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
@@ -127,6 +127,16 @@ class EAGLEDraftCudaGraphRunner:
             )
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
+            rids_int = (
+                torch.zeros((self.max_bs,), dtype=torch.int64)
+                if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
+                else None
+            )
+            bootstrap_room_ids_int = (
+                torch.full((self.max_bs,), -1, dtype=torch.int64)
+                if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
+                else None
+            )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
@@ -167,6 +177,8 @@ class EAGLEDraftCudaGraphRunner:
             out_cache_loc=out_cache_loc,
             positions=positions,
             mrope_positions=mrope_positions,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens=extend_seq_lens,
@@ -262,6 +274,12 @@ class EAGLEDraftCudaGraphRunner:
         out_cache_loc = buffers.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        rids_int = buffers.rids_int[:num_seqs] if buffers.rids_int is not None else None
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:num_seqs]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
         hidden_states = (
             buffers.hidden_states[:num_seqs]
             if buffers.hidden_states is not None
@@ -344,6 +362,8 @@ class EAGLEDraftCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
@@ -415,6 +435,10 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
+            if buffers.rids_int is not None:
+                buffers.rids_int.zero_()
+            if buffers.bootstrap_room_ids_int is not None:
+                buffers.bootstrap_room_ids_int.fill_(-1)
             buffers.topk_p.zero_()
             buffers.topk_index.zero_()
             if buffers.hidden_states is not None:
@@ -429,6 +453,15 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.out_cache_loc
         )
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+        if buffers.rids_int is not None and forward_batch.rids_int is not None:
+            buffers.rids_int[:raw_bs].copy_(forward_batch.rids_int)
+        if (
+            buffers.bootstrap_room_ids_int is not None
+            and forward_batch.bootstrap_room_ids_int is not None
+        ):
+            buffers.bootstrap_room_ids_int[:raw_bs].copy_(
+                forward_batch.bootstrap_room_ids_int
+            )
         maybe_detect_nan(
             forward_batch.spec_info.topk_p,
             "EagleDraftCudaGraphRunner.replay: topk_p",
@@ -460,6 +493,15 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
             forward_batch.positions = buffers.positions[:num_tokens]
+            if buffers.rids_int is not None and forward_batch.rids_int is not None:
+                forward_batch.rids_int = buffers.rids_int[:bs]
+            if (
+                buffers.bootstrap_room_ids_int is not None
+                and forward_batch.bootstrap_room_ids_int is not None
+            ):
+                forward_batch.bootstrap_room_ids_int = buffers.bootstrap_room_ids_int[
+                    :bs
+                ]
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
@@ -484,6 +526,15 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.positions = buffers.positions[:raw_num_token]
             forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
+            if buffers.rids_int is not None and forward_batch.rids_int is not None:
+                forward_batch.rids_int = buffers.rids_int[:raw_bs]
+            if (
+                buffers.bootstrap_room_ids_int is not None
+                and forward_batch.bootstrap_room_ids_int is not None
+            ):
+                forward_batch.bootstrap_room_ids_int = buffers.bootstrap_room_ids_int[
+                    :raw_bs
+                ]
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
 
