@@ -33,6 +33,7 @@ export const DeepSeekV4Deployment = () => {
         { id: "gb300", label: "GB300", default: false },
         { id: "h200",  label: "H200",  default: false },
         { id: "h100",  label: "H100",  default: false },
+        { id: "sm120", label: "RTX PRO 6000 (SM120)", default: false },
       ],
     },
     modelSize: {
@@ -124,7 +125,7 @@ export const DeepSeekV4Deployment = () => {
   // low-latency / balanced / cp recipes, and on PD-Disagg (the cookbook's
   // PD command builder doesn't emit the megamoe backend / env vars yet).
   const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "balanced", "cp", "pd-disagg"]);
-  const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200"]);
+  const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200", "sm120"]);
   const isMegamoeUnsupported = (vals) =>
     MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
     MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe);
@@ -181,6 +182,23 @@ export const DeepSeekV4Deployment = () => {
       return option.items.map((it) =>
         it.id === "fp8"
           ? { ...it, disabled: true, disabledReason: "SGLang FP8 is only available on H100 / H200" }
+          : it
+      );
+    }
+    // SM120: Flash only (Pro doesn't fit in 8× 96 GB).
+    if (option.name === "modelSize" && vals && vals.hardware === "sm120") {
+      return option.items.map((it) =>
+        it.id === "big"
+          ? { ...it, disabled: true, disabledReason: "V4-Pro does not fit on SM120 (8× 96 GB)" }
+          : it
+      );
+    }
+    // SM120: TP-only, no EP / CP / PD-Disagg.
+    if (option.name === "recipe" && vals && vals.hardware === "sm120") {
+      const sm120Unsupported = new Set(["balanced", "max-throughput", "cp", "pd-disagg"]);
+      return option.items.map((it) =>
+        sm120Unsupported.has(it.id)
+          ? { ...it, disabled: true, disabledReason: "SM120 supports low-latency (TP-only) recipe" }
           : it
       );
     }
@@ -342,6 +360,9 @@ export const DeepSeekV4Deployment = () => {
     // the generator. TP=8 single-node uses the same sgl-project FP8 ckpt as
     // H200; the Flash/balanced/max-throughput recipes use TP=8 DP=8 + DeepEP.
     "h100-fp8|small": { slug: "sgl-project/DeepSeek-V4-Flash-FP8", tp: 8, multinode: false },
+    // SM120 (RTX PRO 6000): Flash only, TP=4 single-node. Uses Marlin MoE runner
+    // with SM120 Triton fallback kernels. Requires lmsysorg/sglang:dev-cu13.
+    "sm120|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4, multinode: false },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
@@ -412,6 +433,7 @@ export const DeepSeekV4Deployment = () => {
     "h100-fp8|small|low-latency",
     "h100-fp8|small|balanced",
     "h100-fp8|small|max-throughput",
+    "sm120|small|low-latency",
   ]);
   // Recipes whose command is intentionally not yet provided (e.g. blocked by an
   // upstream limitation). Showing a minimal placeholder is friendlier to users
@@ -473,6 +495,30 @@ export const DeepSeekV4Deployment = () => {
 
     if (recipe === "pd-disagg") {
       return buildPDDisaggCommand(hardware, modelSize);
+    }
+
+    // SM120 (RTX PRO 6000) path: Flash only, TP=4, Marlin MoE w/ SM120 Triton
+    // fallback. Requires Docker image lmsysorg/sglang:dev-cu13 (CUDA 13).
+    if (hardware === "sm120") {
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      const sm120Flags = [
+        "  --trust-remote-code",
+        `  --model-path ${slug}`,
+        `  --tp ${tp}`,
+        "  --moe-runner-backend marlin",
+        "  --mem-fraction-static 0.70",
+        "  --cuda-graph-max-bs 32",
+      ];
+      if (toolcall === "enabled") sm120Flags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") sm120Flags.push("  --reasoning-parser deepseek-v4");
+      sm120Flags.push("  --host 0.0.0.0");
+      sm120Flags.push("  --port 30000");
+
+      const sm120Note = "# SM120: use Docker image lmsysorg/sglang:dev-cu13\n";
+      const sm120Cmd = `${sm120Note}sglang serve \\\n${sm120Flags.join(" \\\n")}`;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? sm120Cmd
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(sm120Cmd)}`;
     }
 
     // H200 (FP4) path: dedicated branch — Hopper runs the FP4-mixed Instruct
