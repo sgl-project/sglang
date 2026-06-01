@@ -21,8 +21,8 @@ into two regimes:
   * Prefill (large M): BLOCK_SIZE_K is pinned (bk=256). We tune BLOCK_SIZE_M,
                        num_warps, num_stages and SPLIT_K.
 
-BLOCK_SIZE_N is always the rank (N) and BLOCK_SIZE_K always 256, so neither is
-tuned or stored; GROUP_SIZE_M is pinned to 1.
+BLOCK_SIZE_N is always the rank (N), BLOCK_SIZE_K always 256, and GROUP_SIZE_M
+always 1, so none of them is tuned or stored (the runtime derives/pins them).
 
 Config files are written to
     python/sglang/srt/lora/triton_ops/moe_shrink_configs/triton_<ver>/
@@ -254,7 +254,7 @@ def benchmark_config(
     # (a power of two) and K is pinned to 256, matching the runtime launcher.
     block_size_n = triton.next_power_of_2(N)
     block_size_k = BLOCK_SIZE_K
-    group_size_m = config["GROUP_SIZE_M"]
+    group_size_m = GROUP_SIZE_M  # always 1; not tuned or stored
     split_k = config["SPLIT_K"]
 
     base_grid = triton.cdiv(sorted_token_ids.shape[0], block_size_m) * triton.cdiv(
@@ -353,12 +353,12 @@ def get_search_space(
                     ):
                         dropped += 1
                         continue
-                    # BLOCK_SIZE_N (=rank) and BLOCK_SIZE_K (=256) are derived by
-                    # the runtime, so they are intentionally not stored.
+                    # BLOCK_SIZE_N (=rank), BLOCK_SIZE_K (=256) and GROUP_SIZE_M
+                    # (=1) are derived/pinned by the runtime, so they are
+                    # intentionally not stored.
                     configs.append(
                         {
                             "BLOCK_SIZE_M": bm,
-                            "GROUP_SIZE_M": GROUP_SIZE_M,
                             "num_warps": num_warps,
                             "num_stages": num_stages,
                             "SPLIT_K": split_k,
@@ -377,7 +377,6 @@ def sort_config(config: Dict[str, Any]) -> Dict[str, Any]:
     ordered = {}
     for key in [
         "BLOCK_SIZE_M",
-        "GROUP_SIZE_M",
         "num_warps",
         "num_stages",
         "SPLIT_K",

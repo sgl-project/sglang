@@ -25,9 +25,9 @@ Each config file is split into two regimes, keyed by token count `M`:
 | **Decode** (small `M`) | `BLOCK_SIZE_M=16`, `BLOCK_SIZE_K=256` | `num_warps`, `num_stages`, `SPLIT_K` |
 | **Prefill** (large `M`) | `BLOCK_SIZE_K=256` | `BLOCK_SIZE_M`, `num_warps`, `num_stages`, `SPLIT_K` |
 
-`BLOCK_SIZE_N` is always the rank `N` and `BLOCK_SIZE_K` is always `256`, so
-neither is tuned or stored in the config — the runtime derives both. `GROUP_SIZE_M`
-is pinned to `1` (the shrink output is at most 64 wide, nothing to group along N).
+`BLOCK_SIZE_N` is always the rank `N`, `BLOCK_SIZE_K` is always `256`, and
+`GROUP_SIZE_M` is always `1` (the shrink output is at most 64 wide, nothing to
+group along N), so none of them is tuned or stored — the runtime derives/pins them.
 
 Search axes: `num_warps ∈ {2,4}`, `num_stages ∈ {1,2,3,4}`, `SPLIT_K ∈
 {1,2,3,4,5,6,7,8}` (clamped to `K // BLOCK_SIZE_K`), and for prefill
@@ -91,13 +91,13 @@ Each file is a JSON object keyed by token count `M`:
 
 ```json
 {
-    "16":  {"BLOCK_SIZE_M": 16, "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 3, "SPLIT_K": 4},
-    "512": {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 4, "SPLIT_K": 2}
+    "16":  {"BLOCK_SIZE_M": 16, "num_warps": 2, "num_stages": 3, "SPLIT_K": 4},
+    "512": {"BLOCK_SIZE_M": 64, "num_warps": 4, "num_stages": 4, "SPLIT_K": 2}
 }
 ```
 
-`BLOCK_SIZE_N` (= rank `N`) and `BLOCK_SIZE_K` (= 256) are derived by the runtime
-and intentionally omitted from the file.
+`BLOCK_SIZE_N` (= rank `N`), `BLOCK_SIZE_K` (= 256) and `GROUP_SIZE_M` (= 1) are
+derived/pinned by the runtime and intentionally omitted from the file.
 
 ## How the configs are consumed
 

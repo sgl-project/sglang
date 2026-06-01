@@ -16,13 +16,12 @@ whose weight is shaped [E, N, K] where:
 Config file naming (kept close to the fused_moe `E=..,N=..` style):
     moe_lora_shrink,E={experts},N={rank},K={hidden},device_name={device}.json
 
-Config file format (keyed by token count M). BLOCK_SIZE_N (= rank N) and
-BLOCK_SIZE_K (= 256) are not stored: they are derived by the runtime launcher.
+Config file format (keyed by token count M). BLOCK_SIZE_N (= rank N),
+BLOCK_SIZE_K (= 256) and GROUP_SIZE_M (= 1) are not stored: they are
+derived/pinned by the runtime launcher.
 {
-    "16":  {"BLOCK_SIZE_M": 16, "GROUP_SIZE_M": 1, "num_warps": 2,
-            "num_stages": 3, "SPLIT_K": 4},
-    "512": {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "num_warps": 4,
-            "num_stages": 4, "SPLIT_K": 2}
+    "16":  {"BLOCK_SIZE_M": 16, "num_warps": 2, "num_stages": 3, "SPLIT_K": 4},
+    "512": {"BLOCK_SIZE_M": 64, "num_warps": 4, "num_stages": 4, "SPLIT_K": 2}
 }
 
 Usage:
