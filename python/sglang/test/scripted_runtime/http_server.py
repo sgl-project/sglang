@@ -192,6 +192,14 @@ def _spawn_server_process(
         kv_canary_real_data="partial",
         kv_canary_sweep_interval=100,
         disable_piecewise_cuda_graph=True,
+        # The scripted runtime drives the engine one forward per `yield` and
+        # asserts precise per-step state (output-token counts, pause freezing, KV
+        # release). The overlap scheduler runs result processing on a separate
+        # worker thread one step behind, which breaks that determinism, so the
+        # harness defaults to the non-overlap loop. Tests that specifically need
+        # the overlap scheduler (e.g. the hybrid-SWA chunked-req regression) pass
+        # disable_overlap_schedule=False explicitly via ENGINE_KWARGS.
+        disable_overlap_schedule=True,
     )
     launch_kwargs.update(engine_kwargs)
     server_process = mp_ctx.Process(
