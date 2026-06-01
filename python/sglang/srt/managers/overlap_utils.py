@@ -78,7 +78,9 @@ def _gather_spec_extras(
     return topk_p, topk_index, bonus_tokens, hidden_states
 
 
-def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+def resolve_forward_inputs(
+    batch: ScheduleBatch, future_map: Optional[FutureMap]
+) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
@@ -86,7 +88,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
-        if batch.mix_running_indices is not None:
+        if batch.mix_running_indices is not None and future_map is not None:
             decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(
@@ -99,7 +101,11 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
-    elif batch.input_ids is None and future_map.spec_algo.is_none():
+    elif (
+        batch.input_ids is None
+        and future_map is not None
+        and future_map.spec_algo.is_none()
+    ):
         batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
@@ -107,7 +113,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             )
 
     # spec_v1 (non-overlap spec) doesn't relay extras; only spec_v2 does.
-    if batch.is_spec_v2:
+    if batch.is_spec_v2 and future_map is not None:
         future_map._resolve_spec_extras(batch)
 
 

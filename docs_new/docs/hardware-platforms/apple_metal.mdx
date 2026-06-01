@@ -56,10 +56,21 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 
 **Key Parameters Explained:**
 
-1. `SGLANG_USE_MLX=1` - Enables the use of MLX as the SGLang runtime backend (if disabled, SGLang will fall back to `torch.mps`, which has less support)
+1. `SGLANG_USE_MLX=1` - Enables the use of MLX as the SGLang runtime backend (if disabled, SGLang will fall back to `torch.mps`, which has less support).
 2. `--disable-cuda-graph` - Disables usage of CUDA graph, which is not relevant for Apple Metal.
-3. `--disable-overlap-schedule` - Disables overlap scheduling (enabled/not present by default) achieved using MLX's `async_eval()`
+3. Overlap Scheduling (Enabled by default) - Achieved using MLX's `async_eval()`. To disable it, use `--disable-overlap-schedule`.
 4. `SGLANG_MLX_USE_CUSTOM_ROPE=1` - Enables the optional custom Metal RoPE kernel. It is disabled by default, so the MLX backend uses the standard RoPE path unless you opt in for A/B testing.
+
+## Troubleshooting
+
+### AttributeError: 'NoneType' object has no attribute 'cpu'
+If you encounter this error during the prefill phase, ensure you are using a version of SGLang that includes the fixes for MLX input resolution. This error typically occurs when the scheduler fails to materialize input tokens for the MLX backend.
+
+### Performance on Apple Silicon
+For the best performance on M-series chips:
+*   Always use `SGLANG_USE_MLX=1`.
+*   Keep overlap scheduling enabled (default behavior).
+*   Adjust `--max-running-requests` and `--max-total-num-tokens` based on your available Unified Memory.
 
 ## Quantization
 

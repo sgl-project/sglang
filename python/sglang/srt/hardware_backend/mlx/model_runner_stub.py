@@ -76,7 +76,8 @@ class MlxModelRunnerStub(ModelRunner):
     weights are loaded and no large KV cache tensors are allocated.  Only
     the minimal bookkeeping pools needed by the scheduler are created.
     """
-
+    canary_manager = None
+    
     def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
         self._mlx_pool_size = mlx_pool_size
         super().__init__(*args, **kwargs)

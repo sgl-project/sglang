@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional
 import mlx.core as mx
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,7 @@ class SchedulerMlxOverlapMixin:
         pending_next: Optional[MlxPendingJob] = None
 
         def _launch_fresh(batch: "ScheduleBatch") -> MlxPendingJob:
+            resolve_forward_inputs(batch, self.future_map)
             lazy_tokens, prefills, extends, decode, mode = (
                 self.tp_worker.async_forward_batch_generation_mlx(batch)
             )
