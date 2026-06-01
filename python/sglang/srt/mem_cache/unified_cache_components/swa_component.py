@@ -242,15 +242,8 @@ class SWAComponent(TreeComponent):
         self._maybe_split_leaf_for_swa_lock(node)
 
     def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
-        """Cap a fresh SWA leaf at one page-aligned sliding window.
-
-        ``inc_lock_ref`` protects every SWA token on the leaf even though SWA
-        only needs the last ``sliding_window_size`` tokens. Chunked prefill
-        produces multi-thousand-token leaves, so locking one inflates
-        ``swa`` protected size by ~``chunked_prefill_size / sliding_window_size``
-        and drives premature SWA pool exhaustion / retract thrashing. Splitting
-        the leaf so the locked child covers just one window keeps the prefix
-        evictable while full-attention (which path-locks to root) is unaffected.
+        """Cap a fresh SWA leaf at one page-aligned window so locking it pins
+        only one window of SWA pool, not the whole (long chunked-prefill) leaf.
         """
         ct = self.component_type
         cd = leaf.component_data[ct]

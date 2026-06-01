@@ -1114,9 +1114,8 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_swa_leaf_capped_to_window_on_insert(self):
-        """A fresh SWA leaf longer than one window is split so that locking it
-        protects only `tail_size` SWA tokens, while full-attention (path-locked
-        to root) still protects the whole sequence."""
+        """A long SWA leaf is split so locking it protects one window of SWA
+        while full attention still protects the whole sequence."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA component")
 
