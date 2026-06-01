@@ -95,7 +95,7 @@ SGLang from the main branch is required for Qwen3.5. You can install from source
 uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
 # Or use Docker (NVIDIA GPUs)
-docker pull lmsysorg/sglang:latest
+docker pull lmsysorg/sglang:nightly-dev-20260216-d3bae71e
 
 # Or use Docker (AMD MI300X/MI325X)
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
@@ -106,9 +106,11 @@ docker pull lmsysorg/sglang:v0.5.9-rocm720-mi35x
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
-This section provides deployment configurations optimized for different hardware platforms and use cases.
+This section provides deployment configurations optimized for different hardware platforms, including NVIDIA GPUs, AMD GPUs, and Intel Xeon CPUs, and use cases.
 
 ### 3.1 Basic Configuration
 
@@ -212,6 +214,9 @@ This section provides deployment configurations optimized for different hardware
     </tr>
   </tbody>
 </table>
+
+
+- For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 <Warning>
 **FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is not included in the generated commands above; add it manually only if memory constraints require the trade-off.

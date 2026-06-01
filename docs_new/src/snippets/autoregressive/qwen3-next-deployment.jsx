@@ -9,7 +9,8 @@ export const Qwen3NextDeployment = () => {
         { id: 'h100', label: 'H100', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'Xeon', default: false }
       ]
     },
     modelsize: {
@@ -22,10 +23,13 @@ export const Qwen3NextDeployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      items: [
-        { id: 'bf16', label: 'BF16', subtitle: 'Full Weights', default: true },
-        { id: 'fp8', label: 'FP8', subtitle: 'High Throughput', default: false }
-      ]
+      getDynamicItems: (values) => {
+        const isXeon = values.hardware === 'xeon';
+        return [
+          { id: 'bf16', label: 'BF16', subtitle: 'Full Weights', default: true },
+          { id: 'fp8', label: 'FP8', subtitle: 'High Throughput', default: false, disabled: isXeon, disabledReason: isXeon ? 'FP8 is not supported on Xeon' : '' }
+        ];
+      }
     },
     thinking: {
       name: 'thinking',
@@ -48,15 +52,19 @@ export const Qwen3NextDeployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
-      items: [
-        { id: 'disabled', label: 'Disabled', default: true },
-        { id: 'enabled', label: 'Enabled', default: false }
-      ],
+      getDynamicItems: (values) => {
+        const isXeon = values.hardware === 'xeon';
+        return [
+          { id: 'disabled', label: 'Disabled', default: true },
+          { id: 'enabled', label: 'Enabled', default: false, disabled: isXeon, disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : '' }
+        ];
+      },
       commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null
     },
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
+      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'v1', label: 'V1', default: true },
         { id: 'v2', label: 'V2', default: false }
@@ -74,7 +82,8 @@ export const Qwen3NextDeployment = () => {
       b200: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 2, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 2, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 2, ep: 0, bf16: true, fp8: true },
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: false }
     }
   };
 
@@ -99,6 +108,10 @@ export const Qwen3NextDeployment = () => {
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
 
+    if (hardware === 'xeon') {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
+
     if (hwConfig.tp > 1) {
       cmd += ` \\\n  --tp ${hwConfig.tp}`;
     }
@@ -113,6 +126,9 @@ export const Qwen3NextDeployment = () => {
     }
 
     for (const [key, option] of Object.entries(options)) {
+      if (option.condition && !option.condition(values)) {
+        continue;
+      }
       if (option.commandRule) {
         const rule = option.commandRule(values[key]);
         if (rule) {

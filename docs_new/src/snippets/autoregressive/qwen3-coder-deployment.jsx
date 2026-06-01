@@ -8,7 +8,8 @@ export const Qwen3CoderDeployment = () => {
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
         { id: 'b200', label: 'B200', default: false },
-        { id: 'gb200', label: 'GB200', default: false }
+        { id: 'gb200', label: 'GB200', default: false },
+        { id: 'xeon', label: 'Xeon', default: false }
       ]
     },
     modelSize: {
@@ -22,11 +23,14 @@ export const Qwen3CoderDeployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      items: [
-        { id: 'bf16', label: 'BF16', default: true },
-        { id: 'fp8', label: 'FP8', default: false },
-        { id: 'nvfp4', label: 'NVFP4', default: false }
-      ]
+      getDynamicItems: (values) => {
+        const isXeon = values.hardware === 'xeon';
+        return [
+          { id: 'bf16', label: 'BF16', default: true },
+          { id: 'fp8', label: 'FP8', default: false, disabled: isXeon, disabledReason: isXeon ? 'FP8 is not supported on Xeon' : '' },
+          { id: 'nvfp4', label: 'NVFP4', default: false, disabled: isXeon, disabledReason: isXeon ? 'FP4 is not supported on Xeon' : '' }
+        ];
+      }
     },
     toolcall: {
       name: 'toolcall',
@@ -46,13 +50,15 @@ export const Qwen3CoderDeployment = () => {
       mi325x: { tp: 8 },
       mi355x: { tp: 8 },
       b200: { tp: 8 },
-      gb200: { tp: 8 }
+      gb200: { tp: 8 },
+      xeon: { tp: 6 }
     },
     '30b': {
       baseName: '30B-A3B',
       mi300x: { tp: 1 },
       mi325x: { tp: 1 },
-      mi355x: { tp: 1 }
+      mi355x: { tp: 1 },
+      xeon: { tp: 3 }
     }
   };
 
@@ -60,6 +66,7 @@ export const Qwen3CoderDeployment = () => {
     const { hardware, modelSize, quantization } = values;
 
     const isNvidia = hardware === 'b200' || hardware === 'gb200';
+    const isXeon = hardware === 'xeon';
 
     const modelConfig = modelConfigs[modelSize];
     const hwConfig = modelConfig[hardware];
@@ -78,6 +85,11 @@ export const Qwen3CoderDeployment = () => {
       return `# BF16 deployment on ${hardware.toUpperCase()} has not been verified yet. Please use FP8 or NVFP4.`;
     }
 
+    // Xeon only supports BF16
+    if (isXeon && quantization !== 'bf16') {
+      return `# Only BF16 quantization is supported on Intel Xeon CPU.`;
+    }
+
     // Build model name
     let modelName;
     if (quantization === 'nvfp4') {
@@ -88,11 +100,15 @@ export const Qwen3CoderDeployment = () => {
     }
 
     let cmd = '';
-    if (!isNvidia) {
+    if (!isNvidia && !isXeon) {
       cmd += 'SGLANG_USE_AITER=0 ';
     }
     cmd += 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
+
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
 
     // TP setting
     cmd += ` \\\n  --tp ${hwConfig.tp}`;
@@ -130,7 +146,7 @@ export const Qwen3CoderDeployment = () => {
     });
 
     // AMD-specific flags
-    if (!isNvidia) {
+    if (!isNvidia && !isXeon) {
       // Context length verified on MI300X/MI325X/MI355X
       cmd += ` \\\n  --context-length 8192`;
 
