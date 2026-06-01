@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
 from fastapi import WebSocket
@@ -124,6 +126,15 @@ RAW_LOSSLESS_OUTPUT_FORMAT = "raw"
 ENCODED_PREVIEW_FORMATS = {"webp", "jpeg"}
 
 
+@dataclass(frozen=True)
+class _TransportPayload:
+    content_type: str
+    payload: bytes
+    metadata: dict[str, int | str | bool]
+    last_raw_rgb_frame: bytes | None = None
+    last_event_id: int | None = None
+
+
 def _split_frame_batch(frames: list[bytes]) -> list[list[bytes]]:
     if not frames:
         return [frames]
@@ -165,6 +176,95 @@ def _encode_rgb_frame_to_jpeg(
         subsampling=JPEG_SUBSAMPLING,
     )
     return buffer.getvalue()
+
+
+def _build_transport_payload(
+    transport_frames: list[bytes],
+    *,
+    content_type: str,
+    metadata: dict[str, int | str],
+    output_format: str | None,
+    output_quality: int | None,
+    reference_frame: bytes | None,
+    event_id: int | None,
+) -> _TransportPayload:
+    payload_content_type = content_type
+    payload_metadata: dict[str, int | str | bool] = {}
+    raw_payload = b""
+
+    if (
+        output_format in ENCODED_PREVIEW_FORMATS
+        and content_type == RAW_RGB_CONTENT_TYPE
+        and transport_frames
+    ):
+        if output_format == "webp":
+            raw_payload = _encode_rgb_frame_to_webp(
+                transport_frames[0],
+                width=int(metadata["width"]),
+                height=int(metadata["height"]),
+                quality=int(output_quality or WEBP_DEFAULT_QUALITY),
+            )
+            payload_content_type = WEBP_FRAME_CONTENT_TYPE
+        else:
+            raw_payload = _encode_rgb_frame_to_jpeg(
+                transport_frames[0],
+                width=int(metadata["width"]),
+                height=int(metadata["height"]),
+                quality=int(output_quality or JPEG_DEFAULT_QUALITY),
+            )
+            payload_content_type = JPEG_FRAME_CONTENT_TYPE
+        payload_metadata = {
+            "format": output_format,
+            "encoding": output_format,
+        }
+    elif (
+        output_format == RAW_LOSSLESS_OUTPUT_FORMAT
+        and content_type == RAW_RGB_CONTENT_TYPE
+        and transport_frames
+    ):
+        raw_payload = b"".join(transport_frames)
+        payload_metadata = {
+            "raw_size": len(raw_payload),
+            "encoding": RAW_LOSSLESS_OUTPUT_FORMAT,
+        }
+    elif content_type == RAW_RGB_CONTENT_TYPE and transport_frames:
+        raw_payload = build_delta_gzip_raw_rgb_payload(
+            transport_frames,
+            reference_frame=reference_frame,
+        )
+        payload_content_type = RAW_RGB_DELTA_GZIP_CONTENT_TYPE
+        payload_metadata = {
+            "raw_size": sum(len(frame) for frame in transport_frames),
+            "encoding": "delta-gzip",
+        }
+        if reference_frame is not None:
+            payload_metadata["delta_reference"] = "previous-frame"
+        return _TransportPayload(
+            content_type=payload_content_type,
+            payload=raw_payload,
+            metadata=payload_metadata,
+            last_raw_rgb_frame=transport_frames[-1],
+            last_event_id=event_id,
+        )
+    else:
+        raw_payload = b"".join(transport_frames)
+
+    return _TransportPayload(
+        content_type=payload_content_type,
+        payload=raw_payload,
+        metadata=payload_metadata,
+    )
+
+
+def _should_build_payload_off_loop(
+    *,
+    content_type: str,
+    output_format: str | None,
+    transport_frames: list[bytes],
+) -> bool:
+    if content_type != RAW_RGB_CONTENT_TYPE or not transport_frames:
+        return False
+    return output_format in ENCODED_PREVIEW_FORMATS or output_format is None
 
 
 class RawRGBRealtimeOutputAdapter:
@@ -241,72 +341,46 @@ class RawRGBRealtimeOutputAdapter:
             for frame_batch_index, transport_frames in enumerate(split_batches):
                 timer = RealtimeStageTimer()
                 transport_metadata = metadata
-                payload_content_type = content_type
-                payload_metadata: dict[str, int | str | bool] = {}
-                raw_payload = b""
-                if (
-                    output_format in ENCODED_PREVIEW_FORMATS
-                    and content_type == RAW_RGB_CONTENT_TYPE
-                    and transport_frames
+                reference_frame = self._last_raw_rgb_frame
+                if event_id != self._last_event_id:
+                    reference_frame = None
+                if _should_build_payload_off_loop(
+                    content_type=content_type,
+                    output_format=output_format,
+                    transport_frames=transport_frames,
                 ):
-                    if output_format == "webp":
-                        raw_payload = _encode_rgb_frame_to_webp(
-                            transport_frames[0],
-                            width=int(metadata["width"]),
-                            height=int(metadata["height"]),
-                            quality=int(output_quality or WEBP_DEFAULT_QUALITY),
-                        )
-                        payload_content_type = WEBP_FRAME_CONTENT_TYPE
-                    else:
-                        raw_payload = _encode_rgb_frame_to_jpeg(
-                            transport_frames[0],
-                            width=int(metadata["width"]),
-                            height=int(metadata["height"]),
-                            quality=int(output_quality or JPEG_DEFAULT_QUALITY),
-                        )
-                        payload_content_type = JPEG_FRAME_CONTENT_TYPE
-                    payload_metadata = {
-                        "format": output_format,
-                        "encoding": output_format,
-                    }
-                elif (
-                    output_format == RAW_LOSSLESS_OUTPUT_FORMAT
-                    and content_type == RAW_RGB_CONTENT_TYPE
-                    and transport_frames
-                ):
-                    raw_payload = b"".join(transport_frames)
-                    payload_metadata = {
-                        "raw_size": len(raw_payload),
-                        "encoding": RAW_LOSSLESS_OUTPUT_FORMAT,
-                    }
-                elif content_type == RAW_RGB_CONTENT_TYPE and transport_frames:
-                    reference_frame = self._last_raw_rgb_frame
-                    if event_id != self._last_event_id:
-                        reference_frame = None
-                    raw_payload = build_delta_gzip_raw_rgb_payload(
+                    transport_payload = await asyncio.to_thread(
+                        _build_transport_payload,
                         transport_frames,
+                        content_type=content_type,
+                        metadata=metadata,
+                        output_format=output_format,
+                        output_quality=output_quality,
                         reference_frame=reference_frame,
+                        event_id=event_id,
                     )
-                    payload_content_type = RAW_RGB_DELTA_GZIP_CONTENT_TYPE
-                    payload_metadata = {
-                        "raw_size": sum(len(frame) for frame in transport_frames),
-                        "encoding": "delta-gzip",
-                    }
-                    if reference_frame is not None:
-                        payload_metadata["delta_reference"] = "previous-frame"
-                    self._last_raw_rgb_frame = transport_frames[-1]
-                    self._last_event_id = event_id
                 else:
-                    raw_payload = b"".join(transport_frames)
+                    transport_payload = _build_transport_payload(
+                        transport_frames,
+                        content_type=content_type,
+                        metadata=metadata,
+                        output_format=output_format,
+                        output_quality=output_quality,
+                        reference_frame=reference_frame,
+                        event_id=event_id,
+                    )
+                if transport_payload.last_raw_rgb_frame is not None:
+                    self._last_raw_rgb_frame = transport_payload.last_raw_rgb_frame
+                    self._last_event_id = transport_payload.last_event_id
                 stats["raw_payload_build_ms"] += timer.mark_ms()
 
                 header: RealtimeFrameBatchHeader = {
                     "type": "frame_batch_header",
                     "request_id": request_id,
                     "chunk_index": chunk_index,
-                    "content_type": payload_content_type,
+                    "content_type": transport_payload.content_type,
                     "num_frames": len(transport_frames),
-                    "total_size": len(raw_payload),
+                    "total_size": len(transport_payload.payload),
                     "frame_batch_index": frame_batch_index,
                     "num_frame_batches": num_frame_batches,
                     "is_final_frame_batch": frame_batch_index
@@ -315,7 +389,7 @@ class RawRGBRealtimeOutputAdapter:
                 if event_id is not None:
                     header["event_id"] = event_id
                 header.update(transport_metadata)
-                header.update(payload_metadata)
+                header.update(transport_payload.metadata)
 
                 header_payload = packb(header, use_bin_type=True)
                 stats["header_pack_ms"] += timer.mark_ms()
@@ -323,14 +397,16 @@ class RawRGBRealtimeOutputAdapter:
                 await ws.send_bytes(header_payload)
                 stats["header_write_ms"] += timer.mark_ms()
 
-                await ws.send_bytes(raw_payload)
+                await ws.send_bytes(transport_payload.payload)
                 stats["raw_write_ms"] += timer.mark_ms()
 
                 stats["raw_bytes"] += sum(len(frame) for frame in transport_frames)
-                stats["ws_payload_bytes"] += len(header_payload) + len(raw_payload)
+                stats["ws_payload_bytes"] += len(header_payload) + len(
+                    transport_payload.payload
+                )
                 stats["num_frames"] += len(transport_frames)
                 stats["num_batches"] += 1
-                stats["content_type"] = payload_content_type
+                stats["content_type"] = transport_payload.content_type
             chunk_index += 1
 
         stats["ws_write_ms"] = stats["header_write_ms"] + stats["raw_write_ms"]
