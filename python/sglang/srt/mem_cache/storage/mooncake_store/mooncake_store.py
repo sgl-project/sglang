@@ -646,47 +646,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
-        # A logical "page" may map to multiple physical objects in storage.
-        # - INDEXER: one key per page
-        # - MAMBA  : one temporal key + N conv keys per page
-        # - MHA SWA: K/V keys per page
-        # key_multiplier records how many component keys are generated per page.
-        # The suffix order must match host_pool.get_page_buffer_meta(), because
-        # Mooncake batch IO zips generated keys with returned buffer pointers.
-        # Mooncake rejects layer_first for the anchor pool, so v2 sidecar keys
-        # are generated for page-packed layouts only.
-        name = transfer.name
-        host_pool = getattr(self, "registered_pools", {}).get(name)
-
-        if name == PoolName.INDEXER:
-            suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
-        elif name == PoolName.MAMBA:
-            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            base_suffix = f"_{self.mha_suffix}"
-            suffixes = [f"{base_suffix}_temporal"] + [
-                f"{base_suffix}_conv_{i}" for i in range(conv_num)
-            ]
-        elif name == PoolName.SWA:
-            if self.is_mla_backend or not hasattr(host_pool, "v_buffer"):
-                # MLA and packed SWA side pools expose one object per page.
-                suffixes = [f"_{self.mla_suffix}_{name}"]
-            else:
-                # Ordinary MHA SWA exposes K/V objects, matching the anchor KV format.
-                base_suffix = f"_{self.mha_suffix}_{name}"
-                suffixes = [f"{base_suffix}_k", f"{base_suffix}_v"]
-        elif name in {
-            PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-            PoolName.DEEPSEEK_V4_C128,
-            PoolName.DEEPSEEK_V4_C4_STATE,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-            PoolName.DEEPSEEK_V4_C128_STATE,
-        }:
-            # DeepSeek V4 compressed/state side pools expose one packed object
-            # per page for Mooncake-supported layouts.
-            suffixes = [f"_{self.mla_suffix}_{name}"]
-        else:
-            raise ValueError(f"Unsupported Mooncake hybrid pool: {name}")
+        # PoolName owns component naming. host_pool only provides shape context,
+        # and suffix order must match get_page_buffer_meta() for one page.
+        host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+        if host_pool is None:
+            raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
+        suffixes = transfer.name.storage_component_suffixes(
+            mha_suffix=self.mha_suffix,
+            mla_suffix=self.mla_suffix,
+            is_mla_backend=self.is_mla_backend,
+            host_pool=host_pool,
+        )
 
         key_multiplier = len(suffixes)
         component_keys = [
