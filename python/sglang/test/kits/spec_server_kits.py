@@ -190,6 +190,12 @@ class SpecAccuracyKit:
                 thres = 2.5 if topk == 1 else 3.47
             self.assertGreater(avg_spec_accept_length, thres)
 
+
+class SpecPerfKit:
+    """Throughput perf check (GPU-specific -> run on the reference/Hopper runner)."""
+
+    perf_output_throughput_thres = 50
+
     def test_max_token_one(self):
         requests.get(self.base_url + "/flush_cache")
         args = SimpleNamespace(
@@ -202,7 +208,9 @@ class SpecAccuracyKit:
             num_threads=128,
         )
         metrics = run_eval(args)
-        self.assertGreater(metrics["output_throughput"], 50)
+        self.assertGreater(
+            metrics["output_throughput"], self.perf_output_throughput_thres
+        )
 
 
 class SpecLogprobKit:

@@ -3,7 +3,7 @@
 Both cases run the same full kit set on the same standard config (EAGLE3,
 topk=1, page_size=1); the only difference is ``disable_overlap``. Config-specific
 variants (other models / page sizes / backends / timeouts) live in
-test_eagle_infer_b.py.
+test_spec_eagle.py.
 """
 
 import unittest

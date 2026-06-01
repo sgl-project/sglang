@@ -20,7 +20,9 @@ from sglang.srt.environ import envs
 from sglang.srt.utils.common import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
+    DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_DRAFT_MODEL_EAGLE3,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -186,3 +188,40 @@ class SpecEagleServerBase(CustomTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
+
+
+class Eagle3Base(SpecEagleServerBase):
+    """EAGLE3 (Llama-3.1) config preset, topk=1 / page_size=1 by default."""
+
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
+    spec_algo = "EAGLE3"
+    spec_steps = 5
+    spec_topk = 1
+    spec_tokens = 6
+    attention_backend = "flashinfer"
+    chunked_prefill_size = 1024
+    # EAGLE3 topk=1 accepts modestly; tune against CI if needed.
+    acc_length_thres = 1.6
+    batch_accept_len_thres = 1.3
+    gsm8k_score_thres = 0.7
+    gsm8k_accept_len_thres = 1.3
+
+
+class EagleLlama2Base(SpecEagleServerBase):
+    """EAGLE (Llama-2) config preset. topk=8 tree -> spec v1; gsm8k is low."""
+
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    spec_algo = "EAGLE"
+    spec_steps = 5
+    spec_topk = 8
+    spec_tokens = 64
+    attention_backend = "flashinfer"
+    chunked_prefill_size = 128
+    mem_fraction_static = 0.7
+    gsm8k_score_thres = 0.20
+    acc_length_thres = 3.0
+    batch_accept_len_thres = 1.8
+    # EAGLE topk>1 already routes to v1; force it explicitly to preserve intent.
+    env_overrides = ((envs.SGLANG_ENABLE_SPEC_V2, False),)
