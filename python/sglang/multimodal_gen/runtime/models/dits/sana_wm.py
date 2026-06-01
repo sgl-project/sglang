@@ -223,8 +223,18 @@ class WanRotaryPosEmbed(nn.Module):
             freqs.append(freq)
         self.register_buffer("_freqs", torch.cat(freqs, dim=1), persistent=False)
 
-    def forward(self, fhw: Tuple[int, int, int], device: torch.device) -> torch.Tensor:
-        ppf, pph, ppw = fhw
+    def forward(
+        self,
+        fhw,
+        device: torch.device,
+        frame_index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # `fhw[0]` is either an int frame count (dense; positions 0..T-1) or a
+        # `(start, end)` tuple selecting GLOBAL frame positions for a streaming
+        # chunk. `frame_index`, when given, supplies per-token global frame
+        # positions directly and overrides `fhw[0]`. Mirrors the reference
+        # WanRotaryPosEmbed so chunk-by-chunk RoPE stays at absolute positions.
+        fspec, pph, ppw = fhw
         freqs = self._freqs.to(device)
         d = self.attention_head_dim
         t_size = d // 2 - 2 * (d // 6)
@@ -232,11 +242,34 @@ class WanRotaryPosEmbed(nn.Module):
         w_size = d // 6
         ft, fh, fw = freqs.split_with_sizes([t_size, h_size, w_size], dim=1)
 
-        freqs_t = ft[:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        if frame_index is not None:
+            f_pos = frame_index.to(device=device, dtype=torch.long)
+        elif isinstance(fspec, (tuple, list)):
+            f_pos = torch.arange(
+                int(fspec[0]), int(fspec[1]), device=device, dtype=torch.long
+            )
+        else:
+            f_pos = torch.arange(int(fspec), device=device, dtype=torch.long)
+        ppf = int(f_pos.shape[0])
+
+        freqs_t = ft[f_pos].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_h = fh[:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_w = fw[:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
         out = torch.cat([freqs_t, freqs_h, freqs_w], dim=-1)
         return out.reshape(1, 1, ppf * pph * ppw, -1)
+
+
+def _slice_rope_to_current_chunk(
+    rotary_emb: Optional[torch.Tensor], current_tokens: int
+) -> Optional[torch.Tensor]:
+    """Defensive no-op: keep the trailing ``current_tokens`` of a RoPE table.
+
+    ``forward_long`` builds ``freqs`` windowed to exactly the chunk, so this is
+    a no-op there; it only trims if a caller hands in a wider table (mirrors the
+    reference ``_slice_rope_to_current_chunk``)."""
+    if rotary_emb is None or rotary_emb.shape[-2] == current_tokens:
+        return rotary_emb
+    return rotary_emb[..., -current_tokens:, :]
 
 
 def _apply_rotary_emb_dn(
@@ -3042,6 +3075,29 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         key = (T, H, W, str(device))
         if key not in self._freqs_cache:
             self._freqs_cache[key] = self.rope((T, H, W), device)
+        return self._freqs_cache[key]
+
+    def _get_freqs_window(
+        self,
+        start: int,
+        end: int,
+        H: int,
+        W: int,
+        device: torch.device,
+        frame_index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """RoPE freqs for a streaming chunk at GLOBAL frame positions.
+
+        ``frame_index`` (per-token global positions) overrides ``(start, end)``;
+        the count branch is cached, the tensor branch is computed fresh.
+        """
+        if frame_index is not None:
+            return self.rope((end - start, H, W), device, frame_index=frame_index)
+        key = ("win", int(start), int(end), H, W, str(device))
+        if key not in self._freqs_cache:
+            self._freqs_cache[key] = self.rope(
+                ((int(start), int(end)), H, W), device
+            )
         return self._freqs_cache[key]
 
     def _get_ucpe_apply_fns(
