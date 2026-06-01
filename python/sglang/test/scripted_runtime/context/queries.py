@@ -23,13 +23,19 @@ def list_active_reqs(ctx: "ScriptedContext") -> List["Req"]:
 
 
 def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:
-    return next((r for r in _get_all_reqs(ctx) if r.rid == rid), None)
+    req = next((r for r in _get_all_reqs(ctx) if r.rid == rid), None)
+    if req is not None:
+        ctx._seen_rids.add(rid)
+    return req
 
 
 def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
     req = find_req_by_rid(ctx, rid)
     if req is None:
-        return rid in ctx._started_rids
+        # A started req that is absent from every scheduler structure is finished
+        # only if it was once observed live; one that has not yet been pulled out
+        # of the recv buffer into the waiting queue is still pending, not finished.
+        return rid in ctx._seen_rids
     return req.finished()
 
 

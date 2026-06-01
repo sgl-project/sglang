@@ -13,12 +13,27 @@ register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 
 _SWA_MODEL = "openai/gpt-oss-20b"
 
+# To reach add_chunked_req's hybrid-SWA early-return the full KV pool must run
+# out while the chunked req r is mid-prefill. We arrange this WITHOUT
+# enable_mixed_chunk and WITHOUT an ignore_eos competitor:
+#
+# A resident competitor (bounded by max_new_tokens, EOS allowed) finishes its
+# own prefill first, so its entire prompt occupies the full-attention KV pool.
+# While r then prefills chunk by chunk, prefill batches preempt decode, so the
+# competitor never gets a decode step -- it neither advances toward EOS nor
+# grows, staying pinned at its full prompt footprint. The competitor prompt +
+# r prompt deliberately exceed the full pool (4096 + 4608 > 8192), so r's
+# per-chunk add_chunked_req drives rem_total_tokens <= 0 partway through its
+# prefill -- the early-return parks r (kept as scheduler.chunked_req but absent
+# from the forward batch). Only once r is parked does the decode batch run,
+# letting the competitor decode to max_new_tokens, finish, and free its KV so r
+# can resume and complete.
 _MAX_TOTAL_TOKENS = 8192
-_SWA_FULL_TOKENS_RATIO = 0.1
-_CHUNK_SIZE = 512
-_RESIDENT_PROMPT = 6144
-_RESIDENT_DECODE = 64
-_CHUNKED_PROMPT = 4096
+_SWA_FULL_TOKENS_RATIO = 0.8
+_CHUNK_SIZE = 64
+_RESIDENT_PROMPT = 4096
+_RESIDENT_DECODE = 82
+_CHUNKED_PROMPT = 4608
 
 
 class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
@@ -42,12 +57,13 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
         s = t._scheduler
 
         competitor = t.start_req(
-            prompt_len=_RESIDENT_PROMPT, max_new_tokens=_RESIDENT_DECODE
+            prompt_len=_RESIDENT_PROMPT,
+            max_new_tokens=_RESIDENT_DECODE,
         )
         yield from run_until(competitor, lambda h: h.is_chunking)
         yield from run_until(competitor, lambda h: not h.is_chunking)
 
-        r = t.start_req(prompt_len=_CHUNKED_PROMPT, max_new_tokens=2)
+        r = t.start_req(prompt_len=_CHUNKED_PROMPT, max_new_tokens=2, prompt_token=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
         observed_early_return = False

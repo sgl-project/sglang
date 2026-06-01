@@ -26,6 +26,7 @@ class ScriptedContextReqStarter:
         ignore_eos: bool,
         priority: Optional[int],
         dp_rank: Optional[int],
+        prompt_token: int = 1,
     ) -> ScriptedReqHandle:
         ctx = self._ctx
 
@@ -35,7 +36,7 @@ class ScriptedContextReqStarter:
 
         sampling_params = {"max_new_tokens": max_new_tokens, "ignore_eos": ignore_eos}
         payload = {
-            "input_ids": [1] * prompt_len,
+            "input_ids": [prompt_token] * prompt_len,
             "sampling_params": sampling_params,
             "rid": rid,
             "stream": True,
@@ -52,5 +53,4 @@ class ScriptedContextReqStarter:
             description=f"request with rid {rid!r}",
         )
 
-        ctx._started_rids.add(rid)
         return ScriptedReqHandle(rid=rid, context=ctx)

@@ -39,7 +39,7 @@ class ScriptedContext:
         self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._http_poster = http_poster
 
-        self._started_rids: set[str] = set()
+        self._seen_rids: set[str] = set()
         self._req_starter = ScriptedContextReqStarter(self)
 
     def start_req(
@@ -51,6 +51,7 @@ class ScriptedContext:
         ignore_eos: bool = False,
         priority: Optional[int] = None,
         dp_rank: Optional[int] = None,
+        prompt_token: int = 1,
     ) -> "ScriptedReqHandle":
         return self._req_starter.start_req(
             prompt_len=prompt_len,
@@ -59,6 +60,7 @@ class ScriptedContext:
             ignore_eos=ignore_eos,
             priority=priority,
             dp_rank=dp_rank,
+            prompt_token=prompt_token,
         )
 
     def pause_generation(self, *, mode: Literal["retract", "in_place"]) -> None:
