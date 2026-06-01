@@ -30,6 +30,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     _with_default_num_gpus,
 )
 from sglang.multimodal_gen.test.test_utils import (
+    DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
@@ -160,6 +161,31 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_lora_basic_api_check=True,
         run_lora_dynamic_switch_check=True,
         run_multi_lora_api_check=True,
+    ),
+    DiffusionTestCase(
+        "cosmos3_nano_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
+            modality="image",
+        ),
+        DiffusionSamplingParams(
+            prompt="A red cube on a white table, product photo.",
+            output_size="832x480",
+            output_format="png",
+            extras={
+                "num_inference_steps": 35,
+                "seed": 0,
+                "max_sequence_length": 128,
+                "flow_shift": 10.0,
+                "extra_args": {
+                    "guardrails": False,
+                    "use_resolution_template": False,
+                },
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(

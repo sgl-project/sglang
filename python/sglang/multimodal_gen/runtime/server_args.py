@@ -1144,6 +1144,7 @@ class ServerArgs(DisaggArgsMixin):
             "--data-parallel-size",
             "--dp-size",
             "--dp",
+            dest="dp_size",
             type=int,
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
@@ -1794,10 +1795,16 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
-        if "mode" in provided_arg_names:
-            provided_arg_names.add("performance_mode")
-        if "layerwise_offload_modules" in provided_arg_names:
-            provided_arg_names.add("layerwise_offload_components")
+        cli_aliases = {
+            "cfg_parallel_size": "cfg_parallel_degree",
+            "data_parallel_size": "dp_size",
+            "dp": "dp_size",
+            "layerwise_offload_modules": "layerwise_offload_components",
+            "mode": "performance_mode",
+        }
+        for alias_name, dest_name in cli_aliases.items():
+            if alias_name in provided_arg_names:
+                provided_arg_names.add(dest_name)
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
