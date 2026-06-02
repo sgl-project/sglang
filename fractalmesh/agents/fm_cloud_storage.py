@@ -194,7 +194,8 @@ def _sign_r2_request(
     region   = "auto"
     service  = "s3"
     host     = f"{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    endpoint = f"https://{host}/{R2_BUCKET_NAME}/{key.lstrip('/')}"
+    quoted_key = urllib.parse.quote(key.lstrip("/"))
+    endpoint = f"https://{host}/{R2_BUCKET_NAME}/{quoted_key}"
 
     now          = time.gmtime()
     amz_date     = time.strftime("%Y%m%dT%H%M%SZ", now)
@@ -340,7 +341,8 @@ def _r2_cdn_url(key: str) -> str:
 
 def _sb_upload(key: str, data: bytes, content_type: str) -> str:
     """Upload bytes to Supabase Storage and return backend URL."""
-    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{key.lstrip('/')}"
+    quoted_key = urllib.parse.quote(key.lstrip("/"))
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{quoted_key}"
     req = urllib.request.Request(
         url,
         data=data,
@@ -359,7 +361,8 @@ def _sb_upload(key: str, data: bytes, content_type: str) -> str:
 
 def _sb_download(key: str) -> bytes:
     """Download object from Supabase Storage (public endpoint)."""
-    url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{key.lstrip('/')}"
+    quoted_key = urllib.parse.quote(key.lstrip("/"))
+    url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{quoted_key}"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
     })
@@ -369,7 +372,8 @@ def _sb_download(key: str) -> bytes:
 
 def _sb_delete(key: str) -> None:
     """Delete object from Supabase Storage."""
-    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{key.lstrip('/')}"
+    quoted_key = urllib.parse.quote(key.lstrip("/"))
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{quoted_key}"
     req = urllib.request.Request(
         url,
         headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"},

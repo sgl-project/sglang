@@ -456,8 +456,8 @@ class AkashHandler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "Provide sdl_id or content"})
 
         valid, errors, parsed = _validate_sdl(content)
-        version  = parsed.get("version", "") if parsed else ""
-        services = list(parsed.get("services", {}).keys()) if parsed else []
+        version  = parsed.get("version", "") if isinstance(parsed, dict) else ""
+        services = list(parsed.get("services", {}).keys()) if isinstance(parsed, dict) else []
         return self._send(200, {
             "valid":    valid,
             "version":  version,

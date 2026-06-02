@@ -180,6 +180,19 @@ def _check_auth(handler) -> tuple:
     # Check token limit
     if row["tier"] != "enterprise" and row["tokens_used"] >= row["token_limit"]:
         return None, "Token limit exceeded for this billing period"
+    # Reset daily counter if last_used was on a different calendar day
+    if row.get("last_used"):
+        last_day = time.strftime("%Y-%m-%d", time.localtime(row["last_used"]))
+        today    = time.strftime("%Y-%m-%d", time.localtime())
+        if last_day != today:
+            try:
+                conn = _db_connect()
+                conn.execute("UPDATE aiaas_keys SET requests_today=0 WHERE key=?", (api_key,))
+                conn.commit()
+                conn.close()
+                row["requests_today"] = 0
+            except Exception as exc:
+                log.warning("Failed to reset requests_today: %s", exc)
     # Check daily requests
     tier_cfg = TIER_LIMITS.get(row["tier"], TIER_LIMITS["free"])
     if row["tier"] != "enterprise" and row["requests_today"] >= tier_cfg["req_day"]:

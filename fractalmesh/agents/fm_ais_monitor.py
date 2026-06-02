@@ -148,7 +148,7 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a    = (math.sin(dlat / 2) ** 2 +
             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
             math.sin(dlon / 2) ** 2)
-    return R * 2 * math.asin(math.sqrt(a))
+    return R * 2 * math.asin(math.sqrt(max(0.0, min(1.0, a))))
 
 
 def _check_spoofing(mmsi: str, lat: float, lon: float,

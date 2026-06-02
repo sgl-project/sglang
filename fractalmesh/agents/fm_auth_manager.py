@@ -436,13 +436,11 @@ class AuthHandler(BaseHTTPRequestHandler):
         email    = (body.get("email") or "").strip().lower()
         password = body.get("password") or ""
         name     = (body.get("name") or "").strip()
-        role     = (body.get("role") or "user").strip()
+        role     = "user"  # public registration always defaults to user; admins assign roles separately
         if not email or "@" not in email:
             self._send_json(400, {"error": "Valid email required"}); return
         if len(password) < 8:
             self._send_json(400, {"error": "Password must be at least 8 characters"}); return
-        if role not in ("admin", "user", "developer", "viewer"):
-            role = "user"
         conn = _get_db()
         try:
             existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()

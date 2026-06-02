@@ -8,6 +8,7 @@ Vault: OPENROUTER_KEY or OPENROUTER_API_KEY (FractalMesh default)
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -124,9 +125,9 @@ def ask_openrouter(theme: str) -> dict:
     )
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        raw = m.group(0)
     return json.loads(raw)
 
 

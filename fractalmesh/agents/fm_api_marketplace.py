@@ -338,6 +338,15 @@ def _run_monthly_billing(period: str) -> None:
 
         for dev in developers:
             dev_id = dev["id"]
+
+            # Skip if already billed for this period
+            already = conn.execute(
+                "SELECT id FROM billing_records WHERE developer_id=? AND period=?",
+                (dev_id, period),
+            ).fetchone()
+            if already:
+                continue
+
             # Get all key_ids for this developer
             keys = conn.execute(
                 "SELECT key_id FROM api_keys WHERE developer_id=?", (dev_id,)

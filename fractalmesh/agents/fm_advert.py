@@ -235,8 +235,11 @@ def process_outreach_queue():
                 "INSERT INTO outreach_log(lead_id,company,email,sequence_step,subject) VALUES(?,?,?,?,?)",
                 (q["lead_id"], q["company"], email, step, subject)
             )
-            conn.execute("INSERT INTO audit_log(event,detail) VALUES('OUTREACH_SENT',?)",
-                         (f"step={step} company={q['company']}",))
+            try:
+                conn.execute("INSERT INTO audit_log(event,detail) VALUES('OUTREACH_SENT',?)",
+                             (f"step={step} company={q['company']}",))
+            except Exception:
+                pass  # audit_log schema may differ across agents
             # Schedule next step (2 days later)
             next_send = (now + timedelta(days=2)).isoformat()
             next_step = step + 1

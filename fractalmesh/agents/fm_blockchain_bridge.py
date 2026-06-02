@@ -362,8 +362,8 @@ def _fetch_nfts(address: str) -> list[dict]:
     conn = _get_db()
     with conn:
         for nft in data.get("ownedNfts", []):
-            contract  = nft.get("contract", {}).get("address", "")
-            token_id  = nft.get("id", {}).get("tokenId", "")
+            contract  = (nft.get("contract") or {}).get("address", "")
+            token_id  = (nft.get("id") or {}).get("tokenId", "")
             meta      = nft.get("metadata", {})
             name      = meta.get("name", "")
             desc      = meta.get("description", "")

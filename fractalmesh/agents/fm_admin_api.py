@@ -69,19 +69,28 @@ def _pm2_list() -> list:
     except Exception: return []
 
 def _pm2_cmd(cmd, agent):
+    import re
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", agent):
+        return {"error": "Invalid agent name"}
     try:
-        out = subprocess.getoutput(f"pm2 {cmd} {agent} 2>&1")
-        return {"status":"ok","output":out[:500]}
-    except Exception as e: return {"error":str(e)}
+        res = subprocess.run(
+            ["pm2", cmd, agent],
+            capture_output=True, text=True, timeout=15
+        )
+        return {"status": "ok", "output": (res.stdout + res.stderr)[:500]}
+    except Exception as e:
+        return {"error": str(e)}
 
 def _tail_log(agent, lines=50) -> str:
-    for suffix in ["-out.log","-error.log"]:
+    for suffix in ["-out.log", "-error.log"]:
         p = ROOT / "logs" / f"{agent}{suffix}"
         if p.exists():
             try:
-                out = subprocess.getoutput(f"tail -n {lines} '{p}'")
-                return out
-            except Exception: pass
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.readlines()
+                    return "".join(content[-lines:])
+            except Exception:
+                pass
     return "log not found"
 
 def _port_scan() -> dict:
