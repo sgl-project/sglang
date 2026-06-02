@@ -2115,6 +2115,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             getattr(self, "_gfx95_quant_format", ""),
         )
 
+        # Zero the padded attention-input rows so they can't contaminate valid tokens.
+        hidden_states = _zero_padded_token_tail(hidden_states, forward_batch)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -2478,8 +2481,6 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
                 )
-                hidden_states = _zero_padded_token_tail(hidden_states, forward_batch)
-                residual = _zero_padded_token_tail(residual, forward_batch)
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2494,8 +2495,6 @@ class DeepseekV2Model(nn.Module):
                 ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
-            hidden_states = _zero_padded_token_tail(hidden_states, forward_batch)
-            residual = _zero_padded_token_tail(residual, forward_batch)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
