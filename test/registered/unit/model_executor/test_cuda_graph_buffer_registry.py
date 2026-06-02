@@ -44,6 +44,8 @@ class _MiniForwardBatch:
     encoder_lens: Optional[torch.Tensor] = None
     mrope_positions: Optional[torch.Tensor] = None
     num_token_non_padded: Optional[torch.Tensor] = None
+    global_num_tokens_gpu: Optional[torch.Tensor] = None
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     forward_mode: Optional[str] = None
     spec_info: Optional[object] = None
 
@@ -668,6 +670,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             seq_lens=torch.full((4,), 5, dtype=torch.int32),
             seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
         )
         reg = build_decode_registry(
             device=torch.device("cpu"),
@@ -715,6 +719,67 @@ class TestFillOncePolicy(unittest.TestCase):
         self.assertTrue(torch.equal(buf[:2], torch.tensor([1, 2], dtype=torch.int32)))
         self.assertTrue(
             torch.equal(buf[2:], torch.tensor([99, 99], dtype=torch.int32))
+        )
+
+
+class TestComputedSlots(unittest.TestCase):
+    """num_token_non_padded (copy_from_fb + post_fill) and global_num_tokens
+    (copy_from_fb=False + post_fill fill)."""
+
+    def test_num_token_non_padded_copy_path(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            require_gathered_buffer=False,
+        )
+        self.assertTrue(reg.has_slot("num_token_non_padded"))
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            num_token_non_padded=torch.tensor([7], dtype=torch.int32),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
+        # Non-gathered: plain FB copy, post_fill is a no-op.
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("num_token_non_padded").buffer,
+                torch.tensor([7], dtype=torch.int32),
+            )
+        )
+
+    def test_global_num_tokens_fill_path(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            require_gathered_buffer=True,
+        )
+        self.assertTrue(reg.has_slot("global_num_tokens_gpu"))
+        # FB carries a stale value; copy_from_fb=False means it's ignored and
+        # the slot is filled with padded_num_tokens by post_fill.
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            global_num_tokens_gpu=torch.tensor([999], dtype=torch.int32),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4)
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("global_num_tokens_gpu").buffer,
+                torch.tensor([4], dtype=torch.int32),
+            )
         )
 
 

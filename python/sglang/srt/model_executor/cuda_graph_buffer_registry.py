@@ -472,6 +472,11 @@ def build_decode_registry(
     enable_mamba_track: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
+    enable_num_token_non_padded: bool = False,
+    require_gathered_buffer: bool = False,
+    enable_prefill_cp: bool = False,
+    require_mlp_tp_gather: bool = False,
+    dp_size: int = 1,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
@@ -581,6 +586,54 @@ def build_decode_registry(
                 axis="bs",
                 padding_policy=PaddingPolicy.FILL_ONCE,
                 pad_value=encoder_len_fill_value,
+            )
+        )
+    if enable_num_token_non_padded:
+        from sglang.srt.model_executor.forward_batch_info import (
+            compute_local_num_token_non_padded,
+        )
+
+        def _num_token_non_padded_post_fill(buf, fb, ctx):
+            # Gathered (DP) path overwrites the plain FB copy with this rank's
+            # local count; the non-gathered path keeps the copied value.
+            if require_gathered_buffer and not enable_prefill_cp:
+                buf.copy_(
+                    compute_local_num_token_non_padded(
+                        global_num_token_non_padded=fb.num_token_non_padded,
+                        num_tokens_per_dp=ctx.padded_num_tokens,
+                    )
+                )
+
+        slots.append(
+            GraphSlot(
+                "num_token_non_padded",
+                lambda _bs, _mt: (1,),
+                torch.int32,
+                axis="none",
+                post_fill=_num_token_non_padded_post_fill,
+            )
+        )
+
+    def _global_num_tokens_post_fill(buf, fb, ctx):
+        # Filled with the padded token count on the gathered (DP) path; left
+        # untouched otherwise. Not an FB copy (copy_from_fb=False).
+        if require_gathered_buffer:
+            buf.fill_(ctx.padded_num_tokens)
+
+    _global_shape = (
+        (lambda _bs, _mt: (dp_size,))
+        if require_mlp_tp_gather
+        else (lambda _bs, _mt: (1,))
+    )
+    for _global_name in ("global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu"):
+        slots.append(
+            GraphSlot(
+                _global_name,
+                _global_shape,
+                torch.int32,
+                axis="none",
+                copy_from_fb=False,
+                post_fill=_global_num_tokens_post_fill,
             )
         )
 

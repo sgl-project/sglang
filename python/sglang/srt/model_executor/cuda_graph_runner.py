@@ -367,23 +367,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             dsts.append(self.bootstrap_room_ids_int[:raw_bs])
             srcs.append(forward_batch.bootstrap_room_ids_int)
 
-        if require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
-
-        if enable_num_token_non_padded_flag:
-            if require_gathered_buffer and not dsa_enable_prefill_cp:
-                num_tokens_per_dp = bs * num_tokens_per_bs
-                local = compute_local_num_token_non_padded(
-                    global_num_token_non_padded=forward_batch.num_token_non_padded,
-                    num_tokens_per_dp=num_tokens_per_dp,
-                )
-                dsts.append(self.num_token_non_padded)
-                srcs.append(local)
-            else:
-                dsts.append(self.num_token_non_padded)
-                srcs.append(forward_batch.num_token_non_padded)
-
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
             for key, buf in self.pp_proxy_tensors.items():
@@ -726,6 +709,11 @@ class CudaGraphRunner:
             enable_mamba_track=enable_mamba_track,
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,
+            enable_num_token_non_padded=enable_num_token_non_padded(),
+            require_gathered_buffer=self.require_gathered_buffer,
+            enable_prefill_cp=self.enable_prefill_cp,
+            require_mlp_tp_gather=self.require_mlp_tp_gather,
+            dp_size=self.dp_size,
             source=self.buffers,
         )
 
