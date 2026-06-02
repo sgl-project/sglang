@@ -239,3 +239,59 @@ def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready():
     assert torch.equal(temb, torch.tensor([[7.0]]))
     assert torch.equal(timestep_proj, torch.tensor([[8.0]]))
     assert image_states is None
+
+
+def test_lingbot_context_cache_update_skips_unused_projection(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
+        lingbot_world_causal_denoising as lingbot_denoising,
+    )
+
+    stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+        LingBotWorldCausalDMDDenoisingStage
+    )
+    calls = []
+
+    class _Transformer:
+        def __call__(self, latent_input, prompt_embeds, timestep, **kwargs):
+            calls.append((latent_input, prompt_embeds, timestep, kwargs))
+            return latent_input
+
+    stage.transformer = _Transformer()
+    monkeypatch.setattr(
+        lingbot_denoising,
+        "current_platform",
+        SimpleNamespace(device_type="cpu"),
+    )
+
+    context_input = torch.ones(2, 3, 4, 5, 6)
+    batch = SimpleNamespace()
+    stage._update_causal_context_cache(
+        batch,
+        SimpleNamespace(pipeline_config=SimpleNamespace(context_noise=7)),
+        context_input=context_input,
+        prompt_embeds="prompt",
+        kv_cache="kv",
+        crossattn_cache="cross",
+        current_start_tokens=12,
+        start_frame=4,
+        image_kwargs={"encoder_hidden_states_image": "image"},
+        pos_cond_kwargs={"c2ws_plucker_emb": "pose"},
+        attn_metadata="metadata",
+        target_dtype=torch.float32,
+        autocast_enabled=False,
+    )
+
+    assert len(calls) == 1
+    latent_input, prompt_embeds, timestep, kwargs = calls[0]
+    assert latent_input is context_input
+    assert prompt_embeds == "prompt"
+    assert timestep.shape == (2, 1)
+    assert timestep.dtype == torch.long
+    assert timestep.tolist() == [[7], [7]]
+    assert kwargs["kv_cache"] == "kv"
+    assert kwargs["crossattn_cache"] == "cross"
+    assert kwargs["current_start"] == 12
+    assert kwargs["start_frame"] == 4
+    assert kwargs["encoder_hidden_states_image"] == "image"
+    assert kwargs["c2ws_plucker_emb"] == "pose"
+    assert kwargs["skip_final_projection"] is True

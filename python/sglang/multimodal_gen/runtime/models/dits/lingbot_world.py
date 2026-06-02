@@ -1208,6 +1208,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         cache_start: int = 0,
         start_frame: int = 0,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        skip_final_projection: bool = False,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
         sequence_shard_enabled = (
@@ -1324,6 +1325,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 cache_start=cache_start,
                 c2ws_plucker_emb=c2ws_plucker_emb,
             )
+
+        if skip_final_projection:
+            return hidden_states
 
         if sequence_shard_enabled:
             hidden_states = _sequence_all_gather_varlen(
