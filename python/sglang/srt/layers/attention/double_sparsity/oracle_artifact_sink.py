@@ -120,9 +120,6 @@ _ACTIVE_TRIAL: Optional[OracleTrialContext] = None
 _ACTIVE_TRIAL_LOCK = threading.Lock()
 _TRIAL_FILE_ENV = "SGLANG_DS_RECALL_ORACLE_TRIAL_FILE"
 
-# Cache for the cross-process trial file: (mtime, parsed context).
-_TRIAL_FILE_CACHE: tuple = (None, None)
-
 
 def _trial_file() -> Optional[str]:
     return os.environ.get(_TRIAL_FILE_ENV) or None
@@ -170,34 +167,26 @@ def clear_active_trial() -> None:
 def get_active_trial() -> Optional[OracleTrialContext]:
     """Return the active trial, preferring the in-process var, then the file.
 
-    The file read is mtime-cached so the selector hot path (eager only) does not
-    re-parse JSON every call within a single request.
+    Reads the trial file FRESH every call (no mtime cache). This is an eager
+    diagnostic path; a stale-cache micro-optimization is not worth the
+    cross-process correctness risk (a coarse-mtime collision or a stale context
+    with out-of-range needle positions silently suppressed all recording).
     """
     if _ACTIVE_TRIAL is not None:
         return _ACTIVE_TRIAL
     path = _trial_file()
     if path is None:
         return None
-    global _TRIAL_FILE_CACHE
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return None
-    cached_mtime, cached_ctx = _TRIAL_FILE_CACHE
-    if cached_mtime == mtime and cached_ctx is not None:
-        return cached_ctx
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        ctx = OracleTrialContext(
+        return OracleTrialContext(
             request_id=data["request_id"],
             trial_id=data["trial_id"],
             needle_positions=[int(p) for p in data["needle_positions"]],
         )
     except (OSError, ValueError, KeyError):
         return None
-    _TRIAL_FILE_CACHE = (mtime, ctx)
-    return ctx
 
 
 def next_sample_index() -> int:

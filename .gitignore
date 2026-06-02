@@ -290,6 +290,10 @@ artifacts/
 development/loop5/refined_plan_v1.md
 development/loop7/refined_plan_v1.md
 
+# Loop-7 transient/runtime measurement artifacts (reproducible from the drivers)
+development/loop7/oracle_trial.json
+development/loop7/ds_niah_smoke.json
+
 # Large local calibration corpus (rebuildable; provenance recorded in calibration_provenance.md)
 runs/20260528_dsv32_mvp/calib_corpus_pileval.txt
 runs/20260528_dsv32_mvp/longprompt_ac11.txt
