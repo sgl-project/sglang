@@ -45,9 +45,7 @@ export const Gemma4Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      // 12B unified: the *-assistant draft uses the gemma4_unified_assistant arch,
-      // which SGLang does not register yet — hide MTP until supported.
-      condition: (values) => !['mi300x'].includes(values.hardware) && values.modelSize !== '12b',
+      condition: (values) => !['mi300x'].includes(values.hardware),
       items: [
         { id: 'disabled', label: 'Disabled', subtitle: 'Baseline', default: true },
         { id: 'enabled', label: 'Enabled', subtitle: 'Lower Latency', default: false }

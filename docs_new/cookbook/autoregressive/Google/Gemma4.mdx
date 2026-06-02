@@ -202,6 +202,18 @@ sglang serve \
 ```
 
 ```bash Command
+# Gemma 4 12B + MTP (~35% faster single-stream decode on H200)
+sglang serve \
+  --model-path google/gemma-4-12B-it \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path google/gemma-4-12B-it-assistant \
+  --speculative-num-steps 5 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-eagle-topk 1 \
+  --mem-fraction-static 0.85
+```
+
+```bash Command
 # Gemma 4 31B + MTP
 sglang serve \
   --model-path google/gemma-4-31B-it \
