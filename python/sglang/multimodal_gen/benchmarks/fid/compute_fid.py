@@ -23,7 +23,7 @@ def compute_fid(
 ) -> float:
     try:
         from pytorch_fid import fid_score
-    except Exception as e:
+    except ImportError as e:
         raise RuntimeError(
             "pytorch-fid is required. Install with: pip install pytorch-fid"
         ) from e
