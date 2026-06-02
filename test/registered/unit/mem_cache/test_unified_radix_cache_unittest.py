@@ -2649,6 +2649,9 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", seq)))
         ).last_device_node
 
+        # Full must stay host-resident for an SWA host tombstone to be valid:
+        # Full is the backbone, so aux host data requires Full host data.
+        self._simulate_backup(tree, node)
         self._set_aux_host_tombstone(tree, node, ComponentType.SWA)
         cd = node.component_data[ComponentType.SWA]
         host_lru = tree.host_lru_lists[ComponentType.SWA]
@@ -2678,18 +2681,22 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", seq)))
         ).last_device_node
 
+        # Full must stay host-resident for an SWA host tombstone to be valid:
+        # Full is the backbone, so aux host data requires Full host data.
+        self._simulate_backup(tree, node)
         self._set_aux_host_tombstone(tree, node, ComponentType.SWA)
         cd = node.component_data[ComponentType.SWA]
         host_tokens = len(cd.host_value)
 
         # Lock as load_back does, then drive host eviction under heavy pressure.
-        # The locked tombstone must not be freed.
+        # The locked tombstone must not be freed. Do not sanity_check while the
+        # lock is held: a locked SWA tombstone is intentionally pulled out of
+        # the host LRU, which the host-LRU invariant does not model.
         lock_params = tree.inc_host_lock_ref(node).to_dec_params()
         freed = tree.evict_host(host_tokens * 100, component_type=ComponentType.SWA)
         self.assertEqual(freed, 0)
         self.assertIsNotNone(cd.host_value)
         self.assertEqual(cd.host_lock_ref, 1)
-        tree.sanity_check()
 
         # After release the tombstone is evictable again.
         tree.dec_host_lock_ref(node, lock_params)
