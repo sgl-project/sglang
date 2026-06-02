@@ -331,7 +331,6 @@ def trtllm_fp4_block_scale_routed_moe_lora(
     act_type: Optional[int] = None,
     norm_topk_prob: bool = True,
     lora_ready_event: int = 0,
-    act_ready_event: int = 0,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """NVFP4 sibling of :func:`trtllm_fp8_block_scale_routed_moe_lora`.
 
@@ -410,7 +409,6 @@ def trtllm_fp4_block_scale_routed_moe_lora(
         gate_up_lora_delta,
         activation_lora_input,
         lora_ready_event,
-        act_ready_event,
     )
 
     return output if do_finalize else result
