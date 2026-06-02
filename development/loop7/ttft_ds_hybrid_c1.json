@@ -1,0 +1,21 @@
+{
+  "label": "DS-hybrid c1 short",
+  "mode": "stream",
+  "conc": 1,
+  "osl": 256,
+  "prompt_repeat": 1,
+  "completed": 1,
+  "ttft_ms_mean": 178.4,
+  "ttft_ms_p50": 178.4,
+  "ttft_ms_p99": 178.4,
+  "ttft_ms_min": 178.4,
+  "ttft_ms_max": 178.4,
+  "ttft_ms_all": [
+    178.4
+  ],
+  "per_req_decode_tps_mean": 41.1,
+  "per_req_decode_tps_min": 41.1,
+  "system_throughput_tok_s": 40.1,
+  "total_out_tokens": 256,
+  "wall_s": 6.4
+}

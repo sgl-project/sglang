@@ -1,15 +1,24 @@
-"""Loop-7 closed-batch decode-TPS probe (AC-6 perf guardrail).
+"""Loop-7 closed-batch decode-TPS + TTFT probe (AC-6 perf guardrail).
 
 The trustworthy pure-decode-TPS method (per the loop's bench lessons): fire ``conc``
 concurrent ``/generate`` requests with a SHORT prompt + ``ignore_eos`` + a fixed
 output length, so the server runs a steady closed decode batch (no new arrivals,
-``#queue-req: 0``). Per-request decode TPS = output_tokens / e2e (prefill is
-negligible for a short prompt, so e2e ~= decode time). This avoids the GSP
-window-mode harness that can fabricate throughput from empty streams.
+``#queue-req: 0``). This avoids the GSP window-mode harness that can fabricate
+throughput from empty streams (BL-20260531-bench-empty-stream-failclosed).
+
+Two modes:
+  * default (non-streaming): per-request decode TPS = output_tokens / e2e (prefill is
+    negligible for a short prompt, so e2e ~= decode time). Kept for R19 reproducibility.
+  * ``--stream`` (SSE): records TTFT (first-token arrival - submit) AND a clean
+    post-first-token decode TPS = (completion_tokens - 1) / (t_last - t_first). This is
+    the AC-6 TTFT guardrail. It mirrors the canonical SGLang streaming parser
+    (``data: {"text": <cumulative>, "meta_info": {"completion_tokens": N}}``) and FAILS
+    CLOSED on an HTTP-200 empty stream (never records a no-token response as a
+    completion -- BL-20260531-bench-empty-stream-failclosed).
 
 Usage:
     DS_BASE_URL=http://127.0.0.1:30000 python development/loop7/perf_closed_batch.py \
-        --conc 16 --osl 256 --label "DS-hybrid graph" --out development/loop7/perf_x.json
+        --conc 16 --osl 256 --stream --label "DS-hybrid graph" --out development/loop7/perf_x.json
 """
 
 from __future__ import annotations
@@ -22,10 +31,25 @@ import time
 import urllib.request
 
 
-def _one(base_url: str, osl: int):
+def _pct(xs, q):
+    """Linear-interpolation percentile (q in [0,1]); no numpy dependency."""
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    if len(s) == 1:
+        return s[0]
+    pos = (len(s) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    frac = pos - lo
+    return s[lo] * (1 - frac) + s[hi] * frac
+
+
+def _one(base_url: str, osl: int, prompt: str = "The capital of France is"):
+    """Non-streaming /generate: returns (e2e_seconds, completion_tokens)."""
     body = json.dumps(
         {
-            "text": "The capital of France is",
+            "text": prompt,
             "sampling_params": {
                 "max_new_tokens": osl,
                 "temperature": 0.0,
@@ -44,38 +68,154 @@ def _one(base_url: str, osl: int):
     return e2e, ct
 
 
+def _one_stream(base_url: str, osl: int, prompt: str):
+    """Streaming SSE /generate: returns dict with ttft, e2e, completion_tokens, decode_tps.
+
+    Mirrors ``async_request_sglang_generate``: each SSE line is ``data: {json}``; the
+    payload carries the *cumulative* ``text`` and ``meta_info.completion_tokens``. TTFT is
+    the arrival time of the first chunk carrying non-empty text; pure decode TPS uses the
+    post-first-token window only. FAILS CLOSED on an HTTP-200 stream that yields no token.
+    """
+    body = json.dumps(
+        {
+            "text": prompt,
+            "sampling_params": {
+                "max_new_tokens": osl,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            },
+            "stream": True,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        base_url + "/generate", data=body, headers={"Content-Type": "application/json"}
+    )
+    t0 = time.perf_counter()
+    ttft = 0.0
+    t_first = None
+    t_last = t0
+    completion_tokens = 0
+    generated_text = ""
+    with urllib.request.urlopen(req, timeout=900) as r:
+        for raw in r:
+            raw = raw.strip()
+            if not raw:
+                continue
+            chunk = raw.decode("utf-8")
+            if chunk.startswith("data: "):
+                chunk = chunk[len("data: ") :]
+            if chunk == "[DONE]":
+                continue
+            data = json.loads(chunk)
+            if data.get("text"):
+                now = time.perf_counter()
+                generated_text = data["text"]
+                completion_tokens = int(data["meta_info"]["completion_tokens"])
+                if ttft == 0.0:
+                    ttft = now - t0
+                    t_first = now
+                t_last = now
+    e2e = time.perf_counter() - t0
+    # Fail closed: an HTTP-200 stream that produced no token must NOT be recorded as a
+    # completion (otherwise throughput/TTFT is fabricated). See the bench lesson.
+    if ttft == 0.0 and not generated_text:
+        raise RuntimeError(
+            "HTTP 200 but streaming response produced no tokens (empty stream); "
+            "refusing to record as a completed request"
+        )
+    decode_s = (t_last - t_first) if t_first is not None else 0.0
+    decode_tps = (
+        (completion_tokens - 1) / decode_s
+        if (decode_s > 0 and completion_tokens > 1)
+        else 0.0
+    )
+    return {
+        "ttft": ttft,
+        "e2e": e2e,
+        "completion_tokens": completion_tokens,
+        "decode_tps": decode_tps,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--conc", type=int, required=True)
     ap.add_argument("--osl", type=int, default=256)
     ap.add_argument("--label", default="")
     ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--stream",
+        action="store_true",
+        help="SSE streaming mode: record TTFT + clean post-first-token decode TPS",
+    )
+    ap.add_argument("--prompt", default="The capital of France is")
+    ap.add_argument(
+        "--prompt-repeat",
+        type=int,
+        default=1,
+        help="repeat the prompt sentence N times to build a longer (prefill-bound) prompt",
+    )
     args = ap.parse_args()
     base = os.environ.get("DS_BASE_URL", "http://127.0.0.1:30000")
+    prompt = (" ".join([args.prompt] * args.prompt_repeat)).strip()
 
-    _one(base, 16)  # warmup (capture/JIT)
+    if args.stream:
+        _one_stream(base, 16, prompt)  # warmup (capture/JIT)
+        t0 = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.conc) as ex:
+            futs = [ex.submit(_one_stream, base, args.osl, prompt) for _ in range(args.conc)]
+            res = [f.result() for f in futs]
+        wall = time.time() - t0
 
-    t0 = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.conc) as ex:
-        futs = [ex.submit(_one, base, args.osl) for _ in range(args.conc)]
-        res = [f.result() for f in futs]
-    wall = time.time() - t0
+        ttfts = [r["ttft"] for r in res]
+        decode_tps = [r["decode_tps"] for r in res if r["decode_tps"] > 0]
+        cts = [r["completion_tokens"] for r in res]
+        out = {
+            "label": args.label,
+            "mode": "stream",
+            "conc": args.conc,
+            "osl": args.osl,
+            "prompt_repeat": args.prompt_repeat,
+            "completed": len(res),
+            "ttft_ms_mean": round(1000 * sum(ttfts) / len(ttfts), 1),
+            "ttft_ms_p50": round(1000 * _pct(ttfts, 0.50), 1),
+            "ttft_ms_p99": round(1000 * _pct(ttfts, 0.99), 1),
+            "ttft_ms_min": round(1000 * min(ttfts), 1),
+            "ttft_ms_max": round(1000 * max(ttfts), 1),
+            "ttft_ms_all": [round(1000 * t, 1) for t in ttfts],
+            "per_req_decode_tps_mean": (
+                round(sum(decode_tps) / len(decode_tps), 2) if decode_tps else 0.0
+            ),
+            "per_req_decode_tps_min": round(min(decode_tps), 2) if decode_tps else 0.0,
+            "system_throughput_tok_s": round(sum(cts) / wall, 1),
+            "total_out_tokens": sum(cts),
+            "wall_s": round(wall, 1),
+        }
+    else:
+        _one(base, 16, prompt)  # warmup (capture/JIT)
+        t0 = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.conc) as ex:
+            futs = [ex.submit(_one, base, args.osl, prompt) for _ in range(args.conc)]
+            res = [f.result() for f in futs]
+        wall = time.time() - t0
 
-    e2es = [e for e, _ in res]
-    cts = [c for _, c in res]
-    per_req_tps = [c / e for c, e in zip(cts, e2es) if e > 0]
-    out = {
-        "label": args.label,
-        "conc": args.conc,
-        "osl": args.osl,
-        "completed": len(res),
-        "per_req_decode_tps_mean": round(sum(per_req_tps) / len(per_req_tps), 2),
-        "per_req_decode_tps_min": round(min(per_req_tps), 2),
-        "system_throughput_tok_s": round(sum(cts) / wall, 1),
-        "mean_e2e_s": round(sum(e2es) / len(e2es), 2),
-        "total_out_tokens": sum(cts),
-        "wall_s": round(wall, 1),
-    }
+        e2es = [e for e, _ in res]
+        cts = [c for _, c in res]
+        per_req_tps = [c / e for c, e in zip(cts, e2es) if e > 0]
+        out = {
+            "label": args.label,
+            "mode": "e2e",
+            "conc": args.conc,
+            "osl": args.osl,
+            "completed": len(res),
+            "per_req_decode_tps_mean": round(sum(per_req_tps) / len(per_req_tps), 2),
+            "per_req_decode_tps_min": round(min(per_req_tps), 2),
+            "system_throughput_tok_s": round(sum(cts) / wall, 1),
+            "mean_e2e_s": round(sum(e2es) / len(e2es), 2),
+            "total_out_tokens": sum(cts),
+            "wall_s": round(wall, 1),
+        }
+
     print(json.dumps(out), flush=True)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:

@@ -4,7 +4,7 @@ Consolidated guardrail report for Loop 7 (the source artifact for the task20
 decision record). All measurements are at the Loop-7 op-point under **CUDA graph**:
 DS int8 / `mem_fraction_static=0.7` / fp8-KV / TP=8 / page 64 / `flashmla_kv`
 prefill+decode / radix-off / `--disable-overlap-schedule` / `--disable-piecewise-cuda-graph`.
-GPU: 8× NVIDIA H200 (sm90). Commit: R19 tree on `f9f6ec056`.
+GPU: 8× NVIDIA H200 (sm90). Commit: R19 decode-TPS on `f9f6ec056`; R20 TTFT guardrails on `68969deb0`.
 
 ## Perf guardrails (conc-1 / conc-16, graph mode)
 Per-request decode TPS measured by the **closed-batch** method (the trustworthy
@@ -22,6 +22,51 @@ client number). All decode batches ran under CUDA graph (`cuda graph: True`).
 Artifacts: `perf_ds_default_c{1,16}.json`, `perf_ds_hybrid_c{1,16}.json`,
 `perf_dsa_c{1,16}.json` (+ `perf_closed_batch.py`); lifted from `m10_lifted_graph_finding.md`.
 
+## TTFT guardrails (conc-1 / conc-16, graph mode) — R20
+Fresh time-to-first-token measured by the **streaming** mode of the same closed-batch
+probe (`perf_closed_batch.py --stream`): per request TTFT = first-streamed-token arrival −
+submit; it mirrors the canonical SGLang SSE parser (`data: {"text": <cumulative>,
+"meta_info": {"completion_tokens": N}}`) and **fails closed on an HTTP-200 empty stream**
+(never records a no-token response as a completion — the loop-6 R19 fail-closed lesson).
+Two closed-batch prompt regimes at the same Loop-7 op-point, under CUDA graph: a SHORT
+prompt (the R19 decode cross-check) and a ~770-token prompt (a prefill-bound TTFT
+guardrail; stays in the dense-prefill regime, < the 2048 DSA prefill threshold). TTFT in
+**milliseconds**; conc-16 reports p50 / p99 across the 16 concurrent requests.
+
+| variant | c1 short | c16 short (p50 / p99) | c1 ~770-tok | c16 ~770-tok (p50 / p99) | graph | served |
+|---|---|---|---|---|---|---|
+| DSA (native-NSA) | 150.8 | 307.1 / 309.2 | 150.9 | 1161.5 / 1322.1 | replay ✓ | 16/16 |
+| DS-default | 183.3 | 371.7 / 374.0 | 180.4 | 1210.9 / 1400.2 | replay ✓ | 16/16 |
+| DS-hybrid (Tier-2.B) | 178.4 | 363.3 / 365.1 | 177.7 | 1218.1 / 1405.2 | replay ✓ | 16/16 |
+
+Artifacts: `ttft_{ds_default,ds_hybrid,dsa}_c{1,16}.json` (short) +
+`ttft_{ds_default,ds_hybrid,dsa}_c{1,16}_p770.json` (~770-tok prefill); each carries the
+per-request `ttft_ms_all` array + mean/p50/p99/min/max.
+
+**Streaming decode-TPS cross-check** (the same `--stream` run also yields a *clean*
+post-first-token decode TPS = `(completion_tokens − 1) / (t_last − t_first)`, which —
+unlike the R19 e2e number — excludes prefill+first-token, so it is the theoretically
+correct pure-decode rate and runs slightly higher): DSA **87.3 / 58.7**, DS-default
+**40.8 / 28.5**, DS-hybrid **41.1 / 28.5** (conc-1 / conc-16). This reproduces the R19
+closed-batch ordering and the DS ≈ 0.48–0.49× DSA structural ratio, validating both
+methods.
+
+### TTFT findings (non-regression)
+1. **DS-hybrid TTFT ≈ DS-default TTFT** at every point (178 vs 183 ms c1; 363 vs 372 ms
+   c16-short p50; 1218 vs 1211 ms c16-p770 p50 — all within run-to-run noise). The
+   Tier-2.B hybrid scorer adds **no material TTFT cost** — the same decode-free result the
+   R19 decode-TPS table showed, now confirmed on the first-token latency too.
+2. **DS TTFT is modestly above DSA** (~+30 ms c1, ~+60 ms c16-short, ~+50–80 ms c16-p770) —
+   the small per-step cost of the DS selection + logical→physical adapter, the same
+   structural overhead as the decode-TPS gap; NOT a Loop-7 regression. In the prefill-bound
+   c16-p770 case TTFT is dominated by prefill and DS ≈ DSA + ~5%.
+3. **Every measured TTFT is far below the Loop-6 directional ceiling** (P99 22 s): the
+   heaviest measured point (DS conc-16, ~770-tok prefill) is P99 ≈ **1.4 s** — over an
+   order of magnitude under budget. (The Loop-6 directional P99 13.13 s < 22 s was at the
+   much longer full-context Option-B prompt; that point is unchanged because the
+   admission/decode path is untouched by the opt-in/default-off Loop-7 work, so the
+   directional result still holds and the fresh op-point TTFT shows no regression.)
+
 ## Non-regression conclusions
 1. **The Tier-2.B hybrid scorer adds NO material decode cost.** DS-hybrid == DS-default
    to within noise: conc-1 40.1 vs 39.8 tok/s/req; conc-16 **27.6 vs 27.6** (identical);
@@ -35,9 +80,13 @@ Artifacts: `perf_ds_default_c{1,16}.json`, `perf_ds_hybrid_c{1,16}.json`,
    the gap is the same selector cost present since the Tier-1 spine landed.
 3. **The DS-default conc-16 decode TPS (27.6) matches the Loop-6 closed-batch number
    (27.1 at the full-context op-point)** — the Tier-1 admission/decode spine is
-   non-regressed; the directional AC-5 conc-16 result (P99 TTFT 13.13 s < 22 s at the
-   full-context Option-B point, Loop-6) still holds because the decode/admission path
-   is unchanged by the Loop-7 scorer/lifted work (all opt-in, default-off byte-identical).
+   non-regressed. The **fresh R20 conc-1/16 TTFT** (see the TTFT table: DS-default P99
+   374 ms short / 1.40 s at ~770-tok prefill; DS-hybrid within noise of it) confirms no
+   first-token-latency regression at the measured op-point, and is far under the P99 22 s
+   ceiling. The Loop-6 directional AC-5 result (P99 TTFT 13.13 s < 22 s at the much longer
+   full-context Option-B point) still holds as the historical full-context reference
+   because the decode/admission path is unchanged by the Loop-7 scorer/lifted work (all
+   opt-in, default-off byte-identical).
 4. **DSA / fp16 defaults are behavior-unchanged.** The native-NSA reference boots with
    no `--enable-double-sparsity`; the default `flashmla_kv` `dsa_index_topk` assert is
    untouched; with every DS opt-in flag off the decode is byte-identical (347/350 DS
@@ -71,14 +120,22 @@ and the wider-budget lever is a bounded-secondary 4K lever.
 - DS-hybrid config: same + `"scorer_norm":"hybrid","scorer_norm_hybrid_threshold":8192,"head_agg":"mean"`.
 - DSA: `serve_native_nsa.sh` `DISABLE_RADIX_CACHE=1 MEM_FRACTION_STATIC=0.85` (no DS).
 - Launch: `LOOP7_MEASUREMENT=1 [SCORER_NORM=hybrid HEAD_AGG=mean] bash development/serve_double_sparsity.sh` (graph mode — no `--disable-cuda-graph`).
-- Probe: `development/loop7/perf_closed_batch.py` (closed-batch, OSL=256).
+- Probe: `development/loop7/perf_closed_batch.py` — closed-batch, OSL=256; default mode
+  for the R19 e2e decode-TPS, `--stream` mode for the R20 TTFT + clean post-first-token
+  decode-TPS.
 - Measurement caveat: the GSP window-mode bench (`benchmark.sh`) can fabricate
   throughput from empty streams (the loop-6 R19 fail-closed lesson), so this uses the
-  closed-batch decode-TPS method instead; full-context TTFT/P99 at conc-16 is the
-  Loop-6 AC-5 directional result (unchanged decode/admission path).
+  closed-batch probe; the `--stream` TTFT path adopts the same fail-closed guard (an
+  HTTP-200 empty stream raises, never recorded as a completion). The R20 TTFT here is the
+  fresh conc-1/16 guardrail at the Loop-7 op-point; the Loop-6 full-context P99 13.13 s
+  is retained only as the historical full-context directional reference.
 
 ## AC-6 status
-**MET** — perf guardrails recorded at conc-1/16 (decode TPS, GPU mem, graph-replay,
-admission) for DS-default / DS-hybrid / DSA / lifted; the landed long-context deliverable
-(DS-default + the Tier-2.B hybrid) is non-regressing (hybrid == default decode TPS,
-Loop-6 spine intact); DSA/fp16 defaults unchanged.
+**MET** — the full conc-1/16 guardrail set required by the plan
+(`refined_plan_v1.md:80`: **TTFT, decode TPS/req, GPU memory, graph-replay success,
+admission**) is recorded for DS-default / DS-hybrid / DSA (+ lifted decode TPS): the R19
+decode-TPS/mem/graph/admission table **and** the R20 fresh conc-1/16 TTFT table above. The
+landed long-context deliverable (DS-default + the Tier-2.B hybrid) is non-regressing on
+**both** decode TPS (hybrid == default, 27.6 == 27.6 conc-16) **and** TTFT (hybrid ≈
+default within noise); every measured TTFT is far under the P99 22 s ceiling; the Loop-6
+Tier-1 spine is intact; DSA/fp16 defaults are behavior-unchanged.

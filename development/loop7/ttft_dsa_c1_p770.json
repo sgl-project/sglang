@@ -1,0 +1,21 @@
+{
+  "label": "DSA c1 p770",
+  "mode": "stream",
+  "conc": 1,
+  "osl": 256,
+  "prompt_repeat": 128,
+  "completed": 1,
+  "ttft_ms_mean": 150.9,
+  "ttft_ms_p50": 150.9,
+  "ttft_ms_p99": 150.9,
+  "ttft_ms_min": 150.9,
+  "ttft_ms_max": 150.9,
+  "ttft_ms_all": [
+    150.9
+  ],
+  "per_req_decode_tps_mean": 84.54,
+  "per_req_decode_tps_min": 84.54,
+  "system_throughput_tok_s": 80.8,
+  "total_out_tokens": 256,
+  "wall_s": 3.2
+}
