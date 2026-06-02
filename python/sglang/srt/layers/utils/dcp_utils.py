@@ -234,8 +234,10 @@ def cp_lse_ag_out_rs(
 
     with use_symmetric_memory(cp_group):
         # cp_attn_out is [B,H,D], we want to transpose it to [H,B,D] for the kernel, and then transpose back after correction.
-        new_output = cp_attn_out.new_empty(cp_attn_out.transpose(0, 1).shape)
-        cp_attn_lse = cp_attn_lse.clone()
+        new_output = cp_attn_out.new_empty(
+            cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
+        )
+        cp_attn_lse = cp_attn_lse.to(torch.float32)
     lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
@@ -243,7 +245,7 @@ def cp_lse_ag_out_rs(
         cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
     )
     out = cp_group.reduce_scatter_along_dim(out, dim=0)
-    return out
+    return out.to(cp_attn_out.dtype)
 
 
 @triton.jit
