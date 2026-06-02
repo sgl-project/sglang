@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -124,26 +123,6 @@ class SessionSlot:
 
 def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
-
-
-# Floor priority (just above the radix root's -sys.maxsize) for KV that a
-# radix-native session inserts into the evictable tree. Session KV must be the
-# FIRST thing reclaimed under pressure -- otherwise a saturated pool could wedge
-# even though nothing is pinned. Stamping the floor makes these nodes the first
-# eviction victims under `--radix-eviction-policy priority`; inert under the
-# default `lru` policy (node priority is ignored there).
-RADIX_NATIVE_SESSION_PRIORITY = -(sys.maxsize - 1)
-
-
-def _is_radix_native_session(req: Optional[Req]) -> bool:
-    # A radix-native session is a non-pinned session (streaming=False) -- its KV
-    # rides the evictable radix rather than a slot. (Pinned streaming sessions
-    # have streaming=True and are handled by the slot path.)
-    return (
-        req is not None
-        and req.session is not None
-        and not req.session.streaming
-    )
 
 
 class StreamingSession(BasePrefixCache):
@@ -393,23 +372,15 @@ class StreamingSession(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
-        if _is_radix_native_session(req):
-            req.priority = RADIX_NATIVE_SESSION_PRIORITY
         self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if self.try_cache_unfinished_req(req, **kwargs):
             return
-        if _is_radix_native_session(req):
-            req.priority = RADIX_NATIVE_SESSION_PRIORITY
         self.inner.cache_unfinished_req(req, **kwargs)
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
-
-    def drain_pending_release(self, max_nodes: int = 64) -> int:
-        drain = getattr(self.inner, "drain_pending_release", None)
-        return drain(max_nodes) if drain is not None else 0
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         result = self.try_inc_lock_ref(node)
@@ -430,11 +401,6 @@ class StreamingSession(BasePrefixCache):
     def release_session(self, session_id: str) -> None:
         slot = self.slots.pop(session_id, None)
         if slot is None:
-            # Radix-native session: no pinned slot. Its KV lives in the evictable
-            # radix; deterministically free the session's unique chain at close.
-            release = getattr(self.inner, "release_session", None)
-            if release is not None:
-                release(session_id)
             return
         protected_len = slot.cache_protected_len
         lock_node = slot.last_node
