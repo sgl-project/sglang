@@ -75,6 +75,8 @@ pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
 # Install transformers with Gemma 4 support
 pip install 'git+https://github.com/huggingface/transformers.git@91b1ab1fdfa81a552644a92fbe3e8d88de40e167'
+# gemma-4-12B-it (unified) additionally requires a transformers build that
+# includes the gemma4_unified model family (>= 5.10).
 
 # Or use Docker AMD64
 docker pull lmsysorg/sglang:gemma4 # CUDA 12.9
@@ -548,6 +550,18 @@ Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his
 ```
 
 </details>
+
+For best ASR quality, use the recommended transcription prompt structure:
+
+```text Prompt
+Transcribe the following speech segment in {LANGUAGE} into {LANGUAGE} text.
+
+Follow these specific instructions for formatting the answer:
+* Only output the transcription, with no newlines.
+* When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, and write 3 instead of three.
+```
+
+For speech translation (AST), ask for the transcription in the source language first, then the translation: *"Transcribe the following speech segment in {SOURCE_LANGUAGE}, then translate it into {TARGET_LANGUAGE}. ..."*
 
 ## 5. Benchmark
 
