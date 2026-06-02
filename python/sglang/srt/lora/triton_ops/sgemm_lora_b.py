@@ -2,7 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    lora_pdl_enabled,
+    lora_pdl_launch_kwargs,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -36,6 +40,7 @@ def _sgemm_lora_b_kernel(
     BLOCK_K: tl.constexpr,
     # For fused output scaling
     scalings,
+    ENABLE_PDL: tl.constexpr,
 ):
     """
     Computes a segmented batched matrix multiplication for the LoRA B matrix
@@ -94,34 +99,42 @@ def _sgemm_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    # Iterate to compute the block in output matrix
     n_mask = n_offset[None, :] < N
-    partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        x_tile = tl.load(
-            x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
-            other=0.0,
-        )
-        w_tile = tl.load(
-            w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
-            other=0.0,
-        )
-        partial_sum += tl.dot(x_tile, w_tile)
-
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
-
-    # Store result to output matrix
-    partial_sum *= scaling
-    partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
     output_mask = (s_offset[:, None] < seg_len) & n_mask
-    partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
-    tl.store(output_ptr, partial_sum, mask=output_mask)
+
+    # PDL: the LoRA-B weight is a static pool buffer and the routing metadata is
+    # prepared upstream, so load the weight in the prologue to overlap it with
+    # the producing shrink kernel's tail. There is exactly one K-tile here
+    # (BLOCK_K = next_pow2(rank) >= rank >= K), so this single load covers the
+    # whole contraction. Wait only before reading the dynamic shrink output `x`
+    # and the fused-add base (which the immediately-preceding kernel may write).
+    w_tile = tl.load(
+        w_ptrs,
+        mask=(k_offset[:, None] < K) & n_mask,
+        other=0.0,
+    )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x_tile = tl.load(
+        x_ptrs,
+        mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K),
+        other=0.0,
+    )
+    partial_sum = tl.dot(x_tile, w_tile)
+
+    # Store result to output matrix
+    partial_sum *= scaling
+    partial_sum = partial_sum.to(x.dtype.element_ty)
+    # Fused base-add. Each (token, n) output tile has a single writer and runs
+    # after the base GEMM on the same stream, so a relaxed atomic_add is correct
+    # and drops the base read+store from the critical path.
+    tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def sgemm_lora_b_fwd(
@@ -145,9 +158,10 @@ def sgemm_lora_b_fwd(
     R = weights.shape[-1]
     assert x.shape[-1] == R
 
-    # Block shapes
+    # Block shapes. BLOCK_R = next_pow2(R) >= R so the contraction is a single
+    # K-tile (the kernel relies on this for its single-load straight-line path).
     BLOCK_S = 16
-    BLOCK_R = 16
+    BLOCK_R = triton.next_power_of_2(R)
     BLOCK_N = 256
 
     grid = (
@@ -161,6 +175,7 @@ def sgemm_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl = lora_pdl_enabled()
     _sgemm_lora_b_kernel[grid](
         x,
         weights,
@@ -184,5 +199,7 @@ def sgemm_lora_b_fwd(
         BLOCK_N,
         BLOCK_R,
         batch_info.scalings,
+        enable_pdl,
+        **lora_pdl_launch_kwargs(enable_pdl),
     )
     return output

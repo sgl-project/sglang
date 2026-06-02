@@ -2,7 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    lora_pdl_enabled,
+    lora_pdl_launch_kwargs,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -36,6 +40,7 @@ def _gate_up_lora_b_kernel(
     BLOCK_K: tl.constexpr,
     # For fused output scaling
     scalings,
+    ENABLE_PDL: tl.constexpr,
 ):
     """
     This kernel packs 2 sgemms (gate/up) into a single kernel. The multiplication
@@ -104,37 +109,37 @@ def _gate_up_lora_b_kernel(
     w_ptrs = (weights + w_index * w_stride_0 + n_start * w_stride_1) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
+    w_tile = tl.load(
+        w_ptrs,
+        mask=(k_offset[:, None] < K) & (n_offset[None, :] < output_dim),
+        other=0.0,
+    )
 
-    # Iterate to compute the block in output matrix
-    partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        x_tile = tl.load(
-            x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
-            other=0.0,
-        )
-        w_tile = tl.load(
-            w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K)
-            & (n_offset[None, :] < output_dim),
-            other=0.0,
-        )
-        partial_sum += tl.dot(x_tile, w_tile)
-
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
-
-    # Store result to output matrix
-    partial_sum *= scaling
-    partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = (
         output
         + n_start * output_stride_1
         + (s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
     )
     output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < output_dim)
-    partial_sum += tl.load(output_ptr, mask=output_mask)
-    tl.store(output_ptr, partial_sum, mask=output_mask)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    # Iterate to compute the block in output matrix
+    x_tile = tl.load(
+        x_ptrs,
+        mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K),
+        other=0.0,
+    )
+    partial_sum = tl.dot(x_tile, w_tile) * scaling
+
+    # Store result to output matrix
+    partial_sum *= scaling
+    partial_sum = partial_sum.to(x.dtype.element_ty)
+    tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def gate_up_lora_b_fwd(
@@ -161,7 +166,7 @@ def gate_up_lora_b_fwd(
     assert input_dim == 2 * r
 
     BLOCK_S = 16
-    BLOCK_R = 16
+    BLOCK_R = triton.next_power_of_2(r)
     BLOCK_OUT = 64
 
     grid_b = (
@@ -176,6 +181,7 @@ def gate_up_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl = lora_pdl_enabled()
     _gate_up_lora_b_kernel[grid_b](
         x,
         gate_up_lora_b,
@@ -199,6 +205,8 @@ def gate_up_lora_b_fwd(
         BLOCK_OUT,
         BLOCK_R,
         batch_info.scalings,
+        enable_pdl,
+        **lora_pdl_launch_kwargs(enable_pdl),
     )
 
     return output

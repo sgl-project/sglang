@@ -48,7 +48,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    lora_pdl_enabled,
+    lora_pdl_launch_kwargs,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 
 # ---------------------------------------------------------------------------
@@ -71,10 +75,6 @@ from sglang.srt.lora.utils import LoRABatchInfo
 # ---------------------------------------------------------------------------
 
 _BLOCK_S = 16
-_STEP_A_BLOCK_K = 64  # contraction over qk_nope (~128) or kv_lora_rank (~512)
-_STEP_A_BLOCK_N = 16  # output is rank
-_STEP_B_BLOCK_K = 16  # contraction is rank
-_STEP_B_BLOCK_N = 64  # output is kv_lora_rank (~512) or v_head_dim (~128)
 
 
 def _num_segments(batch_info: LoRABatchInfo) -> int:
@@ -136,6 +136,7 @@ def _step_a_q_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -182,6 +183,11 @@ def _step_a_q_kernel(
         head_id * FULL_K
     )  # row offset for this head's K-half (i in [0, qk_nope))
 
+    # PDL: static routing/index setup runs in the prologue; wait before the
+    # K-loop reads the dynamic `x` (q_nope, still being written upstream).
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
@@ -220,6 +226,9 @@ def _step_a_q_kernel(
     out_mask = row_mask[:, None] & (n_offset[None, :] < N_eff)
     tl.store(out + out_offs, partial_sum, mask=out_mask)
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def step_a_q_fwd(
     q_nope: torch.Tensor,
@@ -239,7 +248,9 @@ def step_a_q_fwd(
         ``(S, H, rank)`` -- per-token, per-head low-rank intermediate, ready for step B_q.
     """
     S, H, qk_nope_dim = q_nope.shape
+    _STEP_A_BLOCK_K = min(256, triton.next_power_of_2(qk_nope_dim))
     rank = B_buf.shape[-1]
+    _STEP_A_BLOCK_N = triton.next_power_of_2(rank)
     out = torch.empty((S, H, rank), device=q_nope.device, dtype=q_nope.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
@@ -251,6 +262,7 @@ def step_a_q_fwd(
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl = lora_pdl_enabled()
 
     _step_a_q_kernel[grid](
         q_nope,
@@ -279,6 +291,8 @@ def step_a_q_fwd(
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_A_BLOCK_N,
         BLOCK_K=_STEP_A_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **lora_pdl_launch_kwargs(enable_pdl),
     )
     return out
 
@@ -325,6 +339,7 @@ def _step_b_q_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -367,6 +382,20 @@ def _step_b_q_kernel(
     n_mask = n_offset[None, :] < N
     safe_n = tl.minimum(n_offset, N - 1)
 
+    # Accumulate into base[s, h, n].
+    base_offs = (
+        safe_row[:, None] * b_stride_s
+        + head_id * b_stride_h
+        + safe_n[None, :] * b_stride_n
+    )
+    out_mask = row_mask[:, None] & n_mask
+
+    # PDL: static routing/index setup runs in the prologue; wait before the
+    # K-loop reads the dynamic `x` (step-A output) and the accumulate-base read
+    # below. The shared-A weight streams in the loop interleaved with `x`.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
@@ -398,15 +427,10 @@ def _step_b_q_kernel(
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
 
-    # Accumulate into base[s, h, n].
-    base_offs = (
-        safe_row[:, None] * b_stride_s
-        + head_id * b_stride_h
-        + safe_n[None, :] * b_stride_n
-    )
-    out_mask = row_mask[:, None] & n_mask
-    partial_sum += tl.load(base + base_offs, mask=out_mask, other=0.0)
-    tl.store(base + base_offs, partial_sum, mask=out_mask)
+    tl.atomic_add(base + base_offs, partial_sum, mask=out_mask, sem="relaxed")
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def step_b_q_fwd(
@@ -428,7 +452,9 @@ def step_b_q_fwd(
         ``base_output`` (same object, mutated).
     """
     S, H, rank = q_lora_a.shape
+    _STEP_B_BLOCK_K = triton.next_power_of_2(rank)
     kv_lora_rank = A_buf.shape[-1]
+    _STEP_B_BLOCK_N = min(256, triton.next_power_of_2(kv_lora_rank))
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
@@ -440,6 +466,7 @@ def step_b_q_fwd(
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl = lora_pdl_enabled()
 
     _step_b_q_kernel[grid](
         q_lora_a,
@@ -467,6 +494,8 @@ def step_b_q_fwd(
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_B_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **lora_pdl_launch_kwargs(enable_pdl),
     )
     return base_output
 
@@ -512,6 +541,7 @@ def _step_a_v_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -552,6 +582,11 @@ def _step_a_v_kernel(
     safe_row = tl.minimum(s_physical, S - 1)
     safe_n = tl.minimum(n_offset, N_eff - 1)
 
+    # PDL: static routing/index setup runs in the prologue; wait before the
+    # K-loop reads the dynamic `x` (attn_output, still being written upstream).
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
@@ -591,6 +626,9 @@ def _step_a_v_kernel(
     out_mask = row_mask[:, None] & (n_offset[None, :] < N_eff)
     tl.store(out + out_offs, partial_sum, mask=out_mask)
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def step_a_v_fwd(
     attn_output: torch.Tensor,
@@ -608,7 +646,9 @@ def step_a_v_fwd(
         ``(S, H, rank)`` -- per-token, per-head low-rank intermediate for step B_v.
     """
     S, H, kv_lora_rank = attn_output.shape
+    _STEP_A_BLOCK_K = min(256, triton.next_power_of_2(kv_lora_rank))
     rank = A_buf.shape[1]
+    _STEP_A_BLOCK_N = triton.next_power_of_2(rank)
     out = torch.empty((S, H, rank), device=attn_output.device, dtype=attn_output.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
@@ -620,6 +660,7 @@ def step_a_v_fwd(
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl = lora_pdl_enabled()
 
     _step_a_v_kernel[grid](
         attn_output,
@@ -646,6 +687,8 @@ def step_a_v_fwd(
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_A_BLOCK_N,
         BLOCK_K=_STEP_A_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **lora_pdl_launch_kwargs(enable_pdl),
     )
     return out
 
@@ -695,6 +738,7 @@ def _step_b_v_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -739,6 +783,12 @@ def _step_b_v_kernel(
     # V-half row base for this head: h*FULL_K + qk_nope
     head_row_base = head_id * FULL_K + QK_NOPE_OFFSET
 
+    # PDL: static routing/index setup runs in the prologue; wait before the
+    # K-loop reads the dynamic `x` (step-A_v output) and the accumulate-base read
+    # below. The V-half B weight streams in the loop interleaved with `x`.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
@@ -780,6 +830,9 @@ def _step_b_v_kernel(
     partial_sum += tl.load(base + base_offs, mask=out_mask, other=0.0)
     tl.store(base + base_offs, partial_sum, mask=out_mask)
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def step_b_v_fwd(
     attn_lora_a: torch.Tensor,
@@ -804,7 +857,9 @@ def step_b_v_fwd(
         ``base_output`` (same object, mutated).
     """
     S, H, rank = attn_lora_a.shape
+    _STEP_B_BLOCK_K = triton.next_power_of_2(rank)
     full_K_per_head = qk_nope_head_dim + v_head_dim
+    _STEP_B_BLOCK_N = triton.next_power_of_2(v_head_dim)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
@@ -816,6 +871,7 @@ def step_b_v_fwd(
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl = lora_pdl_enabled()
 
     _step_b_v_kernel[grid](
         attn_lora_a,
@@ -845,5 +901,7 @@ def step_b_v_fwd(
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_B_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **lora_pdl_launch_kwargs(enable_pdl),
     )
     return base_output

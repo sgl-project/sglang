@@ -222,6 +222,14 @@ class Envs:
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
+    # LoRA
+    # Programmatic Dependent Launch (PDL) for the LoRA Triton kernels: each issues
+    # its static loads (LoRA weights + routing metadata) in the PDL prologue, then
+    # gdc_wait()s for the producing kernel before reading the dynamic activation.
+    # Hopper+ only; AND'd with is_arch_support_pdl() so it is a no-op on unsupported
+    # arch / HIP. Opt-in; default off (measured ~neutral at decode bs64).
+    SGLANG_LORA_ENABLE_PDL = EnvBool(False)
+
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
