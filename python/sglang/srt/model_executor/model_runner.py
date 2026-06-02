@@ -2336,15 +2336,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return attn_backend_wrapper(self, full_attention_backend)
 
     def kernel_warmup(self):
-        """
-        Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
-        """
+        """Warmup and tune kernels before cuda graph capture."""
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+        if (
+            envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and self.pp_size > 1
+            and not self.spec_algorithm.is_speculative()
+        ):
+            from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
+                pp_parallel_deep_gemm_warmup,
+            )
+
+            pp_parallel_deep_gemm_warmup(self)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
@@ -2473,9 +2482,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             / f"rank_tp{self.tp_rank}_pp{self.pp_rank}_dp{self.dp_rank or 0}.json"
         )
 
-    def _dummy_run(self, batch_size: int, run_ctx=None):
-        """Run a dummy forward pass for warmup/profiling."""
-        if self.is_generation:
+    def _dummy_run(
+        self,
+        batch_size: int,
+        run_ctx=None,
+        forward_mode_override: Optional[ForwardMode] = None,
+    ):
+        """Run a dummy forward pass for warmup/profiling.
+
+        ``forward_mode_override`` forces EXTEND/DECODE regardless of
+        ``is_generation`` (used by the PP-parallel DeepGEMM warmup).
+        """
+        if forward_mode_override is not None:
+            capture_forward_mode = forward_mode_override
+        elif self.is_generation:
             capture_forward_mode = ForwardMode.DECODE
         else:
             capture_forward_mode = ForwardMode.EXTEND
@@ -2546,11 +2566,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            hc_hidden_size=getattr(self.model_config, "hc_hidden_size", None),
         )
         buffers.num_token_non_padded[...] = num_tokens
 
         # For extend mode
-        if not self.is_generation:
+        if capture_forward_mode == ForwardMode.EXTEND:
             extend_prefix_lens_cpu = [0] * batch_size
             extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
             extend_num_tokens = num_tokens
@@ -2572,8 +2593,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extend_start_loc = None
 
         if self.server_args.pp_size > 1:
+            # PP0 already cp-split hidden_states before send.
+            pp_hidden_tokens = num_tokens
+            if (
+                capture_forward_mode == ForwardMode.EXTEND
+                and self.pp_rank != 0
+                and self.attn_cp_size > 1
+            ):
+                pp_hidden_tokens = num_tokens // self.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         if require_mlp_tp_gather_:
@@ -2592,6 +2621,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
             global_dp_buffer_len = num_tokens * self.server_args.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.server_args.dp_size
         elif require_attn_tp_gather(self.server_args):
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -2608,8 +2638,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
             global_dp_buffer_len = num_tokens
+            global_num_tokens_cpu = [num_tokens]
         else:
             global_dp_buffer_len = None
+            global_num_tokens_cpu = None
 
         def get_spec_info():
             spec_info = None
@@ -2698,6 +2730,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
