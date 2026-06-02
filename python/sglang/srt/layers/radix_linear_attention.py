@@ -26,7 +26,7 @@ from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph imp
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
-    get_forward_context,
+    get_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
@@ -82,7 +82,7 @@ class RadixLinearAttention(nn.Module):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        if forward_batch.forward_mode.is_extend() and get_tc_piecewise_forward_context() is not None:
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
             seq_len = mixed_qkv.shape[0]
             output = torch.empty(
@@ -129,7 +129,7 @@ def unified_linear_attention_with_output(
     """
     Custom op wrapper for linear attention computation only.
     """
-    context = get_forward_context()
+    context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]

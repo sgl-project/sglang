@@ -10,7 +10,7 @@ from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph.
     enable_tc_piecewise_cuda_graph as enable_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph.context_manager import (
-    set_forward_context as piecewise_forward_context,
+    set_tc_piecewise_forward_context as piecewise_forward_context,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 

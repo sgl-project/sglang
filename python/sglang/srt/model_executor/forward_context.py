@@ -11,7 +11,7 @@ duration of each forward; callers that need a per-call override (PDmux
 per-stream backend, frozen-KV MTP draft loop, TBO per-child dispatch) use
 ``dataclasses.replace`` and wrap the override scope with ``forward_context()``.
 
-Distinct from ``sglang.srt.compilation.piecewise_context_manager.ForwardContext``,
+Distinct from ``sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph.TcPiecewiseForwardContext``,
 which collects compilation-time refs for the piecewise CUDA graph backend.
 
 Concurrency: ``_current`` is a plain module-level global, not thread-local.

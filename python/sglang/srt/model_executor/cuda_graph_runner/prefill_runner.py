@@ -47,7 +47,7 @@ from sglang.srt.model_executor.cuda_graph_backend.factory import (
     resolve_prefill_backend,
 )
 from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
-    set_forward_context,
+    set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.cuda_graph_runner.base_runner import (
@@ -246,14 +246,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch
 
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
-        """Run model.forward inside the prefill set_forward_context."""
+        """Run model.forward inside the prefill set_tc_piecewise_forward_context."""
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
 
         with forward_context(
             ForwardContext(attn_backend=self.model_runner.attn_backend)
-        ), set_forward_context(
+        ), set_tc_piecewise_forward_context(
             forward_batch,
             self.attention_layers,
             self.quant_config,
@@ -488,7 +488,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             with forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
-            ), set_forward_context(
+            ), set_tc_piecewise_forward_context(
                 static_forward_batch,
                 self.attention_layers,
                 self.quant_config,

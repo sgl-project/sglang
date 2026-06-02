@@ -7,10 +7,13 @@ backend (currently breakable + tc_piecewise):
   are inside the capture or replay window of a piecewise CUDA graph.
   Read by model code that needs to take the static-buffer / fixed-shape
   branch. See ``refactor/plan.md`` §6.5 for the full semantics.
-* ``ForwardContext`` — a dataclass propagated across attention/MoE
+* ``TcPiecewiseForwardContext`` — a dataclass propagated across attention/MoE
   layers during capture and replay so that submodules can reach the
   current ``ForwardBatch`` and per-layer metadata without threading
-  arguments through every call site.
+  arguments through every call site. Named ``TcPiecewise…`` (matches
+  ``Backend.TC_PIECEWISE`` + ``enable_tc_piecewise_cuda_graph``) to
+  disambiguate from the per-forward-call
+  ``sglang.srt.model_executor.forward_context.ForwardContext``.
 
 This module deliberately does **not** own torch.compile-specific state
 (warmup flag, capture stream); those live in ``compilation/compile_phase.py``.
@@ -62,7 +65,7 @@ def enable_tc_piecewise_cuda_graph():
 
 
 @dataclass
-class ForwardContext:
+class TcPiecewiseForwardContext:
     forward_batch: Optional[ForwardBatch] = None
     attention_layers: Optional[List[Any]] = field(default=None)
     quant_config: Any = None
@@ -71,15 +74,15 @@ class ForwardContext:
     dsa_indexers: Optional[List[Any]] = field(default=None)
 
 
-_forward_context: Optional[ForwardContext] = None
+_tc_piecewise_forward_context: Optional[TcPiecewiseForwardContext] = None
 
 
-def get_forward_context() -> Optional[ForwardContext]:
-    return _forward_context
+def get_tc_piecewise_forward_context() -> Optional[TcPiecewiseForwardContext]:
+    return _tc_piecewise_forward_context
 
 
 @contextmanager
-def set_forward_context(
+def set_tc_piecewise_forward_context(
     forward_batch: ForwardBatch,
     attention_layers: List[Any],
     quant_config: Any,
@@ -87,8 +90,8 @@ def set_forward_context(
     moe_fusions: List[Any],
     dsa_indexers: Optional[List[Any]] = None,
 ):
-    global _forward_context
-    _forward_context = ForwardContext(
+    global _tc_piecewise_forward_context
+    _tc_piecewise_forward_context = TcPiecewiseForwardContext(
         forward_batch=forward_batch,
         attention_layers=attention_layers,
         quant_config=quant_config,
@@ -99,7 +102,7 @@ def set_forward_context(
     try:
         yield
     finally:
-        _forward_context = None
+        _tc_piecewise_forward_context = None
 
 
 TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (

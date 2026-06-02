@@ -63,7 +63,7 @@ from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph imp
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
-    get_forward_context,
+    get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -1021,7 +1021,7 @@ def nemotron_mamba2_with_output(
     layer_id: int,
 ) -> None:
     """Split op for Mamba2 forward in piecewise CUDA graph mode."""
-    context = get_forward_context()
+    context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     mamba_layer = attention_layers[layer_id]

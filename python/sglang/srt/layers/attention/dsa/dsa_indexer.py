@@ -23,7 +23,7 @@ from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
-    get_forward_context,
+    get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.state_capturer.indexer_topk import (
@@ -118,8 +118,8 @@ if _is_cuda:
         ), "Internal error: piecewise CUDA graph is only supported on CUDA"
         from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
-        forward_batch = get_forward_context().forward_batch
-        indexer = get_forward_context().dsa_indexers[layer_id]
+        forward_batch = get_tc_piecewise_forward_context().forward_batch
+        indexer = get_tc_piecewise_forward_context().dsa_indexers[layer_id]
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         # slice off padding from piecewise CUDA graph
@@ -1309,7 +1309,7 @@ class Indexer(MultiPlatformOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        # In piecewise CUDA graph mode, metadata is fetched inside custom ops via get_forward_context() to
+        # In piecewise CUDA graph mode, metadata is fetched inside custom ops via get_tc_piecewise_forward_context() to
         # prevent Dynamo from guarding on forward_metadata identity (which changes each
         # replay when init_forward_metadata creates a new ForwardMetadata object).
         if not is_in_tc_piecewise_cuda_graph():
