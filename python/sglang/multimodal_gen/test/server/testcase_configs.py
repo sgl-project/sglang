@@ -21,14 +21,18 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import statistics
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.registry import get_model_info
+from sglang.multimodal_gen.registry import (
+    get_model_info,
+    get_pipeline_config_classes,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
@@ -242,6 +246,15 @@ class DiffusionSamplingParams:
 
     num_outputs_per_prompt: int = 1
 
+    # Realtime video consistency harness. When set, server tests use
+    # /v1/realtime_video/generate and fold streamed chunks back into mp4 bytes.
+    realtime_num_chunks: int | None = None
+    realtime_events: list[dict[str, Any]] = field(default_factory=list)
+    realtime_perf_thresholds: dict[str, float] = field(default_factory=dict)
+    realtime_perf_ignore_initial_chunks: int = 0
+    # None keeps the lossless/raw transport used by GT-backed consistency checks.
+    realtime_output_format: str | None = None
+
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
     extras: dict = field(default_factory=dict)
@@ -253,7 +266,7 @@ class DiffusionTestCase:
 
     id: str  # pytest test id and scenario name
     server_args: DiffusionServerArgs
-    sampling_params: DiffusionSamplingParams
+    sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
@@ -265,6 +278,13 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
 
     def __post_init__(self) -> None:
+        if self.sampling_params is None:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                get_default_sampling_params_for_server_args(self.server_args),
+            )
+
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
         has_second_lora = self.server_args.second_lora_path is not None
@@ -288,6 +308,48 @@ class DiffusionTestCase:
             raise ValueError(
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
+
+
+LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "A slow aerial orbit around a pastel floating island hotel in the open "
+        "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
+        "clean horizon, cinematic but playful."
+    ),
+    image_path=(
+        "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/"
+        "b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg"
+    ),
+    output_size="832x480",
+    num_frames=9,
+    fps=16,
+    realtime_num_chunks=4,
+    realtime_events=[
+        {
+            "after_chunk": 0,
+            "kind": "camera_actions",
+            "payload": {"mode": "state", "transitions": [{"actions": ["w"]}]},
+        },
+        {
+            "after_chunk": 2,
+            "kind": "camera_actions",
+            "payload": {"mode": "state", "transitions": [{"actions": []}]},
+        },
+    ],
+    realtime_perf_thresholds={
+        "p95_chunk_total_ms": 5000.0,
+        "p95_scheduler_forward_ms": 4500.0,
+        "p95_ws_payload_mb": 16.0,
+    },
+    realtime_perf_ignore_initial_chunks=2,
+    extras={
+        "seed": 42,
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "realtime_causal_sink_size": 9,
+        "realtime_causal_kv_cache_num_frames": 18,
+    },
+)
 
 
 def sample_step_indices(
@@ -437,6 +499,62 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     prompt="",
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
+
+
+def _get_extra_arg_value(extras: Sequence[str], option_name: str) -> str | None:
+    tokens: list[str] = []
+    for item in extras:
+        tokens.extend(shlex.split(item))
+
+    option_prefix = f"{option_name}="
+    for index, token in enumerate(tokens):
+        if token.startswith(option_prefix):
+            return token[len(option_prefix) :]
+        if token == option_name and index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+def get_model_task_type_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> ModelTaskType:
+    pipeline_class_name = _get_extra_arg_value(
+        server_args.extras, "--pipeline-class-name"
+    )
+    if pipeline_class_name:
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            pipeline_config_cls, _ = config_classes
+            return pipeline_config_cls.task_type
+
+    model_info = get_model_info(server_args.model_path)
+    if model_info is None:
+        raise ValueError(f"Could not resolve model info for {server_args.model_path!r}")
+    return model_info.pipeline_config_cls.task_type
+
+
+def get_default_sampling_params_for_model_task(
+    task_type: ModelTaskType,
+) -> DiffusionSamplingParams:
+    if task_type == ModelTaskType.T2I:
+        return T2I_sampling_params
+    if task_type in (ModelTaskType.I2I, ModelTaskType.TI2I):
+        return TI2I_sampling_params
+    if task_type == ModelTaskType.T2V:
+        return T2V_sampling_params
+    if task_type in (ModelTaskType.I2V, ModelTaskType.TI2V):
+        return TI2V_sampling_params
+    if task_type == ModelTaskType.I2M:
+        return HUNYUAN3D_SHAPE_sampling_params
+    raise ValueError(f"No default sampling params for model task {task_type!r}")
+
+
+def get_default_sampling_params_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> DiffusionSamplingParams:
+    task_type = get_model_task_type_for_server_args(server_args)
+    return get_default_sampling_params_for_model_task(task_type)
+
 
 MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
