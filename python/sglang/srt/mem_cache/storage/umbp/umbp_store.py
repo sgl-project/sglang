@@ -1069,9 +1069,6 @@ class KVEventsSubscriber:
         self._dp_rank = dp_rank
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # Track reported hashes so AllBlocksCleared can revoke them all.
-        self._reported_hashes: set = set()
-        self._hashes_lock = threading.Lock()
         # Cache UMBPTierType constants to avoid repeated attribute lookups.
         import mori.umbp as _umbp_mod
 
@@ -1168,8 +1165,6 @@ class KVEventsSubscriber:
                     len(hashes),
                     attn_dp_rank,
                 )
-            with self._hashes_lock:
-                self._reported_hashes.update(hashes)
 
         elif isinstance(event, BlockRemoved):
             hashes = [str(h) for h in event.block_hashes]
@@ -1181,30 +1176,24 @@ class KVEventsSubscriber:
                     len(hashes),
                     attn_dp_rank,
                 )
-            with self._hashes_lock:
-                self._reported_hashes.difference_update(hashes)
 
         elif isinstance(event, AllBlocksCleared):
-            with self._hashes_lock:
-                all_hashes = list(self._reported_hashes)
-                self._reported_hashes.clear()
-            if all_hashes:
-                # `_reported_hashes` is currently a flat set without tier
-                # attribution, so revoke from both tiers on all-clear.
-                ok_hbm = self._umbp_client.revoke_external_kv_blocks(
-                    all_hashes, self._tier_hbm
+            # AllBlocksCleared wipes the local KV event publisher's cache. Ask
+            # the master to clear this node's whole bucket for each tier this
+            # subscriber can report, instead of sending a full hash list back.
+            ok_hbm = self._umbp_client.revoke_all_external_kv_blocks_at_tier(
+                self._tier_hbm
+            )
+            ok_dram = self._umbp_client.revoke_all_external_kv_blocks_at_tier(
+                self._tier_dram
+            )
+            if ok_hbm is False or ok_dram is False:
+                logger.warning(
+                    "revoke_all_external_kv_blocks_at_tier (all-clear) failed "
+                    "(hbm=%s dram=%s)",
+                    ok_hbm,
+                    ok_dram,
                 )
-                ok_dram = self._umbp_client.revoke_external_kv_blocks(
-                    all_hashes, self._tier_dram
-                )
-                if not (ok_hbm and ok_dram):
-                    logger.warning(
-                        "revoke_external_kv_blocks (all-clear) failed for %d hashes "
-                        "(hbm=%s dram=%s)",
-                        len(all_hashes),
-                        ok_hbm,
-                        ok_dram,
-                    )
 
         else:
             logger.debug(
