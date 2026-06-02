@@ -51,5 +51,18 @@ class ScriptedReqHandle:
 
     @property
     def lock_refs(self) -> int:
-        node = self.req.last_node
-        return node.lock_ref if node is not None else 0
+        # A finished/aborted req has dropped its node reference; report 0 rather
+        # than dereferencing None. SWA radix nodes split the lock ref into
+        # full-attention and sliding-window counts; a plain node exposes a single
+        # lock_ref.
+        from sglang.srt.mem_cache.swa_radix_cache import TreeNode as SWATreeNode
+
+        req = self.req
+        if req is None:
+            return 0
+        node = req.last_node
+        if node is None:
+            return 0
+        if isinstance(node, SWATreeNode):
+            return node.full_lock_ref + node.swa_lock_ref
+        return node.lock_ref
