@@ -211,7 +211,7 @@ class WanUpsample(nn.Upsample):
     """
 
     def forward(self, x):
-        return super().forward(x.float()).type_as(x)
+        return super().forward(x)
 
 
 is_first_frame = None
