@@ -39,6 +39,8 @@ _ALLOWED_FIELDS = {
     "anchor_mode",
     "anchor_budget",
     "recall_oracle",
+    "enable_lifted_budget_decode",
+    "lifted_budget_top_k",
     "extra",
 }
 
@@ -57,6 +59,16 @@ _ALLOWED_FIELDS = {
 #   diagnostic (off by default; byte-identical selection). Config-borne so it
 #   reaches TP workers; forces the eager selector path and requires
 #   --disable-cuda-graph (the hook does host syncs illegal under graph capture).
+# enable_lifted_budget_decode: opt-in Tier-2.A adjustable-budget decode (AC-4).
+#   When True, the selector may pick more than the DSA index_topk (a wider budget
+#   recovers needles that rank in (index_topk, lifted_budget_top_k]); the opt-in
+#   backend remaps physical selected slots → compact dequantized-KV indices for
+#   flash_mla_sparse_fwd. Default False ⇒ the DSA dsa_index_topk==top_k assert is
+#   untouched. This is the NEW, explicit mechanism — NOT max_top_k / Twilight
+#   fields / the SGLANG_DS_ALLOW_TOPK_MISMATCH ablation escape.
+# lifted_budget_top_k: the fixed (padded) budget for the lifted-budget path; must
+#   be > index_topk and is only meaningful when enable_lifted_budget_decode is on.
+_DEFAULT_LIFTED_BUDGET_TOP_K = 0  # 0 = unset; required (>top_k) when lifted enabled
 _ALLOWED_SCORER_NORM = ("off", "cosine", "hybrid")
 _DEFAULT_SCORER_NORM = "off"
 _DEFAULT_HYBRID_THRESHOLD = 8192
@@ -87,6 +99,8 @@ class DoubleSparsityConfig:
     anchor_mode: str = _DEFAULT_ANCHOR_MODE
     anchor_budget: int = _DEFAULT_ANCHOR_BUDGET
     recall_oracle: bool = False
+    enable_lifted_budget_decode: bool = False
+    lifted_budget_top_k: int = _DEFAULT_LIFTED_BUDGET_TOP_K
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -120,6 +134,35 @@ class DoubleSparsityConfig:
                 f"Double Sparsity 'recall_oracle' must be a boolean, "
                 f"got {self.recall_oracle!r}."
             )
+        if not isinstance(self.enable_lifted_budget_decode, bool):
+            raise ValueError(
+                f"Double Sparsity 'enable_lifted_budget_decode' must be a boolean, "
+                f"got {self.enable_lifted_budget_decode!r}."
+            )
+        if not isinstance(self.lifted_budget_top_k, int) or self.lifted_budget_top_k < 0:
+            raise ValueError(
+                f"Double Sparsity 'lifted_budget_top_k' must be a non-negative "
+                f"integer, got {self.lifted_budget_top_k!r}."
+            )
+        if self.enable_lifted_budget_decode:
+            # The lifted budget must exceed the base budget (otherwise it is a
+            # no-op and should not opt in to the heavier decode path).
+            if self.lifted_budget_top_k <= self.top_k:
+                raise ValueError(
+                    "Double Sparsity 'lifted_budget_top_k' "
+                    f"({self.lifted_budget_top_k}) must be > 'top_k' ({self.top_k}) "
+                    "when enable_lifted_budget_decode is set (a lifted budget must "
+                    "widen selection beyond the base index_topk)."
+                )
+        elif self.lifted_budget_top_k > 0:
+            # Fail closed: a lifted budget set without the enable flag would
+            # silently no-op (the default path keeps top_k == index_topk).
+            raise ValueError(
+                "Double Sparsity 'lifted_budget_top_k' is set "
+                f"({self.lifted_budget_top_k}) but 'enable_lifted_budget_decode' is "
+                "false — it would be ignored. Set enable_lifted_budget_decode=true "
+                "to use the opt-in lifted-budget decode path."
+            )
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError(
                 f"Double Sparsity 'top_k' must be a positive integer, got {self.top_k!r}."
@@ -148,7 +191,7 @@ class DoubleSparsityConfig:
             )
 
 
-def _coerce_bool(value: Any) -> bool:
+def _coerce_bool(value: Any, field: str = "flag") -> bool:
     """Accept JSON booleans plus the common string/int spellings the serve
     script may emit (``true``/``1``/``yes`` etc.) so a config flag never silently
     no-ops because of a quoting mismatch."""
@@ -159,7 +202,7 @@ def _coerce_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     raise ValueError(
-        f"Double Sparsity 'recall_oracle' must be a boolean, got {value!r}."
+        f"Double Sparsity {field!r} must be a boolean, got {value!r}."
     )
 
 
@@ -217,6 +260,12 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         head_agg=str(data.get("head_agg", _DEFAULT_HEAD_AGG)),
         anchor_mode=str(data.get("anchor_mode", _DEFAULT_ANCHOR_MODE)),
         anchor_budget=int(data.get("anchor_budget", _DEFAULT_ANCHOR_BUDGET)),
-        recall_oracle=_coerce_bool(data.get("recall_oracle", False)),
+        recall_oracle=_coerce_bool(data.get("recall_oracle", False), "recall_oracle"),
+        enable_lifted_budget_decode=_coerce_bool(
+            data.get("enable_lifted_budget_decode", False), "enable_lifted_budget_decode"
+        ),
+        lifted_budget_top_k=int(
+            data.get("lifted_budget_top_k", _DEFAULT_LIFTED_BUDGET_TOP_K)
+        ),
         extra=data.get("extra", {}),
     )

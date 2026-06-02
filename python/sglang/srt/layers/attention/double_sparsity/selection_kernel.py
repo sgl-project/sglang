@@ -915,8 +915,13 @@ def _force_include_anchor(
         return indices.to(torch.int32), (indices >= 0).to(torch.int32).sum(-1)
     device = indices.device
     bs, K = indices.shape
-    A = int(anchor_budget)
     max_seq = scores.shape[1]
+    # Bound the [bs, A] temporaries: the effective budget is
+    # min(anchor_budget, valid_count, seq_len) and valid_count <= K, so anchor
+    # slots beyond K (or max_seq) can never be valid. Clamping A here is
+    # bit-identical (clamped-out slots would be invalid anyway) but stops a
+    # pathological opt-in anchor_budget from over-allocating scratch.
+    A = min(int(anchor_budget), K, max_seq)
     pos = indices.to(torch.int64)
     real_mask = pos >= 0
     real_count = real_mask.sum(1)

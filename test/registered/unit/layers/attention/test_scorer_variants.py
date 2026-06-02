@@ -287,6 +287,52 @@ class TestGraphSafeScorerEqualsEager(unittest.TestCase):
                 )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_anchor_over_budget_graph_matches_eager(self):
+        """R10: over-budget anchor (anchor_budget > top_k) is bit-identical
+        eager-vs-graph (substantiates the over-budget coverage claim + exercises
+        the A=min(anchor_budget,K,max_seq) temp-shape clamp)."""
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels, retrieve_topk_graph_safe,
+        )
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state,
+        )
+        dev = torch.device("cuda")
+        torch.manual_seed(3)
+        BS, H, LD, MAXT, MSL, K = 2, 4, 8, 256, 96, 16
+        AB = K + 40  # anchor_budget WELL over top_k
+        q = torch.randn(BS, H, LD, device=dev)
+        sig = torch.randn(1, MAXT, H, LD, device=dev, dtype=torch.float16)
+        written = torch.ones(1, MAXT, dtype=torch.bool, device=dev)
+        chsel = torch.arange(LD, device=dev).view(1, 1, -1).expand(1, H, -1).to(torch.int32).contiguous()
+        chw = torch.ones(1, H, LD, device=dev)
+        rpi = torch.arange(BS, device=dev, dtype=torch.int32)
+        rtt = torch.arange(MSL, device=dev, dtype=torch.int32).unsqueeze(0).expand(BS, -1).contiguous()
+        sl = torch.tensor([12, MSL], device=dev, dtype=torch.int32)  # one with seq_len<K
+        st = allocate_graph_state(max_bs=BS, max_top_k=K, max_seq_len=MSL, device=dev)
+        for am in ("recency", "global", "strided"):
+            idx_e, vl_e = retrieve_topk_via_labels(
+                queries=q, token_signatures=sig, written=written, channel_selection=chsel,
+                channel_weights=chw, layer_id=0, max_top_k=K, req_pool_indices=rpi,
+                req_to_token=rtt, seq_lens=sl, max_seq_len=MSL,
+                anchor_mode=am, anchor_budget=AB,
+            )
+            st.selected_indices.fill_(-1); st.valid_lengths.fill_(0)
+            retrieve_topk_graph_safe(
+                queries=q, token_signatures=sig, written=written, channel_selection=chsel,
+                channel_weights=chw, layer_id=0, req_pool_indices=rpi, req_to_token=rtt,
+                seq_lens=sl, max_seq_len=MSL, max_top_k=K,
+                out_indices=st.selected_indices, out_lengths=st.valid_lengths,
+                scratch_scores=st.scratch_scores, scratch_topk_values=st.scratch_topk_values,
+                scratch_topk_indices=st.scratch_topk_indices, scratch_invalid_mask=st.scratch_invalid_mask,
+                scratch_sorted_vals=st.scratch_sorted_vals, scratch_boundary=st.scratch_boundary,
+                scratch_valid_i64=st.scratch_valid_i64, scratch_throwaway_idx=st.scratch_throwaway_idx,
+                anchor_mode=am, anchor_budget=AB,
+            )
+            self.assertTrue(torch.equal(st.selected_indices[:BS, :K], idx_e.to(torch.int32)), f"over-budget am={am} idx")
+            self.assertTrue(torch.equal(st.valid_lengths[:BS], vl_e.to(torch.int32)), f"over-budget am={am} len")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_anchor_graph_safe_replay_zero_alloc(self):
         """R9: a hybrid+anchor graph-safe selection captured in a real CUDA graph
         replays byte-identically + with zero new allocations."""
@@ -401,6 +447,93 @@ class TestRecallOracleGraphGuard(unittest.TestCase):
             # recall_oracle/cuda-graph guard must NOT be what fired.
             self.assertNotIn("recall_oracle", str(e))
             self.assertNotIn("CUDA graph", str(e))
+
+
+class TestLiftedBudgetABI(unittest.TestCase):
+    """AC-4 task13: the opt-in lifted-budget ABI (config fields + validation)."""
+
+    def _parse(self, extra):
+        from sglang.srt.layers.attention.double_sparsity.config import (
+            parse_double_sparsity_config,
+        )
+        return parse_double_sparsity_config(
+            '{"channel_mask_path": "/tmp/cm.safetensors"' + extra + "}"
+        )
+
+    def test_default_off(self):
+        c = self._parse("")
+        self.assertFalse(c.enable_lifted_budget_decode)
+        self.assertEqual(c.lifted_budget_top_k, 0)
+
+    def test_valid_lifted_budget(self):
+        c = self._parse(', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096')
+        self.assertTrue(c.enable_lifted_budget_decode)
+        self.assertEqual(c.lifted_budget_top_k, 4096)
+
+    def test_rejects_lifted_budget_le_top_k(self):
+        with self.assertRaises(ValueError) as cm:
+            self._parse(', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 2048')
+        self.assertIn("lifted_budget_top_k", str(cm.exception))
+
+    def test_rejects_lifted_budget_without_flag(self):
+        # Set without the enable flag would silently no-op -> fail closed.
+        with self.assertRaises(ValueError) as cm:
+            self._parse(', "lifted_budget_top_k": 4096')
+        self.assertIn("enable_lifted_budget_decode", str(cm.exception))
+
+    def test_rejects_flag_without_budget(self):
+        with self.assertRaises(ValueError):
+            self._parse(', "enable_lifted_budget_decode": true')
+
+    def test_abi_not_max_top_k_or_twilight(self):
+        # The reserved Twilight fields must still be rejected as unknown keys;
+        # the lifted budget is the ONLY sanctioned wider-than-index_topk mechanism.
+        for bad in ('"max_top_k": 4096', '"selection_mode": "top_p"', '"top_p": 0.9'):
+            with self.assertRaises(ValueError):
+                self._parse(", " + bad)
+
+    def _server_args(self, cfg_extra, top_k):
+        from types import SimpleNamespace
+        cfg = (
+            '{"channel_mask_path": "/tmp/cm.safetensors", "top_k": %d' % top_k
+            + cfg_extra + "}"
+        )
+        hf = object()
+        return SimpleNamespace(
+            enable_double_sparsity=True, enable_hisparse=False, disaggregation_mode=None,
+            double_sparsity_config=cfg, disable_cuda_graph=False, page_size=64,
+            kv_cache_dtype="auto",
+            get_model_config=lambda: SimpleNamespace(hf_config=hf),
+        )
+
+    def test_validator_topk_gt_index_topk_requires_flag(self):
+        import sglang.srt.configs.model_config as mc
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        o1, o2 = mc.is_deepseek_dsa, mc.get_dsa_index_topk
+        mc.is_deepseek_dsa = lambda hf: True
+        mc.get_dsa_index_topk = lambda hf: 2048
+        try:
+            # top_k=4096 > index_topk=2048 WITHOUT the lifted flag -> rejected,
+            # steered to the ABI (not SGLANG_DS_ALLOW_TOPK_MISMATCH).
+            with self.assertRaises(ValueError) as cm:
+                validate_double_sparsity(self._server_args("", top_k=4096))
+            msg = str(cm.exception)
+            self.assertIn("lifted-budget", msg)
+            self.assertIn("enable_lifted_budget_decode", msg)
+            # WITH the lifted flag (+ top_k stays at index_topk) -> the top_k gate
+            # must NOT fire (a later channel-mask check may raise instead).
+            try:
+                validate_double_sparsity(self._server_args(
+                    ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096',
+                    top_k=2048,
+                ))
+            except Exception as e:
+                self.assertNotIn("lifted-budget", str(e))
+                self.assertNotIn("index_topk", str(e))
+        finally:
+            mc.is_deepseek_dsa, mc.get_dsa_index_topk = o1, o2
 
 
 if __name__ == "__main__":
