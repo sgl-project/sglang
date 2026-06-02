@@ -1240,7 +1240,8 @@ module.exports = {
             ['fm-legacy-governor','fm_legacy_governor',  '20M'],
             ['fm-rss-ingest',     'fm_rss_ingest',       '30M'],
             ['fm-stripe-worker',  'fm_stripe_worker',    '25M'],
-            ['fm-negotiator',     'fm_negotiator',       '25M'],
+            ['fm-negotiator',           'fm_negotiator',           '25M'],
+            ['fm-revenue-convergence',  'fm_revenue_convergence',  '30M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
