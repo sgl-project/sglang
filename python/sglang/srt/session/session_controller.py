@@ -298,14 +298,15 @@ class SessionController:
             logger.warning("session id is None, cannot open.")
             return OpenSessionReqOutput(session_id, False)
         elif _radix_native_enabled():
-            # Radix-native session: no pinned slot. The session is a routing +
-            # cleanup tag over ordinary evictable radix KV. streaming=False makes
-            # create_req treat each turn as full context (no slot, no append
-            # reconstruction, no _inflight guard), so it can never deadlock on
-            # non-evictable KV and never duplicates context. Reuse across turns
-            # comes from radix prefix matching; the KV is floor-priority (see
-            # StreamingSession) so it is evicted first under pressure and
-            # bulk-dropped via RadixCache.release_session at close.
+            # Radix-native session: no pinned slot, no StreamingSession wrapper.
+            # The session is a lifecycle token (open here, release at close); the
+            # data path is fully native -- the scheduler routes its requests as
+            # plain Reqs carrying req.session_id (no create_req reconstruction, no
+            # _inflight), and RadixCache tags + floor-prices their KV by session_id
+            # so it rides ordinary evictable radix (cannot deadlock, no context
+            # duplication, reuse via prefix match) and is bulk-dropped via
+            # RadixCache.release_session at close. streaming=False keeps it off the
+            # streaming-session path entirely.
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len,
                 session_id,
