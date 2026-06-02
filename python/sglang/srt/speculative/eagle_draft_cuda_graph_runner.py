@@ -373,6 +373,8 @@ class EAGLEDraftCudaGraphRunner:
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
+            self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
+
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
@@ -392,8 +394,8 @@ class EAGLEDraftCudaGraphRunner:
             return ret
 
         with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
-            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
-                forward_batch
+            self.draft_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=True
             )
             self.deepep_adapter.capture(is_extend_in_batch=False)
             self._capture_init(run_once)
@@ -509,9 +511,8 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            forward_batch, bs
-        )
+        # forward_batch.batch_size was overwritten to bs above when padding.
+        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         self.raw_bs = raw_bs
         self.bs = bs
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
