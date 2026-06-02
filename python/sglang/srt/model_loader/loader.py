@@ -508,9 +508,7 @@ class DefaultModelLoader(BaseModelLoader):
                     for i in range(0, len(hf_weights_files), group_size):
                         group = hf_weights_files[i : i + group_size]
                         n = len(group)
-                        staggered.extend(
-                            group[(j + tp_rank * k) % n] for j in range(n)
-                        )
+                        staggered.extend(group[(j + tp_rank * k) % n] for j in range(n))
                     hf_weights_files = staggered
 
         return hf_folder, hf_weights_files, use_safetensors
