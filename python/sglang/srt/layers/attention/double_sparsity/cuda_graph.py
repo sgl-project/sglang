@@ -77,6 +77,17 @@ class DSGraphState:
     # bad-req_pool count here. Zeroed on every call.
     lp_error_scratch: Optional[torch.Tensor] = None          # int32 [1]
 
+    # Opt-in lifted-budget decode scratch (only when enable_lifted_budget_decode).
+    # The fixed-shape graph-safe compact decode (build_lifted_compact_kv_fixed +
+    # dequantize_k_cache_paged_out + flash_mla_sparse_fwd) writes into these so the
+    # lifted decode is alloc-free under CUDA-graph capture. compact_kv dominates
+    # the footprint ([max_bs*max_top_k, 1, 576] bf16).
+    lifted_page_table: Optional[torch.Tensor] = None       # int32 [max_bs*max_top_k]
+    lifted_compact_indices: Optional[torch.Tensor] = None  # int32 [max_bs, max_top_k]
+    lifted_valid_counts: Optional[torch.Tensor] = None     # int32 [max_bs]
+    lifted_compact_kv: Optional[torch.Tensor] = None       # bf16 [max_bs*max_top_k, 1, 576]
+    lifted_q_padded: Optional[torch.Tensor] = None         # bf16 [max_bs, q_pad_heads, 576]
+
 
 def allocate_graph_state(
     *,
@@ -87,6 +98,9 @@ def allocate_graph_state(
     partial_topk: int = 0,
     num_local_heads: int = 0,
     label_dim: int = 0,
+    enable_lifted_budget_decode: bool = False,
+    lifted_q_pad_heads: int = 0,
+    lifted_head_dim: int = 576,
     device: Optional[torch.device] = None,
 ) -> DSGraphState:
     """Pre-allocate replay-stable buffers for the DS decode path.
@@ -188,6 +202,30 @@ def allocate_graph_state(
         )
         lp_error_scratch = torch.zeros((1,), dtype=torch.int32, device=device)
 
+    # Lifted-budget decode scratch — only when the opt-in path is enabled, since
+    # lifted_compact_kv is large ([max_bs*max_top_k, 1, head_dim] bf16).
+    lifted_page_table = None
+    lifted_compact_indices = None
+    lifted_valid_counts = None
+    lifted_compact_kv = None
+    lifted_q_padded = None
+    if enable_lifted_budget_decode:
+        lifted_page_table = torch.zeros(
+            (max_bs * max_top_k,), dtype=torch.int32, device=device,
+        )
+        lifted_compact_indices = torch.full(
+            (max_bs, max_top_k), -1, dtype=torch.int32, device=device,
+        )
+        lifted_valid_counts = torch.zeros((max_bs,), dtype=torch.int32, device=device)
+        lifted_compact_kv = torch.zeros(
+            (max_bs * max_top_k, 1, lifted_head_dim), dtype=torch.bfloat16, device=device,
+        )
+        if lifted_q_pad_heads > 0:
+            lifted_q_padded = torch.zeros(
+                (max_bs, lifted_q_pad_heads, lifted_head_dim),
+                dtype=torch.bfloat16, device=device,
+            )
+
     return DSGraphState(
         selected_indices=selected,
         valid_lengths=valid,
@@ -206,6 +244,11 @@ def allocate_graph_state(
         scratch_req_pool_indices=scratch_req_pool_indices,
         scratch_seq_lens=scratch_seq_lens,
         lp_error_scratch=lp_error_scratch,
+        lifted_page_table=lifted_page_table,
+        lifted_compact_indices=lifted_compact_indices,
+        lifted_valid_counts=lifted_valid_counts,
+        lifted_compact_kv=lifted_compact_kv,
+        lifted_q_padded=lifted_q_padded,
     )
 
 

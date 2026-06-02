@@ -539,19 +539,28 @@ class TestLiftedBudgetABI(unittest.TestCase):
         finally:
             mc.is_deepseek_dsa, mc.get_dsa_index_topk = o1, o2
 
-    def test_validator_lifted_requires_disable_cuda_graph(self):
-        # The lifted path is eager-only (dequantize_k_cache_paged allocates and is
-        # not graph-safe). With CUDA graph enabled it must be rejected — and this
-        # gate is hf_config-independent, so no monkeypatch is needed.
+    def test_validator_lifted_allows_cuda_graph(self):
+        # The lifted path is now CUDA-graph-safe (fixed-shape builder + alloc-free
+        # out= dequant + preallocated scratch), so the validator must NOT reject it
+        # for running under CUDA graph. (A later channel-mask load on the fake path
+        # may raise, but not a `--disable-cuda-graph` rejection.)
+        import sglang.srt.configs.model_config as mc
         from sglang.srt.layers.attention.double_sparsity.validator import (
             validate_double_sparsity,
         )
-        with self.assertRaises(ValueError) as cm:
-            validate_double_sparsity(self._server_args(
-                ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096',
-                top_k=2048, disable_cuda_graph=False,
-            ))
-        self.assertIn("disable-cuda-graph", str(cm.exception))
+        o1, o2 = mc.is_deepseek_dsa, mc.get_dsa_index_topk
+        mc.is_deepseek_dsa = lambda hf: True
+        mc.get_dsa_index_topk = lambda hf: 2048
+        try:
+            try:
+                validate_double_sparsity(self._server_args(
+                    ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096',
+                    top_k=2048, disable_cuda_graph=False,
+                ))
+            except Exception as e:  # noqa: BLE001
+                self.assertNotIn("disable-cuda-graph", str(e))
+        finally:
+            mc.is_deepseek_dsa, mc.get_dsa_index_topk = o1, o2
 
     def test_validator_lifted_requires_top_k_eq_index_topk(self):
         # The base budget must stay == index_topk; lifted_budget_top_k is the

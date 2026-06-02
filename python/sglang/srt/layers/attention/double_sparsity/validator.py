@@ -93,17 +93,17 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
-    # Lifted-budget decode opt-in gate. The backend path now exists
+    # Lifted-budget decode opt-in gate. The backend path is wired
     # (ds_lifted_budget_decode_available() == True): the selector widens to
     # lifted_budget_top_k and decode routes the selected slots through the
-    # request-local compact remap -> dequantize_k_cache_paged ->
-    # flash_mla_sparse_fwd path. Two hf_config-independent requirements (the
-    # top_k == index_topk shape check lives in the model-topk block below):
-    #   * It is an EAGER research path — the internally-allocating dequant is not
-    #     CUDA-graph-safe, so the opt-in requires --disable-cuda-graph until the
-    #     alloc-free out= hardening lands.
-    #   * If a future build ever ships the flag without a wired backend, fail
-    #     closed rather than booting into a silent no-op / the flashmla_kv assert.
+    # request-local compact remap -> dequantize_k_cache_paged_out ->
+    # flash_mla_sparse_fwd path. As of the production-graph hardening this path is
+    # CUDA-graph-safe (fixed-shape compact builder + alloc-free `out=` dequant +
+    # preallocated DSGraphState scratch, proven zero-alloc under graph replay), so
+    # it no longer requires --disable-cuda-graph. The only remaining gate here is
+    # fail-closed if a future build ever ships the flag without a wired backend
+    # (the top_k == index_topk / lifted_budget_top_k shape checks live in the
+    # model-topk block below).
     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
         ds_lifted_budget_decode_available,
     )
@@ -116,13 +116,6 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
                 "build, so the flag cannot be honored and the server fails closed "
                 "rather than booting into a silent no-op or the flashmla_kv "
                 "'indices.shape[-1] == dsa_index_topk' assert."
-            )
-        if not getattr(server_args, "disable_cuda_graph", False):
-            raise ValueError(
-                "Double Sparsity enable_lifted_budget_decode is an eager research "
-                "path: its dequantize_k_cache_paged step allocates internally and is "
-                "not CUDA-graph-safe, so it requires --disable-cuda-graph. Re-run "
-                "with --disable-cuda-graph, or disable enable_lifted_budget_decode."
             )
 
     # Production-path selector-variant safety (future-proof guard). As of R9 ALL

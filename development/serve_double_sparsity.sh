@@ -96,14 +96,15 @@ DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "d
   "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}" "${SCORER_NORM_HYBRID_THRESHOLD}" "${HEAD_AGG}" "${ANCHOR_MODE}" "${ANCHOR_BUDGET}" "${RECALL_ORACLE_JSON}" "${LIFTED_BUDGET_JSON}" "${LIFTED_BUDGET_TOP_K}")
 echo ">>> effective double_sparsity_config = ${DS_CONFIG}"
 
-# Eager is required for the recall-oracle diagnostic (it host-syncs) AND for the
-# lifted-budget decode path (its dequantize_k_cache_paged allocates and is not
-# CUDA-graph-safe). As of R9 all non-learned scorer/anchor variants are graph-safe
-# and run under CUDA graph; auto-add --disable-cuda-graph only for those two.
+# Eager is required only for the recall-oracle diagnostic (it host-syncs). As of R9
+# all non-learned scorer/anchor variants are graph-safe, and the lifted-budget
+# decode path is now graph-safe too (fixed-shape compact builder + alloc-free out=
+# dequant + preallocated scratch), so it runs UNDER CUDA graph. Auto-add
+# --disable-cuda-graph only for RECALL_ORACLE.
 CUDA_GRAPH_ARGS=()
-if [[ "${RECALL_ORACLE}" == "1" || "${LIFTED_BUDGET}" == "1" ]]; then
+if [[ "${RECALL_ORACLE}" == "1" ]]; then
   CUDA_GRAPH_ARGS=(--disable-cuda-graph)
-  echo ">>> recall_oracle/lifted-budget require eager: adding --disable-cuda-graph"
+  echo ">>> recall_oracle diagnostic requires eager: adding --disable-cuda-graph"
 fi
 
 # Radix cache: DS serves radix-off by default. To serve radix-on, set

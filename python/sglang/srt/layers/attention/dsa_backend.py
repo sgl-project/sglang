@@ -859,6 +859,8 @@ class DeepseekSparseAttnBackend(
                 max_bs=int(forward_batch.batch_size),
                 max_top_k=self.ds_max_top_k,
                 max_seq_len=int(self.req_to_token.shape[1]),
+                enable_lifted_budget_decode=self.ds_lifted_budget_decode,
+                lifted_q_pad_heads=(128 if self.device_sm_major >= 10 else 64),
                 device=cache_seqlens_int32.device,
             )
 
@@ -1174,6 +1176,8 @@ class DeepseekSparseAttnBackend(
                 max_bs=bs,
                 max_top_k=self.ds_max_top_k,
                 max_seq_len=int(self.req_to_token.shape[1]),
+                enable_lifted_budget_decode=self.ds_lifted_budget_decode,
+                lifted_q_pad_heads=(128 if self.device_sm_major >= 10 else 64),
                 device=cache_seqlens_int32.device,
             )
 
@@ -2105,10 +2109,49 @@ class DeepseekSparseAttnBackend(
         compact KV buffer (dequantizing the selected fp8 slots, or gathering bf16)
         and attend it with ``flash_mla_sparse_fwd`` (no 2048 cap). The default
         ``flashmla_kv`` path and its ``dsa_index_topk`` assert are untouched.
+
+        Graph path: when the metadata carries preallocated lifted scratch
+        (``DSGraphState.lifted_compact_kv``), use the FIXED-shape builder + the
+        alloc-free ``out=`` dequant into that scratch so the decode is alloc-free
+        under CUDA-graph capture. Eager fallback (non-graph runs): the dynamic
+        ``build_lifted_compact_kv``.
         """
         from sglang.srt.layers.attention.double_sparsity.lifted_budget import (
             build_lifted_compact_kv,
+            build_lifted_compact_kv_fixed,
         )
+
+        bs, width = page_table_1.shape[0], page_table_1.shape[1]
+        fm = getattr(self, "forward_metadata", None)
+        gs = getattr(fm, "ds_graph_state", None) if fm is not None else None
+        lifted_kv = getattr(gs, "lifted_compact_kv", None) if gs is not None else None
+
+        if lifted_kv is not None:
+            # Graph-safe fixed-shape path into preallocated scratch (sliced to the
+            # captured bs/width — both fixed at capture).
+            out_ptf = gs.lifted_page_table[: bs * width]
+            out_ci = gs.lifted_compact_indices[:bs, :width]
+            out_vc = gs.lifted_valid_counts[:bs]
+            out_kv = gs.lifted_compact_kv[: bs * width]
+            valid_lengths = (page_table_1 >= 0).sum(dim=1)
+            build_lifted_compact_kv_fixed(
+                kv_cache,
+                page_table_1,
+                valid_lengths,
+                out_page_table=out_ptf,
+                out_compact_indices=out_ci,
+                out_compact_kv=out_kv,
+                store_is_fp8=self.dsa_kv_cache_store_fp8,
+                out_valid_counts=out_vc,
+            )
+            return self._forward_flashmla_sparse(
+                q_all=q_all,
+                kv_cache=out_kv,
+                page_table_1=out_ci,
+                sm_scale=sm_scale,
+                v_head_dim=v_head_dim,
+                q_pad_scratch=gs.lifted_q_padded,
+            )
 
         compact_kv, compact_indices, _ = build_lifted_compact_kv(
             kv_cache,
@@ -2130,6 +2173,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        q_pad_scratch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -2148,9 +2192,16 @@ class DeepseekSparseAttnBackend(
                 f"TP size may be too large for this model."
             )
 
-            # Pad q to required size
-            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
-            q_padded[:, :num_heads, :] = q_all
+            if q_pad_scratch is not None:
+                # Alloc-free graph path: write real heads into preallocated scratch.
+                # The pad-head tail stays 0 (zero-allocated, never written), so the
+                # padded heads' (trimmed) output cannot perturb the real heads.
+                q_padded = q_pad_scratch[:num_tokens]
+                q_padded[:, :num_heads, :].copy_(q_all)
+            else:
+                # Pad q to required size (eager / non-graph path).
+                q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
+                q_padded[:, :num_heads, :] = q_all
             q_input = q_padded
         else:
             q_input = q_all

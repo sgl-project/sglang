@@ -547,5 +547,103 @@ class TestLiftedBudgetGraphSafe(unittest.TestCase):
         self._capture_and_check(8192)
 
 
+@unittest.skipUnless(_HAS_CUDA, "lifted-budget backend graph proof requires CUDA")
+class TestLiftedBudgetBackendGraphSafe(unittest.TestCase):
+    """The WIRED backend `_forward_lifted_budget` graph path (fixed builder + the
+    DSGraphState lifted scratch + q-pad scratch) replays zero-alloc under a real
+    CUDA graph and matches the eager reference."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = "cuda"
+        cls.major = torch.cuda.get_device_capability()[0]
+        torch.manual_seed(0xB17)
+
+    def _backend(self, bs, width):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state,
+        )
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        be = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        be.device_sm_major = self.major
+        be.dsa_kv_cache_store_fp8 = True
+        gs = allocate_graph_state(
+            max_bs=bs,
+            max_top_k=width,
+            max_seq_len=0,  # selection scratch not needed for this decode proof
+            enable_lifted_budget_decode=True,
+            lifted_q_pad_heads=(128 if self.major >= 10 else 64),
+            device=self.device,
+        )
+        be.forward_metadata = SimpleNamespace(ds_graph_state=gs)
+        return be
+
+    def _run(self, width):
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            assert_no_alloc_in_region,
+        )
+        from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+            dequantize_k_cache_paged,
+        )
+        from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
+
+        d_qk, P, bs, h = 576, 3300, 2, 16
+        phys = torch.randn(P, 1, 1, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        phys.clamp_(-6, 6)
+        quant = quantize_k_cache(phys)
+        full_dequant = dequantize_k_cache_paged(
+            quant, torch.arange(P, device=self.device, dtype=torch.int32)
+        )
+        sel = torch.full((bs, width), -1, dtype=torch.int32, device=self.device)
+        sel[0, :3000] = torch.arange(3000, device=self.device, dtype=torch.int32)
+        sel[1, :5] = torch.tensor([5, 7, 5, 9, 11], device=self.device, dtype=torch.int32)
+        q = torch.randn(bs, h, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        q.clamp_(-6, 6)
+        sm_scale = 1.0 / (d_qk**0.5)
+        static_out = torch.empty(bs, h, 512, dtype=torch.bfloat16, device=self.device)
+
+        be = self._backend(bs, width)
+
+        def step():
+            o = be._forward_lifted_budget(
+                q_all=q, kv_cache=quant, v_head_dim=512, page_table_1=sel, sm_scale=sm_scale
+            )
+            static_out.copy_(o)
+
+        ref = _ref_lifted_from_physical(q, full_dequant, sel, sm_scale)
+        step()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            static_out.float(), ref.to(static_out.dtype).float(), atol=3e-2, rtol=3e-2
+        )
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            step()
+        torch.cuda.synchronize()
+        with assert_no_alloc_in_region(f"backend lifted decode w={width}"):
+            for _ in range(20):
+                g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            static_out.float(), ref.to(static_out.dtype).float(), atol=3e-2, rtol=3e-2
+        )
+
+    def test_backend_graph_safe_4096(self):
+        self._run(4096)
+
+    def test_backend_graph_safe_8192(self):
+        self._run(8192)
+
+
 if __name__ == "__main__":
     unittest.main()
