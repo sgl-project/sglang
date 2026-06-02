@@ -213,3 +213,97 @@ def build_lifted_compact_kv(
     else:
         compact_kv = kv_flat.index_select(0, ptf.to(torch.int64)).unsqueeze(1)
     return compact_kv, remap.compact_indices, remap.valid_counts
+
+
+def build_lifted_compact_index_fixed(
+    physical_slots: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    *,
+    out_page_table: torch.Tensor,
+    out_compact_indices: torch.Tensor,
+    out_valid_counts=None,
+    pad_value: int = -1,
+    safe_slot: int = 0,
+) -> None:
+    """Fixed-shape, graph-safe variant of :func:`build_compact_decode_index`.
+
+    Unlike the eager builder (whose ``page_table_1_flattened`` has a dynamic
+    ``total_valid`` length — uncapturable), this version keeps a **fixed**
+    ``[bs, width]`` layout: EVERY lane gets a compact row at ordinal
+    ``b*width + lane``, so the compact buffer is always ``[bs*width, 1, 576]``.
+    Invalid / within-row-duplicate lanes are handled by writing a **safe
+    in-bounds physical slot** into the dequant input (``out_page_table``, never
+    ``-1`` — it is loaded) and ``-1`` into ``out_compact_indices`` (so
+    ``flash_mla_sparse_fwd`` masks them). A request therefore attends exactly the
+    same set of valid (post-dedup) slots as the eager builder — same attention
+    result — but in a capturable fixed shape.
+
+    Fully tensorized (no ``.item()``, no dynamic boolean-mask shapes); writes into
+    the caller-owned scratch via ``copy_``. Intermediate tensors allocate from the
+    CUDA-graph pool during capture and replay alloc-free (fixed shapes).
+
+    Args:
+        physical_slots: ``int [bs, width]`` selected physical KV slots, ``-1`` pads.
+        valid_lengths: ``int [bs]`` per-request valid leading-lane count.
+        out_page_table: ``int32 [bs*width]`` scratch (written): per-row physical slot.
+        out_compact_indices: ``int32 [bs, width]`` scratch (written): request-local
+            ordinal ``b*width+lane`` for valid lanes, ``-1`` for masked lanes.
+        out_valid_counts: optional ``int32 [bs]`` scratch (written): post-dedup count.
+        safe_slot: an in-bounds physical slot for masked lanes (default ``0``).
+    """
+    bs, width = physical_slots.shape
+    device = physical_slots.device
+    phys = physical_slots.to(torch.int64)
+    vlen = valid_lengths.to(torch.int64).reshape(-1)
+    lane = torch.arange(width, device=device).unsqueeze(0).expand(bs, width)
+    valid = (lane < vlen.unsqueeze(1)) & (phys != pad_value)
+    dup = _within_row_duplicate_mask(phys, valid)
+    final_valid = valid & (~dup)
+
+    base = (torch.arange(bs, device=device, dtype=torch.int64) * width).unsqueeze(1)
+    compact = torch.where(
+        final_valid, base + lane, torch.full_like(phys, pad_value)
+    )
+    out_compact_indices.copy_(compact)
+
+    ptf = torch.where(final_valid, phys, torch.full_like(phys, safe_slot))
+    out_page_table.copy_(ptf.reshape(-1))
+
+    if out_valid_counts is not None:
+        out_valid_counts.copy_(final_valid.sum(dim=1))
+
+
+def build_lifted_compact_kv_fixed(
+    kv_store: torch.Tensor,
+    physical_slots: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    *,
+    out_page_table: torch.Tensor,
+    out_compact_indices: torch.Tensor,
+    out_compact_kv: torch.Tensor,
+    store_is_fp8: bool,
+    out_valid_counts=None,
+) -> None:
+    """Graph-safe, alloc-free materialization of the lifted compact KV + indices
+    into caller-owned scratch (the fixed-shape counterpart of
+    :func:`build_lifted_compact_kv`). Runs the fixed-shape index builder, then
+    dequantizes (fp8) / gathers (bf16) the selected rows into
+    ``out_compact_kv [bs*width, 1, dim]`` via the alloc-free `out=` path."""
+    build_lifted_compact_index_fixed(
+        physical_slots,
+        valid_lengths,
+        out_page_table=out_page_table,
+        out_compact_indices=out_compact_indices,
+        out_valid_counts=out_valid_counts,
+    )
+    kv_flat = kv_store.reshape(-1, kv_store.shape[-1])
+    if store_is_fp8:
+        from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+            dequantize_k_cache_paged_out,
+        )
+
+        dequantize_k_cache_paged_out(kv_flat, out_page_table, out_compact_kv)
+    else:
+        torch.index_select(
+            kv_flat, 0, out_page_table.to(torch.int64), out=out_compact_kv[:, 0, :]
+        )

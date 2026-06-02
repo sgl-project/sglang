@@ -160,9 +160,22 @@ availability seam is flipped (`ds_lifted_budget_decode_available()` → `True`):
 - ~~selection budget widening / `%128` enforcement / decode wiring~~
   **RESOLVED (R13)**: selector + backend widen to `lifted_budget_top_k`, config
   enforces `%128`, the decode branch + validator gating are wired.
-- **task16 hardening**: the dequant is not graph-safe → the path is eager-required
-  (validator-enforced); an alloc-free `out=`/scratch dequant + CUDA-graph capture is
-  needed before production graph use.
+- **task16 hardening (R15 review forced implementation; in progress)**:
+  - **Graph-safe primitives — DONE (R16)**: `dequantize_k_cache_paged_out` (alloc-free
+    dequant into caller scratch; the allocating API now wraps it) + a **fixed-shape,
+    fully-tensorized** compact builder (`build_lifted_compact_index_fixed` /
+    `build_lifted_compact_kv_fixed`) that keeps a fixed `[bs*lifted_width]` layout
+    (masked/dup lanes → a safe physical slot in the dequant input + `-1` compact
+    index), removing the dynamic `total_valid` that made the path uncapturable. A
+    standalone **real `torch.cuda.CUDAGraph` capture/replay replays zero-alloc** at
+    4096 and 8192 (`assert_no_alloc_in_region`) and matches the eager reference
+    (`test_lifted_budget_decode.py::TestLiftedBudgetGraphSafe`). dequant `out=` is
+    byte-identical to the allocating dequant.
+  - **Remaining (R17, part 2)**: wire the fixed scratch (incl. q head-padding) into
+    `DSGraphState`/`allocate_graph_state` + route `_forward_lifted_budget` through it
+    under capture; relax the validator `--disable-cuda-graph` requirement; **live**
+    boot with CUDA graph + graph-mode 4K recall re-measure (the eager 95% is not the
+    graph number) + perf/memory; then the task17 production-ready disposition.
 
 ## Artifacts
 `config.py` (ABI + `%128`), `validator.py` (lifted gating: eager-required,

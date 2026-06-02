@@ -400,5 +400,152 @@ class TestLiftedBudgetBackendDecode(unittest.TestCase):
         self._run(8192)
 
 
+class TestLiftedCompactIndexFixed(unittest.TestCase):
+    """The fixed-shape graph-safe compact builder (CPU): fixed `b*width+lane`
+    layout, safe-slot for masked lanes, `-1` compact index for masked lanes,
+    within-row dedup keep-first."""
+
+    def test_fixed_layout_with_dedup_and_pad(self):
+        from sglang.srt.layers.attention.double_sparsity.lifted_budget import (
+            build_lifted_compact_index_fixed,
+        )
+
+        width = 4
+        sel = torch.tensor([[10, 20, 30, -1], [40, 40, 50, -1]], dtype=torch.int64)
+        vlen = torch.tensor([3, 3], dtype=torch.int64)
+        ptf = torch.empty(2 * width, dtype=torch.int32)
+        ci = torch.empty(2, width, dtype=torch.int32)
+        vc = torch.empty(2, dtype=torch.int32)
+        build_lifted_compact_index_fixed(
+            sel, vlen, out_page_table=ptf, out_compact_indices=ci, out_valid_counts=vc
+        )
+        # request 0: lanes 0,1,2 valid -> ordinals 0,1,2; lane 3 masked.
+        self.assertEqual(ci[0].tolist(), [0, 1, 2, -1])
+        # request 1: lane 1 (dup 40) masked; ordinals 4,_,6,_ ; base = 1*width = 4.
+        self.assertEqual(ci[1].tolist(), [4, -1, 6, -1])
+        # page table: valid slots placed at their fixed ordinal; masked -> safe slot 0.
+        self.assertEqual(ptf.tolist(), [10, 20, 30, 0, 40, 0, 50, 0])
+        self.assertEqual(vc.tolist(), [3, 2])
+        # No -1 ever reaches the page table (dequant input).
+        self.assertTrue(bool((ptf >= 0).all()))
+
+
+@unittest.skipUnless(_HAS_CUDA, "lifted-budget graph-safe proof requires CUDA")
+class TestLiftedBudgetGraphSafe(unittest.TestCase):
+    """Production-hardening primitives: alloc-free dequant `out=` variant + the
+    fixed-shape compact builder replay zero-alloc under a real CUDA graph and
+    match the eager reference."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = "cuda"
+        major = torch.cuda.get_device_capability()[0]
+        cls.h_real = 16  # V3.2 per-rank head count (128 / TP8)
+        cls.h_pad = 128 if major >= 10 else 64
+        torch.manual_seed(0xB16)
+
+    def test_dequant_out_matches_allocating(self):
+        from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+            dequantize_k_cache_paged,
+            dequantize_k_cache_paged_out,
+        )
+        from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
+
+        P = 256
+        phys = torch.randn(P, 1, 1, 576, device=self.device, dtype=torch.bfloat16) / 8
+        quant = quantize_k_cache(phys)
+        ptf = torch.randint(0, P, (640,), device=self.device, dtype=torch.int32)
+        ref = dequantize_k_cache_paged(quant, ptf)
+        out = torch.empty(640, 1, 576, device=self.device, dtype=torch.bfloat16)
+        got = dequantize_k_cache_paged_out(quant, ptf, out)
+        self.assertIs(got, out)
+        torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
+
+    def _capture_and_check(self, width):
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            assert_no_alloc_in_region,
+        )
+        from sglang.srt.layers.attention.double_sparsity.lifted_budget import (
+            build_lifted_compact_kv_fixed,
+        )
+        from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+            dequantize_k_cache_paged,
+        )
+        from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+        d_qk, P, bs = 576, 3300, 2
+        phys = torch.randn(P, 1, 1, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        phys.clamp_(-6, 6)
+        quant = quantize_k_cache(phys)
+        full_dequant = dequantize_k_cache_paged(
+            quant, torch.arange(P, device=self.device, dtype=torch.int32)
+        )
+
+        sel = torch.full((bs, width), -1, dtype=torch.int32, device=self.device)
+        sel[0, :3000] = torch.arange(3000, device=self.device, dtype=torch.int32)
+        sel[1, :5] = torch.tensor([5, 7, 5, 9, 11], device=self.device, dtype=torch.int32)
+        vlen = (sel >= 0).sum(dim=1).to(torch.int32)
+
+        # Preallocated fixed-shape scratch.
+        scratch_ptf = torch.empty(bs * width, dtype=torch.int32, device=self.device)
+        scratch_ci = torch.empty(bs, width, dtype=torch.int32, device=self.device)
+        scratch_kv = torch.empty(bs * width, 1, d_qk, dtype=torch.bfloat16, device=self.device)
+        q = torch.randn(bs, self.h_real, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        q.clamp_(-6, 6)
+        q_padded = torch.zeros(bs, self.h_pad, d_qk, dtype=torch.bfloat16, device=self.device)
+        static_out = torch.empty(bs, self.h_real, 512, dtype=torch.bfloat16, device=self.device)
+        sm_scale = 1.0 / (d_qk**0.5)
+
+        def step():
+            build_lifted_compact_kv_fixed(
+                quant, sel, vlen,
+                out_page_table=scratch_ptf,
+                out_compact_indices=scratch_ci,
+                out_compact_kv=scratch_kv,
+                store_is_fp8=True,
+            )
+            q_padded[:, : self.h_real, :].copy_(q)
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_padded, kv=scratch_kv,
+                indices=scratch_ci.unsqueeze(1), sm_scale=sm_scale, d_v=512,
+            )
+            static_out.copy_(o[:, : self.h_real, :])
+
+        ref = _ref_lifted_from_physical(q, full_dequant, sel, sm_scale)
+
+        # Warmup (triton autotune / lazy init) on a side stream, then capture.
+        step()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            static_out.float(), ref.to(static_out.dtype).float(), atol=3e-2, rtol=3e-2
+        )
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(s)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            step()
+
+        torch.cuda.synchronize()
+        with assert_no_alloc_in_region(f"lifted graph-safe decode w={width}"):
+            for _ in range(20):
+                g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            static_out.float(), ref.to(static_out.dtype).float(), atol=3e-2, rtol=3e-2
+        )
+
+    def test_graph_safe_replay_zero_alloc_4096(self):
+        self._capture_and_check(4096)
+
+    def test_graph_safe_replay_zero_alloc_8192(self):
+        self._capture_and_check(8192)
+
+
 if __name__ == "__main__":
     unittest.main()

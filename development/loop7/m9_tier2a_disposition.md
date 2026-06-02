@@ -1,5 +1,14 @@
 # M9 — Tier-2.A (lifted-budget decode) landing disposition (AC-4 close)
 
+> **STATUS (superseded by the R15 review):** the R15 review **rejected the
+> deferred-with-evidence close** and required task16 production hardening to be
+> implemented. task16 is now in progress (graph-safe primitives landed R16; backend
+> integration + validator relax + live graph-mode re-measure in R17), after which a
+> **production-ready** disposition (task17 redo) replaces this deferred-only record.
+> The evidence and the DEC-4/DEC-6 analysis below remain valid as the record of why
+> the path is bounded-secondary and what hardening is required; only the "defer
+> instead of harden" conclusion is overridden.
+
 ## Decision
 Tier-2.A — the opt-in adjustable-budget ("lifted-budget") decode path — lands as
 an **opt-in, eager, default-off research path with recorded served recall
