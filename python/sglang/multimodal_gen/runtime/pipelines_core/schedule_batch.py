@@ -353,6 +353,12 @@ class Req:
                 self.negative_prompt, key_hint="negative_prompt"
             )
 
+        effective_flow_shift = (
+            self.flow_shift
+            if self.flow_shift is not None
+            else getattr(server_args.pipeline_config, "flow_shift", None)
+        )
+
         debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
@@ -366,7 +372,7 @@ class Req:
               guidance_scale: {self.guidance_scale}
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
-                  flow_shift: {server_args.pipeline_config.flow_shift}
+                  flow_shift: {effective_flow_shift}
                   image_path: {self.image_path}
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}

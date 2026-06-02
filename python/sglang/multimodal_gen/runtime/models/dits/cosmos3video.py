@@ -1051,6 +1051,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         fps: float | None = None,
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
+        max_text_seq_len: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass for denoising.
@@ -1069,6 +1070,8 @@ class Cosmos3OmniTransformer(CachableDiT):
                 noisy frames (timestep embedding applied) and 0 marks
                 conditioned frames (clean context, embedding skipped).
                 ``None`` means every frame is noisy (T2V / T2I).
+            max_text_seq_len: Real text length already computed during
+                tokenization. When omitted it is derived from ``text_mask``.
 
         Returns:
             [B, C, T, H, W] velocity prediction
@@ -1078,7 +1081,11 @@ class Cosmos3OmniTransformer(CachableDiT):
 
         batch_size, C, T, H, W = hidden_states.shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        max_real_len = int(text_mask.sum(dim=1).max().item())
+        if max_text_seq_len is None:
+            max_text_seq_len = int(text_mask.sum(dim=1).max().item())
+        if max_text_seq_len < text_ids.shape[1]:
+            text_ids = text_ids[:, :max_text_seq_len]
+            text_mask = text_mask[:, :max_text_seq_len]
 
         # Check if sequence parallelism is enabled
         sequence_shard_enabled = self.sp_size > 1
@@ -1177,8 +1184,6 @@ class Cosmos3OmniTransformer(CachableDiT):
         residual: torch.Tensor | None = None
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
-            k_und = k_und[:, :max_real_len]
-            v_und = v_und[:, :max_real_len]
             hidden_gen, residual = layer(
                 hidden_gen,
                 k_und,
