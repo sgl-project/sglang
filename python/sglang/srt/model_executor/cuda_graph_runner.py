@@ -325,36 +325,28 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         dsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
+        registry,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        if bs != raw_bs:
-            self.seq_lens.fill_(seq_len_fill_value)
-            self.out_cache_loc.zero_()
-            # Pair with seq_lens fill: padded rows must point at reserved
-            # req_pool slot 0 (req_to_token[0, :] is all zeros from init),
-            # so dummy attention reads land on slot 0 instead of a stale
-            # req_to_token row left by an earlier replay.
-            self.req_pool_indices.zero_()
-            if self.mamba_track_indices is not None:
-                self.mamba_track_indices.zero_()
-            if self.mamba_track_mask is not None:
-                self.mamba_track_mask.fill_(False)
+        # Registry-owned FB-shared slots — input_ids / positions /
+        # out_cache_loc / req_pool_indices / seq_lens / seq_lens_cpu /
+        # mrope_positions (and mamba_track_* when enabled) — including their
+        # padding reset and the dtype-grouped copy. The registry adopted these
+        # buffers, so it writes the same storage the old per-field code did
+        # (seq_lens -> FILL_SENTINEL, out_cache_loc/req_pool_indices/mamba ->
+        # ZERO; the old full-buffer fill_/zero_ is equivalent to the policies'
+        # tail-only reset because the head is overwritten by the copy).
+        registry.fill_from(
+            forward_batch,
+            raw_bs=raw_bs,
+            padded_bs=bs,
+            raw_num_tokens=raw_num_token,
+            padded_num_tokens=bs * num_tokens_per_bs,
+        )
 
-        # Build batched copy lists for all GPU tensors.
-        dsts = [
-            self.input_ids[:raw_num_token],
-            self.req_pool_indices[:raw_bs],
-            self.seq_lens[:raw_bs],
-            self.out_cache_loc[:raw_num_token],
-            self.positions[:raw_num_token],
-        ]
-        srcs = [
-            forward_batch.input_ids,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-        ]
+        # Residual fields the registry does not own yet.
+        dsts = []
+        srcs = []
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
@@ -365,26 +357,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 ngram_embedding_info.req_lens
             )
 
-        if (
-            self.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            dsts.append(self.mamba_track_indices[:raw_bs])
-            srcs.append(forward_batch.mamba_track_indices)
-        if (
-            self.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            dsts.append(self.mamba_track_mask[:raw_bs])
-            srcs.append(forward_batch.mamba_track_mask)
-
         if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
             dsts.append(self.encoder_lens[:raw_bs])
             srcs.append(forward_batch.encoder_lens)
-
-        if forward_batch.mrope_positions is not None:
-            dsts.append(self.mrope_positions[:, :raw_num_token])
-            srcs.append(forward_batch.mrope_positions)
 
         if self.rids_int is not None and forward_batch.rids_int is not None:
             dsts.append(self.rids_int[:raw_bs])
@@ -421,14 +396,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 dsts.append(buf[:dim])
                 srcs.append(src)
 
-        # Batch all GPU copies, grouped by dtype pair.
+        # Batch the residual GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
-
-        # CPU tensor copy (cannot be batched with GPU tensors).
-        if forward_batch.seq_lens_cpu is not None:
-            if bs != raw_bs:
-                self.seq_lens_cpu.fill_(seq_len_fill_value)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
 
 # Detect whether the current forward pass is in capture mode
@@ -1269,6 +1238,7 @@ class CudaGraphRunner:
             # "any prefill-CP flavor enabled" (DSA CP or MLA CP).
             dsa_enable_prefill_cp=self.enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(),
+            registry=self.buffer_registry,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
