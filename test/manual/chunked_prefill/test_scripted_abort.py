@@ -15,6 +15,21 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
+def _drain_until_released(t: ScriptedContext, *handles: ScriptedReqHandle):
+    # Under the overlap scheduler an abort is injected at the top of the next
+    # get_next_batch_to_run, but the actual KV/row/lock release lands a couple of
+    # forward steps later -- the in-flight forward's result must drain first. Step
+    # the loop until every aborted handle is fully released instead of asserting
+    # after a single yield.
+    for _ in range(12):
+        if all(
+            h.kv_pages == 0 and (h.req is None or h.req.req_pool_idx is None)
+            for h in handles
+        ):
+            return
+        yield
+
+
 class TestAbortBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
@@ -31,7 +46,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert pages_before > 0, "chunked req should own KV pages mid-chunk"
 
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
 
         assert r.status in (
             "finished",
@@ -57,7 +72,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
@@ -71,7 +86,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
 
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
 
@@ -85,7 +100,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.is_chunking)
 
         t.abort(r1)
-        yield
+        yield from _drain_until_released(t, r1)
 
         assert r1.kv_pages == 0
         yield from run_until_finished(r2)
@@ -98,7 +113,7 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_abort_with_zero_yield(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
         assert r.lock_refs == 0
@@ -111,7 +126,7 @@ class TestAbortBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
 
@@ -155,7 +170,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(reqs[0], lambda h: h.is_chunking)
         for r in reqs:
             t.abort(r)
-        yield
+        yield from _drain_until_released(t, *reqs)
         for r in reqs:
             assert r.kv_pages == 0
             assert r.req is None or r.req.req_pool_idx is None
@@ -275,9 +290,9 @@ class TestAbortBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=4)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
-        assert r.req.inflight_middle_chunks == 0
+        assert r.req is None or r.req.inflight_middle_chunks == 0
 
     def test_abort_penultimate_chunk(self):
         self.server.execute_script(self._script_abort_penultimate_chunk)
@@ -287,7 +302,7 @@ class TestAbortBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=4 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
         assert r.lock_refs == 0
@@ -301,7 +316,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         t.abort(r)
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
@@ -315,7 +330,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.status == "running")
         assert r.kv_pages > 0, "decode req must own KV before abort"
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
@@ -346,6 +361,7 @@ class TestAbortBasic(ScriptedTestCase):
         for r in reqs:
             t.abort(r)
             yield
+        yield from _drain_until_released(t, *reqs)
         for r in reqs:
             assert r.kv_pages == 0
 
@@ -359,7 +375,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
 
         # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
         assert r.kv_pages == 0
@@ -412,8 +428,7 @@ class TestAbortBasic(ScriptedTestCase):
         chunks_before = r.chunks_done
 
         t.abort(r)
-        yield
-        yield
+        yield from _drain_until_released(t, r)
 
         hit_counts_after = t.get_all_node_hit_counts()
         node_count_after = len(hit_counts_after)
@@ -477,7 +492,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert not r.is_chunking
 
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
@@ -503,8 +518,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert (1 if t.scheduler.chunked_req is not None else 0) == 1
 
         t.abort(r)
-        yield
-        yield
+        yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert (1 if t.scheduler.chunked_req is not None else 0) == 0
@@ -528,7 +542,7 @@ class TestAbortBasic(ScriptedTestCase):
 
         t.abort(r1)
         r2 = t.start_req(prompt_len=16, max_new_tokens=2)
-        yield
+        yield from _drain_until_released(t, r1)
 
         cur = (
             t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
@@ -549,7 +563,7 @@ class TestAbortBasic(ScriptedTestCase):
 
         t.pause_generation(mode="retract")
         t.abort(r1)
-        yield
+        yield from _drain_until_released(t, r1)
 
         assert r1.kv_pages == 0, (
             f"force_retract + abort same yield must release KV; got " f"{r1.kv_pages}"
@@ -570,13 +584,15 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_chunked_with_baton_handoff(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Distinct prompt_token so r2 does not hit r1's partially-cached prefix
+        # after r1 is aborted -- it must re-chunk from scratch to take the baton.
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=1)
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=2)
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (1 if t.scheduler.chunked_req is not None else 0) == 1
 
         t.abort(r1)
-        yield
+        yield from _drain_until_released(t, r1)
 
         yield from run_until(r2, lambda h: h.is_chunking)
         assert r1.kv_pages == 0
@@ -605,7 +621,7 @@ class TestAbortPP(ScriptedTestCase):
         )
 
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert r.req is None or r.req.req_pool_idx is None
