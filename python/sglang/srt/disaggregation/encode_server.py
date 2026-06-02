@@ -1,12 +1,15 @@
 import asyncio
 import concurrent.futures
+import contextlib
 import ctypes
+import functools
 import logging
 import multiprocessing as mp
 import os
 import pickle
 import time
 import traceback
+from collections import defaultdict
 from http import HTTPStatus
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -54,6 +57,7 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
+from sglang.srt.utils.common import configure_logger
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -78,9 +82,12 @@ rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
 
-use_image_processor_gpu = (
-    int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
-)
+use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
+
+ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
+# Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
+# if the batch worker stalls (NCCL hang, dead worker proc, etc.).
+ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
 
 
 class MMError(Exception):
@@ -174,9 +181,36 @@ def _get_mm_feature(mm_inputs, modality):
     )
 
 
+def _normalize_aux_value(val):
+    """Normalize aux values to pickle types compatible with safe_pickle_loads.
+
+    HF multimodal processors (e.g. Qwen3-VL/Omni) emit numpy arrays for
+    fields like ``video_timestamps`` / ``second_per_grid_ts``. ``numpy.*`` is
+    not in SafeUnpickler's allowlist, so the receiver would refuse to load
+    those payloads. Convert numpy values to torch tensors (numeric) or plain
+    Python lists (object dtype) before pickling.
+    """
+    if val is None:
+        return None
+    if isinstance(val, np.ndarray):
+        if val.dtype == object:
+            return val.tolist()
+        return torch.from_numpy(np.ascontiguousarray(val))
+    if isinstance(val, np.generic):
+        return val.item()
+    if isinstance(val, (list, tuple)):
+        return type(val)(_normalize_aux_value(v) for v in val)
+    if isinstance(val, dict):
+        return {k: _normalize_aux_value(v) for k, v in val.items()}
+    return val
+
+
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
-    return {attr: mm_inputs.get(attr) for attr in video_meta_attrs_for(model_type)}
+    return {
+        attr: _normalize_aux_value(mm_inputs.get(attr))
+        for attr in video_meta_attrs_for(model_type)
+    }
 
 
 class MMEncoder:
@@ -223,6 +257,8 @@ class MMEncoder:
             use_image_processor_gpu and not server_args.disable_fast_image_processor
         )
         self._build_vision_config(server_args.mm_process_config)
+        self.model_audio_sr = self._resolve_audio_sr()
+        logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),
@@ -243,6 +279,11 @@ class MMEncoder:
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        # Dedicated executor for image preprocessing (resize/normalize).
+        # Separate from self.executor (ZMQ sends) to avoid contention under high concurrency.
+        self.preproc_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=envs.SGLANG_ENCODER_PREPROC_WORKERS.get()
+        )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
@@ -275,6 +316,14 @@ class MMEncoder:
         else:
             self.mm_global_cache = None
 
+        # Pre-compute embedding metadata (needed by all ranks for mooncake)
+        if self.server_args.encoder_transfer_backend == "mooncake":
+            self._embedding_dims = self._infer_embedding_dims()
+            self._embedding_dtype = next(self.model.parameters()).dtype
+            self._element_size = torch.tensor(
+                [], dtype=self._embedding_dtype
+            ).element_size()
+
         if self.rank == 0:
             logger.info(
                 f"Using transfer backend: {self.server_args.encoder_transfer_backend}"
@@ -299,6 +348,33 @@ class MMEncoder:
                     )
 
             self.embedding_to_send = dict()
+            # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
+            self.encode_dispatch_lock = asyncio.Lock()
+
+            # Async mooncake state: track background VIT forward completion
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._forward_ready_events: Dict[str, asyncio.Event] = {}
+                self._forward_results: Dict[str, dict] = {}
+                # when multiple decoder TP ranks call
+                # POST /encode with the same req_id, only the first triggers
+                # _run_forward(); subsequent callers wait on the event and
+                # return the cached metadata.
+                self._inflight_encode_lock = asyncio.Lock()
+                self._inflight_encode_events: Dict[str, asyncio.Event] = {}
+                self._inflight_encode_meta: Dict[str, Tuple] = {}
+                self._inflight_encode_cleanup_tasks: Dict[str, asyncio.Task] = {}
+
+        # Bind unified encode entry point based on backend and cache config
+        if self.mm_global_cache is not None:
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._encode_fn = self.encode_with_global_cache_mooncake
+            else:
+                self._encode_fn = self.encode_with_global_cache
+        else:
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._encode_fn = self.encode_with_mooncake
+            else:
+                self._encode_fn = self.encode
 
         logger.info(f"rank {rank} init finish ")
 
@@ -340,6 +416,44 @@ class MMEncoder:
 
         logger.info(f"Global cache embedding dims: {dims}")
         return dims
+
+    def _resolve_audio_sr(self) -> int:
+        # Must match MiMoProcessor.from_hf_config — on drift, mimo tags the
+        # ndarray with its own audio_sampling_rate and skips resample, so the
+        # waveform is interpreted at the wrong rate and warped.
+        def _read(obj, attr):
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get(attr)
+            return getattr(obj, attr, None)
+
+        audio_cfg = self.vision_config.get("audio", {})
+        sr = audio_cfg.get("audio_sampling_rate")
+        if sr:
+            return int(sr)
+
+        hf_cfg = self.model_config.hf_config
+        thinker_cfg = _read(hf_cfg, "thinker_config")
+        pc = _read(thinker_cfg, "processor_config") or _read(hf_cfg, "processor_config")
+        sr = _read(pc, "audio_sampling_rate")
+        if sr:
+            return int(sr)
+        ac = _read(thinker_cfg, "audio_config") or _read(hf_cfg, "audio_config")
+        for attr in ("sampling_rate", "sample_rate"):
+            sr = _read(ac, attr)
+            if sr:
+                return int(sr)
+
+        sr = audio_cfg.get("sampling_rate")
+        if sr:
+            return int(sr)
+        logger.warning(
+            "No audio sampling rate found in mm_config or hf_config; "
+            "falling back to 16000 Hz. If the model expects a different SR "
+            "(e.g. MiMo-V2 defaults to 24000), audio will be warped."
+        )
+        return 16000
 
     def _build_vision_config(self, mm_process_config):
         """
@@ -440,7 +554,6 @@ class MMEncoder:
         data,
         modality: Modality,
         frame_count_limit=None,
-        audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
     ):
         """
@@ -463,7 +576,7 @@ class MMEncoder:
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
-                return load_audio(data, audio_sample_rate)
+                return load_audio(data, self.model_audio_sr)
 
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
@@ -500,6 +613,11 @@ class MMEncoder:
                 ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_lens // 100) * 13
             )
             return output_lengths
+        elif self.model_type == "mimo_v2":
+            # MiMo-V2's preprocess_audio returns audio_token_len (already
+            # post-encoder/avg-pooler/group-size). Stored in audio_feature_lens_raw,
+            # so no further reduction here.
+            return feature_lens
         else:
             # fallback to original HF audio sample logic for other models
             logger.warning(
@@ -631,10 +749,18 @@ class MMEncoder:
         return slices
 
     def _calculate_hashes_from_features(
-        self, mm_feature: torch.Tensor, grid_thw: List, modality: Modality
-    ) -> List[str]:
+        self, mm_feature, grid_thw: List, modality: Modality
+    ) -> List[int]:
         """CPU Task: Compute hashes based on processed feature patches."""
-        hashes, offset = [], 0
+        hashes = []
+        if modality == Modality.AUDIO and isinstance(mm_feature, list):
+            for feature in mm_feature:
+                tmp_item = MultimodalDataItem(modality=modality, feature=feature)
+                tmp_item.set_pad_value()
+                hashes.append(tmp_item.hash)
+            return hashes
+
+        offset = 0
         logger.info(f"{mm_feature.shape=} with {modality=}")
         for grid in grid_thw:
             num_patches = self.get_num_patches(grid, modality)
@@ -645,36 +771,50 @@ class MMEncoder:
             offset += num_patches
         return hashes
 
-    async def _encode_missing(
+    def _encode_missing(
         self,
-        mm_feature: torch.Tensor,
+        mm_feature,
         mm_inputs: dict,
         indices: List[int],
         modality: Modality = Modality.IMAGE,
         get_feature_fn=None,
+        grid_thw: Optional[List] = None,
+        keep_on_gpu: bool = False,
     ) -> List[torch.Tensor]:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        if grid_thw is None:
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
-        # 1. Slice mm_feature to get only the patches for missing mm items
-        sub_feature_list = []
-        offsets = [0]
-        curr = 0
-        for g in grid_thw:
-            curr += self.get_num_patches(g, modality)
-            offsets.append(curr)
-
-        for idx in indices:
-            sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
-
-        sub_feature = torch.cat(sub_feature_list, dim=0)
+        # Audio features are per-item (list of mels for mimo_v2, or batched
+        # N x n_mels x T_max for qwen2_audio); slice by item index and keep
+        # per-item shape. Image/video features are concatenated along the
+        # patch dim; slice by cumulative patch offsets and cat.
+        if modality == Modality.AUDIO:
+            if isinstance(mm_feature, list):
+                sub_feature = [mm_feature[i] for i in indices]
+            else:
+                sub_feature = mm_feature[list(indices)]
+        else:
+            sub_feature_list = []
+            offsets = [0]
+            curr = 0
+            for g in grid_thw:
+                curr += self.get_num_patches(g, modality)
+                offsets.append(curr)
+            for idx in indices:
+                sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
+            sub_feature = torch.cat(sub_feature_list, dim=0)
 
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": modality,
-                "feature": _convert(sub_feature),
+                "feature": (
+                    sub_feature
+                    if isinstance(sub_feature, list)
+                    else _convert(sub_feature)
+                ),
             }
         )
 
@@ -688,7 +828,9 @@ class MMEncoder:
                 mm_item.set(k, val)
 
         with torch.inference_mode():
-            new_embeddings = get_feature_fn([mm_item]).cpu()
+            new_embeddings = get_feature_fn([mm_item])
+            if not keep_on_gpu:
+                new_embeddings = new_embeddings.cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
 
@@ -710,6 +852,15 @@ class MMEncoder:
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
 
+        # Hashes must be grid-space; a leaf-space list would size-mismatch
+        # rank>0's mask (zeros(num_items)) and deadlock TP.
+        if hashes is not None and len(hashes) != num_items:
+            raise BadRequestError(
+                f"User-supplied hashes length {len(hashes)} != grid count "
+                f"{num_items} for {self.model_type}/{modality.name}; hashes "
+                f"must be in grid space (1 per encoder grid entry)."
+            )
+
         # Step 1: Rank 0 checks global cache and broadcasts hit/miss mask to all ranks.
         if self.rank == 0:
             if hashes is None:
@@ -718,7 +869,9 @@ class MMEncoder:
                 )
             else:
                 mm_hashes = hashes
-            exist_mask = await self.mm_global_cache.batch_is_exist(mm_hashes)
+            # Convert hashes to strings (L2 cache expects string keys for Mooncake)
+            str_mm_hashes = [str(h) for h in mm_hashes]
+            exist_mask = await self.mm_global_cache.batch_is_exist(str_mm_hashes)
             mask_tensor = torch.tensor(
                 [1 if e else 0 for e in exist_mask], dtype=torch.int32
             )
@@ -740,7 +893,7 @@ class MMEncoder:
         # Step 2: All ranks run ViT together on cache-miss images.
         new_slices = []
         if missing_indices:
-            new_slices = await self._encode_missing(
+            new_slices = self._encode_missing(
                 mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
             )
 
@@ -749,7 +902,7 @@ class MMEncoder:
 
         if self.rank == 0:
             if hit_indices:
-                hit_hashes = [mm_hashes[i] for i in hit_indices]
+                hit_hashes = [str_mm_hashes[i] for i in hit_indices]
                 hit_tokens = [
                     self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
                 ]
@@ -783,7 +936,7 @@ class MMEncoder:
                 f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
                 f"for {len(hit_indices)} mm items."
             )
-            fallback_slices = await self._encode_missing(
+            fallback_slices = self._encode_missing(
                 mm_feature, mm_inputs, hit_indices, modality, get_feature_fn
             )
         else:
@@ -799,7 +952,7 @@ class MMEncoder:
             # Fill in cache-hit embeddings (from prefetch or fallback)
             if prefetch_status.item() == 1 and hit_indices:
                 cached_slices = self.mm_global_cache.get_embeddings(
-                    [mm_hashes[i] for i in hit_indices]
+                    [str_mm_hashes[i] for i in hit_indices]
                 )
                 for i, idx in enumerate(hit_indices):
                     final_slices[idx] = cached_slices[i]
@@ -811,10 +964,10 @@ class MMEncoder:
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
-            all_new_hashes = [mm_hashes[i] for i in missing_indices]
+            all_new_hashes = [str_mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
-                all_new_hashes += [mm_hashes[i] for i in hit_indices]
+                all_new_hashes += [str_mm_hashes[i] for i in hit_indices]
                 all_new_slices += list(fallback_slices)
 
             if all_new_hashes:
@@ -840,6 +993,8 @@ class MMEncoder:
                 mm_embedding,
                 **aux_data,
             )
+            if self.profiler is not None:
+                self.profiler.step()
             return (
                 mm_embedding.nbytes,
                 mm_embedding.shape[0],
@@ -848,11 +1003,220 @@ class MMEncoder:
                 None,
             )
         else:
+            if self.profiler is not None:
+                self.profiler.step()
             return (0, 0, 0, None, None)
+
+    async def encode_with_global_cache_mooncake(
+        self,
+        mm_items,
+        modality: Modality,
+        req_id: str,
+        num_parts: int,
+        part_idx: int,
+        hashes: Optional[List[str]] = None,
+    ):
+        """Async encode with global cache for mooncake backend.
+        All ranks participate in VIT forward; tp_size > 1 adds broadcasts for sync."""
+        try:
+            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            num_items = len(grid_thw)
+            aux_data = _build_mm_aux_data(mm_inputs)
+
+            # Setup metadata and event management
+            nbytes, total_tokens, embedding_dim, event = (
+                self._setup_mooncake_async_encode(
+                    req_id, num_parts, part_idx, grid_thw, modality, aux_data
+                )
+            )
+
+            # Rank 0: compute hashes
+            if self.rank == 0:
+                if hashes is None:
+                    mm_hashes = self._calculate_hashes_from_features(
+                        mm_feature, grid_thw, modality
+                    )
+                else:
+                    mm_hashes = hashes
+
+            # All ranks: launch background task for cache check + VIT forward.
+            # Do NOT use run_in_executor: get_feature_fn relies on a session
+            # context (CUDA / SGLang inference session) that is bound to the
+            # event-loop main thread and is NOT available inside a
+            # ThreadPoolExecutor worker thread.
+            async def _run_forward_with_cache():
+                try:
+                    # Step 1: Rank 0 checks cache, broadcast mask if TP > 1
+                    if self.rank == 0:
+                        exist_mask = await self.mm_global_cache.batch_is_exist(
+                            mm_hashes
+                        )
+                        mask_tensor = torch.tensor(
+                            [1 if e else 0 for e in exist_mask],
+                            dtype=torch.int32,
+                        )
+                    else:
+                        mask_tensor = torch.zeros(num_items, dtype=torch.int32)
+
+                    if self.server_args.tp_size > 1:
+                        torch.distributed.broadcast(
+                            mask_tensor,
+                            src=0,
+                            group=self.mm_global_cache.prefetch_tp_group,
+                        )
+
+                    exist_mask = [m.item() == 1 for m in mask_tensor]
+                    missing_indices = [i for i, e in enumerate(exist_mask) if not e]
+                    hit_indices = [i for i, e in enumerate(exist_mask) if e]
+                    final_slices = [None] * num_items
+
+                    # Step 2: All ranks run VIT forward for cache misses
+                    # (runs in event loop to preserve session context)
+                    new_slices = []
+                    if missing_indices:
+                        new_slices = self._encode_missing(
+                            mm_feature,
+                            mm_inputs,
+                            missing_indices,
+                            modality,
+                            get_feature_fn,
+                            grid_thw,
+                            keep_on_gpu=True,
+                        )
+                        if self.rank == 0:
+                            for i, idx in enumerate(missing_indices):
+                                final_slices[idx] = new_slices[i]
+
+                    # Step 3: Rank 0 prefetches cache-hit embeddings
+                    prefetch_status = torch.tensor([1], dtype=torch.int32)
+                    if self.rank == 0 and hit_indices:
+                        hit_hashes = [mm_hashes[i] for i in hit_indices]
+                        hit_tokens = [
+                            self.get_num_tokens(grid_thw[i], modality)
+                            for i in hit_indices
+                        ]
+                        self.mm_global_cache.prefetch(
+                            req_id, hit_hashes, hit_tokens, modality
+                        )
+                        try:
+
+                            async def _wait_prefetch():
+                                while not self.mm_global_cache.check_prefetch_progress(
+                                    req_id
+                                ):
+                                    await asyncio.sleep(0.005)
+
+                            await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
+                            cached_slices = self.mm_global_cache.get_embeddings(
+                                hit_hashes
+                            )
+                            for i, idx in enumerate(hit_indices):
+                                final_slices[idx] = cached_slices[i]
+                        except (asyncio.TimeoutError, Exception) as e:
+                            logger.error(
+                                f"Prefetch failed for {req_id}: {e}. "
+                                f"Falling back to ViT for "
+                                f"{len(hit_indices)} hit items."
+                            )
+                            prefetch_status[0] = 0
+
+                    # Broadcast prefetch result if TP > 1
+                    if self.server_args.tp_size > 1:
+                        torch.distributed.broadcast(
+                            prefetch_status,
+                            src=0,
+                            group=self.mm_global_cache.prefetch_tp_group,
+                        )
+
+                    # Step 4: All ranks fallback VIT for failed prefetch
+                    # (runs in event loop to preserve session context)
+                    fallback_slices = None
+                    if prefetch_status.item() == 0 and hit_indices:
+                        fallback_slices = self._encode_missing(
+                            mm_feature,
+                            mm_inputs,
+                            hit_indices,
+                            modality,
+                            get_feature_fn,
+                            grid_thw,
+                            keep_on_gpu=True,
+                        )
+                        if self.rank == 0:
+                            for i, idx in enumerate(hit_indices):
+                                final_slices[idx] = fallback_slices[i]
+
+                    # Step 5: Rank 0 assembles and stores result
+                    if self.rank == 0:
+                        mm_embedding = torch.cat(final_slices, dim=0)
+                        # Wait for any pending VIT / cat kernels to finish
+                        # before publishing to /send: mooncake transfer_sync
+                        # is a host-side RDMA read that bypasses CUDA streams
+                        # and would otherwise race with in-flight kernels.
+                        torch.cuda.current_stream(mm_embedding.device).synchronize()
+
+                        # Background insert new embeddings into cache
+                        all_new_hashes = [mm_hashes[i] for i in missing_indices]
+                        all_new_slices = list(new_slices)
+                        if fallback_slices is not None:
+                            all_new_hashes += [mm_hashes[i] for i in hit_indices]
+                            all_new_slices += list(fallback_slices)
+                        if all_new_hashes:
+
+                            async def _background_insert():
+                                await asyncio.to_thread(
+                                    self.mm_global_cache.insert_batch,
+                                    all_new_hashes,
+                                    all_new_slices,
+                                )
+
+                            insert_task = asyncio.create_task(_background_insert())
+                            self.background_tasks.add(insert_task)
+                            insert_task.add_done_callback(self.background_tasks.discard)
+
+                        self._forward_results[req_id]["embedding"] = mm_embedding
+                        logger.info(
+                            f"Global cache + VIT forward completed for "
+                            f"{req_id}, shape={mm_embedding.shape}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Global cache + VIT forward failed for " f"{req_id}: {e}"
+                    )
+                    if self.rank == 0:
+                        self._forward_results[req_id]["error"] = str(e)
+                finally:
+                    if self.rank == 0:
+                        event.set()
+                    if self.profiler is not None:
+                        self.profiler.step()
+
+            self._launch_mooncake_background_task(_run_forward_with_cache())
+
+            if self.rank == 0:
+                logger.info(
+                    f"Returning metadata immediately for {req_id}, "
+                    f"global cache + VIT forward running async"
+                )
+
+            return (nbytes, total_tokens, embedding_dim, None, None)
+
+        except Exception as e:
+            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+            error_msg = str(e)
+            logger.error(
+                f"Rank {self.rank} encode_with_global_cache_mooncake "
+                f"failed: {error_msg} {error_code = }"
+            )
+            return self._handle_mooncake_encode_error(
+                req_id, num_parts, part_idx, modality, error_msg, error_code
+            )
 
     async def _flatten_and_load_audios(self, mm_items):
         """
-        Flatten mm_items structure, load audios concurrently, and restore original structure.
+        Flatten mm_items, load audios concurrently as np.ndarray at
+        self.model_audio_sr, restore original structure.
         """
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
 
@@ -892,6 +1256,28 @@ class MMEncoder:
             else:
                 flat.append(item)
         return flat
+
+    def _grid_count_per_leaf(self, leaves: List, modality: Modality) -> List[int]:
+        """Number of grid entries each leaf produces under the model's processor.
+
+        Most processors map 1 leaf → 1 grid. Kimi-VL/K25 image processors expand
+        a leaf shaped {"type": "image", "image": [pil1, pil2, ...]} into N grids
+        (see _normalize_kimi_encoder_images). Cross-request batching needs these
+        counts to keep per-request boundaries aligned with grid_dim.
+        """
+        if self.model_type not in ("kimi_k25", "kimi_vl") or modality != Modality.IMAGE:
+            return [1] * len(leaves)
+
+        def count(leaf):
+            if (
+                isinstance(leaf, dict)
+                and leaf.get("type") == "image"
+                and isinstance(leaf.get("image"), (list, tuple))
+            ):
+                return len(self._flatten_nested_items(leaf["image"]))
+            return 1
+
+        return [count(leaf) for leaf in leaves]
 
     def _normalize_kimi_encoder_images(self, images):
         """Normalize Kimi image inputs for the image processor call."""
@@ -978,7 +1364,10 @@ class MMEncoder:
         image_config = self.vision_config.get("image", {})
         if self.model_type in ["kimi_k25", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
-        return self.image_processor(images=images, **image_config)
+        return await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(self.image_processor, images=images, **image_config),
+        )
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
@@ -987,7 +1376,12 @@ class MMEncoder:
             raise ValueError("No video processor available")
 
         videos, video_processor_kwargs = await self._flatten_and_load_videos(mm_items)
-        processor_input = self.video_processor(videos=videos, **video_processor_kwargs)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.video_processor, videos=videos, **video_processor_kwargs
+            ),
+        )
 
         # Get additional video metadata
         if (
@@ -1039,18 +1433,26 @@ class MMEncoder:
         return processor_input
 
     async def _process_audio_items(self, mm_items, model_preprocessor):
+        # Await off the event loop so EncoderScheduler can accumulate
+        # cross-request batches during download.
+        audios = await self._flatten_and_load_audios(mm_items)
+
         if model_preprocessor:
-            return model_preprocessor(mm_items, Modality.AUDIO, self.vision_config)
+            return model_preprocessor(audios, Modality.AUDIO, self.vision_config)
+
         if not self.audio_processor:
             raise ValueError("No audio processor available")
 
-        audios = await self._flatten_and_load_audios(mm_items)
         audio_config = self.vision_config.get("audio", {})
-        processor_input = self.audio_processor.feature_extractor(audios, **audio_config)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.audio_processor.feature_extractor, audios, **audio_config
+            ),
+        )
         processor_input["feature_attention_mask"] = processor_input.pop(
             "attention_mask"
         )
-        # convert to same format as image/video
         input_lengths = torch.tensor(
             processor_input["feature_attention_mask"].sum(-1), dtype=torch.long
         )
@@ -1141,11 +1543,61 @@ class MMEncoder:
         url=None,
     ):
         if self.server_args.encoder_transfer_backend == "mooncake":
-            self.engine.register(embedding.data_ptr(), embedding.nbytes)
-            self.engine.transfer_sync(
-                session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
+            # Wait for async VIT forward completion if needed
+            req_id = mm_data.req_id
+            if req_id in self._forward_ready_events:
+                await self._forward_ready_events[req_id].wait()
+                result = self._forward_results.get(req_id)
+                if result is not None:
+                    if "error" in result:
+                        raise InternalError(f"VIT forward failed: {result['error']}")
+                    embedding = result["embedding"]
+                    # Cache the embedding on mm_data so subsequent /send calls
+                    # from other decoder TP ranks can reuse it.
+                    mm_data.cached_embedding = embedding
+
+            # Retrieve cached embedding for duplicate /send calls from other
+            # decoder TP ranks.
+            if embedding is None:
+                embedding = mm_data.cached_embedding
+            if embedding is None:
+                raise InternalError(
+                    f"No embedding available for Mooncake GPU-direct transfer: {req_id}"
+                )
+
+            expected_nbytes = mm_data.shape[0] * mm_data.shape[1] * self._element_size
+            assert embedding.nbytes == expected_nbytes, (
+                f"Embedding size mismatch for {req_id}: "
+                f"actual={embedding.nbytes}, expected={expected_nbytes} "
+                f"(shape={mm_data.shape}, element_size={self._element_size})"
             )
-            self.engine.deregister(embedding.data_ptr())
+
+            # MR was registered once in _run_forward and is shared across all
+            # sibling-TP /send calls;
+            mr_already_registered = (
+                self._forward_results.get(req_id, {}).get("mr_ptr")
+                == embedding.data_ptr()
+            )
+            if not mr_already_registered:
+                self.engine.register(embedding.data_ptr(), embedding.nbytes)
+            _t_xfer_start = time.monotonic()
+            await asyncio.to_thread(
+                self.engine.transfer_sync,
+                session_id,
+                embedding.data_ptr(),
+                buffer_address,
+                embedding.nbytes,
+            )
+            xfer_ms = (time.monotonic() - _t_xfer_start) * 1000.0
+            if not mr_already_registered:
+                self.engine.deregister(embedding.data_ptr())
+            # Only emit at INFO when transfer is slow or fell back
+            # to per-/send register;
+            if xfer_ms > 200.0 or not mr_already_registered:
+                logger.info(
+                    f"[{req_id}] mooncake transfer_sync={xfer_ms:.1f}ms "
+                    f"nbytes={embedding.nbytes} shared_mr={mr_already_registered}"
+                )
 
             mm_data.embedding = None
 
@@ -1158,7 +1610,9 @@ class MMEncoder:
 
         # Serialize data
         if self.server_args.encoder_transfer_backend == "mooncake":
-            serialized_data = pickle.dumps(mm_data)
+            # Mooncake already pushed the embedding via RDMA;
+            new_mm_data = mm_data.copy_without_embedding()
+            serialized_data = pickle.dumps(new_mm_data)
             buffer = None
         else:
             new_mm_data = mm_data.copy_without_embedding()
@@ -1185,7 +1639,9 @@ class MMEncoder:
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
-    async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
+    async def encode(
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+    ):
         try:
             grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
 
@@ -1224,6 +1680,309 @@ class MMEncoder:
                 self.embedding_to_send[req_id] = mm_data
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
+
+    def _setup_mooncake_async_encode(
+        self,
+        req_id: str,
+        num_parts: int,
+        part_idx: int,
+        grid_thw,
+        modality: Modality,
+        aux_data: dict,
+    ):
+        """Setup metadata and event management for mooncake async encode.
+        Returns (nbytes, total_tokens, embedding_dim, event)."""
+        total_tokens = sum(self.get_num_tokens(g, modality) for g in grid_thw)
+        embedding_dim = self._embedding_dims[modality]
+        nbytes = total_tokens * embedding_dim * self._element_size
+
+        event = None
+        if self.rank == 0:
+            mm_data = EmbeddingData(
+                req_id,
+                num_parts,
+                part_idx,
+                grid_thw,
+                modality,
+                embedding=None,
+                embedding_shape=[total_tokens, embedding_dim],
+                **aux_data,
+            )
+            self.embedding_to_send[req_id] = mm_data
+            event = asyncio.Event()
+            self._forward_ready_events[req_id] = event
+            self._forward_results[req_id] = {}
+
+        return nbytes, total_tokens, embedding_dim, event
+
+    def _handle_mooncake_encode_error(
+        self, req_id, num_parts, part_idx, modality, error_msg, error_code
+    ):
+        """Handle outer exception for mooncake async encode methods."""
+        if self.rank == 0:
+            if req_id in self._forward_ready_events:
+                self._forward_results[req_id] = {"error": error_msg}
+                self._forward_ready_events[req_id].set()
+            mm_data = EmbeddingData(
+                req_id,
+                num_parts,
+                part_idx,
+                None,
+                modality,
+                error_msg=error_msg,
+                error_code=error_code,
+            )
+            self.embedding_to_send[req_id] = mm_data
+        return 0, 0, 0, error_msg, error_code
+
+    def _launch_mooncake_background_task(self, coro):
+        """Launch an async background task and track it."""
+        task = asyncio.create_task(coro)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
+
+    async def _cleanup_inflight_encode_state(self, req_id: str):
+        if not hasattr(self, "_inflight_encode_events"):
+            return
+        async with self._inflight_encode_lock:
+            self._inflight_encode_events.pop(req_id, None)
+            self._inflight_encode_meta.pop(req_id, None)
+            task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+        # Also clean up embedding data and forward state
+        mm_data = self.embedding_to_send.pop(req_id, None)
+        if mm_data is not None:
+            mm_data.cached_embedding = None
+        # Release the rkey after all /send calls have completed.
+        forward_state = self._forward_results.pop(req_id, None)
+        if forward_state is not None:
+            mr_ptr = forward_state.get("mr_ptr")
+            if mr_ptr is not None:
+                try:
+                    self.engine.deregister(mr_ptr)
+                except Exception as dereg_err:
+                    logger.warning(
+                        f"Shared-MR deregister failed for {req_id}: {dereg_err}"
+                    )
+        self._forward_ready_events.pop(req_id, None)
+
+    def _schedule_inflight_encode_cleanup(self, req_id: str):
+        if not hasattr(self, "_inflight_encode_events"):
+            return
+
+        async def _cleanup_later():
+            await asyncio.sleep(self.send_timeout)
+            await self._cleanup_inflight_encode_state(req_id)
+
+        old_task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        task = asyncio.create_task(_cleanup_later())
+        self._inflight_encode_cleanup_tasks[req_id] = task
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+
+    async def encode_with_mooncake(
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+    ):
+        """Async encode for mooncake: all ranks participate in VIT forward via background task,
+        rank 0 returns metadata immediately."""
+        try:
+            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            aux_data = _build_mm_aux_data(mm_inputs)
+
+            # Setup metadata and event management
+            nbytes, total_tokens, embedding_dim, event = (
+                self._setup_mooncake_async_encode(
+                    req_id, num_parts, part_idx, grid_thw, modality, aux_data
+                )
+            )
+
+            # Build mm_item (all ranks)
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": modality,
+                    "feature": _convert(_get_mm_feature(mm_inputs, modality)),
+                }
+            )
+            for k, v in mm_inputs.items():
+                if k in _mm_feature_attrs.get(modality, []):
+                    continue
+                val = _convert(v)
+                mm_item.set(k, val)
+
+            async def _run_forward():
+                try:
+                    with torch.inference_mode():
+                        emb = get_feature_fn([mm_item])
+                        if len(emb.shape) != 2:
+                            emb = emb.reshape(-1, emb.shape[-1])
+                        # mooncake's transfer_sync is a host-side
+                        # RDMA read that bypasses the CUDA stream. Without an
+                        # explicit sync here, sibling-TP /send handlers can
+                        # invoke transfer_sync while VIT kernels are still
+                        # writing `emb`, producing partial / garbage data on
+                        # the receiver side
+                        if emb.is_cuda:
+                            torch.cuda.current_stream(emb.device).synchronize()
+                    if self.rank == 0:
+                        # Register the MR exactly once here so all sibling-TP /send coroutines share a single registration.
+                        try:
+                            self.engine.register(emb.data_ptr(), emb.nbytes)
+                            self._forward_results[req_id]["mr_ptr"] = emb.data_ptr()
+                        except Exception as reg_err:
+                            logger.warning(
+                                f"Shared-MR register failed for {req_id}, "
+                                f"falling back to per-/send register: {reg_err}"
+                            )
+                            self._forward_results[req_id]["mr_ptr"] = None
+                        self._forward_results[req_id]["embedding"] = emb
+                except Exception as e:
+                    logger.error(f"VIT forward failed for {req_id}: {e}")
+                    if self.rank == 0:
+                        self._forward_results[req_id]["error"] = str(e)
+                finally:
+                    if self.rank == 0:
+                        event.set()
+                    if self.profiler is not None:
+                        self.profiler.step()
+
+            self._launch_mooncake_background_task(_run_forward())
+
+            if self.rank == 0:
+                logger.info(
+                    f"Returning metadata immediately for {req_id}, "
+                    f"VIT forward running async"
+                )
+
+            return (nbytes, total_tokens, embedding_dim, None, None)
+
+        except Exception as e:
+            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+            error_msg = str(e)
+            logger.error(
+                f"Rank {self.rank} encode_with_mooncake failed: "
+                f"{error_msg} {error_code = }",
+                exc_info=True,
+            )
+            return self._handle_mooncake_encode_error(
+                req_id, num_parts, part_idx, modality, error_msg, error_code
+            )
+
+    async def encode_request(self, req: dict, modality: Modality):
+        """Single-request encode dispatcher.
+
+        Delegates to ``self._encode_fn``, which is bound at ``__init__``
+        time to the correct variant (cache / no-cache / mooncake).
+        """
+        return await self._encode_fn(
+            mm_items=req["mm_items"],
+            modality=modality,
+            req_id=req["req_id"],
+            num_parts=req["num_parts"],
+            part_idx=req["part_idx"],
+            hashes=req.get("hashes"),
+        )
+
+    async def batch_encode(
+        self, requests: List[dict], modality: Modality
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        """Cross-request encoder fusion (image/audio). No cache path."""
+        # items_per_req counts grid entries (post-expansion) so per-request
+        # slicing of grid_dim/final_slices stays aligned for processors that
+        # expand one leaf into multiple grids (e.g. Kimi-VL/K25 dict-of-images).
+        flat_items, items_per_req = [], []
+        for req in requests:
+            leaves = MMEncoder._flatten_nested_items(req["mm_items"])
+            flat_items.extend(leaves)
+            items_per_req.append(sum(self._grid_count_per_leaf(leaves, modality)))
+        total = sum(items_per_req)
+
+        try:
+            mm_inputs, get_feat = await self._process_mm_items(flat_items, modality)
+        except NotImplementedError as e:
+            return self._batch_set_error(
+                requests, modality, InternalError(f"Not implemented error: {e}")
+            )
+        except Exception as e:
+            return self._batch_set_error(
+                requests, modality, BadRequestError(f"Failed to process mm items: {e}")
+            )
+
+        try:
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            if len(grid_dim) != total:
+                return self._batch_set_error(
+                    requests,
+                    modality,
+                    InternalError(
+                        f"Grid count mismatch for {self.model_type}/"
+                        f"{modality.name}: {len(flat_items)} leaves across "
+                        f"{len(requests)} requests → expected {total} grids "
+                        f"(per-req {items_per_req}), but processor produced "
+                        f"{len(grid_dim)}. Add tile-expansion handling in "
+                        f"_grid_count_per_leaf."
+                    ),
+                )
+
+            final_slices = self._encode_missing(
+                mm_feature,
+                mm_inputs,
+                list(range(total)),
+                modality,
+                get_feat,
+            )
+
+            if self.profiler is not None:
+                for _ in requests:
+                    self.profiler.step()
+            # No aux_data here: batch_encode only handles IMAGE/AUDIO
+            # (_BATCHABLE_MODALITIES), and _build_mm_aux_data only extracts
+            # video-meta fields — which never appear in image/audio mm_inputs.
+            results = []
+            offset = 0
+            for req, n in zip(requests, items_per_req):
+                slices = final_slices[offset : offset + n]
+                emb = slices[0] if n == 1 else torch.cat(slices, dim=0)
+                if self.rank == 0:
+                    self.embedding_to_send[req["req_id"]] = EmbeddingData(
+                        req["req_id"],
+                        req["num_parts"],
+                        req["part_idx"],
+                        grid_dim[offset : offset + n],
+                        modality,
+                        emb,
+                    )
+                results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
+                offset += n
+            return results
+        except Exception as e:
+            return self._batch_set_error(
+                requests, modality, InternalError(f"Internal encoding error: {e}")
+            )
+
+    def _batch_set_error(
+        self, requests: List[dict], modality: Modality, exc: Exception
+    ) -> List[Tuple[int, int, int, str, int]]:
+        code = getattr(exc, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+        msg = str(exc)
+        logger.error(f"Rank {self.rank} batch_encode failed: {msg} {code = }")
+        if self.rank == 0:
+            for req in requests:
+                self.embedding_to_send[req["req_id"]] = EmbeddingData(
+                    req["req_id"],
+                    req["num_parts"],
+                    req["part_idx"],
+                    None,
+                    modality,
+                    error_msg=msg,
+                    error_code=code,
+                )
+        return [(0, 0, 0, msg, code)] * len(requests)
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
@@ -1396,9 +2155,239 @@ class EncoderProfiler:
         return True, None
 
 
-app = FastAPI()
+class PendingRequest:
+    __slots__ = ("request", "future", "submit_time")
+
+    def __init__(self, request: dict, loop: asyncio.AbstractEventLoop):
+        self.request = request
+        self.future: asyncio.Future = loop.create_future()
+        self.submit_time = time.time()
+
+
+# VIDEO excluded: per-video preprocess kwargs (do_sample_frames, video_metadata)
+# vary per request and can't merge into one HF processor call.
+_BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
+
+
+class EncoderScheduler:
+    """Aggregate concurrent /encode requests into bounded image/audio batches."""
+
+    def __init__(
+        self,
+        encoder: "MMEncoder",
+        send_sockets: List[zmq.Socket],
+        max_batch_size: int,
+        request_timeout: float = ENCODER_REQ_TIMEOUT,
+    ):
+        self.encoder = encoder
+        self.send_sockets = send_sockets
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.request_timeout = max(1.0, float(request_timeout))
+        self.pending_queue: "asyncio.Queue[PendingRequest]" = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._batch_worker())
+            logger.info(
+                f"EncoderScheduler started with max_batch_size={self.max_batch_size}"
+            )
+
+    async def stop(self) -> None:
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_task
+            self._worker_task = None
+        # Reject any requests still queued so their HTTP handlers don't hang.
+        while True:
+            try:
+                pending = self.pending_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not pending.future.done():
+                pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+
+    async def submit(self, request: dict) -> Tuple:
+        pending = PendingRequest(request, asyncio.get_running_loop())
+        await self.pending_queue.put(pending)
+        try:
+            return await asyncio.wait_for(pending.future, timeout=self.request_timeout)
+        except asyncio.TimeoutError:
+            if not pending.future.done():
+                pending.future.cancel()
+            req_id = request.get("req_id")
+            logger.error(
+                f"EncoderScheduler.submit timed out after {self.request_timeout}s "
+                f"for req_id={req_id}"
+            )
+            raise
+
+    async def _collect_batch(self) -> List[PendingRequest]:
+        batch = [await self.pending_queue.get()]
+        while len(batch) < self.max_batch_size:
+            try:
+                batch.append(self.pending_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return batch
+
+    async def _batch_worker(self) -> None:
+        while True:
+            batch: List[PendingRequest] = []
+            try:
+                batch = await self._collect_batch()
+                groups: Dict[Modality, List[PendingRequest]] = defaultdict(list)
+                for p in batch:
+                    groups[
+                        Modality.from_str(p.request.get("modality", "image"))
+                    ].append(p)
+                for modality, group in groups.items():
+                    await self._dispatch_group(group, modality)
+            except asyncio.CancelledError:
+                for p in batch:
+                    if not p.future.done():
+                        p.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Error in EncoderScheduler batch worker: {e}", exc_info=True
+                )
+                for p in batch:
+                    if not p.future.done():
+                        p.future.set_exception(e)
+
+    @staticmethod
+    def _validate_request_shape(req: dict) -> Optional[str]:
+        # Cheap pre-broadcast checks: shape errors that don't require running
+        # the HF processor. Once a request reaches TP workers they enter
+        # batch_encode and expect to join its collectives — a malformed batch
+        # that makes rank-0 bail mid-flight would deadlock the workers.
+        if not isinstance(req, dict):
+            return f"request is not a dict: {type(req).__name__}"
+        if not req.get("req_id"):
+            return "missing req_id"
+        if not req.get("mm_items"):
+            return "missing or empty mm_items"
+        if "num_parts" not in req or "part_idx" not in req:
+            return "missing num_parts / part_idx"
+        h = req.get("hashes")
+        if h is not None and not isinstance(h, (list, tuple, str, int, bytes)):
+            return f"hashes must be list/scalar, got {type(h).__name__}"
+        return None
+
+    async def _dispatch_group(
+        self, group: List[PendingRequest], modality: Modality
+    ) -> None:
+        # Video can't fuse (per-video preprocess kwargs vary).
+        if modality not in _BATCHABLE_MODALITIES:
+            await self._dispatch_per_request(group, modality)
+            return
+
+        # Drop structurally-bad requests before broadcasting; otherwise TP
+        # workers would join batch_encode collectives that rank-0 has already
+        # abandoned.
+        valid: List[PendingRequest] = []
+        for p in group:
+            err = self._validate_request_shape(p.request)
+            if err is None:
+                valid.append(p)
+                continue
+            logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
+            if not p.future.done():
+                p.future.set_exception(BadRequestError(err))
+        if not valid:
+            return
+        group = valid
+
+        requests = [p.request for p in group]
+        start = time.time()
+        for sock in self.send_sockets:
+            sock.send_pyobj(
+                {
+                    "type": "batch_encode",
+                    "modality": modality.name,
+                    "requests": requests,
+                    "enter_time": start,
+                }
+            )
+
+        logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
+
+        try:
+            results = await self.encoder.batch_encode(requests, modality)
+            if len(group) > 1:
+                logger.info(
+                    f"Batch of {len(group)} {modality.name} requests completed in "
+                    f"{(time.time() - start) * 1000:.1f}ms"
+                )
+        except Exception as e:
+            # batch_encode normally catches and returns errors via _batch_set_error.
+            # If it raised, rank-0 may have skipped a collective broadcast, leaving
+            # TP workers stuck. Don't try to recover — fail every pending future
+            # and let the client retry. Re-broadcasting would risk a deadlock.
+            logger.error(f"batch_encode raised: {e}", exc_info=True)
+            for p in group:
+                if not p.future.done():
+                    p.future.set_exception(e)
+            return
+
+        if len(results) != len(group):
+            err = RuntimeError(
+                f"batch_encode returned {len(results)} results for {len(group)} requests"
+            )
+            logger.error(str(err))
+            for p in group:
+                if not p.future.done():
+                    p.future.set_exception(err)
+            return
+
+        for p, result in zip(group, results):
+            if not p.future.done():
+                p.future.set_result(result)
+
+    async def _dispatch_per_request(
+        self,
+        group: List[PendingRequest],
+        modality: Modality,
+    ) -> None:
+        for p in group:
+            req = p.request
+            try:
+                for sock in self.send_sockets:
+                    sock.send_pyobj(req)
+                result = await self.encoder.encode_request(req, modality)
+                if not p.future.done():
+                    p.future.set_result(result)
+            except Exception as e:
+                logger.error(
+                    f"Per-request encode failed for req_id={req.get('req_id')}: {e}"
+                )
+                if not p.future.done():
+                    p.future.set_exception(e)
+
+
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
+encoder_scheduler: Optional[EncoderScheduler] = None
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI):
+    global encoder_scheduler
+    if encoder is not None:
+        encoder_scheduler = EncoderScheduler(
+            encoder, send_sockets, max_batch_size=ENCODER_MAX_BATCH_SIZE
+        )
+        encoder_scheduler.start()
+    try:
+        yield
+    finally:
+        if encoder_scheduler is not None:
+            await encoder_scheduler.stop()
+
+
+app = FastAPI(lifespan=_lifespan)
 
 
 async def run_encoder(
@@ -1414,24 +2403,15 @@ async def run_encoder(
                 encoder.profiler.start(request)
             else:
                 encoder.profiler.stop()
+        elif isinstance(request, dict) and request.get("type") == "batch_encode":
+            await encoder.batch_encode(
+                request["requests"],
+                Modality.from_str(request["modality"]),
+            )
         else:
-            if encoder.mm_global_cache is not None:
-                await encoder.encode_with_global_cache(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                    hashes=request.get("hashes", None),
-                )
-            else:
-                await encoder.encode(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                )
+            await encoder.encode_request(
+                request, Modality.from_str(request["modality"])
+            )
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
@@ -1483,37 +2463,74 @@ async def handle_encode_request(request: dict):
     req_id = request["req_id"]
     start_time = time.monotonic()
     try:
+        # when multiple decoder TP ranks POST /encode
+        # with the same req_id, only the first triggers the VIT forward;
+        # subsequent callers wait and return the same metadata.
+        if encoder.server_args.encoder_transfer_backend == "mooncake":
+            async with encoder._inflight_encode_lock:
+                if req_id in encoder._inflight_encode_events:
+                    event = encoder._inflight_encode_events[req_id]
+                    is_duplicate = True
+                else:
+                    event = asyncio.Event()
+                    encoder._inflight_encode_events[req_id] = event
+                    is_duplicate = False
+
+            if is_duplicate:
+                await event.wait()
+                meta = encoder._inflight_encode_meta.get(req_id)
+                if meta is None:
+                    return ORJSONResponse(
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        content={
+                            "status": "error",
+                            "message": "Encode failed on the first request",
+                            "req_id": req_id,
+                        },
+                    )
+                nbytes, embedding_len, embedding_dim = meta
+                # Build the same metadata response as the first request
+                resp = dict(request)
+                del resp["mm_items"]
+                resp.update(
+                    {
+                        "embedding_size": nbytes,
+                        "embedding_len": embedding_len,
+                        "embedding_dim": embedding_dim,
+                    }
+                )
+                return ORJSONResponse(content=resp)
 
         def start_background_send(req_id):
             task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
             encoder.background_tasks.add(task)
             task.add_done_callback(encoder.background_tasks.discard)
 
-        # broadcast request
-        request.update({"enter_time": time.time()})
-        for socket in send_sockets:
-            socket.send_pyobj(request)
-        if encoder.mm_global_cache is not None:
-            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode_with_global_cache(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                    hashes=request.get("hashes", None),
+        # broadcast request, lock together with rank0 await so NCCL
+        # launch order matches the ZMQ dispatch order rank>0 sees.
+        async with encoder.encode_dispatch_lock:
+            request.update({"enter_time": time.time()})
+            modality = Modality.from_str(request["modality"])
+            if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
+                try:
+                    nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                        await encoder_scheduler.submit(request)
+                    )
+                except asyncio.TimeoutError:
+                    return ORJSONResponse(
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                        content={
+                            "status": "error",
+                            "message": "encoder batch timed out",
+                            "req_id": req_id,
+                        },
+                    )
+            else:
+                for socket in send_sockets:
+                    socket.send_pyobj(request)
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder.encode_request(request, modality)
                 )
-            )
-        else:
-            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                )
-            )
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
@@ -1526,11 +2543,28 @@ async def handle_encode_request(request: dict):
                             prefill_host=request["prefill_host"],
                             embedding_port=port,
                         )
+            # Signal waiters on failure for mooncake
+            if encoder.server_args.encoder_transfer_backend == "mooncake":
+                encoder._inflight_encode_meta.pop(req_id, None)
+                evt = encoder._inflight_encode_events.pop(req_id, None)
+                if evt:
+                    evt.set()
+                await encoder._cleanup_inflight_encode_state(req_id)
             return ORJSONResponse(
                 status_code=error_code,
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":
+            # Store metadata for duplicate callers and signal them
+            encoder._inflight_encode_meta[req_id] = (
+                nbytes,
+                embedding_len,
+                embedding_dim,
+            )
+            evt = encoder._inflight_encode_events.get(req_id)
+            if evt:
+                evt.set()
+            encoder._schedule_inflight_encode_cleanup(req_id)
             del request["mm_items"]
             request.update(
                 {
@@ -1577,6 +2611,13 @@ async def handle_encode_request(request: dict):
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
         rid_to_err_msg[req_id] = error_msg
+        # Ensure inflight waiters are unblocked on unexpected errors
+        if encoder.server_args.encoder_transfer_backend == "mooncake":
+            encoder._inflight_encode_meta.pop(req_id, None)
+            evt = encoder._inflight_encode_events.pop(req_id, None)
+            if evt:
+                evt.set()
+            await encoder._cleanup_inflight_encode_state(req_id)
         return ORJSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={
@@ -1597,7 +2638,10 @@ async def handle_send_request(request: dict):
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
-    encoder.embedding_to_send.pop(request["req_id"], None)
+    req_id = request["req_id"]
+    # Don't pop embedding_to_send here — other decoder TP ranks may still
+    # need it for their /send calls. Cleanup is handled by the scheduled
+    # timeout task or _cleanup_inflight_encode_state.
     return ORJSONResponse(content=None)
 
 

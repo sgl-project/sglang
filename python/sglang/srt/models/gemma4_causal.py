@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.gemma4_fused_ops import (
+    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
@@ -220,6 +221,14 @@ class Gemma4MoE(nn.Module):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             # softmax(all)[topk] / sum(softmax(all)[topk]) = softmax(topk_logits),
             # so we softmax only the top-k logits (fewer kernel launches).
+            if (
+                gating_output.is_cuda
+                and gating_output.dim() == 2
+                and gating_output.dtype
+                in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                return gemma4_fused_routing(gating_output, per_expert_scale, topk)
+
             topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
             topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
 
@@ -1147,7 +1156,8 @@ class Gemma4ForCausalLM(PreTrainedModel):
             ("experts.w13_weight", "experts.gate_up_proj", ("w1", "w3")),
             ("experts.w2_weight", "experts.down_proj", ("w2",)),
         ]
-        num_experts = self.config.num_experts
+        # Dense subclasses (e.g. the Gemma4 MTP assistant) reuse this.
+        num_experts = getattr(self.config, "num_experts", None) or 0
 
         # Per-expert checkpoint format used by compressed-tensors / FP8
         # (e.g. RedHatAI/*-FP8-Dynamic) and by ModelOpt NVFP4
@@ -1159,11 +1169,15 @@ class Gemma4ForCausalLM(PreTrainedModel):
         # in a trailing dot, so the standard `name.replace(weight_name,
         # param_name)` collapses every suffix uniformly to the fused
         # FusedMoE params (experts.w13_*, experts.w2_*).
-        per_expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=num_experts,
+        per_expert_params_mapping = (
+            FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+            )
+            if num_experts
+            else []
         )
 
         k_eq_v_layers = self._get_k_eq_v_layers()

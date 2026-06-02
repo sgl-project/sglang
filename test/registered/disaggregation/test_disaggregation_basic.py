@@ -72,6 +72,32 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
             len(input_logprobs) > 0
         ), f"input_logprobs should have at least one token, but got {len(input_logprobs)}"
 
+    def test_chat_completion_top_logprobs(self):
+        client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")
+        response = client.chat.completions.create(
+            model="dummy",
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant."},
+                {"role": "user", "content": "What is the capital of France?"},
+            ],
+            temperature=0,
+            max_tokens=8,
+            logprobs=True,
+            top_logprobs=5,
+        )
+
+        self.assertIsNotNone(response.choices[0].logprobs)
+        content_logprobs = response.choices[0].logprobs.content
+        self.assertGreater(len(content_logprobs), 0)
+
+        first_top_logprobs = next(
+            (item.top_logprobs for item in content_logprobs if item.top_logprobs),
+            None,
+        )
+        self.assertIsNotNone(first_top_logprobs)
+        self.assertGreater(len(first_top_logprobs), 0)
+        self.assertIsInstance(first_top_logprobs[0].token, str)
+
     def test_structured_output(self):
         json_schema = json.dumps(
             {

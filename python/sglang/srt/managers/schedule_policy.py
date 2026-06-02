@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
@@ -84,7 +85,7 @@ IGNORE_EOS_RESERVE_TOKENS = 1
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
-    token_ids: Optional[List[int]] = None,
+    token_ids: Optional[array[int]] = None,
     *,
     cow_mamba: bool = False,
     include_req: bool = False,
@@ -442,8 +443,10 @@ class PrefillAdder:
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
+        self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
+        self.reprocessed_log_input_tokens = 0
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -579,7 +582,11 @@ class PrefillAdder:
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        retracted_stain: bool,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -598,8 +605,13 @@ class PrefillAdder:
         elif self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
 
+        # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
+        # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
+        if retracted_stain:
+            self.reprocessed_log_hit_tokens += prefix_len
+            self.reprocessed_log_input_tokens += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -627,7 +639,7 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        self._update_prefill_budget(prefix_len, trunc_len, 0)
+        self._update_prefill_budget(prefix_len, trunc_len, 0, req.retracted_stain)
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -653,7 +665,9 @@ class PrefillAdder:
             if not truncated
             else 0
         )
-        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
+        self._update_prefill_budget(
+            0, req.extend_input_len, max_new_tokens, req.retracted_stain
+        )
 
         # Return based on remaining token availability
         return (
@@ -692,6 +706,7 @@ class PrefillAdder:
                 if not truncated
                 else 0
             ),
+            req.retracted_stain,
         )
 
         # Return if chunked prefill not finished
@@ -793,6 +808,7 @@ class PrefillAdder:
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                req.retracted_stain,
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -805,7 +821,7 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
 
         return self.budget_state()
 
@@ -825,9 +841,7 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if (
-            self.dsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
-        ) and len(self.can_run_list) >= 1:
+        if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
@@ -927,6 +941,7 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
+                    req.retracted_stain,
                 )
             else:
                 # Make sure at least one page is available
@@ -961,7 +976,9 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(
+                    prefix_len, trunc_len, 0, req.retracted_stain
+                )
 
         return self.budget_state()
 

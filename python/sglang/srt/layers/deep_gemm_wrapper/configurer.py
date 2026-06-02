@@ -23,6 +23,9 @@ def _compute_enable_deep_gemm():
         or current_platform.is_out_of_tree()
     ):
         return False
+    # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
+    if sm_version == 120:
+        return False
     if not (_is_cuda or _is_musa):
         return False
 

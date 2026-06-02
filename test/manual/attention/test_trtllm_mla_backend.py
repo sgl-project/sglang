@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -268,6 +269,7 @@ class MockModelRunner:
             device=self.device,
             enable_memory_saver=False,
         )
+        self.hisparse_coordinator = None
 
 
 def compare_outputs(trtllm_out, reference_out, tolerance=1e-2):
@@ -1029,15 +1031,15 @@ class TestTRTLLMMLA(CustomTestCase):
         )
         req_pool_indices = torch.arange(batch_size, device=config["device"])
 
-        backend.init_forward_metadata_capture_cuda_graph(
-            bs=batch_size,
-            num_tokens=batch_size,
+        capture_fb = SimpleNamespace(
+            batch_size=batch_size,
+            forward_mode=ForwardMode.DECODE,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
+            positions=torch.arange(batch_size, device=config["device"]),
             spec_info=None,
         )
+        backend.init_forward_metadata_out_graph(capture_fb, in_capture=True)
 
         # Verify capture metadata
         self.assertIn(batch_size, backend.decode_cuda_graph_metadata)
@@ -1053,16 +1055,15 @@ class TestTRTLLMMLA(CustomTestCase):
             device=config["device"],
         )
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=batch_size,
+        replay_fb = SimpleNamespace(
+            batch_size=batch_size,
+            forward_mode=ForwardMode.DECODE,
             req_pool_indices=req_pool_indices,
             seq_lens=new_seq_lens,
-            seq_lens_sum=new_seq_lens.sum().item(),
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=None,
             seq_lens_cpu=new_seq_lens.cpu(),
+            spec_info=None,
         )
+        backend.init_forward_metadata_out_graph(replay_fb)
 
         # Verify replay updated the metadata
         replay_metadata = backend.forward_decode_metadata
