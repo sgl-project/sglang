@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -145,6 +146,74 @@ def _aiter_fp8_paged_mqa_logits(
         KVBlockSize=kv_block_size,
         Preshuffle=True,
     )
+    return logits
+
+
+def fp8_paged_mqa_logits_torch_sm120(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """CUDA-graph-compatible FP8 paged MQA logits for SM120 (vectorized, no .item())."""
+    _ = deep_gemm_metadata
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
+    device = q_fp8.device
+
+    assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
+    assert (
+        block_size == 64
+    ), "Vectorized torch impl hardcodes block_size=64 cache layout"
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert weight.shape == (batch_size, num_heads)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
+    assert seq_lens.shape == (batch_size,)
+    assert page_table.shape[0] == batch_size
+    assert clean_logits == False
+
+    max_pages = (max_seq_len + block_size - 1) // block_size
+    max_padded_seq = max_pages * block_size
+
+    kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
+    SCALE_OFFSET = block_size * head_dim
+
+    page_ids = page_table[:, :max_pages]
+    kvcache_gathered = kvcache_flat[page_ids]
+
+    kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
+    kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
+
+    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
+    kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
+
+    kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
+    kv_scale = kv_scale.view(batch_size, max_padded_seq)
+
+    q = q_fp8[:, 0].to(torch.float32)
+
+    score = torch.bmm(kv_value, q.transpose(1, 2))
+
+    score = F.relu(score)
+    score = score * weight.unsqueeze(1)
+    score = score.sum(dim=2)
+
+    score = score * kv_scale
+
+    out_width = min(max_padded_seq, max_seq_len)
+    logits = score.new_full((batch_size, max_seq_len), float("-inf"))
+    logits[:, :out_width] = score[:, :out_width]
+
+    positions = torch.arange(max_seq_len, device=device)
+    invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
+    logits.masked_fill_(invalid_mask, float("-inf"))
+
     return logits
 
 
@@ -428,7 +497,10 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            fn = fp8_paged_mqa_logits_torch
+            if is_sm120_supported():
+                fn = fp8_paged_mqa_logits_torch_sm120
+            else:
+                fn = fp8_paged_mqa_logits_torch
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
