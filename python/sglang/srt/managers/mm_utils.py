@@ -709,15 +709,15 @@ def _get_chunked_prefill_embedding(
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
-    # [MMMU FIX] Decide per-image vs combined over the WHOLE batch (matches the
-    # proven amd_fix_ci_0525 behavior). The reconstructed per-image path mixes
-    # badly with the combined path within one forward batch, yielding embeddings
-    # with the right token count but wrong values -> empty/degenerate output ->
-    # lmms-eval take_first IndexError. If ANY item in the batch is not exactly
-    # single-offset, route the entire batch through the combined path.
-    batch_is_per_image = len(embedding_items) > 0 and all(
-        item.offsets is not None and len(item.offsets) == 1 for item in embedding_items
-    )
+    # [MMMU FIX] The reconstructed per-image path (_get_chunked_embedding_by_item)
+    # produces embeddings with the right token count but WRONG values on ROCm
+    # (passes the count check -> [MM_PROBE] OK, but yields empty/degenerate output
+    # -> [RESP_PROBE] empty=True -> lmms-eval take_first IndexError). The earlier
+    # whole-batch gate only removed the mixed-path cases (89 -> 30 empties); the
+    # remainder come from the per-image path itself. Force the combined path
+    # (_get_chunked_embedding_full) for the whole batch, which also completes what
+    # the #25910 revert intended (drop the per-image batched encoding).
+    batch_is_per_image = False
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
