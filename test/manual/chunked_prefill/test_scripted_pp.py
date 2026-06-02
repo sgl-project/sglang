@@ -30,6 +30,19 @@ def _expected_chunks(prompt_len: int, chunk_size: int) -> int:
     return (prompt_len + chunk_size - 1) // chunk_size
 
 
+def _drain_until_released(t, *handles):
+    # Abort releases KV/row/lock over a few forward steps under overlap (and the PP
+    # micro-batch pipeline adds more lag), so step until every handle is released
+    # instead of asserting after a single yield.
+    for _ in range(16):
+        if all(
+            h.kv_pages == 0 and (h.req is None or h.req.req_pool_idx is None)
+            for h in handles
+        ):
+            return
+        yield
+
+
 class TestPPBasic(ScriptedTestCase):
     ENGINE_KWARGS = _pp_engine_kwargs()
 
@@ -41,7 +54,7 @@ class TestPPBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         # at-most-one finish is enforced by the engine (output_streamer: assert not req.finished_output)
@@ -51,7 +64,11 @@ class TestPPBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_pp_last_chunk_cross_mb_kv_correctness(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8)
+        # Distinct prompt_token so this req chunks cold (8x) rather than hitting a
+        # prefix left cached by an earlier test in this shared-engine class.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=8, prompt_token=7
+        )
         yield from run_until_finished(r)
         assert r.finished
         assert r.chunks_done >= 2
@@ -110,8 +127,14 @@ class TestPPBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_pp_two_chunked_one_per_mb_simultaneous(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Distinct prompt_token: identical prompts dedup in the radix tree, so r2
+        # would hit r1's prefix and chunk fewer than 2 times.
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=1
+        )
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=2
+        )
         yield from run_until_all_finished(handles=[r1, r2], max_steps=800)
         assert r1.finished and r2.finished
         assert r1.chunks_done >= 2 and r2.chunks_done >= 2
