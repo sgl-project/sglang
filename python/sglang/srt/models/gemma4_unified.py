@@ -13,7 +13,7 @@
 # ==============================================================================
 """Gemma4 *Unified* (encoder-free) multimodal model for SGLang.
 
-The unified Gemma4 family (e.g. ``gg-hf-gu/gemma-4-12B-it``, arch
+The unified Gemma4 family (e.g. ``google/gemma-4-12B-it``, arch
 ``Gemma4UnifiedForConditionalGeneration``, ``model_type="gemma4_unified"``)
 shares the Gemma4 *text* decoder verbatim but replaces both modality towers
 with light "encoder-free" projection pipelines:
