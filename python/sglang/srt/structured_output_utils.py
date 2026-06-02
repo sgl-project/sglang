@@ -34,12 +34,18 @@ def response_format_to_json_schema(
 
 
 def apply_response_format_to_sampling_params(
-    sampling_params: Optional[dict[str, Any]],
+    sampling_params: Optional[Any],
     response_format: Optional[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
+) -> Optional[Any]:
     """Apply response_format to sampling params unless a constraint already exists."""
     if response_format is None:
         return sampling_params
+
+    if isinstance(sampling_params, list):
+        return [
+            apply_response_format_to_sampling_params(params, response_format)
+            for params in sampling_params
+        ]
 
     params = dict(sampling_params or {})
     if any(params.get(key) for key in _CONSTRAINT_KEYS):

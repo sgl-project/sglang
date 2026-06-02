@@ -42,6 +42,26 @@ class TestStructuredOutputUtils(unittest.TestCase):
         self.assertEqual(params["temperature"], 0)
         self.assertEqual(params["json_schema"], '{"type": "object"}')
 
+    def test_apply_response_format_handles_list_of_dicts(self):
+        params = apply_response_format_to_sampling_params(
+            [{"temperature": 0}, {"temperature": 0.5}],
+            {"type": "json_object"},
+        )
+
+        self.assertEqual(params[0]["temperature"], 0)
+        self.assertEqual(params[0]["json_schema"], '{"type": "object"}')
+        self.assertEqual(params[1]["temperature"], 0.5)
+        self.assertEqual(params[1]["json_schema"], '{"type": "object"}')
+
+    def test_apply_response_format_list_preserves_existing_constraint(self):
+        params = apply_response_format_to_sampling_params(
+            [{"temperature": 0}, {"regex": "[a-z]+"}],
+            {"type": "json_object"},
+        )
+
+        self.assertEqual(params[0]["json_schema"], '{"type": "object"}')
+        self.assertEqual(params[1], {"regex": "[a-z]+"})
+
 
 if __name__ == "__main__":
     unittest.main()
