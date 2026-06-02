@@ -1712,7 +1712,7 @@ class DeepseekV4Model(nn.Module):
                     prev_residual,
                     prev_post,
                     prev_comb,
-                    topk_indices,
+                    layer_topk_indices,
                 ) = layer(
                     positions=positions,
                     hidden_states=hidden_states,
@@ -1724,6 +1724,8 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+                if layer.self_attn.next_skip_topk is not None:
+                    topk_indices = layer_topk_indices
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
