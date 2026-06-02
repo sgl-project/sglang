@@ -2368,20 +2368,7 @@ class AiterAttnBackend(AttentionBackend):
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             bs0 = forward_batch.batch_size + 1
-
-            # To keep the mha_batch_prefill_func function parameters
-            # declare the necessary parameter and assign None as default value
             q_descale = None
-
-            _extend_no_prefix = (
-                forward_batch.extend_prefix_lens_cpu is not None
-                and not any(forward_batch.extend_prefix_lens_cpu)
-            )
-
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype and (not _extend_no_prefix):
-                q = q.to(fp8_dtype)
-                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
 
             window_size = (-1, -1)
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
@@ -2391,9 +2378,9 @@ class AiterAttnBackend(AttentionBackend):
             # reuse) we already have the entire prompt's K/V as the freshly
             # arrived (k, v) inputs — no need to read the pool. Run
             # mha_batch_prefill_func in 3D LINEAR mode against (k, v)
-            # directly. This eliminates the 5D pool from the prefill read
-            # path, so any subsequent decode mismatch must come from the
-            # writer or decode kernel — not from the prefill read.
+            # directly in their native bf16 (q/k/v come from QKV projection
+            # before any fp8 cast). No descale arguments needed since no
+            # data is read from the fp8 cache here.
             _extend_no_prefix = (
                 forward_batch.extend_prefix_lens_cpu is not None
                 and not any(forward_batch.extend_prefix_lens_cpu)
@@ -2405,8 +2392,6 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices_lin = torch.arange(
                     total_tokens, dtype=torch.int32, device=k_lin.device
                 )
-                # kv_indptr coincides with qo_indptr since no prefix; the
-                # kernel reads via page_indices [kv_indptr[i]:kv_indptr[i+1]).
                 kv_indptr_lin = self.qo_indptr[:bs0]
                 max_q = int(self.forward_metadata.max_q_len)
                 o = mha_batch_prefill_func(
@@ -2425,13 +2410,15 @@ class AiterAttnBackend(AttentionBackend):
                     return_attn_probs=False,
                     window_size=window_size,
                     sink_ptr=sinks,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
                 )
                 if o.dtype != self.input_dtype:
                     o = o.to(self.input_dtype)
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
+            if self.kv_cache_dtype == fp8_dtype:
+                q = q.to(fp8_dtype)
+                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
 
             k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -2655,6 +2642,18 @@ class AiterAttnBackend(AttentionBackend):
                     dtype=q_in.dtype,
                     device=q_in.device,
                 )
+                # For fp8 KV cache the kernel needs per-tensor dequant scales
+                # (key_scale/value_scale). Without them the fp8 bytes are
+                # interpreted as fp8 values directly with no dequant.
+                _pa_key_scale = None
+                _pa_value_scale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    _pa_key_scale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+                    _pa_value_scale = (
+                        layer.v_scale if layer.v_scale is not None else self.v_scale
+                    )
                 pa_decode_gluon(
                     output=o_view,
                     query=q_in,
@@ -2667,6 +2666,8 @@ class AiterAttnBackend(AttentionBackend):
                     max_context_partition_num=max_part_num,
                     context_partition_size=ctx_part,
                     compute_type=self.input_dtype,
+                    key_scale=_pa_key_scale,
+                    value_scale=_pa_value_scale,
                     exp_sums=exp_sums,
                     max_logits=max_logits,
                     temporary_output=temporary_output,

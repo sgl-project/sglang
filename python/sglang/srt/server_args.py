@@ -3093,7 +3093,17 @@ class ServerArgs:
 
     def _handle_page_size(self):
         if self.page_size is None:
-            if not is_musa():
+            # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
+            # is tuned for and prefers page_size=64 — making it the default
+            # when the layout flag is set avoids users having to pass
+            # --page-size 64 explicitly.
+            if envs.SGLANG_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d":
+                self.page_size = 64
+                logger.info(
+                    "Setting page_size=64 as default for "
+                    "SGLANG_KV_CACHE_LAYOUT=vectorized_5d."
+                )
+            elif not is_musa():
                 self.page_size = 1
             else:
                 self.page_size = 64

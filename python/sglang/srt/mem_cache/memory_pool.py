@@ -855,13 +855,11 @@ class MHATokenToKVPool(KVCache):
             )
         self.kv_cache_layout = layout
         if layout == "vectorized_5d":
-            # Pre-flight constraints. Relaxing these requires either an fp8
-            # path on the writer or different X handling on the kernel side.
-            assert self.store_dtype == self.dtype, (
-                "vectorized_5d KV layout requires store_dtype == dtype; "
-                f"got store_dtype={self.store_dtype}, dtype={self.dtype}"
-            )
-            self._kv_vector_x = 16 // self.dtype.itemsize  # 8 for bf16/fp16
+            # X is the inner vectorization width in the SHUFFLE layout,
+            # determined by the STORAGE dtype (not the compute dtype) since
+            # it controls how many elements fit in 16 bytes of the on-pool
+            # tensor. For fp8 storage X=16, for bf16/fp16 X=8.
+            self._kv_vector_x = 16 // self.store_dtype.itemsize
             assert (self.size + self.page_size) % self.page_size == 0
             assert self.page_size % self._kv_vector_x == 0, (
                 f"page_size={self.page_size} must be divisible by "
