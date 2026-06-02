@@ -359,7 +359,7 @@ def launch_pd_mix_node(model_config):
     start_time = time.time()
     while not is_ready and time.time() - start_time < LOCAL_TIMEOUT:
         configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
-        if configmap.data is None:
+        if not configmap or configmap.data is None:
             logger.info(f"configmap is None, wait for 15s ......")
             time.sleep(15)
             continue
