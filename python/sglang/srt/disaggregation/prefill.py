@@ -123,8 +123,10 @@ class PrefillBootstrapQueue:
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
-        self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
+        self.max_total_num_tokens = (
+            self.scheduler.tp_worker.model_runner.max_token_pool_size
+        )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
             raise RuntimeError(
@@ -132,13 +134,6 @@ class PrefillBootstrapQueue:
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
-
-        if self.scheduler.tp_worker.is_hybrid_swa:
-            # FIXME: current SWA allocation allocate full kv cache size in prefill
-            self.max_total_num_tokens = min(
-                self.max_total_num_tokens,
-                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
-            )
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -437,7 +432,8 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
 
             # WAR barrier on shared GPU buffers (req_to_token_pool / SWA mapping).
-            self.schedule_stream.wait_stream(self.forward_stream)
+            if self._war_barrier_enabled:
+                self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()

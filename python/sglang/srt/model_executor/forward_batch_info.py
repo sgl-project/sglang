@@ -27,6 +27,7 @@ ScheduleBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -40,6 +41,10 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
+from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
+    compute_req_all_ids_info,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -49,7 +54,6 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -60,10 +64,11 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -448,6 +453,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
+    # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
+    rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
+
+    # kv-canary token-id validator snapshot
+    req_all_ids_flat: Optional[torch.Tensor] = None
+    req_all_ids_lens: Optional[torch.Tensor] = None
+
     @classmethod
     def init_new(
         cls,
@@ -508,8 +521,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             seq_lens_cpu = batch.seq_lens_cpu
 
-        if batch.seq_lens_sum is None:
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        if batch.seq_lens_sum is None and seq_lens_cpu is not None:
+            batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
         ret = cls(
             # Required core inputs
@@ -534,7 +547,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_embeds=batch.input_embeds,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
-            token_type_ids=batch.token_type_ids,
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
@@ -544,8 +556,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
-            dimensions=batch.dimensions,
-            return_pooled_hidden_states=batch.return_pooled_hidden_states,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
@@ -554,7 +564,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
-            multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             # Compound (carry their own device tensors)
@@ -562,7 +571,28 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
+        ret._maybe_init_non_generation_fields(batch)
+
         device = model_runner.device
+
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            hashed = _hash_rids_to_tensor(
+                rids=[req.rid for req in batch.reqs],
+                device=device,
+            )
+            bootstrap_room_ids = _bootstrap_rooms_to_tensor(
+                bootstrap_rooms=[req.bootstrap_room for req in batch.reqs],
+                device=device,
+            )
+            batch.sampling_info.rids_int = hashed
+            batch.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
+            ret.rids_int = hashed
+            ret.bootstrap_room_ids_int = bootstrap_room_ids
+
+        if envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get():
+            ret.req_all_ids_flat, ret.req_all_ids_lens = compute_req_all_ids_info(
+                batch.reqs
+            )
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -629,14 +659,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            assert isinstance(extend_seq_lens, list)
-            assert isinstance(extend_prefix_lens, list)
-            ret.extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
-            ret.extend_prefix_lens = torch.tensor(
-                extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            if isinstance(extend_seq_lens, list):
+                # Main path: H2D from host lists; populate *_cpu mirrors.
+                assert isinstance(extend_prefix_lens, list)
+                ret.extend_seq_lens = torch.tensor(
+                    extend_seq_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_prefix_lens = torch.tensor(
+                    extend_prefix_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_prefix_lens_cpu = extend_prefix_lens
+                ret.extend_seq_lens_cpu = extend_seq_lens
+            else:
+                # gpu_only: device tensors handed in directly; leave *_cpu unset.
+                assert isinstance(extend_seq_lens, torch.Tensor)
+                ret.extend_seq_lens = extend_seq_lens
+                ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
@@ -646,8 +684,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             if ret.positions is None:
                 ret.positions = positions
-            ret.extend_prefix_lens_cpu = extend_prefix_lens
-            ret.extend_seq_lens_cpu = extend_seq_lens
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.use_ngram_embedding:
@@ -672,6 +708,49 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
+        """Derive non-generation (max_new_tokens==0) forward fields from reqs.
+
+        token_type_ids gates on presence, not is_prefill_only: a missing
+        tensor makes bert/roberta silently fall back to zeros.
+        """
+        if self.is_prefill_only:
+            if batch.model_config.is_matryoshka and any(
+                r.dimensions is not None for r in batch.reqs
+            ):
+                self.dimensions = [
+                    r.dimensions if r.dimensions else batch.model_config.hidden_size
+                    for r in batch.reqs
+                ]
+
+            self.return_pooled_hidden_states = any(
+                r.return_pooled_hidden_states for r in batch.reqs
+            )
+
+            # --enable-mis: every request must carry delimiter indices (the score
+            # endpoint always produces MIS-structured requests; consumers index
+            # without None-checking).
+            if get_global_server_args().enable_mis and any(
+                r.multi_item_delimiter_indices is not None for r in batch.reqs
+            ):
+                assert all(
+                    r.multi_item_delimiter_indices is not None for r in batch.reqs
+                ), "MIS batch must have delimiter indices on every request"
+                self.multi_item_delimiter_indices = [
+                    torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
+                    for r in batch.reqs
+                ]
+
+        token_type_ids = [
+            r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
+        ]
+        if token_type_ids:
+            self.token_type_ids = torch.tensor(
+                sum(token_type_ids, []),
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(batch.device),
+            ).to(batch.device, non_blocking=True)
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
@@ -1044,6 +1123,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
+        if self.rids_int is not None:
+            self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)
+            if self.sampling_info is not None:
+                self.sampling_info.rids_int = self.rids_int
+        if self.bootstrap_room_ids_int is not None:
+            self.bootstrap_room_ids_int = self._pad_tensor_to_size(
+                self.bootstrap_room_ids_int, bs, value=-1
+            )
+            if self.sampling_info is not None:
+                self.sampling_info.bootstrap_room_ids_int = self.bootstrap_room_ids_int
+
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
@@ -1277,3 +1367,20 @@ if is_cuda() or is_hip():
     clamp_position = clamp_position_cuda
 else:
     clamp_position = _clamp_position_native
+
+
+def _hash_rids_to_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
+    values: List[int] = [_stable_hash_str_to_i64(rid) for rid in rids]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _bootstrap_rooms_to_tensor(
+    *, bootstrap_rooms: List[Optional[int]], device: torch.device
+) -> torch.Tensor:
+    values: List[int] = [room if room is not None else -1 for room in bootstrap_rooms]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _stable_hash_str_to_i64(rid: str) -> int:
+    digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little", signed=True)
