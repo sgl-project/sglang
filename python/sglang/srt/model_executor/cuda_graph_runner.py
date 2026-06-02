@@ -914,7 +914,7 @@ class CudaGraphRunner:
         registry = self.buffer_registry
 
         def _slot(name):
-            return registry.get_slot(name).view(bs, num_tokens)
+            return registry.get_slot(name).slice_for(bs, num_tokens)
 
         input_ids = _slot("input_ids")
         req_pool_indices = _slot("req_pool_indices")
@@ -991,9 +991,7 @@ class CudaGraphRunner:
             else None
         )
         mamba_track_mask = (
-            _slot("mamba_track_mask")
-            if registry.has_slot("mamba_track_mask")
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
 
         if stream_idx is None:

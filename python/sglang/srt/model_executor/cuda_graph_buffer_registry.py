@@ -178,9 +178,9 @@ class GraphSlot:
     pad_value: Optional[Any] = None
     enabled: bool = True
     copy_from_fb: bool = True
-    post_fill: Optional[Callable[[torch.Tensor, "ForwardBatch", "FillContext"], None]] = (
-        None
-    )
+    post_fill: Optional[
+        Callable[[torch.Tensor, "ForwardBatch", "FillContext"], None]
+    ] = None
     slice_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None
     source_fn: Optional[
         Callable[["ForwardBatch", "FillContext"], Optional[torch.Tensor]]
@@ -211,8 +211,12 @@ class GraphSlot:
             return raw_num_tokens
         return self.buffer.shape[0] if self.buffer is not None else 0
 
-    def view(self, padded_bs: int, padded_num_tokens: int) -> torch.Tensor:
-        """Return the ``[:padded_n]`` slice consumed by callers."""
+    def slice_for(self, padded_bs: int, padded_num_tokens: int) -> torch.Tensor:
+        """Return the ``[:padded_n]`` slice of the buffer consumed by callers.
+
+        This truncates the (full-length) buffer to the active region for the
+        current iteration — it is a slice, not a tensor reshape.
+        """
         if self.buffer is None:
             raise RuntimeError(f"GraphSlot {self.name!r}: buffer not allocated")
         if self.slice_fn is not None:
@@ -234,17 +238,17 @@ class GraphSlot:
         ):
             return
         # slice_fn governs non-trivial layouts (e.g. mrope_positions [3, T]);
-        # the pad region is the same axis the slot exposes via view().
+        # the pad region is the same axis the slot exposes via slice_for().
         if self.slice_fn is not None:
             # slice_fn returns the [:padded_n] portion already; we need the
             # tail [raw_n:padded_n]. We rely on slice_fn slicing the same
-            # axis used by view(): take the padded view first, then index
+            # axis used by slice_for(): take the padded slice first, then index
             # the tail with the standard slice on axis 0 of the result.
-            padded_view = self.slice_fn(self.buffer, padded_n)
+            padded_slice = self.slice_fn(self.buffer, padded_n)
             tail = (
-                padded_view[..., raw_n:padded_n]
-                if padded_view.dim() > 1
-                else padded_view[raw_n:padded_n]
+                padded_slice[..., raw_n:padded_n]
+                if padded_slice.dim() > 1
+                else padded_slice[raw_n:padded_n]
             )
         else:
             tail = self.buffer[raw_n:padded_n]
@@ -498,7 +502,7 @@ class CudaGraphBufferRegistry:
             # adopted backing object, not re-attached to the FB view here.
             if "." in slot.name:
                 continue
-            replace_kwargs[slot.name] = slot.view(padded_bs, padded_num_tokens)
+            replace_kwargs[slot.name] = slot.slice_for(padded_bs, padded_num_tokens)
         return dataclasses.replace(forward_batch_template, **replace_kwargs)
 
 

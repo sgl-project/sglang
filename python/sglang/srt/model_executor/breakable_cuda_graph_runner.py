@@ -293,7 +293,7 @@ class BreakableCudaGraphRunner:
         bs = 1
 
         def _slot(name):
-            return registry.get_slot(name).view(bs, num_tokens)
+            return registry.get_slot(name).slice_for(bs, num_tokens)
 
         with torch.device(self.device):
             seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
@@ -470,7 +470,7 @@ class BreakableCudaGraphRunner:
             if self.use_input_embeds:
                 if ie is None:
                     raise ValueError("BCG replay expects input_embeds but got None")
-                self.buffer_registry.get_slot("input_embeds").view(
+                self.buffer_registry.get_slot("input_embeds").slice_for(
                     1, static_num_tokens
                 ).copy_(ie[:static_num_tokens])
             else:

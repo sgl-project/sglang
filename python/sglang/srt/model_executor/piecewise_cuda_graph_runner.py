@@ -52,13 +52,13 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_prefill_registry
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.model_executor.cuda_graph_buffer_registry import build_prefill_registry
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import (
@@ -374,7 +374,7 @@ class PiecewiseCudaGraphRunner:
         bs = 1
 
         def _slot(name):
-            return registry.get_slot(name).view(bs, num_tokens)
+            return registry.get_slot(name).slice_for(bs, num_tokens)
 
         input_ids = _slot("input_ids")
         positions = _slot("positions")
@@ -534,7 +534,7 @@ class PiecewiseCudaGraphRunner:
         # Graph inputs — views into the registry's (adopted) graph-resident
         # slots; capture burns these addresses into the graph.
         def _slot(name):
-            return registry.get_slot(name).view(bs, num_tokens)
+            return registry.get_slot(name).slice_for(bs, num_tokens)
 
         input_ids = _slot("input_ids")
         positions = _slot("positions")
@@ -690,7 +690,7 @@ class PiecewiseCudaGraphRunner:
         )
 
         def _slot(name):
-            return registry.get_slot(name).view(bs, static_num_tokens)
+            return registry.get_slot(name).slice_for(bs, static_num_tokens)
 
         input_ids = _slot("input_ids")
         positions = _slot("positions")

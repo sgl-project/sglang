@@ -76,7 +76,7 @@ class TestGraphSlot(unittest.TestCase):
                 axis="garbage",
             )
 
-    def test_view_before_buffer_alloc_raises(self):
+    def test_slice_for_before_buffer_alloc_raises(self):
         slot = GraphSlot(
             name="x",
             shape_fn=lambda bs, mt: (bs,),
@@ -84,7 +84,7 @@ class TestGraphSlot(unittest.TestCase):
             axis="bs",
         )
         with self.assertRaises(RuntimeError):
-            slot.view(padded_bs=1, padded_num_tokens=1)
+            slot.slice_for(padded_bs=1, padded_num_tokens=1)
 
 
 class TestRegistryRegister(unittest.TestCase):
@@ -549,7 +549,9 @@ class TestSourceFnSlots(unittest.TestCase):
         )
         r.fill_from(fb, raw_bs=3, padded_bs=8, raw_num_tokens=3, padded_num_tokens=16)
         # Head [:3] copied from the source; tail [3:] kept as the sentinel.
-        self.assertTrue(torch.equal(buf[:3], torch.tensor([1, 2, 3], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(buf[:3], torch.tensor([1, 2, 3], dtype=torch.int32))
+        )
         self.assertTrue(torch.all(buf[3:] == 99))
 
     def test_source_fn_returning_none_skips_copy(self):
@@ -604,7 +606,9 @@ class TestSourceFnSlots(unittest.TestCase):
             padded_num_tokens=16,
             pp_proxy_tensors=pp,
         )
-        self.assertTrue(torch.equal(buf[:4], torch.tensor([5, 6, 7, 8], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(buf[:4], torch.tensor([5, 6, 7, 8], dtype=torch.int32))
+        )
 
     def test_extract_buffer_skips_dotted_slots(self):
         r = _make_registry(max_bs=8, max_num_tokens=16)
@@ -758,9 +762,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
             seq_lens=torch.tensor([7, 8], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([7, 8], dtype=torch.int32),
-            mrope_positions=torch.tensor(
-                [[0, 1], [0, 1], [0, 1]], dtype=torch.int64
-            ),
+            mrope_positions=torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int64),
         )
         # Poison tails so resets are observable.
         for n in ("input_ids", "positions", "out_cache_loc", "req_pool_indices"):
@@ -882,8 +884,12 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             ),
         )
         reg.fill_from(fb, raw_bs=3, padded_bs=4, raw_num_tokens=3, padded_num_tokens=8)
-        self.assertTrue(torch.equal(col[:3], torch.tensor([7, 8, 9], dtype=torch.int32)))
-        self.assertTrue(torch.equal(req[:3], torch.tensor([1, 1, 2], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(col[:3], torch.tensor([7, 8, 9], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(req[:3], torch.tensor([1, 1, 2], dtype=torch.int32))
+        )
 
     def test_source_with_pp_registers_proxy_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -969,8 +975,12 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
         reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=8)
         # Head copied; bootstrap tail keeps its -1 init (no per-iter reset).
-        self.assertTrue(torch.equal(rids[:2], torch.tensor([10, 11], dtype=torch.int64)))
-        self.assertTrue(torch.equal(boot[:2], torch.tensor([20, 21], dtype=torch.int64)))
+        self.assertTrue(
+            torch.equal(rids[:2], torch.tensor([10, 11], dtype=torch.int64))
+        )
+        self.assertTrue(
+            torch.equal(boot[:2], torch.tensor([20, 21], dtype=torch.int64))
+        )
         self.assertTrue(torch.all(boot[2:] == -1))
 
 
@@ -1017,7 +1027,9 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         # raw 3 tokens, padded (static) bucket 8
         reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
         ids = reg.get_slot("input_ids").buffer
-        self.assertTrue(torch.equal(ids[:3], torch.tensor([1, 2, 3], dtype=torch.int64)))
+        self.assertTrue(
+            torch.equal(ids[:3], torch.tensor([1, 2, 3], dtype=torch.int64))
+        )
         self.assertTrue(torch.all(ids[3:8] == 0))  # padded tail reset
         self.assertTrue(torch.all(ids[8:] == 7))  # beyond the bucket: untouched
 
@@ -1049,7 +1061,9 @@ class TestBuildPrefillRegistry(unittest.TestCase):
             positions=torch.zeros(3, dtype=torch.int64),
             out_cache_loc=torch.zeros(3, dtype=torch.int64),
             mrope_positions=torch.ones((3, 3), dtype=torch.int64),
-            input_embeds=torch.full((3, 4), 9.0),  # must be ignored (copy_from_fb=False)
+            input_embeds=torch.full(
+                (3, 4), 9.0
+            ),  # must be ignored (copy_from_fb=False)
         )
         reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
         # input_embeds: head NOT copied from FB; padded tail zeroed.
@@ -1119,9 +1133,7 @@ class TestFillOncePolicy(unittest.TestCase):
         reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4)
         # Head copied; tail NOT reset (FILL_ONCE skips the per-iter reset).
         self.assertTrue(torch.equal(buf[:2], torch.tensor([1, 2], dtype=torch.int32)))
-        self.assertTrue(
-            torch.equal(buf[2:], torch.tensor([99, 99], dtype=torch.int32))
-        )
+        self.assertTrue(torch.equal(buf[2:], torch.tensor([99, 99], dtype=torch.int32)))
 
 
 class TestComputedSlots(unittest.TestCase):
