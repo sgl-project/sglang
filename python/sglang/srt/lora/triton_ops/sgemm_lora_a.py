@@ -77,15 +77,6 @@ def _sgemm_lora_a_kernel(
         return
 
     # Adjust N (stack_num * max_rank) to this adapter's actual rank.
-    #
-    # Only clamp on the SPLIT_K == 1 path, for two reasons: (1) it keeps that
-    # path bit-identical to the original kernel; (2) on the split-K path a
-    # data-dependent N forces the bf16 store atomic into per-element scalar
-    # `atom...bf16`, whereas the unclamped (kernel-arg) N lets Triton emit the
-    # packed `atom...v2.bf16` (~3-4x fewer atomics under contention). The expand
-    # kernels read only the rank-packed [:rank*stack] region, so the extra
-    # columns the unclamped split-K path writes are never consumed
-    # (see validate_aclamp_layout.py).
     if SPLIT_K == 1:
         N = tl.minimum(N, rank * stack_num)
 
@@ -137,11 +128,6 @@ def _sgemm_lora_a_kernel(
     if SPLIT_K == 1:
         tl.store(output_ptr, partial_sum.to(output.dtype.element_ty), mask=output_mask)
     else:
-        # Pre-zeroed accumulator in x.dtype; combine the K-splits with native
-        # atomics. For bf16 x this is a packed `atom...v2.bf16` (unclamped N,
-        # see the SPLIT_K==1 clamp note above). Cross-split accumulation is in
-        # x.dtype, so bf16 trades some precision for skipping the fp32->bf16
-        # cast and halving the atomic count.
         tl.atomic_add(
             output_ptr,
             partial_sum.to(output.dtype.element_ty),
@@ -194,11 +180,23 @@ def sgemm_lora_a_fwd(
         if base_grid < num_sms and num_k_tiles >= 8:
             split_k = max(1, min(2 * num_sms // base_grid, num_k_tiles, 16))
 
+    # Launch-config tuning applies only to the split-K path; SPLIT_K == 1 keeps
+    # Triton's defaults so it stays byte-identical to the original kernel.
+    launch_kwargs = {}
     if split_k > 1:
         # Pre-zeroed accumulator in x.dtype: the K-splits atomic-add into it.
         # Keeping it in x.dtype (bf16) lets the bf16 atomic vectorize into a
         # packed .v2 store and avoids a trailing fp32->bf16 cast.
         output = torch.zeros((S, R), device=x.device, dtype=x.dtype)
+        # Tuned on B200 (sweep across K/bs): num_stages=3 is a free win (short
+        # K-loop, nothing to pipeline beyond ~3); the tiny 16xR tile over-fills
+        # at num_warps>=8, so use 2 warps at high batch (small split_k, device
+        # already fairly full) and 4 at low batch (needs more warps to hide
+        # latency). Best config is shape-dependent but these are near-optimal.
+        launch_kwargs = {
+            "num_warps": 2 if split_k <= 4 else 4,
+            "num_stages": 3,
+        }
     else:
         output = torch.empty((S, R), device=x.device, dtype=x.dtype)
 
@@ -231,5 +229,6 @@ def sgemm_lora_a_fwd(
         BLOCK_R,
         BLOCK_K,
         split_k,
+        **launch_kwargs,
     )
     return output.to(x.dtype)
