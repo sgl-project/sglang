@@ -242,6 +242,7 @@ class TestBuildEagleTree(unittest.TestCase):
             retrieve_index,
             retrieve_next_token,
             retrieve_next_sibling,
+            retrieve_parent_token,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             bonus_tokens=bonus_tokens,

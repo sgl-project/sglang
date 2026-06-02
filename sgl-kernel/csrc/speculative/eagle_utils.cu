@@ -40,6 +40,7 @@ __global__ void build_tree_efficient(
     int64_t* retrive_index,
     int64_t* retrive_next_token,
     int64_t* retrive_next_sibling,
+    int64_t* retrive_parent_token,
     int topk,
     int depth,
     int draft_token_num,
@@ -92,6 +93,11 @@ __global__ void build_tree_efficient(
         continue;
       }
 
+      // Record the parent of token i
+      if (retrive_parent_token != nullptr) {
+        retrive_parent_token[bid * draft_token_num + i] = parent_position;
+      }
+
       if (retrive_next_token[bid * draft_token_num + parent_position] == -1) {
         retrive_next_token[bid * draft_token_num + parent_position] = i;
       } else {
@@ -99,6 +105,10 @@ __global__ void build_tree_efficient(
         retrive_next_token[bid * draft_token_num + parent_position] = i;
         retrive_next_sibling[bid * draft_token_num + i] = origin_next_token;
       }
+    }
+    // Root token has no parent
+    if (retrive_parent_token != nullptr) {
+      retrive_parent_token[bid * draft_token_num] = -1;
     }
     retrive_index[bid * draft_token_num] = bid * draft_token_num;
   } else {
@@ -139,6 +149,7 @@ __global__ void build_tree_efficient_partial_packed(
     int64_t* retrive_index,
     int64_t* retrive_next_token,
     int64_t* retrive_next_sibling,
+    int64_t* retrive_parent_token,
     int topk,
     int depth,
     int draft_token_num,
@@ -179,6 +190,11 @@ __global__ void build_tree_efficient_partial_packed(
         continue;
       }
 
+      // Record the parent of token i
+      if (retrive_parent_token != nullptr) {
+        retrive_parent_token[bid * draft_token_num + i] = parent_position;
+      }
+
       if (retrive_next_token[bid * draft_token_num + parent_position] == -1) {
         retrive_next_token[bid * draft_token_num + parent_position] = i;
       } else {
@@ -186,6 +202,10 @@ __global__ void build_tree_efficient_partial_packed(
         retrive_next_token[bid * draft_token_num + parent_position] = i;
         retrive_next_sibling[bid * draft_token_num + i] = origin_next_token;
       }
+    }
+    // Root token has no parent
+    if (retrive_parent_token != nullptr) {
+      retrive_parent_token[bid * draft_token_num] = -1;
     }
     retrive_index[bid * draft_token_num] = bid * draft_token_num;
   } else {
@@ -220,6 +240,7 @@ void build_tree_kernel_efficient(
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
+    at::Tensor retrive_parent_token,
     int64_t topk,
     int64_t depth,
     int64_t draft_token_num,
@@ -230,6 +251,10 @@ void build_tree_kernel_efficient(
   dim3 grid(bs);
   dim3 block(draft_token_num);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // For non-GDN/KDA models, retrive_parent_token may be empty (numel==0) -> pass nullptr
+  int64_t* parent_token_ptr =
+      retrive_parent_token.numel() > 0 ? static_cast<int64_t*>(retrive_parent_token.data_ptr()) : nullptr;
 
   if (tree_mask_mode == QLEN_ONLY_BITPACKING) {
     size_t num_bytes_per_item = 1;
@@ -247,6 +272,7 @@ void build_tree_kernel_efficient(
         static_cast<int64_t*>(retrive_index.data_ptr()),
         static_cast<int64_t*>(retrive_next_token.data_ptr()),
         static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+        parent_token_ptr,
         int32_t(topk),
         int32_t(depth),
         int32_t(draft_token_num),
@@ -261,6 +287,7 @@ void build_tree_kernel_efficient(
         static_cast<int64_t*>(retrive_index.data_ptr()),
         static_cast<int64_t*>(retrive_next_token.data_ptr()),
         static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+        parent_token_ptr,
         int32_t(topk),
         int32_t(depth),
         int32_t(draft_token_num),
