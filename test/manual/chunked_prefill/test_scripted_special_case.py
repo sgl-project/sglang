@@ -310,9 +310,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        assert (
-            r.kv_pages == 0
-        ), f"retract must release KV; got kv_pages={r.kv_pages}"
+        assert r.kv_pages == 0, f"retract must release KV; got kv_pages={r.kv_pages}"
         assert not r.finished, "retract must re-queue r, not finish or abort it"
         assert not r.is_chunking, "retract must release the chunked slot"
         assert r.status == "waiting", (
@@ -576,8 +574,12 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         # and admits non-chunked (never entering is_chunking), so saw_r2 would stay
         # False. Distinct tokens force both to chunk over their lifetime while still
         # exercising the single-chunked-slot mutual exclusion.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=11)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10
+        )
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=11
+        )
         saw_r1_chunking = False
         saw_r2_chunking = False
         for _ in range(DEFAULT_MAX_STEPS * 2):
