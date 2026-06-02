@@ -234,7 +234,10 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
-from sglang.srt.session.session_controller import SessionController
+from sglang.srt.session.session_controller import (
+    SessionController,
+    _radix_native_enabled,
+)
 from sglang.srt.speculative.dflash_utils import (
     resolve_dflash_prefill_refill_target,
     should_delay_dflash_prefill_for_batching,
@@ -2003,9 +2006,14 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        # Radix-native session: the session_id is just a tag carried on the req. The
+        # Session object (opened for lifecycle/close) never enters the data path --
+        # such requests build a plain Req (no create_req reconstruction, no slot) and
+        # are tagged + floor-priced in the radix cache keyed on req.session_id.
+        radix_native_session = session_id is not None and _radix_native_enabled()
 
-        if session_id is None:
-            # Normal non-session request
+        if session_id is None or radix_native_session:
+            # Normal non-session request, or a radix-native session request
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -2056,6 +2064,10 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            if radix_native_session:
+                # Tag for radix-native KV (see RadixCache._tag_session_leaf /
+                # release_session). No Session object enters the data path.
+                req.session_id = session_id
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
