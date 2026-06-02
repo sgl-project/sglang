@@ -485,9 +485,12 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
             return self.forward_native(residual, x, gate, shift, scale)
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_scale_residual_norm_scale_shift,
-        )
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+                fused_scale_residual_norm_scale_shift,
+            )
+        except Exception:
+            return self.forward_native(residual, x, gate, shift, scale)
 
         if isinstance(gate, int) and gate != 1:
             raise ValueError(
@@ -634,9 +637,12 @@ class _NormScaleShift(CustomOp):
             )
             return self.forward_native(x, shift, scale)
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_norm_scale_shift,
-        )
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+                fused_norm_scale_shift,
+            )
+        except Exception:
+            return self.forward_native(x, shift, scale)
 
         return fused_norm_scale_shift(
             x.contiguous(),
@@ -727,9 +733,12 @@ class _NormTanhMulAdd(CustomOp):
             )
             return self.forward_native(x, scale, shift)
 
-        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-            fused_norm_tanh_mul_add,
-        )
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+                fused_norm_tanh_mul_add,
+            )
+        except Exception:
+            return self.forward_native(x, scale, shift)
 
         x, scale, shift = x.contiguous(), scale.contiguous(), shift.contiguous()
         weight = _ensure_contiguous(getattr(self.norm, "weight", None))
@@ -954,19 +963,22 @@ def apply_rmsnorm_tanh_mul_add(
         return residual + torch.tanh(gate) * norm(x)
 
     if _is_cuda and x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
-        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-            fused_norm_tanh_mul_add,
-        )
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+                fused_norm_tanh_mul_add,
+            )
 
-        return fused_norm_tanh_mul_add(
-            x.contiguous(),
-            norm.weight.data.contiguous(),
-            None,
-            gate.contiguous(),
-            residual.contiguous(),
-            "rms",
-            norm.variance_epsilon,
-        )
+            return fused_norm_tanh_mul_add(
+                x.contiguous(),
+                norm.weight.data.contiguous(),
+                None,
+                gate.contiguous(),
+                residual.contiguous(),
+                "rms",
+                norm.variance_epsilon,
+            )
+        except Exception:
+            pass
 
     return residual + torch.tanh(gate) * norm(x)
 

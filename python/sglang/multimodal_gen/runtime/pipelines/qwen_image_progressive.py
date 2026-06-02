@@ -23,11 +23,6 @@ from __future__ import annotations
 
 import torch
 
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.pipelines.qwen_image import (
-    QwenImagePipeline,
-    prepare_mu,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
@@ -195,58 +190,3 @@ class QwenImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
             new_w_pixel,
             len(ctx.cfg_policy.branches),
         )
-
-
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
-
-
-class QwenImageProgressivePipeline(QwenImagePipeline):
-    """QwenImagePipeline variant that uses QwenImageProgressiveDenoisingStage.
-
-    Replaces the standard DenoisingStage with QwenImageProgressiveDenoisingStage,
-    which delegates to DenoisingStage.forward() when progressive_mode == "fullres"
-    (the default) so all existing non-progressive requests are unaffected.
-
-    Usage (progressive):
-        sglang generate --model-path Qwen/Qwen2.5-Image-7B-Diffuser \
-            --progressive-mode dct_rewind --progressive-levels 1 \
-            --progressive-delta 0.05 --num-inference-steps 30
-    """
-
-    pipeline_name = "QwenImageProgressivePipeline"
-
-    def create_pipeline_stages(self, server_args: ServerArgs):
-        from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-            InputValidationStage,
-        )
-
-        self.add_stage(InputValidationStage())
-        self.add_standard_text_encoding_stage()
-        self.add_standard_latent_preparation_stage()
-        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
-        self._add_qwen_progressive_denoising_stage()
-        self.add_standard_decoding_stage()
-
-    def _add_qwen_progressive_denoising_stage(
-        self, stage_name: str = "denoising_stage"
-    ) -> None:
-        """Add QwenImageProgressiveDenoisingStage.
-
-        Routes to DenoisingStage.forward() when progressive_mode == 'fullres'
-        (the default), preserving identical behaviour for non-progressive requests.
-        """
-
-        def create_stage():
-            return QwenImageProgressiveDenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-                pipeline=self,
-                vae=self.get_module("vae", None),
-            )
-
-        self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
-
-
-EntryClass = QwenImageProgressivePipeline

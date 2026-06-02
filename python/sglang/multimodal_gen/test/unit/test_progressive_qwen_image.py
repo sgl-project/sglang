@@ -17,11 +17,11 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.pipelines.qwen_image import QwenImagePipeline
 from sglang.multimodal_gen.runtime.pipelines.qwen_image_progressive import (
     QWEN_IMAGE_SPECTRUM_A,
     QWEN_IMAGE_SPECTRUM_BETA,
     QwenImageProgressiveDenoisingStage,
-    QwenImageProgressivePipeline,
     _qwen_image_pack,
     _qwen_image_unpack,
 )
@@ -411,33 +411,26 @@ class TestQwenImageProgressiveStage(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# QwenImageProgressivePipeline
+# QwenImagePipeline now carries QwenImageProgressiveDenoisingStage
 # ---------------------------------------------------------------------------
 
 
-class TestQwenImageProgressivePipeline(unittest.TestCase):
+class TestQwenImagePipelineUsesProgressiveStage(unittest.TestCase):
+    """QwenImagePipeline is modified to always use QwenImageProgressiveDenoisingStage
+    (following the same pattern as FluxPipeline and ZImagePipeline).
+    """
+
     def test_pipeline_name(self):
-        self.assertEqual(
-            QwenImageProgressivePipeline.pipeline_name,
-            "QwenImageProgressivePipeline",
-        )
+        self.assertEqual(QwenImagePipeline.pipeline_name, "QwenImagePipeline")
 
-    def test_inherits_from_qwen_image_pipeline(self):
-        from sglang.multimodal_gen.runtime.pipelines.qwen_image import (
-            QwenImagePipeline,
-        )
+    def test_has_add_qwen_denoising_stage_method(self):
+        """QwenImagePipeline must expose _add_qwen_denoising_stage."""
+        self.assertTrue(hasattr(QwenImagePipeline, "_add_qwen_denoising_stage"))
 
-        self.assertTrue(issubclass(QwenImageProgressivePipeline, QwenImagePipeline))
-
-    def test_required_config_modules_inherited(self):
-        """Inherits _required_config_modules from QwenImagePipeline."""
-        self.assertIn(
-            "transformer", QwenImageProgressivePipeline._required_config_modules
-        )
-        self.assertIn(
-            "scheduler", QwenImageProgressivePipeline._required_config_modules
-        )
-        self.assertIn("vae", QwenImageProgressivePipeline._required_config_modules)
+    def test_required_config_modules(self):
+        self.assertIn("transformer", QwenImagePipeline._required_config_modules)
+        self.assertIn("scheduler", QwenImagePipeline._required_config_modules)
+        self.assertIn("vae", QwenImagePipeline._required_config_modules)
 
 
 # ---------------------------------------------------------------------------
