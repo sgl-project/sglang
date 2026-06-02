@@ -499,6 +499,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run transformer forward pass.
 
@@ -513,10 +514,9 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and "uncond" for unconditional to enable cache reuse across steps.
             noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V conditioning mask.
         """
-        with set_forward_context(
-            current_timestep=int(timestep.flatten()[0].item()),
-            attn_metadata=None,
-        ):
+        if current_timestep is None:
+            current_timestep = int(timestep.flatten()[0].item())
+        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
@@ -641,6 +641,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         noisy_frame_mask=velocity_mask,
                         cond_text_seq_len=batch.extra["cond_text_seq_len"],
                         uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
+                        current_timestep=i,
                     )
                 elif effective_scale == 1.0:
                     noise_pred = self._run_transformer(
@@ -653,6 +654,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         cache_key="cond",
                         noisy_frame_mask=velocity_mask,
                         max_text_seq_len=batch.extra["cond_text_seq_len"],
+                        current_timestep=i,
                     )
                 else:
                     noise_pred = self._predict_noise_cfg_batched(
@@ -670,6 +672,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                             batch.extra["cond_text_seq_len"],
                             batch.extra["uncond_text_seq_len"],
                         ),
+                        current_timestep=i,
                     )
             else:
                 noise_pred = self._run_transformer(
@@ -682,6 +685,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                     cache_key="cond",
                     noisy_frame_mask=velocity_mask,
                     max_text_seq_len=batch.extra["cond_text_seq_len"],
+                    current_timestep=i,
                 )
 
             # I2V: zero-velocity at conditioned frames so the scheduler keeps
@@ -717,6 +721,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         guidance_scale: float,
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run CFG by stacking both branches into a batch_size=2 forward.
 
@@ -744,6 +749,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             cache_key="cfg_batched",
             noisy_frame_mask=mask_batched,
             max_text_seq_len=max_text_seq_len,
+            current_timestep=current_timestep,
         )
 
         noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
@@ -767,6 +773,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         noisy_frame_mask: torch.Tensor | None = None,
         cond_text_seq_len: int | None = None,
         uncond_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run CFG with one branch per CFG rank, combined by all-reduce.
 
@@ -787,6 +794,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 cache_key="cond",
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=cond_text_seq_len,
+                current_timestep=current_timestep,
             )
             partial = guidance_scale * noise_pred
         else:
@@ -800,6 +808,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 cache_key="uncond",
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=uncond_text_seq_len,
+                current_timestep=current_timestep,
             )
             partial = (1.0 - guidance_scale) * noise_pred
 
