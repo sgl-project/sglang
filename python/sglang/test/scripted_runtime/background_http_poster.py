@@ -47,13 +47,6 @@ class BackgroundHttpPoster:
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            # Each scripted request opens a streaming POST that stays connected for
-            # the request's whole lifetime, and scripts routinely hold many such
-            # requests at once (ballast that never finishes, hundreds-of-request
-            # leak checks). aiohttp's default connection pool caps at 100, after
-            # which a new POST silently blocks waiting for a free connection and the
-            # request never reaches the scheduler. Remove the cap so every request
-            # is dispatched immediately.
             self._session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(limit=0)
             )

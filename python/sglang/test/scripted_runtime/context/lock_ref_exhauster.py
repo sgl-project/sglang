@@ -30,18 +30,7 @@ class ScriptedLockRefExhauster:
         self._locked: List[Any] = []
 
     def exhaust(self, *, leave_refs: int) -> None:
-        # "leave_refs" = the number of radix nodes left unlocked (evictable)
-        # after exhaustion. We repeatedly pick a still-evictable node and lock it
-        # via inc_lock_ref until at most `leave_refs` evictable nodes remain.
-        #
-        # inc_lock_ref(node) walks node -> root, locking every ancestor too, so a
-        # single call can lock several nodes at once. We therefore re-scan the
-        # evictable set after each lock instead of assuming a fixed count, and
-        # only record nodes that this call actually transitioned from evictable
-        # to locked, so release() can undo exactly what we did.
         tree_cache = self.scheduler.tree_cache
-        # A disabled cache (ChunkCache, or radix disabled) has no evictable
-        # prefix tree to pin, and its inc_lock_ref is a no-op. Nothing to do.
         if tree_cache.disable:
             return
 
@@ -50,23 +39,15 @@ class ScriptedLockRefExhauster:
             if len(evictable) <= leave_refs:
                 return
 
-            # Any evictable node reduces the evictable count by at least one
-            # (itself), so pick the first and re-scan.
             target = evictable[0]
             tree_cache.inc_lock_ref(target)
 
             newly_locked = [node for node in evictable if _node_lock_ref(node) > 0]
             if not newly_locked:
-                # Defensive: inc_lock_ref made no node non-evictable (should not
-                # happen for a real evictable node). Stop to avoid an infinite
-                # loop rather than hand-mutating state.
                 return
             self._locked.append(target)
 
     def release(self) -> None:
-        # Idempotent cleanup run before each script resets the engine. Undo each
-        # inc_lock_ref with a matching dec_lock_ref on the same node, then clear
-        # the record so a second call is a no-op.
         tree_cache = self.scheduler.tree_cache
         for node in self._locked:
             tree_cache.dec_lock_ref(node)

@@ -76,9 +76,6 @@ def find_req_by_rid(ctx: "ScriptedContext", rid: str) -> Optional["Req"]:
 def is_finished(ctx: "ScriptedContext", rid: str) -> bool:
     req = find_req_by_rid(ctx, rid)
     if req is None:
-        # A started req that is absent from every scheduler structure is finished
-        # only if it was once observed live; one that has not yet been pulled out
-        # of the recv buffer into the waiting queue is still pending, not finished.
         return rid in ctx._seen_rids
     return req.finished()
 
@@ -108,14 +105,6 @@ def remaining_prompt_tokens(ctx: "ScriptedContext", rid: str) -> int:
 
 
 def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
-    # Count the prefill forward passes a chunked prompt has taken so far. The
-    # scheduler holds the req as chunked_req for every chunk except the final one
-    # that completes the prefill: add_chunked_req clears chunked_req before that
-    # batch runs, so the completing chunk runs as an extend batch carrying the rid
-    # with chunked_rid != rid. Count the held chunks, then add the completing chunk
-    # only once it has actually run. This stays exact mid-flight -- it does not jump
-    # ahead by one before the prompt finishes prefilling -- and matches the total
-    # after completion. A prompt that never chunks reports zero.
     log = ctx._scheduler_hook._batch_log
     held = sum(1 for record in log if record.chunked_rid == rid and rid in record.rids)
     if held == 0:
@@ -127,12 +116,6 @@ def chunks_done(ctx: "ScriptedContext", rid: str) -> int:
 
 
 def chunked_parks(ctx: "ScriptedContext", rid: str) -> int:
-    # The dual of chunks_done: iterations where the scheduler still held this rid
-    # as its chunked_req but did NOT run it in the batch -- i.e. add_chunked_req's
-    # hybrid-SWA early-return parked it instead of scheduling its next chunk.
-    # on_run_batch records chunked_rid right after get_next_batch_to_run in the
-    # same loop iteration, so "chunked_rid set but absent from the batch" is an
-    # exact, refactor-stable signal for a park, independent of any scheduler flag.
     return sum(
         1
         for record in ctx._scheduler_hook._batch_log

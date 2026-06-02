@@ -6,13 +6,8 @@ DEFAULT_CHUNK_SIZE: int = 256
 
 DEFAULT_MAX_STEPS: int = 400
 
-# Long enough to span 8 chunks at the default chunk size, which comfortably
-# exceeds every chunks_done lower bound (<= 4) asserted in the manual suite.
 VERY_LONG_PROMPT_LEN: int = 8 * DEFAULT_CHUNK_SIZE
 
-# Qwen3-0.6B ties its word embeddings and already handles the tie correctly
-# under pipeline parallelism (qwen3.py), so the PP scripted-runtime tests can
-# use it without patching the model code.
 SMALL_MODEL: str = "Qwen/Qwen3-0.6B"
 
 
@@ -57,9 +52,6 @@ def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_S
 
 
 def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_STEPS):
-    # Populate the radix cache with a prefix by running a real request to
-    # completion, so a later request hits the cached prefix. Uniform prompts
-    # only (every manual call site passes [v] * n).
     assert prompt_tokens, "warmup_radix needs a non-empty prompt"
     token = prompt_tokens[0]
     assert all(
@@ -71,18 +63,10 @@ def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_ST
     yield from run_until_finished(handle, max_steps=max_steps)
 
 
-# Long enough that ballast requests never finish for the duration of any test
-# (>> every max_steps below), yet 1 + this stays within the smallest test model's
-# context window (Qwen3-0.6B is 40960); a larger max_new_tokens is rejected at
-# admission ("exceeds the model's maximum context length") and never holds a row.
 BALLAST_MAX_NEW_TOKENS: int = 30000
 
 
 def exhaust_row_pool(t, *, leave_rows: int, max_steps: int = DEFAULT_MAX_STEPS):
-    # Pressure req_to_token_pool with REAL ballast requests instead of slicing
-    # the pool's internal free_slots: a request occupies exactly one row for its
-    # whole lifetime, so M never-finishing ballast reqs hold exactly M rows. The
-    # engine's abort_all() drain on reset frees them, so no custom restore needed.
     target: int = t.scheduler.req_to_token_pool.available_size() - leave_rows
     if target <= 0:
         return

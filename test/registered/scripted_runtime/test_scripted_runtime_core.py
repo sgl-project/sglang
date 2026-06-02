@@ -149,10 +149,6 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             req is not None and req in t.scheduler.waiting_queue
         ), f"pause(retract) did not park the req in waiting_queue; found {req!r}"
 
-        # Capture the frozen length only after the retract has settled: the overlap
-        # scheduler completes the one forward already in flight when pause is
-        # requested, so output_ids advances by one before generation halts. From
-        # here on the paused engine must not advance the req any further.
         frozen = len(req.output_ids)
         for _ in range(3):
             yield
@@ -436,10 +432,6 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
             f"baseline={baseline_free} during={during_free}"
         )
         yield from run_until_finished(r)
-        # The finished req lingers in the running batch for one more iteration; let
-        # it drain so the engine is idle before flushing. flush_cache only evicts
-        # the now-cached KV (committed to the radix tree on finish) when idle, so
-        # flushing first would be a no-op and the pool would never recover.
         for _ in range(5):
             yield
         t.flush_cache()
@@ -711,9 +703,6 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
     @staticmethod
     def _script_forward_ct_advances_once_per_yield(t: ScriptedContext):
-        # Each `yield` hands control back for exactly one scheduler event-loop
-        # iteration, and a steady decode runs exactly one forward pass per
-        # iteration; so forward_ct must advance by the number of yields.
         sched = t.scheduler
 
         before_no_yield = sched.forward_ct

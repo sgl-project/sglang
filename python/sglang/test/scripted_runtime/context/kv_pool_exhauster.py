@@ -37,7 +37,6 @@ class ScriptedKvPoolExhauster:
         self._held.append(held)
 
     def release(self) -> None:
-        # Idempotent cleanup run before each script resets the engine.
         for held in self._held:
             self.scheduler.token_to_kv_pool_allocator.free(held)
         self._held.clear()

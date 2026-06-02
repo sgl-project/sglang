@@ -17,9 +17,6 @@ def get_all_node_lock_refs(ctx: "ScriptedContext") -> Dict[int, int]:
 
 
 def _node_lock_ref(node: Any) -> int:
-    # SWA radix nodes track the full-attention and sliding-window lock refs
-    # separately; a node is held if either is locked. Plain radix nodes expose a
-    # single lock_ref.
     if isinstance(node, SWATreeNode):
         return node.full_lock_ref + node.swa_lock_ref
     return node.lock_ref

@@ -39,10 +39,6 @@ class ScriptedReqHandle:
 
     @property
     def kv_pages(self) -> int:
-        # KV pages this req currently holds in the token pool. A finished, aborted,
-        # or retracted req has released its row (req_pool_idx is None) and owns no
-        # exclusive KV -- its kv_allocated_len attribute is left stale and must not
-        # be read. Only a req that still owns a row holds KV pages.
         req = self.req
         if req is None or req.req_pool_idx is None:
             return 0
