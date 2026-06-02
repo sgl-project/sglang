@@ -646,17 +646,47 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
-        # PoolName owns component naming. host_pool only provides shape context,
-        # and suffix order must match get_page_buffer_meta() for one page.
         host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
-        suffixes = transfer.name.storage_component_suffixes(
-            mha_suffix=self.mha_suffix,
-            mla_suffix=self.mla_suffix,
-            is_mla_backend=self.is_mla_backend,
-            host_pool=host_pool,
-        )
+
+        # Suffix order must match get_page_buffer_meta() for one page, because
+        # Mooncake zips object keys with registered buffer pointers.
+        pool_name = transfer.name
+        suffixes = []
+        if pool_name == PoolName.MAMBA:
+            # Mamba stores one temporal object plus one object per conv state.
+            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
+            suffixes = [f"_{self.mha_suffix}_temporal"] + [
+                f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)
+            ]
+        elif pool_name in (
+            PoolName.INDEXER,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        ):
+            # DSA indexer and DeepSeek V4 side pools are page-packed
+            # single-object pools.
+            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+        elif pool_name == PoolName.SWA:
+            if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
+                # Ordinary MHA SWA mirrors a K/V pool.
+                suffixes = [
+                    f"_{self.mha_suffix}_{pool_name}_k",
+                    f"_{self.mha_suffix}_{pool_name}_v",
+                ]
+            elif self.is_mla_backend:
+                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+
+        if not suffixes:
+            raise ValueError(
+                f"Unsupported Mooncake hybrid pool name: {pool_name}, "
+                f"host_pool={type(host_pool)}"
+            )
 
         key_multiplier = len(suffixes)
         component_keys = [

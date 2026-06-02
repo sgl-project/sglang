@@ -71,32 +71,6 @@ class PoolName(str, Enum):
     def __str__(self) -> str:
         return self.value
 
-    def storage_component_suffixes(
-        self,
-        *,
-        mha_suffix: str,
-        mla_suffix: str,
-        is_mla_backend: bool,
-        host_pool: Optional[Any] = None,
-    ) -> list[str]:
-        """Storage object suffixes for one logical page.
-
-        The returned order must match the host pool's get_page_buffer_meta()
-        order, because zero-copy backends zip keys with buffer pointers.
-        """
-        if self == PoolName.MAMBA:
-            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            return [f"_{mha_suffix}_temporal"] + [
-                f"_{mha_suffix}_conv_{i}" for i in range(conv_num)
-            ]
-        if (
-            self == PoolName.SWA
-            and not is_mla_backend
-            and hasattr(host_pool, "v_buffer")
-        ):
-            return [f"_{mha_suffix}_{self}_k", f"_{mha_suffix}_{self}_v"]
-        return [f"_{mla_suffix}_{self}"]
-
 
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
