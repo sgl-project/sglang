@@ -1077,9 +1077,9 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         num_replicated_prefix = num_txt_tokens
         if sp_size > 1 and num_txt_tokens % sp_size == 0:
             sp_rank = get_sp_parallel_rank()
-            encoder_hidden_states = torch.chunk(
-                encoder_hidden_states, sp_size, dim=1
-            )[sp_rank]
+            encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_size, dim=1)[
+                sp_rank
+            ]
             if freqs_cis is not None:
                 cos, sin = freqs_cis
                 txt_cos_local = torch.chunk(cos[:num_txt_tokens], sp_size, dim=0)[
