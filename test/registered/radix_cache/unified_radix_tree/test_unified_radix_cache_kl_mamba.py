@@ -3,7 +3,7 @@ import shutil
 import tempfile
 import unittest
 
-from test_unified_radix_cache_kl_hicache_nightly import AccuracyTwoPassMixin
+from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
