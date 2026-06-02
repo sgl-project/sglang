@@ -105,6 +105,9 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.kv_canary.api import install_canary
+from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -250,6 +253,7 @@ MLA_ATTENTION_BACKENDS = [
     "fa4",
     "triton",
     "flashmla",
+    "cutedsl_mla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
@@ -264,6 +268,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "fa3",
     "fa4",
     "flashmla",
+    "cutedsl_mla",
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
@@ -646,6 +651,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
+        self._token_oracle_manager = install_token_oracle_from_env(
+            server_args=server_args,
+            vocab_size=self.model_config.vocab_size,
+        )
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -749,6 +758,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
+        # Must be called AFTER init_memory_pool so the pool object exists for
+        # canary to monkey-patch, and BEFORE init_device_graphs so warmup
+        # forwards captured into the graph see the patched pool methods.
+        self.canary_manager = install_canary(
+            server_args=server_args,
+            model_runner=self,
+            token_oracle_manager=self._token_oracle_manager,
+        )
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
@@ -825,6 +843,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+        if self.canary_manager is not None and not self.is_draft_worker:
+            self.canary_manager.mark_init_finished()
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -923,7 +944,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
+            local_ip,
+            "P2PHANDSHAKE",
+            envs.MOONCAKE_PROTOCOL.get(),
+            envs.MOONCAKE_DEVICE.get(),
         )
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
@@ -1050,7 +1074,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
             if self.server_args.mooncake_ib_device:
-                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    get_ib_devices_for_gpu,
+                )
+
+                ib_device_for_gpu = get_ib_devices_for_gpu(
+                    self.server_args.mooncake_ib_device, self.gpu_id
+                )
+                mooncake_ib_device = (
+                    ib_device_for_gpu.split(",") if ib_device_for_gpu else []
+                )
                 try:
                     from mooncake import ep as mooncake_ep
 
@@ -2303,22 +2336,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return attn_backend_wrapper(self, full_attention_backend)
 
     def kernel_warmup(self):
-        """
-        Warmup and tune kernels before cuda graph capture.
-        Covers framework-level warmups and optional model-specific warmups.
-        """
+        """Warmup and tune kernels before cuda graph capture."""
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
-        # Models may need their own warmup for model-specific kernels or JIT paths.
-        # Register those hooks on the model class so ModelRunner can keep this
-        # warmup entry point generic.
-        model_kernel_warmup = getattr(self.model, "kernel_warmup", None)
-        if model_kernel_warmup is not None:
-            model_kernel_warmup(self)
+        if (
+            envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and self.pp_size > 1
+            and not self.spec_algorithm.is_speculative()
+        ):
+            from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
+                pp_parallel_deep_gemm_warmup,
+            )
+
+            pp_parallel_deep_gemm_warmup(self)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
@@ -2386,13 +2421,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from flashinfer.autotuner import autotune
 
         cache_path = self._flashinfer_autotune_cache_path()
-        logger.info("Running FlashInfer autotune with cache: %s", cache_path)
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+            autotune_cache = cache_path
+            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            runs_dir = cache_path.parent / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            autotune_cache = (
+                runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+            )
+            logger.info(
+                "Running FlashInfer autotune (cache reuse DISABLED via "
+                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
+                autotune_cache,
+            )
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
+            with torch.inference_mode(), autotune(True, cache=str(autotune_cache)):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
@@ -2433,9 +2482,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             / f"rank_tp{self.tp_rank}_pp{self.pp_rank}_dp{self.dp_rank or 0}.json"
         )
 
-    def _dummy_run(self, batch_size: int, run_ctx=None):
-        """Run a dummy forward pass for warmup/profiling."""
-        if self.is_generation:
+    def _dummy_run(
+        self,
+        batch_size: int,
+        run_ctx=None,
+        forward_mode_override: Optional[ForwardMode] = None,
+    ):
+        """Run a dummy forward pass for warmup/profiling.
+
+        ``forward_mode_override`` forces EXTEND/DECODE regardless of
+        ``is_generation`` (used by the PP-parallel DeepGEMM warmup).
+        """
+        if forward_mode_override is not None:
+            capture_forward_mode = forward_mode_override
+        elif self.is_generation:
             capture_forward_mode = ForwardMode.DECODE
         else:
             capture_forward_mode = ForwardMode.EXTEND
@@ -2506,11 +2566,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            hc_hidden_size=getattr(self.model_config, "hc_hidden_size", None),
         )
         buffers.num_token_non_padded[...] = num_tokens
 
         # For extend mode
-        if not self.is_generation:
+        if capture_forward_mode == ForwardMode.EXTEND:
             extend_prefix_lens_cpu = [0] * batch_size
             extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
             extend_num_tokens = num_tokens
@@ -2532,8 +2593,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extend_start_loc = None
 
         if self.server_args.pp_size > 1:
+            # PP0 already cp-split hidden_states before send.
+            pp_hidden_tokens = num_tokens
+            if (
+                capture_forward_mode == ForwardMode.EXTEND
+                and self.pp_rank != 0
+                and self.attn_cp_size > 1
+            ):
+                pp_hidden_tokens = num_tokens // self.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         if require_mlp_tp_gather_:
@@ -2552,6 +2621,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
             global_dp_buffer_len = num_tokens * self.server_args.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.server_args.dp_size
         elif require_attn_tp_gather(self.server_args):
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -2568,8 +2638,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
             global_dp_buffer_len = num_tokens
+            global_num_tokens_cpu = [num_tokens]
         else:
             global_dp_buffer_len = None
+            global_num_tokens_cpu = None
 
         def get_spec_info():
             spec_info = None
@@ -2658,6 +2730,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
@@ -3182,7 +3255,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
+
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
+            )
+            if not self.is_draft_worker and ((c := self.canary_manager) is not None)
+            else contextlib.nullcontext()
+        )
+
         with (
+            canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
