@@ -188,7 +188,7 @@ class DeepSeekV4SingleKVPool(KVCache):
             cache=self.kv_buffer[layer_id],
             indices=loc,
             page_size=self.page_size,
-            type="flashmla",
+            type="flashmla_bf16" if self.is_bf16_kv_cache else "flashmla",
         )
 
     def get_key_buffer(self, layer_id: int):

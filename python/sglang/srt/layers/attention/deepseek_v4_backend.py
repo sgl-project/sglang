@@ -926,7 +926,7 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         raw_loc = forward_batch.out_cache_loc
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get() and not self.is_bf16_kv_cache:
+        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
