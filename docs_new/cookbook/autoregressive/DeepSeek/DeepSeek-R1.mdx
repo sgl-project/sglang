@@ -15,7 +15,7 @@ import { DeepSeekR1AdvancedDeployment } from '/src/snippets/autoregressive/deeps
 
 - **Advanced Reasoning**: Built-in reasoning capabilities for complex problem-solving
 - **Multiple Quantizations**: FP8 and FP4 variants for different performance/memory trade-offs
-- **Hardware Optimization**: Specifically tuned for NVIDIA B200 (Blackwell) and H200 (Hopper) GPUs, AMD MI300X, MI325X and MI355X GPUs, and Intel Xeon CPUs
+- **Hardware Optimization**: Specifically tuned for NVIDIA B200 (Blackwell) and H200 (Hopper) GPUs, AMD MI300X, MI325X and MI355X GPUs, as well as Intel Xeon CPUs
 - **High Performance**: Optimized for both throughput and latency scenarios
 
 **Available Models:**
@@ -54,7 +54,7 @@ Pareto-optimal configurations for B200, H200, MI300X, MI325X, and MI355X hardwar
 
 For more detailed configuration tips and advanced tuning, please refer to [DeepSeek V3/V3.1/R1 Usage](../../../docs/basic_usage/deepseek_v3).
 
-For configuring CPU service, please refer to the [SGLang CPU usage guide](../../../docs/basic_usage/cpu_server).
+For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
