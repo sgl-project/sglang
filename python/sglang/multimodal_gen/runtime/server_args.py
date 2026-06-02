@@ -893,21 +893,18 @@ class ServerArgs(DisaggArgsMixin):
 
         if explicitly_set_component_names is not None:
             self.layerwise_offload_components = explicitly_set_component_names
-            self._disable_cpu_offload_for_layerwise_components(
+            self._disable_non_dit_cpu_offload_for_layerwise_components(
                 explicitly_set_component_names
             )
             return
 
-    def _disable_cpu_offload_for_layerwise_components(
+    def _disable_non_dit_cpu_offload_for_layerwise_components(
         self, component_names: list[str]
     ) -> None:
-        # Layerwise offload owns H2D/D2H for selected component weights.
+        # non-DiT layerwise offload replaces the corresponding component-level CPU offload
         flag_names = cpu_offload_flags_for_layerwise_components(component_names)
         disabled_flag_names: list[str] = []
 
-        if "dit_cpu_offload" in flag_names and self.dit_cpu_offload is not False:
-            self.dit_cpu_offload = False
-            disabled_flag_names.append("dit_cpu_offload")
         if (
             "text_encoder_cpu_offload" in flag_names
             and self.text_encoder_cpu_offload is not False
@@ -1147,6 +1144,7 @@ class ServerArgs(DisaggArgsMixin):
             "--data-parallel-size",
             "--dp-size",
             "--dp",
+            dest="dp_size",
             type=int,
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
@@ -1254,7 +1252,9 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
             "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
-            "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+            "(SGLANG_CACHE_DIT_ENABLED) or use_fsdp_inference. May be combined with "
+            "--dit-cpu-offload, in which case DiT weights stay on host memory and only the "
+            "layers needed for the current step are brought on-device (lowest peak GPU memory).",
         )
         parser.add_argument(
             "--layerwise-offload-components",
@@ -1331,9 +1331,11 @@ class ServerArgs(DisaggArgsMixin):
             help=(
                 "Quantization method for the transformer. If omitted, the method is "
                 "auto-detected from the checkpoint config or safetensors metadata when "
-                "possible. Applies to both pre-quantized checkpoints and online "
-                "quantization. Use this flag to override auto-detection. "
-                "Options: 'fp8', 'mxfp8', 'mxfp4', 'mxfp4_npu', 'modelslim'. "
+                "possible. Use this flag to override auto-detection. "
+                "Online (post-load) quantization from a BF16/FP16 checkpoint "
+                "is supported for 'fp8' and 'mxfp4'. Other methods "
+                "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
+                "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
                 "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
             ),
@@ -1793,10 +1795,16 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
-        if "mode" in provided_arg_names:
-            provided_arg_names.add("performance_mode")
-        if "layerwise_offload_modules" in provided_arg_names:
-            provided_arg_names.add("layerwise_offload_components")
+        cli_aliases = {
+            "cfg_parallel_size": "cfg_parallel_degree",
+            "data_parallel_size": "dp_size",
+            "dp": "dp_size",
+            "layerwise_offload_modules": "layerwise_offload_components",
+            "mode": "performance_mode",
+        }
+        for alias_name, dest_name in cli_aliases.items():
+            if alias_name in provided_arg_names:
+                provided_arg_names.add(dest_name)
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -1834,20 +1842,14 @@ class ServerArgs(DisaggArgsMixin):
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
-            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
-            if self.use_fsdp_inference and should_disable_dit_cpu_offload:
+            is_dit_layerwise_offload_selected = self.is_dit_layerwise_offload_selected
+            if self.use_fsdp_inference and is_dit_layerwise_offload_selected:
                 logger.warning(
                     "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
 
-            if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
-                logger.warning(
-                    "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."
-                )
-                self.dit_cpu_offload = False
-
-            if envs.SGLANG_CACHE_DIT_ENABLED and should_disable_dit_cpu_offload:
+            if envs.SGLANG_CACHE_DIT_ENABLED and is_dit_layerwise_offload_selected:
                 raise ValueError(
                     "DiT layerwise offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
