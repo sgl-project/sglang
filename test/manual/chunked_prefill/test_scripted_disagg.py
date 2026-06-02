@@ -17,6 +17,7 @@ class TestDisaggBasic(ScriptedTestCase):
         model_path=DEFAULT_MODEL_NAME_FOR_TEST,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disaggregation_mode="prefill",
+        disaggregation_transfer_backend="fake",
     )
 
     def test_naive_disagg_chunked(self):
@@ -58,6 +59,7 @@ class TestDisaggNonOverlap(ScriptedTestCase):
         model_path=DEFAULT_MODEL_NAME_FOR_TEST,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disaggregation_mode="prefill",
+        disaggregation_transfer_backend="fake",
         disable_overlap_schedule=True,
     )
 
@@ -149,6 +151,7 @@ class TestDisaggInflightQueue(ScriptedTestCase):
         model_path=DEFAULT_MODEL_NAME_FOR_TEST,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disaggregation_mode="prefill",
+        disaggregation_transfer_backend="fake",
     )
 
     def test_inflight_queue_membership_only_on_final_chunk(self):
@@ -217,6 +220,7 @@ class TestDisaggPartialPage(ScriptedTestCase):
         chunked_prefill_size=15,  # 15 % 16 != 0 -> non-final fill boundaries misalign
         page_size=PAGE_SIZE,
         disaggregation_mode="prefill",
+        disaggregation_transfer_backend="fake",
         disable_overlap_schedule=True,
     )
 
@@ -274,6 +278,7 @@ class TestDisaggOverlap(ScriptedTestCase):
         model_path=DEFAULT_MODEL_NAME_FOR_TEST,
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disaggregation_mode="prefill",
+        disaggregation_transfer_backend="fake",
         disable_overlap_schedule=False,
     )
 
