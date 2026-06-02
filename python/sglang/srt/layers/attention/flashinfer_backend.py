@@ -1113,7 +1113,11 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
-        if spec_info is None:
+        # Under dp-attention, an IDLE rank's spec_info (EagleVerifyInput.create_idle_input)
+        # carries no kv_indptr/kv_indices; its rows are all fake DP padding and the output is
+        # discarded, so build a valid decode plan from the (padded) seq_lens instead of reading
+        # the missing spec tensors. Real (non-idle) spec verify keeps using spec_info's plan.
+        if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]

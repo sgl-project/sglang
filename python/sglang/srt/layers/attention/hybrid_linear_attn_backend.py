@@ -151,6 +151,39 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
+        """Run deferred clear/COW ops on the forward stream to avoid races."""
+        # TARGET_VERIFY reports is_extend()==True but must NOT clear the mamba state:
+        # the request's committed ssm/conv state has to survive the verify forward.
+        # In cuda-graph mode the verify skips init_forward_metadata (replay), so this
+        # never ran there; in eager mode it ran every verify step and zeroed the
+        # committed mamba state -> frozen state -> degenerate output. Only the genuine
+        # prefill EXTEND (fresh slot, mamba_needs_clear) should clear.
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or self.is_draft_worker
+        ):
+            return
+        if (
+            forward_batch.mamba_clear_indices is not None
+            and len(forward_batch.mamba_clear_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.clear_slots(
+                forward_batch.mamba_clear_indices
+            )
+        if (
+            forward_batch.mamba_cow_src_indices is not None
+            and len(forward_batch.mamba_cow_src_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.copy_from(
+                forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
+            )
+        forward_batch.mamba_clear_indices = None
+        forward_batch.mamba_cow_src_indices = None
+        forward_batch.mamba_cow_dst_indices = None
+
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
@@ -166,6 +199,15 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        # DP-attention pads each rank to a common row count for collective alignment
+        # (an idle rank is all padding). Padding rows reuse req_pool slot 0, whose
+        # mamba slot may be unallocated -> illegal access in the mixer. Mark them -1
+        # so the mamba kernels skip recurrent-state read/write for those rows — same
+        # sentinel the cuda-graph padding path uses (see init_*_cuda_graph).
+        _real_bs = getattr(forward_batch, "_original_batch_size", None)
+        if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
+            mamba_cache_indices = mamba_cache_indices.clone()
+            mamba_cache_indices[_real_bs:] = -1
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(

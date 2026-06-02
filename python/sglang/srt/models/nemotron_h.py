@@ -627,22 +627,42 @@ class NemotronHAttention(nn.Module):
         # real cu_seqlens, so Q/K/V are trimmed to the real tokens; decode runs a
         # wrapper captured at the padded batch size, so Q stays padded while K/V
         # and the cache-write locations are trimmed.
+        # target_verify (spec/NEXTN) uses the SAME padded-batch wrapper as decode
+        # (qo_indptr is built at the padded length), so Q must stay padded there too —
+        # otherwise q.shape[0] (real) != qo_indptr[-1] (padded) in flashinfer prefill.
         padded_shape = hidden_states.shape[0]
         real_tokens = _get_real_num_tokens(hidden_states, forward_batch)
         has_padding = real_tokens < padded_shape
-        keep_q_padded = forward_batch.forward_mode.is_decode()
+        keep_q_padded = (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_idle()
+            # A decode/idle batch DP-padded into ForwardMode.EXTEND (MAX_LEN) still
+            # runs the padded-batch wrapper, so Q must stay padded. Genuine prefill
+            # has no _original_forward_mode and keeps trimming Q to the real tokens.
+            or getattr(forward_batch, "_original_forward_mode", None) is not None
+        )
         original_out_cache_loc = forward_batch.out_cache_loc
 
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if has_padding:
+        if has_padding and real_tokens > 0:
             k, v = k[:real_tokens], v[:real_tokens]
             if original_out_cache_loc is not None:
                 forward_batch.out_cache_loc = original_out_cache_loc[:real_tokens]
             if not keep_q_padded:
                 q = q[:real_tokens]
-
-        attn_output = self.attn.forward(q, k, v, forward_batch)
+        # real_tokens == 0: a fully-idle DP rank carrying a synthesized fake prefill
+        # (one req spanning all num_tokens padding tokens, prefix 0). Keep Q/K/V at the
+        # padded length so the prefill ragged kernel sees a well-formed self-attention
+        # (matching cu_seqlens); trimming K/V to 0 while Q stays padded makes the kernel
+        # read past K/V (TMA-descriptor / illegal-instruction failure). It must still run
+        # the attention collective but must NOT write KV: save_kv_cache is False below
+        # (a 0-row store_cache launches a 0-grid kernel -> CUDA invalid argument), and the
+        # output rows are zeroed afterwards.
+        attn_output = self.attn.forward(
+            q, k, v, forward_batch, save_kv_cache=real_tokens > 0
+        )
         # out_cache_loc is only consumed by self.attn.forward (KV write); restore it now.
         forward_batch.out_cache_loc = original_out_cache_loc
 
