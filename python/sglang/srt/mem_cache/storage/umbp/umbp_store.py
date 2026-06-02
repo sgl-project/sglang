@@ -1168,7 +1168,8 @@ class KVEventsSubscriber:
 
         elif isinstance(event, BlockRemoved):
             hashes = [str(h) for h in event.block_hashes]
-            ok = self._umbp_client.revoke_external_kv_blocks(hashes)
+            tier = self._medium_to_tier(event.medium)
+            ok = self._umbp_client.revoke_external_kv_blocks(hashes, tier)
             if not ok:
                 logger.warning(
                     "revoke_external_kv_blocks failed for %d hashes (dp_rank=%s)",
@@ -1183,11 +1184,21 @@ class KVEventsSubscriber:
                 all_hashes = list(self._reported_hashes)
                 self._reported_hashes.clear()
             if all_hashes:
-                ok = self._umbp_client.revoke_external_kv_blocks(all_hashes)
-                if not ok:
+                # `_reported_hashes` is currently a flat set without tier
+                # attribution, so revoke from both tiers on all-clear.
+                ok_hbm = self._umbp_client.revoke_external_kv_blocks(
+                    all_hashes, self._tier_hbm
+                )
+                ok_dram = self._umbp_client.revoke_external_kv_blocks(
+                    all_hashes, self._tier_dram
+                )
+                if not (ok_hbm and ok_dram):
                     logger.warning(
-                        "revoke_external_kv_blocks (all-clear) failed for %d hashes",
+                        "revoke_external_kv_blocks (all-clear) failed for %d hashes "
+                        "(hbm=%s dram=%s)",
                         len(all_hashes),
+                        ok_hbm,
+                        ok_dram,
                     )
 
         else:
