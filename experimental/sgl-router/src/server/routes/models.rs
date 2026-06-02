@@ -21,16 +21,14 @@ pub struct ModelEntry {
 }
 
 pub async fn list_models(State(ctx): State<Arc<AppContext>>) -> Json<ModelsList> {
-    let data = ctx
-        .config
-        .models
-        .iter()
-        .map(|m| ModelEntry {
-            id: m.id.clone(),
-            object: "model",
-            owned_by: "sglang",
-        })
-        .collect();
+    // The router serves a single configured model; OpenAI clients still
+    // expect a list shape, so return a one-element `data` array.
+    let m = &ctx.config.model;
+    let data = vec![ModelEntry {
+        id: m.id.clone(),
+        object: "model",
+        owned_by: "sglang",
+    }];
     Json(ModelsList {
         object: "list",
         data,
@@ -47,24 +45,15 @@ mod tests {
     use crate::config::PolicyKind;
 
     #[tokio::test]
-    async fn lists_configured_models() {
+    async fn lists_configured_model() {
         let mut ctx = crate::server::app_context::AppContext::stub();
-        ctx.config.models = vec![
-            crate::config::ModelConfig {
-                id: "qwen3".into(),
-                tokenizer_path: "x".into(),
-                policy: PolicyKind::RoundRobin,
-                circuit_breaker: None,
-                cache_aware: None,
-            },
-            crate::config::ModelConfig {
-                id: "deepseek".into(),
-                tokenizer_path: "y".into(),
-                policy: PolicyKind::RoundRobin,
-                circuit_breaker: None,
-                cache_aware: None,
-            },
-        ];
+        ctx.config.model = crate::config::ModelConfig {
+            id: "qwen3".into(),
+            tokenizer_path: "x".into(),
+            policy: PolicyKind::RoundRobin,
+            circuit_breaker: None,
+            cache_aware: None,
+        };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
         let res = app
             .oneshot(
@@ -85,13 +74,12 @@ mod tests {
             .iter()
             .map(|m| m["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["qwen3", "deepseek"]);
+        assert_eq!(ids, vec!["qwen3"]);
         assert_eq!(v["data"][0]["object"], "model");
         // Pin `owned_by` so a refactor that flips the hardcoded value to
         // "openai" / "" / a typo would fail loudly here. OpenAI clients
         // expect this field and some (e.g. langchain-openai) treat
         // `owned_by != "system"` as a meaningful signal.
         assert_eq!(v["data"][0]["owned_by"], "sglang");
-        assert_eq!(v["data"][1]["owned_by"], "sglang");
     }
 }

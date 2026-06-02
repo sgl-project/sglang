@@ -100,14 +100,18 @@ impl AppContext {
                     port: 0,
                 },
                 observability: Default::default(),
-                models: vec![],
-                discovery: crate::config::DiscoveryConfig {
-                    backend: crate::config::DiscoveryBackend::StaticUrls(
-                        crate::config::StaticUrlsDiscoveryConfig {
-                            urls: vec!["http://placeholder:0".into()],
-                        },
-                    ),
+                model: crate::config::ModelConfig {
+                    id: "stub-model".into(),
+                    tokenizer_path: "stub".into(),
+                    policy: crate::config::PolicyKind::RoundRobin,
+                    circuit_breaker: None,
+                    cache_aware: None,
                 },
+                discovery: crate::config::DiscoveryBackend::StaticUrls(
+                    crate::config::StaticUrlsDiscoveryConfig {
+                        urls: vec!["http://placeholder:0".into()],
+                    },
+                ),
                 proxy: crate::config::ProxyConfig::default(),
                 active_load: crate::config::ActiveLoadConfig::default(),
             },
