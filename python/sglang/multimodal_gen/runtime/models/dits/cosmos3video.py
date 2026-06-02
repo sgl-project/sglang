@@ -428,18 +428,21 @@ class Cosmos3CausalAttention(nn.Module):
         batch_size, seq_len = hidden_states.shape[:2]
 
         qkv, _ = self.to_qkv(hidden_states)
-        # split returns strided views into qkv; .contiguous() before .view()
-        # because the per-head reshape needs row-major memory.
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.contiguous().view(
-            batch_size, seq_len, self.num_attention_heads, self.head_dim
+        qkv = qkv.view(
+            batch_size,
+            seq_len,
+            self.num_attention_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
         )
-        k = k.contiguous().view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
-        )
-        v = v.contiguous().view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
-        )
+        q = qkv[:, :, : self.num_attention_heads, :]
+        k = qkv[
+            :,
+            :,
+            self.num_attention_heads : self.num_attention_heads
+            + self.num_key_value_heads,
+            :,
+        ]
+        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
         q = F.rms_norm(
             q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
@@ -536,16 +539,21 @@ class Cosmos3CrossAttention(nn.Module):
         batch_size, seq_len_gen = hidden_states.shape[:2]
 
         qkv, _ = self.to_qkv(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.contiguous().view(
-            batch_size, seq_len_gen, self.num_attention_heads, self.head_dim
+        qkv = qkv.view(
+            batch_size,
+            seq_len_gen,
+            self.num_attention_heads + 2 * self.num_key_value_heads,
+            self.head_dim,
         )
-        k = k.contiguous().view(
-            batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim
-        )
-        v = v.contiguous().view(
-            batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim
-        )
+        q = qkv[:, :, : self.num_attention_heads, :]
+        k = qkv[
+            :,
+            :,
+            self.num_attention_heads : self.num_attention_heads
+            + self.num_key_value_heads,
+            :,
+        ]
+        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
 
         q = F.rms_norm(
             q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
@@ -558,10 +566,7 @@ class Cosmos3CrossAttention(nn.Module):
         # K/V = [text (replicated full on every SP rank) | image (sharded same as Q)].
         # USPAttention routes through the registered attention backend (FA, sage,
         # …) and handles the Ulysses all-to-all when SP > 1.
-        num_und = k_und.shape[1]
-        k = torch.cat([k_und, k], dim=1)
-        v = torch.cat([v_und, v], dim=1)
-        out = self.attn(q, k, v, num_replicated_kv_prefix=num_und)
+        out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
@@ -1051,6 +1056,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         fps: float | None = None,
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
+        max_text_seq_len: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass for denoising.
@@ -1069,6 +1075,8 @@ class Cosmos3OmniTransformer(CachableDiT):
                 noisy frames (timestep embedding applied) and 0 marks
                 conditioned frames (clean context, embedding skipped).
                 ``None`` means every frame is noisy (T2V / T2I).
+            max_text_seq_len: Real text length already computed during
+                tokenization. When omitted it is derived from ``text_mask``.
 
         Returns:
             [B, C, T, H, W] velocity prediction
@@ -1078,7 +1086,11 @@ class Cosmos3OmniTransformer(CachableDiT):
 
         batch_size, C, T, H, W = hidden_states.shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        max_real_len = int(text_mask.sum(dim=1).max().item())
+        if max_text_seq_len is None:
+            max_text_seq_len = int(text_mask.sum(dim=1).max().item())
+        if max_text_seq_len < text_ids.shape[1]:
+            text_ids = text_ids[:, :max_text_seq_len]
+            text_mask = text_mask[:, :max_text_seq_len]
 
         # Check if sequence parallelism is enabled
         sequence_shard_enabled = self.sp_size > 1
@@ -1151,24 +1163,23 @@ class Cosmos3OmniTransformer(CachableDiT):
             self.cached_kv[cache_key] = self.language_model(
                 text_ids, text_mask, freqs_und[0], freqs_und[1]
             )
-            self.cached_freqs_gen[cache_key] = freqs_gen
+            cos_gen, sin_gen = freqs_gen
+            if sequence_shard_enabled:
+                if seq_shard_pad > 0:
+                    pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
+                    pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
+                    cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
+                    sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
+                cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
+                sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
+                cos_gen = cos_gen[:, self.sp_rank, :, :]
+                sin_gen = sin_gen[:, self.sp_rank, :, :]
+            cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
+            sin_gen = sin_gen.unsqueeze(2)
+            self.cached_freqs_gen[cache_key] = (cos_gen, sin_gen)
 
         freqs_gen = self.cached_freqs_gen[cache_key]
         cos_gen, sin_gen = freqs_gen
-
-        if sequence_shard_enabled:
-            if seq_shard_pad > 0:
-                pad_cos = cos_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                pad_sin = sin_gen[:, -1:].expand(-1, seq_shard_pad, -1)
-                cos_gen = torch.cat([cos_gen, pad_cos], dim=1)
-                sin_gen = torch.cat([sin_gen, pad_sin], dim=1)
-            cos_gen = cos_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-            sin_gen = sin_gen.view(batch_size, self.sp_size, local_seq_len, -1)
-            cos_gen = cos_gen[:, self.sp_rank, :, :]
-            sin_gen = sin_gen[:, self.sp_rank, :, :]
-
-        cos_gen = cos_gen.unsqueeze(2)  # [B, S, 1, D]
-        sin_gen = sin_gen.unsqueeze(2)
 
         # Run GEN layers. `residual` is threaded so each layer's
         # input_layernorm and post_attention_layernorm can use the
@@ -1177,8 +1188,6 @@ class Cosmos3OmniTransformer(CachableDiT):
         residual: torch.Tensor | None = None
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
-            k_und = k_und[:, :max_real_len]
-            v_und = v_und[:, :max_real_len]
             hidden_gen, residual = layer(
                 hidden_gen,
                 k_und,
