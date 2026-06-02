@@ -76,8 +76,18 @@ def _sgemm_lora_a_kernel(
     if seg_len == 0:
         return
 
-    # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
-    N = tl.minimum(N, rank * stack_num)
+    # Adjust N (stack_num * max_rank) to this adapter's actual rank.
+    #
+    # Only clamp on the SPLIT_K == 1 path, for two reasons: (1) it keeps that
+    # path bit-identical to the original kernel; (2) on the split-K path a
+    # data-dependent N forces the bf16 store atomic into per-element scalar
+    # `atom...bf16`, whereas the unclamped (kernel-arg) N lets Triton emit the
+    # packed `atom...v2.bf16` (~3-4x fewer atomics under contention). The expand
+    # kernels read only the rank-packed [:rank*stack] region, so the extra
+    # columns the unclamped split-K path writes are never consumed
+    # (see validate_aclamp_layout.py).
+    if SPLIT_K == 1:
+        N = tl.minimum(N, rank * stack_num)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -88,8 +98,7 @@ def _sgemm_lora_a_kernel(
 
     # Create pointers for the first block of x and weights[batch_id]
     # The pointers will be advanced as we move in the K direction
-    # and accumulate. With SPLIT_K > 1 this program starts at K-tile pid_sk and
-    # strides by BLOCK_K * SPLIT_K; with SPLIT_K == 1 it walks all of K.
+    # and accumulate.
     s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = pid_sk * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -128,8 +137,17 @@ def _sgemm_lora_a_kernel(
     if SPLIT_K == 1:
         tl.store(output_ptr, partial_sum.to(output.dtype.element_ty), mask=output_mask)
     else:
-        # fp32 accumulator, pre-zeroed; combine the K-splits with native fp32 atomics.
-        tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+        # Pre-zeroed accumulator in x.dtype; combine the K-splits with native
+        # atomics. For bf16 x this is a packed `atom...v2.bf16` (unclamped N,
+        # see the SPLIT_K==1 clamp note above). Cross-split accumulation is in
+        # x.dtype, so bf16 trades some precision for skipping the fp32->bf16
+        # cast and halving the atomic count.
+        tl.atomic_add(
+            output_ptr,
+            partial_sum.to(output.dtype.element_ty),
+            mask=output_mask,
+            sem="relaxed",
+        )
 
 
 @functools.lru_cache(maxsize=None)
@@ -177,7 +195,10 @@ def sgemm_lora_a_fwd(
             split_k = max(1, min(2 * num_sms // base_grid, num_k_tiles, 16))
 
     if split_k > 1:
-        output = torch.zeros((S, R), device=x.device, dtype=torch.float32)
+        # Pre-zeroed accumulator in x.dtype: the K-splits atomic-add into it.
+        # Keeping it in x.dtype (bf16) lets the bf16 atomic vectorize into a
+        # packed .v2 store and avoids a trailing fp32->bf16 cast.
+        output = torch.zeros((S, R), device=x.device, dtype=x.dtype)
     else:
         output = torch.empty((S, R), device=x.device, dtype=x.dtype)
 
