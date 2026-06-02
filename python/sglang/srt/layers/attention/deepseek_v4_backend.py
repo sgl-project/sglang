@@ -53,14 +53,17 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.utils import ceil_align
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+    from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_sm120 = is_sm120_supported()
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +84,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    import flash_mla
+    if _is_sm120:
+        return None
+    import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
 
@@ -354,8 +359,10 @@ class DeepseekV4AttnBackend(
         self.page_size = model_runner.page_size
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        self.hisparse_coordinator = model_runner.hisparse_coordinator
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -363,6 +370,9 @@ class DeepseekV4AttnBackend(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
 
+        self.enable_deepseek_v4_fp4_indexer: bool = (
+            model_runner.server_args.enable_deepseek_v4_fp4_indexer
+        )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -376,7 +386,6 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
-        self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -660,141 +669,51 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
-            return
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
+        # materialization is recorded inside the cuda graph; a no-op (Full
+        # already) when PREP_IN_CUDA_GRAPH=0.
+        if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
+            self.forward_metadata = self.make_forward_metadata_from_raw_verify(
+                raw_metadata=self.forward_metadata,
+            )
+        elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
+            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
+                raw_metadata=self.forward_metadata,
+            )
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ) -> None:
+        bucket = _GraphBucket.of(forward_batch.forward_mode)
+        bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert forward_batch.req_to_token_pool.req_to_token is self.req_to_token
+        seq_lens = forward_batch.seq_lens
 
-        assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
-        assert seq_lens_cpu is not None
-        max_seq_len = int(seq_lens_cpu.max().item())
-
-        if forward_batch.forward_mode.is_decode_or_idle():
-            metadata = self.init_forward_metadata_decode(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
-            )
-        elif forward_batch.forward_mode.is_target_verify():
-            metadata = self.init_forward_metadata_target_verify(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
-            )
-        elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            extend_seq_lens = forward_batch.extend_seq_lens
-            assert (
-                seq_lens is not None
-                and seq_lens_cpu is not None
-                and extend_seq_lens is not None
-                and extend_seq_lens_cpu is not None
-            )
-            is_draft = forward_batch.forward_mode.is_draft_extend(include_v2=True)
-            metadata = self.init_forward_metadata_prefill(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu.tolist(),
-                out_cache_loc=forward_batch.out_cache_loc,
-                num_tokens=sum(extend_seq_lens_cpu),
-                extend_seq_lens=extend_seq_lens,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                need_compress=not is_draft,
-            )
+        if in_capture:
+            # Captured graph does no real cache writes, so synthesize a dummy
+            # out_cache_loc per bucket (replay supplies the real value).
+            assert req_pool_indices.size(0) == bs
+            assert seq_lens.size(0) == bs
+            num_tokens = forward_batch.positions.numel()
+            if bucket == _GraphBucket.DECODE_OR_IDLE:
+                out_cache_loc = torch.zeros_like(seq_lens)
+            elif bucket == _GraphBucket.TARGET_VERIFY:
+                out_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
+            else:
+                out_cache_loc = None
+            actual_forward_mode = forward_batch.forward_mode
+            seq_lens_sum = int(seq_lens.sum().item())
+            seq_lens_cpu = seq_lens.cpu()
         else:
-            raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
-
-        self.forward_metadata = metadata
-
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
-        self.cuda_graph_metadata_of_bucket_and_bs: Dict[
-            _GraphBucket,
-            Dict[
-                int,
-                Union[DSV4Metadata, DSV4RawDecodeMetadata, DSV4RawVerifyMetadata],
-            ],
-        ] = {bucket: {} for bucket in _GraphBucket}
-        self.draft_extend_num_tokens_per_bs = (
-            max_num_tokens // max_bs if max_bs > 0 else 1
-        )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ) -> None:
-        assert req_pool_indices.size(0) == bs
-        assert seq_lens.size(0) == bs
-
-        bucket = _GraphBucket.of(forward_mode)
-        raw_type: Optional[type] = None
-        if bucket == _GraphBucket.DECODE_OR_IDLE:
-            metadata = self.init_forward_metadata_decode(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=torch.zeros_like(seq_lens),
+            out_cache_loc = forward_batch.out_cache_loc
+            actual_forward_mode = getattr(
+                forward_batch, "actual_forward_mode", forward_batch.forward_mode
             )
-            raw_type = DSV4RawDecodeMetadata
-        elif bucket == _GraphBucket.TARGET_VERIFY:
-            out_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
-            metadata = self.init_forward_metadata_target_verify(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-                use_prefill_cuda_graph=True,
-            )
-            raw_type = DSV4RawVerifyMetadata
-        elif bucket == _GraphBucket.DRAFT_EXTEND:
-            num_tokens_per_bs = num_tokens // bs
-            metadata = self.init_forward_metadata_draft_extend(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens.tolist(),
-                num_tokens_per_bs=num_tokens_per_bs,
-                use_prefill_cuda_graph=True,
-            )
-        else:
-            raise NotImplementedError(f"{forward_mode=} not supported yet")
-
-        self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = metadata
-        self.forward_metadata = metadata
-        if raw_type is not None:
-            self._current_capture_raw = (
-                metadata if isinstance(metadata, raw_type) else None
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ) -> None:
-        bucket = _GraphBucket.of(forward_mode)
-
-        # FIXME: see cuda_graph_runner — this attribute is set out-of-band.
-        fb = self._replay_forward_batch
-        out_cache_loc = fb.out_cache_loc
-        actual_forward_mode = fb.forward_mode
+            seq_lens_sum = forward_batch.seq_lens_sum
+            seq_lens_cpu = forward_batch.seq_lens_cpu
 
         if actual_forward_mode == ForwardMode.IDLE:
             logger.debug(
@@ -837,10 +756,10 @@ class DeepseekV4AttnBackend(
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
-            num_tokens = self.speculative_num_draft_tokens * bs
+            num_tokens_v = self.speculative_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
-                pad=(0, num_tokens - len(out_cache_loc)),
+                pad=(0, num_tokens_v - len(out_cache_loc)),
                 mode="constant",
                 value=0,
             )
@@ -868,6 +787,98 @@ class DeepseekV4AttnBackend(
             bs=bs, temp_metadata=temp_metadata, bucket=bucket
         )
 
+        if in_capture:
+            # Preserve _current_capture_raw for on_after_cuda_graph_warmup
+            metadata = self.forward_metadata
+            self._current_capture_raw = (
+                metadata
+                if isinstance(
+                    metadata,
+                    (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata),
+                )
+                else None
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+            return
+
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        assert self.req_to_token_pool.req_to_token is self.req_to_token
+
+        assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
+        assert seq_lens_cpu is not None
+        max_seq_len = int(seq_lens_cpu.max().item())
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            # DSv4 bakes this step's KV write target (c4/c128) into metadata,
+            # so slice the shared multi-step out_cache_loc now, not at forward time.
+            out_cache_loc = forward_batch.out_cache_loc
+            if self.topk > 0 and self.speculative_num_steps > 1:
+                out_cache_loc = per_step_draft_out_cache_loc(
+                    out_cache_loc,
+                    forward_batch.batch_size,
+                    self.topk,
+                    self.speculative_num_steps,
+                )[self.speculative_step_id]
+            metadata = self.init_forward_metadata_decode(
+                max_seq_len=max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+            )
+        elif forward_batch.forward_mode.is_target_verify():
+            metadata = self.init_forward_metadata_target_verify(
+                max_seq_len=max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
+        elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            extend_seq_lens = forward_batch.extend_seq_lens
+            assert (
+                seq_lens is not None
+                and seq_lens_cpu is not None
+                and extend_seq_lens is not None
+                and extend_seq_lens_cpu is not None
+            )
+            is_draft = forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            metadata = self.init_forward_metadata_prefill(
+                max_seq_len=max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu.tolist(),
+                out_cache_loc=forward_batch.out_cache_loc,
+                num_tokens=sum(extend_seq_lens_cpu),
+                extend_seq_lens=extend_seq_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                need_compress=not is_draft,
+            )
+        else:
+            raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
+
+        self.forward_metadata = metadata
+        self.init_forward_metadata_in_graph(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        self.cuda_graph_metadata_of_bucket_and_bs: Dict[
+            _GraphBucket,
+            Dict[
+                int,
+                Union[
+                    DSV4Metadata,
+                    DSV4RawDecodeMetadata,
+                    DSV4RawVerifyMetadata,
+                ],
+            ],
+        ] = {bucket: {} for bucket in _GraphBucket}
+        self.draft_extend_num_tokens_per_bs = (
+            max_num_tokens // max_bs if max_bs > 0 else 1
+        )
+
     def replay_cuda_graph_metadata_from(
         self,
         bs: int,
@@ -878,6 +889,11 @@ class DeepseekV4AttnBackend(
         ],
         bucket: _GraphBucket,
     ) -> None:
+        if bs not in self.cuda_graph_metadata_of_bucket_and_bs[bucket]:
+            # First call (from capture): store the new metadata directly.
+            self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = temp_metadata
+            self.forward_metadata = temp_metadata
+            return
         chosen_metadata = self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs]
         chosen_metadata.copy_(temp_metadata)
         self.forward_metadata = chosen_metadata
@@ -919,24 +935,6 @@ class DeepseekV4AttnBackend(
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
             )
 
-    def _maybe_upgrade_forward_metadata(self) -> None:
-        # With SGLANG_PREP_IN_CUDA_GRAPH=1, init_forward_metadata_*
-        # returns a Raw metadata that only carries a few tensors. The
-        # full DSV4Metadata (including c4/c128 compress + core_attn +
-        # indexer metadata) must be materialized before any caller that
-        # touches those fields. For 1.6T the first two layers have
-        # compress_ratio=128, so forward_core_compressor / forward_c4_indexer
-        # can fire before attn_backend.forward(), and must trigger the
-        # upgrade themselves.
-        if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
-            self.forward_metadata = self.make_forward_metadata_from_raw_verify(
-                raw_metadata=self.forward_metadata,
-            )
-        elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
-            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
-                raw_metadata=self.forward_metadata,
-            )
-
     def forward(
         self,
         q: torch.Tensor,
@@ -949,8 +947,6 @@ class DeepseekV4AttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
-        self._maybe_upgrade_forward_metadata()
-
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
@@ -960,7 +956,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         metadata = self.forward_metadata
         core_attn_metadata = metadata.core_attn_metadata
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
@@ -1031,24 +1027,42 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import flash_mla
+            if _is_sm120:
+                from sglang.srt.layers.attention.flash_mla_sm120 import (
+                    flash_mla_with_kvcache_sm120,
+                )
 
-            o = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+                o = flash_mla_with_kvcache_sm120(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+            else:
+                import sgl_kernel.flash_mla as flash_mla
+
+                o = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
 
             o = o.squeeze(1)
             return o
@@ -1183,7 +1197,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner)
-        self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends: List[DeepseekV4AttnBackend] = []
@@ -1197,6 +1210,52 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 )
             )
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        from types import SimpleNamespace
+
+        inner_fb = SimpleNamespace(
+            batch_size=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            # Propagate the real runtime mode so inner backends can detect IDLE
+            # and apply their idle substitution.
+            actual_forward_mode=getattr(
+                forward_batch, "actual_forward_mode", forward_batch.forward_mode
+            ),
+            input_ids=getattr(forward_batch, "input_ids", None),
+            positions=getattr(forward_batch, "positions", None),
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            encoder_lens=None,
+            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            spec_info=forward_batch.spec_info,
+        )
+        if in_capture:
+            for i in range(self.speculative_num_steps):
+                self.attn_backends[i].init_forward_metadata_out_graph(
+                    inner_fb, in_capture=True
+                )
+        else:
+            if self.speculative_num_steps == 1:
+                return
+            self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
+            temp_metadata = self.attn_backends[0].forward_metadata
+            for i in range(1, self.speculative_num_steps - 1):
+                self.attn_backends[i].replay_cuda_graph_metadata_from(
+                    bs=forward_batch.batch_size,
+                    temp_metadata=temp_metadata,
+                    bucket=_GraphBucket.DECODE_OR_IDLE,
+                )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
@@ -1205,48 +1264,9 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
     def on_after_cuda_graph_warmup(self):
         for backend in self.attn_backends:
             backend.on_after_cuda_graph_warmup()
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        if self.speculative_num_steps == 1:
-            return
-
-        self.attn_backends[0]._replay_forward_batch = forward_batch
-        self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-        )
-        self.attn_backends[0]._replay_forward_batch = None
-        temp_metadata = self.attn_backends[0].forward_metadata
-
-        for i in range(1, self.speculative_num_steps - 1):
-            self.attn_backends[i].replay_cuda_graph_metadata_from(
-                bs=bs,
-                temp_metadata=temp_metadata,
-                bucket=_GraphBucket.DECODE_OR_IDLE,
-            )
 
 
 def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
