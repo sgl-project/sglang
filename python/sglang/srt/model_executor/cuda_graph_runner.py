@@ -357,10 +357,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 ngram_embedding_info.req_lens
             )
 
-        if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
-            dsts.append(self.encoder_lens[:raw_bs])
-            srcs.append(forward_batch.encoder_lens)
-
         if self.rids_int is not None and forward_batch.rids_int is not None:
             dsts.append(self.rids_int[:raw_bs])
             srcs.append(forward_batch.rids_int)
@@ -974,10 +970,9 @@ class CudaGraphRunner:
         seq_lens_cpu = _slot("seq_lens_cpu")
         out_cache_loc = _slot("out_cache_loc")
         positions = _slot("positions")
-        if self.is_encoder_decoder:
-            encoder_lens = buffers.encoder_lens[:bs]
-        else:
-            encoder_lens = None
+        encoder_lens = (
+            _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
+        )
         mrope_positions = _slot("mrope_positions")
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
