@@ -9,14 +9,6 @@ if TYPE_CHECKING:
 
 
 class ScriptedKvPoolExhauster:
-    """Grabs KV pages from the real allocator to create deterministic memory
-    pressure, and hands them back so the next script starts from a full pool.
-
-    Uses the allocator's public alloc/free, so the held pages are accounted for
-    exactly like engine-owned KV; this is what makes "leave exactly N pages
-    free" precise and stable, unlike pressure from real requests whose KV
-    footprint grows as they decode.
-    """
 
     def __init__(self, scheduler: "Scheduler") -> None:
         self.scheduler = scheduler

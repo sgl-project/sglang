@@ -70,7 +70,6 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
             )
 
     def test_assert_swa_divergence_observed_uses_peak_out_of_window(self) -> None:
-        """An earlier diverging sample satisfies the check even if the final sample is in-window (0)."""
         diverged = SwaDivergenceLog(
             forward_ct=120,
             verify_full=10000,
@@ -98,7 +97,6 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
     def test_assert_swa_divergence_observed_checks_verify_lag_on_latest_line(
         self,
     ) -> None:
-        """verify_swa<verify_full reads the final sample because the counters are monotonic totals."""
         lagging = SwaDivergenceLog(
             forward_ct=120,
             verify_full=10000,

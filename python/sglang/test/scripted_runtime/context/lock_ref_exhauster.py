@@ -9,21 +9,6 @@ if TYPE_CHECKING:
 
 
 class ScriptedLockRefExhauster:
-    """Pins evictable radix nodes via the cache's real ``inc_lock_ref`` to create
-    deterministic eviction pressure, and releases them so the next script starts
-    from a fully-evictable tree.
-
-    This is distinct from ``exhaust_kv``: the KV exhauster makes free pages
-    *disappear* by grabbing them from the allocator, whereas this exhauster
-    leaves the KV present but *pinned* (protected, non-evictable). It exercises
-    the path where the cache is full of locked prefixes and the engine must make
-    progress without being able to evict them.
-
-    Uses the cache's public ``inc_lock_ref`` / ``dec_lock_ref`` so the held
-    nodes move between the evictable and protected accounting exactly like
-    engine-owned locks; this is what makes "leave exactly N nodes evictable"
-    precise and reversible.
-    """
 
     def __init__(self, scheduler: "Scheduler") -> None:
         self.scheduler = scheduler

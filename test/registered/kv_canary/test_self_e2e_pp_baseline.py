@@ -10,12 +10,10 @@ register_cuda_ci(est_time=220, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestPPBaselineSwa(CanaryPPFixture):
-    """No perturb, kv-canary=log: a clean pp_size=2 SWA run must report no violation."""
 
     kv_canary_mode = CanaryMode.LOG
 
     def test_no_violation(self) -> None:
-        """Verify a clean pp_size=2 canary run completes without violations."""
         for _ in range(self.workload_n_batches):
             self.send_parallel_requests()
         self.assert_no_violation(wait_seconds=2.0)
