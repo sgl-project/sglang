@@ -30,7 +30,7 @@ if is_intel:
         chunk_gated_delta_rule_fwd_intra,
     )
 
-CHUNK_SIZE = 128 if is_intel else 64
+CHUNK_SIZE = 64
 
 
 def chunk_gated_delta_rule_fwd(

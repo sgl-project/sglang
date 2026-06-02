@@ -56,7 +56,6 @@ import logging
 import multiprocessing
 import os
 import time
-from array import array
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -384,7 +383,7 @@ def prepare_extend_inputs_for_correctness_test(
 ):
     for i in range(len(reqs)):
         req: Req = reqs[i]
-        req.fill_ids += array(req.fill_ids.typecode, input_ids[i][bench_args.cut_len :])
+        req.fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
             # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
