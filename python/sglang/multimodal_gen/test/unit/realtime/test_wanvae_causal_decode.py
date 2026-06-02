@@ -26,6 +26,8 @@ def _tiny_cached_wan_vae() -> AutoencoderKLWan:
             num_res_blocks=1,
             temperal_downsample=(False, True),
             attn_scales=(),
+            latents_mean=(0.0, 0.0),
+            latents_std=(1.0, 1.0),
         ),
         load_encoder=False,
         load_decoder=True,
