@@ -11,7 +11,7 @@ const DEFAULT_TARGET_FPS = 25;
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
 const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
 const DEFAULT_UPSCALING_SCALE = 2;
-const DEFAULT_VIEW_MODE = "fit";
+const DEFAULT_PREVIEW_SCALE = 120;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
@@ -224,10 +224,13 @@ let encodedDecodeErrors = 0;
 let socketHadError = false;
 let socketCloseExpected = false;
 let socketServerError = "";
+let renderedPreviewFrames = 0;
+let previewScaleFrame = 0;
 const decodeRequests = new Map();
 let controlStateController = null;
 
 const stage = document.querySelector(".stage");
+const previewFrame = document.querySelector(".preview-frame");
 const canvas = $("viewport");
 const ctx = canvas.getContext("2d", { alpha: false });
 const scratchCanvas = document.createElement("canvas");
@@ -238,6 +241,12 @@ function setStatus(text, kind = "") {
   $("statusDot").className = "dot" + (kind ? ` ${kind}` : "");
 }
 
+function setPreviewState(state) {
+  if (!stage) return;
+  stage.dataset.previewState = state;
+  canvas.setAttribute("aria-busy", state === "waiting" ? "true" : "false");
+}
+
 function addHistory(text) {
   const item = document.createElement("span");
   item.textContent = text;
@@ -246,19 +255,66 @@ function addHistory(text) {
 }
 
 function drawIdle() {
-  const w = canvas.width, h = canvas.height;
-  const g = ctx.createLinearGradient(0, 0, w, h);
-  g.addColorStop(0, "#171a16");
-  g.addColorStop(0.58, "#253628");
-  g.addColorStop(1, "#8f4a37");
-  ctx.fillStyle = g;
+  const w = 1280, h = 720;
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  setPreviewState("idle");
+  renderedPreviewFrames = 0;
+  const sky = ctx.createLinearGradient(0, 0, w, h);
+  sky.addColorStop(0, "#10150f");
+  sky.addColorStop(0.46, "#182318");
+  sky.addColorStop(1, "#0f1719");
+  ctx.fillStyle = sky;
   ctx.fillRect(0, 0, w, h);
-  ctx.fillStyle = "rgba(238,241,236,.82)";
-  ctx.font = "600 46px Avenir Next, sans-serif";
-  ctx.fillText("sglang-diffusion", 56, 86);
-  for (let i = 0; i < 18; i++) {
-    ctx.fillStyle = `rgba(238,241,236,${0.05 + i * 0.015})`;
-    ctx.fillRect(56 + i * 64, h - 86 - i * 7, 42, 42 + i * 4);
+
+  const blueGlow = ctx.createRadialGradient(w * 0.23, h * 0.26, 20, w * 0.23, h * 0.26, 380);
+  blueGlow.addColorStop(0, "rgba(63,96,124,0.38)");
+  blueGlow.addColorStop(1, "rgba(63,96,124,0)");
+  ctx.fillStyle = blueGlow;
+  ctx.fillRect(0, 0, w, h);
+
+  const amberGlow = ctx.createRadialGradient(w * 0.76, h * 0.2, 12, w * 0.76, h * 0.2, 330);
+  amberGlow.addColorStop(0, "rgba(185,84,60,0.24)");
+  amberGlow.addColorStop(1, "rgba(185,84,60,0)");
+  ctx.fillStyle = amberGlow;
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.strokeStyle = "rgba(238,241,236,0.16)";
+  ctx.lineWidth = 1.2;
+  for (let i = 0; i < 12; i++) {
+    const y = h * 0.58 + i * 28;
+    ctx.beginPath();
+    ctx.moveTo(110 - i * 20, y);
+    ctx.lineTo(w - 110 + i * 20, y + i * 10);
+    ctx.stroke();
+  }
+  const vanishingX = w * 0.52;
+  const vanishingY = h * 0.58;
+  for (let i = -7; i <= 7; i++) {
+    ctx.beginPath();
+    ctx.moveTo(vanishingX, vanishingY);
+    ctx.lineTo(w * 0.5 + i * 118, h - 56);
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = "rgba(238,241,236,0.28)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(58, 58, w - 116, h - 116);
+  ctx.strokeStyle = "rgba(185,84,60,0.44)";
+  ctx.beginPath();
+  ctx.moveTo(58, 150);
+  ctx.lineTo(58, 58);
+  ctx.lineTo(172, 58);
+  ctx.moveTo(w - 58, h - 150);
+  ctx.lineTo(w - 58, h - 58);
+  ctx.lineTo(w - 172, h - 58);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(238,241,236,0.72)";
+  for (let i = 0; i < 4; i++) {
+    ctx.fillRect(w * 0.5 - 54 + i * 34, h * 0.49, 20, 4);
   }
 }
 
@@ -280,6 +336,7 @@ function resetStreamStats() {
   currentReceiveChunk = null;
   currentReceiveChunkFrames = 0;
   encodedDecodeErrors = 0;
+  renderedPreviewFrames = 0;
   controlStateController?.reset({ sendRelease: false });
   resetDecoderState();
   updateStats();
@@ -663,7 +720,6 @@ async function payloadToArrayBuffer(data) {
 function drawFrame(image) {
   const sourceWidth = image.width;
   const sourceHeight = image.height;
-  setNativeViewportSize(sourceWidth, sourceHeight);
   let drawSource = image;
   if (image instanceof ImageData) {
     if (scratchCanvas.width !== sourceWidth || scratchCanvas.height !== sourceHeight) {
@@ -674,20 +730,15 @@ function drawFrame(image) {
     drawSource = scratchCanvas;
   }
 
-  const rect = canvas.getBoundingClientRect();
-  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
-  const targetWidth = Math.max(1, Math.round(rect.width * dpr));
-  const targetHeight = Math.max(
-    1,
-    Math.round((targetWidth * sourceHeight) / sourceWidth),
-  );
-  if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-    canvas.width = targetWidth;
-    canvas.height = targetHeight;
+  if (canvas.width !== sourceWidth || canvas.height !== sourceHeight) {
+    canvas.width = sourceWidth;
+    canvas.height = sourceHeight;
   }
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(drawSource, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(drawSource, 0, 0, sourceWidth, sourceHeight);
+  renderedPreviewFrames += 1;
+  setPreviewState("live");
   if (!(image instanceof ImageData)) image.close?.();
 }
 
@@ -775,6 +826,7 @@ async function setPresetReference(preset) {
 
 function showError(error) {
   setStatus("Reference load failed", "error");
+  if (!renderedPreviewFrames) setPreviewState("idle");
   addHistory(error.message || "reference load failed");
 }
 
@@ -800,10 +852,12 @@ function abortCurrentSession(reason = "session closed by client", {
     clearQueueOnClose = false;
     if (!keepConnectDisabled) $("connectBtn").disabled = false;
     setStatus("Closed");
+    if (!renderedPreviewFrames) setPreviewState("idle");
     return null;
   }
   if (!keepConnectDisabled) $("connectBtn").disabled = false;
   setStatus(expectedClose ? "Closing" : "Aborting");
+  if (!renderedPreviewFrames) setPreviewState("idle");
   addHistory(reason);
   socket.close(expectedClose ? 1000 : 1011, reason.slice(0, 120));
   return socket;
@@ -833,6 +887,7 @@ function waitForSocketClose(socket, timeoutMs = RECONNECT_CLOSE_TIMEOUT_MS) {
 async function connect() {
   $("connectBtn").disabled = true;
   setStatus("Preparing");
+  setPreviewState("waiting");
   addHistory("preparing session");
   try {
     if (ws && ws.readyState !== WebSocket.CLOSED) {
@@ -850,6 +905,7 @@ async function connect() {
     const firstFrame = await readFirstFrame();
     if (!firstFrame) {
       setStatus("Pick a reference", "error");
+      setPreviewState("idle");
       addHistory("reference image required");
       $("connectBtn").disabled = false;
       return;
@@ -915,6 +971,7 @@ async function connect() {
         setStatus("Closed");
         addHistory(closeText);
       }
+      if (!renderedPreviewFrames) setPreviewState("idle");
       socketCloseExpected = false;
     };
     socket.onerror = () => {
@@ -935,6 +992,7 @@ async function connect() {
   } catch (error) {
     $("connectBtn").disabled = false;
     setStatus("Init failed", "error");
+    if (!renderedPreviewFrames) setPreviewState("idle");
     addHistory(error.message || "init failed");
   }
 }
@@ -1307,20 +1365,15 @@ function updateSuperResolutionControls() {
   updateOutputSizeText();
 }
 
-function setNativeViewportSize(width, height) {
-  if (!stage) return;
-  stage.style.setProperty("--native-preview-width", `${width}px`);
-  stage.style.setProperty("--native-preview-height", `${height}px`);
-}
-
-function setPreviewMode(mode) {
-  if (!stage) return;
-  const viewMode = mode || DEFAULT_VIEW_MODE;
-  stage.dataset.viewMode = viewMode;
-  document.querySelectorAll("[data-view-mode]").forEach((btn) => {
-    const active = btn.dataset.viewMode === viewMode;
-    btn.classList.toggle("is-active", active);
-    btn.setAttribute("aria-pressed", active ? "true" : "false");
+function setPreviewScale(value) {
+  if (!previewFrame) return;
+  const scale = Math.max(80, Math.min(170, Number(value || DEFAULT_PREVIEW_SCALE)));
+  $("previewScale").value = String(scale);
+  $("previewScaleText").textContent = `${scale}%`;
+  if (previewScaleFrame) cancelAnimationFrame(previewScaleFrame);
+  previewScaleFrame = requestAnimationFrame(() => {
+    previewScaleFrame = 0;
+    previewFrame.style.setProperty("--preview-scale", String(scale / 100));
   });
 }
 
@@ -1377,8 +1430,7 @@ async function applyQueryParams() {
   const srParam = params.get("sr");
   $("superResolution").checked = srParam === "1" || srParam === "true";
   $("upscalingScale").value = params.get("sr_scale") || String(DEFAULT_UPSCALING_SCALE);
-  const viewMode = params.get("view") || DEFAULT_VIEW_MODE;
-  setPreviewMode(viewMode);
+  setPreviewScale(params.get("preview_scale") || params.get("zoom"));
   updateSuperResolutionControls();
   return {
     model: Boolean(model),
@@ -1475,7 +1527,7 @@ function unpack(buf) {
 
 renderPresets();
 drawIdle();
-setPreviewMode(DEFAULT_VIEW_MODE);
+setPreviewScale(DEFAULT_PREVIEW_SCALE);
 updateSuperResolutionControls();
 applyPreset(presets[0], { sendRuntimeEvents: false })
   .then(applyQueryParams)
@@ -1492,9 +1544,7 @@ $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
 $("size").addEventListener("input", () => updateOutputSizeText());
 $("superResolution").addEventListener("change", updateSuperResolutionControls);
 $("upscalingScale").addEventListener("change", () => updateOutputSizeText());
-document.querySelectorAll("[data-view-mode]").forEach((btn) => {
-  btn.addEventListener("click", () => setPreviewMode(btn.dataset.viewMode));
-});
+$("previewScale").addEventListener("input", () => setPreviewScale($("previewScale").value));
 $("serverUrl").addEventListener("change", () => {
   queryServerModelInfo({ applyPresetForModel: true }).catch(showError);
 });

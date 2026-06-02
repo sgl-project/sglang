@@ -24,8 +24,11 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="fps" type="number" value="25"' in index_html
     assert 'id="superResolution" type="checkbox"' in index_html
     assert 'id="upscalingScale"' in index_html
-    assert 'data-view-mode="large"' in index_html
-    assert 'data-view-mode="native"' in index_html
+    assert 'class="workspace"' in index_html
+    assert 'class="preview-frame"' in index_html
+    assert 'id="previewOverlay" class="preview-overlay"' in index_html
+    assert 'id="previewScale" type="range" min="80" max="170" value="120"' in index_html
+    assert 'id="previewScaleText"' in index_html
     assert 'id="outputSizeText"' in index_html
     assert 'id="frameInterpolation" type="checkbox" />' in index_html
     assert (
@@ -45,13 +48,19 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "Info" not in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-sr-v32" in index_html
-    assert "app.js?v=realtime-sr-v32" in index_html
+    assert "styles.css?v=realtime-sr-v35" in index_html
+    assert "app.js?v=realtime-sr-v35" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";' in app_js
     assert "const DEFAULT_TARGET_FPS = 25;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;" in app_js
     assert "const DEFAULT_UPSCALING_SCALE = 2;" in app_js
+    assert "const DEFAULT_PREVIEW_SCALE = 120;" in app_js
+    assert "setPreviewState(\"waiting\")" in app_js
+    assert "stage.dataset.previewState = state" in app_js
+    assert 'document.querySelector(".preview-frame")' in app_js
+    assert 'previewFrame.style.setProperty("--preview-scale"' in app_js
+    assert "cancelAnimationFrame(previewScaleFrame)" in app_js
     assert "enable_frame_interpolation: true" in app_js
     assert "frame_interpolation_exp: DEFAULT_FRAME_INTERPOLATION_EXP" in app_js
     assert "frame_interpolation_scale: DEFAULT_FRAME_INTERPOLATION_SCALE" in app_js
@@ -59,7 +68,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "enable_upscaling: true" in app_js
     assert "upscaling_scale: readUpscalingScale()" in app_js
     assert "updateOutputSizeFromHeader(header)" in app_js
-    assert "setPreviewMode(DEFAULT_VIEW_MODE)" in app_js
+    assert "setPreviewScale(DEFAULT_PREVIEW_SCALE)" in app_js
+    assert "preview_scale" in app_js
     assert "sr_scale" in app_js
     assert "elapsedMs % targetMs" in app_js
     assert "liveQueueFrameFloor(header, chunkFrameCount)" in app_js
@@ -89,6 +99,9 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'message.type === "chunk_stats"' in app_js
     assert "chunkTotal > 0 ? numFrames / chunkTotal" in app_js
     assert ".stage-stat" in styles_css
-    assert ".view-mode" in styles_css
-    assert '.stage[data-view-mode="large"]' in styles_css
-    assert "--native-preview-width" in styles_css
+    assert ".workspace" in styles_css
+    assert ".preview-frame" in styles_css
+    assert ".preview-overlay" in styles_css
+    assert "@keyframes previewSweep" in styles_css
+    assert ".preview-scale-control" in styles_css
+    assert "--preview-scale" in styles_css

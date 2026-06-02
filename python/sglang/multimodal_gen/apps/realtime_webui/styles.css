@@ -32,7 +32,7 @@ button:disabled { cursor: wait; opacity: 0.64; transform: none; }
 
 .shell {
   display: grid;
-  grid-template-columns: minmax(260px, 320px) minmax(420px, 1fr) minmax(260px, 320px);
+  grid-template-columns: minmax(260px, 320px) minmax(560px, 1fr);
   gap: 18px;
   min-height: 100vh;
   padding: 18px;
@@ -215,6 +215,12 @@ button:focus-visible {
 }
 .wide { width: 100%; margin-top: 10px; }
 
+.workspace {
+  display: grid;
+  gap: 18px;
+  min-width: 0;
+}
+
 .stage {
   position: relative;
   display: grid;
@@ -222,7 +228,7 @@ button:focus-visible {
   align-self: start;
   justify-self: center;
   width: 100%;
-  max-width: 1040px;
+  max-width: min(1500px, 100%);
   overflow: hidden;
   border: 1px solid #11140f;
   border-radius: 8px;
@@ -230,14 +236,55 @@ button:focus-visible {
   box-shadow: var(--shadow);
 }
 
-.stage[data-view-mode="large"] {
-  max-width: min(1500px, calc(100vw - 36px));
+.preview-frame {
+  position: relative;
+  display: grid;
+  place-items: center;
+  justify-self: center;
+  width: min(calc(1040px * var(--preview-scale, 1.2)), 100%);
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 22% 22%, rgba(63, 96, 124, 0.26), transparent 32%),
+    radial-gradient(circle at 76% 16%, rgba(185, 84, 60, 0.18), transparent 28%),
+    linear-gradient(145deg, #10150f 0%, #172016 48%, #0f1719 100%);
+  contain: paint;
+  isolation: isolate;
 }
 
-.stage[data-view-mode="native"] {
-  width: min-content;
-  max-width: calc(100vw - 36px);
-  overflow: auto;
+.preview-frame::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, rgba(238, 241, 236, 0.06) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(238, 241, 236, 0.04) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(circle at 50% 50%, black 0%, transparent 74%);
+}
+
+.preview-frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 0%,
+    transparent 37%,
+    rgba(238, 241, 236, 0.22) 50%,
+    transparent 63%,
+    transparent 100%
+  );
+  transform: translateX(-130%);
+}
+
+.stage[data-preview-state="waiting"] .preview-frame::after {
+  opacity: 1;
+  animation: previewSweep 1.35s ease-in-out infinite;
 }
 
 .topbar, .timeline {
@@ -252,33 +299,27 @@ button:focus-visible {
 }
 
 .topbar-spacer { flex: 1; }
-.view-mode {
-  display: inline-grid;
-  grid-template-columns: repeat(3, auto);
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid rgba(232, 234, 223, 0.16);
-  border-radius: 6px;
-  background: rgba(255, 253, 247, 0.06);
-}
-.view-mode button {
-  min-height: 24px;
-  border: 0;
-  border-radius: 4px;
-  padding: 0 8px;
-  background: transparent;
-  color: rgba(232, 234, 223, 0.68);
+.preview-scale-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 190px;
+  margin: 0;
+  color: rgba(232, 234, 223, 0.72);
   font-size: 11px;
 }
-.view-mode button:hover:not(:disabled) {
-  background: rgba(255, 253, 247, 0.1);
-  box-shadow: none;
-  color: #fffdf7;
-  transform: none;
+.preview-scale-control input {
+  width: 92px;
+  min-width: 72px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: #eef1ec;
 }
-.view-mode button.is-active {
-  background: #eef1ec;
-  color: #11140f;
+.preview-scale-control b {
+  min-width: 36px;
+  color: #fffdf7;
+  font-weight: 650;
 }
 #statusText {
   display: inline-block;
@@ -306,23 +347,58 @@ button:focus-visible {
 .dot.error { background: var(--accent); }
 
 #viewport {
+  position: relative;
+  z-index: 1;
   display: block;
   width: 100%;
   height: auto;
-  max-height: min(56vh, 560px);
+  max-height: min(calc(56vh * var(--preview-scale, 1.2)), 82vh);
   min-height: 0;
   object-fit: contain;
   image-rendering: auto;
+  transform: translateZ(0);
 }
 
-.stage[data-view-mode="large"] #viewport {
-  max-height: min(74vh, 920px);
+.preview-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: none;
+  place-items: center;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 50%, rgba(17, 20, 15, 0.12), transparent 44%);
 }
 
-.stage[data-view-mode="native"] #viewport {
-  width: var(--native-preview-width, 100%);
-  max-width: none;
-  max-height: none;
+.stage[data-preview-state="waiting"] .preview-overlay {
+  display: grid;
+}
+
+.preview-loader {
+  position: relative;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background:
+    conic-gradient(from 0deg, transparent 0 22%, rgba(238, 241, 236, 0.95) 23% 34%, transparent 35% 100%),
+    radial-gradient(circle, transparent 56%, rgba(238, 241, 236, 0.2) 58% 63%, transparent 66%);
+  box-shadow: 0 0 34px rgba(238, 241, 236, 0.18);
+  animation: previewSpin 900ms linear infinite;
+}
+
+.preview-loader::before,
+.preview-loader::after {
+  content: "";
+  position: absolute;
+  inset: 13px;
+  border-radius: 50%;
+  border: 1px solid rgba(238, 241, 236, 0.32);
+}
+
+.preview-loader::after {
+  inset: 22px;
+  background: rgba(238, 241, 236, 0.88);
+  border: 0;
+  animation: previewPulse 1.1s ease-in-out infinite;
 }
 
 .stage-controls {
@@ -421,7 +497,7 @@ button:focus-visible {
 
 .spec-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
   gap: 8px;
   margin-bottom: 12px;
 }
@@ -445,18 +521,18 @@ button:focus-visible {
 }
 
 .presets {
-  position: sticky;
-  top: 18px;
-  max-height: calc(100vh - 36px);
-  overflow: auto;
+  position: static;
+  max-height: none;
+  overflow: visible;
   scrollbar-gutter: stable;
 }
 
 .preset-list {
   display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 7px;
-  min-height: 320px;
-  max-height: min(54vh, 560px);
+  min-height: 0;
+  max-height: 230px;
   margin-bottom: 12px;
   overflow: auto;
   padding-right: 3px;
@@ -538,7 +614,7 @@ button:focus-visible {
 .history-list {
   display: grid;
   gap: 7px;
-  max-height: 76px;
+  max-height: 92px;
   overflow: auto;
 }
 
@@ -554,19 +630,25 @@ button:focus-visible {
 @media (max-width: 980px) {
   .shell { grid-template-columns: 1fr; }
   .presets { position: static; max-height: none; overflow: visible; }
+  .spec-grid { grid-template-columns: repeat(2, 1fr); }
   .preset-list { min-height: 260px; max-height: 420px; }
   #viewport { max-height: 420px; }
   .stage-controls { grid-template-columns: 1fr; }
   .stage-telemetry { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topbar { flex-wrap: wrap; height: auto; min-height: 44px; padding: 10px 14px; }
   .topbar-spacer { display: none; }
-  .stage[data-view-mode="large"],
-  .stage[data-view-mode="native"] {
-    width: 100%;
-    max-width: none;
-  }
-  .stage[data-view-mode="native"] #viewport {
-    width: 100%;
-    max-height: none;
-  }
+  .preview-scale-control { min-width: 160px; }
+}
+
+@keyframes previewSweep {
+  to { transform: translateX(130%); }
+}
+
+@keyframes previewSpin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes previewPulse {
+  0%, 100% { opacity: 0.42; transform: scale(0.86); }
+  50% { opacity: 1; transform: scale(1); }
 }
