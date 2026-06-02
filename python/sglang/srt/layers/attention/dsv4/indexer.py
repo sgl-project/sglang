@@ -467,7 +467,7 @@ class C4IndexerBackendMixin:
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id
             ].compress_layer_id
-            indexer_capturer.capture(compress_layer_id, raw_indices)
+            indexer_capturer.capture(compress_layer_id, raw_indices, forward_batch)
 
 
 class C4Indexer(nn.Module):

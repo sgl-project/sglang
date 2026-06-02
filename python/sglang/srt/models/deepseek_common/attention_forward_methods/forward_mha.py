@@ -145,13 +145,19 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
+                from sglang.srt.state_capturer.indexer_topk import (
+                    get_global_indexer_capturer,
+                )
+
+                # dense MHA ignores topk_indices, but capture the prefill
+                # select-all selection for rollout replay when a capturer is set
                 _ = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
                     positions=positions,
                     forward_batch=forward_batch,
                     layer_id=self.layer_id,
-                    return_indices=False,
+                    return_indices=get_global_indexer_capturer() is not None,
                 )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant

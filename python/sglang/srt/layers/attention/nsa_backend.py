@@ -232,6 +232,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
+        return_raw_indices: bool = False,
     ) -> torch.Tensor:
         from sgl_kernel import (
             fast_topk_transform_fused,
@@ -262,10 +263,18 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             page_table_size_1 = self.attn_metadata.page_table_1
 
         if not envs.SGLANG_NSA_FUSE_TOPK.get() or self.force_unfused_topk:
-            return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
-        elif self.topk_transform_method == TopkTransformMethod.PAGED:
-            # NOTE(dark): if fused, we return a transformed page table directly
-            return fast_topk_transform_fused(
+            result = fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
+            return (result, result) if return_raw_indices else result
+
+        # sequence-relative selection, before the kv-cache coordinate remap
+        raw_indices = (
+            fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
+            if return_raw_indices
+            else None
+        )
+
+        if self.topk_transform_method == TopkTransformMethod.PAGED:
+            result = fast_topk_transform_fused(
                 score=logits,
                 lengths=seq_lens_topk,
                 page_table_size_1=page_table_size_1,
@@ -279,7 +288,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                     "RAGGED topk_transform requires topk_indices_offset; "
                     "expected extend-without-speculative metadata."
                 )
-            return fast_topk_transform_ragged_fused(
+            result = fast_topk_transform_ragged_fused(
                 score=logits,
                 lengths=seq_lens_topk,
                 topk_indices_offset=cu_topk_indices_offset,
@@ -288,6 +297,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             )
         else:
             assert False, f"Unsupported {self.topk_transform_method = }"
+
+        return (result, raw_indices) if return_raw_indices else result
 
 
 _NSA_IMPL_T: TypeAlias = Literal[

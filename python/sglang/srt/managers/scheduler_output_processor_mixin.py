@@ -1263,6 +1263,13 @@ class SchedulerOutputProcessorMixin:
 
         dp_ranks = [self.dp_rank] * len(rids) if rids else None
 
+        indexer_topk_num_layers = None
+        if (
+            indexer_topk is not None
+            and (cap := get_global_indexer_capturer()) is not None
+        ):
+            indexer_topk_num_layers = cap.num_layers
+
         # Send to detokenizer
         if reqs or is_idle_batch:
             if getattr(self.model_config, "is_multimodal_gen", False):
@@ -1304,6 +1311,7 @@ class SchedulerOutputProcessorMixin:
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
                     indexer_topk=indexer_topk,
+                    indexer_topk_num_layers=indexer_topk_num_layers,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
