@@ -153,24 +153,22 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        if forward_mode.is_decode_or_idle():
-            if spec_info is None:
-                max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
-
-                create_flashmla_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    None,
-                    self.cuda_graph_kv_indices,
-                    self.req_to_token.stride(0),
-                    self.cuda_graph_kv_indices.stride(0),
-                    PAGED_SIZE=PAGE_SIZE,
-                )
-                self.forward_metadata = CutlassMLADecodeMetadata(
-                    self.cuda_graph_mla_workspace,
-                    self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-                )
+        if forward_mode.is_decode_or_idle() and spec_info is None:
+            self.init_forward_metadata_replay_cuda_graph(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_sum=None,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_cpu=None,
+            )
+            max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
+            self.forward_metadata = CutlassMLADecodeMetadata(
+                self.cuda_graph_mla_workspace,
+                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+            )
         else:
             super().init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -193,15 +191,11 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-
         if forward_mode.is_decode_or_idle():
-            assert seq_lens_cpu is not None
-            seq_lens = seq_lens[:bs]
-
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices[:bs],
-                seq_lens,
+                seq_lens[:bs],
                 None,
                 self.cuda_graph_kv_indices,
                 self.req_to_token.stride(0),

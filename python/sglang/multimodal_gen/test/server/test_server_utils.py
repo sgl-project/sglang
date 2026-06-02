@@ -986,7 +986,7 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no text prompt configured")
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = sampling_params.output_format
         req_background = None  # Not specified in current request
 
         # Build extra_body for optional features
@@ -998,6 +998,7 @@ def get_generate_fn(
             n=n,
             size=output_size,
             response_format="b64_json",
+            output_format=req_output_format,
             extra_body=extra_body if extra_body else None,
         )
         result = response.parse()
