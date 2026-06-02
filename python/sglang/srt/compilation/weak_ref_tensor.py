@@ -22,7 +22,11 @@ def weak_ref_tensors(
     if isinstance(tensors, torch.Tensor):
         return weak_ref_tensor(tensors)
     if isinstance(tensors, list):
-        return [weak_ref_tensor(t) for t in tensors]
+        return [
+            weak_ref_tensor(t) if isinstance(t, torch.Tensor) else t for t in tensors
+        ]
     if isinstance(tensors, tuple):
-        return tuple(weak_ref_tensor(t) for t in tensors)
+        return tuple(
+            weak_ref_tensor(t) if isinstance(t, torch.Tensor) else t for t in tensors
+        )
     raise ValueError("Invalid type for tensors")

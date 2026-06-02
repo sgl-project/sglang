@@ -1355,7 +1355,7 @@ class ServerArgs:
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
         # 5. Non-CUDA hardware (AMD, NPU, CPU, MPS, XPU, etc.)
-        if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
+        if is_hip() or is_cpu() or is_mps() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 5b. OOT platforms that don't support piecewise cuda graph
         if current_platform.is_out_of_tree():

@@ -2956,8 +2956,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if hasattr(layer.self_attn, "attn"):
                     attn_layer = layer.self_attn.attn
                 elif hasattr(layer.self_attn, "attn_mqa"):
-                    # For DeepSeek model
-                    attn_layer = layer.self_attn.attn_mqa
+                    # For DeepSeek model.
+                    # On NPU non-DSA extend, dispatch goes through MHA_NPU →
+                    # forward_mha_core_npu → attn_mha, so store attn_mha.
+                    # DSA extend uses DSA_NPU → forward_dsa_core_npu → attn_mqa,
+                    # so keep attn_mqa for layers with an indexer.
+                    # Other platforms always use attn_mqa (MLA absorb path).
+                    if (
+                        _is_npu
+                        and hasattr(layer.self_attn, "attn_mha")
+                        and not hasattr(layer.self_attn, "indexer")
+                    ):
+                        attn_layer = layer.self_attn.attn_mha
+                    else:
+                        attn_layer = layer.self_attn.attn_mqa
             # For hybrid model
             elif hasattr(layer, "attn"):
                 attn_layer = layer.attn

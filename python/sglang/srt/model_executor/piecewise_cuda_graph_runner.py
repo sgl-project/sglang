@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import gc
 import logging
 import warnings
@@ -217,6 +218,24 @@ class PiecewiseCudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        # For hybrid linear-attention (mamba/GDN) models, do NOT make the speculative
+        # prefill hit PCG. The mamba/linear recurrence is order-sensitive and the
+        # request that triggers NPU graph capture computes a wrong recurrent state
+        # (garbled output). Leaving capture_hidden_mode at the default (NULL) makes
+        # the spec prefill (FULL/LAST) miss can_run() -> it runs eager (correct),
+        # while verify/draft/decode still use their own (full) cuda graphs. Non-mamba
+        # models keep the spec-aware capture_hidden_mode so their prefill uses PCG.
+        is_mambaish = getattr(model_runner, "mambaish_config", None) is not None
+        if (
+            not is_mambaish
+            and model_runner.spec_algorithm is not None
+            and model_runner.spec_algorithm.is_eagle()
+        ):
+            if model_runner.is_draft_worker:
+                self.capture_hidden_mode = CaptureHiddenMode.LAST
+            else:
+                self.capture_hidden_mode = CaptureHiddenMode.FULL
+
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
         )
@@ -301,7 +320,30 @@ class PiecewiseCudaGraphRunner:
                 # Capture
                 self.capture()
 
+        # PCG warmup/capture runs the linear-attention (mamba/GDN) recurrence on
+        # dummy (zero) inputs over the full padded length, using req_pool_index 0
+        # which maps to the mamba *dummy slot 0*. A long (e.g. 128-step) recurrence
+        # on garbage input writes diverging/non-zero state into that shared slot.
+        # During real serving, decode/verify reads slot 0 for padding positions, so
+        # the poisoned state corrupts MTP verify (garbled output; the state then
+        # explodes to ~1e19 over decode steps). Capture runs before any real
+        # request, so restore the pristine all-zero mamba state here.
+        self._reset_mamba_state_after_capture()
+
         self.raw_num_tokens = 0
+
+    def _reset_mamba_state_after_capture(self) -> None:
+        mamba_pool = getattr(self.model_runner.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return
+        cache = mamba_pool.mamba_cache
+        if not dataclasses.is_dataclass(cache):
+            return
+        for f in dataclasses.fields(cache):
+            v = getattr(cache, f.name)
+            for t in v if isinstance(v, (list, tuple)) else [v]:
+                if isinstance(t, torch.Tensor):
+                    t.zero_()
 
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
@@ -366,7 +408,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -424,9 +466,7 @@ class PiecewiseCudaGraphRunner:
             ):
                 if start_len is not None and start_len < seq_len:
                     return False
-        if num_tokens <= self.max_num_tokens:
-            return True
-        return False
+        return num_tokens <= self.max_num_tokens
 
     def capture(self) -> None:
         # Trigger CUDA graph capture for specific shapes.
@@ -537,7 +577,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -752,6 +792,7 @@ class PiecewiseCudaGraphRunner:
                         and output.mm_input_embeds is not None
                     ):
                         mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
+
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
                             : self.raw_num_tokens
