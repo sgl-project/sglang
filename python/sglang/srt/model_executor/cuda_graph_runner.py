@@ -60,6 +60,7 @@ from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     _grouped_foreach_copy_,
+    build_decode_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -747,6 +748,19 @@ class CudaGraphRunner:
             ),
         )
         self.buffers.share_buffers()
+        # FB-shared slot registry, adopting the DecodeInputBuffers storage so
+        # it mirrors the same physical buffers (stable data_ptr for capture vs
+        # replay). This is the unified fill/extract surface that eager /
+        # capture / replay migrate onto, replacing populate_from_forward_batch.
+        self.buffer_registry = build_decode_registry(
+            device=self.device,
+            max_bs=self.max_bs,
+            max_num_token=self.max_num_token,
+            seq_len_fill_value=self.seq_len_fill_value,
+            cache_loc_dtype=self._cache_loc_dtype(),
+            enable_mamba_track=enable_mamba_track,
+            source=self.buffers,
+        )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
