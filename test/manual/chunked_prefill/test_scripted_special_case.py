@@ -232,33 +232,6 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     def test_mamba_pool_idx_cleanup_skip_chunked_resume(self):
         pass
 
-    def test_chunked_req_bypasses_req_pool_exhaustion(self):
-        self.server.execute_script(
-            self._script_chunked_req_bypasses_req_pool_exhaustion
-        )
-
-    @staticmethod
-    def _script_chunked_req_bypasses_req_pool_exhaustion(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-        chunks_before_pressure = r.chunks_done
-
-        yield from exhaust_row_pool(t, leave_rows=0)
-
-        progressed_under_pressure = False
-        for _ in range(DEFAULT_MAX_STEPS * 2):
-            if r.chunks_done > chunks_before_pressure:
-                progressed_under_pressure = True
-            if r.finished:
-                break
-            yield
-        assert r.finished
-        assert progressed_under_pressure, (
-            "chunked req must advance even when get_num_allocatable_reqs "
-            "returns 0; pre-fix the bypass would block forever"
-        )
-        assert r.kv_pages == 0
-
     def test_pause_retract_clears_chunked_req(self):
         self.server.execute_script(self._script_pause_retract_clears_chunked_req)
 
@@ -688,6 +661,46 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
+
+
+class TestSpecialCaseRowPoolExhaustion(ScriptedTestCase):
+    # req_to_token_pool.size == max_running_requests (model_runner_kv_cache_mixin.py:
+    # max_num_reqs = self.max_running_requests). The default pool is thousands of rows,
+    # which the ballast reqs can never fully occupy because the KV pool exhausts long
+    # before the row pool does. Cap max_running_requests small so exhaust_row_pool can
+    # actually drive get_num_allocatable_reqs() to 0 while the in-flight chunked req
+    # (already admitted into the chunked slot) keeps progressing -- the bypass under test.
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        max_running_requests=8,
+    )
+
+    def test_chunked_req_bypasses_req_pool_exhaustion(self):
+        self.server.execute_script(
+            self._script_chunked_req_bypasses_req_pool_exhaustion
+        )
+
+    @staticmethod
+    def _script_chunked_req_bypasses_req_pool_exhaustion(t: ScriptedContext):
+        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking)
+        chunks_before_pressure = r.chunks_done
+
+        yield from exhaust_row_pool(t, leave_rows=0)
+
+        progressed_under_pressure = False
+        for _ in range(DEFAULT_MAX_STEPS * 2):
+            if r.chunks_done > chunks_before_pressure:
+                progressed_under_pressure = True
+            if r.finished:
+                break
+            yield
+        assert r.finished
+        assert progressed_under_pressure, (
+            "chunked req must advance even when get_num_allocatable_reqs "
+            "returns 0; pre-fix the bypass would block forever"
+        )
+        assert r.kv_pages == 0
 
 
 class TestSpecialCaseMixedChunk(ScriptedTestCase):
