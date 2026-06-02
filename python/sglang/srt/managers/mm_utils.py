@@ -709,6 +709,16 @@ def _get_chunked_prefill_embedding(
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
+    # [MMMU FIX] Decide per-image vs combined over the WHOLE batch (matches the
+    # proven amd_fix_ci_0525 behavior). The reconstructed per-image path mixes
+    # badly with the combined path within one forward batch, yielding embeddings
+    # with the right token count but wrong values -> empty/degenerate output ->
+    # lmms-eval take_first IndexError. If ANY item in the batch is not exactly
+    # single-offset, route the entire batch through the combined path.
+    batch_is_per_image = len(embedding_items) > 0 and all(
+        item.offsets is not None and len(item.offsets) == 1 for item in embedding_items
+    )
+
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
@@ -726,7 +736,7 @@ def _get_chunked_prefill_embedding(
         # Use per-image path when all items have exactly one offset (already
         # split per-image) — this avoids encoding images not in this chunk.
         # Fall back to combined path for non-split items or EVS.
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
+        is_per_image = batch_is_per_image
 
         if is_per_image:
             chunk_embedding = _get_chunked_embedding_by_item(
