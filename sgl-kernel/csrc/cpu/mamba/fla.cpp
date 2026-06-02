@@ -27,6 +27,101 @@ inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
   }
 }
 
+template <typename scalar_t, int D, bool has_scale>
+struct l2norm_kernel {
+  static inline void apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, float eps) {
+    TORCH_CHECK(false, "l2norm_kernel: scalar path not implemented!");
+  }
+};
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <int D, bool has_scale>
+struct l2norm_kernel<at::BFloat16, D, has_scale> {
+  static inline void apply(at::BFloat16* __restrict__ out, const at::BFloat16* __restrict__ input, float eps) {
+    static_assert(D % 32 == 0);
+    constexpr int COLS = D / 32;
+
+    __m512bh va[COLS];
+    __m512 vrscale;
+
+    constexpr float scale = 1.f / std::sqrt(D);
+    __m512 vscale = _mm512_set1_ps(scale);
+
+    // step 1: load input and do reduce with avx512-bf16
+    __m512 vsum = _mm512_set1_ps(0.f);
+    auto reduce = [&](auto col) {
+      va[col] = (__m512bh)(_mm512_loadu_si512(input + col * 32));
+      vsum = _mm512_dpbf16_ps(vsum, va[col], va[col]);
+    };
+    Unroll<COLS>{}(reduce);
+
+    float sqsum = _mm512_reduce_add_ps(vsum);
+    float rscale = 1.f / std::sqrt(sqsum + eps);
+
+    // step 2: apply scale to output
+    auto map = [&](auto col) {
+      __m512i a16 = (__m512i)va[col];
+      __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(a16, 0));
+      __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(a16, 1));
+      va0 = _mm512_mul_ps(va0, vrscale);
+      va1 = _mm512_mul_ps(va1, vrscale);
+      // keep the mul order same as torch code:
+      //   query = l2norm(query) * scale
+      if constexpr (has_scale) {
+        va0 = _mm512_mul_ps(va0, vscale);
+        va1 = _mm512_mul_ps(va1, vscale);
+      }
+      _mm512_storeu_si512(out + col * 32, (__m512i)(_mm512_cvtne2ps_pbh(va1, va0)));
+    };
+    Unroll<COLS>{}(map);
+  }
+};
+#endif
+
+// template head_dim here to reduce extra read
+//   * normal approach: read inputs 2 times:
+//     - reduce: 1R
+//     - scale: 1R + 1W
+//   * keep input data in register:
+//     - reduce: 1R
+//     - scale: 1W
+template <typename scalar_t, int D>
+void l2norm_fwd_kernel_impl(
+    scalar_t* __restrict__ query_norm,
+    scalar_t* __restrict__ key_norm,
+    const scalar_t* __restrict__ query,
+    const scalar_t* __restrict__ key,
+    float eps,
+    int64_t T,
+    int64_t H,
+    int64_t q_strideT,
+    int64_t q_strideH,
+    int64_t k_strideT,
+    int64_t k_strideH) {
+  // expected to be contuguous
+  int64_t qn_strideH = D;
+  int64_t kn_strideH = D;
+
+  // parallel on [B, T, H]
+  at::parallel_for(0, T * H, 0, [&](int64_t begin, int64_t end) {
+    int64_t t{0}, h{0};
+    data_index_init(begin, t, T, h, H);
+
+    for (int64_t i = begin; i < end; ++i) {
+      const scalar_t* __restrict__ q_ptr = query + t * q_strideT + h * q_strideH;
+      const scalar_t* __restrict__ k_ptr = key + t * k_strideT + h * k_strideH;
+      scalar_t* __restrict__ qn_ptr = query_norm + i * qn_strideH;
+      scalar_t* __restrict__ kn_ptr = key_norm + i * kn_strideH;
+
+      l2norm_kernel<scalar_t, D, true>::apply(qn_ptr, q_ptr, eps);
+      l2norm_kernel<scalar_t, D, false>::apply(kn_ptr, k_ptr, eps);
+
+      // move to the next index
+      data_index_step(t, T, h, H);
+    }
+  });
+}
+
 template <typename scalar_t, int64_t chunk_size = 64>
 void chunk_gated_delta_rule_kernel_impl(
     scalar_t* __restrict__ out,                  // [B, T, HV, EV]
@@ -1072,6 +1167,7 @@ void fused_gdn_gating_kernel_impl(
 
 }  // anonymous namespace
 
+// TODO: remove this one
 template <bool is_last_dim_contiguous>
 inline void
 CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::IntArrayRef& sizes, at::ScalarType st) {
@@ -1085,6 +1181,101 @@ CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::
   }
 }
 
+#define LAUNCH_L2NORM_KERNEL(HD)        \
+  l2norm_fwd_kernel_impl<scalar_t, HD>( \
+      query_norm.data_ptr<scalar_t>(),  \
+      key_norm.data_ptr<scalar_t>(),    \
+      query.data_ptr<scalar_t>(),       \
+      key.data_ptr<scalar_t>(),         \
+      eps,                              \
+      T,                                \
+      H,                                \
+      query.stride(1),                  \
+      query.stride(2),                  \
+      key.stride(1),                    \
+      key.stride(2));
+
+std::tuple<at::Tensor, at::Tensor> l2norm_fwd(const at::Tensor& query, const at::Tensor& key, double eps) {
+  int64_t B = query.size(0);
+  int64_t T = query.size(1);
+  int64_t H = query.size(2);
+  int64_t D = query.size(3);
+
+  at::Tensor query_norm = at::empty_like(query);
+  at::Tensor key_norm = at::empty_like(key);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "l2norm_fwd", [&] {
+    switch (D) {
+      case 64:
+        LAUNCH_L2NORM_KERNEL(64);
+        break;
+      case 128:
+        LAUNCH_L2NORM_KERNEL(128);
+        break;
+      default:
+        TORCH_CHECK(false, "Unexpected head dim size, ", D);
+    }
+  });
+
+  return std::make_tuple(query_norm, key_norm);
+}
+
+// [NB]: Support only varlen inputs
+//   B: packed batch dim of q/k/v (== 1)
+//   num_seqs: number of variable-length sequences
+//
+//   query: [B, T, H, D]
+//   key: [B, T, H, D]
+//   value: [B, T, Hv, Dv]
+//   g: [B, T, Hv] FP32
+//   beta: [B, T, Hv]
+//   initial_state: [num_seqs, Hv, D, Dv] FP32
+//   cu_seqlens: [num_seqs + 1] INT32
+//
+std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state,
+    bool output_final_state,
+    const at::Tensor& cu_seqlens,
+    bool head_first,
+    bool use_qk_l2norm_in_kernel,
+    double eps = 1e-5) {
+  TORCH_CHECK(!head_first, "chunk_gated_delta_rule_cpu: does not support head first");
+
+  int64_t B = query.size(0);
+  int64_t T = query.size(1);
+  int64_t H = query.size(2);
+  int64_t D = query.size(3);
+  int64_t Hv = value.size(2);
+  int64_t Dv = value.size(3);
+  int64_t num_seqs = initial_state.size(0);
+
+  TORCH_CHECK(B == 1, __func__, ": expect batch size to be 1");
+  TORCH_CHECK(Hv % H == 0, __func__, ": expect num_heads_kv multiple of num_heads.");
+  TORCH_CHECK(D % 32 == 0, __func__, ": expect head_dim to be multiples of 32.");
+  TORCH_CHECK(Dv % 32 == 0, __func__, ": expect head_dim_v to be multiples of 32.");
+  CHECK_INPUT_SHAPE_DTYPE<true>(query, {B, T, H, D}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<true>(key, {B, T, H, D}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<true>(value, {B, T, Hv, Dv}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<false>(g, {B, T, Hv}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<false>(beta, {B, T, Hv}, at::kBFloat16);
+  CHECK_INPUT_SHAPE_DTYPE<false>(cu_seqlens, {num_seqs + 1}, at::kInt);
+  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {num_seqs, Hv, D, Dv}, at::kFloat);
+
+  std::cout << "### chunk_gated_delta_rule_cpu ..." << std::endl;
+
+  auto [query_, key_] = use_qk_l2norm_in_kernel ? l2norm_fwd(query, key, eps) : std::make_tuple(query, key);
+
+  at::Tensor output = at::empty_like(value, value.options());  // [B, T, Hv, Dv]
+  at::Tensor final_state = initial_state.to(at::kFloat);       // [num_seqs, Hv, D, Dv]
+
+  return std::make_tuple(output, final_state);
+}
+
 // query: [B, T, HK, EK]
 // key: [B, T, HK, EK]
 // value: [B, T, HV, EV]
@@ -1095,7 +1286,7 @@ CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::
 // cu_seqlens: [N + 1] INT32
 // head_first: bool
 // use_qk_l2norm_in_kernel: bool
-std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu1(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
