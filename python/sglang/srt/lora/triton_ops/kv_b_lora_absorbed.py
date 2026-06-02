@@ -71,10 +71,18 @@ from sglang.srt.lora.utils import LoRABatchInfo
 # ---------------------------------------------------------------------------
 
 _BLOCK_S = 16
-_STEP_A_BLOCK_K = 64  # contraction over qk_nope (~128) or kv_lora_rank (~512)
-_STEP_A_BLOCK_N = 16  # output is rank
-_STEP_B_BLOCK_K = 16  # contraction is rank
-_STEP_B_BLOCK_N = 64  # output is kv_lora_rank (~512) or v_head_dim (~128)
+# Tuned per kernel (B200; H=16, kv_lora_rank=512, qk_nope=v_head_dim=128, rank 16/32).
+# The a/b pair don't share: step_a contracts a wide K into a tiny N=rank output,
+# step_b is the inverse, so they want opposite tiles.
+_STEP_A_Q_BLOCK_K = 128  # step_a_q: K=qk_nope (~128) -> single contraction block
+_STEP_A_Q_BLOCK_N = 16  # output is rank
+_STEP_A_V_BLOCK_K = (
+    256  # step_a_v: K=kv_lora_rank (~512); 256 -> 2 iters (was 8) ~-25..-40%
+)
+_STEP_A_V_BLOCK_N = 32  # output is rank; 32 covers rank-32 in one tile
+_STEP_B_BLOCK_K = 16  # step_b contraction is rank (q and v agree here)
+_STEP_B_Q_BLOCK_N = 128  # step_b_q output is kv_lora_rank (~512); 128 ~-6..-16%
+_STEP_B_V_BLOCK_N = 64  # step_b_v output is v_head_dim (~128); 64 already optimal
 
 
 def _num_segments(batch_info: LoRABatchInfo) -> int:
@@ -246,7 +254,7 @@ def step_a_q_fwd(
     segment_grid = _segment_grid_size(batch_info, num_segments)
 
     grid = (
-        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
+        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_Q_BLOCK_N),
         H,
         segment_grid,
     )
@@ -277,8 +285,8 @@ def step_a_q_fwd(
         FULL_K=full_K_per_head,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_A_BLOCK_N,
-        BLOCK_K=_STEP_A_BLOCK_K,
+        BLOCK_N=_STEP_A_Q_BLOCK_N,
+        BLOCK_K=_STEP_A_Q_BLOCK_K,
     )
     return out
 
@@ -438,7 +446,7 @@ def step_b_q_fwd(
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S)
-        * triton.cdiv(kv_lora_rank, _STEP_B_BLOCK_N),
+        * triton.cdiv(kv_lora_rank, _STEP_B_Q_BLOCK_N),
         H,
         segment_grid,
     )
@@ -467,9 +475,9 @@ def step_b_q_fwd(
         batch_info.scalings,
         num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
-        N_DIV=(kv_lora_rank % _STEP_B_BLOCK_N == 0),
+        N_DIV=(kv_lora_rank % _STEP_B_Q_BLOCK_N == 0),
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_B_BLOCK_N,
+        BLOCK_N=_STEP_B_Q_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
     )
     return base_output
@@ -619,7 +627,7 @@ def step_a_v_fwd(
     segment_grid = _segment_grid_size(batch_info, num_segments)
 
     grid = (
-        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
+        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_V_BLOCK_N),
         H,
         segment_grid,
     )
@@ -648,8 +656,8 @@ def step_a_v_fwd(
         num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_A_BLOCK_N,
-        BLOCK_K=_STEP_A_BLOCK_K,
+        BLOCK_N=_STEP_A_V_BLOCK_N,
+        BLOCK_K=_STEP_A_V_BLOCK_K,
     )
     return out
 
@@ -818,7 +826,7 @@ def step_b_v_fwd(
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S)
-        * triton.cdiv(v_head_dim, _STEP_B_BLOCK_N),
+        * triton.cdiv(v_head_dim, _STEP_B_V_BLOCK_N),
         H,
         segment_grid,
     )
@@ -849,9 +857,9 @@ def step_b_v_fwd(
         FULL_K=full_K_per_head,
         QK_NOPE_OFFSET=qk_nope_head_dim,
         SORTED_BY_ADAPTER=sorted_by_adapter,
-        N_DIV=(v_head_dim % _STEP_B_BLOCK_N == 0),
+        N_DIV=(v_head_dim % _STEP_B_V_BLOCK_N == 0),
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_B_BLOCK_N,
+        BLOCK_N=_STEP_B_V_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
     )
     return base_output
