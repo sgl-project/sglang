@@ -4122,6 +4122,19 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_hierarchical_cache and self.enable_return_routed_experts:
+            raise ValueError(
+                "enable-hierarchical-cache is incompatible with enable-return-routed-experts: "
+                "captured expert routing data is not migrated on host-tier cache hits "
+                "(see issue #26975)."
+            )
+        if self.enable_hierarchical_cache and self.enable_return_indexer_topk:
+            raise ValueError(
+                "enable-hierarchical-cache is incompatible with enable-return-indexer-topk: "
+                "captured indexer data is not migrated on host-tier cache hits "
+                "(see issue #26975)."
+            )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
