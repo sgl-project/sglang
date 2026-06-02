@@ -78,7 +78,10 @@ def _qkv_lora_b_kernel(
     n_start = tl.load(n_offs + qkv_id)
     n_size = tl.load(n_offs + qkv_id + 1) - n_start
     scaling = tl.load(scalings + w_index)
-    # Adjust K (rank) according to the specific LoRA adapter
+    # Adjust K (rank) according to the specific LoRA adapter.
+    # NOTE: this clamp is load-bearing beyond truncating the contraction -- it also
+    # sets the x slice offset `qkv_id * K` below, since the LoRA-A output packs the
+    # q/k/v slices by *actual* rank. So (unlike sgemm_lora_b) it can NOT be dropped.
     K = tl.minimum(K, rank)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
@@ -107,23 +110,18 @@ def _qkv_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    # Iterate to compute the block in output matrix
-    partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        x_tile = tl.load(
-            x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
-            other=0.0,
-        )
-        w_tile = tl.load(
-            w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < n_size),
-            other=0.0,
-        )
-        partial_sum += tl.dot(x_tile, w_tile)
-
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
+    n_mask = n_offset[None, :] < n_size
+    x_tile = tl.load(
+        x_ptrs,
+        mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K),
+        other=0.0,
+    )
+    w_tile = tl.load(
+        w_ptrs,
+        mask=(k_offset[:, None] < K) & n_mask,
+        other=0.0,
+    )
+    partial_sum = tl.dot(x_tile, w_tile)
 
     # Store result to output matrix
     partial_sum *= scaling
@@ -134,8 +132,7 @@ def _qkv_lora_b_kernel(
         + (s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
     )
     output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < n_size)
-    partial_sum += tl.load(output_ptr, mask=output_mask)
-    tl.store(output_ptr, partial_sum, mask=output_mask)
+    tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
 
 
 def qkv_lora_b_fwd(
@@ -171,7 +168,7 @@ def qkv_lora_b_fwd(
     assert output_offset.shape[0] == n_slices + 1
 
     BLOCK_S = 16
-    BLOCK_R = 16
+    BLOCK_R = triton.next_power_of_2(r)
     BLOCK_OUT = 64
 
     grid_b = (

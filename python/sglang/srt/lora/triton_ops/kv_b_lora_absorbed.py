@@ -405,8 +405,7 @@ def _step_b_q_kernel(
         + safe_n[None, :] * b_stride_n
     )
     out_mask = row_mask[:, None] & n_mask
-    partial_sum += tl.load(base + base_offs, mask=out_mask, other=0.0)
-    tl.store(base + base_offs, partial_sum, mask=out_mask)
+    tl.atomic_add(base + base_offs, partial_sum, mask=out_mask, sem="relaxed")
 
 
 def step_b_q_fwd(
@@ -777,8 +776,7 @@ def _step_b_v_kernel(
         + safe_n[None, :] * b_stride_n
     )
     out_mask = row_mask[:, None] & n_mask
-    partial_sum += tl.load(base + base_offs, mask=out_mask, other=0.0)
-    tl.store(base + base_offs, partial_sum, mask=out_mask)
+    tl.atomic_add(base + base_offs, partial_sum, mask=out_mask, sem="relaxed")
 
 
 def step_b_v_fwd(
