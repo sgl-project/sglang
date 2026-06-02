@@ -11,7 +11,6 @@ import queue
 import sys
 import threading
 import time
-from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, TextIO
 
 import torch
@@ -531,13 +530,20 @@ class HiRadixCache(RadixCache):
                     # This request has been terminated early.
                     # Refer to check_prefetch_progress() and release_aborted_request().
                     cc.mem_pool_host.free(
-                        operation.host_indices[operation.completed_tokens : ack.completed_tokens])
+                        operation.host_indices[
+                            operation.completed_tokens : ack.completed_tokens
+                        ]
+                    )
                     if ack.completed_req:
-                        cc.mem_pool_host.free(operation.host_indices[ack.completed_tokens :])
+                        cc.mem_pool_host.free(
+                            operation.host_indices[ack.completed_tokens :]
+                        )
                 else:
                     operation.completed_tokens = ack.completed_tokens
                     if ack.completed_req:
-                        logger.debug(f"Prefetch {ack.rid} completed with {ack.completed_tokens} tokens")
+                        logger.debug(
+                            f"Prefetch {ack.rid} completed with {ack.completed_tokens} tokens"
+                        )
                         self._handle_prefetch_result(ack.rid)
 
         def _drain_backup():
@@ -1134,7 +1140,9 @@ class HiRadixCache(RadixCache):
             return tuple(HiRadixCache._tree_child_sort_key(x) for x in child_key)
         return (0, child_key)
 
-    def _sanity_check_radix_tree_digest(self, node: TreeNode, hasher: "hashlib._Hash") -> None:
+    def _sanity_check_radix_tree_digest(
+        self, node: TreeNode, hasher: "hashlib._Hash"
+    ) -> None:
         """
         Compute the hash of radix tree recursively, including node fields that are expected to
         be identical across PP ranks.
@@ -1148,14 +1156,10 @@ class HiRadixCache(RadixCache):
             if node.value is not None:
                 hasher.update(node.value.detach().cpu().view(-1).numpy().tobytes())
             if node.host_value is not None:
-                hasher.update(
-                    node.host_value.detach().cpu().view(-1).numpy().tobytes()
-                )
+                hasher.update(node.host_value.detach().cpu().view(-1).numpy().tobytes())
             hasher.update(str(node.lock_ref).encode("utf-8"))
 
-        for child_key in sorted(
-            node.children.keys(), key=self._tree_child_sort_key
-        ):
+        for child_key in sorted(node.children.keys(), key=self._tree_child_sort_key):
             self._sanity_check_radix_tree_digest(node.children[child_key], hasher)
 
     def pretty_print_to_file(self, f: TextIO) -> None:
@@ -1200,9 +1204,7 @@ class HiRadixCache(RadixCache):
 
         if self.pp_size > 1:
             sync_tensor = (
-                min_hash.clone()
-                if self.pp_rank == 0
-                else torch.zeros_like(local_hash)
+                min_hash.clone() if self.pp_rank == 0 else torch.zeros_like(local_hash)
             )
             self._pp_sync(sync_tensor)
             if self.pp_rank > 0:
@@ -1280,7 +1282,9 @@ class HiRadixCache(RadixCache):
         should_terminate = False
         if self.pp_rank == 0:
             should_terminate = self.can_terminate_prefetch(operation)
-        should_terminate_tensor = torch.tensor(int(should_terminate), dtype=torch.int, device="cpu")
+        should_terminate_tensor = torch.tensor(
+            int(should_terminate), dtype=torch.int, device="cpu"
+        )
         self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
         should_terminate = should_terminate_tensor.item() == 1
 
@@ -1289,16 +1293,20 @@ class HiRadixCache(RadixCache):
 
         # Handle partial or full completion.
         self.cache_controller.terminate_prefetch(operation)
-        logger.debug(f"Terminate prefetch {req_id} and {operation.completed_tokens} tokens are completed")
+        logger.debug(
+            f"Terminate prefetch {req_id} and {operation.completed_tokens} tokens are completed"
+        )
         self._handle_prefetch_result(req_id)
         return True
-    
+
     def _handle_prefetch_result(self, req_id: str) -> None:
         """
         Handle fully or partially prefetch result.  Install cache blocks into the radix tree, so that
         they are visible to others.  Release resources if necessary.
         """
-        last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch.pop(req_id)
+        last_host_node, prefetch_key, host_indices, operation = (
+            self.ongoing_prefetch.pop(req_id)
+        )
         completed_tokens = operation.completed_tokens
         hash_value = operation.hash_value
         fetched_key = prefetch_key[:completed_tokens]
@@ -1394,7 +1402,8 @@ class HiRadixCache(RadixCache):
             avaliable_size = self.cache_controller.mem_pool_host.available_size()
             prefetch_length = avaliable_size - (avaliable_size % self.page_size)
             if prefetch_length >= self.prefetch_threshold:
-                new_input_tokens = new_input_tokens[:prefetch_length]
+                # Truncate prefetch_key to keep it consistent with host_indices.
+                prefetch_key = prefetch_key[:prefetch_length]
                 host_indices = self.cache_controller.mem_pool_host.alloc(
                     prefetch_length
                 )
@@ -1670,11 +1679,15 @@ class HiRadixCache(RadixCache):
         5     |                         |                         | _pp_sync(data=1) ends
         """
         if self.pp_rank > 0:
-            torch.distributed.recv(data, group_src=self.pp_rank-1, group=self.pp_group, tag=2)
+            torch.distributed.recv(
+                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+            )
         if self.pp_rank + 1 < self.pp_size:
             # Make a copy of data, so that the caller is safe to modify `data` after this call.
             # This is cheap, as _pp_sync is not to be used for transmitting large data.
             copy_of_data = data.clone()
-            send_work = torch.distributed.isend(copy_of_data, group_dst=self.pp_rank+1, group=self.pp_group, tag=2)
+            send_work = torch.distributed.isend(
+                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+            )
             self.work_list.append(send_work)
         return
