@@ -74,7 +74,7 @@ class LingBotWorldArchConfig(DiTArchConfig):
     boundary_ratio: float | None = None
     local_attn_size: int = -1
     sink_size: int = 3
-    num_frames_per_block: int = 3
+    num_frames_per_block: int = 5
     sliding_window_num_frames: int = 45
 
     def __post_init__(self):
