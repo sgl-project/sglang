@@ -2403,9 +2403,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(
-                True, cache=str(autotune_cache)
-            ), autotune_dummy_run_mode():
+            with (
+                torch.inference_mode(),
+                autotune(True, cache=str(autotune_cache)),
+                autotune_dummy_run_mode(),
+            ):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
