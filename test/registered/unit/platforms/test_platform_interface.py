@@ -361,11 +361,22 @@ class TestCpuDeviceMixin(CustomTestCase):
         base = CpuSRTPlatform()
         self.assertEqual(base.get_available_memory(), (100, 200))
 
-    @patch("sglang.srt.platforms.cpu.psutil.Process")
-    def test_default_get_current_memory_usage_uses_process_rss(self, mock_proc):
-        mock_proc.return_value.memory_info.return_value.rss = 4567
+    @patch("sglang.srt.platforms.cpu.psutil.virtual_memory")
+    def test_default_get_current_memory_usage_is_system_used(self, mock_vm):
+        mock_vm.return_value.total = 1000
+        mock_vm.return_value.available = 300
         base = CpuSRTPlatform()
-        self.assertEqual(base.get_current_memory_usage(), 4567.0)
+        # system-used == total - available (not per-process RSS)
+        self.assertEqual(base.get_current_memory_usage(), 700.0)
+
+    @patch("sglang.srt.platforms.cpu.psutil.virtual_memory")
+    def test_memory_free_contract_yields_available(self, mock_vm):
+        # The [Active] contract free = total - used must yield psutil.available.
+        mock_vm.return_value.total = 1000
+        mock_vm.return_value.available = 300
+        base = CpuSRTPlatform()
+        free = base.get_device_total_memory() - base.get_current_memory_usage()
+        self.assertEqual(free, 300)
 
     @patch("torch.cpu.set_device")
     def test_default_set_device_uses_torch_cpu(self, mock_set_device):

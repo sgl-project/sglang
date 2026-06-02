@@ -40,7 +40,20 @@ class CpuDeviceMixin(DeviceMixin):
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None
     ) -> float:
-        return float(psutil.Process().memory_info().rss)
+        """Whole-machine used memory (``total - available``) in bytes.
+
+        Chosen so the [Active] contract
+        ``free = get_device_total_memory() - get_current_memory_usage()``
+        yields ``psutil.available`` — the real free RAM on a machine shared
+        with the OS and other processes. Per-process RSS would wrongly ignore
+        their usage. There is no per-device allocator peak on CPU (unlike
+        ``torch.cuda.max_memory_allocated``), so this is current usage, not a
+        peak. Returns whole-machine bytes; per-rank NUMA division for CPU TP
+        is the caller's concern (kept in ``get_available_gpu_memory``'s CPU
+        branch), not here.
+        """
+        vm = psutil.virtual_memory()
+        return float(vm.total - vm.available)
 
     def get_device(self, local_rank: int) -> "torch.device":
         # local_rank is ignored: all CPU ranks share the one CPU device, so
