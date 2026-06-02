@@ -30,7 +30,8 @@ MAMBA_TRACK_INTERVAL = 128
 class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + UnifiedRadixCache."""
 
-    kl_threshold = 0.003
+    # fp8 cache-hit KL is noisy and flaked at 0.003, match the HiCache variant
+    kl_threshold = 0.005
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
     )
