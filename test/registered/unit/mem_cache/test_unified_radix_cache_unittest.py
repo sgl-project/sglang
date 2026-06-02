@@ -1644,7 +1644,7 @@ class UnifiedRadixCacheSuite:
             prefetch_threshold=1,
         )
         req_id = "l3-prefetch-req"
-        cons.prefetch_from_storage(req_id, cons.root_node, list(seq), None, None)
+        cons.prefetch_from_storage(req_id, cons.root_node, array("q", seq), None, None)
         self._run_prefetch_to_completion(cons, req_id)
         cons.drain_storage_control_queues()
 
@@ -1736,6 +1736,22 @@ class UnifiedRadixCacheSuite:
 
         storage_extra_config = None
         if storage_backend == "file":
+            import sglang.srt.managers.cache_controller as cache_controller
+
+            # The file-backend storage config records TP rank/size.  These unit
+            # fixtures run without initializing distributed parallel state, so
+            # provide the local single-rank values that the fixture represents.
+            tp_rank_patcher = mock.patch.object(
+                cache_controller, "get_tensor_model_parallel_rank", return_value=0
+            )
+            tp_size_patcher = mock.patch.object(
+                cache_controller, "get_tensor_model_parallel_world_size", return_value=1
+            )
+            tp_rank_patcher.start()
+            tp_size_patcher.start()
+            self.addCleanup(tp_rank_patcher.stop)
+            self.addCleanup(tp_size_patcher.stop)
+
             assert storage_dir is not None, "file backend needs a storage_dir"
             # HiCacheFile reads the directory from this env var.
             cm = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(storage_dir)
@@ -1762,6 +1778,14 @@ class UnifiedRadixCacheSuite:
         tree.write_through_threshold = 1 << 30
         tree.load_back_threshold = 0
         if storage_backend is not None:
+            # Unit fixtures size host/device pools equally, which makes the
+            # production prefetch capacity limit (host - device) zero.  Keep the
+            # L3 tests focused on storage round trips by allowing one fixture
+            # worth of prefetch tokens.
+            tree.cache_controller.prefetch_capacity_limit = max(
+                tree.cache_controller.prefetch_capacity_limit,
+                tree.cache_controller.mem_pool_host.size,
+            )
             # Background prefetch/backup threads are daemon; stop them per-test.
             self.addCleanup(tree.cache_controller._stop_storage_threads)
 
