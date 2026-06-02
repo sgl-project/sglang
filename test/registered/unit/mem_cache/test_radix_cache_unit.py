@@ -207,17 +207,6 @@ class TestRadixKeyMatch(unittest.TestCase):
         self.assertEqual(self._match([], [1, 2]), 0)
         self.assertEqual(self._match([1, 2], []), 0)
 
-    def test_list_token_ids(self):
-        # token_ids may be a plain Python list (e.g. SWA/test reqs build keys
-        # from list(range(...))); match must handle it, not just array('q').
-        a = RadixKey([1, 2, 9, 4])
-        b = RadixKey([1, 2, 3, 4])
-        self.assertEqual(a.match(b), 2)
-        # mixed list / array operands behave the same as all-array.
-        a2 = RadixKey([1, 2, 3, 4])
-        b2 = RadixKey(array("q", [1, 2, 3, 4]))
-        self.assertEqual(a2.match(b2, page_size=2), 4)
-
     def test_extra_key_mismatch_raises(self):
         a = RadixKey(array("q", [1, 2, 3]), extra_key="lora-A")
         b = RadixKey(array("q", [1, 2, 3]), extra_key="lora-B")
@@ -283,12 +272,7 @@ class TestRadixKeyMatch(unittest.TestCase):
                 .token_ids
             )
             expected = _reference_match(a_tokens, b_tokens, page_size, is_bigram)
-            # Exercise both the array('q') fast path and the list fallback.
-            make_a = list if rng.random() < 0.5 else (lambda t: array("q", t))
-            make_b = list if rng.random() < 0.5 else (lambda t: array("q", t))
-            got = RadixKey(make_a(a_tokens), is_bigram=is_bigram).match(
-                RadixKey(make_b(b_tokens), is_bigram=is_bigram), page_size=page_size
-            )
+            got = self._match(a_tokens, b_tokens, page_size, is_bigram)
             self.assertEqual(
                 got,
                 expected,

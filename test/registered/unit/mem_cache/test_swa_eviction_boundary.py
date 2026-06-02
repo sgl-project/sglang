@@ -14,6 +14,7 @@ Tests use real tree/allocator/pool with mock Req/ScheduleBatch wrappers.
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
 
 import torch
@@ -103,8 +104,9 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
     """Mock Req with fields needed by _evict_swa and cache_finished_req."""
     req = SimpleNamespace(
         req_pool_idx=req_pool_idx,
-        origin_input_ids=token_ids,
-        output_ids=[],
+        # Mirror the real Req, which stores token ids as array('q').
+        origin_input_ids=array("q", token_ids),
+        output_ids=array("q"),
         cache_protected_len=cache_protected_len,
         swa_evicted_seqlen=0,
         extra_key=None,

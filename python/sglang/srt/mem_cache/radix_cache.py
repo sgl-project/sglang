@@ -147,28 +147,17 @@ class RadixKey:
             )
 
     @staticmethod
-    def _first_mismatch(t0, t1) -> int:
-        """Common prefix token count. Uses a zero-copy NumPy view for the common
-        ``array('q')`` (int64) case and falls back to a scalar loop otherwise
-        (e.g. plain ``list`` token ids).
+    def _first_mismatch(t0: array[int], t1: array[int]) -> int:
+        """Common prefix token count, via a zero-copy NumPy view over the
+        ``array('q')`` (int64) token id buffers.
         """
         n = min(len(t0), len(t1))
         if n == 0:
             return 0
-        if (
-            isinstance(t0, array)
-            and isinstance(t1, array)
-            and t0.itemsize == 8
-            and t1.itemsize == 8
-        ):
-            a = np.frombuffer(t0, dtype=np.int64, count=n)
-            b = np.frombuffer(t1, dtype=np.int64, count=n)
-            nz = np.flatnonzero(a != b)
-            return int(nz[0]) if nz.size else n
-        for i in range(n):
-            if t0[i] != t1[i]:
-                return i
-        return n
+        a = np.frombuffer(t0, dtype=np.int64, count=n)
+        b = np.frombuffer(t1, dtype=np.int64, count=n)
+        nz = np.flatnonzero(a != b)
+        return int(nz[0]) if nz.size else n
 
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
