@@ -98,6 +98,22 @@ class PaddingPolicy(Enum):
 
 
 @dataclass
+class FillContext:
+    """Per-iteration shape context passed to ``GraphSlot.post_fill``.
+
+    Carries both the bs-axis and tokens-axis raw/padded counts so a hook can
+    derive values regardless of its own slot's axis — e.g. the padded token
+    count (``padded_num_tokens`` == padded_bs * num_tokens_per_bs), which the
+    global-num-tokens fill and the local-num-token-non-padded transform need.
+    """
+
+    raw_bs: int
+    padded_bs: int
+    raw_num_tokens: int
+    padded_num_tokens: int
+
+
+@dataclass
 class GraphSlot:
     """A single FB-mirrored buffer.
 
@@ -123,11 +139,15 @@ class GraphSlot:
         pad_value      — sentinel for ``FILL_SENTINEL``.
         enabled        — runtime gate; disabled slots are not allocated
                          and skipped during fill / extract.
-        post_fill      — optional ``(buffer, forward_batch, raw_n,
-                         padded_n) -> None`` hook run after the
-                         grouped copy. Used for compute-then-write
-                         slots like the local-num-token-non-padded
-                         transform.
+        copy_from_fb   — when ``True`` (default), ``fill_from`` copies the
+                         same-named FB tensor into the buffer head. Set
+                         ``False`` for computed slots whose value is not a
+                         straight FB copy (e.g. ``global_num_tokens_*``,
+                         filled by a ``post_fill`` instead).
+        post_fill      — optional ``(buffer, forward_batch, FillContext)
+                         -> None`` hook run after the grouped copy. Used for
+                         compute-then-write slots (local-num-token-non-padded
+                         transform, global-num-tokens fill).
         slice_fn       — optional ``(buffer, padded_n) -> Tensor``
                          override for slots with non-trivial slicing
                          (e.g. ``mrope_positions`` shape ``[3, T]`` is
@@ -142,7 +162,10 @@ class GraphSlot:
     padding_policy: PaddingPolicy = PaddingPolicy.FOREACH_COPY
     pad_value: Optional[Any] = None
     enabled: bool = True
-    post_fill: Optional[Callable[[torch.Tensor, "ForwardBatch", int, int], None]] = None
+    copy_from_fb: bool = True
+    post_fill: Optional[Callable[[torch.Tensor, "ForwardBatch", "FillContext"], None]] = (
+        None
+    )
     slice_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None
 
     # runtime
@@ -372,7 +395,7 @@ class CudaGraphBufferRegistry:
         cpu_dsts: List[torch.Tensor] = []
         cpu_srcs: List[torch.Tensor] = []
         for slot in self._slots.values():
-            if not slot.enabled or slot.buffer is None:
+            if not slot.enabled or slot.buffer is None or not slot.copy_from_fb:
                 continue
             src = getattr(forward_batch, slot.name, None)
             if src is None:
@@ -402,13 +425,17 @@ class CudaGraphBufferRegistry:
         for dst, src in zip(cpu_dsts, cpu_srcs):
             dst.copy_(src)
 
-        # Phase 3: post-fill hooks.
+        # Phase 3: post-fill hooks (compute-then-write slots).
+        ctx = FillContext(
+            raw_bs=raw_bs,
+            padded_bs=padded_bs,
+            raw_num_tokens=raw_num_tokens,
+            padded_num_tokens=padded_num_tokens,
+        )
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None or slot.post_fill is None:
                 continue
-            raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-            padded_n = slot._padded_n(padded_bs, padded_num_tokens)
-            slot.post_fill(slot.buffer, forward_batch, raw_n, padded_n)
+            slot.post_fill(slot.buffer, forward_batch, ctx)
 
     def extract_buffer(
         self,

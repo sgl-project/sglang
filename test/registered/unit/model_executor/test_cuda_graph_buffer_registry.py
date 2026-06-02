@@ -432,11 +432,11 @@ class TestPostFillHook(unittest.TestCase):
     def test_post_fill_runs_after_copy(self):
         observed = {}
 
-        def hook(buf, fb, raw_n, padded_n):
+        def hook(buf, fb, ctx):
             # Multiply the raw region by 10 in-place.
-            buf[:raw_n] *= 10
-            observed["raw_n"] = raw_n
-            observed["padded_n"] = padded_n
+            buf[: ctx.raw_num_tokens] *= 10
+            observed["raw_n"] = ctx.raw_num_tokens
+            observed["padded_n"] = ctx.padded_num_tokens
 
         r = _make_registry(max_bs=4, max_num_tokens=8)
         r.register_slot(
