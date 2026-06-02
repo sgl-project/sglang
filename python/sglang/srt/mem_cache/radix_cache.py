@@ -244,6 +244,12 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # Radix-native session tag: the session_id whose request last extended
+        # this node to a leaf. release_session(id) seeds from these leaves and
+        # frees the session's unique leaf-to-branch chain (shared prefixes are
+        # branch points and are preserved). None for ordinary cache nodes.
+        self.session_id: Optional[str] = None
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -478,6 +484,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
+        # Radix-native session: tag the leaf so release_session can bulk-free
+        # this session's unique chain at close (see release_session).
+        self._tag_session_leaf(req, radix_key)
+
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
@@ -547,6 +557,61 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+
+        # Radix-native session tag (see release_session).
+        self._tag_session_leaf(req, radix_key)
+
+    def _tag_session_leaf(self, req: Req, radix_key) -> None:
+        """Tag the leaf node for this request's full key with its session_id, so
+        release_session can later free the session's unique chain. No-op for
+        non-session requests. ``req.session_id`` is set natively for radix-native
+        sessions (see Req); fall back to req.session for the RPC transport."""
+        sid = getattr(req, "session_id", None)
+        if sid is None:
+            session = getattr(req, "session", None)
+            sid = getattr(session, "session_id", None) if session is not None else None
+        if sid is None:
+            return
+        result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        node = result.last_device_node
+        if node is not None and node is not self.root_node:
+            node.session_id = sid
+
+    def release_session(self, session_id: str) -> int:
+        """Free the KV uniquely owned by a radix-native session: seed from leaves
+        tagged with this session_id and walk up the single-child chain, freeing
+        each node until a branch point (a shared prefix where another turn or
+        session diverges) or a locked node. Shared prefixes are branch points, so
+        they are never freed. Returns the number of tokens freed.
+
+        This is the deterministic 'evict on close' for radix-native sessions; it
+        complements floor-priority lazy eviction (which handles live pressure)."""
+        freed = 0
+        seeds = [
+            n
+            for n in list(self.evictable_leaves)
+            if getattr(n, "session_id", None) == session_id and n.lock_ref == 0
+        ]
+        for leaf in seeds:
+            node = leaf
+            while (
+                node is not self.root_node
+                and node.lock_ref == 0
+                and len(node.children) == 0
+                and not node.evicted
+            ):
+                parent = node.parent
+                self.token_to_kv_pool_allocator.free(node.value)
+                freed += len(node.value)
+                self._delete_leaf(node)
+                node = parent
+        if freed:
+            logger.info(
+                "Radix-native session released: %s (%d tokens freed)",
+                session_id,
+                freed,
+            )
+        return freed
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
