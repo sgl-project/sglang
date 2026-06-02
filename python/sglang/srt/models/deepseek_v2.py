@@ -78,6 +78,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -2219,11 +2220,18 @@ class DeepseekV2Model(nn.Module):
             self.cp_size = None
 
         if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                enable_tp=False,
-            )
+            if envs.SGLANG_ENABLE_EMBED_REPLICATION.get():
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    enable_tp=False,
+                )
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    use_attn_tp_group=is_dp_attention_enabled(),
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 
