@@ -41,6 +41,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.unified_cache_components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
@@ -229,16 +231,21 @@ class TestTreeNode(unittest.TestCase):
 
     def test_get_prefix_hash_values_not_shared_across_calls(self):
         """Regression guard for cached mutable prefix hash lists."""
-        for node_cls in (TreeNode, MambaTreeNode):
-            with self.subTest(node_cls=node_cls.__module__):
-                root = node_cls()
-                n1 = node_cls()
+        node_factories = (
+            ("radix_cache", TreeNode),
+            ("mamba_radix_cache", MambaTreeNode),
+            ("unified_radix_cache", lambda: UnifiedTreeNode((ComponentType.FULL,))),
+        )
+        for label, make_node in node_factories:
+            with self.subTest(node_cls=label):
+                root = make_node()
+                n1 = make_node()
                 n1.parent = root
                 n1.hash_value = ["h1"]
-                n2 = node_cls()
+                n2 = make_node()
                 n2.parent = n1
                 n2.hash_value = ["h2"]
-                n3 = node_cls()
+                n3 = make_node()
                 n3.parent = n2
                 n3.hash_value = ["h3"]
 
@@ -254,7 +261,7 @@ class TestTreeNode(unittest.TestCase):
                 self.assertEqual(second, ["h1", "h2"])
                 self.assertIsNot(second, first)
 
-                n4 = node_cls()
+                n4 = make_node()
                 n4.parent = n3
                 n4.hash_value = ["h4"]
                 self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
