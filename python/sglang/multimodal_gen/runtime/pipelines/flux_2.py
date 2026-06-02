@@ -3,9 +3,17 @@
 
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines.flux_2_progressive import (
+    Flux2ProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    ImageVAEEncodingStage,
+    InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -50,13 +58,40 @@ class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
             * 2
         )
 
-        self.add_standard_ti2i_stages(
-            include_input_validation=True,
-            vae_image_processor=vae_image_processor,
-            prompt_encoding="text",
-            image_vae_stage_kwargs={"vae_image_processor": vae_image_processor},
-            prepare_extra_timestep_kwargs=[compute_empirical_mu],
+        self.add_stage(InputValidationStage(vae_image_processor=vae_image_processor))
+        self.add_standard_text_encoding_stage()
+        self.add_stage(
+            ImageVAEEncodingStage(
+                vae=self.get_module("vae"),
+                component_name="vae",
+                vae_image_processor=vae_image_processor,
+            )
         )
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage(
+            prepare_extra_kwargs=[compute_empirical_mu]
+        )
+        self._add_flux2_denoising_stage()
+        self.add_standard_decoding_stage()
+
+    def _add_flux2_denoising_stage(
+        self, stage_name: str = "denoising_stage"
+    ) -> "Flux2Pipeline":
+        """Add Flux2ProgressiveDenoisingStage.
+
+        Routes to DenoisingStage.forward() when progressive_mode == 'fullres'
+        (the default), preserving identical behaviour for non-progressive requests.
+        """
+
+        def create_stage() -> Flux2ProgressiveDenoisingStage:
+            return Flux2ProgressiveDenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+                pipeline=self,
+                vae=self.get_module("vae", None),
+            )
+
+        return self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
 
 
 EntryClass = Flux2Pipeline
