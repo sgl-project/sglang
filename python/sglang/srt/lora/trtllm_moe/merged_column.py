@@ -22,6 +22,7 @@ from sglang.srt.lora.trtllm_moe import (
     get_lora_side_stream,
     get_original_merged_column_forward,
     is_two_stream_active,
+    lora_overlap_alloc_stream,
 )
 
 
@@ -44,10 +45,11 @@ def merged_column_lora_forward(self, input_: torch.Tensor):
     use_gate_up = lora_n_slices == 2 and self.use_gate_up_lora
 
     # Shrink on side stream, concurrent with the base merged-column GEMM on main.
+    _alloc = lora_overlap_alloc_stream()  # capture MAIN stream here (before the fork)
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         shrink_intermediate = sgemm_lora_a_fwd(
-            input_, self.A_buffer, sgemm_info, stack_num=lora_n_slices
+            input_, self.A_buffer, sgemm_info, stack_num=lora_n_slices, out_alloc_stream=_alloc
         )
 
     output_parallel = self.base_layer.quant_method.apply(

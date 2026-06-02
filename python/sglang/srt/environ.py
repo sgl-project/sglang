@@ -446,6 +446,14 @@ class Envs:
     # (their env gates were removed — proven useful). The down-proj overlap is DISABLED (load-triggered
     # cuda-graph/NCCL race → decode garbage; see moe_overlap.py `_overlap_down`).
     SGLANG_TWO_STREAM_MAX_TOKENS = EnvInt(256)
+    # Allocate the two-stream LoRA-A shrink OUTPUT buffer on the MAIN (consumer) stream instead of
+    # inside the side-stream context. A buffer allocated under `with torch.cuda.stream(side)` is tagged
+    # to the side stream, so the caching allocator can free/reuse it on the side stream's schedule —
+    # before the MAIN stream's LoRA-B expand (the real last consumer) finishes. Under cuda-graph replay
+    # (record_stream is a no-op during capture) that's a premature-reuse WAR → qwen3.5 mamba decode
+    # garbage with a single shared side stream. Set =1 to allocate the output on the consumer stream
+    # (as the MoE O1 path already does for gate_up_delta), making a single shared side stream graph-safe.
+    SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC = EnvBool(False)
     # WIP (unstaged, test-only): tuned triton a_stage_config for the MoE LoRA shrink GEMM. Default off.
     # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
     # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.

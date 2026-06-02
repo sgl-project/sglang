@@ -65,6 +65,21 @@ def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> Non
         get_lora_side_stream()
 
 
+def lora_overlap_alloc_stream() -> Optional[torch.cuda.Stream]:
+    """Stream to allocate side-stream LoRA-shrink OUTPUT buffers on, or None for default behavior.
+
+    A buffer allocated *inside* ``with torch.cuda.stream(side)`` is tagged to the side stream, so the
+    caching allocator may free/reuse it on the side stream's schedule — before the MAIN stream (the real
+    consumer, via the LoRA-B expand) is done. Under cuda-graph replay that's a premature-reuse WAR ->
+    qwen3.5 mamba decode garbage. With ``SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC`` this returns the MAIN
+    stream so the op allocates the output on the consumer stream (like the MoE O1 ``gate_up_delta``),
+    making a single shared side stream graph-safe. Call on the MAIN stream BEFORE forking to the side.
+    """
+    if envs.SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC.get():
+        return torch.cuda.current_stream()
+    return None
+
+
 # References to the original implementations, captured at install time so the
 # patched callables can defer to them for non-decode batches.
 _ORIGINAL_QKV_FORWARD: Optional[Callable] = None

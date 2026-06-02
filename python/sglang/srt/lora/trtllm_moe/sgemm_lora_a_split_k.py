@@ -163,7 +163,13 @@ def sgemm_lora_a_fwd_split_k(
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
     stack_num: int = 1,
+    out_alloc_stream=None,
 ) -> torch.Tensor:
+    # out_alloc_stream: accepted for signature parity with sgemm_lora_a_fwd. Main-stream output
+    # allocation (SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC) is not wired into the split-K path — no current
+    # config exercises split-K together with the two-stream overlap on a mamba model (qwen3.5 leaves
+    # split-K off; kimi uses split-K but is coherent with a single stream — no mamba). Wire it here if
+    # that combination ever ships.
     # x: (s, input_dim)
     # weights: (num_lora, stack_num * r, input_dim)
     # output: (s, stack_num * r)

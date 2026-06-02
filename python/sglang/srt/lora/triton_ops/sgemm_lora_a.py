@@ -125,13 +125,16 @@ def sgemm_lora_a_fwd(
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
     stack_num: int = 1,
+    out_alloc_stream=None,
 ) -> torch.Tensor:
     # Opt-in fp32 split-K for the dense LoRA-A shrink (PR #26962): route to the gated implementation in
     # trtllm_moe/sgemm_lora_a_split_k.py. Default (env off) falls through to the original path below.
     if envs.SGLANG_ENABLE_LORA_SHRINK_SPLIT_K.get():
         from sglang.srt.lora.trtllm_moe.sgemm_lora_a_split_k import sgemm_lora_a_fwd_split_k
 
-        return sgemm_lora_a_fwd_split_k(x, weights, batch_info, stack_num)
+        return sgemm_lora_a_fwd_split_k(
+            x, weights, batch_info, stack_num, out_alloc_stream=out_alloc_stream
+        )
     # x: (s, input_dim)
     # weights: (num_lora, stack_num * r, input_dim)
     # output: (s, stack_num * r)
@@ -161,7 +164,14 @@ def sgemm_lora_a_fwd(
 
     sorted_by_adapter = batch_info.permutation is not None
 
-    output = torch.empty((S, R), device=x.device, dtype=x.dtype)
+    # Allocate the output on the MAIN (consumer) stream when requested, so the caching allocator frees/
+    # reuses it on the consumer's schedule, not the side stream's (cuda-graph WAR — see
+    # lora_overlap_alloc_stream / SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC).
+    if out_alloc_stream is not None:
+        with torch.cuda.stream(out_alloc_stream):
+            output = torch.empty((S, R), device=x.device, dtype=x.dtype)
+    else:
+        output = torch.empty((S, R), device=x.device, dtype=x.dtype)
     _sgemm_lora_a_kernel[grid](
         x,
         weights,

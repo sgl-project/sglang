@@ -21,6 +21,7 @@ from sglang.srt.lora.trtllm_moe import (
     get_original_replicated_forward,
     get_original_row_forward,
     is_two_stream_active,
+    lora_overlap_alloc_stream,
 )
 
 
@@ -41,10 +42,11 @@ def qkv_proj_lora_forward(self, input_: torch.Tensor):
     # sgemm_info is host-side (LoRABatchInfo); compute once, share both calls.
     sgemm_info = self.lora_backend._sgemm_info()
 
+    _alloc = lora_overlap_alloc_stream()  # capture MAIN stream here (before the fork)
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         shrink_intermediate = sgemm_lora_a_fwd(
-            input_, self.A_buffer_qkv, sgemm_info, stack_num=3
+            input_, self.A_buffer_qkv, sgemm_info, stack_num=3, out_alloc_stream=_alloc
         )
 
     # Base qkv_proj GEMM on main, concurrent with the side-stream shrink.
@@ -105,10 +107,11 @@ def row_parallel_lora_forward(
     )
 
     side_stream = get_lora_side_stream()
+    _alloc = lora_overlap_alloc_stream()  # capture MAIN stream here (before the fork)
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
-            input_parallel, self.A_buffer
+            input_parallel, self.A_buffer, out_alloc_stream=_alloc
         )
 
     # Base row-parallel GEMM on main, concurrent with the side-stream shrink.
@@ -166,9 +169,12 @@ def column_parallel_lora_forward(self, input_: torch.Tensor):
     bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
     side_stream = get_lora_side_stream()
 
+    _alloc = lora_overlap_alloc_stream()  # capture MAIN stream here (before the fork)
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
-        lora_a_output = self.lora_backend.run_lora_a_sgemm(input_, self.A_buffer)
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(
+            input_, self.A_buffer, out_alloc_stream=_alloc
+        )
 
     # Base ColumnParallel GEMM on main, concurrent with the side-stream shrink.
     output_parallel = self.base_layer.quant_method.apply(self.base_layer, input_, bias)
@@ -208,10 +214,11 @@ def replicated_lora_forward(self, x: torch.Tensor):
     side_stream = get_lora_side_stream()
     first_dim = self.first_output_dim
 
+    _alloc = lora_overlap_alloc_stream()  # capture MAIN stream here (before the fork)
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
-            x, self.A_buffer, stack_num=(2 if first_dim > 0 else 1)
+            x, self.A_buffer, stack_num=(2 if first_dim > 0 else 1), out_alloc_stream=_alloc
         )
 
     # Base ReplicatedLinear GEMM on main, concurrent with the side-stream shrink.
