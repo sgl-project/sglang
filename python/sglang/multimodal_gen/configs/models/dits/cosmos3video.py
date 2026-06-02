@@ -25,6 +25,8 @@ def _build_cosmos3_param_names_mapping() -> dict:
         norm_moe_gen.weight                                    -> norm_moe_gen.weight
         time_embedder.linear_{1,2}.weight                      -> (pass-through)
         proj_in.weight, proj_out.weight                        -> (pass-through)
+        vae2llm.weight                                         -> proj_in.weight  (FP8 ckpt alias)
+        llm2vae.weight                                         -> proj_out.weight (FP8 ckpt alias)
 
     GEN patterns (`*_moe_gen`, `add_*`, `to_add_out`, `norm_added_*`) must
     precede the UND catch-all so the catch-all can't claim GEN keys.
@@ -42,6 +44,9 @@ def _build_cosmos3_param_names_mapping() -> dict:
         # Top-level norms / embeddings.
         r"^norm_moe_gen\.(.*)$": r"norm_moe_gen.\1",
         r"^embed_tokens\.(.*)$": r"language_model.embed_tokens.\1",
+        # FP8 checkpoint aliases for the latent projection layers.
+        r"^vae2llm\.(.*)$": r"proj_in.\1",
+        r"^llm2vae\.(.*)$": r"proj_out.\1",
         # GEN pathway: per-layer (must run before the UND catch-all below).
         # Q/K/V merge into MergedColumnParallelLinear to_qkv (concat order: Q, K, V).
         r"^layers\.(\d+)\.self_attn\.add_q_proj\.(.*)$": (
@@ -167,6 +172,11 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     )
     reverse_param_names_mapping: dict = field(default_factory=dict)
     lora_param_names_mapping: dict = field(default_factory=dict)
+    # FP8 checkpoint quantization_config.ignore uses checkpoint module names;
+    # translate them to model names so _is_layer_ignored matches correctly.
+    quant_ignore_remap: dict = field(
+        default_factory=lambda: {"vae2llm": "proj_in", "llm2vae": "proj_out"}
+    )
 
     def __post_init__(self):
         super().__post_init__()
