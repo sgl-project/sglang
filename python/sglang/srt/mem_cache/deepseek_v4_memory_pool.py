@@ -531,7 +531,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
 
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def get_cached_swa_loc(self, raw_loc: torch.Tensor, layer_id: int) -> torch.Tensor:
         if self._should_cache_swa:

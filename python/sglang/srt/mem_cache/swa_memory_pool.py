@@ -177,9 +177,7 @@ class SWAKVPool(BaseSWAKVPool):
                     "translate_loc_from_full_to_swa: loc tensor changed mid-forward "
                     "without invalidate_loc_cache() — possible missing call site"
                 )
-            self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
-                torch.int32
-            )
+            self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices]
             self._cached_loc_key = key
         return self._cached_swa_loc
 
