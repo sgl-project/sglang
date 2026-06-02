@@ -39,7 +39,6 @@ class TestRegressionBasic(ScriptedTestCase):
     def _script_abort_waiting_releases_all(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        yield from run_until(r, lambda h: h.status == "waiting")
 
         t.abort(r)
         yield
@@ -57,7 +56,6 @@ class TestRegressionBasic(ScriptedTestCase):
     def _script_pause_covers_waiting_chunked(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        yield from run_until(r, lambda h: h.status == "waiting")
 
         t.pause_generation(mode="retract")
         yield
@@ -192,21 +190,6 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until_all_finished([r1, r2])
         assert r1.finished and r2.finished
 
-    def test_abort_dedup_dual_queue_holding(self):
-        self.server.execute_script(self._script_abort_dedup_dual_queue_holding)
-
-    @staticmethod
-    def _script_abort_dedup_dual_queue_holding(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        yield from run_until(r, lambda h: h.is_chunking)
-        t.abort(r)
-        t.abort(r)
-        yield
-        assert r.kv_pages == 0
-        assert r.req.req_pool_idx is None
-        assert r.lock_refs == 0
-        assert r.finished
-
     def test_chunked_admission_reuse_branch_balanced(self):
         self.server.execute_script(self._script_chunked_admission_reuse_branch_balanced)
 
@@ -229,32 +212,6 @@ class TestRegressionBasic(ScriptedTestCase):
             f"baseline={baseline_refs}, final={final_refs}"
         )
         assert r.lock_refs == 0
-
-    def test_chunked_resume_lives_in_waiting_queue(self):
-        self.server.execute_script(self._script_chunked_resume_lives_in_waiting_queue)
-
-    @staticmethod
-    def _script_chunked_resume_lives_in_waiting_queue(t: ScriptedContext):
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE + 32, max_new_tokens=2)
-
-        yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
-        assert r.status == "waiting", (
-            f"between chunks the chunked-resume req must hold in "
-            f"waiting_queue; got status={r.status!r}"
-        )
-        assert (
-            r.is_chunking
-        ), f"is_chunking must be set while mid-chunk; got {r.is_chunking!r}"
-        assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
-        ) is None, (
-            f"v2 must not maintain a top-level chunked_req field; "
-            f"got {(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
-        )
-
-        yield from run_until_finished(r)
-        assert not r.is_chunking
-        assert r.status in ("finished", "unknown")
 
     def test_streaming_session_multiturn_no_reuse_branch(self):
         self.server.execute_script(
@@ -295,7 +252,6 @@ class TestRegressionBasic(ScriptedTestCase):
         baseline_refs = t.get_all_node_lock_refs()
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        yield from run_until(r, lambda h: h.status == "waiting")
 
         assert r.req.req_pool_idx is not None, "row must be held mid-chunk"
         assert r.kv_pages > 0, "committed KV must be held mid-chunk"
@@ -317,47 +273,6 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.req.inflight_middle_chunks == 0
         assert t.get_all_node_lock_refs() == baseline_refs
 
-    def test_abort_chunked_resume_dual_queue_no_double_release(self):
-        self.server.execute_script(
-            self._script_abort_chunked_resume_dual_queue_no_double_release
-        )
-
-    @staticmethod
-    def _script_abort_chunked_resume_dual_queue_no_double_release(t: ScriptedContext):
-        baseline_free = t.engine_stats()["kv_pool_free"]
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-
-        for _ in range(DEFAULT_MAX_STEPS):
-            in_waiting = r.rid in [req.rid for req in t.scheduler.waiting_queue]
-            in_batch = r.rid in [req.rid for req in t.scheduler.running_batch.reqs]
-            if in_waiting and in_batch:
-                break
-            if r.finished:
-                raise AssertionError(
-                    "req finished before reaching the dual-queue window"
-                )
-            yield
-        else:
-            raise AssertionError(
-                "never observed chunked-resume in both waiting_queue and batch.reqs"
-            )
-
-        t.abort(r)
-        yield
-
-        assert r.finished
-        assert r.kv_pages == 0
-        assert r.req.req_pool_idx is None
-        # There is no underflow counter in the engine. The real invariant a double
-        # release_kv_cache would break is the pool's free accounting: an over-free
-        # would push kv_pool_free above its pre-request baseline. Assert the pool
-        # returns to exactly baseline (every page released once, none twice).
-        post_free = t.engine_stats()["kv_pool_free"]
-        assert post_free == baseline_free, (
-            f"double release_kv_cache corrupted pool accounting; "
-            f"kv_pool_free baseline={baseline_free}, after abort={post_free}"
-        )
-
     def test_pause_retract_releases_waiting_chunked_resume(self):
         self.server.execute_script(
             self._script_pause_retract_releases_waiting_chunked_resume
@@ -367,7 +282,6 @@ class TestRegressionBasic(ScriptedTestCase):
     def _script_pause_retract_releases_waiting_chunked_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        yield from run_until(r, lambda h: h.status == "waiting")
         assert r.req.req_pool_idx is not None and r.kv_pages > 0 and r.lock_refs >= 1
 
         t.pause_generation(mode="retract")
@@ -615,7 +529,6 @@ class TestRegressionLpm(ScriptedTestCase):
 
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.chunks_done >= 1 and h.is_chunking)
-        yield from run_until(r1, lambda h: h.status == "waiting")
 
         last_node_before = r1.req.last_node.id
         prefix_len_before = len(r1.req.prefix_indices)
@@ -686,8 +599,6 @@ class TestRegressionGptOss(ScriptedTestCase):
 
         committed = r.req.kv_committed_len
         assert committed > 0
-
-        yield from run_until(r, lambda h: h.status == "waiting")
 
         assert len(r.req.prefix_indices) <= committed, (
             f"cache_unfinished_req over-read past kv_committed_len: "

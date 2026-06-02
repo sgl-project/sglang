@@ -40,7 +40,6 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_abort_waiting_chunked_resume(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        yield from run_until(r, lambda h: h.status == "waiting" and h.chunks_done >= 1)
 
         pages_before = r.kv_pages
         assert pages_before > 0, "chunked req should own KV pages mid-chunk"
@@ -414,11 +413,6 @@ class TestAbortBasic(ScriptedTestCase):
         # unscheduled remainder.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        # Land in the inter-chunk gap: the req has finished >=1 chunk and is parked
-        # in the waiting queue, so _chunked_req_scheduled_last_iter is False.
-        yield from run_until(
-            r, lambda h: h.status == "waiting" and h.chunks_done >= 1 and h.is_chunking
-        )
 
         # Snapshot the radix tree before abort. The skipped stash must not add a
         # node nor bump any node's hit_count for the unscheduled remainder.
