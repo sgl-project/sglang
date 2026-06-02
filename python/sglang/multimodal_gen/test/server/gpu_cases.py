@@ -632,6 +632,16 @@ TWO_GPU_CASES = [
         run_perf_check=False,
     ),
     DiffusionTestCase(
+        "sana_wm_ti2v_tp2",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST,
+            tp_size=2,
+        ),
+        SANA_WM_TI2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+    ),
+    DiffusionTestCase(
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
@@ -749,7 +759,7 @@ TWO_GPU_CASES = [
     # NOTE: SANA-WM does not currently support sequence parallelism. The DiT
     # uses a frame-wise GDN recurrent scan and a temporal depth-wise conv that
     # both span across frames, so splitting along T would corrupt outputs.
-    # A 2-GPU case will be added once SP-aware (halo-exchange) GDN lands.
+    # Add a 2-GPU SP case once SP-aware (halo-exchange) GDN lands.
 ]
 
 if not current_platform.is_hip():

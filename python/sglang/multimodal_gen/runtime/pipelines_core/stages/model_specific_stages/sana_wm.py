@@ -531,7 +531,15 @@ class SanaWMTextEncodingStage(TextEncodingStage):
         prompt_seq_lens_list = self._seq_lens_from_masks(prompt_masks_list)
 
         if batch.do_classifier_free_guidance:
-            assert isinstance(batch.negative_prompt, str)
+            negative_prompt = batch.negative_prompt
+            if not isinstance(negative_prompt, (str, list)) or (
+                isinstance(negative_prompt, list)
+                and not all(isinstance(text, str) for text in negative_prompt)
+            ):
+                raise TypeError(
+                    "SANA-WM CFG negative_prompt must be a string or a list of "
+                    f"strings, got {type(negative_prompt).__name__}."
+                )
             (
                 neg_embeds_list,
                 neg_masks_list,
@@ -539,7 +547,7 @@ class SanaWMTextEncodingStage(TextEncodingStage):
                 neg_embeds_masks_list,
                 _neg_seq_lens_list,
             ) = self.encode_text(
-                batch.negative_prompt,
+                negative_prompt,
                 server_args,
                 encoder_index=[0],
                 return_attention_mask=True,
@@ -694,7 +702,7 @@ class SanaWMDenoisingStage(DenoisingStage):
         if cfg_parallel and get_classifier_free_guidance_world_size() > 2:
             logger.warning_once(
                 "SANA-WM CFG parallel uses two guidance branches; extra CFG ranks "
-                "run dummy forwards and contribute zeros."
+                "skip transformer forwards and contribute zeros."
             )
 
         if cfg_parallel:
@@ -770,16 +778,19 @@ class SanaWMDenoisingStage(DenoisingStage):
                 timestep = torch.minimum(timestep, timestep_condition_limit)
                 model_timestep = timestep[:, :1, :, 0, 0]
 
-                with set_forward_context(
-                    current_timestep=step_idx,
-                    attn_metadata=None,
-                    forward_batch=batch,
-                ):
-                    noise_pred = transformer(
-                        hidden_states=latent_model_input.to(target_dtype),
-                        timestep=model_timestep,
-                        **model_kwargs,
-                    )
+                if cfg_parallel and cfg_rank > 1:
+                    noise_pred = torch.zeros_like(latents, dtype=target_dtype)
+                else:
+                    with set_forward_context(
+                        current_timestep=step_idx,
+                        attn_metadata=None,
+                        forward_batch=batch,
+                    ):
+                        noise_pred = transformer(
+                            hidden_states=latent_model_input.to(target_dtype),
+                            timestep=model_timestep,
+                            **model_kwargs,
+                        )
 
                 if do_cfg:
                     guidance_scale = float(getattr(batch, "guidance_scale", 1.0) or 1.0)

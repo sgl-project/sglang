@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     GLUMBConvTemp,
     _RMSNorm,
     _SanaWMPaddedLocalAttention,
+    SanaWMTransformer3DModel,
     _make_sana_wm_local_attention,
     _sana_wm_chunk_index_from_chunk_size,
     _sana_wm_chunked_attention,
@@ -96,6 +97,13 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
 
     def test_task_type_is_ti2v(self) -> None:
         self.assertEqual(self.config.task_type, ModelTaskType.TI2V)
+
+    def test_pipeline_config_public_export(self) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs import (
+            SanaWMPipelineConfig as ExportedSanaWMPipelineConfig,
+        )
+
+        self.assertIs(ExportedSanaWMPipelineConfig, SanaWMPipelineConfig)
 
     def test_adjust_num_frames_rounds_to_temporal_stride(self) -> None:
         self.assertEqual(self.config.adjust_num_frames(50), 49)
@@ -189,6 +197,12 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertEqual(arch.y_norm_scale_factor, 0.01)
         self.assertEqual(arch.y_norm_eps, 1e-5)
         self.assertEqual(arch.timestep_norm_scale_factor, 1.0)
+
+    def test_dit_tp_config_requires_heads_divisible_by_tp_size(self) -> None:
+        arch = SanaWMConfig().arch_config
+        SanaWMTransformer3DModel._validate_tp_config(arch, 2)
+        with self.assertRaisesRegex(ValueError, "num_attention_heads"):
+            SanaWMTransformer3DModel._validate_tp_config(arch, 3)
 
     def test_prepare_neg_cond_kwargs_keeps_camera_for_cfg(self) -> None:
         camera_conditions = torch.zeros(1, 7, 20)
@@ -453,10 +467,23 @@ class TestSanaWMTwoStagePipeline(unittest.TestCase):
 
 
 class TestSanaWMPipeline(unittest.TestCase):
-    def test_validate_parallelism_rejects_tensor_parallelism(self) -> None:
-        with self.assertRaisesRegex(ValueError, "tensor parallelism"):
+    def test_validate_parallelism_allows_tensor_parallelism(self) -> None:
+        SanaWMPipeline._validate_parallelism_args(
+            SimpleNamespace(
+                tp_size=2,
+                sp_degree=1,
+                pipeline_config=SanaWMPipelineConfig(),
+            )
+        )
+
+    def test_validate_parallelism_rejects_bad_tensor_parallelism(self) -> None:
+        with self.assertRaisesRegex(ValueError, "num_attention_heads"):
             SanaWMPipeline._validate_parallelism_args(
-                SimpleNamespace(tp_size=2, sp_degree=1)
+                SimpleNamespace(
+                    tp_size=3,
+                    sp_degree=1,
+                    pipeline_config=SanaWMPipelineConfig(),
+                )
             )
 
     def test_validate_parallelism_rejects_sequence_parallelism(self) -> None:
@@ -1056,7 +1083,7 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertTrue(torch.equal(batch.timesteps, torch.arange(3)))
 
 
-class TestSanaWMTextEncodingStage(unittest.TestCase):
+class TestSanaWMTextEncodingStage(_GlobalStageArgsMixin, unittest.TestCase):
     def test_official_prompt_window_keeps_bos_and_tail(self) -> None:
         tensor = torch.arange(5).reshape(1, 5, 1)
 
@@ -1065,6 +1092,38 @@ class TestSanaWMTextEncodingStage(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(selected.squeeze(-1), torch.tensor([[0, 3, 4]])))
+
+    def test_forward_accepts_batched_negative_prompts(self) -> None:
+        stage = SanaWMTextEncodingStage(text_encoders=[object()], tokenizers=[object()])
+        batch = Req(
+            prompt=["turn left", "turn right"],
+            negative_prompt=["blur", "distortion"],
+            guidance_scale=4.5,
+        )
+        server_args = SimpleNamespace(pipeline_config=SanaWMPipelineConfig())
+        pos_mask = torch.ones(2, 4, dtype=torch.long)
+        neg_mask = torch.tensor([[1, 1, 0, 0], [1, 0, 0, 0]], dtype=torch.long)
+        pos_outputs = (
+            [torch.ones(2, 4, 2304)],
+            [pos_mask],
+            [],
+            [pos_mask.bool()],
+            [[4, 4]],
+        )
+        neg_outputs = (
+            [torch.zeros(2, 4, 2304)],
+            [neg_mask],
+            [],
+            [neg_mask.bool()],
+            [[2, 1]],
+        )
+
+        with patch.object(stage, "encode_text", side_effect=[pos_outputs, neg_outputs]):
+            out = stage.forward(batch, server_args)
+
+        self.assertEqual(out.negative_prompt_embeds[0].shape[0], 2)
+        self.assertTrue(torch.equal(out.negative_attention_mask[0], neg_mask))
+        self.assertEqual(out.negative_prompt_seq_lens[0], [2, 1])
 
 
 class TestSanaWMDenoisingStage(unittest.TestCase):
@@ -1115,6 +1174,21 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
 
         self.assertTrue(torch.allclose(combined_from_pos_rank, serial))
         self.assertTrue(torch.allclose(combined_from_neg_rank, serial))
+
+    def test_cfg_parallel_idle_rank_contributes_zero(self) -> None:
+        local_noise = torch.tensor([7.0])
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.cfg_model_parallel_all_reduce",
+            side_effect=lambda partial: partial,
+        ) as all_reduce:
+            combined = SanaWMDenoisingStage._combine_cfg_parallel_noise(
+                local_noise, guidance_scale=4.5, cfg_rank=2
+            )
+
+        expected = torch.zeros_like(local_noise)
+        self.assertTrue(torch.equal(combined, expected))
+        self.assertTrue(torch.equal(all_reduce.call_args.args[0], expected))
 
 
 class TestSanaWMOptionalAttentionPadding(unittest.TestCase):
@@ -1632,6 +1706,39 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertFalse(stage.text_encoder.called)
         self.assertEqual(prompt_embeds.shape, (1, 4, 4))
         self.assertTrue(torch.equal(attention_mask, torch.tensor([[1, 1, 0, 0]])))
+
+    def test_refiner_forward_refines_batch_in_single_call(self) -> None:
+        stage = SanaWMLTX2RefinerStage(
+            transformer=torch.nn.Identity(),
+            connectors=torch.nn.Identity(),
+            text_encoder=torch.nn.Identity(),
+            tokenizer=SimpleNamespace(pad_token="<pad>", eos_token="<eos>"),
+            dtype=torch.float32,
+        )
+        original_latents = torch.zeros(2, 128, 3, 1, 1)
+        refined_latents = torch.ones_like(original_latents)
+        batch = Req(
+            prompt=["left", "right"],
+            latents=original_latents,
+            seeds=[11, 23],
+            extra={},
+        )
+
+        with (
+            patch.object(
+                stage, "_refine_batch", return_value=refined_latents
+            ) as refine_batch,
+            patch.object(stage, "_refine_one", side_effect=AssertionError),
+        ):
+            out = stage.forward(batch, SimpleNamespace())
+
+        refine_batch.assert_called_once()
+        call_args = refine_batch.call_args
+        self.assertIs(call_args.args[0], original_latents)
+        self.assertEqual(call_args.args[1], ["left", "right"])
+        self.assertEqual(call_args.kwargs["seeds"], [11, 23])
+        self.assertTrue(torch.equal(out.latents, refined_latents))
+        self.assertTrue(out.extra["sana_wm_refiner_applied"])
 
     def test_refiner_decoding_drops_clean_sink_frame_after_decode(self) -> None:
         stage = SanaWMRefinerDecodingStage(vae=None)

@@ -10,11 +10,25 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_rank,
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.layernorm import tensor_parallel_rms_norm
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -42,6 +56,42 @@ def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
     )
 
 
+def _sana_wm_tp_world_size() -> int:
+    if not model_parallel_is_initialized():
+        return 1
+    return get_tp_world_size()
+
+
+def _sana_wm_tp_rank() -> int:
+    if not model_parallel_is_initialized():
+        return 0
+    return get_tp_rank()
+
+
+def _sana_wm_linear(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    out = module(x)
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _sana_wm_all_gather_hidden(x: torch.Tensor, tp_size: int) -> torch.Tensor:
+    if tp_size == 1:
+        return x
+    return tensor_model_parallel_all_gather(x.contiguous(), dim=-1)
+
+
+def _sana_wm_tp_rms_norm(
+    x: torch.Tensor,
+    norm: nn.Module,
+    *,
+    tp_size: int,
+) -> torch.Tensor:
+    if tp_size == 1 or not isinstance(norm, _RMSNorm):
+        return norm(x)
+    if norm.weight.shape[0] == x.shape[-1]:
+        return norm(x)
+    return tensor_parallel_rms_norm(x, norm)
+
+
 class _RMSNorm(nn.Module):
     def __init__(
         self,
@@ -51,6 +101,7 @@ class _RMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.eps = eps
+        self.variance_epsilon = eps
         self.weight = nn.Parameter(torch.ones(dim) * scale_factor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -74,8 +125,24 @@ class _ShortConvolution(nn.Module):
         self.hidden_size = hidden_size
         self.kernel_size = kernel_size
         self.weight = nn.Parameter(torch.zeros(hidden_size, 1, kernel_size))
+        set_weight_attrs(
+            self.weight,
+            {
+                "output_dim": 0,
+                "weight_loader": self.weight_loader,
+            },
+        )
         with torch.no_grad():
             self.weight[:, 0, -1] = 1.0
+
+    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is not None and tuple(param.shape) != tuple(loaded_weight.shape):
+            shard_size = param.shape[output_dim]
+            start_idx = _sana_wm_tp_rank() * shard_size
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        assert param.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         # x: (B, T, C) -> (B, C, T) for conv1d
@@ -872,7 +939,7 @@ class GLUMBConvTemp(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, HW: Tuple[int, int, int]) -> torch.Tensor:
-        B, N, C = x.shape
+        B, N, _ = x.shape
         T, H, W = HW
         assert N == T * H * W, f"GLUMBConvTemp: N={N} != T*H*W={T * H * W}"
 
@@ -1385,6 +1452,18 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.out_dim = out_dim
         self.heads = heads
         self.dim = head_dim
+        self.tp_size = _sana_wm_tp_world_size()
+        if self.tp_size < 1:
+            raise ValueError(f"Invalid SANA-WM tp_size={self.tp_size}.")
+        if heads % self.tp_size != 0:
+            raise ValueError(
+                "SANA-WM tensor parallelism requires num_attention_heads "
+                f"({heads}) to be divisible by tp_size ({self.tp_size})."
+            )
+        self.tp_rank = _sana_wm_tp_rank()
+        self.local_heads = heads // self.tp_size
+        self.local_out_dim = self.local_heads * head_dim
+        self.use_tp = self.tp_size > 1
         self.eps = eps
         self.softmax_main = softmax_main
         self.update_rule = update_rule
@@ -1399,7 +1478,15 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
 
         # Main branch: fused QKV + output proj (shared with cam branch)
-        self.qkv = nn.Linear(in_dim, 3 * out_dim, bias=False)
+        if self.use_tp:
+            self.qkv = MergedColumnParallelLinear(
+                in_dim,
+                [out_dim, out_dim, out_dim],
+                bias=False,
+                gather_output=False,
+            )
+        else:
+            self.qkv = nn.Linear(in_dim, 3 * out_dim, bias=False)
         self.proj = nn.Linear(out_dim, out_dim, bias=True)
 
         if qk_norm:
@@ -1421,11 +1508,12 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.register_buffer("recall_gate", torch.zeros(1))
         self.output_gate = nn.Linear(in_dim, out_dim, bias=True)
 
+        conv_hidden_size = self.local_out_dim if self.use_tp else out_dim
         if conv_kernel_size > 0 and not softmax_main:
-            self.conv_k = _ShortConvolution(out_dim, conv_kernel_size)
+            self.conv_k = _ShortConvolution(conv_hidden_size, conv_kernel_size)
             if not k_conv_only:
-                self.conv_q = _ShortConvolution(out_dim, conv_kernel_size)
-                self.conv_v = _ShortConvolution(out_dim, conv_kernel_size)
+                self.conv_q = _ShortConvolution(conv_hidden_size, conv_kernel_size)
+                self.conv_v = _ShortConvolution(conv_hidden_size, conv_kernel_size)
             else:
                 self.conv_q = None
                 self.conv_v = None
@@ -1434,17 +1522,28 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.conv_kernel_size = conv_kernel_size
         self.k_conv_only = k_conv_only
 
-        self.q_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
-        self.k_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
-        self.v_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
+        if self.use_tp:
+            self.q_proj_cam = ColumnParallelLinear(
+                in_dim, out_dim, bias=True, gather_output=False
+            )
+            self.k_proj_cam = ColumnParallelLinear(
+                in_dim, out_dim, bias=True, gather_output=False
+            )
+            self.v_proj_cam = ColumnParallelLinear(
+                in_dim, out_dim, bias=True, gather_output=False
+            )
+        else:
+            self.q_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
+            self.k_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
+            self.v_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
         self.out_proj_cam = nn.Linear(out_dim, out_dim, bias=True)
         nn.init.zeros_(self.out_proj_cam.weight)
         nn.init.zeros_(self.out_proj_cam.bias)
         if conv_kernel_size > 0 and not softmax_main:
-            self.conv_k_cam = _ShortConvolution(out_dim, conv_kernel_size)
+            self.conv_k_cam = _ShortConvolution(conv_hidden_size, conv_kernel_size)
             if not k_conv_only:
-                self.conv_q_cam = _ShortConvolution(out_dim, conv_kernel_size)
-                self.conv_v_cam = _ShortConvolution(out_dim, conv_kernel_size)
+                self.conv_q_cam = _ShortConvolution(conv_hidden_size, conv_kernel_size)
+                self.conv_v_cam = _ShortConvolution(conv_hidden_size, conv_kernel_size)
             else:
                 self.conv_q_cam = None
                 self.conv_v_cam = None
@@ -1453,7 +1552,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         if softmax_main:
             self.softmax_attn = _make_sana_wm_local_attention(
-                num_heads=heads,
+                num_heads=self.local_heads,
                 head_size=head_dim,
                 pad_head_dim_to_flash=pad_attention_head_dim_to_flash,
             )
@@ -1469,7 +1568,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         HW: Tuple[int, int, int],
         bidirectional: bool = True,
     ) -> torch.Tensor:
-        B, N, C = x.shape
+        B, N, _ = x.shape
         T, H, W = HW
         S = H * W
         # Move T into the time axis: (B, T, S, C) -> (B*S, T, C)
@@ -1483,6 +1582,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
 
     def _get_cam_qkv_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.use_tp:
+            raise RuntimeError("SANA-WM TP camera QKV uses per-projection modules.")
         weights = (
             self.q_proj_cam.weight,
             self.k_proj_cam.weight,
@@ -1513,6 +1614,12 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         return params
 
     def _cam_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_tp:
+            return (
+                _sana_wm_linear(self.q_proj_cam, x),
+                _sana_wm_linear(self.k_proj_cam, x),
+                _sana_wm_linear(self.v_proj_cam, x),
+            )
         qkv_weight, qkv_bias = self._get_cam_qkv_params()
         return F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
 
@@ -1522,19 +1629,24 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         HW: Tuple[int, int, int],
         rotary_emb: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, N, C = x.shape
+        B, N, _ = x.shape
         T, H_sp, W_sp = HW
         S = H_sp * W_sp
+        local_C = self.local_out_dim
 
-        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim).contiguous()
+        qkv = (
+            _sana_wm_linear(self.qkv, x)
+            .reshape(B, N, 3, self.local_heads, self.dim)
+            .contiguous()
+        )
         q, k, v = qkv.unbind(2)
 
         # Short conv on K only.
         if self.conv_k is not None:
             k = self._temporal_short_conv(
-                k.reshape(B, N, C), self.conv_k, HW, bidirectional=True
+                k.reshape(B, N, local_C), self.conv_k, HW, bidirectional=True
             )
-            k = k.reshape(B, N, self.heads, self.dim)
+            k = k.reshape(B, N, self.local_heads, self.dim)
             qkv = torch.stack((q, k, v), dim=2).contiguous()
 
         beta, decay = _compute_frame_gates(
@@ -1546,12 +1658,24 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             self.dt_bias,
             self.A_log,
         )
+        if self.use_tp:
+            head_start = self.tp_rank * self.local_heads
+            beta = beta.narrow(1, head_start, self.local_heads)
+            decay = decay.narrow(1, head_start, self.local_heads)
 
         q, k, v = qkv.unbind(2)
 
         # Q/K norm on the flattened channel dim (B, N, C)
-        q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
-        k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        q = _sana_wm_tp_rms_norm(
+            q.reshape(B, N, local_C),
+            self.q_norm,
+            tp_size=self.tp_size,
+        ).reshape(B, N, self.local_heads, self.dim)
+        k = _sana_wm_tp_rms_norm(
+            k.reshape(B, N, local_C),
+            self.k_norm,
+            tp_size=self.tp_size,
+        ).reshape(B, N, self.local_heads, self.dim)
 
         # ReLU kernel + key scale
         q = F.relu(q)
@@ -1589,7 +1713,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             eps=self.eps,
         ).to(dtype)
 
-        out = out.permute(0, 3, 1, 2).reshape(B, N, C)
+        out = out.permute(0, 3, 1, 2).reshape(B, N, local_C)
+        out = _sana_wm_all_gather_hidden(out, self.tp_size)
         return out, beta, decay
 
     def _main_branch_softmax(
@@ -1601,16 +1726,27 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         chunk_split_strategy: str = "uniform",
         chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
+        B, N, _ = x.shape
+        local_C = self.local_out_dim
+        qkv = _sana_wm_linear(self.qkv, x).reshape(
+            B, N, 3, self.local_heads, self.dim
+        )
         q, k, v = qkv.unbind(2)
         if self.conv_k is not None:
             k = self._temporal_short_conv(
-                k.reshape(B, N, C), self.conv_k, HW, bidirectional=True
+                k.reshape(B, N, local_C), self.conv_k, HW, bidirectional=True
             )
-            k = k.reshape(B, N, self.heads, self.dim)
-        q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
-        k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+            k = k.reshape(B, N, self.local_heads, self.dim)
+        q = _sana_wm_tp_rms_norm(
+            q.reshape(B, N, local_C),
+            self.q_norm,
+            tp_size=self.tp_size,
+        ).reshape(B, N, self.local_heads, self.dim)
+        k = _sana_wm_tp_rms_norm(
+            k.reshape(B, N, local_C),
+            self.k_norm,
+            tp_size=self.tp_size,
+        ).reshape(B, N, self.local_heads, self.dim)
         # RoPE primitives are written for (B, H, N, D); LocalAttention takes
         # (B, N, H, D). Permute for RoPE, then transpose back at the call site.
         q = q.permute(0, 2, 1, 3)  # (B, H, N, D)
@@ -1636,7 +1772,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
         if out is None:
             out = self.softmax_attn(q_in, k_in, v_in)
-        return out.reshape(B, N, C)
+        out = out.reshape(B, N, local_C)
+        return _sana_wm_all_gather_hidden(out, self.tp_size)
 
 
     def _cam_branch(
@@ -1649,24 +1786,33 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         beta: torch.Tensor,
         decay: torch.Tensor,
     ) -> torch.Tensor:
-        B, N, C = x.shape
+        B, N, _ = x.shape
         T, H_sp, W_sp = HW
         S = H_sp * W_sp
+        local_C = self.local_out_dim
 
         q, k, v = self._cam_qkv(x)
-        q = q.reshape(B, N, self.heads, self.dim)
-        k = k.reshape(B, N, self.heads, self.dim)
-        v = v.reshape(B, N, self.heads, self.dim)
+        q = q.reshape(B, N, self.local_heads, self.dim)
+        k = k.reshape(B, N, self.local_heads, self.dim)
+        v = v.reshape(B, N, self.local_heads, self.dim)
 
         # Short conv on K only (k_conv_only)
         if self.conv_k_cam is not None:
             k = self._temporal_short_conv(
-                k.reshape(B, N, C), self.conv_k_cam, HW, bidirectional=True
+                k.reshape(B, N, local_C), self.conv_k_cam, HW, bidirectional=True
             )
-            k = k.reshape(B, N, self.heads, self.dim)
+            k = k.reshape(B, N, self.local_heads, self.dim)
 
-        q = self.q_norm_cam(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
-        k = self.k_norm_cam(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        q = _sana_wm_tp_rms_norm(
+            q.reshape(B, N, local_C),
+            self.q_norm_cam,
+            tp_size=self.tp_size,
+        ).reshape(B, N, self.local_heads, self.dim)
+        k = _sana_wm_tp_rms_norm(
+            k.reshape(B, N, local_C),
+            self.k_norm_cam,
+            tp_size=self.tp_size,
+        ).reshape(B, N, self.local_heads, self.dim)
 
         q = F.relu(q)
         k = F.relu(k)
@@ -1700,7 +1846,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             k_dn.float(), dim=2, keepdim=True
         ).clamp_min(1e-6)
         inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2
-        frame_inflation_sq = inflation_sq.view(B, self.heads, T, S).mean(dim=-1)
+        frame_inflation_sq = inflation_sq.view(B, self.local_heads, T, S).mean(dim=-1)
         if beta.ndim == 3:
             beta = beta / frame_inflation_sq.clamp_min(1.0)
         elif beta.ndim == 4:
@@ -1725,8 +1871,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         # apply inverse UCPE projection on output
         out_bhnd = apply_o(out_bhnd)
-        out = out_bhnd.permute(0, 2, 1, 3).reshape(B, N, C)
-        return out
+        out = out_bhnd.permute(0, 2, 1, 3).reshape(B, N, local_C)
+        return _sana_wm_all_gather_hidden(out, self.tp_size)
 
     def _cam_branch_softmax(
         self,
@@ -1739,21 +1885,30 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         chunk_split_strategy: str = "uniform",
         chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        B, N, C = x.shape
+        B, N, _ = x.shape
+        local_C = self.local_out_dim
 
         q, k, v = self._cam_qkv(x)
-        q = q.reshape(B, N, self.heads, self.dim)
-        k = k.reshape(B, N, self.heads, self.dim)
-        v = v.reshape(B, N, self.heads, self.dim)
+        q = q.reshape(B, N, self.local_heads, self.dim)
+        k = k.reshape(B, N, self.local_heads, self.dim)
+        v = v.reshape(B, N, self.local_heads, self.dim)
 
         if self.conv_k_cam is not None:
             k = self._temporal_short_conv(
-                k.reshape(B, N, C), self.conv_k_cam, HW, bidirectional=True
+                k.reshape(B, N, local_C), self.conv_k_cam, HW, bidirectional=True
             )
-            k = k.reshape(B, N, self.heads, self.dim)
+            k = k.reshape(B, N, self.local_heads, self.dim)
 
-        q = self.q_norm_cam(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
-        k = self.k_norm_cam(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        q = _sana_wm_tp_rms_norm(
+            q.reshape(B, N, local_C),
+            self.q_norm_cam,
+            tp_size=self.tp_size,
+        ).reshape(B, N, self.local_heads, self.dim)
+        k = _sana_wm_tp_rms_norm(
+            k.reshape(B, N, local_C),
+            self.k_norm_cam,
+            tp_size=self.tp_size,
+        ).reshape(B, N, self.local_heads, self.dim)
 
         q_bhnd = q.permute(0, 2, 1, 3)
         k_bhnd = k.permute(0, 2, 1, 3)
@@ -1790,7 +1945,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         out_bhnd = out.transpose(1, 2).contiguous()
         out_bhnd = apply_o(out_bhnd)
-        return out_bhnd.transpose(1, 2).reshape(B, N, C)
+        out = out_bhnd.transpose(1, 2).reshape(B, N, local_C)
+        return _sana_wm_all_gather_hidden(out, self.tp_size)
 
 
     def forward(
@@ -1859,9 +2015,29 @@ class MultiHeadCrossAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.tp_size = _sana_wm_tp_world_size()
+        if self.tp_size < 1:
+            raise ValueError(f"Invalid SANA-WM tp_size={self.tp_size}.")
+        if num_heads % self.tp_size != 0:
+            raise ValueError(
+                "SANA-WM cross-attention tensor parallelism requires "
+                f"num_heads ({num_heads}) to be divisible by tp_size ({self.tp_size})."
+            )
+        self.tp_rank = _sana_wm_tp_rank()
+        self.local_num_heads = num_heads // self.tp_size
+        self.local_d_model = self.local_num_heads * self.head_dim
+        self.use_tp = self.tp_size > 1
 
-        self.q_linear = nn.Linear(d_model, d_model, bias=True)
-        self.kv_linear = nn.Linear(d_model, d_model * 2, bias=True)
+        if self.use_tp:
+            self.q_linear = ColumnParallelLinear(
+                d_model, d_model, bias=True, gather_output=False
+            )
+            self.kv_linear = MergedColumnParallelLinear(
+                d_model, [d_model, d_model], bias=True, gather_output=False
+            )
+        else:
+            self.q_linear = nn.Linear(d_model, d_model, bias=True)
+            self.kv_linear = nn.Linear(d_model, d_model * 2, bias=True)
         self.proj = nn.Linear(d_model, d_model, bias=True)
         if qk_norm:
             self.q_norm = _RMSNorm(d_model, eps=1e-6)
@@ -1873,7 +2049,7 @@ class MultiHeadCrossAttention(nn.Module):
         # The padding-mask path falls back to SDPA internally; the unmasked
         # path can pick FA3 / FlashInfer / etc.
         self.attn = _make_sana_wm_local_attention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
             pad_head_dim_to_flash=pad_attention_head_dim_to_flash,
         )
@@ -1884,19 +2060,28 @@ class MultiHeadCrossAttention(nn.Module):
         cond: torch.Tensor,  # (B, L, D)
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        B, N, D = x.shape
+        B, N, _ = x.shape
 
-        q = self.q_linear(x)
-        kv = self.kv_linear(cond).view(B, -1, 2, D)
+        q = _sana_wm_linear(self.q_linear, x)
+        kv = _sana_wm_linear(self.kv_linear, cond).view(B, -1, 2, self.local_d_model)
         k, v = kv.unbind(2)
         # LocalAttention takes (B, N, H, D); skip the legacy BHND transpose.
-        q = self.q_norm(q).view(B, N, self.num_heads, self.head_dim)
-        k = self.k_norm(k).view(B, -1, self.num_heads, self.head_dim)
-        v = v.view(B, -1, self.num_heads, self.head_dim)
+        q = _sana_wm_tp_rms_norm(
+            q,
+            self.q_norm,
+            tp_size=self.tp_size,
+        ).view(B, N, self.local_num_heads, self.head_dim)
+        k = _sana_wm_tp_rms_norm(
+            k,
+            self.k_norm,
+            tp_size=self.tp_size,
+        ).view(B, -1, self.local_num_heads, self.head_dim)
+        v = v.view(B, -1, self.local_num_heads, self.head_dim)
 
         attn_mask = mask.bool() if mask is not None else None
         out = self.attn(q, k, v, attn_mask=attn_mask)  # (B, N, H, D)
-        out = out.reshape(B, N, D)
+        out = out.reshape(B, N, self.local_d_model)
+        out = _sana_wm_all_gather_hidden(out, self.tp_size)
         return self.proj(out)
 
 
@@ -2074,11 +2259,33 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     reverse_param_names_mapping = SanaWMConfig().reverse_param_names_mapping
     lora_param_names_mapping: dict = {}
 
+    @staticmethod
+    def _validate_tp_config(arch, tp_size: int) -> None:
+        if tp_size < 1:
+            raise ValueError(f"Invalid SANA-WM tp_size={tp_size}.")
+        if tp_size == 1:
+            return
+
+        if arch.num_attention_heads % tp_size != 0:
+            raise ValueError(
+                "SANA-WM tensor parallelism requires num_attention_heads to be "
+                f"divisible by tp_size, got num_attention_heads="
+                f"{arch.num_attention_heads}, tp_size={tp_size}."
+            )
+        hidden_size = arch.num_attention_heads * arch.attention_head_dim
+        if hidden_size % tp_size != 0:
+            raise ValueError(
+                "SANA-WM tensor parallelism requires hidden_size to be divisible "
+                f"by tp_size, got hidden_size={hidden_size}, tp_size={tp_size}."
+            )
+
     def __init__(self, config: SanaWMConfig, hf_config=None, **kwargs) -> None:
         super().__init__(config, hf_config=hf_config or {}, **kwargs)
         if hasattr(config, "apply_user_flags_to_arch_config"):
             config.apply_user_flags_to_arch_config()
         arch = config.arch_config
+        self.tp_size = _sana_wm_tp_world_size()
+        self._validate_tp_config(arch, self.tp_size)
 
         self.patch_size = (arch.patch_size_t, arch.patch_size, arch.patch_size)
         self.inner_dim = arch.num_attention_heads * arch.attention_head_dim
@@ -2170,12 +2377,14 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         logger.info(
             "SANA-WM attention config: use_chunked_softmax_attention=%s, "
             "pad_attention_head_dim_to_flash=%s, attention_head_dim=%d, "
-            "effective_softmax_head_dim=%d, softmax_blocks=%s, chunk_size=%s, "
-            "chunk_split_strategy=%s",
+            "effective_softmax_head_dim=%d, tp_size=%d, local_attention_heads=%d, "
+            "softmax_blocks=%s, chunk_size=%s, chunk_split_strategy=%s",
             self.use_chunked_softmax_attention,
             self.pad_attention_head_dim_to_flash,
             arch.linear_head_dim,
             effective_softmax_head_dim,
+            self.tp_size,
+            arch.num_attention_heads // self.tp_size,
             self.softmax_block_indices,
             self.chunk_size,
             self.chunk_split_strategy,

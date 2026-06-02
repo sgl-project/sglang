@@ -467,11 +467,14 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         )
 
     @torch.inference_mode()
-    def _encode_prompt(
+    def _encode_prompts(
         self,
-        prompt: str,
+        prompts: list[str],
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not prompts:
+            raise ValueError("SANA-WM refiner requires at least one prompt.")
+
         tokenizer = self.tokenizer
         if getattr(tokenizer, "padding_side", "right") != "left":
             tokenizer.padding_side = "left"
@@ -479,7 +482,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             tokenizer.pad_token = tokenizer.eos_token
 
         text_inputs = tokenizer(
-            [prompt.strip()],
+            [prompt.strip() for prompt in prompts],
             padding="max_length",
             max_length=self.text_max_sequence_length,
             truncation=True,
@@ -526,6 +529,14 @@ class SanaWMLTX2RefinerStage(PipelineStage):
             video_attention_mask.to(device=device),
         )
 
+    @torch.inference_mode()
+    def _encode_prompt(
+        self,
+        prompt: str,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._encode_prompts([prompt], device)
+
     def _predict_current_x0(
         self,
         *,
@@ -537,7 +548,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         fps: float,
         n_context_tokens: int,
         step_idx: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         full_latent = torch.cat([sink, noisy_current], dim=2)
         batch_size, _, num_frames, height, width = full_latent.shape
         patch_size = int(_refiner_config_value(self.transformer, "patch_size"))
@@ -592,38 +603,50 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                         n_context_tokens=n_context_tokens,
                     )
 
+        current_tokens = latent_tokens[:, n_context_tokens:, :]
         denoised = latent_tokens.float() - velocity_tokens.float() * raw_timestep
-        return denoised[:, n_context_tokens:, :].to(self.dtype)
+        return current_tokens, denoised[:, n_context_tokens:, :].to(self.dtype)
 
     @torch.inference_mode()
-    def _refine_one(
+    def _refine_batch(
         self,
-        latent: torch.Tensor,
-        prompt: str,
+        latents: torch.Tensor,
+        prompts: list[str],
         *,
         fps: float,
-        seed: int,
+        seeds: list[int],
         sink_size: int = 1,
     ) -> torch.Tensor:
         device = get_local_torch_device()
-        z = latent.to(device=device, dtype=self.dtype)
+        z = latents.to(device=device, dtype=self.dtype)
         if z.shape[2] <= sink_size:
             raise ValueError(
                 f"Stage-1 latent has {z.shape[2]} frames but sink_size={sink_size}."
             )
+        batch_size = int(z.shape[0])
+        if len(prompts) != batch_size:
+            raise ValueError(
+                "SANA-WM refiner prompt batch does not match latent batch: "
+                f"{len(prompts)} prompts for batch {batch_size}."
+            )
+        if len(seeds) != batch_size:
+            raise ValueError(
+                "SANA-WM refiner seed batch does not match latent batch: "
+                f"{len(seeds)} seeds for batch {batch_size}."
+            )
         self.log_info(
-            "SANA-WM refiner start: latent=%s, fps=%.3f, seed=%d, "
+            "SANA-WM refiner start: latent=%s, fps=%.3f, seeds=%s, "
             "sink_size=%d, sigmas=%s, diagnostics=%s",
             tuple(z.shape),
             fps,
-            seed,
+            seeds,
             sink_size,
             STAGE_2_DISTILLED_SIGMA_VALUES,
             "on" if sana_wm_diagnostics_enabled() else "off",
         )
         log_sana_wm_tensor_stats("refiner.input_latent", z)
 
-        prompt_embeds, prompt_attention_mask = self._encode_prompt(prompt, device)
+        prompt_embeds, prompt_attention_mask = self._encode_prompts(prompts, device)
 
         sigmas = torch.tensor(
             STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=device
@@ -633,8 +656,18 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         current = z[:, :, sink_size:].contiguous()
         log_sana_wm_tensor_stats("refiner.sink_latent", sink)
         log_sana_wm_tensor_stats("refiner.current_latent_clean", current)
-        gen = torch.Generator(device=device).manual_seed(int(seed))
-        eps = torch.randn(current.shape, generator=gen, device=device, dtype=self.dtype)
+        eps = torch.cat(
+            [
+                torch.randn(
+                    current[index : index + 1].shape,
+                    generator=torch.Generator(device=device).manual_seed(int(seed)),
+                    device=device,
+                    dtype=self.dtype,
+                )
+                for index, seed in enumerate(seeds)
+            ],
+            dim=0,
+        )
         noisy = (1.0 - start_sigma) * current + start_sigma * eps
         log_sana_wm_tensor_stats("refiner.current_latent_noisy_initial", noisy)
 
@@ -646,7 +679,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
 
         for step_idx in range(len(sigmas) - 1):
             sigma = sigmas[step_idx]
-            denoised = self._predict_current_x0(
+            noisy_tokens, denoised = self._predict_current_x0(
                 sink=sink,
                 noisy_current=noisy,
                 prompt_embeds=prompt_embeds,
@@ -656,7 +689,6 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 n_context_tokens=n_context_tokens,
                 step_idx=step_idx,
             )
-            noisy_tokens = pack_latents(noisy, patch_size, patch_size_t)
             velocity_tokens = (noisy_tokens.float() - denoised.float()) / sigma.float()
             next_tokens = (
                 noisy_tokens.float()
@@ -670,23 +702,42 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 patch_size=patch_size,
                 patch_size_t=patch_size_t,
             )
-            velocity_5d = unpack_latents(
-                velocity_tokens,
-                num_frames=noisy.shape[2],
-                height=noisy.shape[3],
-                width=noisy.shape[4],
-                patch_size=patch_size,
-                patch_size_t=patch_size_t,
-            )
-            log_sana_wm_tensor_stats(
-                f"refiner.step_{step_idx}.velocity_current",
-                velocity_5d.to(self.dtype),
-            )
-            log_sana_wm_tensor_stats(f"refiner.step_{step_idx}.current_latent", noisy)
+            if sana_wm_diagnostics_enabled():
+                velocity_5d = unpack_latents(
+                    velocity_tokens,
+                    num_frames=noisy.shape[2],
+                    height=noisy.shape[3],
+                    width=noisy.shape[4],
+                    patch_size=patch_size,
+                    patch_size_t=patch_size_t,
+                )
+                log_sana_wm_tensor_stats(
+                    f"refiner.step_{step_idx}.velocity_current",
+                    velocity_5d.to(self.dtype),
+                )
+                log_sana_wm_tensor_stats(f"refiner.step_{step_idx}.current_latent", noisy)
 
         refined = torch.cat([sink, noisy], dim=2)
         log_sana_wm_tensor_stats("refiner.output_latent", refined)
         return refined
+
+    @torch.inference_mode()
+    def _refine_one(
+        self,
+        latent: torch.Tensor,
+        prompt: str,
+        *,
+        fps: float,
+        seed: int,
+        sink_size: int = 1,
+    ) -> torch.Tensor:
+        return self._refine_batch(
+            latent,
+            [prompt],
+            fps=fps,
+            seeds=[seed],
+            sink_size=sink_size,
+        )
 
     @torch.inference_mode()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -719,17 +770,8 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         else:
             seeds = [int(getattr(batch, "seed", 0) or 0)] * batch_size
 
-        refined: list[torch.Tensor] = []
-        for idx, (prompt, seed) in enumerate(zip(prompts, seeds, strict=True)):
-            refined.append(
-                self._refine_one(
-                    batch.latents[idx : idx + 1],
-                    prompt,
-                    fps=fps,
-                    seed=seed,
-                )
-            )
-        batch.latents = torch.cat(refined, dim=0).to(
+        refined = self._refine_batch(batch.latents, prompts, fps=fps, seeds=seeds)
+        batch.latents = refined.to(
             device=batch.latents.device, dtype=batch.latents.dtype
         )
         if batch.extra is None:

@@ -50,11 +50,23 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
     @staticmethod
     def _validate_parallelism_args(server_args: ServerArgs) -> None:
         tp_size = getattr(server_args, "tp_size", 1) or 1
-        if tp_size != 1:
-            raise ValueError(
-                "SANA-WM does not support tensor parallelism yet. "
-                "Use --num-gpus with FSDP/CFG parallelism instead of "
-                f"--tp-size {tp_size}."
+        if tp_size < 1:
+            raise ValueError(f"Invalid SANA-WM tensor parallelism size: {tp_size}.")
+        if tp_size > 1:
+            pipeline_config = getattr(server_args, "pipeline_config", None)
+            dit_config = getattr(pipeline_config, "dit_config", None)
+            arch = getattr(dit_config, "arch_config", None)
+            num_heads = getattr(arch, "num_attention_heads", None)
+            if num_heads is not None and num_heads % tp_size != 0:
+                raise ValueError(
+                    "SANA-WM tensor parallelism requires num_attention_heads "
+                    f"({num_heads}) to be divisible by tp_size ({tp_size})."
+                )
+            logger.info(
+                "SANA-WM tensor parallelism enabled with tp_size=%d. "
+                "Attention/GDN heads are sharded across TP ranks; sequence "
+                "parallelism remains disabled.",
+                tp_size,
             )
 
         sp_degree = getattr(server_args, "sp_degree", 1) or 1
