@@ -75,7 +75,14 @@ MI35X_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "1"},
+        # AITER MXFP4 fused-MoE for gpt-oss uses the SEPARATED gate/up tile
+        # layout (matches `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+        # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4 callers default
+        # to INTERLEAVE, so opt out explicitly here.
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+        },
     ),
     ModelConfig(
         model_path="openai/gpt-oss-120b",
@@ -93,7 +100,10 @@ MI35X_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+        },
     ),
 ]
 
