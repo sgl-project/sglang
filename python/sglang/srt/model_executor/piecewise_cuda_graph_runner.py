@@ -595,7 +595,6 @@ class PiecewiseCudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            # Eager entry (not _out_graph): handles EXTEND and covers _in_graph.
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
             # Run and capture

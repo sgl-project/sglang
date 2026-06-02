@@ -387,7 +387,6 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        # Eager entry (not _out_graph): handles EXTEND and covers _in_graph.
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
