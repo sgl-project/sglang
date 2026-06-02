@@ -189,7 +189,7 @@ WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 
 @dataclasses.dataclass
 class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
-    template_manager: TemplateManager
+    template_manager: Optional[TemplateManager]
     scheduler_info: Dict
 
 
@@ -284,6 +284,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    grpc_handle = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -378,6 +379,21 @@ async def lifespan(fast_api_app: FastAPI):
         traceback = get_exception_traceback()
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
 
+    # Start the native gRPC sidecar from the lifespan so it inherits the
+    # already-running HTTP event loop. Skip multi-tokenizer-worker mode
+    # because every worker would try to bind the same gRPC port.
+    in_grpc_capable_worker = (
+        getattr(fast_api_app, "is_single_tokenizer_mode", False)
+        or envs.SGLANG_GRANIAN_PARENT_PID.get() is not None
+    )
+    if in_grpc_capable_worker and server_args.enable_grpc:
+        grpc_handle = _start_native_grpc_server_for_runtime(
+            server_args=server_args,
+            tokenizer_manager=_global_state.tokenizer_manager,
+            template_manager=_global_state.template_manager,
+            scheduler_info=_global_state.scheduler_info,
+        )
+
     # Execute custom warmups
     if server_args.warmups is not None:
         await execute_warmups(
@@ -398,6 +414,7 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
+        _shutdown_native_grpc_server(grpc_handle)
         warmup_thread.join()
 
 
@@ -2332,6 +2349,60 @@ def _setup_and_run_http_server(
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
+def _start_native_grpc_server_for_runtime(
+    server_args,
+    tokenizer_manager,
+    template_manager,
+    scheduler_info,
+):
+    """Attempt to start the native Rust gRPC server for a live runtime.
+
+    Returns a GrpcServerHandle on success, or None if the native gRPC
+    extension is not present in this wheel.
+    """
+    try:
+        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+        from sglang.srt.grpc import _core as grpc_native
+
+        runtime_handle = RuntimeHandle(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            server_args=server_args,
+            scheduler_info=scheduler_info or {},
+        )
+
+        grpc_handle = grpc_native.start_server(
+            host=server_args.host,
+            port=server_args.grpc_port,
+            runtime_handle=runtime_handle,
+            worker_threads=server_args.grpc_worker_threads,
+            max_prefill_tokens=server_args.grpc_max_prefill_tokens,
+        )
+        logger.info(
+            f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"
+        )
+        return grpc_handle
+    except ImportError:
+        logger.info(
+            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel; "
+            "native gRPC server disabled. The extension is built from rust/sglang-grpc/ "
+            "via setuptools-rust during wheel build."
+        )
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to start native gRPC server: {e}")
+        return None
+
+
+def _shutdown_native_grpc_server(grpc_handle) -> None:
+    if grpc_handle is None:
+        return
+    try:
+        grpc_handle.shutdown()
+    except Exception as e:
+        logger.warning(f"Failed to shut down native gRPC server: {e}")
+
+
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -2369,6 +2440,11 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
+    # Native gRPC sidecar startup lives in the FastAPI lifespan so it
+    # inherits uvicorn/Granian's already-running event loop. The bridge's
+    # run_coroutine_threadsafe schedules onto that loop; starting gRPC
+    # before uvicorn (as we used to here) created a stale loop that
+    # nothing drove, causing every async gRPC RPC to hang.
     _setup_and_run_http_server(
         server_args,
         tokenizer_manager,
