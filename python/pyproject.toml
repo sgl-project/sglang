@@ -111,6 +111,7 @@ diffusion = [
   "av==16.1.0",
   "scikit-image==0.25.2",
   "trimesh>=4.0.0",
+  "websockets",
   "xatlas",
 ]
 

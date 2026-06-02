@@ -14,7 +14,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -610,7 +609,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             f"CFG_parallel={enable_cfg_parallel}, cfg_rank={cfg_rank}"
         )
 
-        progress_bar = tqdm(
+        progress_bar = self.progress_bar(
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
@@ -882,7 +881,7 @@ class Cosmos3DecodingStage(PipelineStage):
 
     @staticmethod
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
-        return (decoded * 0.5 + 0.5).clamp(0, 1).float()
+        return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
 
     @staticmethod
     def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
