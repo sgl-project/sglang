@@ -64,14 +64,25 @@ class TestRadixBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r1)
         assert r1.finished
+        # evict_radix(None) flushes the tree, but flush only frees nodes once they
+        # are unreferenced. r1 lingers in the running batch for one overlap step
+        # after finishing, so drain to idle before flushing or the flush is a no-op
+        # and r2 re-hits r1's stale prefix.
+        for _ in range(5):
+            yield
         t.evict_radix(prefix_tokens=None)
         yield
 
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r2)
         assert r2.finished
-        assert r2.chunks_done >= 2
-        assert r2.req.cached_tokens == 0
+        assert r2.chunks_done >= 2, (
+            f"after eviction r2 must re-chunk from scratch; "
+            f"chunks_done={r2.chunks_done} cached_tokens={r2.req.cached_tokens}"
+        )
+        assert (
+            r2.req.cached_tokens == 0
+        ), f"eviction must clear r1's prefix; cached_tokens={r2.req.cached_tokens}"
         assert r2.kv_pages == 0
         assert r2.lock_refs == 0
 
@@ -84,8 +95,11 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_finished(r1)
         assert r1.finished
 
+        # Residual past the cached prefix must EXCEED chunk_size, or it completes in
+        # one non-chunked prefill (a residual of exactly chunk_size does not chunk).
+        # 2 * chunk_size of fresh tail guarantees the chunked-resume branch runs.
         r2 = t.start_req(
-            prompt_len=VERY_LONG_PROMPT_LEN + DEFAULT_CHUNK_SIZE, max_new_tokens=2
+            prompt_len=VERY_LONG_PROMPT_LEN + 2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2
         )
         yield from run_until_finished(r2)
         assert r2.finished
@@ -127,7 +141,14 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_finished(r1)
         r2 = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=1)
         yield from run_until_finished(r2)
-        assert r2.chunks_done == 1
+        # r2 hits r1's full chunk_size prefix, leaving a residual of exactly
+        # chunk_size. A residual equal to chunk_size completes in one non-chunked
+        # prefill (the chunked path engages only when the residual exceeds the chunk
+        # budget), so chunks_done is 0 -- the defining behavior at this boundary.
+        assert r2.chunks_done == 0, (
+            f"residual of exactly chunk_size must not chunk; "
+            f"chunks_done={r2.chunks_done} cached_tokens={r2.req.cached_tokens}"
+        )
 
     def test_radix_two_distinct_prefixes(self):
         self.server.execute_script(self._script_radix_two_distinct_prefixes)
@@ -231,6 +252,10 @@ class TestRadixBasic(ScriptedTestCase):
         yield from run_until_finished(r_warm, max_steps=400)
         assert r_warm.finished
 
+        # Drain the overlap lag so r_warm is fully unreferenced before flushing;
+        # otherwise evict_radix's flush is a no-op and the warm prefix survives.
+        for _ in range(5):
+            yield
         t.evict_radix(prefix_tokens=None)
         r = t.start_req(
             prompt_len=warm_len + DEFAULT_CHUNK_SIZE * 2,
@@ -240,7 +265,10 @@ class TestRadixBasic(ScriptedTestCase):
         assert r.finished
         # The warm prefix was evicted before r was submitted, so r must miss
         # the cache and re-chunk its whole 6-chunk prompt from scratch.
-        assert r.req.cached_tokens == 0
+        assert r.req.cached_tokens == 0, (
+            f"eviction must clear the warm prefix; "
+            f"cached_tokens={r.req.cached_tokens} chunks_done={r.chunks_done}"
+        )
         assert r.chunks_done >= 2
         assert r.kv_pages == 0
         assert r.lock_refs == 0
