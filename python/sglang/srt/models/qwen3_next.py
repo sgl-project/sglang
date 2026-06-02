@@ -813,6 +813,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             or not self.attn_output_gate
+            or torch.compiler.is_compiling()
         ):
             q, k, v, gate = self.forward_prepare_native(
                 positions=positions,
