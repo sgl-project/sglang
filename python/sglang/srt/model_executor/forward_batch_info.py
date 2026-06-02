@@ -994,13 +994,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
         # make sure that each rank has the same number of tokens to do collective communication.
-        # Zigzag (in-seq-split) CP additionally needs each rank's tokens divisible into
-        # 2 * CP chunks for load balance, so it pads to 2 * attn_cp_size; other CP modes
-        # (e.g. round-robin) only pad to attn_cp_size. With CP off nothing is padded here:
-        # the extra even-length padding breaks EAGLE/MTP draft prefill (NaN draft logits,
-        # see #23269).
-        # FIXME(kpham-sgl): make the EAGLE/MTP draft prefill-extend path tolerate padded
-        # dummy tokens so this padding does not need CP-mode-specific gating.
+        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
+        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
+        # prefill with NaN draft logits, see #23269).
+        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
         cp_align_size = get_cp_padding_align_size()
         if cp_align_size > 1:
             for i in range(sync_group_size):
