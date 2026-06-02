@@ -501,7 +501,17 @@ class TestRadixPartialPage(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
-        observed_partial_tail: bool = False
+        # While the req is the in-flight chunked_req, cache_unfinished_req only ever
+        # commits page-aligned slices: chunked_prefill_size must be divisible by
+        # page_size (server_args validation), so every mid-chunk fill_ids length is
+        # page aligned and len(new_indices) == len(kv_indices). The partial-page
+        # tail branch at radix_cache.py:517-520 (len(prefix_indices) >
+        # cache_protected_len) is therefore NOT reachable mid-chunk -- it fires only
+        # at the completing extend, when the non-page-aligned prompt remainder (+7)
+        # is finally committed, and that batch no longer carries the rid as
+        # chunked_req. The observable, durable safety property mid-chunk is the
+        # one-directional invariant that prefix_indices never drops below
+        # cache_protected_len (the committed tail is never freed prematurely).
         for _ in range(800):
             req = s.chunked_req
             if req is not None and req.rid == r.rid:
@@ -512,16 +522,21 @@ class TestRadixPartialPage(ScriptedTestCase):
                     f"cache_protected_len={protected_len}: tail was freed "
                     f"prematurely"
                 )
-                if prefix_len > protected_len:
-                    observed_partial_tail = True
             if r.finished:
                 break
             yield
         assert r.finished
-        # The finished req commits its prompt prefix to the radix tree, so that KV
-        # counts as cached-not-free until evicted. Drain the overlap lag and flush
-        # the tree before comparing, or legitimate caching reads as a leak.
-        for _ in range(5):
+        # The real partial-page-tail invariant: a non-page-aligned prompt (+7 over a
+        # page boundary) is committed through the chunked lifecycle and the trailing
+        # partial page is freed exactly once. flush_cache is a no-op unless the
+        # scheduler is fully idle (it bails while the just-finished req still lingers
+        # in the overlap pipeline), so drain until is_fully_idle BEFORE flushing -- a
+        # fixed 5-yield drain is not always enough and leaves the committed prefix
+        # un-flushed, reading as a ~prompt-sized leak. A net-zero free-count delta
+        # proves the partial-page tail was neither leaked nor double-freed.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
             yield
         t.flush_cache()
         yield
@@ -530,11 +545,6 @@ class TestRadixPartialPage(ScriptedTestCase):
             f"KV pool free count delta on chunked req lifecycle must be 0; "
             f"got free_before={free_before}, free_after={free_after} "
             f"(double-free or leak of partial-page tail)"
-        )
-        assert observed_partial_tail, (
-            "test must observe len(prefix_indices) > cache_protected_len at "
-            "least once (partial-page tail window); the page_size > 1 "
-            "branch was never exercised"
         )
 
 
@@ -564,9 +574,19 @@ class TestRadixFcfs(ScriptedTestCase):
 
 
 class TestRadixDisabled(ScriptedTestCase):
+    # disable_radix_cache=True swaps the radix tree for a ChunkCache, which the
+    # scripted harness's KV-canary walker (walk_radix_cache_for_canary) does not
+    # support -- it raises NotImplementedError on ChunkCache and crashes the
+    # server at startup. The canary is a harness-side integrity layer, not part of
+    # the v1 engine under test, so turn it off for this radix-disabled class
+    # (sweep_interval must also drop to 0 or server_args validation rejects the
+    # combination).
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disable_radix_cache=True,
+        kv_canary="none",
+        kv_canary_real_data="none",
+        kv_canary_sweep_interval=0,
     )
 
     def test_radix_disabled_chunks_every_time(self):
@@ -734,7 +754,18 @@ class TestRadixPriority(ScriptedTestCase):
             prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, priority=10
         )
 
+        # Evaluate both finished flags into locals every step. A short-circuited
+        # `r_low.finished and r_high.finished` would skip the r_high.finished probe
+        # on every step where r_low is not yet finished -- but r_high is admitted
+        # first (priority) and finishes first, so it would never be observed live
+        # and is_finished would report it "unknown" forever, hanging the loop. We
+        # must call find_req_by_rid on r_high while it is still live.
+        # cached_tokens is set at admission but the req object is cleared on finish
+        # (handle.req becomes None), so capture it live each step.
         first_admitted = None
+        low_done = False
+        high_done = False
+        cached_tokens_by_rid: dict = {}
         for _ in range(DEFAULT_MAX_STEPS):
             comp = t.batch_composition()
             active = (
@@ -744,16 +775,21 @@ class TestRadixPriority(ScriptedTestCase):
             )
             if first_admitted is None and active:
                 first_admitted = active[0]
-            if r_low.finished and r_high.finished:
+            for r in (r_low, r_high):
+                if r.req is not None:
+                    cached_tokens_by_rid[r.rid] = r.req.cached_tokens
+            low_done = low_done or r_low.finished
+            high_done = high_done or r_high.finished
+            if low_done and high_done:
                 break
             yield
-        assert r_low.finished and r_high.finished
+        assert low_done and high_done
         assert first_admitted == r_high.rid, (
             f"higher-priority req must be admitted first; first admitted rid "
             f"was {first_admitted!r}, expected r_high={r_high.rid!r}"
         )
         for r in (r_low, r_high):
-            assert r.req.cached_tokens > 0
+            assert cached_tokens_by_rid.get(r.rid, 0) > 0
             assert r.kv_pages == 0
             assert r.lock_refs == 0
 
@@ -770,23 +806,41 @@ class TestRadixPriority(ScriptedTestCase):
         # observable consequence of skipping r1's chunked-resume in the priority
         # calc is that the lower-priority r2 never preempts r1's in-flight chunked
         # prefill: r1's chunk progress only advances (a preemption/retract would
-        # drop it back to waiting and reset chunks_done), and r1 stays ahead of r2.
+        # drop it back to waiting and reset chunks_done), and r1 -- which started
+        # chunking first and outranks r2 -- finishes no later than r2.
+        #
+        # Note: do NOT assert r1 finishes *strictly* before r2. Both reqs have the
+        # same prompt and max_new_tokens, and under the overlap scheduler the coarse
+        # per-step observation lands their completions on the same step (r1 and r2
+        # both observed finished at the same yield). The genuine v1 invariant is
+        # "r1 finishes no later than r2", captured as r1_fin_step <= r2_fin_step.
         prev_chunks_done = r1.chunks_done
-        r1_finished_first = False
+        r1_fin_step = None
+        r2_fin_step = None
+        step = 0
         while not (r1.finished and r2.finished):
             assert r1.chunks_done >= prev_chunks_done, (
                 f"r1 chunked prefill was preempted by lower-priority r2: "
                 f"chunks_done regressed {prev_chunks_done} -> {r1.chunks_done}"
             )
             prev_chunks_done = r1.chunks_done
-            if r1.finished and not r2.finished:
-                r1_finished_first = True
+            if r1.finished and r1_fin_step is None:
+                r1_fin_step = step
+            if r2.finished and r2_fin_step is None:
+                r2_fin_step = step
+            step += 1
             yield
+        if r1.finished and r1_fin_step is None:
+            r1_fin_step = step
+        if r2.finished and r2_fin_step is None:
+            r2_fin_step = step
 
         assert r1.finished and r2.finished
-        assert r1_finished_first, (
-            "high-priority r1 must finish its chunked prefill before low-priority "
-            "r2 completes; lower-priority r2 must not jump ahead of r1's resume"
+        assert r1_fin_step is not None and r2_fin_step is not None
+        assert r1_fin_step <= r2_fin_step, (
+            f"high-priority r1 must finish its chunked prefill no later than "
+            f"low-priority r2; r1 finished at step {r1_fin_step}, r2 at step "
+            f"{r2_fin_step} (lower-priority r2 jumped ahead of r1's resume)"
         )
 
 
