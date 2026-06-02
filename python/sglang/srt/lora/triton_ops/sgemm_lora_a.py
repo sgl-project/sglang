@@ -77,8 +77,7 @@ def _sgemm_lora_a_kernel(
         return
 
     # Adjust N (stack_num * max_rank) to this adapter's actual rank.
-    if SPLIT_K == 1:
-        N = tl.minimum(N, rank * stack_num)
+    N = tl.minimum(N, rank * stack_num)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -180,19 +179,9 @@ def sgemm_lora_a_fwd(
         if base_grid < num_sms and num_k_tiles >= 8:
             split_k = max(1, min(2 * num_sms // base_grid, num_k_tiles, 16))
 
-    # Launch-config tuning applies only to the split-K path; SPLIT_K == 1 keeps
-    # Triton's defaults so it stays byte-identical to the original kernel.
     launch_kwargs = {}
     if split_k > 1:
-        # Pre-zeroed accumulator in x.dtype: the K-splits atomic-add into it.
-        # Keeping it in x.dtype (bf16) lets the bf16 atomic vectorize into a
-        # packed .v2 store and avoids a trailing fp32->bf16 cast.
-        output = torch.zeros((S, R), device=x.device, dtype=x.dtype)
-        # Tuned on B200 (sweep across K/bs): num_stages=3 is a free win (short
-        # K-loop, nothing to pipeline beyond ~3); the tiny 16xR tile over-fills
-        # at num_warps>=8, so use 2 warps at high batch (small split_k, device
-        # already fairly full) and 4 at low batch (needs more warps to hide
-        # latency). Best config is shape-dependent but these are near-optimal.
+        output = torch.zeros((S, R), device=x.device, dtype=torch.float32)
         launch_kwargs = {
             "num_warps": 2 if split_k <= 4 else 4,
             "num_stages": 3,
