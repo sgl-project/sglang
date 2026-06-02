@@ -25,8 +25,11 @@ import logging
 import os
 import random
 import tempfile
+import uuid
+from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -35,6 +38,9 @@ from sglang.srt.arg_groups.argparse_actions import (
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    parse_ib_device_config,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
@@ -95,6 +101,8 @@ LLAMA4_MODEL_ARCHS = (
 )
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+    SAMPLING_BACKEND_CHOICES.add("token_oracle")
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -447,6 +455,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    load_snapshot_publish_interval: int = 15
     use_ray: bool = False
     custom_sigquit_handler: Optional[Callable] = None
 
@@ -590,8 +599,6 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
-    speculative_adaptive: bool = False
-    speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
@@ -604,6 +611,10 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
+
+    # Adaptive speculative decoding
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -769,6 +780,9 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     disable_attn_tp_gather: bool = False
     gc_threshold: Optional[List[int]] = None
+    kv_canary: str = "none"
+    kv_canary_real_data: str = "none"
+    kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
     dsa_prefill_cp_mode: str = "round-robin-split"
@@ -982,6 +996,9 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+
+        # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
+        self._validate_cutedsl_a2a_token_budget()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -2049,6 +2066,20 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
 
+            if is_sm120_supported():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "marlin"
+                    logger.info(
+                        "Use marlin as MoE runner backend on SM120 for DeepseekV4"
+                    )
+                # SM120 lacks tcgen05/TMEM: disable features that depend on
+                # DeepGEMM or require >99KB SMEM (topk_v2).
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
@@ -2056,6 +2087,8 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_cpu() and cpu_has_amx_support():
+                    self.attention_backend = "intel_amx"
                 elif is_xpu():
                     self.attention_backend = "intel_xpu"
                 elif is_hip():
@@ -2081,6 +2114,7 @@ class ServerArgs:
                 "fa3",
                 "fa4",
                 "ascend",
+                "intel_amx",
                 "intel_xpu",
                 "aiter",
             ]
@@ -2128,6 +2162,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
+                    # The AITER MXFP4 fused-MoE path for GPT-OSS expects the
+                    # SEPARATED gate/up tile layout (matches the
+                    # `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+                    # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
+                    # callers default to INTERLEAVE; opt this path out
+                    # unless the user explicitly overrode it.
+                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
@@ -2144,6 +2185,7 @@ class ServerArgs:
                     self.ep_size == 1
                     and is_triton_kernels_available()
                     and self.quantization is None
+                    and not (is_cpu() and cpu_has_amx_support())
                 ):
                     # The triton_kernels package segfaults on Blackwell (B200)
                     # with NVIDIA driver >= 595. Fall back to triton backend.
@@ -2208,7 +2250,21 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
                 )
-        elif "Step3p5ForCausalLM" in model_arch:
+        elif (
+            "Step3p5ForCausalLM" in model_arch
+            or "Step3p7ForConditionalGeneration" in model_arch
+        ):
+            if self.is_attention_backend_not_set():
+                if is_blackwell_supported():
+                    self.attention_backend = "fa4"
+                    logger.info(
+                        "Auto-select fa4 attention backend for Step3p7 on Blackwell."
+                    )
+                elif is_sm90_supported():
+                    self.attention_backend = "fa3"
+                    logger.info(
+                        "Auto-select fa3 attention backend for Step3p7 on Hopper."
+                    )
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(
@@ -3092,17 +3148,14 @@ class ServerArgs:
     def _handle_linear_attn_backend(self):
         import torch
 
-        # SM100+: default to FlashInfer GDN decode when the user hasn't
-        # explicitly chosen a decode backend and mamba-ssm-dtype is bf16
-        # (required by FlashInfer GDN on SM100+).
+        # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
+        # when the user hasn't explicitly chosen a decode backend and
+        # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
-        # Excluded when MTP speculative decoding is enabled because
-        # FlashInfer GDN MTP verify is not yet supported on SM100+.
         if (
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
-            and self.speculative_algorithm is None
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
@@ -3302,6 +3355,62 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
+    def cutedsl_moe_max_num_tokens(self) -> int:
+        """Largest number of tokens a single forward routes through a CuteDSL
+        MoE layer on one (DP) rank. Single source of truth for both the
+        standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
+        budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
+        capture (piecewise_cuda_graph_max_tokens), and decode/verify
+        (cuda_graph_max_bs * num_tokens_per_bs) bounds; num_tokens_per_bs is
+        speculative_num_draft_tokens under speculative decoding, else 1.
+        """
+        if self.speculative_algorithm:
+            num_tokens_per_bs = self.speculative_num_draft_tokens or 1
+        else:
+            num_tokens_per_bs = 1
+        prefill_tokens = self.max_prefill_tokens
+        if not self.disable_piecewise_cuda_graph:
+            prefill_tokens = max(
+                prefill_tokens, self.piecewise_cuda_graph_max_tokens or 0
+            )
+        decode_tokens = (self.cuda_graph_max_bs or 0) * num_tokens_per_bs
+        return max(prefill_tokens, decode_tokens)
+
+    def _validate_cutedsl_a2a_token_budget(self):
+        """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
+        largest CuteDSL MoE forward. Runs after speculative decoding is resolved
+        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_bs."""
+        if not (
+            self.moe_a2a_backend == "flashinfer"
+            and self.moe_runner_backend == "flashinfer_cutedsl"
+            and self.max_prefill_tokens > 0
+            and self.disaggregation_mode != "decode"
+        ):
+            return
+        required_tokens = self.cutedsl_moe_max_num_tokens()
+        max_dispatch_tokens_per_rank = get_int_env_var(
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
+        )
+        max_cutedsl_tokens = max_dispatch_tokens_per_rank * self.ep_size
+        if max_cutedsl_tokens < required_tokens:
+            required_per_rank = (required_tokens + self.ep_size - 1) // self.ep_size
+            raise ValueError(
+                "FlashInfer MoE A2A with flashinfer_cutedsl requires "
+                "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
+                "ep_size to cover the largest CuteDSL MoE forward "
+                f"({required_tokens} tokens). Otherwise the FlashInfer "
+                "dispatcher can crash at runtime with "
+                "`ValueError: num_tokens (...) exceeds max_num_tokens (...)`. "
+                "Current values: "
+                f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                f"{max_dispatch_tokens_per_rank}, ep_size={self.ep_size}, "
+                f"capacity={max_cutedsl_tokens}, required={required_tokens}. "
+                f"Set `export "
+                f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                f"{required_per_rank}` or lower the relevant limit "
+                f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
+            )
+
     def _handle_a2a_moe(self):
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
             logger.warning(
@@ -3397,37 +3506,6 @@ class ServerArgs:
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
-            if (
-                self.moe_runner_backend == "flashinfer_cutedsl"
-                and self.max_prefill_tokens is not None
-                and self.max_prefill_tokens > 0
-                and self.disaggregation_mode != "decode"
-            ):
-                max_dispatch_tokens_per_rank = get_int_env_var(
-                    "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
-                )
-                max_cutedsl_tokens = max_dispatch_tokens_per_rank * self.ep_size
-                if max_cutedsl_tokens < self.max_prefill_tokens:
-                    required_per_rank = (
-                        self.max_prefill_tokens + self.ep_size - 1
-                    ) // self.ep_size
-                    raise ValueError(
-                        "FlashInfer MoE A2A with flashinfer_cutedsl requires "
-                        "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
-                        "ep_size to cover --max-prefill-tokens. Otherwise the "
-                        "FlashInfer dispatcher can crash at runtime with "
-                        "`ValueError: num_tokens (...) exceeds max_num_tokens (...)` "
-                        "when a local DP rank schedules too many prefill tokens. "
-                        "Current values: "
-                        f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                        f"{max_dispatch_tokens_per_rank}, ep_size={self.ep_size}, "
-                        f"capacity={max_cutedsl_tokens}, "
-                        f"max_prefill_tokens={self.max_prefill_tokens}. "
-                        f"Set `export "
-                        f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                        f"{required_per_rank}` or lower `--max-prefill-tokens` "
-                        f"to <= {max_cutedsl_tokens}."
-                    )
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
@@ -3859,15 +3937,16 @@ class ServerArgs:
                 f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
             )
 
-    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
+    def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB device names, a per-GPU JSON mapping,
+                or a path to a JSON file containing that mapping.
 
         Returns:
-            Normalized comma-separated string of validated device names, or None if input is None.
+            A normalized comma-separated string or per-GPU JSON mapping string, or None if input is None.
         """
         if device_str is None:
             logger.warning(
@@ -3875,20 +3954,34 @@ class ServerArgs:
             )
             return None
 
-        # Strip whitespace from device names
-        devices = [d.strip() for d in device_str.split(",") if d.strip()]
-        if len(devices) == 0:
-            raise ValueError("No valid IB devices specified")
+        def _normalize_device_group(raw_value: str, context: str) -> str:
+            if not isinstance(raw_value, str):
+                raise ValueError(
+                    f"Invalid IB device format for {context}: expected a string. "
+                    f"Got {type(raw_value)}"
+                )
+            devices = [d.strip() for d in raw_value.split(",") if d.strip()]
+            if not devices:
+                raise ValueError(f"No valid IB devices specified for {context}")
+            unique_devices = list(dict.fromkeys(devices))
+            if len(unique_devices) != len(devices):
+                logger.warning(
+                    "Duplicate IB devices specified for %s: %s. Deduplicating to: %s",
+                    context,
+                    raw_value,
+                    ",".join(unique_devices),
+                )
+            invalid_devices = [d for d in unique_devices if d not in available_devices]
+            if len(invalid_devices) != 0:
+                raise ValueError(
+                    f"Invalid IB devices specified for {context}: {invalid_devices}. "
+                    f"Available devices: {sorted(available_devices)}"
+                )
+            return ",".join(unique_devices)
 
-        # Deduplicate while preserving order
-        unique_devices = list(dict.fromkeys(devices))
-        if len(unique_devices) != len(devices):
-            logger.warning(
-                "Duplicate IB devices specified: %s. Deduplicating to: %s",
-                device_str,
-                ",".join(unique_devices),
-            )
-            devices = unique_devices
+        normalized_input = device_str.strip()
+        if not normalized_input:
+            raise ValueError("No valid IB devices specified")
 
         # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
@@ -3902,15 +3995,22 @@ class ServerArgs:
         if len(available_devices) == 0:
             raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
 
-        # Check for invalid devices
-        invalid_devices = [d for d in devices if d not in available_devices]
-        if len(invalid_devices) != 0:
-            raise ValueError(
-                f"Invalid IB devices specified: {invalid_devices}. "
-                f"Available devices: {sorted(available_devices)}"
+        parsed_config = parse_ib_device_config(normalized_input)
+        if isinstance(parsed_config, str):
+            return _normalize_device_group(normalized_input, "all GPUs")
+        assert parsed_config is not None
+
+        normalized_mapping: Dict[str, str] = {}
+        for gpu_key, gpu_devices in parsed_config.items():
+            normalized_key = str(gpu_key)
+            normalized_mapping[normalized_key] = _normalize_device_group(
+                gpu_devices, f"GPU {normalized_key}"
             )
 
-        return ",".join(devices)
+        if not normalized_mapping:
+            raise ValueError("No valid GPU mappings found in IB device JSON")
+
+        return json.dumps(normalized_mapping, separators=(",", ":"))
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
@@ -4909,6 +5009,12 @@ class ServerArgs:
             "--sleep-on-idle",
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
+        )
+        parser.add_argument(
+            "--load-snapshot-publish-interval",
+            type=int,
+            default=ServerArgs.load_snapshot_publish_interval,
+            help="Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
         )
         parser.add_argument(
             "--use-ray",
@@ -6224,6 +6330,36 @@ class ServerArgs:
             help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
+            "--kv-canary",
+            type=str,
+            default=ServerArgs.kv_canary,
+            choices=["none", "log", "raise"],
+            help=(
+                "KV cache canary mode. "
+                "'none' disables the canary (default). "
+                "'log' prints them while the server keeps running (production-safe). "
+                "'raise' fails the server on the first detected mismatch (CI lane)."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-real-data",
+            type=str,
+            default=ServerArgs.kv_canary_real_data,
+            choices=[m.name.lower() for m in RealKvHashMode],
+            help=(
+                "Check the real KV-cache in the canary. "
+                "'none' (default) disables the feature. "
+                "'partial' checks the first 16 bytes of each real-KV slot. "
+                "'all' checks the full real-KV slot."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-sweep-interval",
+            type=int,
+            default=ServerArgs.kv_canary_sweep_interval,
+            help="Every N forward steps, run a full-pool sweep.",
+        )
+        parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
@@ -6715,9 +6851,12 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
-            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+            help="The InfiniBand devices for disaggregation transfer. Supports a single device "
+            "(e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list "
+            "(e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping "
+            '(e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), '
+            "or a path to a JSON file containing that mapping. Default is None, which triggers "
+            "automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",
@@ -7050,8 +7189,9 @@ class ServerArgs:
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
 
-    def effective_max_speculative_num_draft_tokens(self) -> Optional[int]:
-        """Return the maximum draft-token count runtime speculative decoding may use."""
+    @cached_property
+    def max_speculative_num_draft_tokens(self) -> Optional[int]:
+        """Return the maximum draft-token count speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:
@@ -7116,10 +7256,11 @@ class ServerArgs:
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-        assert self.moe_dense_tp_size in {
-            1,
+        assert self.moe_dense_tp_size in (
             None,
-        }, "moe_dense_tp_size only support 1 and None currently"
+            1,
+            self.tp_size,
+        ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
         if not is_runai_obj_uri(self.served_model_name):
@@ -7269,6 +7410,11 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
+            raise ValueError(
+                "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
@@ -7712,6 +7858,14 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
+    # empty when IPC mode derives the address from instance_id).
+    load_collector_ipc_name: str = ""
+
+    # Stable token shared by all processes in one server instance, used to
+    # derive the /dev/shm path for load snapshots.
+    instance_id: str = ""
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -7730,6 +7884,8 @@ class PortArgs:
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
+        instance_id = uuid.uuid4().hex[:12]
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -7740,6 +7896,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                instance_id=instance_id,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -7754,6 +7911,7 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
+            load_collector_port = port_base + 5
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -7769,6 +7927,8 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
+                    if server_args.nnodes > 1:
+                        wait_port_available(load_collector_port, "load_collector_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -7791,6 +7951,10 @@ class PortArgs:
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                load_collector_ipc_name=NetworkAddress(
+                    dist_init_host, load_collector_port
+                ).to_tcp(),
+                instance_id=instance_id,
             )
 
 
