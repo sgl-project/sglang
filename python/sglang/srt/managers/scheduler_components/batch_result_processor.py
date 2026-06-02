@@ -864,22 +864,37 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
+        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
         at_boundary, track_seqlen = self._mamba_check_track_boundary(
             req, batch, result, i
         )
         if not at_boundary:
+            if (
+                lazy
+                and batch.mamba_lazy_backup_mask_cpu is not None
+                and i < len(batch.mamba_lazy_backup_mask_cpu)
+                and batch.mamba_lazy_backup_mask_cpu[i]
+            ):
+                self.mamba_lazy_post_decode_at_boundary(req, batch)
             return
 
-        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
         if not lazy:
             req.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
                 )
             )
-        req.mamba_last_track_seqlen = track_seqlen
-        if lazy:
+            req.mamba_last_track_seqlen = track_seqlen
+            return
+
+        if req.finished():
+            # Cache the backed-up previous checkpoint instead of the boundary
+            # slot that may have been overwritten by an overlapped stale forward.
             self.mamba_lazy_post_decode_at_boundary(req, batch)
+            return
+
+        req.mamba_last_track_seqlen = track_seqlen
+        self.mamba_lazy_post_decode_at_boundary(req, batch)
 
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
@@ -908,11 +923,10 @@ class SchedulerBatchResultProcessor:
     ):
         """Post-decode cleanup at a lazy-mode track boundary.
 
-        For running reqs: free the old ping-pong slot so we go back to
-        holding only 1 slot until the next boundary.
-        For finished reqs: if prealloc failed (other slot is -1), the
-        forward overwrote the only slot with corrupted state — mark
-        is_insert=False so cache_finished_req skips the insert.
+        For running reqs: free the temporary backup so we go back to holding
+        only 1 slot until the next boundary.
+        For finished reqs: keep the backup for cache insertion; if no backup
+        exists, skip insertion because the only slot may have been overwritten.
         """
         other_idx = 1 - req.mamba_next_track_idx
         if req.finished():
@@ -920,7 +934,7 @@ class SchedulerBatchResultProcessor:
                 req.mamba_lazy_is_insert = False
             return
         pool = batch.req_to_token_pool
-        old_val = req.mamba_ping_pong_track_buffer[other_idx]
-        if old_val.item() != -1:
-            pool.mamba_pool.free(old_val.unsqueeze(0))
+        backup_val = req.mamba_ping_pong_track_buffer[other_idx]
+        if backup_val.item() != -1:
+            pool.mamba_pool.free(backup_val.unsqueeze(0))
         pool.set_mamba_ping_pong_slot(req, other_idx, -1)

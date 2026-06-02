@@ -301,7 +301,22 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            if get_global_server_args().enable_mamba_extra_buffer():
+            server_args = get_global_server_args()
+            if server_args.enable_mamba_extra_buffer():
+                if server_args.enable_mamba_extra_buffer_lazy():
+                    interval = server_args.mamba_track_interval
+                    seq_lens_cpu = (
+                        batch.seq_lens_cpu.tolist()
+                        if batch.seq_lens_cpu is not None
+                        else [req.seqlen for req in batch.reqs]
+                    )
+                    batch.mamba_lazy_backup_at_boundary(
+                        [
+                            seq_len // interval
+                            != (seq_len + self.draft_token_num) // interval
+                            for seq_len in seq_lens_cpu
+                        ]
+                    )
                 set_mamba_track_indices_from_reqs(batch)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None

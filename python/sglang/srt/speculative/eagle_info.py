@@ -16,7 +16,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -169,15 +172,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             bs,
         )
 
-        if get_global_server_args().enable_mamba_extra_buffer():
-            batch.mamba_track_indices = torch.tensor(
-                [
-                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
-                    for req in batch.reqs
-                ],
-                dtype=torch.int64,
-                device=batch.device,
-            )
+        server_args = get_global_server_args()
+        if server_args.enable_mamba_extra_buffer():
+            if server_args.enable_mamba_extra_buffer_lazy():
+                interval = server_args.mamba_track_interval
+                seq_lens_cpu = (
+                    batch.seq_lens_cpu.tolist()
+                    if batch.seq_lens_cpu is not None
+                    else [req.seqlen for req in batch.reqs]
+                )
+                batch.mamba_lazy_backup_at_boundary(
+                    [
+                        seq_len // interval
+                        != (seq_len + self.draft_token_num) // interval
+                        for seq_len in seq_lens_cpu
+                    ]
+                )
+            set_mamba_track_indices_from_reqs(batch)
             batch.mamba_track_mask = None
             batch.mamba_track_seqlens = None
 

@@ -649,10 +649,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_ping_pong_keep_idx(self, req: "Req") -> int:
         """Return the ping-pong index holding the most recent tracked state.
 
-        In lazy mode the valid state stays at next_track_idx (no eager swap).
+        In lazy mode the valid state normally stays at next_track_idx. A
+        short-lived backup in the other slot takes priority during overlap.
         In normal mode it is at the "other" index (swapped after each track).
         """
         if self.enable_mamba_extra_buffer_lazy:
+            backup_idx = self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+            if req.mamba_ping_pong_track_buffer[backup_idx].item() != -1:
+                return backup_idx
             return req.mamba_next_track_idx
         return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
 
