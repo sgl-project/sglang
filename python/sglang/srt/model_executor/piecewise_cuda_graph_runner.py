@@ -370,27 +370,32 @@ class PiecewiseCudaGraphRunner:
 
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
-        buffers = self.buffers
-        input_ids = buffers.input_ids[:num_tokens]
-        input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
-        positions = buffers.positions[:num_tokens]
-        mrope_positions = (
-            buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+        registry = self.buffer_registry
+        bs = 1
+
+        def _slot(name):
+            return registry.get_slot(name).view(bs, num_tokens)
+
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
+        input_embeds = (
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        mrope_positions = (
+            _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
+        )
         mamba_track_indices = (
-            buffers.mamba_track_indices[:1]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:1]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:1]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
         )
         with torch.device(self.device):
@@ -523,32 +528,35 @@ class PiecewiseCudaGraphRunner:
                     self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
-        buffers = self.buffers
+        registry = self.buffer_registry
         bs = 1
 
-        # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
-        input_embeds = buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+        # Graph inputs — views into the registry's (adopted) graph-resident
+        # slots; capture burns these addresses into the graph.
+        def _slot(name):
+            return registry.get_slot(name).view(bs, num_tokens)
 
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
+        input_embeds = (
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
+        )
+        mrope_positions = (
+            _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
+        )
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
-        )
-        positions = buffers.positions[:num_tokens]
-        mrope_positions = (
-            buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
         )
 
         global_dp_buffer_len = None
