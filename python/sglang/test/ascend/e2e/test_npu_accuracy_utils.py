@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -28,8 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-AISBENCHMARK = "aisbench"
-BENCHMARK_TOOL_DEFAULT = AISBENCHMARK
+EVALSCOPE = "evalscope"
+BENCHMARK_TOOL_DEFAULT = EVALSCOPE
 
 PYTHON_FOR_TEST_TOOL = "test_env_transformers_tool/bin/python"
 if not os.path.exists(PYTHON_FOR_TEST_TOOL) or not os.access(
@@ -41,7 +42,6 @@ logger.info(f"PYTHON_FOR_TEST_TOOL: {PYTHON_FOR_TEST_TOOL}")
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
-# Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
 
 if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
@@ -55,40 +55,67 @@ else:
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_SERVER_PORT_FOR_TEST + 66}"
 
 
-def run_aisbench(
+def run_evalscope(
     host,
     port,
-    model_path,
-    dataset_name,
-    dataset_type,
-    output_len,
-    max_concurrency,
-    num_prompts,
-    request_rate,
-    generation_kwargs=None,
+    model,
+    datasets,
+    dataset_args=None,
+    eval_batch_size=1,
+    limit=100000,
+    generation_config=None,
+    dataset_dir=None,
+    timeout=60000,
+    stream=True,
+    eval_type="openai_api",
 ):
 
     metrics_path = os.getenv("METRICS_DATA_FILE")
-    result_path = "./aisbench_result" if not metrics_path else metrics_path
+    result_path = "./evalscope_result" if not metrics_path else metrics_path
     logger.info(f"The metrics result file: {result_path}")
 
-    cmd = f"/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_aisbench.sh "
-    cmd += f"--mode accuracy "
-    cmd += f"--ip {host} "
-    cmd += f"--port {str(port)} "
-    cmd += f"--model {os.path.basename(model_path)} "
-    cmd += f"--model-path {model_path} "
-    cmd += f"--dataset-name {dataset_name} "
-    cmd += f"--dataset-type {dataset_type} "
-    cmd += f"--output-path {result_path} "
-    cmd += f"--output-len {output_len} "
-    cmd += f"--batch-size {max_concurrency} "
-    cmd += f"--num-prompts {num_prompts}"
+    api_url = f"http://{host}:{port}/v1/chat/completions"
 
-    if generation_kwargs:
-        cmd += f" --generation-kwargs '{generation_kwargs}'"
-    if request_rate:
-        cmd += f" --request_rate '{request_rate}'"
+    if generation_config is None:
+        generation_config = {"max_tokens": 512}
+
+    config_dict = {
+        "model": model,
+        "api_url": api_url,
+        "eval_type": eval_type,
+        "datasets": datasets,
+        "eval_batch_size": eval_batch_size,
+        "generation_config": generation_config,
+        "timeout": timeout,
+        "stream": stream,
+        "limit": limit,
+        "work_dir": result_path,
+    }
+    if dataset_args:
+        config_dict["dataset_args"] = dataset_args
+    if dataset_dir:
+        config_dict["dataset_dir"] = dataset_dir
+
+    config_json = json.dumps(config_dict, ensure_ascii=False, indent=2)
+    config_json_escaped = config_json.replace("\\", "\\\\").replace("'''", "\\'\\'\\'")
+
+    script_content = "import json\n"
+    script_content += "from evalscope import TaskConfig, run_task\n\n"
+    script_content += f"config = json.loads('''{config_json_escaped}''')\n"
+    script_content += "task_cfg = TaskConfig(**config)\n"
+    script_content += "run_task(task_cfg=task_cfg)\n"
+
+    script_path = f"/tmp/evalscope_run_{model}_{'_'.join(datasets)}.py"
+    with open(script_path, "w") as f:
+        f.write(script_content)
+
+    logger.info(f"Generated evalscope script: {script_path}")
+
+    install_cmd = "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+    subprocess.run(install_cmd, shell=True, check=True)
+
+    python_bin = "test_env_evalscope/bin/python"
+    cmd = f"{python_bin} {script_path}"
 
     logger.info(f"Command: {cmd}")
 
@@ -119,14 +146,41 @@ def run_aisbench(
         metrics = {}
         full_output = "\n".join(output_lines)
 
-        matches = re.findall(r"accuracy\s+[a-zA-Z]+\s+([\d.]+)", full_output)
+        report_match = re.search(r"Dump report to:\s*(\S+)", full_output)
+        if report_match:
+            report_path = report_match.group(1)
+            logger.info(f"Found evalscope report file: {report_path}")
+            try:
+                with open(report_path, "r") as rf:
+                    report_data = json.load(rf)
+                for item in report_data:
+                    score = item.get("score")
+                    if score is not None:
+                        metrics["accuracy"] = float(score)
+                        logger.info(f"The Final Accuracy from report: {score}")
+                        break
+            except Exception as e:
+                logger.warning(f"Failed to read report file {report_path}: {e}")
 
-        if matches:
-            final_accuracy = float(matches[-1])
-            metrics["accuracy"] = final_accuracy
-            logger.info(f"The Final Accuracy: {final_accuracy}")
-        else:
-            logger.info(f"Can Not Find The Accuracy")
+        if "accuracy" not in metrics:
+            accuracy_patterns = [
+                r"mean_acc\s*.*?│\s*\d+\s*│\s*([\d.]+)\s*│",
+                r"│\s+([\d.]+)\s+│\s+\S+\s+│\s*$",
+                r"accuracy\s*[:=]?\s*([\d.]+)",
+                r"Accuracy\s*[:=]?\s*([\d.]+)",
+                r"score\s*[:=]?\s*([\d.]+)",
+            ]
+
+            for pattern in accuracy_patterns:
+                matches = re.findall(pattern, full_output)
+                if matches:
+                    final_accuracy = float(matches[-1])
+                    metrics["accuracy"] = final_accuracy
+                    logger.info(f"The Final Accuracy from output: {final_accuracy}")
+                    break
+
+        if "accuracy" not in metrics:
+            logger.info("Can Not Find The Accuracy in evalscope output")
 
         return metrics
 
@@ -149,11 +203,6 @@ def run_aisbench(
 
 
 def assert_metrics(self, metrics):
-    """Assert benchmark metrics against expected values.
-
-    Args:
-        metrics (dict): Benchmark metrics dictionary.
-    """
     if not metrics:
         raise Exception("No metrics obtained from benchmark")
 
@@ -169,18 +218,20 @@ class TestAscendAccuracyTestCaseBase(CustomTestCase):
     model = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
-    dataset_name = "gsm8k_gen_4_shot_cot_str"  # gsm8k
-    dataset_type = "gsm8k"
+    datasets = ["gsm8k"]
+    dataset_args = None
+    eval_batch_size = 1
+    limit = 100000
+    generation_config = None
+    dataset_dir = None
+    stream = True
+    timeout = 60000
+    eval_type = "openai_api"
     other_args = None
-    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     max_attempts = 2
     accuracy = 0.1
-    output_len = 512
-    max_concurrency = 1
-    num_prompts = 100000
-    generation_kwargs = None
-    request_rate = None
 
     @classmethod
     def setUpClass(cls):
@@ -198,7 +249,7 @@ class TestAscendAccuracyTestCaseBase(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=cls.timeout,
+            timeout=cls.server_timeout,
             other_args=other_args,
             env=env,
         )
@@ -215,18 +266,21 @@ class TestAscendAccuracyTestCaseBase(CustomTestCase):
         parsed_url = urlparse(self.base_url)
         host = parsed_url.hostname
         port = parsed_url.port
-        if self.benchmark_tool == AISBENCHMARK:
-            metrics = run_aisbench(
+        if self.benchmark_tool == EVALSCOPE:
+            model_name = os.path.basename(self.model)
+            metrics = run_evalscope(
                 host=host,
                 port=port,
-                model_path=self.model,
-                dataset_name=self.dataset_name,
-                dataset_type=self.dataset_type,
-                output_len=self.output_len,
-                max_concurrency=self.max_concurrency,
-                num_prompts=self.num_prompts,
-                request_rate=self.request_rate,
-                generation_kwargs=self.generation_kwargs,
+                model=model_name,
+                datasets=self.datasets,
+                dataset_args=self.dataset_args,
+                eval_batch_size=self.eval_batch_size,
+                limit=self.limit,
+                generation_config=self.generation_config,
+                dataset_dir=self.dataset_dir,
+                stream=self.stream,
+                timeout=self.timeout,
+                eval_type=self.eval_type,
             )
             assert_metrics(self, metrics)
 
@@ -235,18 +289,20 @@ class TestAscendAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     model_config = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
-    dataset_name = "gsm8k_gen_4_shot_cot_str"  # gsm8k
-    dataset_type = "gsm8k"
+    datasets = ["gsm8k"]
+    dataset_args = None
+    eval_batch_size = 1
+    limit = 100000
+    generation_config = None
+    dataset_dir = None
+    stream = True
+    timeout = 60000
+    eval_type = "openai_api"
     other_args = None
-    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     max_attempts = 2
     accuracy = 0.1
-    output_len = 512
-    max_concurrency = 1
-    num_prompts = 100000
-    generation_kwargs = None
-    request_rate = None
 
     @classmethod
     def setUpClass(cls):
@@ -298,18 +354,21 @@ class TestAscendAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         parsed_url = urlparse(self.base_url)
         host = parsed_url.hostname
         port = parsed_url.port
-        if self.benchmark_tool == AISBENCHMARK:
-            metrics = run_aisbench(
+        if self.benchmark_tool == EVALSCOPE:
+            model_name = os.path.basename(self.model_config.get("model_path"))
+            metrics = run_evalscope(
                 host=self.host,
                 port=self.port,
-                model_path=self.model_config.get("model_path"),
-                dataset_name=self.dataset_name,
-                dataset_type=self.dataset_type,
-                output_len=self.output_len,
-                max_concurrency=self.max_concurrency,
-                num_prompts=self.num_prompts,
-                request_rate=self.request_rate,
-                generation_kwargs=self.generation_kwargs,
+                model=model_name,
+                datasets=self.datasets,
+                dataset_args=self.dataset_args,
+                eval_batch_size=self.eval_batch_size,
+                limit=self.limit,
+                generation_config=self.generation_config,
+                dataset_dir=self.dataset_dir,
+                stream=self.stream,
+                timeout=self.timeout,
+                eval_type=self.eval_type,
             )
             assert_metrics(self, metrics)
 
@@ -318,17 +377,19 @@ class TestAscendAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     model_config = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     backend = "sglang"
-    dataset_name = "gsm8k_gen_4_shot_cot_str"  # gsm8k
-    dataset_type = "gsm8k"
+    datasets = ["gsm8k"]
+    dataset_args = None
+    eval_batch_size = 1
+    limit = 100000
+    generation_config = None
+    dataset_dir = None
+    stream = True
+    timeout = 60000
+    eval_type = "openai_api"
     other_args = None
-    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     max_attempts = 2
     accuracy = 0.1
-    output_len = 512
-    max_concurrency = 1
-    num_prompts = 100000
-    generation_kwargs = None
-    request_rate = None
 
     @classmethod
     def setUpClass(cls):
@@ -380,13 +441,10 @@ class TestAscendAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.process = launch_pd_separation_node(cls.model_config)
         logger.info(f"Pd separation node started with PID: {cls.process.pid}")
 
-        # Loop to check if the process is still running
         while True:
             if cls.process.poll() is None:
-                # Process is still running
                 time.sleep(30)
             else:
-                # Process has exited
                 exit_code = cls.process.poll()
                 raise Exception(
                     f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
@@ -397,17 +455,20 @@ class TestAscendAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         parsed_url = urlparse(self.base_url)
         host = parsed_url.hostname
         port = parsed_url.port
-        if self.benchmark_tool == AISBENCHMARK:
-            metrics = run_aisbench(
+        if self.benchmark_tool == EVALSCOPE:
+            model_name = os.path.basename(self.model_config.get("model_path"))
+            metrics = run_evalscope(
                 host=host,
                 port=port,
-                model_path=self.model_config.get("model_path"),
-                dataset_name=self.dataset_name,
-                dataset_type=self.dataset_type,
-                output_len=self.output_len,
-                max_concurrency=self.max_concurrency,
-                num_prompts=self.num_prompts,
-                request_rate=self.request_rate,
-                generation_kwargs=self.generation_kwargs,
+                model=model_name,
+                datasets=self.datasets,
+                dataset_args=self.dataset_args,
+                eval_batch_size=self.eval_batch_size,
+                limit=self.limit,
+                generation_config=self.generation_config,
+                dataset_dir=self.dataset_dir,
+                stream=self.stream,
+                timeout=self.timeout,
+                eval_type=self.eval_type,
             )
             assert_metrics(self, metrics)
