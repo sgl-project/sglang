@@ -277,6 +277,21 @@ class AutoWeightsLoader:
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
     pool = get_token_to_kv_pool()
+
+    # Plan A: the fused QKV+set_kv writer (`fused_qk_norm_rope_store`) assumes
+    # NHD 4D paged storage and `.view(buffer -> (-1, page, H, D))` the pool.
+    # That view succeeds for a SHUFFLE 5D pool because numel matches, but the
+    # data lands at wrong physical positions and silently corrupts the cache.
+    # Force the slow path so the 5D Triton writer dispatches correctly.
+    def _is_vec5d(p):
+        if isinstance(p, SWAKVPool):
+            return getattr(p.full_kv_pool, "kv_cache_layout", "nhd") == (
+                "vectorized_5d"
+            )
+        return getattr(p, "kv_cache_layout", "nhd") == "vectorized_5d"
+
+    if _is_vec5d(pool):
+        return False
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16

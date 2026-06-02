@@ -814,6 +814,11 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        # Plan A: explicit per-pool override for the physical KV layout.
+        # When None (default) the env var SGLANG_KV_CACHE_LAYOUT is consulted.
+        # SWAKVPool passes "nhd" explicitly for its SWA sub-pool so the SWA
+        # decode path continues using unified_attention on the legacy layout.
+        kv_cache_layout: Optional[str] = None,
     ):
         super().__init__(
             size,
@@ -832,6 +837,38 @@ class MHATokenToKVPool(KVCache):
             if swa_v_head_dim is not None
             else v_head_dim if v_head_dim is not None else head_dim
         )
+
+        # Plan A: optional SHUFFLE 5D ("vectorized") physical layout for K/V.
+        # Selected by `SGLANG_KV_CACHE_LAYOUT=vectorized_5d`. When active:
+        #   K shape: (num_blocks, H, D_k // X, page, X)
+        #   V shape: (num_blocks, H, page // X, D_v, X)   where X = 16 / dtype_bytes
+        # aiter `mha_batch_prefill_func` consumes these 5D shapes natively and
+        # aiter `pa_decode_gluon` reads SHUFFLE blocks directly during decode.
+        if kv_cache_layout is not None:
+            layout = kv_cache_layout.lower()
+        else:
+            layout = envs.SGLANG_KV_CACHE_LAYOUT.get().lower()
+        if layout not in ("nhd", "vectorized_5d"):
+            raise ValueError(
+                f"Unsupported SGLANG_KV_CACHE_LAYOUT={layout!r}; "
+                "expected 'nhd' or 'vectorized_5d'."
+            )
+        self.kv_cache_layout = layout
+        if layout == "vectorized_5d":
+            # Pre-flight constraints. Relaxing these requires either an fp8
+            # path on the writer or different X handling on the kernel side.
+            assert self.store_dtype == self.dtype, (
+                "vectorized_5d KV layout requires store_dtype == dtype; "
+                f"got store_dtype={self.store_dtype}, dtype={self.dtype}"
+            )
+            self._kv_vector_x = 16 // self.dtype.itemsize  # 8 for bf16/fp16
+            assert (self.size + self.page_size) % self.page_size == 0
+            assert self.page_size % self._kv_vector_x == 0, (
+                f"page_size={self.page_size} must be divisible by "
+                f"X={self._kv_vector_x} for vectorized_5d layout"
+            )
+            assert self.head_dim % self._kv_vector_x == 0
+            assert self.v_head_dim % self._kv_vector_x == 0
 
         self._create_buffers()
 
@@ -909,24 +946,63 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                if self.kv_cache_layout == "vectorized_5d":
+                    total_slots = self.size + self.page_size
+                    num_blocks = total_slots // self.page_size
+                    x = self._kv_vector_x
+                    # K: (num_blocks, H, D_k // X, page, X)
+                    self.k_buffer = [
+                        torch.zeros(
+                            (
+                                num_blocks,
+                                self.head_num,
+                                self.head_dim // x,
+                                self.page_size,
+                                x,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    # V: (num_blocks, H, page // X, D_v, X)
+                    self.v_buffer = [
+                        torch.zeros(
+                            (
+                                num_blocks,
+                                self.head_num,
+                                self.page_size // x,
+                                self.v_head_dim,
+                                x,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                else:
+                    # [size, head_num, head_dim] for each layer
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (
+                                self.size + self.page_size,
+                                self.head_num,
+                                self.v_head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -1077,6 +1153,27 @@ class MHATokenToKVPool(KVCache):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
+
+        if self.kv_cache_layout == "vectorized_5d":
+            # Late-import to keep the NHD path import-clean.
+            from sglang.srt.layers.attention.utils import (
+                launch_reshape_and_cache_shuffle_5d,
+            )
+
+            # The writer kernel only uses .stride(0) (token stride) of the
+            # source, and assumes (H_kv, D) are contiguous within each token.
+            # Force contiguity here to be safe against non-canonical strides
+            # coming from QKV splits / RoPE in upstream attention code.
+            cache_k = cache_k.contiguous()
+            cache_v = cache_v.contiguous()
+            launch_reshape_and_cache_shuffle_5d(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                loc,
+            )
+            return
 
         _set_kv_buffer_impl(
             cache_k,

@@ -391,6 +391,16 @@ class Envs:
     # skips the explicit pad. Currently only takes effect on the
     # post_attention_layernorm path with aiter backend and TP=1.
     SGLANG_FUSE_RMSNORM_PAD = EnvBool(False)
+    # Physical layout for MHA KV cache. "nhd" (default) keeps the existing
+    # (size, head_num, head_dim) per-token storage that
+    # `aiter.mha.mha_batch_prefill_func`/`unified_attention` consume directly.
+    # "vectorized_5d" allocates K as (num_blocks, H_kv, head_dim/x, page_size, x)
+    # and V as (num_blocks, H_kv, page_size/x, head_dim, x) (x = 16 / dtype_size),
+    # matching the SHUFFLE layout that aiter's CK FmhaBatchPrefill kernel and
+    # `aiter.ops.triton.gluon.pa_decode_gluon` both consume natively. This is
+    # the Plan A KV layout that enables pa_decode_gluon for full-attn decode
+    # without runtime permutes.
+    SGLANG_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
