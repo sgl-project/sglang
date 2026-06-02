@@ -210,6 +210,31 @@ class LRUList:
         self.cache[node.id] = node
         self._add_node(node)
 
+    def insert_after(self, prev_node, node):
+        """Insert ``node`` immediately on the LRU-side of ``prev_node``.
+
+        Used by ``_split_node(preserve_lru_position=True)`` so split halves
+        keep the original node's LRU slot rather than getting promoted to
+        MRU (which would make an eviction-time split look like a cache
+        hit).
+        """
+        assert (
+            not self.is_swa_list or not node.swa_tombstone
+        ), f"Inserting swa tombstone node in swa lru list: {node.id=}"
+        assert (
+            node.id not in self.cache
+        ), f"Inserting node {node.id=} already in lru list"
+        self.cache[node.id] = node
+        self._add_node_after(prev_node, node)
+
+    def get_raw_prev(self, node: TreeNode):
+        """Return ``node``'s immediate LRU predecessor without skipping
+        locked nodes (may be the sentinel head). Used to capture an LRU
+        anchor before a split.
+        """
+        assert node.id in self.cache, f"Getting raw_prev of node {node.id=} not in lru list"
+        return getattr(node, self.prv)
+
     def remove_node(self, node: TreeNode):
         """
         Remove node from lru list
@@ -360,6 +385,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             self.init_metrics_collector()
 
         self.sliding_window_size = params.sliding_window_size
+        self._window_aligned_size = (
+            (self.sliding_window_size + self.page_size - 1)
+            // self.page_size
+            * self.page_size
+        )
         self.reset()
 
     ##### Public API #####
@@ -607,65 +637,178 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 x = x_next
 
         if swa_num_evicted < swa_num_tokens:
-            # get the least recently used node that is not locked, doesn't have to be a leaf
-            x = self.swa_lru_list.get_lru_no_lock()
-
-            # evict lru leaf nodes until swa_num_tokens is reached
-            while swa_num_evicted < swa_num_tokens and (self.swa_lru_list.in_list(x)):
-                assert not x.swa_tombstone, f"duplicate swa tombstone node, {x.id=}"
-                assert x != self.root_node, f"root node is not evictable, {x.id=}"
-                assert x.swa_lock_ref == 0, f"node is in use by swa kv indices, {x.id=}"
-
-                if len(x.children) > 0:
-                    # 1. an internal node, free swa tokens.
-                    self.token_to_kv_pool_allocator.free_swa(x.value)
-                    swa_num_evicted += len(x.value)
-
-                    # 2. get the next node, update the lru lists
-                    x_next = self.swa_lru_list.get_prev_no_lock(x)
-                    self.swa_lru_list.remove_node(x)
-
-                    # 3. tombstone the node
-                    self._tombstone_internal_node(x)
-                elif x.full_lock_ref > 0:
-                    # Leaf still holds a full-side lock (can happen when the
-                    # SWA leaf-lock early-release optimization revived a
-                    # tombstoned leaf. Treat it like an internal tombstone.
-                    self.token_to_kv_pool_allocator.free_swa(x.value)
-                    swa_num_evicted += len(x.value)
-
-                    x_next = self.swa_lru_list.get_prev_no_lock(x)
-                    self.swa_lru_list.remove_node(x)
-
-                    self.swa_evictable_size_ -= len(x.value)
-                    x.swa_tombstone = True
-                else:
-                    assert (
-                        x.full_lock_ref == 0
-                    ), f"leaf node with full lock must also have swa lock, {x.id=}"
-                    # 1. a leaf node, free full and swa tokens
-                    self._record_remove_event(x)
-                    self.token_to_kv_pool_allocator.free(x.value)
-                    full_num_evicted += len(x.value)
-                    swa_num_evicted += len(x.value)
-
-                    # 2. get the next node, update the lru lists
-                    x_next = self.swa_lru_list.get_prev_no_lock(x)
-                    self.full_lru_list.remove_node(x)
-                    self.swa_lru_list.remove_node(x)
-
-                    # 3. delete the leaf node
-                    self._delete_leaf(x)
-
-                    # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
-                    self._iteratively_delete_tombstone_leaf(x)
-
-                x = x_next
+            if envs.SGLANG_OPT_SWA_EVICT_KEEP_WINDOW.get():
+                fe, se = self._evict_swa_keep_window(
+                    swa_num_tokens - swa_num_evicted
+                )
+            else:
+                fe, se = self._evict_swa_legacy(swa_num_tokens - swa_num_evicted)
+            full_num_evicted += fe
+            swa_num_evicted += se
 
         self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
         return EvictResult(
             num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
         )
+
+    def _evict_swa_legacy(self, swa_num_tokens: int) -> Tuple[int, int]:
+        """Legacy single-pass SWA eviction: walk SWA LRU from oldest,
+        wholesale-tombstone or delete-leaf each node until the deficit is met.
+        """
+        full_num_evicted = 0
+        swa_num_evicted = 0
+        x = self.swa_lru_list.get_lru_no_lock()
+        while swa_num_evicted < swa_num_tokens and self.swa_lru_list.in_list(x):
+            assert not x.swa_tombstone, f"duplicate swa tombstone node, {x.id=}"
+            assert x != self.root_node, f"root node is not evictable, {x.id=}"
+            assert x.swa_lock_ref == 0, f"node is in use by swa kv indices, {x.id=}"
+            x_next, fe, se = self._evict_swa_node_wholesale(x)
+            full_num_evicted += fe
+            swa_num_evicted += se
+            x = x_next
+        return full_num_evicted, swa_num_evicted
+
+    def _evict_swa_keep_window(self, swa_num_tokens: int) -> Tuple[int, int]:
+        """Two-pass SWA eviction (SGLANG_OPT_SWA_EVICT_KEEP_WINDOW):
+
+        - Pass 1 defers window-sized SWA nodes (including
+          retained suffixes produced by an earlier keep-window split).
+          For longer internal nodes, the older prefix is split off and
+          tombstoned; the last window-sized suffix stays alive at the
+          original LRU slot via
+          ``_split_node(preserve_lru_position=True)``. Longer leaves
+          still go through the legacy wholesale path.
+        - Pass 2 evicts the deferred window-sized nodes if pass 1 alone
+          cannot satisfy the deficit.
+
+        Retained nodes are identified STRUCTURALLY by size
+        (``len(value) ≤ window_aligned``), not by a marker. This avoids
+        the need to propagate a marker through every later ``_split_node``
+        (match_prefix mid-walk, overlap insert, etc.), at the cost of
+        also deferring naturally short nodes that were never produced
+        by keep-window. The strategy prefers this false positive over
+        the false negative of accidentally tombstoning a real retained
+        window after it becomes a leaf. Deferred nodes remain evictable
+        in pass 2 so they don't permanently wedge the SWA pool.
+        """
+        full_num_evicted = 0
+        swa_num_evicted = 0
+        fe, se = self._evict_swa_keep_window_pass(
+            swa_num_tokens, evict_window_sized=False
+        )
+        full_num_evicted += fe
+        swa_num_evicted += se
+        if swa_num_evicted < swa_num_tokens:
+            fe, se = self._evict_swa_keep_window_pass(
+                swa_num_tokens - swa_num_evicted, evict_window_sized=True
+            )
+            full_num_evicted += fe
+            swa_num_evicted += se
+        return full_num_evicted, swa_num_evicted
+
+    def _evict_swa_keep_window_pass(
+        self, swa_num_tokens: int, evict_window_sized: bool
+    ) -> Tuple[int, int]:
+        full_num_evicted = 0
+        swa_num_evicted = 0
+        window_aligned = self._window_aligned_size
+
+        x = self.swa_lru_list.get_lru_no_lock()
+        while swa_num_evicted < swa_num_tokens and self.swa_lru_list.in_list(x):
+            assert not x.swa_tombstone, f"duplicate swa tombstone node, {x.id=}"
+            assert x != self.root_node, f"root node is not evictable, {x.id=}"
+            assert x.swa_lock_ref == 0, f"node is in use by swa kv indices, {x.id=}"
+
+            # Pass 1: this is a window-sized SWA node. That includes
+            # retained suffixes that later became leaves after their
+            # children were evicted; without this guard they would be
+            # deleted as ordinary leaves in the next pass-1 scan.
+            if not evict_window_sized and len(x.value) <= window_aligned:
+                x = self.swa_lru_list.get_prev_no_lock(x)
+                continue
+
+            if len(x.children) > 0:
+                # Internal node: keep-window split by size.
+                if not evict_window_sized and len(x.value) > window_aligned:
+                    # Pass 1: split off the older prefix; keep the
+                    # window-sized suffix at the original LRU slot.
+                    x_next = self.swa_lru_list.get_prev_no_lock(x)
+                    split_at = len(x.value) - window_aligned
+                    new_parent = self._split_node(
+                        x.key, x, split_at, preserve_lru_position=True
+                    )
+                    self.token_to_kv_pool_allocator.free_swa(new_parent.value)
+                    swa_num_evicted += len(new_parent.value)
+                    self.swa_lru_list.remove_node(new_parent)
+                    self._tombstone_internal_node(new_parent)
+                    x = x_next
+                    continue
+                # Pass 2 (evict_window_sized=True): wholesale tombstone.
+                x_next, fe, se = self._evict_swa_node_wholesale(x)
+            else:
+                # Leaf — always evict atomically (matches legacy).
+                x_next, fe, se = self._evict_swa_node_wholesale(x)
+
+            full_num_evicted += fe
+            swa_num_evicted += se
+            x = x_next
+
+        return full_num_evicted, swa_num_evicted
+
+    def _evict_swa_node_wholesale(
+        self, x: TreeNode
+    ) -> Tuple[Optional[TreeNode], int, int]:
+        """Wholesale-evict a single SWA LRU node (no split). Returns
+        (x_next, full_evicted, swa_evicted). Mirrors the three legacy
+        branches: internal-tombstone / revived-leaf-tombstone / leaf-delete.
+        """
+        full_num_evicted = 0
+        swa_num_evicted = 0
+        if len(x.children) > 0:
+            # 1. an internal node, free swa tokens.
+            self.token_to_kv_pool_allocator.free_swa(x.value)
+            swa_num_evicted += len(x.value)
+
+            # 2. get the next node, update the lru lists
+            x_next = self.swa_lru_list.get_prev_no_lock(x)
+            self.swa_lru_list.remove_node(x)
+
+            # 3. tombstone the node
+            self._tombstone_internal_node(x)
+        elif x.full_lock_ref > 0:
+            # Leaf still holds a full-side lock (can happen when the
+            # SWA leaf-lock early-release optimization revived a
+            # tombstoned leaf. Treat it like an internal tombstone.
+            self.token_to_kv_pool_allocator.free_swa(x.value)
+            swa_num_evicted += len(x.value)
+
+            x_next = self.swa_lru_list.get_prev_no_lock(x)
+            self.swa_lru_list.remove_node(x)
+
+            self.swa_evictable_size_ -= len(x.value)
+            x.swa_tombstone = True
+        else:
+            assert (
+                x.full_lock_ref == 0
+            ), f"leaf node with full lock must also have swa lock, {x.id=}"
+            # 1. a leaf node, free full and swa tokens
+            self._record_remove_event(x)
+            self.token_to_kv_pool_allocator.free(x.value)
+            full_num_evicted += len(x.value)
+            swa_num_evicted += len(x.value)
+
+            # 2. get the next node, update the lru lists
+            x_next = self.swa_lru_list.get_prev_no_lock(x)
+            self.full_lru_list.remove_node(x)
+            self.swa_lru_list.remove_node(x)
+
+            # 3. delete the leaf node
+            self._delete_leaf(x)
+
+            # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
+            self._iteratively_delete_tombstone_leaf(x)
+
+        return x_next, full_num_evicted, swa_num_evicted
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         """
@@ -1029,12 +1172,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             return leaf
 
-        # Smallest page-aligned size that still covers the sliding window.
-        tail_size = (
-            (self.sliding_window_size + self.page_size - 1)
-            // self.page_size
-            * self.page_size
-        )
+        tail_size = self._window_aligned_size
         if len(leaf.value) <= tail_size:
             return leaf
 
@@ -1050,7 +1188,26 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self._split_node(leaf.key, leaf, split_at)
         return leaf
 
-    def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
+    def _split_node(
+        self,
+        key: RadixKey,
+        child: TreeNode,
+        split_len: int,
+        preserve_lru_position: bool = False,
+    ) -> TreeNode:
+        """Split ``child`` at ``split_len`` into a new prefix parent + suffix.
+
+        When ``preserve_lru_position`` is True, the split halves are
+        reinserted at child's original slot — concretely, the post-split
+        MRU→LRU order is
+        ``anchor → new_node → child → (child's old LRU-side neighbor)``,
+        i.e. new_node ends up on the MRU-side of child and the suffix
+        child keeps the same LRU-side neighbor it had before the split.
+        ``child.last_access_time`` is preserved. Used by SWA keep-window
+        eviction so splitting under memory pressure does not get
+        promoted to MRU (which would look like a fresh cache hit and
+        starve true LRU candidates).
+        """
         # new_node -> child
         new_node = TreeNode()
         new_node.children = {key[split_len:].child_key(self.page_size): child}
@@ -1064,8 +1221,37 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
         child.swa_uuid = None
-        # child time should be later than parent's time for swa tombstone
-        child.last_access_time = get_last_access_time()
+
+        if preserve_lru_position:
+            # Capture each LRU's raw predecessor of child BEFORE we remove
+            # child from the list. Both halves get reinserted right after
+            # this anchor so MRU→LRU order ends up as
+            #   anchor → new_node → child → (child's old LRU-side neighbor)
+            # i.e. new_node sits on the MRU-side of child, and child
+            # keeps its LRU-side neighbor. The split is invisible to LRU
+            # ordering and is not treated as a cache hit.
+            #
+            # Time invariant: legacy ``sanity_check`` heap-orders LRU by
+            # ``last_access_time`` (TreeNode.__lt__ compares times). Since
+            # new_node is more MRU than child post-split, it must compare
+            # strictly GREATER than child and strictly LESS than child's
+            # old MRU-side neighbor. ``_match_post_processor`` uses 1e-5
+            # decrements per ancestor; 1e-6 is below that floor and never
+            # collides with any other node's slotted time, while also
+            # fitting inside the >= 1.0 gap left by the integer-stepped
+            # counter for naturally-spaced nodes.
+            new_node.last_access_time = child.last_access_time + 1e-6
+            full_lru_prev = self.full_lru_list.get_raw_prev(child)
+            swa_lru_prev = (
+                self.swa_lru_list.get_raw_prev(child)
+                if not child.swa_tombstone
+                else None
+            )
+        else:
+            # child time should be later than parent's time for swa tombstone
+            child.last_access_time = get_last_access_time()
+            full_lru_prev = None
+            swa_lru_prev = None
 
         # remove the child from the lru lists because it is being split
         self.full_lru_list.remove_node(child)
@@ -1080,13 +1266,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             child.hash_value, split_len, self.page_size
         )
 
-        # insert the new node and child into the lru lists, insert
-        # parent first so that parent is after child in the lru list
-        self.full_lru_list.insert_mru(new_node)
-        self.full_lru_list.insert_mru(child)
-        if not new_node.swa_tombstone:
-            self.swa_lru_list.insert_mru(new_node)
-            self.swa_lru_list.insert_mru(child)
+        if preserve_lru_position:
+            # Reinsert at the original slot. anchor was captured as
+            # child's MRU-side neighbor; insert_after(anchor, X) places
+            # X on anchor's LRU-side. Final MRU→LRU order:
+            #   anchor → new_node → child → (child's old LRU-side neighbor).
+            self.full_lru_list.insert_after(full_lru_prev, new_node)
+            self.full_lru_list.insert_after(new_node, child)
+            if not new_node.swa_tombstone:
+                self.swa_lru_list.insert_after(swa_lru_prev, new_node)
+                self.swa_lru_list.insert_after(new_node, child)
+        else:
+            # insert the new node and child into the lru lists, insert
+            # parent first so that parent is after child in the lru list
+            self.full_lru_list.insert_mru(new_node)
+            self.full_lru_list.insert_mru(child)
+            if not new_node.swa_tombstone:
+                self.swa_lru_list.insert_mru(new_node)
+                self.swa_lru_list.insert_mru(child)
         return new_node
 
     def _insert_helper(

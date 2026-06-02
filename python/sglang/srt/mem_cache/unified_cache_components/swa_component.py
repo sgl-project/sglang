@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -51,6 +52,11 @@ class SWAComponent(TreeComponent):
         ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(cache.token_to_kv_pool_allocator)}"
         super().__init__(cache, params)
         self.sliding_window_size = params.sliding_window_size
+        self._window_aligned_size = (
+            (self.sliding_window_size + self.cache.page_size - 1)
+            // self.cache.page_size
+            * self.cache.page_size
+        )
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -382,24 +388,137 @@ class SWAComponent(TreeComponent):
         request = params.swa_num_tokens
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
+        keep_window = envs.SGLANG_OPT_SWA_EVICT_KEEP_WINDOW.get()
+
+        if not keep_window:
+            # Legacy single-pass eviction. Preserved verbatim to keep the
+            # behavior identical when the opt is off.
+            x = lru.get_lru_no_lock()
+            while tracker[ct] < request and x is not None and lru.in_list(x):
+                assert x.component_data[ct].value is not None
+                if x in self.cache.evictable_device_leaves:
+                    # D-leaf: atomic eviction of all components
+                    x_next = lru.get_prev_no_lock(x)
+                    self.cache._evict_device_leaf(x, tracker)
+                    if not lru.in_list(x_next):
+                        x_next = lru.get_lru_no_lock()
+                    x = x_next
+                else:
+                    # Internal: tombstone SWA + cascade
+                    x_next = lru.get_prev_no_lock(x)
+                    self.cache._evict_component_and_detach_lru(
+                        x, self, target=EvictLayer.DEVICE, tracker=tracker
+                    )
+                    self.cache._cascade_evict(x, self, tracker)
+                    x = x_next
+            return
+
+        # ----- evict-prefix-keep-window two-pass strategy -----
+        # Pass 1 defers window-sized SWA nodes (including
+        # retained suffixes produced by an earlier keep-window split).
+        # For longer internal nodes, the older prefix is split off and
+        # tombstoned; the last window-sized suffix stays alive at the
+        # original LRU slot. Longer D-leaves still evict atomically.
+        # Retained nodes are identified STRUCTURALLY by size
+        # (``len(value) ≤ window_aligned``), not by a marker. This
+        # avoids the need to propagate a marker through every later
+        # ``_split_node`` (match_prefix mid-walk, overlap insert, etc.),
+        # at the cost of also deferring naturally short nodes that were
+        # never produced by keep-window. The strategy prefers this false
+        # positive over the false negative of accidentally tombstoning a
+        # real retained window after it becomes a leaf.
+        # Pass 2 evicts the deferred window-sized nodes if pass 1 alone
+        # cannot satisfy the deficit, so they remain evictable under
+        # sustained pressure.
+        self._drive_eviction_pass(request, tracker, evict_window_sized=False)
+        if tracker[ct] < request:
+            self._drive_eviction_pass(request, tracker, evict_window_sized=True)
+
+    def _drive_eviction_pass(
+        self,
+        request: int,
+        tracker: dict[ComponentType, int],
+        evict_window_sized: bool,
+    ) -> None:
+        ct = self.component_type
+        lru = self.cache.lru_lists[ct]
+        window_aligned = self._window_aligned_size
+
         x = lru.get_lru_no_lock()
         while tracker[ct] < request and x is not None and lru.in_list(x):
-            assert x.component_data[ct].value is not None
+            cd = x.component_data[ct]
+            assert cd.value is not None
+            x_next = lru.get_prev_no_lock(x)
+
+            if not evict_window_sized and len(cd.value) <= window_aligned:
+                # A retained suffix can become a D-leaf after its children
+                # are evicted. Keep the same first-pass protection for that
+                # leaf form; pass 2 can still drain it under sustained
+                # pressure.
+                x = x_next
+                continue
+
             if x in self.cache.evictable_device_leaves:
-                # D-leaf: atomic eviction of all components
-                x_next = lru.get_prev_no_lock(x)
+                # Longer D-leaves evict atomically — leaf SWA is by
+                # definition the tail of a chain, splitting it would
+                # also free the FULL component since the two are bound
+                # by the leaf identity.
                 self.cache._evict_device_leaf(x, tracker)
-                if not lru.in_list(x_next):
-                    x_next = lru.get_lru_no_lock()
-                x = x_next
             else:
-                # Internal: tombstone SWA + cascade
-                x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_component_and_detach_lru(
-                    x, self, target=EvictLayer.DEVICE, tracker=tracker
+                # Internal node
+                target_node = self._window_retention_evict_node(
+                    x, evict_window_sized=evict_window_sized
                 )
-                self.cache._cascade_evict(x, self, tracker)
-                x = x_next
+                if target_node is None:
+                    # Pass 1 deferral: this internal node is already at
+                    # or below window size, keep it as the retained
+                    # window. Pass 2 ignores this branch entirely.
+                    x = x_next
+                    continue
+                self.cache._evict_component_and_detach_lru(
+                    target_node, self, target=EvictLayer.DEVICE, tracker=tracker
+                )
+                self.cache._cascade_evict(target_node, self, tracker)
+
+            if x_next is None or not lru.in_list(x_next):
+                x_next = lru.get_lru_no_lock()
+            x = x_next
+
+    def _window_retention_evict_node(
+        self, node: UnifiedTreeNode, evict_window_sized: bool
+    ) -> Optional[UnifiedTreeNode]:
+        """Decide what to evict for an internal SWA node under keep-window.
+
+        Returns ``None`` to defer (pass-1 only), the node itself to evict
+        wholesale, or a freshly-split prefix parent to evict only the
+        older prefix while keeping a window-sized suffix child alive.
+        """
+        cd = node.component_data[self.component_type]
+        value_len = len(cd.value)
+        window_aligned = self._window_aligned_size
+
+        if evict_window_sized:
+            # Pass 2: pass-1 already split everything that could be split,
+            # so any internal node left in the LRU is at or below window
+            # size. Evict it wholesale.
+            return node
+
+        if value_len <= window_aligned:
+            # Pass 1: this IS the retained window (size-based identification
+            # is structurally invariant — any further mid-node ``_split_node``
+            # caused by match_prefix walking mid-node or by an overlapping
+            # insert produces two halves both ≤ window_aligned, so both
+            # remain deferred without needing an explicit marker).
+            return None
+
+        # Long internal node: split off the older prefix and tombstone it.
+        # ``preserve_lru_position=True`` so the suffix child stays at the
+        # original LRU slot — splitting under memory pressure must not be
+        # treated as a fresh cache hit (which insert_mru would imply).
+        split_at = value_len - window_aligned
+        return self.cache._split_node(
+            node.key, node, split_at, preserve_lru_position=True
+        )
 
     def acquire_component_lock(
         self,

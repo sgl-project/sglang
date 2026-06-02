@@ -162,6 +162,17 @@ class UnifiedLRUList:
         self.cache[node.id] = node
         self._add_node(node)
 
+    def insert_after(self, prev_node: UnifiedTreeNode, node: UnifiedTreeNode):
+        """Insert ``node`` immediately on the LRU-side of ``prev_node``.
+
+        Used by ``_split_node(preserve_lru_position=True)`` to put split
+        halves back at the original child's position rather than promoting
+        them to MRU (which would treat an eviction-time split as a hit).
+        """
+        assert node.id not in self.cache
+        self.cache[node.id] = node
+        self._add_node_after(prev_node, node)
+
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
         del self.cache[node.id]
@@ -207,6 +218,14 @@ class UnifiedLRUList:
 
     def in_list(self, node: Optional[UnifiedTreeNode]):
         return node is not None and node.id in self.cache
+
+    def get_raw_prev(self, node: UnifiedTreeNode) -> UnifiedTreeNode:
+        """Return ``node``'s immediate LRU predecessor without skipping locked
+        nodes (may be the sentinel head). Used to capture an LRU anchor before
+        a split so the post-split halves can be reinserted at the same slot.
+        """
+        assert node.id in self.cache
+        return node.lru_prev[self._pt]
 
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
@@ -859,14 +878,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return result
 
     def _split_node(
-        self, key: RadixKey, child: UnifiedTreeNode, split_len: int
+        self,
+        key: RadixKey,
+        child: UnifiedTreeNode,
+        split_len: int,
+        preserve_lru_position: bool = False,
     ) -> UnifiedTreeNode:
+        """Split ``child`` at ``split_len`` into a new prefix parent + suffix.
+
+        When ``preserve_lru_position`` is True, the non-BASE device LRU
+        entries for new_parent + child are reinserted at child's original
+        slot — concretely, the post-split MRU→LRU order is
+        ``anchor → new_parent → child → (child's old LRU-side neighbor)``,
+        i.e. new_parent ends up on the MRU-side of child and the suffix
+        child keeps the same LRU-side neighbor it had before the split.
+        ``child.last_access_time`` is preserved. This avoids promoting
+        an eviction-time split to MRU, which would otherwise mask a
+        degraded retention as a fresh cache hit.
+        """
         new_node = UnifiedTreeNode(self.tree_components, priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+
+        device_lru_prev: dict[int, UnifiedTreeNode] = {}
+        if preserve_lru_position:
+            new_node.last_access_time = child.last_access_time
+            for ct in self.tree_components:
+                if ct == BASE_COMPONENT_TYPE:
+                    continue
+                lru = self.lru_lists[ct]
+                if lru.in_list(child):
+                    device_lru_prev[ct] = lru.get_raw_prev(child)
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -880,13 +925,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        self._for_each_component_lru(
-            new_node, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        self._for_each_component_lru(
-            child, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        child.last_access_time = get_and_increase_time_counter()
+        if preserve_lru_position:
+            # Reinsert at the original slot. MRU→LRU order ends up as
+            # anchor → new_node → child → (child's old LRU-side neighbor),
+            # so new_node sits on the MRU-side of child and child keeps
+            # its LRU-side neighbor. BASE LRU (if any) is not tracked
+            # here; preserve_lru_position is for SWA-style splits that
+            # already operate on device LRU.
+            for ct, prev_node in device_lru_prev.items():
+                lru = self.lru_lists[ct]
+                anchor = prev_node
+                if new_node.component_data[ct].value is not None:
+                    lru.insert_after(anchor, new_node)
+                    anchor = new_node
+                if child.component_data[ct].value is not None:
+                    lru.insert_after(anchor, child)
+        else:
+            self._for_each_component_lru(
+                new_node, UnifiedLRUList.insert_mru, skip_existing=True
+            )
+            self._for_each_component_lru(
+                child, UnifiedLRUList.insert_mru, skip_existing=True
+            )
+            child.last_access_time = get_and_increase_time_counter()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)

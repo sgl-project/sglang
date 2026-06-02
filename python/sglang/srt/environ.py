@@ -688,6 +688,15 @@ class Envs:
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
+    # SWA eviction (both UnifiedRadixCache and legacy SWARadixCache):
+    # when reclaiming a long-SWA internal node, split it so the last
+    # (page-aligned) sliding_window_size tokens are retained as a smaller
+    # suffix child, and only the older prefix portion is tombstoned. First
+    # eviction pass skips retained suffix nodes; second pass only picks
+    # them up if the first pass can't meet the deficit. Improves SWA
+    # retention near branch points for hybrid SWA models under memory
+    # pressure.
+    SGLANG_OPT_SWA_EVICT_KEEP_WINDOW = EnvBool(False)
 
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
