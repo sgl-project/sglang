@@ -664,72 +664,51 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ):
-        buffers = self.buffers
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
         self.raw_num_tokens = num_tokens
-        if static_num_tokens != num_tokens:
-            buffers.out_cache_loc.zero_()
-            buffers.input_ids[num_tokens:static_num_tokens].zero_()
-            buffers.positions[num_tokens:static_num_tokens].zero_()
-            if self.is_multimodal:
-                buffers.input_embeds[num_tokens:static_num_tokens].zero_()
-            if forward_batch.mrope_positions is not None:
-                buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
-
         bs = forward_batch.batch_size
+        registry = self.buffer_registry
+        # Reset the padded token tail (ZERO) + copy the [:num_tokens] head for
+        # every graph-resident slot in one grouped pass. input_embeds is
+        # reset-only (the model writes embeds into it inside the graph).
+        registry.fill_from(
+            forward_batch,
+            raw_bs=bs,
+            padded_bs=bs,
+            raw_num_tokens=num_tokens,
+            padded_num_tokens=static_num_tokens,
+        )
 
-        buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        def _slot(name):
+            return registry.get_slot(name).view(bs, static_num_tokens)
 
-        if (
-            buffers.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            buffers.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-        if (
-            buffers.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            buffers.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-        if (
-            buffers.mamba_track_seqlens is not None
-            and forward_batch.mamba_track_seqlens is not None
-        ):
-            buffers.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
-
-        input_ids = buffers.input_ids[:static_num_tokens]
-        positions = buffers.positions[:static_num_tokens]
-        out_cache_loc = buffers.out_cache_loc[:static_num_tokens]
-
+        input_ids = _slot("input_ids")
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
         )
-        if forward_batch.mrope_positions is not None:
-            buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
-
-        input_ids = buffers.input_ids[:static_num_tokens]
         input_embeds = (
-            buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
-
         mrope_positions = (
-            buffers.mrope_positions[:, :static_num_tokens]
-            if forward_batch.mrope_positions is not None
+            _slot("mrope_positions")
+            if (
+                registry.has_slot("mrope_positions")
+                and forward_batch.mrope_positions is not None
+            )
             else None
         )
 
