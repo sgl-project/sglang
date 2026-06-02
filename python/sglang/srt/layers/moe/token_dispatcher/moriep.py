@@ -494,7 +494,16 @@ class _MoriEPDispatcherImplBase:
             # prefill: match MORI_MOE_MAX_INPUT_TOKENS_PREFILL exactly.
             return (self.num_max_dispatch_tokens_per_rank * world_size) // 2
         # decode: match the legacy decode-side truncation sizing.
-        return (topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10
+        raw = (topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10
+        # Floor to the per-rank dispatch buffer capacity. During CUDA-graph
+        # capture topk_ids.shape[0] shrinks to tiny batch sizes, which would
+        # drive get_padded_M(expected_m) below the real LL recv-buffer row
+        # count (num_max_dispatch_tokens_per_rank * world_size) and make the
+        # fused-MoE kernel index out of bounds (GPU memory access fault). The
+        # floor maps to the same nextPow2 tier the CI truncation used, so it
+        # never changes the conc-128 steady-state tier, only stabilizes capture.
+        floor = self.num_max_dispatch_tokens_per_rank * world_size
+        return max(raw, floor)
 
     def dispatch_a(
         self,
