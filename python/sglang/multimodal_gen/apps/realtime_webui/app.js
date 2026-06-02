@@ -1153,6 +1153,63 @@ function formatControlDistance(value, unit) {
   return value.toFixed(2);
 }
 
+function modelsUrlFromServerUrl(serverUrl) {
+  const url = new URL(serverUrl, window.location.href);
+  if (url.protocol === "ws:") url.protocol = "http:";
+  if (url.protocol === "wss:") url.protocol = "https:";
+  url.pathname = "/v1/models";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function firstServedModelInfo(payload) {
+  if (Array.isArray(payload?.data) && payload.data.length > 0) return payload.data[0];
+  if (payload && typeof payload === "object") return payload;
+  return null;
+}
+
+function servedModelId(info) {
+  return String(info?.id || info?.model || info?.root || "");
+}
+
+function presetForModelInfo(info) {
+  const id = servedModelId(info).toLowerCase();
+  if (!id) return null;
+  return presets.find((preset) => (
+    preset.model && id.includes(preset.model.toLowerCase())
+  )) || null;
+}
+
+async function queryServerModelInfo(options = {}) {
+  const applyPresetForModel = options.applyPresetForModel ?? true;
+  let info;
+  try {
+    const response = await fetch(modelsUrlFromServerUrl($("serverUrl").value), {
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`/v1/models ${response.status}`);
+    info = firstServedModelInfo(await response.json());
+  } catch (error) {
+    addHistory(`model query failed · ${error.message || "unknown"}`);
+    return null;
+  }
+  if (!info) return null;
+
+  const modelId = servedModelId(info);
+  const preset = presetForModelInfo(info);
+  if (preset && applyPresetForModel && preset !== selectedPreset) {
+    await applyPreset(preset, { sendRuntimeEvents: false });
+  }
+  if (modelId) $("model").value = modelId;
+  addHistory(
+    preset
+      ? `server model · ${preset.name}`
+      : `server model · ${modelId || "unknown"}`,
+  );
+  return info;
+}
+
 function enhancePrompt() {
   const suffix = " high-fidelity temporal consistency, stable camera geometry, natural motion, clean lighting.";
   if (!$("prompt").value.includes("temporal consistency")) {
@@ -1221,12 +1278,31 @@ function renderPresets() {
   });
 }
 
-function applyQueryParams() {
+async function applyQueryParams() {
   const params = new URLSearchParams(window.location.search);
+  const presetKey = params.get("preset");
+  let appliedPreset = false;
+  if (presetKey) {
+    const normalized = presetKey.toLowerCase();
+    const preset = presets.find((item) => (
+      item.name.toLowerCase() === normalized
+      || item.name.toLowerCase().replaceAll(" ", "-") === normalized
+    ));
+    if (preset && preset !== selectedPreset) {
+      await applyPreset(preset, { sendRuntimeEvents: false });
+      appliedPreset = true;
+    }
+  }
   const server = params.get("server");
   if (server) $("serverUrl").value = server;
+  const model = params.get("model");
+  if (model) $("model").value = model;
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  return {
+    model: Boolean(model),
+    preset: Boolean(presetKey && appliedPreset),
+  };
 }
 
 function pack(value) {
@@ -1316,16 +1392,23 @@ function unpack(buf) {
   return read();
 }
 
-applyQueryParams();
 renderPresets();
 drawIdle();
-applyPreset(presets[0], { sendRuntimeEvents: false }).catch(showError);
+applyPreset(presets[0], { sendRuntimeEvents: false })
+  .then(applyQueryParams)
+  .then((query) => queryServerModelInfo({
+    applyPresetForModel: !query.model && !query.preset,
+  }))
+  .catch(showError);
 requestAnimationFrame(renderLoop);
 $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
 $("enhanceBtn").onclick = enhancePrompt;
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
+$("serverUrl").addEventListener("change", () => {
+  queryServerModelInfo({ applyPresetForModel: true }).catch(showError);
+});
 document.querySelectorAll("button").forEach((btn) => {
   btn.addEventListener("pointerdown", () => btn.classList.add("is-pressed"));
   ["pointerup", "pointercancel", "pointerleave", "blur"].forEach((eventName) => {

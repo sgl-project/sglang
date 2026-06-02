@@ -14,7 +14,7 @@
           <strong>Realtime Studio</strong>
         </div>
         <label>Server<input id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate" /></label>
-        <label>Model<input id="model" value="robbyant/lingbot-world-fast-diffusers" /></label>
+        <label>Model<input id="model" value="" placeholder="auto from /v1/models" /></label>
         <div class="section-title">Reference</div>
         <label class="reference-upload">
           <input id="firstFrame" type="file" accept="image/*" />
@@ -124,6 +124,6 @@
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-    <script src="./app.js?v=realtime-fixes-v30"></script>
+    <script src="./app.js?v=realtime-model-info-v31"></script>
   </body>
 </html>
