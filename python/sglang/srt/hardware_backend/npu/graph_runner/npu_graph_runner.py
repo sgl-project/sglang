@@ -37,7 +37,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_runner import DecodeCudaGraphRunner
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,

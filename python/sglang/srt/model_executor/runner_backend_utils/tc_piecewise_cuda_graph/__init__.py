@@ -11,7 +11,7 @@ The torch.compile-warmup flag (``is_in_torch_compile_warmup``) lives in
 not piecewise-shared.
 """
 
-from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph.context_manager import (  # noqa: F401
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (  # noqa: F401
     TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
     TcPiecewiseForwardContext,
     enable_tc_piecewise_cuda_graph,

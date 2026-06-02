@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
+from sglang.srt.model_executor.runner import set_global_graph_memory_pool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -407,19 +407,19 @@ def _capture_eagle_draft_graph_runner(
 ) -> EAGLEDraftCudaGraphRunner:
     with (
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.decode_runner.graph_capture",
+            "sglang.srt.model_executor.runner.decode_runner.graph_capture",
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.decode_runner.get_tensor_model_parallel_rank",
+            "sglang.srt.model_executor.runner.decode_runner.get_tensor_model_parallel_rank",
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.decode_runner.get_available_gpu_memory",
+            "sglang.srt.model_executor.runner.decode_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.base_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.runner.base_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):
@@ -444,7 +444,7 @@ def _capture_frozen_kv_mtp_graph_runner(
             lambda: 0,
         ),
         patch(
-            "sglang.srt.model_executor.cuda_graph_runner.base_runner.get_attention_cp_size",
+            "sglang.srt.model_executor.runner.base_runner.get_attention_cp_size",
             lambda: 1,
         ),
     ):

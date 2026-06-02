@@ -55,26 +55,26 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.model_executor.cuda_graph_backend.breakable_cudagraph_backend import (
+from sglang.srt.model_executor.runner_backend.breakable_cudagraph_backend import (
     BreakableCudaGraphBackend,
 )
-from sglang.srt.model_executor.cuda_graph_backend.factory import resolve_decode_backend
-from sglang.srt.model_executor.cuda_graph_backend_utils import (
+from sglang.srt.model_executor.runner_backend.factory import resolve_decode_backend
+from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.model_executor.cuda_graph_runner.base_runner import (
+from sglang.srt.model_executor.runner.base_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_executor.cuda_graph_runner_utils.buffers import (
+from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
 )
-from sglang.srt.model_executor.cuda_graph_runner_utils.capture_mode import (
+from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_lora_variant,
     model_capture_mode,
 )
-from sglang.srt.model_executor.cuda_graph_runner_utils.deepep_adapter import (
+from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.model_executor.forward_batch_info import (

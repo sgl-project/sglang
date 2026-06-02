@@ -3,13 +3,13 @@ from typing import Any, Callable
 
 import torch
 
-from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph.context import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
     enable_tc_piecewise_cuda_graph as enable_piecewise_cuda_graph,
 )
-from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
     set_tc_piecewise_forward_context as piecewise_forward_context,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context

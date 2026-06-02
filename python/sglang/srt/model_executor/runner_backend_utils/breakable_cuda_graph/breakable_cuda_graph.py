@@ -34,7 +34,7 @@ try:
 except ImportError:
     rt = None
 
-from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph.cuda_utils import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
 

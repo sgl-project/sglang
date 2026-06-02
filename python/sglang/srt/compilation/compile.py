@@ -9,7 +9,7 @@ from typing import Any, Callable, Optional, Union
 import torch
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
 

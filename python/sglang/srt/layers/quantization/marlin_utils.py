@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
 

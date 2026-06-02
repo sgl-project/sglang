@@ -642,13 +642,13 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         self.assertTrue(decide_needs_cpu_seq_lens(server_args, [attn_backend]))
 
     @patch(
-        "sglang.srt.model_executor.cuda_graph_backend."
+        "sglang.srt.model_executor.runner_backend."
         "tc_piecewise_cudagraph_backend.get_moe_a2a_backend"
     )
     def test_tc_piecewise_build_config_reads_phase_config_dataclass(
         self, mock_get_moe_a2a_backend
     ):
-        from sglang.srt.model_executor.cuda_graph_backend.tc_piecewise_cudagraph_backend import (
+        from sglang.srt.model_executor.runner_backend.tc_piecewise_cudagraph_backend import (
             TcPiecewiseCudaGraphBackend,
         )
 

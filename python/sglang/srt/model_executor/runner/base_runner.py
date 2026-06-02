@@ -34,7 +34,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.utils import require_gathered_buffer
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.cuda_graph_backend.base_cudagraph_backend import (
+    from sglang.srt.model_executor.runner_backend.base_cudagraph_backend import (
         BaseCudaGraphBackend,
     )
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

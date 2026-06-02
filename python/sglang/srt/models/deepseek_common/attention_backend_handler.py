@@ -1,6 +1,6 @@
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
-from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend

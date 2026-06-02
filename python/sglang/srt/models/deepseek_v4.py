@@ -86,7 +86,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.cuda_graph_runner import (
+from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
 )

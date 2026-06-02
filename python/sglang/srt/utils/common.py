@@ -3086,7 +3086,7 @@ def dispose_tensor(x: torch.Tensor):
     # Skip disposal during piecewise CUDA graph capture/replay: freeing the
     # backing storage would invalidate addresses recorded in the graph.
     # Local import avoids a circular dependency.
-    from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
     )
 

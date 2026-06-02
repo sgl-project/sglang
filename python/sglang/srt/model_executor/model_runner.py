@@ -137,13 +137,13 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
+from sglang.srt.model_executor.runner.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.cuda_graph_runner import (
+from sglang.srt.model_executor.runner import (
     DecodeInputBuffers,
     PrefillCudaGraphRunner,
 )
@@ -2845,7 +2845,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.decode_cuda_graph_runner = GraphRunnerCls(self)
         else:
-            from sglang.srt.model_executor.cuda_graph_runner.decode_runner import (
+            from sglang.srt.model_executor.runner.decode_runner import (
                 DecodeCudaGraphRunner,
             )
 

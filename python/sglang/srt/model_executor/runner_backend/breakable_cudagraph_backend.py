@@ -20,10 +20,10 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.model_executor.cuda_graph_backend.base_cudagraph_backend import (
+from sglang.srt.model_executor.runner_backend.base_cudagraph_backend import (
     BaseCudaGraphBackend,
 )
-from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph import (
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     eager_on_graph,
