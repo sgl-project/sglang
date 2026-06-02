@@ -17,6 +17,7 @@ class TestIndexerTopkCapturer(unittest.TestCase):
         capturer.host_cache = SimpleNamespace(
             buffer=torch.zeros((32, 1, 2), dtype=torch.int32)
         )
+        capturer._capture_num_tokens = None
         return capturer
 
     def test_non_dp_attention_uses_forward_batch_length(self):
@@ -47,6 +48,7 @@ class TestIndexerTopkCapturer(unittest.TestCase):
             indexer_topk.get_dp_local_slice_cpu = (
                 lambda forward_batch, can_run_graph, cuda_graph_batch: (2, 3)
             )
+            capturer._capture_num_tokens = 5
 
             actual = capturer._get_local_slice(
                 forward_batch, can_run_graph=True, cuda_graph_batch=8
@@ -71,6 +73,7 @@ class TestIndexerTopkCapturer(unittest.TestCase):
             indexer_topk.get_dp_local_slice_cpu = (
                 lambda forward_batch, can_run_graph, cuda_graph_batch: (2, 3)
             )
+            capturer._capture_num_tokens = 5
 
             output = capturer.on_forward_end(
                 forward_batch,
@@ -108,6 +111,7 @@ class TestIndexerTopkCapturer(unittest.TestCase):
             indexer_topk.get_dp_local_slice_cpu = (
                 lambda forward_batch, can_run_graph, cuda_graph_batch: (4, 2)
             )
+            capturer._capture_num_tokens = 2
 
             output = capturer.on_forward_end(
                 forward_batch,
@@ -118,14 +122,52 @@ class TestIndexerTopkCapturer(unittest.TestCase):
 
             self.assertEqual(output.out_cache_loc.tolist(), [20, 21])
             self.assertTrue(
-                torch.equal(output.topk, capturer.device_cache.buffer[4:6, :, :2])
+                torch.equal(output.topk, capturer.device_cache.buffer[:2, :, :2])
             )
 
             output.finalize()
             self.assertTrue(
                 torch.equal(
                     capturer.host_cache.buffer[20:22],
-                    capturer.device_cache.buffer[4:6, :, :2],
+                    capturer.device_cache.buffer[:2, :, :2],
+                )
+            )
+        finally:
+            indexer_topk.is_dp_attention_enabled = old_is_dp_attention_enabled
+            indexer_topk.get_dp_local_slice_cpu = old_get_dp_local_slice_cpu
+
+    def test_dp_attention_truncates_local_locations_to_captured_topk(self):
+        capturer = self._make_capturer()
+        forward_batch = SimpleNamespace(
+            out_cache_loc=torch.tensor([20, 21, 22, 23, 24], dtype=torch.int64)
+        )
+
+        old_is_dp_attention_enabled = indexer_topk.is_dp_attention_enabled
+        old_get_dp_local_slice_cpu = indexer_topk.get_dp_local_slice_cpu
+        try:
+            indexer_topk.is_dp_attention_enabled = lambda: True
+            indexer_topk.get_dp_local_slice_cpu = (
+                lambda forward_batch, can_run_graph, cuda_graph_batch: (4, 5)
+            )
+            capturer._capture_num_tokens = 3
+
+            output = capturer.on_forward_end(
+                forward_batch,
+                can_run_graph=False,
+                cuda_graph_batch=None,
+                no_copy_to_cpu=True,
+            )
+
+            self.assertEqual(output.out_cache_loc.tolist(), [20, 21, 22])
+            self.assertTrue(
+                torch.equal(output.topk, capturer.device_cache.buffer[:3, :, :2])
+            )
+
+            output.finalize()
+            self.assertTrue(
+                torch.equal(
+                    capturer.host_cache.buffer[20:23],
+                    capturer.device_cache.buffer[:3, :, :2],
                 )
             )
         finally:

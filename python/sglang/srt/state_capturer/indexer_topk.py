@@ -27,6 +27,7 @@ class IndexerTopkCapturer(BaseTopkCapturer):
 
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
+        self._capture_num_tokens: Optional[int] = None
 
         attn_tp_size = get_attention_tp_size()
         assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
@@ -43,6 +44,32 @@ class IndexerTopkCapturer(BaseTopkCapturer):
             name="indexer_topk",
         )
 
+    def capture(self, layer_id: int, topk_indices: torch.Tensor):
+        self._capture_num_tokens = topk_indices.shape[0]
+        super().capture(layer_id, topk_indices)
+
+    def _get_dp_slice_info(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: Optional[int],
+    ) -> tuple[int, int, int, bool]:
+        local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
+            forward_batch, can_run_graph, cuda_graph_batch
+        )
+        captured_num_tokens = getattr(self, "_capture_num_tokens", None)
+        if captured_num_tokens is None:
+            captured_num_tokens = local_num_tokens
+        uses_global_layout = (
+            captured_num_tokens >= local_start_pos + local_num_tokens
+        )
+        loc_num_tokens = forward_batch.out_cache_loc.shape[0]
+        if uses_global_layout and loc_num_tokens >= local_start_pos + local_num_tokens:
+            num_tokens = local_num_tokens
+        else:
+            num_tokens = min(captured_num_tokens, local_num_tokens, loc_num_tokens)
+        return local_start_pos, local_num_tokens, num_tokens, uses_global_layout
+
     def _get_local_slice(
         self,
         forward_batch: ForwardBatch,
@@ -54,10 +81,12 @@ class IndexerTopkCapturer(BaseTopkCapturer):
                 forward_batch, can_run_graph, cuda_graph_batch
             )
 
-        local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
+        local_start_pos, _, num_tokens, uses_global_layout = self._get_dp_slice_info(
             forward_batch, can_run_graph, cuda_graph_batch
         )
-        local_end_pos = local_start_pos + local_num_tokens
+        if not uses_global_layout:
+            return self.device_cache.buffer[:num_tokens, :, : self.topk_size]
+        local_end_pos = local_start_pos + num_tokens
         return self.device_cache.buffer[
             local_start_pos:local_end_pos, :, : self.topk_size
         ]
@@ -73,13 +102,32 @@ class IndexerTopkCapturer(BaseTopkCapturer):
                 forward_batch, can_run_graph, cuda_graph_batch
             )
 
-        local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
+        local_start_pos, _, num_tokens, uses_global_layout = self._get_dp_slice_info(
             forward_batch, can_run_graph, cuda_graph_batch
         )
-        local_end_pos = local_start_pos + local_num_tokens
-        if forward_batch.out_cache_loc.shape[0] >= local_end_pos:
+        local_end_pos = local_start_pos + num_tokens
+        if (
+            uses_global_layout
+            and forward_batch.out_cache_loc.shape[0] >= local_end_pos
+        ):
             return forward_batch.out_cache_loc[local_start_pos:local_end_pos]
-        return forward_batch.out_cache_loc[:local_num_tokens]
+        return forward_batch.out_cache_loc[:num_tokens]
+
+    def on_forward_end(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: Optional[int],
+        no_copy_to_cpu: bool = False,
+    ):
+        output = super().on_forward_end(
+            forward_batch,
+            can_run_graph,
+            cuda_graph_batch,
+            no_copy_to_cpu=no_copy_to_cpu,
+        )
+        self._capture_num_tokens = None
+        return output
 
 
 _global_indexer_capturer: Optional[IndexerTopkCapturer] = None
