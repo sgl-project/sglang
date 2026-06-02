@@ -1179,6 +1179,49 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             cache[cache_key] = freqs_cis
         return freqs_cis
 
+    def _prepare_cached_rope_for_sequence_shard(
+        self,
+        *,
+        forward_batch,
+        local_seq_len: int,
+        token_start: int,
+        frame_stride: int,
+        post_patch_width: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, ...]:
+        cache = self._get_request_cache(forward_batch, "lingbot_sequence_shard_rope")
+        cache_key = (
+            local_seq_len,
+            token_start,
+            frame_stride,
+            post_patch_width,
+            device.type,
+            device.index,
+        )
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
+        freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard_with_offset(
+            local_seq_len,
+            token_start,
+            frame_stride,
+            post_patch_width,
+            device,
+        )
+        freqs_cos = freqs_cos.float()
+        freqs_sin = freqs_sin.float()
+        freqs_cis: tuple[torch.Tensor, ...] = (freqs_cos, freqs_sin)
+        if _is_cuda:
+            freqs_cis = (
+                freqs_cos,
+                freqs_sin,
+                torch.cat([freqs_cos.contiguous(), freqs_sin.contiguous()], dim=-1),
+            )
+        if cache is not None:
+            cache.clear()
+            cache[cache_key] = freqs_cis
+        return freqs_cis
+
     def _prepare_condition_embeddings(
         self,
         *,
@@ -1274,22 +1317,14 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 )
             frame_stride = post_patch_height * post_patch_width
             token_start = start_frame * frame_stride + sum(seq_shard_splits[:sp_rank])
-            freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard_with_offset(
-                local_seq_len,
-                token_start,
-                frame_stride,
-                post_patch_width,
-                hidden_states.device,
+            freqs_cis = self._prepare_cached_rope_for_sequence_shard(
+                forward_batch=forward_batch,
+                local_seq_len=local_seq_len,
+                token_start=token_start,
+                frame_stride=frame_stride,
+                post_patch_width=post_patch_width,
+                device=hidden_states.device,
             )
-            freqs_cos = freqs_cos.float()
-            freqs_sin = freqs_sin.float()
-            freqs_cis = (freqs_cos, freqs_sin)
-            if _is_cuda:
-                freqs_cis = (
-                    freqs_cos,
-                    freqs_sin,
-                    torch.cat([freqs_cos.contiguous(), freqs_sin.contiguous()], dim=-1),
-                )
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self._prepare_condition_embeddings(
