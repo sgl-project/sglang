@@ -443,9 +443,6 @@ class C4IndexerBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        # PREP_IN_CG lazy upgrade: this runs from MQALayer._forward_prepare,
-        # before attn_backend.forward() would trigger the upgrade.
-        self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = self.token_to_kv_pool
 
         if TYPE_CHECKING:
