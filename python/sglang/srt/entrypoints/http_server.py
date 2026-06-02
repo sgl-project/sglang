@@ -1967,9 +1967,7 @@ def _uds_request(
         body = None
         if json_data is not None:
             body = json.dumps(json_data).encode("utf-8")
-            merged_headers.setdefault(
-                "Content-Type", "application/json; charset=utf-8"
-            )
+            merged_headers.setdefault("Content-Type", "application/json; charset=utf-8")
         conn.request(method, path, body=body, headers=merged_headers)
         resp = conn.getresponse()
         raw = resp.read()
