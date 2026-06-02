@@ -89,7 +89,16 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
-        yield
+        # The overlap pipeline clears the chunked slot and releases the req's KV/row
+        # over several steps after the abort is injected, not in a single yield.
+        for _ in range(12):
+            if (
+                t.scheduler.chunked_req is None
+                and r.kv_pages == 0
+                and r.lock_refs == 0
+            ):
+                break
+            yield
 
         assert (
             t.scheduler.chunked_req is None
