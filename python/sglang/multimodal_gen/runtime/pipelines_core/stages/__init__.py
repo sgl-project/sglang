@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution import (
     ProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
     RealtimeInputValidationStage,
 )
