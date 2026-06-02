@@ -10,6 +10,8 @@ const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
 const DEFAULT_TARGET_FPS = 25;
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
 const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
+const DEFAULT_UPSCALING_SCALE = 2;
+const DEFAULT_VIEW_MODE = "fit";
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
@@ -225,6 +227,7 @@ let socketServerError = "";
 const decodeRequests = new Map();
 let controlStateController = null;
 
+const stage = document.querySelector(".stage");
 const canvas = $("viewport");
 const ctx = canvas.getContext("2d", { alpha: false });
 const scratchCanvas = document.createElement("canvas");
@@ -290,6 +293,7 @@ function resetStreamStats() {
   $("theoreticalFpsText").textContent = "-";
   $("chunkText").textContent = "chunk -";
   $("payloadMode").textContent = selectedTransportLabel();
+  updateOutputSizeText();
 }
 
 function rejectPendingDecodes(message) {
@@ -659,6 +663,7 @@ async function payloadToArrayBuffer(data) {
 function drawFrame(image) {
   const sourceWidth = image.width;
   const sourceHeight = image.height;
+  setNativeViewportSize(sourceWidth, sourceHeight);
   let drawSource = image;
   if (image instanceof ImageData) {
     if (scratchCanvas.width !== sourceWidth || scratchCanvas.height !== sourceHeight) {
@@ -851,6 +856,7 @@ async function connect() {
     }
     const previewTransportParams = readPreviewTransportParams();
     const frameInterpolationParams = readFrameInterpolationParams();
+    const superResolutionParams = readSuperResolutionParams();
     const init = compact({
       type: "init",
       model: $("model").value,
@@ -867,6 +873,7 @@ async function connect() {
       first_frame: firstFrame,
       ...previewTransportParams,
       ...frameInterpolationParams,
+      ...superResolutionParams,
     });
     document.activeElement?.blur?.();
     canvas.tabIndex = 0;
@@ -1019,6 +1026,7 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   frames += chunkFrameCount;
   bytes += payloadBytes;
   $("payloadMode").textContent = header.encoding || "raw RGB";
+  updateOutputSizeFromHeader(header);
   updatePlaybackPace(header, performance.now(), chunkFrameCount);
   setStatus("Live", "live");
   updateStats(header);
@@ -1114,6 +1122,7 @@ async function applyPreset(preset, options = {}) {
   $("prompt").value = preset.prompt;
   $("size").value = preset.size;
   $("fps").value = preset.fps;
+  updateOutputSizeText();
   await setPresetReference(preset);
   if (sendRuntimeEvents) {
     sendEvent("prompt", preset.prompt, `prompt update · ${preset.name}`);
@@ -1249,6 +1258,72 @@ function readFrameInterpolationParams() {
   };
 }
 
+function readUpscalingScale() {
+  return Number($("upscalingScale").value || DEFAULT_UPSCALING_SCALE);
+}
+
+function readSuperResolutionParams() {
+  if (!$("superResolution").checked) return {};
+  return {
+    enable_upscaling: true,
+    upscaling_scale: readUpscalingScale(),
+  };
+}
+
+function parseSizeValue(sizeText) {
+  const match = /^(\d+)\s*x\s*(\d+)$/i.exec(String(sizeText || "").trim());
+  if (!match) return null;
+  return {
+    width: Number(match[1]),
+    height: Number(match[2]),
+  };
+}
+
+function updateOutputSizeText(width = null, height = null) {
+  let outputWidth = Number(width || 0);
+  let outputHeight = Number(height || 0);
+  const srEnabled = $("superResolution").checked;
+  const scale = srEnabled ? readUpscalingScale() : 1;
+  if (!outputWidth || !outputHeight) {
+    const base = parseSizeValue($("size").value);
+    if (base) {
+      outputWidth = base.width * scale;
+      outputHeight = base.height * scale;
+    }
+  }
+  $("outputSizeText").textContent = outputWidth && outputHeight
+    ? `${outputWidth}x${outputHeight}${srEnabled ? ` · SR ${scale}x` : ""}`
+    : "-";
+}
+
+function updateOutputSizeFromHeader(header) {
+  const width = Number(header.width || 0);
+  const height = Number(header.height || 0);
+  if (width && height) updateOutputSizeText(width, height);
+}
+
+function updateSuperResolutionControls() {
+  $("upscalingScale").disabled = !$("superResolution").checked;
+  updateOutputSizeText();
+}
+
+function setNativeViewportSize(width, height) {
+  if (!stage) return;
+  stage.style.setProperty("--native-preview-width", `${width}px`);
+  stage.style.setProperty("--native-preview-height", `${height}px`);
+}
+
+function setPreviewMode(mode) {
+  if (!stage) return;
+  const viewMode = mode || DEFAULT_VIEW_MODE;
+  stage.dataset.viewMode = viewMode;
+  document.querySelectorAll("[data-view-mode]").forEach((btn) => {
+    const active = btn.dataset.viewMode === viewMode;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+}
+
 function selectedTransportLabel() {
   const select = $("transportFormat");
   return select.options[select.selectedIndex]?.textContent || "raw RGB";
@@ -1299,6 +1374,12 @@ async function applyQueryParams() {
   if (model) $("model").value = model;
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  const srParam = params.get("sr");
+  $("superResolution").checked = srParam === "1" || srParam === "true";
+  $("upscalingScale").value = params.get("sr_scale") || String(DEFAULT_UPSCALING_SCALE);
+  const viewMode = params.get("view") || DEFAULT_VIEW_MODE;
+  setPreviewMode(viewMode);
+  updateSuperResolutionControls();
   return {
     model: Boolean(model),
     preset: Boolean(presetKey && appliedPreset),
@@ -1394,6 +1475,8 @@ function unpack(buf) {
 
 renderPresets();
 drawIdle();
+setPreviewMode(DEFAULT_VIEW_MODE);
+updateSuperResolutionControls();
 applyPreset(presets[0], { sendRuntimeEvents: false })
   .then(applyQueryParams)
   .then((query) => queryServerModelInfo({
@@ -1406,6 +1489,12 @@ $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
 $("enhanceBtn").onclick = enhancePrompt;
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
+$("size").addEventListener("input", () => updateOutputSizeText());
+$("superResolution").addEventListener("change", updateSuperResolutionControls);
+$("upscalingScale").addEventListener("change", () => updateOutputSizeText());
+document.querySelectorAll("[data-view-mode]").forEach((btn) => {
+  btn.addEventListener("click", () => setPreviewMode(btn.dataset.viewMode));
+});
 $("serverUrl").addEventListener("change", () => {
   queryServerModelInfo({ applyPresetForModel: true }).catch(showError);
 });

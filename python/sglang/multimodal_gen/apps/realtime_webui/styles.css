@@ -136,6 +136,13 @@ textarea { resize: vertical; line-height: 1.45; }
 input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.12); }
 
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.output-options {
+  align-items: end;
+}
+.output-options .toggle-row {
+  min-height: 40px;
+  margin: 12px 0;
+}
 .actions { display: grid; grid-template-columns: 1fr 0.7fr; gap: 10px; margin-top: 16px; }
 .toggle-row {
   display: flex;
@@ -223,6 +230,16 @@ button:focus-visible {
   box-shadow: var(--shadow);
 }
 
+.stage[data-view-mode="large"] {
+  max-width: min(1500px, calc(100vw - 36px));
+}
+
+.stage[data-view-mode="native"] {
+  width: min-content;
+  max-width: calc(100vw - 36px);
+  overflow: auto;
+}
+
 .topbar, .timeline {
   display: flex;
   align-items: center;
@@ -235,6 +252,34 @@ button:focus-visible {
 }
 
 .topbar-spacer { flex: 1; }
+.view-mode {
+  display: inline-grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid rgba(232, 234, 223, 0.16);
+  border-radius: 6px;
+  background: rgba(255, 253, 247, 0.06);
+}
+.view-mode button {
+  min-height: 24px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 8px;
+  background: transparent;
+  color: rgba(232, 234, 223, 0.68);
+  font-size: 11px;
+}
+.view-mode button:hover:not(:disabled) {
+  background: rgba(255, 253, 247, 0.1);
+  box-shadow: none;
+  color: #fffdf7;
+  transform: none;
+}
+.view-mode button.is-active {
+  background: #eef1ec;
+  color: #11140f;
+}
 #statusText {
   display: inline-block;
   min-width: 92px;
@@ -268,6 +313,16 @@ button:focus-visible {
   min-height: 0;
   object-fit: contain;
   image-rendering: auto;
+}
+
+.stage[data-view-mode="large"] #viewport {
+  max-height: min(74vh, 920px);
+}
+
+.stage[data-view-mode="native"] #viewport {
+  width: var(--native-preview-width, 100%);
+  max-width: none;
+  max-height: none;
 }
 
 .stage-controls {
@@ -505,4 +560,13 @@ button:focus-visible {
   .stage-telemetry { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topbar { flex-wrap: wrap; height: auto; min-height: 44px; padding: 10px 14px; }
   .topbar-spacer { display: none; }
+  .stage[data-view-mode="large"],
+  .stage[data-view-mode="native"] {
+    width: 100%;
+    max-width: none;
+  }
+  .stage[data-view-mode="native"] #viewport {
+    width: 100%;
+    max-height: none;
+  }
 }

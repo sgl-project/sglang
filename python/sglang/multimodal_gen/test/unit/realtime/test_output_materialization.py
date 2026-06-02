@@ -114,3 +114,60 @@ def test_raw_rgb_frame_batches_convert_batched_video_tensor_to_thwc_bytes():
     assert np.all(first[..., 0] == 255)
     assert np.all(first[..., 1] == 127)
     assert np.all(first[..., 2] == 0)
+
+
+def test_raw_rgb_frame_batches_apply_realtime_upscaling(monkeypatch):
+    calls = []
+
+    def fake_batch_upscale_frames(frames, *, model_path, scale):
+        calls.append((model_path, scale, [frame.shape for frame in frames]))
+        return [
+            np.repeat(np.repeat(frame, scale, axis=0), scale, axis=1)
+            for frame in frames
+        ]
+
+    from sglang.multimodal_gen.runtime import postprocess
+
+    monkeypatch.setattr(postprocess, "batch_upscale_frames", fake_batch_upscale_frames)
+
+    req = type(
+        "Req",
+        (),
+        {
+            "data_type": DataType.VIDEO,
+            "fps": 24,
+            "output_compression": None,
+            "enable_frame_interpolation": False,
+            "frame_interpolation_exp": 1,
+            "frame_interpolation_scale": 1.0,
+            "frame_interpolation_model_path": None,
+            "enable_upscaling": True,
+            "upscaling_model_path": "mock-sr",
+            "upscaling_scale": 2,
+            "request_id": "req",
+            "block_idx": 0,
+        },
+    )()
+    output_batch = OutputBatch(audio_sample_rate=None)
+
+    def post_process_sample(_sample, *_args, **kwargs):
+        assert kwargs["enable_upscaling"] is False
+        return [np.array([[[1, 2, 3]]], dtype=np.uint8)]
+
+    frame_batches, metadata = build_raw_rgb_frame_batches(
+        torch.zeros(1, 3, 1, 1, 1),
+        req,
+        output_batch,
+        post_process_sample,
+    )
+
+    assert calls == [("mock-sr", 2, [(1, 1, 3)])]
+    assert metadata == {
+        "format": "rgb24",
+        "width": 2,
+        "height": 2,
+        "channels": 3,
+        "bytes_per_frame": 12,
+    }
+    assert len(frame_batches) == 1
+    assert frame_batches[0][0] == bytes([1, 2, 3] * 4)
