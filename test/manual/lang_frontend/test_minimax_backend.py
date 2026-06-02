@@ -14,7 +14,7 @@ class TestMiniMaxBackend(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.chat_backend = MiniMax("MiniMax-M2.5")
+        cls.chat_backend = MiniMax("MiniMax-M3")
 
     def test_mt_bench(self):
         set_default_backend(self.chat_backend)

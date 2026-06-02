@@ -101,7 +101,7 @@ export MINIMAX_API_KEY="your-api-key"
 ```python
 import sglang as sgl
 
-backend = sgl.MiniMax("MiniMax-M2.5")
+backend = sgl.MiniMax("MiniMax-M3")
 sgl.set_default_backend(backend)
 
 @sgl.function
@@ -117,15 +117,16 @@ print(state["answer"])
 
 | Model | Description |
 |-------|-------------|
-| `MiniMax-M2.5` | Default. Peak performance, ultimate value. 204K context window. |
-| `MiniMax-M2.5-highspeed` | Same performance, faster and more agile. 204K context window. |
+| `MiniMax-M3` | Default. Latest generation, 512K context window, up to 128K max output, image input support. |
+| `MiniMax-M2.7` | Previous generation, strong agentic and coding performance. |
+| `MiniMax-M2.7-highspeed` | Same as M2.7, faster and lower latency. |
 
 ### Configuration
 
 ```python
 # Custom base URL (e.g., for users in mainland China)
 backend = sgl.MiniMax(
-    "MiniMax-M2.5",
+    "MiniMax-M3",
     api_key="your-api-key",
     base_url="https://api.minimaxi.com/v1",
 )

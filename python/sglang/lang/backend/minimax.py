@@ -19,13 +19,13 @@ class MiniMax(OpenAI):
 
     Usage:
         import sglang as sgl
-        backend = sgl.MiniMax("MiniMax-M2.5")
+        backend = sgl.MiniMax("MiniMax-M3")
         sgl.set_default_backend(backend)
     """
 
     def __init__(
         self,
-        model_name: str = "MiniMax-M2.5",
+        model_name: str = "MiniMax-M3",
         is_chat_model: Optional[bool] = None,
         chat_template: Optional[ChatTemplate] = None,
         api_key: Optional[str] = None,
