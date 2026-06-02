@@ -518,6 +518,13 @@ class TestRadixPartialPage(ScriptedTestCase):
                 break
             yield
         assert r.finished
+        # The finished req commits its prompt prefix to the radix tree, so that KV
+        # counts as cached-not-free until evicted. Drain the overlap lag and flush
+        # the tree before comparing, or legitimate caching reads as a leak.
+        for _ in range(5):
+            yield
+        t.flush_cache()
+        yield
         free_after: int = allocator.available_size()
         assert free_after == free_before, (
             f"KV pool free count delta on chunked req lifecycle must be 0; "
@@ -593,6 +600,10 @@ class TestRadixLpm(ScriptedTestCase):
         )
         yield from run_until_finished(r_warm)
         assert r_warm.finished
+        # Drain the overlap lag so r_warm fully leaves the running batch before the
+        # competitors start; otherwise it lingers as the "first admitted" rid.
+        for _ in range(5):
+            yield
 
         # Submit two reqs at once so calc_priority orders the waiting queue:
         # r_long shares the full 2-chunk warm prefix (longest prefix match),
@@ -666,9 +677,14 @@ class TestRadixDfsWeight(ScriptedTestCase):
         )
         all_reqs = heavy + [light]
 
+        # cached_tokens is set at admission and is stable, but req objects are
+        # cleared on finish (handle.req becomes None), so capture it live each step.
         finish_order: list = []
+        cached_tokens_by_rid: dict = {}
         for _ in range(DEFAULT_MAX_STEPS * 4):
             for r in all_reqs:
+                if r.req is not None:
+                    cached_tokens_by_rid[r.rid] = r.req.cached_tokens
                 if r.finished and r.rid not in finish_order:
                     finish_order.append(r.rid)
             if all(r.finished for r in all_reqs):
@@ -681,8 +697,8 @@ class TestRadixDfsWeight(ScriptedTestCase):
             f"light={light.rid!r}"
         )
         for r in heavy:
-            assert r.req.cached_tokens > 0
-        assert light.req.cached_tokens > 0
+            assert cached_tokens_by_rid.get(r.rid, 0) > 0
+        assert cached_tokens_by_rid.get(light.rid, 0) > 0
         for r in all_reqs:
             assert r.kv_pages == 0
             assert r.lock_refs == 0
@@ -706,6 +722,10 @@ class TestRadixPriority(ScriptedTestCase):
         r_warm = t.start_req(prompt_len=DEFAULT_CHUNK_SIZE * 2, max_new_tokens=1)
         yield from run_until_finished(r_warm)
         assert r_warm.finished
+        # Drain the overlap lag so r_warm fully leaves the running batch before the
+        # competitors start; otherwise it lingers as the "first admitted" rid.
+        for _ in range(5):
+            yield
 
         r_low = t.start_req(
             prompt_len=DEFAULT_CHUNK_SIZE * 4, max_new_tokens=1, priority=0

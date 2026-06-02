@@ -273,9 +273,17 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_alternating_short_long_seq(t: ScriptedContext):
+        # Distinct prompt_token per iteration: these reqs run sequentially in one
+        # script (no inter-script flush), so an identical fill token would let each
+        # long req hit the previous one's cached prefix and chunk fewer than 8 times.
         for i in range(6):
             prompt = 8 if i % 2 == 0 else VERY_LONG_PROMPT_LEN
-            r = t.start_req(prompt_len=prompt, max_new_tokens=2, ignore_eos=True)
+            r = t.start_req(
+                prompt_len=prompt,
+                max_new_tokens=2,
+                ignore_eos=True,
+                prompt_token=10 + i,
+            )
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 2
@@ -290,8 +298,13 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_seq_with_growing_prompt(t: ScriptedContext):
-        for L in [8, 32, 128, 512, 1024]:
-            r = t.start_req(prompt_len=L, max_new_tokens=1, ignore_eos=True)
+        # Distinct prompt_token per iteration: each growing prompt would otherwise
+        # be a prefix of the next, so a longer req would hit the shorter one's
+        # cached prefix and chunk fewer times than its cold ceil(L/chunk) count.
+        for idx, L in enumerate([8, 32, 128, 512, 1024]):
+            r = t.start_req(
+                prompt_len=L, max_new_tokens=1, ignore_eos=True, prompt_token=10 + idx
+            )
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 1
@@ -340,9 +353,13 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_then_short_seq(t: ScriptedContext):
+        # Distinct prompt_token per iteration so each long req chunks cold (8x)
+        # instead of hitting the previous long req's cached prefix.
         seq = [VERY_LONG_PROMPT_LEN, 8, VERY_LONG_PROMPT_LEN, 8]
-        for L in seq:
-            r = t.start_req(prompt_len=L, max_new_tokens=2, ignore_eos=True)
+        for idx, L in enumerate(seq):
+            r = t.start_req(
+                prompt_len=L, max_new_tokens=2, ignore_eos=True, prompt_token=10 + idx
+            )
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 2
@@ -364,6 +381,12 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.finished
             assert len(r.req.output_ids) == 2
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+        # Finished reqs leave their prompt prefixes cached in the radix tree, so the
+        # pool only returns to baseline after draining the overlap lag and flushing.
+        for _ in range(5):
+            yield
+        t.flush_cache()
+        yield
         final = t.engine_stats()["kv_pool_free"]
         assert (
             final >= baseline - 1
