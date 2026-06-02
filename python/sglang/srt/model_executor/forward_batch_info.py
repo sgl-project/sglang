@@ -27,6 +27,7 @@ ScheduleBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -40,6 +41,10 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
+from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
+    compute_req_all_ids_info,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -49,7 +54,6 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -60,10 +64,11 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -274,6 +279,7 @@ class NgramEmbeddingInfo:
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
 
+    # === Required core inputs (no default; input_ids / req_pool_indices / seq_lens / out_cache_loc are borrowed from ScheduleBatch) ===
     # The forward mode
     forward_mode: ForwardMode
     # The batch size
@@ -286,10 +292,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
-
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
+    # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
+    # they are cloned/relayed into FB-owned copies at the boundary, move them out of
+    # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
@@ -304,21 +313,76 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
 
-    # Optional seq_lens on cpu
+    # For input embeddings
+    input_embeds: Optional[torch.Tensor] = None
+    # For token embedding overrides (sparse replacement at specific positions)
+    replace_embeds: Optional[torch.Tensor] = None
+    replace_positions: Optional[torch.Tensor] = None
+
+    # For cross-encoder model
+    token_type_ids: Optional[torch.Tensor] = None
+
+    # Encoder-decoder device tensors
+    encoder_lens: Optional[torch.Tensor] = None
+    encoder_out_cache_loc: Optional[torch.Tensor] = None
+
+    # === Borrowed from ScheduleBatch: config / flags (by-value) ===
+    # For logprob
+    return_logprob: bool = False
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+    spec_algorithm: SpeculativeAlgorithm = None
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+    # Whether to return pooled hidden states (pre-head transformer output)
+    return_pooled_hidden_states: bool = False
+
+    # For DP attention
+    is_extend_in_batch: bool = False
+    # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
+    all_extend_in_batch: bool = False
+    can_run_dp_cuda_graph: bool = False
+    global_forward_mode: Optional[ForwardMode] = None
+
+    # For two-batch overlap
+    tbo_split_seq_index: Optional[int] = None
+
+    # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
+    # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
 
     # For logprob
-    return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
-    # For logits and logprobs post processing
-    next_token_logits_buffer: torch.Tensor = None
-    temp_scaled_logprobs: bool = False
-    temperature: torch.Tensor = None
-    top_p_normalized_logprobs: bool = False
-    top_p: torch.Tensor = None
+    # For multimodal
+    mm_inputs: Optional[List[MultimodalInputs]] = None
 
+    # Encoder-decoder host fields
+    encoder_cached: Optional[List[bool]] = None
+    encoder_lens_cpu: Optional[List[int]] = None
+
+    # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
+    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
+
+    # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
+    # Sampling info
+    sampling_info: SamplingBatchInfo = None
+    # Speculative decoding
+    spec_info: Optional[SpecInput] = None
+
+    # === Derived from ScheduleBatch.reqs ===
+    # For LoRA
+    lora_ids: Optional[List[str]] = None
+    # For dumper: request IDs for cross-step sequence tracking
+    rids: Optional[List[str]] = None
+
+    # === Resolved from SB one-shot overrides (consumed + reset by init_new) ===
+    capture_hidden_mode: CaptureHiddenMode = None
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
+
+    # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
 
@@ -332,6 +396,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
+    # For DP attention (MLP sync sizes)
+    original_global_num_tokens_cpu: Optional[List[int]] = None
+    global_num_tokens_cpu: Optional[List[int]] = None
+    global_num_tokens_gpu: Optional[torch.Tensor] = None
+    # Has to be None when cuda graph is captured.
+    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+
+    # For padding
+    num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
+    num_token_non_padded_cpu: int = None
+
+    # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
+    # For logits and logprobs post processing
+    next_token_logits_buffer: torch.Tensor = None
+    temperature: torch.Tensor = None
+    top_p: torch.Tensor = None
+
     # For split prefill
     # intermediate values for split prefill
     hidden_states: torch.Tensor = None
@@ -341,39 +423,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     split_index: int = 0
 
     # For multimodal
-    mm_inputs: Optional[List[MultimodalInputs]] = None
+    mm_input_embeds: Optional[torch.Tensor] = None
 
-    # Encoder-decoder
-    encoder_cached: Optional[List[bool]] = None
-    encoder_lens: Optional[torch.Tensor] = None
-    encoder_lens_cpu: Optional[List[int]] = None
-    encoder_out_cache_loc: Optional[torch.Tensor] = None
+    # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
-    # For LoRA
-    lora_ids: Optional[List[str]] = None
-
-    # For input embeddings
-    input_embeds: Optional[torch.Tensor] = None
-
-    # For token embedding overrides (sparse replacement at specific positions)
-    replace_embeds: Optional[torch.Tensor] = None
-    replace_positions: Optional[torch.Tensor] = None
-
-    # For cross-encoder model
-    token_type_ids: Optional[torch.Tensor] = None
-
-    # Sampling info
-    sampling_info: SamplingBatchInfo = None
-
-    # For DP attention
-    original_global_num_tokens_cpu: Optional[List[int]] = None
-    global_num_tokens_cpu: Optional[List[int]] = None
-    global_num_tokens_gpu: Optional[torch.Tensor] = None
-    # Has to be None when cuda graph is captured.
-    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
-    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    # The padding mode for DP attention
+    # For DP attention (padding / local info)
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
@@ -381,54 +436,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
-    is_extend_in_batch: bool = False
-    # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
-    all_extend_in_batch: bool = False
-    can_run_dp_cuda_graph: bool = False
-    global_forward_mode: Optional[ForwardMode] = None
-
-    # Whether this batch is prefill-only (no token generation needed)
-    is_prefill_only: bool = False
-
-    # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
-    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
-
-    # Speculative decoding
-    spec_info: Optional[SpecInput] = None
-    spec_algorithm: SpeculativeAlgorithm = None
-    mm_input_embeds: Optional[torch.Tensor] = None
-    capture_hidden_mode: CaptureHiddenMode = None
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
-    num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
-    num_token_non_padded_cpu: int = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
     # For two-batch overlap
-    tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
-    # For matryoshka embeddings
-    dimensions: Optional[list[int]] = None
-
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
-
-    # For hidden states before normal
-    return_hidden_states_before_norm: bool = False
-
-    # Whether to return pooled hidden states (pre-head transformer output)
-    return_pooled_hidden_states: bool = False
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
-    # For dumper: request IDs for cross-step sequence tracking
-    rids: Optional[List[str]] = None
+    # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
+    rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
+
+    # kv-canary token-id validator snapshot
+    req_all_ids_flat: Optional[torch.Tensor] = None
+    req_all_ids_lens: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -490,56 +521,78 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             seq_lens_cpu = batch.seq_lens_cpu
 
-        if batch.seq_lens_sum is None:
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        if batch.seq_lens_sum is None and seq_lens_cpu is not None:
+            batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
         ret = cls(
+            # Required core inputs
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            seq_lens_sum=batch.seq_lens_sum,
+            # Inputs aliased by reference from ScheduleBatch
+            seq_lens_cpu=seq_lens_cpu,
+            orig_seq_lens=batch.orig_seq_lens,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
-            mm_inputs=batch.multimodal_inputs,
-            encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
-            encoder_lens_cpu=batch.encoder_lens_cpu,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
-            seq_lens_sum=batch.seq_lens_sum,
-            seq_lens_cpu=seq_lens_cpu,
-            orig_seq_lens=batch.orig_seq_lens,
+            input_embeds=batch.input_embeds,
+            replace_embeds=batch.replace_embeds,
+            replace_positions=batch.replace_positions,
+            # Scalar config / flags
             return_logprob=batch.return_logprob,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            token_ids_logprobs=batch.token_ids_logprobs,
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
-            multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
-            lora_ids=[req.lora_id for req in batch.reqs],
-            sampling_info=batch.sampling_info,
             spec_algorithm=batch.spec_algorithm,
-            spec_info=batch.spec_info,
             capture_hidden_mode=capture_hidden_mode,
-            input_embeds=batch.input_embeds,
-            replace_embeds=batch.replace_embeds,
-            replace_positions=batch.replace_positions,
-            token_type_ids=batch.token_type_ids,
-            tbo_split_seq_index=batch.tbo_split_seq_index,
-            dimensions=batch.dimensions,
-            return_pooled_hidden_states=batch.return_pooled_hidden_states,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            tbo_split_seq_index=batch.tbo_split_seq_index,
+            # Host-side metadata
+            top_logprobs_nums=batch.top_logprobs_nums,
+            token_ids_logprobs=batch.token_ids_logprobs,
+            mm_inputs=batch.multimodal_inputs,
+            encoder_cached=batch.encoder_cached,
+            encoder_lens_cpu=batch.encoder_lens_cpu,
+            lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            # Compound (carry their own device tensors)
+            sampling_info=batch.sampling_info,
+            spec_info=batch.spec_info,
         )
 
+        ret._maybe_init_non_generation_fields(batch)
+
         device = model_runner.device
+
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            hashed = _hash_rids_to_tensor(
+                rids=[req.rid for req in batch.reqs],
+                device=device,
+            )
+            bootstrap_room_ids = _bootstrap_rooms_to_tensor(
+                bootstrap_rooms=[req.bootstrap_room for req in batch.reqs],
+                device=device,
+            )
+            batch.sampling_info.rids_int = hashed
+            batch.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
+            ret.rids_int = hashed
+            ret.bootstrap_room_ids_int = bootstrap_room_ids
+
+        if envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get():
+            ret.req_all_ids_flat, ret.req_all_ids_lens = compute_req_all_ids_info(
+                batch.reqs
+            )
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -606,14 +659,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            assert isinstance(extend_seq_lens, list)
-            assert isinstance(extend_prefix_lens, list)
-            ret.extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
-            ret.extend_prefix_lens = torch.tensor(
-                extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            if isinstance(extend_seq_lens, list):
+                # Main path: H2D from host lists; populate *_cpu mirrors.
+                assert isinstance(extend_prefix_lens, list)
+                ret.extend_seq_lens = torch.tensor(
+                    extend_seq_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_prefix_lens = torch.tensor(
+                    extend_prefix_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_prefix_lens_cpu = extend_prefix_lens
+                ret.extend_seq_lens_cpu = extend_seq_lens
+            else:
+                # gpu_only: device tensors handed in directly; leave *_cpu unset.
+                assert isinstance(extend_seq_lens, torch.Tensor)
+                ret.extend_seq_lens = extend_seq_lens
+                ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
@@ -623,8 +684,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             if ret.positions is None:
                 ret.positions = positions
-            ret.extend_prefix_lens_cpu = extend_prefix_lens
-            ret.extend_seq_lens_cpu = extend_seq_lens
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.use_ngram_embedding:
@@ -649,6 +708,49 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
+        """Derive non-generation (max_new_tokens==0) forward fields from reqs.
+
+        token_type_ids gates on presence, not is_prefill_only: a missing
+        tensor makes bert/roberta silently fall back to zeros.
+        """
+        if self.is_prefill_only:
+            if batch.model_config.is_matryoshka and any(
+                r.dimensions is not None for r in batch.reqs
+            ):
+                self.dimensions = [
+                    r.dimensions if r.dimensions else batch.model_config.hidden_size
+                    for r in batch.reqs
+                ]
+
+            self.return_pooled_hidden_states = any(
+                r.return_pooled_hidden_states for r in batch.reqs
+            )
+
+            # --enable-mis: every request must carry delimiter indices (the score
+            # endpoint always produces MIS-structured requests; consumers index
+            # without None-checking).
+            if get_global_server_args().enable_mis and any(
+                r.multi_item_delimiter_indices is not None for r in batch.reqs
+            ):
+                assert all(
+                    r.multi_item_delimiter_indices is not None for r in batch.reqs
+                ), "MIS batch must have delimiter indices on every request"
+                self.multi_item_delimiter_indices = [
+                    torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
+                    for r in batch.reqs
+                ]
+
+        token_type_ids = [
+            r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
+        ]
+        if token_type_ids:
+            self.token_type_ids = torch.tensor(
+                sum(token_type_ids, []),
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(batch.device),
+            ).to(batch.device, non_blocking=True)
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
@@ -889,10 +991,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
-        # make sure that each rank has the same number of tokens to do collective communication.
+        # make sure that each rank has the same number of tokens to do collective communication and
+        # we can divide the tokens into 2 * CP chunks for load balance.
         attn_cp_size = get_attention_cp_size()
         for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size * 2)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1019,6 +1122,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+
+        if self.rids_int is not None:
+            self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)
+            if self.sampling_info is not None:
+                self.sampling_info.rids_int = self.rids_int
+        if self.bootstrap_room_ids_int is not None:
+            self.bootstrap_room_ids_int = self._pad_tensor_to_size(
+                self.bootstrap_room_ids_int, bs, value=-1
+            )
+            if self.sampling_info is not None:
+                self.sampling_info.bootstrap_room_ids_int = self.bootstrap_room_ids_int
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
@@ -1253,3 +1367,20 @@ if is_cuda() or is_hip():
     clamp_position = clamp_position_cuda
 else:
     clamp_position = _clamp_position_native
+
+
+def _hash_rids_to_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
+    values: List[int] = [_stable_hash_str_to_i64(rid) for rid in rids]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _bootstrap_rooms_to_tensor(
+    *, bootstrap_rooms: List[Optional[int]], device: torch.device
+) -> torch.Tensor:
+    values: List[int] = [room if room is not None else -1 for room in bootstrap_rooms]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _stable_hash_str_to_i64(rid: str) -> int:
+    digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little", signed=True)
