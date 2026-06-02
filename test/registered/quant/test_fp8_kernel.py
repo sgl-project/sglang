@@ -18,14 +18,6 @@ _is_xpu = is_xpu()
 
 device = get_device()
 
-from sglang.srt.utils import get_device, is_cuda, is_xpu
-
-_is_cuda = is_cuda()
-_is_xpu = is_xpu()
-
-device = get_device()
-
-
 class TestFP8Base(CustomTestCase):
     @classmethod
     def setUpClass(cls):
