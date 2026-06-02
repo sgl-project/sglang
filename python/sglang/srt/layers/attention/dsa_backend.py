@@ -2547,7 +2547,6 @@ class DeepseekSparseAttnMultiStepBackend:
                         forward_mode=ForwardMode.DECODE,
                     )
         else:
-            # Fallback: compute metadata separately for each backend.
             for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[i]._apply_cuda_graph_metadata(
                     bs=bs,

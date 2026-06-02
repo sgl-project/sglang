@@ -35,8 +35,6 @@ class TboAttnBackend(AttentionBackend):
         )
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
-            # Eager / capture path: prepare_raw has already populated split
-            # children on forward_batch — dispatch directly.
             for child, forward_batch_child in zip(
                 self.children, tbo_children, strict=True
             ):
@@ -46,9 +44,6 @@ class TboAttnBackend(AttentionBackend):
                     )
             return
         if in_capture:
-            # Capture entry without prepared children — caller will populate
-            # children via prepare_raw before any forward; nothing to dispatch
-            # here.
             return
         # Replay path: build_replay_fb_view returns a SimpleNamespace and
         # tbo_plugin.replay_prepare does not call prepare_raw, so split the

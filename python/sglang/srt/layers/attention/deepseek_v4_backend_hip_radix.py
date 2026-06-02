@@ -1187,8 +1187,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # Fan out to every inner backend; they each own their own
-        # forward_metadata rather than sharing self.forward_metadata.
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 
@@ -1197,7 +1195,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # forward_mode is hard-pinned to DECODE for inner dispatch.
         from types import SimpleNamespace
 
         inner_fb = SimpleNamespace(

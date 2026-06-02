@@ -330,7 +330,6 @@ class BreakableCudaGraphRunner:
         with forward_context(
             ForwardContext(attn_backend=self.model_runner.attn_backend)
         ):
-            # Warmup runs eager-style (not under graph.capture).
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             self._run_forward(forward_batch, num_tokens)
 

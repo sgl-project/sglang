@@ -1211,8 +1211,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # Fan out to every inner backend; they each own their own
-        # forward_metadata rather than sharing self.forward_metadata.
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 
@@ -1221,7 +1219,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # forward_mode is hard-pinned to DECODE for inner dispatch.
         from types import SimpleNamespace
 
         inner_fb = SimpleNamespace(
@@ -1250,8 +1247,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         else:
             if self.speculative_num_steps == 1:
                 return
-            # Drive the first inner backend; subsequent steps clone its
-            # captured metadata via replay_cuda_graph_metadata_from.
             self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
             temp_metadata = self.attn_backends[0].forward_metadata
             for i in range(1, self.speculative_num_steps - 1):
