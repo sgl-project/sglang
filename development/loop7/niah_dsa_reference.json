@@ -1,5 +1,5 @@
 {
-  "op_point": "DS int8 / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV",
+  "op_point": "DSA native-NSA (no double-sparsity) / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV",
   "base_url": "http://127.0.0.1:30000",
   "num_per_length": 20,
   "max_new_tokens": 64,

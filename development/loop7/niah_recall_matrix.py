@@ -59,9 +59,12 @@ def main():
     lengths = sorted(set(dsa) | set(dsd) | set(dsh))
     matrix = {
         "materiality_rule": (
-            "An uplift of a DS variant over the DS-default baseline is MATERIAL "
-            "only when the variant recall point lies outside the baseline's 95% "
-            "Clopper-Pearson CI. DSA is the recall ceiling; gap = DSA - DS."
+            "An UPLIFT of a DS variant over the DS-default baseline is MATERIAL "
+            "only when the variant recall point EXCEEDS the DS-default baseline's "
+            "95% Clopper-Pearson CI HIGH (directional, h > base_hi). A below-CI "
+            "point is reported separately (hybrid_below_baseline_CI) and a sub-2-"
+            "needle floor move is NOT a material regression. DSA is the recall "
+            "ceiling; gap = DSA - DS."
         ),
         "op_points": {"dsa": dsa_op, "ds_default": dsd_op, "ds_hybrid": dsh_op},
         "ci": "Clopper-Pearson exact 95%",

@@ -1,0 +1,46 @@
+{
+  "op_point": "DSA native-NSA (no double-sparsity) / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV",
+  "base_url": "http://127.0.0.1:30000",
+  "num_per_length": 50,
+  "max_new_tokens": 64,
+  "index_topk": 2048,
+  "timestamp": "20260602T132038Z",
+  "lengths": [
+    {
+      "length_words": 1024,
+      "num_requested": 50,
+      "served": 50,
+      "admission_fail": 0,
+      "recall_hits": 50,
+      "served_recall": 1.0,
+      "prompt_tokens_min": 1086,
+      "prompt_tokens_max": 1124,
+      "errors": [],
+      "elapsed_s": 12.9
+    },
+    {
+      "length_words": 4096,
+      "num_requested": 50,
+      "served": 50,
+      "admission_fail": 0,
+      "recall_hits": 50,
+      "served_recall": 1.0,
+      "prompt_tokens_min": 4349,
+      "prompt_tokens_max": 4429,
+      "errors": [],
+      "elapsed_s": 23.7
+    },
+    {
+      "length_words": 16384,
+      "num_requested": 50,
+      "served": 50,
+      "admission_fail": 0,
+      "recall_hits": 50,
+      "served_recall": 1.0,
+      "prompt_tokens_min": 17430,
+      "prompt_tokens_max": 17603,
+      "errors": [],
+      "elapsed_s": 92.3
+    }
+  ]
+}

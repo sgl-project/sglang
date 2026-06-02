@@ -9,32 +9,32 @@
   "lengths": {
     "1024": {
       "dsa": {
-        "hits": 20,
-        "served": 20,
+        "hits": 50,
+        "served": 50,
         "admission_fail": 0,
         "recall": 1.0,
         "ci95": [
-          0.8316,
+          0.9289,
           1.0
         ]
       },
       "ds_default": {
-        "hits": 20,
-        "served": 20,
+        "hits": 50,
+        "served": 50,
         "admission_fail": 0,
         "recall": 1.0,
         "ci95": [
-          0.8316,
+          0.9289,
           1.0
         ]
       },
       "ds_hybrid": {
-        "hits": 20,
-        "served": 20,
+        "hits": 50,
+        "served": 50,
         "admission_fail": 0,
         "recall": 1.0,
         "ci95": [
-          0.8316,
+          0.9289,
           1.0
         ]
       },
@@ -44,130 +44,79 @@
       "gap_dsa_minus_ds_default": 0.0,
       "gap_dsa_minus_ds_hybrid": 0.0
     },
-    "1536": {
-      "dsa": null,
-      "ds_default": {
-        "hits": 20,
-        "served": 20,
-        "admission_fail": 0,
-        "recall": 1.0,
-        "ci95": [
-          0.8316,
-          1.0
-        ]
-      },
-      "ds_hybrid": null
-    },
     "4096": {
       "dsa": {
-        "hits": 20,
-        "served": 20,
+        "hits": 50,
+        "served": 50,
         "admission_fail": 0,
         "recall": 1.0,
         "ci95": [
-          0.8316,
+          0.9289,
           1.0
         ]
       },
       "ds_default": {
-        "hits": 15,
-        "served": 20,
+        "hits": 40,
+        "served": 50,
         "admission_fail": 0,
-        "recall": 0.75,
+        "recall": 0.8,
         "ci95": [
-          0.509,
-          0.9134
+          0.6628,
+          0.8997
         ]
       },
       "ds_hybrid": {
-        "hits": 17,
-        "served": 20,
+        "hits": 40,
+        "served": 50,
         "admission_fail": 0,
-        "recall": 0.85,
+        "recall": 0.8,
         "ci95": [
-          0.6211,
-          0.9679
+          0.6628,
+          0.8997
         ]
       },
-      "hybrid_uplift_vs_default": 0.1,
+      "hybrid_uplift_vs_default": 0.0,
       "hybrid_material_uplift_vs_default_CI": false,
       "hybrid_below_baseline_CI": false,
-      "gap_dsa_minus_ds_default": 0.25,
-      "gap_dsa_minus_ds_hybrid": 0.15
+      "gap_dsa_minus_ds_default": 0.2,
+      "gap_dsa_minus_ds_hybrid": 0.2
     },
     "16384": {
       "dsa": {
-        "hits": 20,
-        "served": 20,
+        "hits": 50,
+        "served": 50,
         "admission_fail": 0,
         "recall": 1.0,
         "ci95": [
-          0.8316,
+          0.9289,
           1.0
         ]
       },
       "ds_default": {
-        "hits": 1,
-        "served": 20,
+        "hits": 3,
+        "served": 50,
         "admission_fail": 0,
-        "recall": 0.05,
+        "recall": 0.06,
         "ci95": [
-          0.0013,
-          0.2487
+          0.0125,
+          0.1655
         ]
       },
       "ds_hybrid": {
-        "hits": 8,
-        "served": 20,
+        "hits": 19,
+        "served": 50,
         "admission_fail": 0,
-        "recall": 0.4,
+        "recall": 0.38,
         "ci95": [
-          0.1912,
-          0.6395
+          0.2465,
+          0.5283
         ]
       },
-      "hybrid_uplift_vs_default": 0.35,
+      "hybrid_uplift_vs_default": 0.32,
       "hybrid_material_uplift_vs_default_CI": true,
       "hybrid_below_baseline_CI": false,
-      "gap_dsa_minus_ds_default": 0.95,
-      "gap_dsa_minus_ds_hybrid": 0.6
-    },
-    "65536": {
-      "dsa": {
-        "hits": 20,
-        "served": 20,
-        "admission_fail": 0,
-        "recall": 1.0,
-        "ci95": [
-          0.8316,
-          1.0
-        ]
-      },
-      "ds_default": {
-        "hits": 1,
-        "served": 20,
-        "admission_fail": 0,
-        "recall": 0.05,
-        "ci95": [
-          0.0013,
-          0.2487
-        ]
-      },
-      "ds_hybrid": {
-        "hits": 0,
-        "served": 20,
-        "admission_fail": 0,
-        "recall": 0.0,
-        "ci95": [
-          0.0,
-          0.1684
-        ]
-      },
-      "hybrid_uplift_vs_default": -0.05,
-      "hybrid_material_uplift_vs_default_CI": false,
-      "hybrid_below_baseline_CI": true,
-      "gap_dsa_minus_ds_default": 0.95,
-      "gap_dsa_minus_ds_hybrid": 1.0
+      "gap_dsa_minus_ds_default": 0.94,
+      "gap_dsa_minus_ds_hybrid": 0.62
     }
   }
 }

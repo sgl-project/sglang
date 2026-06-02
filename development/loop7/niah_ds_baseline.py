@@ -63,11 +63,16 @@ def main():
     ap.add_argument("--num", type=int, default=int(os.environ.get("AC12_NIAH_NUM_PROMPTS", 5)))
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--out", default="development/loop7/ds_niah_baseline.json")
+    ap.add_argument(
+        "--op-point",
+        default="DS int8 / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV",
+        help="accurate op-point label for the artifact (e.g. native-NSA/no-DS for DSA).",
+    )
     args = ap.parse_args()
 
     base_url = os.environ.get("DS_BASE_URL", "http://127.0.0.1:30000")
     result = {
-        "op_point": "DS int8 / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV",
+        "op_point": args.op_point,
         "base_url": base_url,
         "num_per_length": args.num,
         "max_new_tokens": args.max_new_tokens,
