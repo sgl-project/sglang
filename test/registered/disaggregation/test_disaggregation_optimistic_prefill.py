@@ -174,7 +174,6 @@ class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
     def test_survive_requests(self):
         # send many small requests to ensure the engine survives injected failures
         n = 100
-        successes = 0
         with ThreadPoolExecutor(max_workers=32) as executor:
             futures = []
             for i in range(n):
