@@ -1056,6 +1056,7 @@ class SchedulerOutputProcessorMixin:
         load = self.get_loads(GetLoadsReqInput(include=["core"]))
         routed_experts = None
         indexer_topk = None
+        indexer_topk_num_layers = None
         customized_info = {}
 
         time_stats = []
@@ -1244,7 +1245,13 @@ class SchedulerOutputProcessorMixin:
                 if req.return_indexer_topk:
                     if indexer_topk is None:
                         indexer_topk = []
+                        indexer_topk_num_layers = []
                     indexer_topk.append(req.indexer_topk)
+                    indexer_topk_num_layers.append(
+                        req.indexer_topk.shape[1]
+                        if req.indexer_topk is not None
+                        else None
+                    )
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1304,6 +1311,7 @@ class SchedulerOutputProcessorMixin:
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
                     indexer_topk=indexer_topk,
+                    indexer_topk_num_layers=indexer_topk_num_layers,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

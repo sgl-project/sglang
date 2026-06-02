@@ -384,6 +384,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
+            indexer_topk_num_layers=recv_obj.indexer_topk_num_layers,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

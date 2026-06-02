@@ -88,7 +88,8 @@ class TestReturnIndexerTopk(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_indexer_topk_generate(self):
-        for topk in self.captured:
+        for topk, num_layers in self.captured:
+            self.assertEqual(num_layers, NUM_INDEXER_LAYERS)
             self._check_shape_and_range(topk)
             self._check_skip_topk_equality(topk)
 
@@ -133,13 +134,19 @@ class TestReturnIndexerTopk(CustomTestCase):
                 for text in cls.texts
             ]
             http_results = await asyncio.gather(*tasks)
-            # Reshape raw int32 bytes into (seqlen-1, num_indexer_layers, index_topk).
-            return [
-                extract_indexer_topk_from_meta_info(res).reshape(
-                    -1, NUM_INDEXER_LAYERS, INDEX_TOPK
+            captured = []
+            for res in http_results:
+                num_layers = res["meta_info"]["indexer_topk_num_layers"]
+                # Reshape raw int32 bytes into (seqlen-1, num_indexer_layers, index_topk).
+                captured.append(
+                    (
+                        extract_indexer_topk_from_meta_info(res).reshape(
+                            -1, num_layers, INDEX_TOPK
+                        ),
+                        num_layers,
+                    )
                 )
-                for res in http_results
-            ]
+            return captured
 
 
 async def make_request(session, url, payload):

@@ -1118,6 +1118,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     routed_experts: List[Optional[torch.Tensor]]
 
     indexer_topk: List[Optional[torch.Tensor]]
+    indexer_topk_num_layers: List[Optional[int]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1183,6 +1184,7 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     routed_experts: List[Optional[str]]
 
     indexer_topk: List[Optional[str]]
+    indexer_topk_num_layers: List[Optional[int]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.

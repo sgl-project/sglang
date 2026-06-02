@@ -1751,9 +1751,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:
+                    if recv_obj.indexer_topk_num_layers is None:
+                        raise ValueError(
+                            "Batch output returned indexer_topk without "
+                            "indexer_topk_num_layers."
+                        )
+                    num_layers = recv_obj.indexer_topk_num_layers[i]
+                    if num_layers is None:
+                        raise ValueError(
+                            "Batch output returned indexer_topk without "
+                            "indexer_topk_num_layers."
+                        )
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["indexer_topk"] = val
+                    meta_info["indexer_topk_num_layers"] = num_layers
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
