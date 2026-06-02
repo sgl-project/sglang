@@ -239,9 +239,21 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
             f.flush()
             params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
         self.assertEqual(params._bs_list, [1, 32])
-        self.assertEqual(params._slots[1].candidate_steps, [1, 5])
+        # initial_steps joins the smallest-BS slot; larger slots stay as-is.
+        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 5])
         self.assertEqual(params._slots[1].up_hysteresis, 0.3)
         self.assertEqual(params._slots[32].candidate_steps, [1, 2])
+
+    def test_initial_steps_joins_smallest_slot(self):
+        # initial_steps must stay in the candidate union so init_states reuses
+        # the worker's pre-built state instead of leaking it.
+        params = AdaptiveSpeculativeParams(initial_steps=5)
+        self.assertIn(5, params.candidate_steps)
+        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 5, 7])
+        self.assertEqual(params._slots[1].current_steps, 5)
+        # Larger-BS slots are not polluted by the launch flag.
+        self.assertEqual(params._slots[8].candidate_steps, [1, 3])
+        self.assertEqual(params._slots[32].candidate_steps, [1])
 
     def test_invalid_config_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:

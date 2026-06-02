@@ -966,9 +966,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(
-                batch_size, self.speculative_num_steps
-            )
+            self.adaptive_controller.activate_step_by_batch(batch_size)
 
     # -- Adaptive speculative decoding protocol --
 

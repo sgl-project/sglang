@@ -522,9 +522,7 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             if self.adaptive_controller is not None:
-                self.adaptive_controller.activate_step_by_batch(
-                    batch.batch_size(), self.speculative_num_steps
-                )
+                self.adaptive_controller.activate_step_by_batch(batch.batch_size())
 
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 

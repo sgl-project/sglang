@@ -110,11 +110,12 @@ class AdaptiveController:
             )
             self._states[steps] = state
 
-        self._activate(self.params.get_steps_for_batch(1))
+        # Start on the initial step.
+        self._activate(self.worker.speculative_num_steps)
 
-    def activate_step_by_batch(self, batch_size: int, current_steps: int) -> None:
+    def activate_step_by_batch(self, batch_size: int) -> None:
         target = self.params.get_steps_for_batch(batch_size)
-        if target != current_steps:
+        if target != self.worker.speculative_num_steps:
             self._activate(target)
 
     def on_verify_complete(

@@ -241,15 +241,21 @@ class AdaptiveSpeculativeParams:
         cfg, bs_entries = _load_adaptive_config(cfg_path)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
+        self._cuda_graph_bs: list[int] | None = None
+
+        # Keep initial_steps in the smallest-BS slot so its candidate union
+        # covers the worker's pre-built state.
+        smallest_bs = self._bs_list[0]
         for bs, entry in sorted(bs_entries.items()):
             merged = {**cfg, **entry}
-            # AdaptiveStepSlot handles fallback internally: if initial_steps
-            # is not in this slot's candidate_steps, it snaps to the middle.
+            if bs == smallest_bs:
+                merged["candidate_steps"] = sorted(
+                    set(merged["candidate_steps"]) | {initial_steps}
+                )
             self._slots[bs] = AdaptiveStepSlot(
                 initial_steps=initial_steps,
                 cfg=merged,
             )
-        self._cuda_graph_bs: list[int] | None = None
 
         first_slot = self._slots[self._bs_list[0]]
         log_info_on_rank0(
