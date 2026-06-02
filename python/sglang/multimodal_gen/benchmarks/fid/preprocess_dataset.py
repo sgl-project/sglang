@@ -12,7 +12,8 @@ IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 def _sniff_delimiter(path: Path) -> str:
-    sample = path.read_text(encoding="utf-8", errors="ignore")[:8192]
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        sample = f.read(8192)
     # Prefer tab for COCO-style TSVs.
     if "\t" in sample:
         return "\t"
@@ -35,6 +36,8 @@ def read_captions_tsv(captions_file: Path) -> list[dict]:
         # Some dumps use 'file_name', others 'filename'
         if "file_name" not in row and "filename" in row:
             row["file_name"] = row["filename"]
+        if row.get("caption"):
+            row["caption"] = row["caption"].replace("\n", " ").strip()
 
     required = {"caption", "file_name"}
     missing = required - set(rows[0].keys())
