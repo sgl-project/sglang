@@ -14,7 +14,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -610,7 +609,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             f"CFG_parallel={enable_cfg_parallel}, cfg_rank={cfg_rank}"
         )
 
-        progress_bar = tqdm(
+        progress_bar = self.progress_bar(
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
