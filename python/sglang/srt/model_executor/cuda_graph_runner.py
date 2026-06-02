@@ -173,7 +173,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
-        is_hybrid_swa: bool = False,
         dcp_size: int = 1,
         hc_hidden_size: Optional[int] = None,
     ) -> "DecodeInputBuffers":
@@ -727,7 +726,6 @@ class CudaGraphRunner:
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
-            is_hybrid_swa=model_runner.is_hybrid_swa,
             dcp_size=self.dcp_size,
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
