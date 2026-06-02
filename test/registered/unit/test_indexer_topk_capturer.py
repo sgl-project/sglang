@@ -18,6 +18,7 @@ class TestIndexerTopkCapturer(unittest.TestCase):
             buffer=torch.zeros((32, 1, 2), dtype=torch.int32)
         )
         capturer._capture_num_tokens = None
+        capturer._captured_layer_ids = set()
         return capturer
 
     def test_non_dp_attention_uses_forward_batch_length(self):
@@ -59,6 +60,36 @@ class TestIndexerTopkCapturer(unittest.TestCase):
         finally:
             indexer_topk.is_dp_attention_enabled = old_is_dp_attention_enabled
             indexer_topk.get_dp_local_slice_cpu = old_get_dp_local_slice_cpu
+
+    def test_maybe_capture_keeps_first_capture_for_layer(self):
+        class FakeCapturer:
+            def __init__(self):
+                self.calls = []
+                self.captured_layer_ids = set()
+
+            def has_capture_for_layer(self, layer_id):
+                return layer_id in self.captured_layer_ids
+
+            def capture(self, layer_id, topk_indices):
+                self.captured_layer_ids.add(layer_id)
+                self.calls.append((layer_id, topk_indices.clone()))
+
+        capturer = FakeCapturer()
+        raw_topk = torch.tensor([[0, 1]], dtype=torch.int32)
+        transformed_topk = torch.tensor([[100, 101]], dtype=torch.int32)
+
+        old_capturer = indexer_topk.get_global_indexer_capturer()
+        try:
+            indexer_topk.set_global_indexer_capturer(capturer)
+
+            indexer_topk.maybe_capture_indexer_topk(0, raw_topk)
+            indexer_topk.maybe_capture_indexer_topk(0, transformed_topk)
+
+            self.assertEqual(len(capturer.calls), 1)
+            self.assertEqual(capturer.calls[0][0], 0)
+            self.assertTrue(torch.equal(capturer.calls[0][1], raw_topk))
+        finally:
+            indexer_topk.set_global_indexer_capturer(old_capturer)
 
     def test_dp_attention_slices_cache_locations_with_topk(self):
         capturer = self._make_capturer()

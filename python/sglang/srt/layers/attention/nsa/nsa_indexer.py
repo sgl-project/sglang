@@ -23,6 +23,7 @@ from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
     maybe_capture_indexer_topk,
 )
 from sglang.srt.utils import (
@@ -312,6 +313,38 @@ class Indexer(MultiPlatformOp):
     ):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
+    def _raw_topk(
+        self,
+        logits: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        *,
+        ks: Optional[torch.Tensor] = None,
+        ke_offset: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from sgl_kernel import fast_topk_v2
+
+        seq_lens_topk = (
+            ke_offset if ke_offset is not None else metadata.get_seqlens_expanded()
+        )
+        return fast_topk_v2(logits, seq_lens_topk, self.index_topk, row_starts=ks)
+
+    def _maybe_capture_raw_topk(
+        self,
+        layer_id: int,
+        logits: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        *,
+        ks: Optional[torch.Tensor] = None,
+        ke_offset: Optional[torch.Tensor] = None,
+    ) -> None:
+        capturer = get_global_indexer_capturer()
+        if capturer is None or capturer.has_capture_for_layer(layer_id):
+            return
+        maybe_capture_indexer_topk(
+            layer_id,
+            self._raw_topk(logits, metadata, ks=ks, ke_offset=ke_offset),
+        )
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -539,6 +572,7 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
+        self._maybe_capture_raw_topk(layer_id, logits[:q_offset], metadata)
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
@@ -674,6 +708,7 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
+            self._maybe_capture_raw_topk(layer_id, logits, metadata, ks=ks)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
             return topk_result
@@ -694,6 +729,12 @@ class Indexer(MultiPlatformOp):
             assert (
                 global_topk_offset.shape[0] >= q_offset
             ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+
+        capturer = get_global_indexer_capturer()
+        capture_raw_topk = capturer is not None and not capturer.has_capture_for_layer(
+            layer_id
+        )
+        raw_topk_result = torch.empty_like(topk_result) if capture_raw_topk else None
 
         start = 0
         while start < q_offset:
@@ -739,7 +780,7 @@ class Indexer(MultiPlatformOp):
                 )
                 batch_idx_chunk = token_to_batch_idx[start:end]
 
-            raw_topk_chunk = metadata.topk_transform(
+            transformed_topk_chunk = metadata.topk_transform(
                 logits_chunk,
                 self.index_topk,
                 ks=ks[start:end],
@@ -748,8 +789,18 @@ class Indexer(MultiPlatformOp):
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
             )
-            topk_result[start:end] = raw_topk_chunk
+            topk_result[start:end] = transformed_topk_chunk
+            if raw_topk_result is not None:
+                raw_topk_result[start:end] = self._raw_topk(
+                    logits_chunk,
+                    metadata,
+                    ks=ks[start:end],
+                    ke_offset=lengths_chunk,
+                )
             start = end
+
+        if raw_topk_result is not None:
+            maybe_capture_indexer_topk(layer_id, raw_topk_result[:q_offset])
 
         return topk_result
 
@@ -793,6 +844,7 @@ class Indexer(MultiPlatformOp):
             dtype=torch.float32,
             device=x_meta.device,
         )
+        self._maybe_capture_raw_topk(layer_id, dummy_logits, metadata)
         return metadata.topk_transform(dummy_logits, self.index_topk)
 
     def _get_topk_ragged_with_cp(
@@ -885,6 +937,9 @@ class Indexer(MultiPlatformOp):
                     ke,
                     clean_logits=False,
                 )
+            self._maybe_capture_raw_topk(
+                layer_id, logits, metadata, ks=ks, ke_offset=ke_offset
+            )
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
@@ -931,6 +986,9 @@ class Indexer(MultiPlatformOp):
                     ke,
                     clean_logits=False,
                 )
+            self._maybe_capture_raw_topk(
+                layer_id, logits, metadata, ks=ks, ke_offset=ke_offset
+            )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
             )

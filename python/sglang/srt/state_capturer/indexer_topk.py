@@ -28,6 +28,7 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
         self._capture_num_tokens: Optional[int] = None
+        self._captured_layer_ids: set[int] = set()
 
         attn_tp_size = get_attention_tp_size()
         assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
@@ -46,7 +47,11 @@ class IndexerTopkCapturer(BaseTopkCapturer):
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self._capture_num_tokens = topk_indices.shape[0]
+        self._captured_layer_ids.add(layer_id)
         super().capture(layer_id, topk_indices)
+
+    def has_capture_for_layer(self, layer_id: int) -> bool:
+        return layer_id in self._captured_layer_ids
 
     def _get_dp_slice_info(
         self,
@@ -60,9 +65,7 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         captured_num_tokens = getattr(self, "_capture_num_tokens", None)
         if captured_num_tokens is None:
             captured_num_tokens = local_num_tokens
-        uses_global_layout = (
-            captured_num_tokens >= local_start_pos + local_num_tokens
-        )
+        uses_global_layout = captured_num_tokens >= local_start_pos + local_num_tokens
         loc_num_tokens = forward_batch.out_cache_loc.shape[0]
         if uses_global_layout and loc_num_tokens >= local_start_pos + local_num_tokens:
             num_tokens = local_num_tokens
@@ -106,10 +109,7 @@ class IndexerTopkCapturer(BaseTopkCapturer):
             forward_batch, can_run_graph, cuda_graph_batch
         )
         local_end_pos = local_start_pos + num_tokens
-        if (
-            uses_global_layout
-            and forward_batch.out_cache_loc.shape[0] >= local_end_pos
-        ):
+        if uses_global_layout and forward_batch.out_cache_loc.shape[0] >= local_end_pos:
             return forward_batch.out_cache_loc[local_start_pos:local_end_pos]
         return forward_batch.out_cache_loc[:num_tokens]
 
@@ -127,6 +127,7 @@ class IndexerTopkCapturer(BaseTopkCapturer):
             no_copy_to_cpu=no_copy_to_cpu,
         )
         self._capture_num_tokens = None
+        self._captured_layer_ids.clear()
         return output
 
 
@@ -153,6 +154,8 @@ def maybe_capture_indexer_topk(
     if topk_indices is None:
         return None
     if (cap := get_global_indexer_capturer()) is not None:
+        if cap.has_capture_for_layer(layer_id):
+            return topk_indices
         cap.capture(layer_id=layer_id, topk_indices=topk_indices)
     return topk_indices
 
