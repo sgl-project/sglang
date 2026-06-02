@@ -586,8 +586,12 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_abort_chunked_with_baton_handoff(t: ScriptedContext):
         # Distinct prompt_token so r2 does not hit r1's partially-cached prefix
         # after r1 is aborted -- it must re-chunk from scratch to take the baton.
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=1)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=2)
+        r1 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=1
+        )
+        r2 = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=2
+        )
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (1 if t.scheduler.chunked_req is not None else 0) == 1
 
