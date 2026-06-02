@@ -480,6 +480,8 @@ class FrozenKVMTPWorker(TpModelWorker):
             speculative_moe_a2a_backend_context(),
         ):
             draft_extend_input = verify_output.draft_extend_input
+            input_is_idle = batch.forward_mode.is_idle()
+
             if (
                 self.server_args.enable_dp_attention
                 or draft_extend_input.input_ids.shape[0] > 0
@@ -490,10 +492,12 @@ class FrozenKVMTPWorker(TpModelWorker):
                 batch.spec_info = draft_extend_input
                 self.forward_draft_extend_after_decode(batch)
             else:
-                # All requests within the batch finish simulatenously.
-                # Install an idle FrozenKVMTPDraftInput for the next iter
-                # with a defined merge_batch / filter_batch method implementation
+                # All reqs finished and dp_attention isn't forcing extend.
+                # Install an idle EagleDraftInput so next iter's scheduler
+                # ops (merge_batch / filter_batch) see well-typed empty
+                # tensors instead of None.
                 self._draft_preprocess_idle(batch)
+           
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
