@@ -9,3 +9,4 @@ node_modules/
 # Allow fractalmesh/dist markdown docs
 !dist/
 !dist/*.md
+.vercel
