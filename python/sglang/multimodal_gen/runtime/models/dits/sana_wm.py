@@ -34,11 +34,30 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _SANA_WM_FLASH_ATTN_HEAD_SIZES = (32, 64, 96, 128, 160, 192, 224, 256)
-_SANA_WM_DISABLE_FUSED_RMSNORM = os.getenv(
-    "SGLANG_SANA_WM_DISABLE_FUSED_RMSNORM", ""
-).lower() in {"1", "true", "yes", "on"} or os.getenv(
+_SANA_WM_DETERMINISTIC = os.getenv(
     "SGLANG_ENABLE_DETERMINISTIC_INFERENCE", ""
 ).lower() in {"1", "true", "yes", "on"}
+_SANA_WM_DISABLE_FUSED_RMSNORM = os.getenv(
+    "SGLANG_SANA_WM_DISABLE_FUSED_RMSNORM", ""
+).lower() in {"1", "true", "yes", "on"} or _SANA_WM_DETERMINISTIC
+_SANA_WM_USE_TRITON_KERNELS = os.getenv(
+    "SGLANG_SANA_WM_USE_TRITON_KERNELS", ""
+).lower() in {"1", "true", "yes", "on"}
+_SANA_WM_TRITON_KERNELS_IMPORT_ERROR: Exception | None = None
+
+
+def _get_sana_wm_triton_qkv_preprocess():
+    global _SANA_WM_TRITON_KERNELS_IMPORT_ERROR
+    try:
+        from sglang.jit_kernel.diffusion.sana_wm.qkv_preprocess import (
+            can_use_sana_wm_qkv_gdn_preprocess,
+            sana_wm_qkv_gdn_preprocess,
+        )
+
+        return sana_wm_qkv_gdn_preprocess, can_use_sana_wm_qkv_gdn_preprocess
+    except Exception as exc:
+        _SANA_WM_TRITON_KERNELS_IMPORT_ERROR = exc
+        return None
 
 
 def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
@@ -1442,6 +1461,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         chunk_gdn_chunk_size: int = 21,
         use_chunked_softmax_attention: bool = False,
         pad_attention_head_dim_to_flash: bool = False,
+        use_triton_kernels: bool = False,
     ) -> None:
         super().__init__()
         out_dim = heads * head_dim
@@ -1470,6 +1490,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.cam_update_rule = cam_update_rule
         self.chunk_gdn_chunk_size = chunk_gdn_chunk_size
         self.use_chunked_softmax_attention = use_chunked_softmax_attention
+        self.use_triton_kernels = bool(use_triton_kernels)
+        self._triton_qkv_preprocess_warning_logged = False
         if self.update_rule not in ("torch_chunk", "torch_recurrent"):
             raise ValueError(f"Unsupported SANA-WM update_rule: {self.update_rule}")
         if self.cam_update_rule not in ("torch_chunk", "torch_recurrent"):
@@ -1623,6 +1645,59 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         qkv_weight, qkv_bias = self._get_cam_qkv_params()
         return F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
 
+    def _try_triton_qkv_gdn_preprocess(
+        self,
+        qkv: torch.Tensor,
+        *,
+        k_scale: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if (
+            not self.use_triton_kernels
+            or self.use_tp
+            or torch.is_grad_enabled()
+            or _SANA_WM_DETERMINISTIC
+            or not isinstance(self.q_norm, _RMSNorm)
+            or not isinstance(self.k_norm, _RMSNorm)
+        ):
+            return None
+        if not qkv.is_cuda:
+            return None
+
+        kernels = _get_sana_wm_triton_qkv_preprocess()
+        if kernels is None:
+            if not self._triton_qkv_preprocess_warning_logged:
+                logger.warning(
+                    "SANA-WM Triton QKV preprocess kernel is unavailable; "
+                    "falling back to torch path. import_error=%s",
+                    _SANA_WM_TRITON_KERNELS_IMPORT_ERROR,
+                )
+                self._triton_qkv_preprocess_warning_logged = True
+            return None
+
+        preprocess, can_use = kernels
+        if not can_use(qkv, self.q_norm.weight, self.k_norm.weight):
+            return None
+
+        try:
+            return preprocess(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                k_scale=k_scale,
+                eps=self.q_norm.eps,
+            )
+        except Exception as exc:
+            self.use_triton_kernels = False
+            if not self._triton_qkv_preprocess_warning_logged:
+                logger.warning(
+                    "SANA-WM Triton QKV preprocess kernel failed; disabling "
+                    "this block's Triton fast path and falling back to torch. "
+                    "error=%s",
+                    exc,
+                )
+                self._triton_qkv_preprocess_warning_logged = True
+            return None
+
     def _main_branch_gdn(
         self,
         x: torch.Tensor,
@@ -1663,30 +1738,33 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             beta = beta.narrow(1, head_start, self.local_heads)
             decay = decay.narrow(1, head_start, self.local_heads)
 
-        q, k, v = qkv.unbind(2)
-
-        # Q/K norm on the flattened channel dim (B, N, C)
-        q = _sana_wm_tp_rms_norm(
-            q.reshape(B, N, local_C),
-            self.q_norm,
-            tp_size=self.tp_size,
-        ).reshape(B, N, self.local_heads, self.dim)
-        k = _sana_wm_tp_rms_norm(
-            k.reshape(B, N, local_C),
-            self.k_norm,
-            tp_size=self.tp_size,
-        ).reshape(B, N, self.local_heads, self.dim)
-
-        # ReLU kernel + key scale
-        q = F.relu(q)
-        k = F.relu(k)
         k_scale = (self.dim**-0.5) * (S**-0.5)
-        k = k * k_scale
+        preprocessed = self._try_triton_qkv_gdn_preprocess(qkv, k_scale=k_scale)
+        if preprocessed is None:
+            q, k, v = qkv.unbind(2)
 
-        # Move to (B, H, D, N)
-        q = q.permute(0, 2, 3, 1)
-        k = k.permute(0, 2, 3, 1)
-        v = v.permute(0, 2, 3, 1)
+            # Q/K norm on the flattened channel dim (B, N, C)
+            q = _sana_wm_tp_rms_norm(
+                q.reshape(B, N, local_C),
+                self.q_norm,
+                tp_size=self.tp_size,
+            ).reshape(B, N, self.local_heads, self.dim)
+            k = _sana_wm_tp_rms_norm(
+                k.reshape(B, N, local_C),
+                self.k_norm,
+                tp_size=self.tp_size,
+            ).reshape(B, N, self.local_heads, self.dim)
+
+            # ReLU kernel + key scale
+            q = F.relu(q)
+            k = F.relu(k) * k_scale
+
+            # Move to (B, H, D, N)
+            q = q.permute(0, 2, 3, 1)
+            k = k.permute(0, 2, 3, 1)
+            v = v.permute(0, 2, 3, 1)
+        else:
+            q, k, v = preprocessed
 
         if rotary_emb is not None:
             q_rot = _apply_rotary_emb_dn(q, rotary_emb)
@@ -2113,6 +2191,7 @@ class SanaWMBlock(nn.Module):
         chunk_gdn_chunk_size: int = 21,
         use_chunked_softmax_attention: bool = False,
         pad_attention_head_dim_to_flash: bool = False,
+        use_triton_kernels: bool = False,
     ) -> None:
         super().__init__()
         self.softmax_main = softmax_main
@@ -2135,6 +2214,7 @@ class SanaWMBlock(nn.Module):
             chunk_gdn_chunk_size=chunk_gdn_chunk_size,
             use_chunked_softmax_attention=use_chunked_softmax_attention,
             pad_attention_head_dim_to_flash=pad_attention_head_dim_to_flash,
+            use_triton_kernels=use_triton_kernels,
         )
 
         self.cross_attn = MultiHeadCrossAttention(
@@ -2352,6 +2432,10 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.pad_attention_head_dim_to_flash = bool(
             getattr(arch, "pad_attention_head_dim_to_flash", False)
         )
+        self.use_triton_kernels = bool(
+            getattr(arch, "use_triton_kernels", False)
+            or _SANA_WM_USE_TRITON_KERNELS
+        )
         effective_softmax_head_dim = (
             _sana_wm_padded_attention_head_size(arch.linear_head_dim)
             if self.pad_attention_head_dim_to_flash
@@ -2378,7 +2462,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "SANA-WM attention config: use_chunked_softmax_attention=%s, "
             "pad_attention_head_dim_to_flash=%s, attention_head_dim=%d, "
             "effective_softmax_head_dim=%d, tp_size=%d, local_attention_heads=%d, "
-            "softmax_blocks=%s, chunk_size=%s, chunk_split_strategy=%s",
+            "softmax_blocks=%s, chunk_size=%s, chunk_split_strategy=%s, "
+            "use_triton_kernels=%s",
             self.use_chunked_softmax_attention,
             self.pad_attention_head_dim_to_flash,
             arch.linear_head_dim,
@@ -2388,6 +2473,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self.softmax_block_indices,
             self.chunk_size,
             self.chunk_split_strategy,
+            self.use_triton_kernels,
         )
 
         self.blocks = nn.ModuleList(
@@ -2417,6 +2503,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     chunk_gdn_chunk_size=getattr(arch, "chunk_gdn_chunk_size", 21),
                     use_chunked_softmax_attention=self.use_chunked_softmax_attention,
                     pad_attention_head_dim_to_flash=self.pad_attention_head_dim_to_flash,
+                    use_triton_kernels=self.use_triton_kernels,
                 )
                 for i in range(depth)
             ]
