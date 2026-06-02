@@ -4,6 +4,9 @@
 from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines.qwen_image_progressive import (
+    QwenImageProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -64,7 +67,33 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_standard_t2i_stages(prepare_extra_timestep_kwargs=[prepare_mu])
+        from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+            InputValidationStage,
+        )
+
+        self.add_stage(InputValidationStage())
+        self.add_standard_text_encoding_stage()
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
+        self._add_qwen_denoising_stage()
+        self.add_standard_decoding_stage()
+
+    def _add_qwen_denoising_stage(self, stage_name: str = "denoising_stage") -> None:
+        """Add QwenImageProgressiveDenoisingStage.
+
+        Routes to DenoisingStage.forward() when progressive_mode == 'fullres'
+        (the default), preserving identical behaviour for non-progressive requests.
+        """
+
+        def create_stage():
+            return QwenImageProgressiveDenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+                pipeline=self,
+                vae=self.get_module("vae", None),
+            )
+
+        self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
 
 
 class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
