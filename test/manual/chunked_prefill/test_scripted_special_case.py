@@ -7,6 +7,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
     VERY_LONG_PROMPT_LEN,
+    advance_to_decode_step,
     base_engine_kwargs,
     exhaust_row_pool,
     run_until,
@@ -630,28 +631,49 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
 
     @staticmethod
     def _script_mix_with_running_chunked_plus_decode(t: ScriptedContext):
+        # Drive the decoders past their own prefill into the decoding state (each
+        # has emitted at least one token) so they sit in running_batch as decode
+        # reqs when the long chunked prompt arrives. The chunked prefill then rides
+        # the same forward pass as the running decodes, producing a MIXED batch.
+        # The exact iteration at which the merge happens is not deterministic (the
+        # chunk admits over several passes), so poll for the MIXED co-batch across
+        # the run rather than asserting it at a single instant.
         decodes = [t.start_req(prompt_len=8, max_new_tokens=16) for _ in range(3)]
-        yield from run_until(decodes[0], lambda h: h.status == "running")
+        for d in decodes:
+            yield from advance_to_decode_step(d, 1)
 
         r_chunk = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=4)
         yield from run_until(r_chunk, lambda h: h.is_chunking)
 
         comp = t.batch_composition()
         assert r_chunk.rid in comp.get("chunked", [])
-        running_in_batch = set(comp.get("decode", [])) | set(comp.get("running", []))
-        assert any(
-            d.rid in running_in_batch for d in decodes
-        ), f"enable_mixed_chunk should merge decode reqs into chunked iter; got {comp!r}"
-        assert (
-            t.last_batch_forward_mode == "MIXED"
-        ), f"expected forward_mode == MIXED with enable_mixed_chunk, got {t.last_batch_forward_mode!r}"
 
+        saw_mixed_with_decode = False
         all_reqs = [r_chunk, *decodes]
         for _ in range(DEFAULT_MAX_STEPS * 2):
+            comp = t.batch_composition()
+            # ForwardMode.MIXED.is_extend() is True, so batch_composition reports the
+            # merged-in decode reqs (everything but the chunked rid) under the
+            # "prefill" bucket, not "decode". Union all batch buckets to catch them.
+            batch_rids = (
+                set(comp.get("prefill", []))
+                | set(comp.get("decode", []))
+                | set(comp.get("running", []))
+            )
+            if (
+                t.last_batch_forward_mode == "MIXED"
+                and r_chunk.rid in comp.get("chunked", [])
+                and any(d.rid in batch_rids for d in decodes)
+            ):
+                saw_mixed_with_decode = True
             if all(x.finished for x in all_reqs):
                 break
             yield
         assert all(x.finished for x in all_reqs)
+        assert saw_mixed_with_decode, (
+            "enable_mixed_chunk should merge running decode reqs into the chunked "
+            "prefill iter (MIXED forward_mode) at least once"
+        )
 
     def test_mixed_chunk_with_logprob_falls_back(self):
         self.server.execute_script(self._script_mixed_chunk_with_logprob_falls_back)
@@ -694,22 +716,30 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
 class TestSpecialCaseTransformers(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        impl="transformers",
+        model_impl="transformers",
     )
 
-    def test_multimodal_transformers_disables_chunking(self):
-        self.server.execute_script(
-            self._script_multimodal_transformers_disables_chunking
-        )
+    def test_transformers_text_model_still_chunks(self):
+        self.server.execute_script(self._script_transformers_text_model_still_chunks)
 
     @staticmethod
-    def _script_multimodal_transformers_disables_chunking(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+    def _script_transformers_text_model_still_chunks(t: ScriptedContext):
+        # Chunked prefill is force-disabled (chunked_prefill_size=-1) only for
+        # *multimodal* models (server_args.py:1353,1413 gated on
+        # model_config.is_multimodal), not by the Transformers backend itself. A
+        # text model (Qwen3-0.6B) on the Transformers backend therefore chunks a
+        # long prompt exactly like the native backend. A distinct prompt_token
+        # makes the req chunk cold so the count matches _expected_chunks.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10
+        )
         yield from run_until_finished(r)
         assert r.finished
-        assert (
-            r.chunks_done == 0
-        ), f"transformers backend should disable chunking; got chunks_done={r.chunks_done}"
+        expected = _expected_chunks(VERY_LONG_PROMPT_LEN, DEFAULT_CHUNK_SIZE)
+        assert r.chunks_done == expected, (
+            f"a text model on the Transformers backend must chunk like the native "
+            f"backend ({expected} chunks); got chunks_done={r.chunks_done}"
+        )
 
 
 class TestSpecialCaseNoChunking(ScriptedTestCase):
@@ -732,8 +762,10 @@ class TestSpecialCaseNoChunking(ScriptedTestCase):
 
 
 class TestSpecialCaseTinyChunk(ScriptedTestCase):
+    # chunked_prefill_size must be divisible by page_size (server_args validation),
+    # so a chunk smaller than the page is invalid. Use chunk == page (still tiny).
     ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=8,
+        chunked_prefill_size=16,
         page_size=16,
     )
 
@@ -768,12 +800,30 @@ class TestSpecialCaseTinyChunk(ScriptedTestCase):
         )
 
 
+# Deterministic inference with the flashinfer backend forces the chunked-prefill
+# truncation to a multiple of the prefill split-tile size
+# (SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE, default 4096; scheduler.py
+# init_deterministic_inference_config). schedule_policy.py:940-946 then refuses to
+# admit a chunk smaller than that align size, so chunked_prefill_size must be at
+# least the align size or the long prompt can never start chunking (it would sit in
+# the waiting queue forever). Use chunk_size == the align size and a prompt longer
+# than one chunk so the req chunks exactly once before the (sub-align) tail admits
+# as the non-chunked last chunk.
+DETERMINISTIC_ALIGN_SIZE = 4096
+
+
 class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
+    # Deterministic inference with flashinfer forces the radix cache off (it is not
+    # yet compatible), so the tree_cache is a ChunkCache that the scripted harness's
+    # default kv_canary="raise" cannot walk (walk_radix_cache_for_canary does not
+    # support ChunkCache), crashing the scheduler. Opt out of the kv canary here.
     ENGINE_KWARGS = base_engine_kwargs(
-        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        chunked_prefill_size=DETERMINISTIC_ALIGN_SIZE,
         page_size=16,
         attention_backend="flashinfer",
         enable_deterministic_inference=True,
+        kv_canary="none",
+        kv_canary_sweep_interval=0,
     )
 
     def test_chunked_truncation_align_size(self):
@@ -781,24 +831,41 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_truncation_align_size(t: ScriptedContext):
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # A distinct prompt_token forces a cold chunk (no radix prefix overlap). The
+        # prompt is one full chunk plus a tail so the first chunk truncates to the
+        # align size and the remaining tail completes as the last (non-chunked) chunk.
+        r = t.start_req(
+            prompt_len=DETERMINISTIC_ALIGN_SIZE + 1024,
+            max_new_tokens=2,
+            prompt_token=10,
+        )
         page_size = 16
+        saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking and r.req.extend_input_len is not None:
+                saw_chunking = True
                 assert r.req.extend_input_len % page_size == 0, (
                     f"deterministic chunk boundary must be page-aligned; "
                     f"got extend_input_len={r.req.extend_input_len}, page_size={page_size}"
                 )
             if r.finished:
-                return
+                break
             yield
-        raise AssertionError("chunked req did not finish")
+        assert r.finished, "chunked req did not finish"
+        assert saw_chunking, "test must observe the req mid-chunk at least once"
 
 
 class TestSpecialCaseHiCache(ScriptedTestCase):
+    # enable_hierarchical_cache=True makes the tree_cache a HiRadixCache, which the
+    # scripted harness's default kv_canary="raise" cannot walk
+    # (walk_radix_cache_for_canary does not support HiRadixCache), crashing the
+    # scheduler. Opt out of the kv canary (and zero its sweep interval, which is only
+    # valid for a non-none kv_canary; server_args.py:7407).
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         enable_hierarchical_cache=True,
+        kv_canary="none",
+        kv_canary_sweep_interval=0,
     )
 
     def test_hicache_breakdown_only_first_chunk(self):
@@ -900,7 +967,12 @@ class TestSpecialCaseDynamicChunkingPP1(ScriptedTestCase):
             "pp_size==1 must force enable_dynamic_chunking off even when the "
             "server arg is True (the 'and ps.pp_size > 1' conjunct)"
         )
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # A distinct prompt_token makes the req chunk cold: with the default fill
+        # token the all-identical prompt overlaps the radix tree and the chunk
+        # boundary count drifts off the exact _expected_chunks value.
+        r = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10
+        )
         yield from run_until_finished(r)
         assert r.finished
         expected = _expected_chunks(VERY_LONG_PROMPT_LEN, DEFAULT_CHUNK_SIZE)
@@ -934,7 +1006,13 @@ class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         chunks_before_squeeze = r.chunks_done
 
-        t.exhaust_kv(leave_pages=1)
+        # Grab every free KV page (leave_pages=0). Leaving a sub-chunk sliver
+        # (e.g. one page) instead lures the scheduler into attempting a full
+        # 256-token chunk allocation against insufficient pages and hard-OOMs the
+        # forward pass; draining to exactly zero makes rem_total_tokens hit 0 so
+        # _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0 and the force-
+        # to-rem_chunk_tokens re-add path (schedule_policy.py:682) runs cleanly.
+        t.exhaust_kv(leave_pages=0)
 
         progressed_after_squeeze = False
         for _ in range(DEFAULT_MAX_STEPS * 2):
@@ -945,14 +1023,17 @@ class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
             yield
         assert r.finished, (
             "non-SWA chunked resume must be force-re-added when _rem_tokens <= 0 "
-            "(schedule_policy.py:682); pre-fix it would block forever and leak"
+            "(schedule_policy.py:682); pre-fix it would block forever and leak "
+            f"progressed={progressed_after_squeeze} chunks_done={r.chunks_done} "
+            f"before={chunks_before_squeeze} status={r.status} kv_pages={r.kv_pages}"
         )
         assert progressed_after_squeeze, (
             "chunks_done must keep advancing after the KV squeeze drove _rem_tokens "
-            "<= 0, witnessing the force-to-rem_chunk_tokens re-add (not a silent drop)"
+            "<= 0, witnessing the force-to-rem_chunk_tokens re-add (not a silent drop) "
+            f"chunks_done={r.chunks_done} before={chunks_before_squeeze}"
         )
-        assert r.kv_pages == 0
-        assert r.lock_refs == 0
+        assert r.kv_pages == 0, f"kv_pages={r.kv_pages}"
+        assert r.lock_refs == 0, f"lock_refs={r.lock_refs}"
 
 
 class TestSpecialCaseRetractMerge(ScriptedTestCase):
@@ -1064,9 +1145,18 @@ class TestSpecialCaseIgnoreEosNoRadix(ScriptedTestCase):
     # add_one_req_ignore_eos only when req.sampling_params.ignore_eos AND
     # getattr(self.tree_cache, "disable", True) (schedule_policy.py:835). With radix
     # enabled the guard fails and ignore_eos reqs go through add_one_req instead.
+    #
+    # disable_radix_cache=True makes the tree_cache a ChunkCache, which the scripted
+    # harness's default kv_canary="raise" cannot walk (walk_radix_cache_for_canary
+    # does not support ChunkCache), crashing the scheduler on the first forward pass.
+    # Opt out of the kv canary for this config so the ignore_eos path can actually
+    # run (sweep_interval must also be zeroed; sweep_interval>0 requires a non-none
+    # kv_canary, server_args.py:7407).
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
         disable_radix_cache=True,
+        kv_canary="none",
+        kv_canary_sweep_interval=0,
     )
 
     def test_ignore_eos_chunked_truncate_path(self):
