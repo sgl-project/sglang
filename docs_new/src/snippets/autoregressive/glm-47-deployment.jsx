@@ -138,7 +138,7 @@ export const GLM47Deployment = () => {
 
     // Add thinking parser if enabled
     if (thinking === 'enabled') {
-      cmd += ` \\\n  --reasoning-parser glm47`;
+      cmd += ` \\\n  --reasoning-parser glm45`;
     }
 
     return cmd;

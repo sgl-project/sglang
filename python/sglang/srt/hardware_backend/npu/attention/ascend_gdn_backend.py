@@ -93,19 +93,16 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        if forward_mode.is_draft_extend(True):
-            return
-        super().init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
         )
-        self.prepare_gdn_inputs(bs, forward_mode, spec_info)
-        self.graph_mode = True
 
     def init_forward_metadata_replay_cuda_graph(
         self,

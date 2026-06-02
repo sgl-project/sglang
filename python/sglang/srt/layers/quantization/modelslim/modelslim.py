@@ -108,6 +108,9 @@ class ModelSlimConfig(QuantizationConfig):
                     [npu_wrapper_rmsnorm_forward],
                 )
 
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        self.packed_modules_mapping.update(mapping)
+
     def get_linear_method(self) -> ModelSlimLinearMethod:
         return ModelSlimLinearMethod(self)
 

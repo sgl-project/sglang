@@ -108,16 +108,16 @@ jobs:
         timeout-minutes: 20
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN} '
+          docker exec "$cid" /opt/venv/bin/python3 -m pip install --upgrade pip
+          docker exec "$cid" /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
+          docker exec "$cid" /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec "$cid" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN} '
 
       - name: Run stage-a tests
         timeout-minutes: 30
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.12 && cd /home/sdp/sglang/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu"
+          docker exec "$cid" bash -c "source /opt/venv/bin/activate && cd /sgl-workspace/sglang/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu"
 
       - name: Cleanup container
         if: always()
@@ -172,16 +172,16 @@ jobs:
         timeout-minutes: 20
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN} '
+          docker exec "$cid" /opt/venv/bin/python3 -m pip install --upgrade pip
+          docker exec "$cid" /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
+          docker exec "$cid" /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec "$cid" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN} '
 
       - name: Run stage-b tests
         timeout-minutes: 60
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.12 && cd /home/sdp/sglang/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
+          docker exec "$cid" bash -c "source /opt/venv/bin/activate && cd /sgl-workspace/sglang/test && python3 run_suite.py --hw xpu --suite stage-b-test-1-gpu-xpu"
 
       - name: Cleanup container
         if: always()

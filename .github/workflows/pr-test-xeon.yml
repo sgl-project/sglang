@@ -29,10 +29,18 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests}}
+    env:
+      PYTHONDONTWRITEBYTECODE: 1
     steps:
+      - name: clean up
+        run: |
+          sudo rm -rf ${{ github.workspace }} || true
+          sudo mkdir -p ${{ github.workspace }}
+          sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          clean: false
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Determine run mode
@@ -72,16 +80,27 @@ jobs:
   build-test:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: xeon-gnr
-    env:
-      HF_HOME: /home/sdp/.cache/huggingface
+    runs-on: ${{ matrix.runner }}
+
     strategy:
       matrix:
-        build_type: ['all']
+        include:
+          - runner: xeon-gnr
+            suite: base-b-test-cpu
+            partition_args: "--auto-partition-id 0 --auto-partition-size 2"
+          - runner: xeon-gnr
+            suite: base-b-test-cpu
+            partition_args: "--auto-partition-id 1 --auto-partition-size 2"
     steps:
+      - name: Cleanup workspace
+        run: |
+          sudo rm -rf ${{ github.workspace }} || true
+          sudo mkdir -p ${{ github.workspace }}
+          sudo chown $(id -u):$(id -g) ${{ github.workspace }}
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          clean: false
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Build and Push
@@ -100,27 +119,28 @@ jobs:
         run: |
           docker run -dt \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
-            -v ${HF_HOME}:/root/.cache/huggingface \
-            --name ci_sglang_xeon \
+            -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
+            --name ci_sglang_${{ matrix.runner }} \
             sglang_xeon
 
       - name: Check AMX support
         id: check_amx
         timeout-minutes: 5
         run: |
-          docker exec -w /sglang-checkout/ ci_sglang_xeon \
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.runner }} \
             bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch._C._cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
 
       - name: Run unit tests
-        timeout-minutes: 36
+        timeout-minutes: 60
         run: |
-          docker exec -w /sglang-checkout/ ci_sglang_xeon \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite base-b-test-cpu"
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.runner }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} ${{ matrix.partition_args }}"
 
       - name: Change permission
         timeout-minutes: 2
         run: |
-          docker exec -u root ci_sglang_xeon bash -c "
+          docker exec -u root ci_sglang_${{ matrix.runner }} bash -c "
             rm -rf /tmp/ci-home  &&
             chown -R  $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true
           "
@@ -128,4 +148,4 @@ jobs:
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f ci_sglang_xeon || true
+          docker rm -f ci_sglang_${{ matrix.runner }} || true

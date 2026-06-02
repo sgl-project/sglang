@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
 import base64
+import json
 import os
 import re
 import shutil
@@ -50,6 +51,30 @@ logger = init_logger(__name__)
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
 DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
+
+
+def flatten_extra_params(payload: Any) -> dict[str, Any]:
+    """Promote vLLM-Omni-style extra_params into regular request fields."""
+    if not isinstance(payload, dict):
+        return {}
+
+    extra_params = payload.pop("extra_params", None)
+    if isinstance(extra_params, str):
+        try:
+            extra_params = json.loads(extra_params)
+        except Exception:
+            extra_params = None
+    if not isinstance(extra_params, dict):
+        if "guardrails" in payload:
+            payload.setdefault("use_guardrails", payload["guardrails"])
+        return payload
+
+    for key, value in extra_params.items():
+        payload.setdefault(key, value)
+    if "guardrails" in extra_params:
+        payload.setdefault("use_guardrails", extra_params["guardrails"])
+
+    return payload
 
 
 @contextmanager

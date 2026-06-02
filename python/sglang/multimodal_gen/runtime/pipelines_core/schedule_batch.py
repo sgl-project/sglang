@@ -328,9 +328,6 @@ class Req:
 
         self.metrics = RequestMetrics(request_id=self.request_id)
 
-    def adjust_size(self, server_args: ServerArgs):
-        pass
-
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
 
@@ -356,6 +353,12 @@ class Req:
                 self.negative_prompt, key_hint="negative_prompt"
             )
 
+        effective_flow_shift = (
+            self.flow_shift
+            if self.flow_shift is not None
+            else getattr(server_args.pipeline_config, "flow_shift", None)
+        )
+
         debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
@@ -369,7 +372,7 @@ class Req:
               guidance_scale: {self.guidance_scale}
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
-                  flow_shift: {server_args.pipeline_config.flow_shift}
+                  flow_shift: {effective_flow_shift}
                   image_path: {self.image_path}
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
@@ -400,3 +403,13 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+
+    def drop_payload_for_warmup(self) -> None:
+        self.output = None
+        self.audio = None
+        self.trajectory_timesteps = None
+        self.trajectory_latents = None
+        self.rollout_trajectory_data = None
+        self.trajectory_decoded = None
+        self.output_file_paths = None
+        self.noise_pred = None

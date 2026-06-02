@@ -566,6 +566,22 @@ SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server --mod
 
 ```
 
+#### 4.2.4 Multi-Token Prediction (NEXTN Speculative Decoding)
+
+Qwen3-Next ships built-in Multi-Token Prediction (MTP) layers and supports [EAGLE-style speculative decoding](../../../docs/advanced_features/speculative_decoding#EAGLE-Decoding) through the `NEXTN` algorithm. The MTP weights are bundled in the main checkpoint, so no separate draft model is required.
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Instruct \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --tp 4
+```
+
+Tune `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens` for your workload with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py). See [PR #10233](https://github.com/sgl-project/sglang/pull/10233) for implementation details.
+
 ## 5. Benchmark
 
 ### 5.1 Speed Benchmark

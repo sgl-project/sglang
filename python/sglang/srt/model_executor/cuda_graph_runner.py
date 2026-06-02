@@ -149,6 +149,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    rids_int: Optional[torch.Tensor]
+    bootstrap_room_ids_int: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -240,6 +242,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 else None
             )
 
+            if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+                rids_int = torch.zeros((max_bs,), dtype=torch.int64)
+                bootstrap_room_ids_int = torch.full((max_bs,), -1, dtype=torch.int64)
+            else:
+                rids_int = None
+                bootstrap_room_ids_int = None
+
         # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
         seq_lens_cpu = torch.full(
             (max_bs,),
@@ -267,6 +276,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
     def populate_from_forward_batch(
@@ -341,6 +352,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if forward_batch.mrope_positions is not None:
             dsts.append(self.mrope_positions[:, :raw_num_token])
             srcs.append(forward_batch.mrope_positions)
+
+        if self.rids_int is not None and forward_batch.rids_int is not None:
+            dsts.append(self.rids_int[:raw_bs])
+            srcs.append(forward_batch.rids_int)
+        if (
+            self.bootstrap_room_ids_int is not None
+            and forward_batch.bootstrap_room_ids_int is not None
+        ):
+            dsts.append(self.bootstrap_room_ids_int[:raw_bs])
+            srcs.append(forward_batch.bootstrap_room_ids_int)
 
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
@@ -935,6 +956,12 @@ class CudaGraphRunner:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:bs]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
 
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
@@ -1050,6 +1077,8 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
         # Trip the coordinator so the hisparse code path is captured into the
@@ -1122,20 +1151,26 @@ class CudaGraphRunner:
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
 
-            for _ in range(2):
-                self.device_module.synchronize()
-                self.model_runner.tp_group.barrier()
-                run_once()
-                attn_backend.on_after_cuda_graph_warmup()
-
-            if get_global_graph_memory_pool() is None:
-                set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-            # Set graph pool id globally to be able to use symmetric memory
-            set_graph_pool_id(get_global_graph_memory_pool())
-
-            out = self._capture_graph(
-                graph, get_global_graph_memory_pool(), stream, run_once
+            canary_ctx = (
+                c.with_active_single_forward_manager(0)
+                if (c := self.model_runner.canary_manager) is not None
+                else contextlib.nullcontext()
             )
+            with canary_ctx:
+                for _ in range(2):
+                    self.device_module.synchronize()
+                    self.model_runner.tp_group.barrier()
+                    run_once()
+                    attn_backend.on_after_cuda_graph_warmup()
+
+                if get_global_graph_memory_pool() is None:
+                    set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+                # Set graph pool id globally to be able to use symmetric memory
+                set_graph_pool_id(get_global_graph_memory_pool())
+
+                out = self._capture_graph(
+                    graph, get_global_graph_memory_pool(), stream, run_once
+                )
 
         return graph, out
 
@@ -1237,11 +1272,16 @@ class CudaGraphRunner:
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
         attn_backend._replay_forward_batch = forward_batch
+        seq_lens_sum_arg = (
+            None
+            if forward_batch.seq_lens_sum is None
+            else forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        )
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
             buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            seq_lens_sum_arg,
             buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
             self.capture_forward_mode,
             forward_batch.spec_info,

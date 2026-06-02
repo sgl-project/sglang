@@ -503,12 +503,16 @@ def _resolve_quant_config(
         )
 
         # modelslim requires a per-layer quant description file; load it from
-        # the component directory rather than returning an empty config.
+        # the component directory rather than constructing an empty config.
         if server_args.quantization == "modelslim":
             return get_quant_config(hf_config, component_model_path)
 
+        # Online-quant convention: for `fp8` and `mxfp4`, a no-arg
+        # QuantizationConfig() selects the post-load path -- weights load
+        # in source dtype and are quantized in
+        # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
-        return quant_cls.from_config({})
+        return quant_cls()
 
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:

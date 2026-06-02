@@ -77,8 +77,21 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
+  set-image-config:
+    runs-on: ubuntu-latest
+    outputs:
+      CANN_image_a3: ${{ steps.set-vars.outputs.CANN_image_a3 }}
+      CANN_image_910b: ${{ steps.set-vars.outputs.CANN_image_910b }}
+    steps:
+      # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
+      - name: Set image config
+        id: set-vars
+        run: |
+          echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+          echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+
   stage-b-test-1-npu-a2:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-1
     strategy:
@@ -86,7 +99,7 @@ jobs:
       matrix:
         part: [ 0, 1 ]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -131,7 +144,7 @@ jobs:
           python3 run_suite.py --hw npu --suite stage-b-test-1-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   stage-b-test-2-npu-a2:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-2
     strategy:
@@ -139,7 +152,7 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -184,11 +197,11 @@ jobs:
           python3 run_suite.py --hw npu --suite stage-b-test-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   stage-b-test-4-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-4
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -234,11 +247,11 @@ jobs:
 
 
   stage-b-test-16-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -283,11 +296,11 @@ jobs:
           python3 run_suite.py --hw npu --suite stage-b-test-16-npu-a3 --timeout-per-file 3600
 
   multimodal-gen-test-1-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-2
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -310,7 +323,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy gsm8k dataset
@@ -327,7 +340,6 @@ jobs:
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
           python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 1-npu
 
@@ -341,11 +353,11 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-2-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-16
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -368,7 +380,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy gsm8k dataset
@@ -385,7 +397,6 @@ jobs:
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
           python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 2-npu
 
@@ -399,11 +410,11 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-8-npu-a3:
-    needs: [check-changes, pr-gate]
+    needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-aarch64-a3-8
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -426,7 +437,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy gsm8k dataset

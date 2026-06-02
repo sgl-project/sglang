@@ -3,7 +3,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 from torch.nn.functional import softplus
-from utils import precision
+from utils import parametrize, precision
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -221,8 +221,8 @@ def sigmoid_gating_delta_rule_update(
         query,
         key,
         value,
-        g.unsqueeze(0),
-        beta.unsqueeze(0),
+        g.unsqueeze(1),
+        beta.unsqueeze(1),
         initial_state,
         output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -309,14 +309,25 @@ class TestMambaAttention(CustomTestCase):
                 torch.testing.assert_close(g, g_sgl, atol=atol, rtol=rtol)
                 torch.testing.assert_close(beta, beta_sgl, atol=atol2, rtol=rtol2)
 
-    def test_fused_sigmoid_gating_delta_rule_update(self):
-        batch_size = 1
-        num_value_heads = 32
-        head_k_dim = 128
-        head_v_dim = 128
-        num_heads = 16
-        seq_len = 1
-        attn_tp_size = 1
+    @parametrize(
+        batch_size=[1, 4],
+        num_value_heads=[32],
+        head_k_dim=[128],
+        head_v_dim=[128],
+        num_heads=[16],
+        seq_len=[1],
+        attn_tp_size=[1],
+    )
+    def test_fused_sigmoid_gating_delta_rule_update(
+        self,
+        batch_size,
+        num_value_heads,
+        head_k_dim,
+        head_v_dim,
+        num_heads,
+        seq_len,
+        attn_tp_size,
+    ):
         key_dim = head_k_dim * num_heads
         value_dim = head_v_dim * num_value_heads
         mixed_qkv_dim = (key_dim * 2 + value_dim) // attn_tp_size
@@ -332,9 +343,9 @@ class TestMambaAttention(CustomTestCase):
             ],
             dim=-1,
         )
-        query = query.view(1, seq_len, num_heads, head_k_dim)
-        key = key.view(1, seq_len, num_heads, head_k_dim)
-        value = value.view(1, seq_len, num_value_heads, head_v_dim)
+        query = query.view(1, batch_size, num_heads, head_k_dim)
+        key = key.view(1, batch_size, num_heads, head_k_dim)
+        value = value.view(1, batch_size, num_value_heads, head_v_dim)
         A_log = torch.rand(num_value_heads, dtype=torch.float32)
         a = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
         b = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
@@ -343,7 +354,7 @@ class TestMambaAttention(CustomTestCase):
             513, num_value_heads, head_k_dim, head_v_dim, dtype=torch.float32
         )
         cache_indices = torch.randint(0, 513, (batch_size,), dtype=torch.int32)
-        query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+        query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32)
         use_qk_l2norm_in_kernel = True
         query_ref = query.clone()
         key_ref = key.clone()

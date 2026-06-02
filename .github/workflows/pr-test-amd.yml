@@ -140,10 +140,17 @@ jobs:
 
       - name: Set continue-on-error for schedule/full runs
         id: set-continue-on-error
+        env:
+          # `bypass-fastfail` PR label: also disable within-suite fast-fail
+          # here. The shared actions/wait-for-jobs already honors the same
+          # label to skip cross-stage waits.
+          BYPASS_FASTFAIL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'bypass-fastfail') }}
         run: |
-          if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" || "${{ inputs.continue_on_error }}" == "true" ]]; then
+          if [[ "${{ steps.run-mode.outputs.run_all_tests }}" == "true" \
+             || "${{ inputs.continue_on_error }}" == "true" \
+             || "$BYPASS_FASTFAIL_LABEL" == "true" ]]; then
             echo "continue_on_error=true" >> $GITHUB_OUTPUT
-            echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }})"
+            echo "Continue-on-error: ENABLED (run_all_tests=${{ steps.run-mode.outputs.run_all_tests }}, input=${{ inputs.continue_on_error }}, bypass-fastfail=$BYPASS_FASTFAIL_LABEL)"
           else
             echo "continue_on_error=false" >> $GITHUB_OUTPUT
             echo "Continue-on-error: DISABLED"

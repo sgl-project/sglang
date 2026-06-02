@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -271,6 +273,173 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.layerwise_offload_components, ["transformer", "text_encoder"]
         )
 
+    def test_serve_cli_preserves_config_and_dynamic_unknown_args(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
+            json.dump({"model_path": "/from/config", "num_gpus": 2}, config_file)
+            config_file.flush()
+            parser = FlexibleArgumentParser()
+            add_multimodal_gen_serve_args(parser)
+            argv = [
+                "--config",
+                config_file.name,
+                "--model-path",
+                "/from/cli",
+                "--vae-path",
+                "/custom/vae",
+                "--component-attention-backends.transformer",
+                "fa3",
+            ]
+
+            with patch.object(sys, "argv", ["sglang", "serve"] + argv):
+                args, unknown_args = parser.parse_known_args(argv)
+                with (
+                    patch.object(
+                        PipelineConfig,
+                        "from_kwargs",
+                        return_value=QwenImagePipelineConfig(),
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.registry.get_model_info",
+                        return_value=None,
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                        return_value=80 * 1024**3,
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                        return_value=80,
+                    ),
+                ):
+                    server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual("/from/cli", server_args.model_path)
+        self.assertEqual(2, server_args.num_gpus)
+        self.assertEqual("/custom/vae", server_args.component_paths["vae"])
+        self.assertEqual(
+            {"transformer": "fa"},
+            server_args.component_attention_backends,
+        )
+
+    def test_serve_cli_defaults_warmup_on(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+            execute_serve_cmd,
+        )
+
+        parser = FlexibleArgumentParser()
+        add_multimodal_gen_serve_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang", "serve"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.cli.serve.dispatch_launch"
+            ) as dispatch_launch,
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            execute_serve_cmd(args, unknown_args)
+
+        server_args = dispatch_launch.call_args.args[0]
+        self.assertTrue(server_args.warmup)
+        self.assertTrue(server_args.server_warmup)
+        self.assertFalse(server_args.is_arg_explicitly_set("warmup"))
+        self.assertFalse(server_args.is_arg_explicitly_set("server_warmup"))
+
+    def test_serve_cli_preserves_explicit_warmup_false(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+            execute_serve_cmd,
+        )
+
+        parser = FlexibleArgumentParser()
+        add_multimodal_gen_serve_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--warmup",
+            "false",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang", "serve"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.cli.serve.dispatch_launch"
+            ) as dispatch_launch,
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            execute_serve_cmd(args, unknown_args)
+
+        server_args = dispatch_launch.call_args.args[0]
+        self.assertFalse(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
+        self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
+
+    def test_serve_cli_preserves_config_warmup_false(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+            execute_serve_cmd,
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
+            json.dump({"model_path": "/fake", "warmup": False}, config_file)
+            config_file.flush()
+
+            parser = FlexibleArgumentParser()
+            add_multimodal_gen_serve_args(parser)
+            argv = [
+                "--config",
+                config_file.name,
+            ]
+
+            with (
+                patch.object(sys, "argv", ["sglang", "serve"] + argv),
+                patch.object(
+                    PipelineConfig,
+                    "from_kwargs",
+                    return_value=QwenImagePipelineConfig(),
+                ),
+                patch(
+                    "sglang.multimodal_gen.runtime.entrypoints.cli.serve.dispatch_launch"
+                ) as dispatch_launch,
+            ):
+                args, unknown_args = parser.parse_known_args(argv)
+                execute_serve_cmd(args, unknown_args)
+
+        server_args = dispatch_launch.call_args.args[0]
+        self.assertFalse(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
+        self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
+
+    def test_disagg_role_disables_server_warmup(self):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            server_args = ServerArgs.from_dict(
+                {
+                    "model_path": "/fake",
+                    "warmup": True,
+                    "server_warmup": True,
+                    "disagg_role": "server",
+                }
+            )
+
+        self.assertTrue(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
+
 
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_pipeline_config(
@@ -390,7 +559,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["image_encoder", "vae"])
 
-    def test_layerwise_components_disable_matching_cpu_offloads(self):
+    def test_layerwise_components_disable_matching_non_dit_cpu_offloads(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             memory_gb=16,
@@ -411,10 +580,33 @@ class TestOffloadDefaults(unittest.TestCase):
         args._adjust_layerwise_offload_components()
 
         self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.dit_cpu_offload)
+        # dit_cpu_offload is complementary to DiT layerwise offload (keeps
+        # weights off-device during load), so it must be preserved here.
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
+
+    def test_dit_layerwise_offload_preserves_dit_cpu_offload(self):
+        """Combining --dit-cpu-offload with --dit-layerwise-offload must keep both on.
+
+        dit_cpu_offload controls initial residency (host memory), while
+        dit_layerwise_offload only swaps layers on/off device at inference.
+        Force-disabling dit_cpu_offload here would push the full DiT to GPU at
+        load time and OOM low-VRAM cards.
+        """
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2I,
+            memory_gb=32,
+            kwargs={
+                "dit_cpu_offload": True,
+                "dit_layerwise_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
@@ -535,7 +727,10 @@ class TestOffloadDefaults(unittest.TestCase):
 
                 self.assertTrue(args.layerwise_offload_components)
                 self.assertFalse(args.use_fsdp_inference)
-                self.assertFalse(args.dit_cpu_offload)
+                # dit_cpu_offload is complementary to DiT layerwise offload:
+                # layerwise only moves layers on/off device at runtime, while
+                # dit_cpu_offload keeps the initial weights on host memory.
+                self.assertTrue(args.dit_cpu_offload)
                 self.assertFalse(args.text_encoder_cpu_offload)
                 self.assertFalse(args.image_encoder_cpu_offload)
                 self.assertEqual(args.dit_offload_prefetch_size, 2)
@@ -575,7 +770,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
@@ -670,7 +865,9 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        # dit_cpu_offload defaults to True from _adjust_offload and is now
+        # preserved alongside DiT layerwise offload (the two are complementary).
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
@@ -706,7 +903,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertTrue(args.text_encoder_cpu_offload)
         self.assertTrue(args.image_encoder_cpu_offload)
@@ -955,7 +1152,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(

@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Max pages per batched storage IO call.
+STORAGE_BATCH_SIZE = 128
+
 
 @dataclass
 class HiCacheStorageConfig:

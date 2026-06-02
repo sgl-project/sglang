@@ -1,8 +1,26 @@
+import asyncio
 import io
+import logging
+import re
 from dataclasses import dataclass
-from typing import List
+from typing import Any, Dict, List, Optional
 
 import soundfile as sf
+from fastapi import Request
+
+from sglang.srt.entrypoints.openai.transcription_adapters.base import (
+    TranscriptionAdapter,
+)
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+logger = logging.getLogger(__name__)
+
+
+# Collapse whitespace before punctuation so batched-inference token
+# boundary jitter (" ," vs ",") doesn't leak into deltas. Covers both
+# ASCII punctuation and the CJK / fullwidth equivalents.
+_PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
 
 
 @dataclass
@@ -22,13 +40,23 @@ class StreamingASRState:
     unfixed_chunk_num: int
     unfixed_token_num: int
     confirmed_text: str = ""
+    # Monotonic accumulator; used as prompt prefix so the model sees a
+    # natural continuation point, not the rolled-back ``confirmed_text``.
+    emitted_text: str = ""
     full_transcript: str = ""
     chunk_index: int = 0
 
     def get_prefix_text(self) -> str:
-        if self.chunk_index < self.unfixed_chunk_num or not self.confirmed_text:
+        if self.chunk_index < self.unfixed_chunk_num or not self.emitted_text:
             return ""
-        return self.confirmed_text
+        return self.emitted_text
+
+    def _record_emit(self, delta: str) -> str:
+        if delta:
+            self.emitted_text = (
+                f"{self.emitted_text} {delta}".strip() if self.emitted_text else delta
+            )
+        return delta
 
     def update(self, new_transcript: str) -> str:
         old_confirmed = self.confirmed_text
@@ -40,7 +68,7 @@ class StreamingASRState:
         self.full_transcript = new_transcript
         self.chunk_index += 1
         if self.confirmed_text.startswith(old_confirmed):
-            return self.confirmed_text[len(old_confirmed) :].strip()
+            return self._record_emit(self.confirmed_text[len(old_confirmed) :].strip())
         # Model revised earlier text, use word level common prefix to avoid
         # re-emitting already-sent content and cutting mid-word.
         old_words = old_confirmed.split()
@@ -50,7 +78,7 @@ class StreamingASRState:
             if ow != nw:
                 break
             common_count += 1
-        return " ".join(new_words[common_count:])
+        return self._record_emit(" ".join(new_words[common_count:]))
 
     def finalize(self) -> str:
         confirmed_words = self.confirmed_text.split()
@@ -64,8 +92,8 @@ class StreamingASRState:
             common_count += 1
         self.confirmed_text = self.full_transcript
         if common_count == 0 and confirmed_words and all_words:
-            return self.full_transcript
-        return " ".join(all_words[common_count:])
+            return self._record_emit(self.full_transcript)
+        return self._record_emit(" ".join(all_words[common_count:]))
 
 
 def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
@@ -91,3 +119,91 @@ def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
         sf.write(buf, data[:end], sample_rate, format="WAV")
         chunks.append(buf.getvalue())
     return chunks
+
+
+def normalize_whitespace(text: str) -> str:
+    return _PUNCT_WS_RE.sub(r"\1", text)
+
+
+_NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
+_NO_SPACE_AFTER = frozenset("([{（【《「『")
+
+
+def _is_cjk(c: str) -> bool:
+    """Whether char is a CJK-context glyph that doesn't take inter-word
+    spaces — ideographs, Japanese kana, CJK punctuation, fullwidth forms.
+    Excludes Hangul / Devanagari / Arabic etc., which are non-ASCII but
+    space-separated and need the normal boundary space."""
+    cp = ord(c)
+    return (
+        0x3000 <= cp <= 0x303F  # CJK Symbols and Punctuation (，。、《》「」…)
+        or 0x3040 <= cp <= 0x309F  # Hiragana
+        or 0x30A0 <= cp <= 0x30FF  # Katakana
+        or 0x3400 <= cp <= 0x4DBF  # CJK Unified Ideographs Ext A
+        or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0xFF00 <= cp <= 0xFFEF  # Halfwidth & Fullwidth Forms (fullwidth ASCII)
+    )
+
+
+def needs_space(prev: str, cur: str) -> bool:
+    """Return whether a boundary space is needed between emitted deltas.
+
+    Avoid spaces around punctuation and between adjacent CJK-context glyphs.
+    Shared by the realtime WS and HTTP SSE chunked streaming paths.
+    """
+    if not prev or not cur:
+        return False
+    if prev[-1].isspace() or cur[0].isspace():
+        return False
+    if cur[0] in _NO_SPACE_BEFORE or prev[-1] in _NO_SPACE_AFTER:
+        return False
+    if _is_cjk(prev[-1]) and _is_cjk(cur[0]):
+        return False
+    return True
+
+
+async def process_asr_chunk(
+    tokenizer_manager: TokenizerManager,
+    adapter: TranscriptionAdapter,
+    state: StreamingASRState,
+    audio_data: bytes,
+    sampling_params: Dict[str, Any],
+    is_last: bool,
+    raw_request: Optional[Request] = None,
+    routing_key: Optional[str] = None,
+) -> str:
+    """Run inference on one audio chunk. Shared by the HTTP and WebSocket paths."""
+    prompt = adapter.prompt_template + state.get_prefix_text()
+
+    chunk_request = GenerateReqInput(
+        text=prompt,
+        audio_data=audio_data,
+        sampling_params=sampling_params,
+        stream=False,
+        modalities=["audio"],
+    )
+    if routing_key is not None:
+        chunk_request.routing_key = routing_key
+
+    try:
+        ret = None
+        async for ret in tokenizer_manager.generate_request(chunk_request, raw_request):
+            break
+    except asyncio.CancelledError:
+        raise
+    except ValueError:
+        logger.warning(
+            "[streaming_asr] chunk %d failed", state.chunk_index, exc_info=True
+        )
+        raise
+
+    if ret is None:
+        logger.warning("[streaming_asr] empty response for chunk %d", state.chunk_index)
+        return ""
+
+    text = normalize_whitespace(adapter.postprocess_text(ret.get("text", "")))
+
+    if is_last:
+        state.full_transcript = text
+        return state.finalize()
+    return state.update(text)

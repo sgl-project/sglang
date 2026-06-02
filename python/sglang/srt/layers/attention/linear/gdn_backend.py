@@ -123,9 +123,9 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer only when the selected FlashInfer kernel
-        # supports MTP verify. On SM100+ FlashInfer GDN decode is supported, but
-        # its MTP verify path is not, so keep Triton as the verify fallback.
+        # Verify kernel: use FlashInfer when the selected FlashInfer kernel
+        # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
+        # bf16-state adapter in FlashInferGDNKernel.
         if (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:

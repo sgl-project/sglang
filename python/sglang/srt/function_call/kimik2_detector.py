@@ -1,10 +1,14 @@
 import json
 import logging
 import re
-from typing import List
+from typing import List, Literal, Optional, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.function_call.base_format_detector import (
+    BaseFormatDetector,
+    StructuralTag,
+    get_model_structural_tag,
+)
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
@@ -22,6 +26,8 @@ _KIMI_K2_SPECIAL_TOKENS = [
     "<|tool_call_end|>",
     "<|tool_call_argument_begin|>",
 ]
+
+_KIMI_NON_STRICT_ARGUMENTS_SCHEMA = {"type": "object"}
 
 
 def _strip_special_tokens(text: str) -> str:
@@ -333,12 +339,45 @@ class KimiK2Detector(BaseFormatDetector):
 
         return get_info
 
-    # Kimi stays on the SGLang legacy structural tag path. xgrammar 0.2.0's
-    # get_kimi_structural_tag(tool_choice="auto") emits a bare
-    # <|tool_call_begin|>...<|tool_call_end|> grammar without the
-    # <|tool_calls_section_begin|>/<|tool_calls_section_end|> wrapper Kimi's
-    # chat template uses, and KimiK2Detector.has_tool_call() keys off the
-    # section marker — bare tool calls would be silently dropped. Inheriting
-    # the base get_structural_tag_name (returns None) keeps FunctionCallParser
-    # on the legacy path, whose structure_info bakes the section markers in.
-    # TODO: re-enable the builtin once https://github.com/mlc-ai/xgrammar/issues/622 is fixed.
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional[StructuralTag]:
+        if not (
+            tools and (tool_choice == "required" or isinstance(tool_choice, ToolChoice))
+        ):
+            return super().get_structural_tag(
+                tools=tools, tool_choice=tool_choice, thinking_mode=thinking_mode
+            )
+        if get_model_structural_tag is None:
+            return None
+
+        converted_tools = []
+        for tool in tools:
+            converted_tool = tool.model_dump()
+            function = converted_tool["function"]
+            if not function.get("strict", False):
+                # Kimi's parser accepts only object-shaped tool arguments. XGrammar
+                # treats strict=False arguments as unconstrained JSON, which can
+                # generate strings/arrays/numbers that Kimi cannot parse. Keep
+                # non-strict semantics loose by constraining only the outer type.
+                function["strict"] = True
+                function["parameters"] = _KIMI_NON_STRICT_ARGUMENTS_SCHEMA
+            converted_tools.append(converted_tool)
+
+        converted_tool_choice = (
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice
+        )
+        return get_model_structural_tag(
+            model="kimi",
+            tools=converted_tools,
+            tool_choice=converted_tool_choice,
+            reasoning=thinking_mode,
+        )
+
+    def get_structural_tag_name(self) -> str:
+        return "kimi"

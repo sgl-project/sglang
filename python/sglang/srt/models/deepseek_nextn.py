@@ -16,6 +16,7 @@
 
 import logging
 import os
+from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -169,69 +170,86 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        zero_allocator = BumpAllocator(
-            buffer_size=2,
-            dtype=torch.float32,
-            device=(
-                input_embeds.device if input_embeds is not None else input_ids.device
-            ),
-        )
+        exit_stack = ExitStack()
+        if (
+            _is_npu
+            and self.quant_config is None
+            and get_global_server_args().quantization is not None
+        ):
+            # ascend mtp unquant
+            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
+            exit_stack.enter_context(
+                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
+            )
 
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
-
-        if hidden_states.shape[0] > 0:
-            eh_input = torch.cat(
-                (
-                    self.enorm(hidden_states),
-                    self.hnorm(
-                        forward_batch.spec_info.hidden_states
-                        if self.rot_weight is None
-                        else torch.matmul(
-                            forward_batch.spec_info.hidden_states, self.rot_weight
-                        )
-                    ),
+        try:
+            zero_allocator = BumpAllocator(
+                buffer_size=2,
+                dtype=torch.float32,
+                device=(
+                    input_embeds.device
+                    if input_embeds is not None
+                    else input_ids.device
                 ),
-                dim=-1,
-            )
-            if isinstance(self.eh_proj, ReplicatedLinear):
-                hidden_states, _ = self.eh_proj(eh_input)
-            else:
-                hidden_states = self.eh_proj(eh_input)
-
-        if dsa_use_prefill_cp(
-            forward_batch, self.dsa_enable_prefill_cp
-        ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
-        residual = None
-        with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual, topk_indices = self.decoder(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-                zero_allocator,
             )
 
-        if not forward_batch.forward_mode.is_idle():
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
             else:
-                hidden_states = self.shared_head.norm(hidden_states)
+                hidden_states = input_embeds
+
+            if hidden_states.shape[0] > 0:
+                eh_input = torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(
+                            forward_batch.spec_info.hidden_states
+                            if self.rot_weight is None
+                            else torch.matmul(
+                                forward_batch.spec_info.hidden_states, self.rot_weight
+                            )
+                        ),
+                    ),
+                    dim=-1,
+                )
+                if isinstance(self.eh_proj, ReplicatedLinear):
+                    hidden_states, _ = self.eh_proj(eh_input)
+                else:
+                    hidden_states = self.eh_proj(eh_input)
 
             if dsa_use_prefill_cp(
                 forward_batch, self.dsa_enable_prefill_cp
             ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
-                # allgather + rerrange
-                hidden_states = cp_all_gather_rerange_output(
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+                positions = cp_split_and_rebuild_position(forward_batch, positions)
+            residual = None
+            with get_global_expert_distribution_recorder().disable_this_region():
+                hidden_states, residual, topk_indices = self.decoder(
+                    positions,
                     hidden_states,
-                    self.cp_size,
                     forward_batch,
-                    torch.cuda.current_stream(),
+                    residual,
+                    zero_allocator,
                 )
+
+            if not forward_batch.forward_mode.is_idle():
+                if residual is not None:
+                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+                else:
+                    hidden_states = self.shared_head.norm(hidden_states)
+
+                if dsa_use_prefill_cp(
+                    forward_batch, self.dsa_enable_prefill_cp
+                ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
+                    # allgather + rerrange
+                    hidden_states = cp_all_gather_rerange_output(
+                        hidden_states,
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+        finally:
+            exit_stack.close()
 
         return hidden_states
 
@@ -311,7 +329,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
         elif self.mla_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, forward_batch):
@@ -320,7 +338,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(

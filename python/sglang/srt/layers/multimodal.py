@@ -119,7 +119,7 @@ def add_tree_reduce_u64_kernel(in_ptr, out_ptr, n_elems, CHUNK: tl.constexpr):
 
 def _as_uint32_words(t: torch.Tensor) -> torch.Tensor:
     assert t.is_cuda, "Use .cuda() first"
-    tb = t.contiguous().view(torch.uint8)
+    tb = t.contiguous().reshape(-1).view(torch.uint8)
     nbytes = tb.numel()
     pad = (4 - (nbytes & 3)) & 3
     if pad:

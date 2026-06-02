@@ -217,9 +217,19 @@ def find_workflow_run_url(
                 continue
 
             # Match by display_title (set by workflow's run-name directive)
-            # This is immediately available, unlike job names which require waiting
+            # This is immediately available, unlike job names which require waiting.
+            #
+            # GitHub caps display_title at 512 chars and appends "..." when the
+            # workflow's run-name is longer (e.g. /rerun-test with many files
+            # newline-joins them into one long command). Accept the un-truncated
+            # prefix when the rest matches our submission verbatim — concurrent
+            # dispatches use different commands (different files per group), so
+            # the prefix is enough to disambiguate.
             display_title = run.get("display_title", "")
-            if display_title == expected_title:
+            if display_title == expected_title or (
+                display_title.endswith("...")
+                and expected_title.startswith(display_title[:-3])
+            ):
                 print(
                     f"Found matching workflow run: {run['id']} with title '{display_title}'"
                 )
@@ -486,6 +496,87 @@ def resolve_test_group_specs(group_name):
     return [os.path.relpath(path, "test") for path in test_files], None
 
 
+# A spec is treated as a wildcard pattern (expanding to many files) when its
+# file part contains a glob metacharacter. Plain specs keep the existing
+# single-file resolution, which requires a unique match.
+_GLOB_METACHARS = ("*", "?", "[")
+
+
+def _is_glob_pattern(file_part):
+    return any(ch in file_part for ch in _GLOB_METACHARS)
+
+
+def expand_glob_spec(file_part):
+    """
+    Expand a wildcard file_part into matching test files (repo-relative paths).
+
+    Globs are matched against the same locations resolve_test_file() searches
+    — test/registered/ and the multimodal_gen test dir — so e.g.
+    `test_*backend*.py` reruns every backend test without hand-enumerating
+    each file. Two constraints keep a broad pattern from pulling in non-tests:
+    a match must live under a known test root and be named `test_*.py`.
+
+    glob's `*` matches path separators only via `**`, so a bare pattern is
+    searched recursively under each root; a path-ful pattern is anchored.
+
+    Returns (sorted_repo_relative_paths, error). On success error is None.
+    """
+    pat = file_part
+    if pat.startswith("test/"):
+        pat = pat[len("test/") :]
+
+    matches = set()
+    if "/" in pat:
+        # Path-ful pattern. Glob from the repo root (handles fully qualified
+        # multimodal paths like python/sglang/multimodal_gen/test/**/test_*.py)
+        # and under test/ (handles test/-relative patterns like
+        # registered/attention/test_*.py).
+        for base in (".", "test"):
+            matches.update(glob.glob(os.path.join(base, pat), recursive=True))
+    else:
+        # Bare pattern: search recursively under each known test root.
+        for root in ("test/registered", MULTIMODAL_TEST_DIR):
+            matches.update(glob.glob(os.path.join(root, "**", pat), recursive=True))
+
+    # If the literal glob matched any directories — e.g. `unittest/*` matching
+    # subdirs `dense/`, `dsa/`, … — descend recursively into them for
+    # test_*.py. glob's `*` doesn't cross `/`, so without this a tree of
+    # subdirs containing tests would return only the top-level entries (and
+    # then get filtered out as non-test files).
+    expanded = set()
+    for p in matches:
+        if os.path.isdir(p):
+            expanded.update(
+                glob.glob(os.path.join(p, "**", "test_*.py"), recursive=True)
+            )
+        else:
+            expanded.add(p)
+    matches = expanded
+
+    def _under_test_root(path):
+        return path.startswith("test/registered/") or path.startswith(
+            MULTIMODAL_TEST_DIR + "/"
+        )
+
+    files = sorted(
+        {
+            os.path.normpath(p)
+            for p in matches
+            if os.path.isfile(p)
+            and os.path.basename(p).startswith("test_")
+            and p.endswith(".py")
+            and _under_test_root(os.path.normpath(p))
+        }
+    )
+    if not files:
+        return [], (
+            f"No test files matched wildcard `{file_part}` under "
+            f"`test/registered/` or `{MULTIMODAL_TEST_DIR}/` "
+            f"(patterns only match files named `test_*.py`)."
+        )
+    return files, None
+
+
 def resolve_test_file(file_part):
     """
     Resolve a user-provided file path to a path relative to test/ or full path for multimodal.
@@ -577,13 +668,122 @@ def detect_multimodal_suite(file_path):
     return MULTIMODAL_DEFAULT_RUNNER, None
 
 
-def _extract_runner_config(content):
-    """Pull `runner_config` and the args string from a `register_cuda_ci(...)` call."""
-    args = re.search(r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE)
-    if not args:
-        return None, None
-    m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
-    return (m.group(1), args.group(1)) if m else (None, None)
+def _extract_runner_configs(content):
+    """Pull `(runner_config, args_str)` from EVERY `register_cuda_ci(...)` call.
+
+    A test file can register itself on multiple pools (e.g. both
+    `4-gpu-b200` and `1-gpu-large`). The earlier `re.search` variant
+    returned only the first match, so /rerun-test silently dropped every
+    registration after the first — multi-pool files only ever ran on the
+    pool listed first. `re.finditer` is what makes the fan-out happen.
+    """
+    out = []
+    for args in re.finditer(
+        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+    ):
+        m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        if m:
+            out.append((m.group(1), args.group(1)))
+    return out
+
+
+def _extract_legacy_suites(content):
+    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)` calls.
+
+    Mirrors _extract_runner_configs for the legacy nightly/weekly shape: a file
+    may register on multiple pools, so collect all of them rather than the first.
+    """
+    out = []
+    for args in re.finditer(
+        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+    ):
+        m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+# Legacy nightly/weekly CUDA suites register with a single-string `suite=`
+# instead of `runner_config=`, so they carry no runner metadata of their own.
+# Map each to the runner_config in scripts/ci/runner_configs.yml whose hardware
+# matches the runner the nightly/weekly pipeline actually uses (see
+# .github/workflows/{nightly,weekly}-test-nvidia.yml), so /rerun-test can still
+# dispatch a single nightly/weekly test. The runner label, install script,
+# timeout and rdma_devices are then resolved from runner_configs.yml as usual,
+# keeping that file the single source of truth for runner details.
+#
+# Suites on hardware with no matching runner_config (e.g. nightly-4-gpu-gb300)
+# and non-CUDA suites (npu/amd) are intentionally absent and stay
+# non-dispatchable until a matching runner_config exists.
+_LEGACY_SUITE_TO_RUNNER_CONFIG = {
+    "nightly-1-gpu": "1-gpu-large",
+    "nightly-kernel-1-gpu": "1-gpu-large",
+    "nightly-eval-text-2-gpu": "2-gpu-large",
+    "nightly-perf-text-2-gpu": "2-gpu-large",
+    "nightly-eval-vlm-2-gpu": "2-gpu-large",
+    "nightly-perf-vlm-2-gpu": "2-gpu-large",
+    "nightly-4-gpu": "4-gpu-h100",
+    "nightly-4-gpu-b200": "4-gpu-b200",
+    "nightly-8-gpu-common": "8-gpu-h200",
+    "nightly-8-gpu-h200": "8-gpu-h200",
+    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
+    "nightly-8-gpu-h20": "8-gpu-h20",
+    "nightly-8-gpu-b200": "8-gpu-b200",
+    "weekly-8-gpu-h200": "8-gpu-h200",
+}
+
+
+def _dispatch_err(suite, msg):
+    """Build a detect_suite error result for the given suite."""
+    return {
+        "suite": suite,
+        "runner_label": None,
+        "install_script": "",
+        "install_timeout": "",
+        "rdma_devices": "",
+        "is_cpu": False,
+        "error": msg,
+    }
+
+
+def _resolve_runner_config(rc, full_path, suite):
+    """Resolve a runner_config key into a detect_suite dispatch dict.
+
+    Returns the dispatch dict on success, or an error dict on failure.
+    """
+    configs = _runner_configs.load()
+    cfg = configs.get(rc)
+    if cfg is None:
+        known = ", ".join(f"`{k}`" for k in sorted(configs))
+        return _dispatch_err(
+            suite,
+            f"Unknown runner_config `{rc}` in `{full_path}` "
+            f"— not in scripts/ci/runner_configs.yml.\n\n"
+            f"Known runner_configs: {known}",
+        )
+    install_script = cfg["install"]
+    if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
+        return _dispatch_err(
+            suite,
+            f"Disallowed `install` value `{install_script}` for runner_config "
+            f"`{rc}` in scripts/ci/runner_configs.yml. The slash handler "
+            f"passes this string verbatim into a shell step, so it must "
+            f"match `scripts/ci/cuda/*.sh`.",
+        )
+    runs_on = cfg.get("runs_on")
+    # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
+    # so always pick the non-kernel b200 pool.
+    if runs_on == "$b200_runner":
+        runs_on = _B200_DEFAULT_RUNNER
+    return {
+        "suite": suite,
+        "runner_label": runs_on,
+        "install_script": install_script,
+        "install_timeout": str(cfg["install_timeout"]),
+        "rdma_devices": cfg.get("rdma_devices", ""),
+        "is_cpu": False,
+        "error": None,
+    }
 
 
 def detect_suite(file_path_from_test):
@@ -591,95 +791,89 @@ def detect_suite(file_path_from_test):
     Read a test file and extract dispatch info from register_cuda_ci or
     register_cpu_ci.
 
-    CUDA tests must use `register_cuda_ci(stage=..., runner_config=...)`;
-    runner label, install script, timeout, and rdma_devices are all resolved
-    from scripts/ci/runner_configs.yml — the same single source of truth that
-    drives the main PR test pipeline.
+    A CUDA file can carry multiple `register_cuda_ci(...)` calls — one per
+    pool it should run on — so this returns a *list* of dispatch dicts, one
+    per registration. Runner label, install script, timeout, and rdma_devices
+    are all resolved from scripts/ci/runner_configs.yml — the same single
+    source of truth that drives the main PR test pipeline.
 
-    CPU tests (`register_cpu_ci(...)`) dispatch to the CPU job (ubuntu-latest).
+    Legacy nightly/weekly CUDA suites (single-string `suite=`) are dispatchable
+    too: each suite name is mapped to the matching runner_config via
+    _LEGACY_SUITE_TO_RUNNER_CONFIG, then resolved the same way.
 
-    Returns dict with keys: suite, runner_label, install_script,
+    CPU files yield a single-element list. A file with no recognised (or no
+    dispatchable) registration yields a one-element list whose dict has an
+    `error` set.
+
+    Each dict has keys: suite, runner_label, install_script,
     install_timeout, rdma_devices, is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
 
-    def _err(suite, msg):
-        return {
-            "suite": suite,
-            "runner_label": None,
-            "install_script": "",
-            "install_timeout": "",
-            "rdma_devices": "",
-            "is_cpu": False,
-            "error": msg,
-        }
+    cuda_calls = _extract_runner_configs(content)
+    if cuda_calls:
+        results = []
+        for rc, args_str in cuda_calls:
+            stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
+            suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
+            results.append(_resolve_runner_config(rc, full_path, suite))
+        return results
 
-    rc, args_str = _extract_runner_config(content)
-    if rc:
-        configs = _runner_configs.load()
-        cfg = configs.get(rc)
-        if cfg is None:
-            known = ", ".join(f"`{k}`" for k in sorted(configs))
-            return _err(
-                rc,
-                f"Unknown runner_config `{rc}` in `{full_path}` "
-                f"— not in scripts/ci/runner_configs.yml.\n\n"
-                f"Known runner_configs: {known}",
-            )
-        install_script = cfg["install"]
-        if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
-            return _err(
-                rc,
-                f"Disallowed `install` value `{install_script}` for runner_config "
-                f"`{rc}` in scripts/ci/runner_configs.yml. The slash handler "
-                f"passes this string verbatim into a shell step, so it must "
-                f"match `scripts/ci/cuda/*.sh`.",
-            )
-        runs_on = cfg.get("runs_on")
-        # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
-        # so always pick the non-kernel b200 pool.
-        if runs_on == "$b200_runner":
-            runs_on = _B200_DEFAULT_RUNNER
-        stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
-        suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-        return {
-            "suite": suite,
-            "runner_label": runs_on,
-            "install_script": install_script,
-            "install_timeout": str(cfg["install_timeout"]),
-            "rdma_devices": cfg.get("rdma_devices", ""),
-            "is_cpu": False,
-            "error": None,
-        }
+    # Legacy nightly/weekly CUDA suites: single-string `suite=`, no
+    # runner_config. Map each mappable suite to its runner_config and resolve.
+    legacy_suites = _extract_legacy_suites(content)
+    mappable = [s for s in legacy_suites if s in _LEGACY_SUITE_TO_RUNNER_CONFIG]
+    if mappable:
+        return [
+            _resolve_runner_config(_LEGACY_SUITE_TO_RUNNER_CONFIG[s], full_path, s)
+            for s in mappable
+        ]
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
-        return {
-            "suite": "cpu",
-            "runner_label": "ubuntu-latest",
-            "install_script": "",
-            "install_timeout": "",
-            "rdma_devices": "",
-            "is_cpu": True,
-            "error": None,
-        }
+        return [
+            {
+                "suite": "cpu",
+                "runner_label": "ubuntu-latest",
+                "install_script": "",
+                "install_timeout": "",
+                "rdma_devices": "",
+                "is_cpu": True,
+                "error": None,
+            }
+        ]
 
-    return _err(
-        None,
-        f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
-        f"found in `{full_path}`. /rerun-test only supports tests registered "
-        f"via the new-style yml-driven API; nightly/weekly tests aren't "
-        f"dispatchable through this command.",
-    )
+    if legacy_suites:
+        suite = legacy_suites[0]
+        return [
+            _dispatch_err(
+                suite,
+                f"Suite `{suite}` in `{full_path}` is not dispatchable via "
+                f"/rerun-test. It has no entry in _LEGACY_SUITE_TO_RUNNER_CONFIG "
+                f"— either it is a non-CUDA suite (npu/amd) or it runs on "
+                f"hardware with no matching runner_config in "
+                f"scripts/ci/runner_configs.yml.",
+            )
+        ]
+
+    return [
+        _dispatch_err(
+            None,
+            f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
+            f"found in `{full_path}`. This file may not be a registered CI test.",
+        )
+    ]
 
 
 def _resolve_test_spec(test_spec):
     """
-    Resolve a single test spec into its components without dispatching.
+    Resolve a single test spec into one or more dispatch entries.
 
-    Returns a dict with keys: spec, test_command, mode, runs_on,
-    install_script, install_timeout, rdma_devices, error.
+    A file registered on N pools (multiple `register_cuda_ci(...)` calls)
+    yields N entries — handle_rerun_test's grouping then sends one workflow
+    per pool. Multimodal and CPU files yield a single entry. Resolution
+    errors yield a one-element list with {"spec","error"}.
     """
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
@@ -693,12 +887,12 @@ def _resolve_test_spec(test_spec):
 
     resolved_path, is_multimodal, err = resolve_test_file(file_part)
     if err:
-        return {"spec": test_spec, "error": err}
+        return [{"spec": test_spec, "error": err}]
 
     if is_multimodal:
         runner_label, err = detect_multimodal_suite(resolved_path)
         if err:
-            return {"spec": test_spec, "error": err}
+            return [{"spec": test_spec, "error": err}]
 
         # For multimodal pytest tests, use :: separator for test selection
         test_command = resolved_path
@@ -706,45 +900,52 @@ def _resolve_test_spec(test_spec):
             test_command = f"{resolved_path}::{test_selector}"
 
         print(
-            f"Resolved (multimodal_gen): file={resolved_path}, selector={test_selector}, "
-            f"runner={runner_label}, command='{test_command}'"
+            f"Resolved (multimodal_gen): file={resolved_path}, "
+            f"selector={test_selector}, runner={runner_label}, "
+            f"command='{test_command}'"
         )
-        return {
-            "spec": test_spec,
-            "test_command": test_command,
-            "mode": "multimodal_gen",
-            "runs_on": runner_label,
-            "install_script": "",
-            "install_timeout": "",
-            "rdma_devices": "",
-            "error": None,
-        }
-
-    info = detect_suite(resolved_path)
-    if info["error"]:
-        return {"spec": test_spec, "error": info["error"]}
+        return [
+            {
+                "spec": test_spec,
+                "test_command": test_command,
+                "mode": "multimodal_gen",
+                "runs_on": runner_label,
+                "install_script": "",
+                "install_timeout": "",
+                "rdma_devices": "",
+                "error": None,
+            }
+        ]
 
     test_command = resolved_path
     if test_selector:
         test_command = f"{resolved_path} {test_selector}"
 
-    mode = "cpu" if info["is_cpu"] else "cuda"
-    print(
-        f"Resolved: file={resolved_path}, selector={test_selector}, "
-        f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
-        f"install={info['install_script']}, rdma={info['rdma_devices']}, "
-        f"command='{test_command}'"
-    )
-    return {
-        "spec": test_spec,
-        "test_command": test_command,
-        "mode": mode,
-        "runs_on": info["runner_label"],
-        "install_script": info["install_script"],
-        "install_timeout": info["install_timeout"],
-        "rdma_devices": info["rdma_devices"],
-        "error": None,
-    }
+    out = []
+    for info in detect_suite(resolved_path):
+        if info["error"]:
+            out.append({"spec": test_spec, "error": info["error"]})
+            continue
+        mode = "cpu" if info["is_cpu"] else "cuda"
+        print(
+            f"Resolved: file={resolved_path}, selector={test_selector}, "
+            f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
+            f"install={info['install_script']}, rdma={info['rdma_devices']}, "
+            f"command='{test_command}'"
+        )
+        out.append(
+            {
+                "spec": test_spec,
+                "test_command": test_command,
+                "mode": mode,
+                "runs_on": info["runner_label"],
+                "install_script": info["install_script"],
+                "install_timeout": info["install_timeout"],
+                "rdma_devices": info["rdma_devices"],
+                "error": None,
+            }
+        )
+    return out
 
 
 def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
@@ -887,7 +1088,14 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
 
 
 def handle_rerun_test(
-    gh_repo, pr, comment, user_perms, test_specs, token, skip_permission_check=False
+    gh_repo,
+    pr,
+    comment,
+    user_perms,
+    test_specs,
+    token,
+    skip_permission_check=False,
+    command_label=None,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -907,7 +1115,9 @@ def handle_rerun_test(
             "- `/rerun-test test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
             "- `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
             "- `/rerun-test test_srt_endpoint.py`\n"
-            "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)"
+            "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)\n"
+            "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
+            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)"
         )
         return False
 
@@ -917,14 +1127,64 @@ def handle_rerun_test(
         pr.create_issue_comment(gate_msg)
         return False
 
-    # Phase 1: Resolve all specs
-    resolved = []
+    # Phase 0: Expand wildcard specs into concrete test files. A spec whose
+    # file part contains a glob metacharacter (* ? [) expands to every
+    # matching file; plain specs pass through to single-file resolution.
     resolve_failures = []
+    seen_failures = set()
+
+    def _record_failure(spec, error):
+        # De-dupe failures by canonical path so the same un-dispatchable file
+        # reported two ways (explicit + glob, or two globs) yields one line.
+        key = spec.strip().strip("\"'`")
+        if key.startswith("test/"):
+            key = key[len("test/") :]
+        if key not in seen_failures:
+            seen_failures.add(key)
+            resolve_failures.append({"spec": spec, "error": error})
+
+    expanded_specs = []
     for spec in test_specs:
-        r = _resolve_test_spec(spec)
-        if r.get("error"):
-            resolve_failures.append(r)
-        else:
+        # Quotes/backticks are never meaningful here (the command isn't
+        # shell-parsed), so strip them. Backtick-wrapping is in fact the
+        # recommended way to write a glob: plain `*backend*` renders as italics
+        # in a GitHub comment, but `` `test_*backend*.py` `` stays literal — and
+        # either way the handler reads the raw body, so the `*` survives.
+        file_part = spec.split("::", 1)[0].strip().strip("\"'`")
+        if not _is_glob_pattern(file_part):
+            expanded_specs.append(spec)
+            continue
+        if "::" in spec:
+            _record_failure(
+                spec,
+                "Wildcard patterns can't be combined with a `::test` "
+                "selector — drop the `::...` to rerun whole files.",
+            )
+            continue
+        matched, err = expand_glob_spec(file_part)
+        if err:
+            _record_failure(spec, err)
+            continue
+        expanded_specs.extend(matched)
+
+    # Phase 1: Resolve all specs, de-duping by the *resolved* identity. A glob
+    # expands to `test/`-prefixed paths while an explicit spec keeps the form
+    # the user typed, so the same file requested both ways resolves to two
+    # different raw strings — keying de-dup on the resolved identity is what
+    # collapses them into a single dispatch instead of running twice.
+    # `runs_on` is included in the key so a file registered on N pools fans
+    # out into one dispatch per pool, instead of all-but-the-first collapsing.
+    resolved = []
+    seen_commands = set()
+    for spec in expanded_specs:
+        for r in _resolve_test_spec(spec):
+            if r.get("error"):
+                _record_failure(r["spec"], r["error"])
+                continue
+            key = (r["mode"], r["runs_on"], r["test_command"])
+            if key in seen_commands:
+                continue
+            seen_commands.add(key)
             resolved.append(r)
 
     # Phase 2: Group by dispatch shape.
@@ -942,7 +1202,8 @@ def handle_rerun_test(
     # Phase 3a: Create placeholder reply comment so we have its ID before
     # dispatching workflows. This lets each dispatched run write its
     # success/failure result back to the right line in this comment.
-    reply_comment = pr.create_issue_comment("🚀 Dispatching rerun-test workflow(s)...")
+    dispatching = f"`{command_label}`" if command_label else "rerun-test workflow(s)"
+    reply_comment = pr.create_issue_comment(f"🚀 Dispatching {dispatching}...")
 
     # Phase 3b: Dispatch one workflow per group, with a unique per-batch
     # marker each. The marker is an HTML comment that the writeback step
@@ -997,6 +1258,11 @@ def handle_rerun_test(
         lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
+    # Echo the originating command so each reply is self-identifying when
+    # several /rerun-test commands are in flight at once. Backtick-wrapping
+    # also keeps any `*` in the pattern from rendering as italics.
+    if command_label:
+        body = f"Results for `{command_label}`:\n\n{body}"
 
     successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
@@ -1008,7 +1274,9 @@ def handle_rerun_test(
     return len(successes) > 0
 
 
-def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
+def handle_rerun_group(
+    gh_repo, pr, comment, user_perms, group_names, token, command_label=None
+):
     """
     Handles the /rerun-group command. Expands one or more registered test
     groups into test file specs, then reuses /rerun-test dispatch behavior.
@@ -1055,6 +1323,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
         test_specs,
         token,
         skip_permission_check=True,
+        command_label=command_label,
     )
 
 
@@ -1165,11 +1434,27 @@ def main():
 
     elif first_line.startswith("/rerun-group"):
         group_names = first_line.split()[1:]
-        handle_rerun_group(repo, pr, comment, user_perms, group_names or None, token)
+        handle_rerun_group(
+            repo,
+            pr,
+            comment,
+            user_perms,
+            group_names or None,
+            token,
+            command_label=first_line,
+        )
 
     elif first_line.startswith("/rerun-test"):
         test_specs = first_line.split()[1:]
-        handle_rerun_test(repo, pr, comment, user_perms, test_specs or None, token)
+        handle_rerun_test(
+            repo,
+            pr,
+            comment,
+            user_perms,
+            test_specs or None,
+            token,
+            command_label=first_line,
+        )
 
     else:
         print(f"Unknown or ignored command: {first_line}")

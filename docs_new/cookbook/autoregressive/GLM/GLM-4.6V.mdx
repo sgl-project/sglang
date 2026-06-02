@@ -10,7 +10,7 @@ GLM-4.6V series model includes two versions: GLM-4.6V (106B), a foundation model
 
 Beyond achieves SoTA performance across major multimodal benchmarks at comparable model scales. GLM-4.6V introduces several key features:
 
-- **Native Multimodal Function Calling** Enables native vision-driven tool use. Images, screenshots, and document pages can be passed directly as tool inputs without text conversion, while visual outputs (charts, search images, rendered pages) are interpreted and integrated into the reasoning chain. This closes the loop from perception to understanding to execution. Please refer to this [example](#tool-call-example).
+- **Native Multimodal Function Calling** Enables native vision-driven tool use. Images, screenshots, and document pages can be passed directly as tool inputs without text conversion, while visual outputs (charts, search images, rendered pages) are interpreted and integrated into the reasoning chain. This closes the loop from perception to understanding to execution. Please refer to this [example](#4-2-3-tool-calling).
 - **Interleaved Image-Text Content Generation** Supports high-quality mixed media creation from complex multimodal inputs. GLM-4.6V takes a multimodal context—spanning documents, user inputs, and tool-retrieved images—and synthesizes coherent, interleaved image-text content tailored to the task. During generation it can actively call search and retrieval tools to gather and curate additional text and visuals, producing rich, visually grounded content.
 - **Multimodal Document Understanding** GLM-4.6V can process up to 128K tokens of multi-document or long-document input, directly interpreting richly formatted pages as images. It understands text, layout, charts, tables, and figures jointly, enabling accurate comprehension of complex, image-heavy documents without requiring prior conversion to plain text.
 - **Frontend Replication & Visual Editing** Reconstructs pixel-accurate HTML/CSS from UI screenshots and supports natural-language-driven edits. It detects layout, components, and styles visually, generates clean code, and applies iterative visual modifications through simple user instructions.
@@ -70,14 +70,56 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
 - **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
 - **TP=8 Configuration**: When using Tensor Parallelism (TP) of 8, the vision attention's 12 heads cannot be evenly divided. You can resolve this by adding `--mm-enable-dp-encoder` (which the generator above handles automatically).
 - **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
-- For more detailed configuration tips, please refer to [GLM-4.5V/GLM-4.6V Usage](../../../docs/basic_usage/glmv).
+- **Hardware Notes:**
+  - **H100 (FP8):** Use the FP8 checkpoint for best memory efficiency.
+  - **A100 / H100 (BF16):** Use standard multimodal parameters to manage throughput and GPU memory usage.
+  - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
+- **Additional Multimodal Parameters:**
+  - `--mm-attention-backend fa3`: Specify multimodal attention backend (Flash Attention 3).
+  - `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid D2H memory copies.
+  - `SGLANG_USE_CUDA_IPC_TRANSPORT=1`: Use CUDA IPC shared memory for multimodal data transport to significantly improve E2E latency.
 
-## 4. Example APIs
+**Example with full multimodal optimizations:**
+```bash Command
+SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
+SGLANG_VLM_CACHE_SIZE_MB=0 \
+python -m sglang.launch_server \
+  --model-path zai-org/GLM-4.6V \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --trust-remote-code \
+  --tp-size 8 \
+  --enable-cache-report \
+  --log-level info \
+  --max-running-requests 64 \
+  --mem-fraction-static 0.65 \
+  --chunked-prefill-size 8192 \
+  --attention-backend fa3 \
+  --mm-attention-backend fa3 \
+  --mm-enable-dp-encoder \
+  --enable-metrics
+```
 
-### Image Input Example
+## 4. Model Invocation
 
-#### API Payload
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Multi-Modal Inputs
+
+GLM-4.6V supports image and video inputs via the OpenAI-compatible API.
+
+**Image Input:**
+
 ```python Example
+import subprocess
+
 curl_command = f"""
 curl -s http://localhost:{30000}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
@@ -90,7 +132,7 @@ curl -s http://localhost:{30000}/v1/chat/completions \\
           {{
             "type": "image_url",
             "image_url": {{
-              "url": "/home/jobuser/sgl_logo.png"
+              "url": "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
             }}
           }},
           {{
@@ -110,15 +152,15 @@ response = subprocess.check_output(curl_command, shell=True).decode()
 print(response)
 ```
 
-#### API Response
 ```text Output
 {"id":"b61596ca71394dd699fd8abd4f650c44","object":"chat.completion","created":1765259019,"model":"default","choices":[{"index":0,"message":{"role":"assistant","content":"The image is a logo featuring the text \"SGL\" (in a bold, orange-brown font) alongside a stylized icon. The icon includes a network-like structure with circular nodes (suggesting connectivity or a tree/graph structure) and a tag with \"</>\" (a common symbol for coding, web development, or software). The color scheme uses warm orange-brown tones with a black background, giving it a tech-focused, modern aesthetic (likely representing a company, project, or tool related to software, web development, or digital technology).<|begin_of_box|>SGL logo (stylized text + network/coding icon)<|end_of_box|>","reasoning_content":"Okay, let's see. The image has a logo with the text \"SGL\" and a little icon on the left. The icon looks like a network or a tree structure with circles, and there's a tag with \"</>\" which is a common symbol for coding or web development. The colors are orange and brown tones, with a black background. So probably a logo for a company or project named SGL, maybe related to software, web development, or a tech company.","tool_calls":null},"logprobs":null,"finish_reason":"stop","matched_stop":151336}],"usage":{"prompt_tokens":2222,"total_tokens":2448,"completion_tokens":226,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default"}}
 ```
 
-### Video Input Example
+**Video Input:**
 
-#### API Payload
 ```python Example
+import subprocess
+
 curl_command = f"""
 curl -s http://localhost:{30000}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
@@ -131,12 +173,12 @@ curl -s http://localhost:{30000}/v1/chat/completions \\
           {{
             "type": "video_url",
             "video_url": {{
-              "url": "/home/jobuser/jobs_presenting_ipod.mp4"
+              "url": "https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4"
             }}
           }},
           {{
             "type": "text",
-            "text": "What is the image"
+            "text": "What is in the video"
           }}
         ]
       }}
@@ -151,26 +193,93 @@ response = subprocess.check_output(curl_command, shell=True).decode()
 print(response)
 ```
 
-#### API Response
 ```text Output
 {"id":"520e0a079e5d4b17b82a6af619315a97","object":"chat.completion","created":1765259029,"model":"default","choices":[{"index":0,"message":{"role":"assistant","content":"The image is a still from a presentation by a man on a stage. He is pointing to a small pocket on his jeans and asking the audience what the pocket is for. The video is being shared by Evan Carmichael. The man then reveals that the pocket is for an iPod Nano.","reasoning_content":"Based on the visual evidence in the video, here is a breakdown of what is being shown:\n\n*   **Subject:** The video features a man on a stage, giving a presentation. He is wearing a black t-shirt and dark jeans.\n*   **Action:** The man is pointing to a pocket on his jeans. He is asking the audience a question about the purpose of this pocket.\n*   **Context:** The presentation is being filmed, and the video is being shared by \"Evan Carmichael,\" a well-known motivational speaker and content creator. The source of the clip is credited to \"JoshuaG.\"\n*   **Reveal:** The man then reveals the answer to his question. He pulls a small, white, rectangular device out of the pocket. He identifies this device as an \"iPod Nano.\"\n\nIn summary, the image is a still from a presentation where a speaker is explaining the purpose of the small pocket found on many pairs of jeans.","tool_calls":null},"logprobs":null,"finish_reason":"stop","matched_stop":151336}],"usage":{"prompt_tokens":30276,"total_tokens":30532,"completion_tokens":256,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default"}}
 ```
 
-### Tool Call Example
+#### 4.2.2 Thinking Mode
 
-#### API Payload
+GLM-4.6V supports Thinking mode. Enable the reasoning parser during deployment:
+
+```shell Command
+python -m sglang.launch_server \
+  --model zai-org/GLM-4.6V \
+  --reasoning-parser glm45 \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+**Streaming with Thinking Process:**
+
 ```python Example
 from openai import OpenAI
-import argparse
-import sys
-import base64
 
-def image_to_base64(image_path):
-    """Convert image file to base64 data URL format for OpenAI API"""
-    with open(image_path, 'rb') as image_file:
-        image_data = image_file.read()
-        base64_string = base64.b64encode(image_data).decode('utf-8')
-        return f"data:image/png;base64,{base64_string}"
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Enable streaming to see the thinking process in real-time
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.6V",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    temperature=0.7,
+    max_tokens=2048,
+    stream=True
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+To solve this problem, I need to calculate 15% of 240.
+Step 1: Convert 15% to decimal: 15% = 0.15
+Step 2: Multiply 240 by 0.15
+Step 3: 240 × 0.15 = 36
+=============== Content =================
+
+The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
+```
+
+**Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
+
+#### 4.2.3 Tool Calling
+
+GLM-4.6V supports tool calling with vision capabilities. Pass tools in your API request:
+
+```python Example
+from openai import OpenAI
 
 openai_api_key = "EMPTY"
 openai_api_base = "http://127.0.0.1:30000/v1"
@@ -203,7 +312,7 @@ tools = [
 messages = [
     {
         "role": "user",
-        "content": "Please help me check today’s weather in Beijing, and tell me whether the tool returned an image."
+        "content": "Please help me check today's weather in Beijing, and tell me whether the tool returned an image."
     },
     {
         "role": "assistant",
@@ -229,7 +338,7 @@ messages = [
             {
                 "type": "image_url",
                 "image_url": {
-                     "url": "/home/jobuser/sgl_logo.png"
+                     "url": "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
                 }
             }
         ]
@@ -245,12 +354,33 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content.strip())
 ```
 
-#### Output
+**Output Example:**
 
 ```text Output
 The weather in Beijing today (November 7, 2025) is sunny with a temperature of 2°C.
 
 Yes, the tool returned an image (the SGL logo).
+```
+
+#### 4.2.4 Thinking Budget
+
+Beyond the reasoning parser, you can cap the number of thinking tokens using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor` and pass `Glm4MoeThinkingBudgetLogitProcessor` in the request — same as the [GLM-4.6 text model approach](./GLM-4.6#4-2-3-thinking-budget):
+
+```python Example
+import openai
+from sglang.srt.sampling.custom_logit_processor import Glm4MoeThinkingBudgetLogitProcessor
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.6V",
+    messages=[{"role": "user", "content": "Describe this image briefly."}],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": Glm4MoeThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {"thinking_budget": 512},
+    },
+)
+print(response)
 ```
 
 ## 5. Benchmark

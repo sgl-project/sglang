@@ -68,6 +68,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
 
@@ -669,7 +670,7 @@ class TransformersBase(nn.Module):
                 new_param = nn.Parameter(
                     torch.empty_like(
                         param.data,
-                        device="cuda",
+                        device=get_device(),
                     )
                 )
                 setattr(module, name, new_param)

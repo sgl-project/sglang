@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
+    needs_cpu_seq_lens: bool = True
+
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""

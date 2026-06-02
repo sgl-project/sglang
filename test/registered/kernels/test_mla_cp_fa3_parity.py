@@ -126,8 +126,15 @@ def _cp_attn_for_rank(
         kv_len_next_tensor=torch.tensor(
             [(b_next + 1) * block_size], dtype=torch.int32, device=DEVICE
         ),
-        actual_seq_q_prev=block_size,
-        actual_seq_q_next=block_size,
+        cu_seqlens_q_prev_tensor=torch.tensor(
+            [0, block_size], dtype=torch.int32, device=DEVICE
+        ),
+        cu_seqlens_q_next_tensor=torch.tensor(
+            [0, block_size], dtype=torch.int32, device=DEVICE
+        ),
+        max_seqlen_q_prev=block_size,
+        max_seqlen_q_next=block_size,
+        total_q_prev_tokens=block_size,
     )
     fb = SimpleNamespace(attn_cp_metadata=cp_meta)
 

@@ -15,6 +15,7 @@ class CPUQuantMethod(IntEnum):
     INT8_W8A8 = 1
     FP8_W8A16 = 2
     INT4_W4A8 = 3
+    MXFP4 = 4
 
 
 class CPUQuantAlgo(IntEnum):
@@ -96,6 +97,7 @@ def dtype_is_supported(weight):
     return weight.dtype in [
         torch.float16,
         torch.bfloat16,
+        torch.uint8,
         torch.int8,
         torch.float8_e4m3fn,
     ]

@@ -410,6 +410,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
 
         # Construct input_ids
+        # TODO: same chunked-prefill chain divergence as PR #26329.
         if not batch.forward_mode.is_idle():
             rotate_input_ids_triton(
                 forward_batch.input_ids,
@@ -664,6 +665,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     @property
     def draft_worker(self):
         return self._draft_worker
+
+    @property
+    def spec_v2_attn_backends(self) -> tuple:
+        return (
+            self._target_worker.model_runner.attn_backend,
+            *self._draft_worker.draft_extend_attn_backend_list,
+        )
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler

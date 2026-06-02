@@ -119,6 +119,8 @@ class TestMLA(CustomTestCase):
             sm_scale,
             logit_cap,
             False,
+            0,
+            None,
             None,
         )
 

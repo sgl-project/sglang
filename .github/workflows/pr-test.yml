@@ -11,7 +11,6 @@ on:
   schedule:
     - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -462,13 +461,13 @@ jobs:
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
     secrets: inherit
 
-  base-c-test-4-gpu-b200:
+  base-c-test-deepep-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: base-c-test-4-gpu-b200
-      runner_config: 4-gpu-b200
+      self_name: base-c-test-deepep-4-gpu-b200
+      runner_config: deepep-4-gpu-b200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -476,27 +475,27 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  base-c-test-dsv4-4-gpu-b200:
+  base-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: base-c-test-dsv4-4-gpu-b200
-      runner_config: dsv4-4-gpu-b200
+      self_name: base-c-test-deepep-8-gpu-h200
+      runner_config: deepep-8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '45'
+      run_timeout_minutes: '30'
       timeout_per_file: '1800'
     secrets: inherit
 
-  base-c-test-dsv4-8-gpu-h200:
+  base-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: base-c-test-dsv4-8-gpu-h200
-      runner_config: dsv4-8-gpu-h200
+      self_name: base-c-test-4-gpu-b200
+      runner_config: 4-gpu-b200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -531,9 +530,9 @@ jobs:
         base-c-test-8-gpu-h20,
         base-c-test-8-gpu-h200,
         base-c-test-deepep-4-gpu-h100,
+        base-c-test-deepep-4-gpu-b200,
+        base-c-test-deepep-8-gpu-h200,
         base-c-test-4-gpu-b200,
-        base-c-test-dsv4-4-gpu-b200,
-        base-c-test-dsv4-8-gpu-h200,
         # base-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
       ]
     if: always()

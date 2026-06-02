@@ -48,6 +48,7 @@ class LoRALayer(nn.Module):
 
         # lora weights in cpu. The weights are loaded from checkpoint.
         self.weights: Dict[str, torch.Tensor] = {}
+        self.pinned_weights: Dict[str, torch.Tensor] = {}
 
 
 class LoRAAdapter(nn.Module):
@@ -87,7 +88,9 @@ class LoRAAdapter(nn.Module):
         )
 
         self.embedding_layers: Dict[str, torch.Tensor] = {}
+        self.pinned_embedding_layers: Dict[str, torch.Tensor] = {}
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
+        self.pinned_added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
     @staticmethod
     def _build_moe_gated_map(base_model: torch.nn.Module) -> Dict[int, bool]:

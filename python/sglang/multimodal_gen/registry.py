@@ -961,6 +961,8 @@ def _register_configs():
         hf_model_paths=[
             "nvidia/Cosmos3-Nano",
             "nvidia/Cosmos3-Super",
+            "nvidia/Cosmos3-Super-Text2Image",
+            "nvidia/Cosmos3-Super-Image2Video",
         ],
         model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
     )
