@@ -1284,10 +1284,20 @@ def causal_conv1d_update(
     else:
         stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
 
+    if retrieve_next_token is not None and (
+        retrieve_parent_token is None or retrieve_parent_token.numel() == 0
+    ):
+        raise ValueError(
+            "retrieve_parent_token must be provided and non-empty when retrieve_next_token is provided"
+        )
+
     # Dispatch: use token-parallel kernel for tree-verify mode (pre-computed parent map,
     # no spec-decoding accept/reject path which uses num_accept_tokens)
     use_token_parallel = (
-        retrieve_parent_token is not None and num_accept_tokens is None and seqlen > 1
+        retrieve_parent_token is not None
+        and retrieve_parent_token.numel() > 0
+        and num_accept_tokens is None
+        and seqlen > 1
     )
 
     if use_token_parallel:
