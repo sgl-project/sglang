@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -78,18 +79,19 @@ def synchronized(func):
     return wrapper
 
 
-class HostTensorAllocator(abc.ABC):
+class HostTensorAllocator:
     def __init__(self):
         """Initialize the HostTensorAllocator."""
         self.dtype = None
         self.dims = None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        """Allocate a tensor of given dims and dtype on the memory."""
+        assert (
+            device == "cpu"
+        ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
         self.dtype = dtype
         self.dims = dims
-        tensor = torch.empty(dims, dtype=dtype, device=device)
-        return tensor
+        return alloc_mmap(dims, dtype)
 
 
 class HiSparseHostPoolMixin:
@@ -187,11 +189,16 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        ret = torch.cuda.cudart().cudaHostRegister(
-            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-        )
-        if ret != 0:
-            raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+        cudart = torch.cuda.cudart()
+        n_bytes = buffer.numel() * buffer.element_size()
+        rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+        if int(rc) != 0:
+            raise RuntimeError(
+                f"cudaHostRegister failed (rc={int(rc)}, "
+                f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
+                f"size={n_bytes}; host buffer is not pinned and device transfers "
+                f"may silently return stale data."
+            )
     return buffer
 
 
@@ -323,6 +330,19 @@ class HostKVCache(abc.ABC):
         Set a flat data page to the host memory pool.
         """
         raise NotImplementedError()
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        Subclasses should override this with a layout-specific stride formula.
+        This base implementation logs a warning and returns False (safe default).
+        """
+        logger.warning(
+            "%s does not implement is_stride_page_aligned(); assuming not aligned. "
+            "O_DIRECT with a file-based NIXL backend will fall back to copy mode for this pool.",
+            type(self).__name__,
+        )
+        return False
 
     @synchronized
     def clear(self):
@@ -850,6 +870,30 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        When O_DIRECT is used with any file-based NIXL backend, every data pointer
+        passed to the kernel must be page-aligned.  In zero-copy mode the
+        pointer for KV page ``p`` is:
+
+            base_ptr + p * page_size * layer_num * head_num * head_dim * itemsize
+
+        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
+        stride must itself be a multiple of the OS page size.
+        """
+        if self.layout not in ("page_first", "page_first_direct", "page_head"):
+            return False
+        stride = (
+            self.page_size
+            * self.layer_num
+            * self.head_num
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
+        return base_aligned and stride % page_size_bytes == 0
+
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
@@ -1249,6 +1293,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        When O_DIRECT is used with any file-based NIXL backend, every data pointer
+        passed to the kernel must be page-aligned.  In zero-copy mode the
+        pointer for KV page ``p`` is:
+
+            base_ptr + p * page_size * layer_num * kv_cache_dim * itemsize
+
+        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
+        stride must itself be a multiple of the OS page size.
+        """
+        if self.layout not in ("page_first", "page_first_direct"):
+            return False
+        stride = (
+            self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+        )
+        base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
+        return base_aligned and stride % page_size_bytes == 0
 
 
 class MambaPoolHost(HostKVCache):
