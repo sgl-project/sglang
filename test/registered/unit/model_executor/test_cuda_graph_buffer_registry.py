@@ -16,6 +16,7 @@ context.
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -46,6 +47,7 @@ class _MiniForwardBatch:
     num_token_non_padded: Optional[torch.Tensor] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    ngram_embedding_info: Optional[object] = None
     forward_mode: Optional[str] = None
     spec_info: Optional[object] = None
 
@@ -511,6 +513,113 @@ class TestSliceFnSlot(unittest.TestCase):
         self.assertEqual(fb_view.mrope_positions.shape, (3, 8))
 
 
+class TestSourceFnSlots(unittest.TestCase):
+    """``source_fn`` slots copy from a nested FB field or a side input, with a
+    source-length slice, and are skipped by ``extract_buffer``."""
+
+    def test_nested_fb_source_copies_source_length_head(self):
+        r = _make_registry(max_bs=8, max_num_tokens=16)
+        r.register_slot(
+            GraphSlot(
+                name="ngram_embedding_info.column_starts",
+                shape_fn=lambda _bs, _mt: (8,),
+                dtype=torch.int32,
+                axis="none",
+                padding_policy=PaddingPolicy.KEEP_PAD,
+                source_fn=lambda fb, ctx: (
+                    None
+                    if fb.ngram_embedding_info is None
+                    else fb.ngram_embedding_info.column_starts
+                ),
+            )
+        )
+        buf = r.get_slot("ngram_embedding_info.column_starts").buffer
+        buf.fill_(99)  # sentinel to prove the tail is untouched
+        fb = _MiniForwardBatch(
+            batch_size=3,
+            ngram_embedding_info=SimpleNamespace(
+                column_starts=torch.tensor([1, 2, 3], dtype=torch.int32),
+            ),
+        )
+        r.fill_from(fb, raw_bs=3, padded_bs=8, raw_num_tokens=3, padded_num_tokens=16)
+        # Head [:3] copied from the source; tail [3:] kept as the sentinel.
+        self.assertTrue(torch.equal(buf[:3], torch.tensor([1, 2, 3], dtype=torch.int32)))
+        self.assertTrue(torch.all(buf[3:] == 99))
+
+    def test_source_fn_returning_none_skips_copy(self):
+        r = _make_registry(max_bs=8, max_num_tokens=16)
+        r.register_slot(
+            GraphSlot(
+                name="ngram_embedding_info.column_starts",
+                shape_fn=lambda _bs, _mt: (8,),
+                dtype=torch.int32,
+                axis="none",
+                padding_policy=PaddingPolicy.KEEP_PAD,
+                source_fn=lambda fb, ctx: (
+                    None
+                    if fb.ngram_embedding_info is None
+                    else fb.ngram_embedding_info.column_starts
+                ),
+            )
+        )
+        buf = r.get_slot("ngram_embedding_info.column_starts").buffer
+        buf.fill_(7)
+        fb = _MiniForwardBatch(batch_size=3, ngram_embedding_info=None)
+        r.fill_from(fb, raw_bs=3, padded_bs=8, raw_num_tokens=3, padded_num_tokens=16)
+        self.assertTrue(torch.all(buf == 7))  # untouched
+
+    def test_side_input_source_via_fill_context(self):
+        r = _make_registry(max_bs=8, max_num_tokens=16)
+        r.register_slot(
+            GraphSlot(
+                name="pp_proxy_tensors.hidden_states",
+                shape_fn=lambda _bs, mt: (mt,),
+                dtype=torch.int32,
+                axis="none",
+                padding_policy=PaddingPolicy.KEEP_PAD,
+                source_fn=lambda fb, ctx: (
+                    None
+                    if ctx.pp_proxy_tensors is None
+                    else ctx.pp_proxy_tensors.tensors["hidden_states"]
+                ),
+            )
+        )
+        buf = r.get_slot("pp_proxy_tensors.hidden_states").buffer
+        buf.zero_()
+        fb = _MiniForwardBatch(batch_size=4)
+        pp = SimpleNamespace(
+            tensors={"hidden_states": torch.tensor([5, 6, 7, 8], dtype=torch.int32)}
+        )
+        r.fill_from(
+            fb,
+            raw_bs=4,
+            padded_bs=8,
+            raw_num_tokens=4,
+            padded_num_tokens=16,
+            pp_proxy_tensors=pp,
+        )
+        self.assertTrue(torch.equal(buf[:4], torch.tensor([5, 6, 7, 8], dtype=torch.int32)))
+
+    def test_extract_buffer_skips_dotted_slots(self):
+        r = _make_registry(max_bs=8, max_num_tokens=16)
+        r.register_slot(
+            GraphSlot(
+                name="ngram_embedding_info.column_starts",
+                shape_fn=lambda _bs, _mt: (8,),
+                dtype=torch.int32,
+                axis="none",
+                padding_policy=PaddingPolicy.KEEP_PAD,
+                source_fn=lambda fb, ctx: None,
+            )
+        )
+        fb = _MiniForwardBatch(batch_size=3)
+        # dataclasses.replace must not be handed a dotted kwarg.
+        fb_view = r.extract_buffer(
+            padded_bs=8, padded_num_tokens=16, forward_batch_template=fb
+        )
+        self.assertEqual(fb_view.batch_size, 8)
+
+
 class TestPoolBackedAlloc(unittest.TestCase):
     """``share_pool=True`` coalesces same-named slot buffers through the
     global ForwardInputBuffers pool (so a registry can share storage with
@@ -656,8 +765,6 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertEqual(fb_view.seq_lens.shape[0], padded_bs)
 
     def test_source_adopts_buffers(self):
-        from types import SimpleNamespace
-
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )

@@ -111,6 +111,10 @@ class FillContext:
     padded_bs: int
     raw_num_tokens: int
     padded_num_tokens: int
+    # Side inputs that are not ForwardBatch attributes but are needed by a
+    # slot's source_fn — e.g. the pipeline-parallel proxy tensors, which the
+    # replay path receives as a separate argument rather than off the FB.
+    pp_proxy_tensors: Optional[Any] = None
 
 
 @dataclass
@@ -152,6 +156,17 @@ class GraphSlot:
                          override for slots with non-trivial slicing
                          (e.g. ``mrope_positions`` shape ``[3, T]`` is
                          sliced on axis 1 not 0).
+        source_fn      — optional ``(forward_batch, FillContext) -> Tensor |
+                         None`` override for the copy *source*. When set,
+                         ``fill_from`` copies ``source_fn(fb, ctx)`` (instead of
+                         the same-named FB attribute) into
+                         ``buffer[:src.shape[0]]`` — a source-length slice for
+                         structured / side-sourced fields whose data lives on a
+                         nested FB dataclass (``ngram_embedding_info.*``) or an
+                         out-of-band argument (``pp_proxy_tensors``, carried on
+                         ``FillContext``). Returning ``None`` skips the copy for
+                         that iteration. Such slots use dotted names and are
+                         skipped by ``extract_buffer``.
     """
 
     name: str
@@ -167,6 +182,9 @@ class GraphSlot:
         None
     )
     slice_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None
+    source_fn: Optional[
+        Callable[["ForwardBatch", "FillContext"], Optional[torch.Tensor]]
+    ] = None
 
     # runtime
     buffer: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -370,17 +388,32 @@ class CudaGraphBufferRegistry:
         padded_bs: int,
         raw_num_tokens: int,
         padded_num_tokens: int,
+        pp_proxy_tensors: Optional[Any] = None,
     ) -> None:
         """Copy FB → registry buffers.
 
         Phase 1 — reset the padded tail per slot ``padding_policy``.
-        Phase 2 — grouped D2D copy of all enabled slots from FB.
+        Phase 2 — grouped D2D copy of all enabled slots from FB (or from a
+                  slot's ``source_fn`` for structured / side-sourced fields).
         Phase 3 — run ``post_fill`` hooks for slots that need
                   post-copy transforms.
 
-        Slots whose FB attribute is ``None`` are silently skipped (the
-        FB doesn't carry that field for the current request).
+        ``pp_proxy_tensors`` is the out-of-band pipeline-parallel input; it is
+        not an FB attribute, so it reaches ``source_fn`` slots via
+        ``FillContext.pp_proxy_tensors``.
+
+        Slots whose FB attribute (or ``source_fn`` result) is ``None`` are
+        silently skipped (the FB doesn't carry that field for the current
+        request).
         """
+        ctx = FillContext(
+            raw_bs=raw_bs,
+            padded_bs=padded_bs,
+            raw_num_tokens=raw_num_tokens,
+            padded_num_tokens=padded_num_tokens,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
         # Phase 1: reset padded regions where it matters.
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None:
@@ -397,21 +430,29 @@ class CudaGraphBufferRegistry:
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None or not slot.copy_from_fb:
                 continue
-            src = getattr(forward_batch, slot.name, None)
-            if src is None:
-                continue
-            if not isinstance(src, torch.Tensor):
-                # Non-tensor FB fields (e.g. dicts, dataclasses) are not
-                # auto-copied — caller handles via custom slot or
-                # post_fill hook.
-                continue
-            raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-            if slot.slice_fn is not None:
-                dst = slot.slice_fn(slot.buffer, raw_n)
-            elif slot.axis == "none":
-                dst = slot.buffer
+            if slot.source_fn is not None:
+                # Structured / side-sourced slot: source comes from a nested FB
+                # dataclass or an out-of-band input, and the copy is sliced to
+                # the source's own length rather than a bs/tokens axis.
+                src = slot.source_fn(forward_batch, ctx)
+                if src is None:
+                    continue
+                dst = slot.buffer[: src.shape[0]]
             else:
-                dst = slot.buffer[:raw_n]
+                src = getattr(forward_batch, slot.name, None)
+                if src is None:
+                    continue
+                if not isinstance(src, torch.Tensor):
+                    # Non-tensor FB fields (e.g. dicts, dataclasses) are not
+                    # auto-copied — caller handles via source_fn or post_fill.
+                    continue
+                raw_n = slot._raw_n(raw_bs, raw_num_tokens)
+                if slot.slice_fn is not None:
+                    dst = slot.slice_fn(slot.buffer, raw_n)
+                elif slot.axis == "none":
+                    dst = slot.buffer
+                else:
+                    dst = slot.buffer[:raw_n]
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":
@@ -426,12 +467,6 @@ class CudaGraphBufferRegistry:
             dst.copy_(src)
 
         # Phase 3: post-fill hooks (compute-then-write slots).
-        ctx = FillContext(
-            raw_bs=raw_bs,
-            padded_bs=padded_bs,
-            raw_num_tokens=raw_num_tokens,
-            padded_num_tokens=padded_num_tokens,
-        )
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None or slot.post_fill is None:
                 continue
@@ -457,6 +492,11 @@ class CudaGraphBufferRegistry:
         replace_kwargs: Dict[str, Any] = {"batch_size": padded_bs}
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None:
+                continue
+            # Structured slots use dotted names ("<field>.<sub>") and are not
+            # top-level FB attributes — their data is consumed in place off the
+            # adopted backing object, not re-attached to the FB view here.
+            if "." in slot.name:
                 continue
             replace_kwargs[slot.name] = slot.view(padded_bs, padded_num_tokens)
         return dataclasses.replace(forward_batch_template, **replace_kwargs)
