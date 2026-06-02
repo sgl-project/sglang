@@ -142,7 +142,11 @@ export const DeepSeekV4Deployment = () => {
   // mooncake_store/README.md), but the cookbook generator doesn't yet emit
   // the hicache flags into buildPDDisaggCommand. Grey it out for now.
   const HICACHE_UNSUPPORTED_RECIPES = new Set(["pd-disagg"]);
-  const HICACHE_UNSUPPORTED_HARDWARE = new Set(["rtx6000"]);
+  const HICACHE_UNSUPPORTED_HARDWARE = new Set(["rtx6000", "h20"]);
+  const HICACHE_UNSUPPORTED_HW_REASON = {
+    rtx6000: "HiCache is not supported on RTX PRO 6000",
+    h20: "HiCache is not yet supported on H20",
+  };
   const isHicacheUnsupported = (vals) =>
     HICACHE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
     HICACHE_UNSUPPORTED_RECIPES.has(vals.recipe);
@@ -192,7 +196,7 @@ export const DeepSeekV4Deployment = () => {
     }
     if (option.name === "hicache" && vals && isHicacheUnsupported(vals)) {
       const reason = HICACHE_UNSUPPORTED_HARDWARE.has(vals.hardware)
-        ? "HiCache is not supported on RTX PRO 6000"
+        ? HICACHE_UNSUPPORTED_HW_REASON[vals.hardware]
         : "HiCache is not yet wired into the PD-Disagg cookbook command";
       return option.items.map((it) =>
         it.id === "disabled"
