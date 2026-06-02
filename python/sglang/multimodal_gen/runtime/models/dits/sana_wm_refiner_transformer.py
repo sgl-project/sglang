@@ -87,10 +87,6 @@ def _streaming_self_attention(
     video_rotary_emb: tuple[torch.Tensor, torch.Tensor],
     n_context_tokens: int,
 ) -> torch.Tensor:
-    """Streaming SLA: context attends to context only, current attends to context+current.
-
-    Mirrors NVlabs `inference_sana_wm.py::_streaming_self_attention`.
-    """
     seq_len = hidden_states.shape[1]
     if n_context_tokens <= 0 or n_context_tokens >= seq_len:
         return attn(hidden_states, context=None, pe=video_rotary_emb)
@@ -113,11 +109,6 @@ def _streaming_self_attention(
 
 
 class SanaWMRefinerBlock(nn.Module):
-    """Video-only LTX-2 transformer block.
-
-    Diffusers-compatible layout: `norm1 -> attn1 (self) -> norm2 -> attn2 (cross) -> norm3 -> ff`,
-    each modulated via per-block `scale_shift_table` + token-wise `temb`.
-    """
 
     def __init__(
         self,
@@ -210,12 +201,6 @@ class SanaWMRefinerBlock(nn.Module):
 
 
 class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
-    """SANA-WM stage-2 LTX-2 video-only refiner.
-
-    Loads Diffusers-format refiner weights from `<model_path>/refiner/transformer/`.
-    Audio params present in the checkpoint are silently dropped by the loader's
-    `strict=False` state_dict load.
-    """
 
     _fsdp_shard_conditions = SanaWMRefinerArchConfig()._fsdp_shard_conditions
     _compile_conditions = SanaWMRefinerArchConfig()._compile_conditions
@@ -302,13 +287,6 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
             quant_config=quant_config,
         )
 
-        # LTX2AudioVideoRotaryPosEmbed expects `dim` to be the *total* hidden
-        # size (num_heads * head_dim), not the per-head dim. It internally
-        # reshapes cos/sin to (B, T, num_heads, head_dim/2). Passing
-        # `attention_head_dim` here would size the RoPE to head_dim/num_heads
-        # and produce a (1, num_heads, L, 2) cos/sin that won't match
-        # LTX2Attention's q/k. See LTX2Transformer3DAVModel.__init__ in
-        # ltx_2.py for the canonical convention (`dim=self.hidden_size`).
         self.rope = LTX2AudioVideoRotaryPosEmbed(
             dim=self.hidden_size,
             patch_size=self.patch_size,

@@ -25,6 +25,23 @@ _SANA_WM_DISABLE_FUSED_RMSNORM = os.getenv(
 ).lower() in {"1", "true", "yes", "on"} or os.getenv(
     "SGLANG_ENABLE_DETERMINISTIC_INFERENCE", ""
 ).lower() in {"1", "true", "yes", "on"}
+_SANA_WM_GDN_EYE_CACHE: dict[
+    Tuple[int, str, Optional[int], torch.dtype], torch.Tensor
+] = {}
+
+
+def _gdn_eye(
+    dim: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    key = (dim, device.type, device.index, dtype)
+    eye = _SANA_WM_GDN_EYE_CACHE.get(key)
+    if eye is None or eye.device != device:
+        eye = torch.eye(dim, device=device, dtype=dtype).view(1, 1, 1, dim, dim)
+        _SANA_WM_GDN_EYE_CACHE[key] = eye
+    return eye
 
 
 def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
@@ -232,16 +249,6 @@ def _apply_complex_rope(
         x_real = x_real.contiguous()
     x_c = torch.view_as_complex(x_real.unflatten(-1, (-1, 2)))
     return torch.view_as_real(x_c * freqs).flatten(-2, -1).type_as(hidden_states)
-
-
-def _apply_block_diagonal(
-    feats: torch.Tensor,
-    func_size_pairs: List[Tuple[Callable[[torch.Tensor], torch.Tensor], int]],
-) -> torch.Tensor:
-    funcs, block_sizes = zip(*func_size_pairs)
-    assert feats.shape[-1] == sum(block_sizes), (feats.shape, block_sizes)
-    x_blocks = torch.split(feats, list(block_sizes), dim=-1)
-    return torch.cat([f(b) for f, b in zip(funcs, x_blocks)], dim=-1)
 
 
 def _sana_wm_chunk_index_from_chunk_size(
@@ -529,10 +536,6 @@ def _build_ucpe_apply_fns(
     raymats: torch.Tensor,  # (B, N, 4, 4) -- ray<-world
     rotary_emb: Optional[torch.Tensor],
 ) -> Tuple[Callable, Callable, Callable]:
-    """Build the (apply_q, apply_kv, apply_o) callables used in the camera
-    branch.  Splits the head_dim in two: half for 4x4 projmat tiling, half
-    for complex-RoPE rotation.
-    """
     P = raymats
     P_T = P.transpose(-1, -2)
     P_inv = _invert_SE3(P)
@@ -565,14 +568,21 @@ def _build_ucpe_apply_fns(
     def ray_proj(y: torch.Tensor) -> torch.Tensor:
         return _apply_ray_projmat(y, P)
 
+    def apply_pair(
+        x: torch.Tensor,
+        ray_fn: Callable[[torch.Tensor], torch.Tensor],
+        rope_fn_: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        return torch.cat((ray_fn(x[..., :half]), rope_fn_(x[..., half:])), dim=-1)
+
     def apply_q(x: torch.Tensor) -> torch.Tensor:
-        return _apply_block_diagonal(x, [(ray_proj_t, half), (rope_fn, half)])
+        return apply_pair(x, ray_proj_t, rope_fn)
 
     def apply_kv(x: torch.Tensor) -> torch.Tensor:
-        return _apply_block_diagonal(x, [(ray_proj_inv, half), (rope_fn, half)])
+        return apply_pair(x, ray_proj_inv, rope_fn)
 
     def apply_o(x: torch.Tensor) -> torch.Tensor:
-        return _apply_block_diagonal(x, [(ray_proj, half), (rope_fn_inv, half)])
+        return apply_pair(x, ray_proj, rope_fn_inv)
 
     return apply_q, apply_kv, apply_o
 
@@ -674,10 +684,8 @@ def process_camera_conditions_ucpe(
     raymats[..., :3, 3] = t_w_to_ray
     raymats[..., 3, 3] = 1.0
     invalid = torch.isnan(d_world).any(dim=-1)
-    if bool(invalid.any()):
-        eye = torch.eye(4, device=device, dtype=dtype)
-        raymats[invalid] = eye
-    return raymats
+    eye = torch.eye(4, device=device, dtype=dtype).view(1, 1, 1, 1, 4, 4)
+    return torch.where(invalid[..., None, None], eye, raymats)
 
 
 def compute_chunk_plucker(
@@ -720,21 +728,14 @@ def compute_chunk_plucker(
     moment = torch.cross(o_exp, d_world, dim=-1)
     plucker = torch.cat([d_world, moment], dim=-1)  # (B, F_orig, H, W, 6)
 
-    time_indices = torch.arange(
-        0, F_orig, vae_temporal_stride, device=device, dtype=torch.long
-    )
-    if time_indices.numel() < T:
-        pad = T - int(time_indices.numel())
-        last = (
-            time_indices[-1:]
-            if time_indices.numel()
-            else torch.zeros(1, device=device, dtype=torch.long)
-        )
-        time_indices = torch.cat([time_indices, last.repeat(pad)], dim=0)
+    time_indices = list(range(0, F_orig, vae_temporal_stride))
+    if len(time_indices) < T:
+        last = time_indices[-1] if time_indices else 0
+        time_indices.extend([last] * (T - len(time_indices)))
     time_indices = time_indices[:T]
 
     chunks = []
-    for time_index in time_indices.tolist():
+    for time_index in time_indices:
         start = max(0, int(time_index) - vae_temporal_stride + 1)
         end = min(start + vae_temporal_stride, F_orig)
         chunk = plucker[:, start:end]
@@ -1150,7 +1151,7 @@ def _gdn_chunk_scan_forward(
             chunk_split_strategy="uniform",
         )
 
-    eye = torch.eye(D, device=q.device, dtype=q.dtype).view(1, 1, 1, D, D)
+    eye = _gdn_eye(D, device=q.device, dtype=q.dtype)
     state_kv = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
     state_z = torch.zeros(B, H, D, 1, device=q.device, dtype=q.dtype)
     num_chunks, den_chunks = [], []
@@ -1387,7 +1388,7 @@ def _single_path_delta_chunk_scan_forward(
             chunk_split_strategy="uniform",
         )
 
-    eye = torch.eye(D, device=q_rot.device, dtype=q_rot.dtype).view(1, 1, 1, D, D)
+    eye = _gdn_eye(D, device=q_rot.device, dtype=q_rot.dtype)
     state_kv = torch.zeros(B, H, D, D, device=q_rot.device, dtype=q_rot.dtype)
     out_chunks = []
 
@@ -1745,13 +1746,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         chunk_size: Optional[int] = None,
         chunk_split_strategy: str = "uniform",
         chunk_index: Optional[List[int]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Softmax variant of the main branch, dispatched through SGLang's
         pluggable attention backend.
-
-        Returns ``(out_raw, beta, decay)`` so the cam branch can reuse the
-        shared gates -- exactly like upstream
-        ``BidirectionalSoftmaxUCPESinglePathLiteLA``.
         """
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
@@ -1788,20 +1785,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
         if out is None:
             out = self.softmax_attn(q_in, k_in, v_in)
-        out = out.reshape(B, N, C)
-
-        # Compute the gates anyway -- they are needed by the cam branch and
-        # also exist in the softmax variant's state dict.
-        beta, decay = _compute_frame_gates(
-            x,
-            HW,
-            self.heads,
-            self.beta_proj,
-            self.gate_proj,
-            self.dt_bias,
-            self.A_log,
-        )
-        return out, beta, decay
+        return out.reshape(B, N, C)
 
     # ------------------------------------------------------------------ #
 
@@ -1845,8 +1829,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v_bhnd = v.permute(0, 2, 1, 3)
 
         q_proj = apply_q(q_bhnd)
-        k_proj = apply_kv(k_bhnd)
-        v_proj = apply_kv(v_bhnd)
+        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
+        k_proj, v_proj = kv_proj.chunk(2, dim=1)
 
         q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         q_dn = q_proj.permute(0, 1, 3, 2)
@@ -1926,8 +1910,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v_bhnd = v.permute(0, 2, 1, 3)
 
         q_proj = apply_q(q_bhnd)
-        k_proj = apply_kv(k_bhnd)
-        v_proj = apply_kv(v_bhnd)
+        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
+        k_proj, v_proj = kv_proj.chunk(2, dim=1)
 
         q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
@@ -1971,7 +1955,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
         if self.softmax_main:
-            main_raw, beta, decay = self._main_branch_softmax(
+            main_raw = self._main_branch_softmax(
                 x,
                 HW,
                 rotary_emb,
@@ -1979,6 +1963,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 chunk_split_strategy=chunk_split_strategy,
                 chunk_index=chunk_index,
             )
+            beta = decay = None
         else:
             main_raw, beta, decay = self._main_branch_gdn(x, HW, rotary_emb)
 
@@ -1996,6 +1981,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     chunk_index=chunk_index,
                 )
             else:
+                assert beta is not None and decay is not None
                 cam_raw = self._cam_branch(
                     x, HW, apply_q, apply_kv, apply_o, beta, decay
                 )
