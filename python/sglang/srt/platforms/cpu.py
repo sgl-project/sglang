@@ -53,16 +53,13 @@ class CpuDeviceMixin(DeviceMixin):
         return torch.device("cpu")
 
     def set_device(self, device: "torch.device") -> None:
-        # No-op by design. On CUDA, set_device moves the current thread's
-        # active-device cursor (so subsequent allocations land on that GPU).
-        # CPU has a single unindexed logical device — there is no cursor to
-        # move, and per-rank isolation is handled via OpenMP/numactl binding
-        # (see get_device), not here.
-        #
-        # We also deliberately avoid ``torch.set_default_device("cpu")``: that
-        # flips the *process-wide* default tensor device, which would break
-        # code paths that explicitly build tensors on another device.
-        pass
+        # Documented no-op on CPU — torch.cpu.set_device is "in CPU we do
+        # nothing". Called (rather than left as ``pass``) for symmetry with
+        # CudaDeviceMixin.set_device. Note this is deliberately NOT
+        # torch.set_default_device("cpu"), which would flip the process-wide
+        # default tensor device; per-rank CPU isolation is via OpenMP/numactl
+        # binding (see get_device), not here.
+        torch.cpu.set_device(device)
 
     def get_device_name(self, device_id: int = 0) -> str:
         proc = _platform.processor() or _platform.machine() or "unknown"
@@ -91,6 +88,11 @@ class CpuDeviceMixin(DeviceMixin):
         # and (b) on a periodic path. Real RSS reclaim, if needed, belongs in a
         # separate benchmarked change gated on the active allocator.
         gc.collect()
+
+    def synchronize(self) -> None:
+        # Documented no-op on CPU (no async streams to drain). Called for
+        # symmetry with CudaDeviceMixin's torch.cuda.synchronize().
+        torch.cpu.synchronize()
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         vm = psutil.virtual_memory()

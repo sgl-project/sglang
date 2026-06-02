@@ -367,9 +367,17 @@ class TestCpuDeviceMixin(CustomTestCase):
         base = CpuSRTPlatform()
         self.assertEqual(base.get_current_memory_usage(), 4567.0)
 
-    def test_default_set_device_is_noop(self):
+    @patch("torch.cpu.set_device")
+    def test_default_set_device_uses_torch_cpu(self, mock_set_device):
         base = CpuSRTPlatform()
-        # Should not raise and should not flip torch default device.
+        device = torch.device("cpu")
+        base.set_device(device)
+        # Documented CPU no-op, but called for symmetry with CudaDeviceMixin.
+        mock_set_device.assert_called_once_with(device)
+
+    def test_default_set_device_does_not_flip_default(self):
+        base = CpuSRTPlatform()
+        # Must not call torch.set_default_device — process-wide default stays put.
         before = torch.empty(0).device
         base.set_device(torch.device("cpu"))
         after = torch.empty(0).device
@@ -381,10 +389,11 @@ class TestCpuDeviceMixin(CustomTestCase):
         base.empty_cache()
         mock_collect.assert_called_once_with()
 
-    def test_default_synchronize_is_noop(self):
+    @patch("torch.cpu.synchronize")
+    def test_default_synchronize_uses_torch_cpu(self, mock_synchronize):
         base = CpuSRTPlatform()
-        # Inherited base ``pass`` — must not raise.
         base.synchronize()
+        mock_synchronize.assert_called_once_with()
 
     def test_default_distributed_backend_is_gloo(self):
         base = CpuSRTPlatform()
