@@ -559,7 +559,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["image_encoder", "vae"])
 
-    def test_layerwise_components_disable_matching_cpu_offloads(self):
+    def test_layerwise_components_disable_matching_non_dit_cpu_offloads(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             memory_gb=16,
@@ -580,10 +580,33 @@ class TestOffloadDefaults(unittest.TestCase):
         args._adjust_layerwise_offload_components()
 
         self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.dit_cpu_offload)
+        # dit_cpu_offload is complementary to DiT layerwise offload (keeps
+        # weights off-device during load), so it must be preserved here.
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
+
+    def test_dit_layerwise_offload_preserves_dit_cpu_offload(self):
+        """Combining --dit-cpu-offload with --dit-layerwise-offload must keep both on.
+
+        dit_cpu_offload controls initial residency (host memory), while
+        dit_layerwise_offload only swaps layers on/off device at inference.
+        Force-disabling dit_cpu_offload here would push the full DiT to GPU at
+        load time and OOM low-VRAM cards.
+        """
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2I,
+            memory_gb=32,
+            kwargs={
+                "dit_cpu_offload": True,
+                "dit_layerwise_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
@@ -704,7 +727,10 @@ class TestOffloadDefaults(unittest.TestCase):
 
                 self.assertTrue(args.layerwise_offload_components)
                 self.assertFalse(args.use_fsdp_inference)
-                self.assertFalse(args.dit_cpu_offload)
+                # dit_cpu_offload is complementary to DiT layerwise offload:
+                # layerwise only moves layers on/off device at runtime, while
+                # dit_cpu_offload keeps the initial weights on host memory.
+                self.assertTrue(args.dit_cpu_offload)
                 self.assertFalse(args.text_encoder_cpu_offload)
                 self.assertFalse(args.image_encoder_cpu_offload)
                 self.assertEqual(args.dit_offload_prefetch_size, 2)
@@ -744,7 +770,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
@@ -839,7 +865,9 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        # dit_cpu_offload defaults to True from _adjust_offload and is now
+        # preserved alongside DiT layerwise offload (the two are complementary).
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
@@ -875,7 +903,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertTrue(args.text_encoder_cpu_offload)
         self.assertTrue(args.image_encoder_cpu_offload)
@@ -1124,7 +1152,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(

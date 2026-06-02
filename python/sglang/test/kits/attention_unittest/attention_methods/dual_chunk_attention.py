@@ -302,6 +302,7 @@ class DualChunkMockModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
         self.tp_size = 1
