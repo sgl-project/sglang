@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -58,6 +59,7 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
+    organize_draft_results,
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -140,6 +142,11 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
+        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
+        self._topk1_parents_prealloc = None
+        self._topk1_score_indices_prealloc = None
+        self._rebuild_topk1_chain_buffers()
+
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
@@ -212,6 +219,35 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    def _rebuild_topk1_chain_buffers(self) -> None:
+        # For topk=1 the draft tree degenerates to a chain, so parent_list and
+        # top_scores_index are runtime-invariant. Must be rebuilt after any
+        # change to speculative_num_steps / speculative_num_draft_tokens.
+        if self.topk != 1:
+            return
+        # _override_worker_state can set both directly, bypassing the hook that
+        # pins this relation; the fast path is only valid when it holds.
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "topk=1 requires speculative_num_draft_tokens == speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
+        num_steps = self.speculative_num_steps
+        sa = self.server_args
+        max_bs = max(
+            sa.cuda_graph_max_bs or 0,
+            sa.max_running_requests or 0,
+            1,
+        )
+        # A single-step chain has no parent entries (slow path drops the last
+        # step). repeat (not expand): the kernel reads these as contiguous.
+        parent_width = num_steps if num_steps > 1 else 0
+        self._topk1_parents_prealloc = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
+        self._topk1_score_indices_prealloc = torch.arange(
+            num_steps, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
 
     def init_token_map(self):
         # Load hot token ids
@@ -553,32 +589,24 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.positions.add_(1)
 
         # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
-        )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        maybe_detect_oob(
-            top_scores_index,
-            0,
-            ss_token_list.shape[1],
-            "draft_forward: top_scores_index OOB for gather on ss_token_list",
-        )
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+        if (
+            self.topk == 1
+            and token_list[0].shape[0] <= self._topk1_parents_prealloc.shape[0]
+        ):
+            # Chain topology: draft_tokens = concat of per-step tokens; the
+            # full-length topk/sort/gather over score_list collapses to an
+            # identity. parent_list and top_scores_index are runtime-invariant
+            # constants pre-allocated on the worker. Oversized batches (rare,
+            # would silently truncate the slice) fall through to the slow path.
+            bs = token_list[0].shape[0]
+            draft_tokens = torch.cat(token_list, dim=1)
+            top_scores_index = self._topk1_score_indices_prealloc[:bs]
+            parent_list = self._topk1_parents_prealloc[:bs]
+            return parent_list, top_scores_index, draft_tokens
 
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
-
-        return parent_list, top_scores_index, draft_tokens
+        return organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )
 
     def draft_extend(self):
         pass
@@ -976,7 +1004,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             target_graph_runner = None
             if not self.server_args.disable_cuda_graph:
-                target_graph_runner = CudaGraphRunner(
+                TargetGraphRunnerCls = NPUGraphRunner if _is_npu else CudaGraphRunner
+                target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,
@@ -1030,6 +1059,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.cuda_graph_runner = state.cuda_graph_runner
         dw.draft_extend_attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
+        dw._rebuild_topk1_chain_buffers()
 
         # Target side
         self._target_worker.model_runner.attn_backend = state.target_attn_backend
@@ -1068,6 +1098,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.speculative_num_draft_tokens = speculative_num_draft_tokens
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        dw._rebuild_topk1_chain_buffers()
 
         try:
             yield
@@ -1085,6 +1116,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
             ) = backup
+            dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
