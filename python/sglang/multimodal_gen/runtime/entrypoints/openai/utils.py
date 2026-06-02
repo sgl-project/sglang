@@ -385,7 +385,7 @@ async def process_generation_batch(
         save_file_path_list = []
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
-        elif result.output:
+        elif result.output is not None:
             num_outputs = len(result.output)
             save_file_path_list = save_outputs(
                 result.output,
