@@ -34,8 +34,6 @@ from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
@@ -57,6 +55,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
+from sglang.srt.model_executor.triton_ops.position import compute_position_triton
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cuda,
@@ -1171,7 +1170,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
-
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
         self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
         bs = self.batch_size
@@ -1282,62 +1280,6 @@ def compute_position(
             extend_prefix_lens, extend_seq_lens
         )
     return positions, extend_start_loc
-
-
-def compute_position_triton(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
-):
-    """Compute positions. It is a fused version of `compute_position_torch`."""
-    batch_size = extend_seq_lens.shape[0]
-    has_prefix = extend_prefix_lens.shape[0] == batch_size
-
-    positions = torch.empty(
-        extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
-    )
-    extend_start_loc = torch.empty(
-        batch_size, dtype=torch.int32, device=extend_seq_lens.device
-    )
-
-    # Launch kernel
-    compute_position_kernel[(batch_size,)](
-        positions,
-        extend_start_loc,
-        extend_prefix_lens,
-        extend_seq_lens,
-        has_prefix,
-    )
-
-    return positions, extend_start_loc
-
-
-@triton.jit
-def compute_position_kernel(
-    positions,
-    extend_start_loc,
-    extend_prefix_lens,
-    extend_seq_lens,
-    has_prefix: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0).to(tl.int64)
-
-    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
-    seq_len = tl.load(extend_seq_lens + pid)
-
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_seq_lens + i)
-
-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        tl.store(
-            positions + cumsum_start + offset,
-            prefix_len + offset,
-            mask=offset < seq_len,
-        )
-    tl.store(extend_start_loc + pid, cumsum_start)
 
 
 def compute_position_torch(
