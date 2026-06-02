@@ -9,6 +9,22 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
 @dataclass
+class MoELoRABatchInfo:
+    # Per-request segment indptrs used by MoE LoRA routing, shape (bs + 1,).
+    seg_indptr: torch.Tensor
+
+    # Per-request adapter index used by MoE LoRA routing, shape (bs,).
+    req_to_lora: torch.Tensor
+
+    # A mask indicating if lora adapter is enabled. Shape (num_loras,)
+    adapter_enabled: torch.Tensor
+
+    # A mapping of which lora adapter is used for each token. Shape (num_tokens,)
+    # If a token has no lora adapter, the value is -1.
+    token_lora_mapping: torch.Tensor
+
+
+@dataclass
 class LoRABatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool
@@ -58,10 +74,33 @@ class LoRABatchInfo:
     # Per-request adapter index, shape (bs,).
     req_weight_indices: Optional[torch.Tensor] = None
 
+    # MoE LoRA batch info
+    moe_lora_info: Optional[MoELoRABatchInfo] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
+
+
+def copy_weight_into_buffer(
+    buffer_view: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    """
+    Copy a LoRA weight tensor into a destination buffer.
+
+    When a pinned CPU source has a dtype mismatch with a device destination,
+    cast on the destination device instead of doing the conversion on CPU.
+    """
+    if weight.dtype == buffer_view.dtype:
+        buffer_view.copy_(weight, non_blocking=True)
+        return
+
+    if weight.device.type == "cpu" and buffer_view.device.type != "cpu":
+        weight = weight.to(device=buffer_view.device, non_blocking=True)
+
+    buffer_view.copy_(weight.to(dtype=buffer_view.dtype), non_blocking=True)
 
 
 def get_hidden_dim(

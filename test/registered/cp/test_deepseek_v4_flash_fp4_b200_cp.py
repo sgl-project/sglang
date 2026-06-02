@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=235, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=235, stage="extra-b", runner_config="deepep-4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -73,6 +73,51 @@ class TestDSV4FlashFP4B200Balanced_CP(
                 DEEPEP_CONFIG,
             ],
             env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """Balanced recipe: TP=4, DP=4, EAGLE (1-step spec)."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--attn-cp-size",
+                "4",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--enable-dsa-prefill-context-parallel",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+                "--moe-runner-backend",  # for fp4 checkpoint
+                "flashinfer_mxfp4",
+            ],
         )
 
     @classmethod
