@@ -21,6 +21,20 @@ using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
+SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
+  const float ax = fminf(fabsf(x), 6.0f);
+  uint8_t idx = 0;
+  idx += ax > 0.25f;
+  idx += ax > 0.75f;
+  idx += ax > 1.25f;
+  idx += ax > 1.75f;
+  idx += ax > 2.5f;
+  idx += ax > 3.5f;
+  idx += ax > 5.0f;
+  if (x < 0.0f && idx != 0) idx |= 0x8;
+  return idx;
+}
+
 // 4 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
 constexpr uint32_t kFusedQBlockSize = 128;
 constexpr uint32_t kFusedQNumWarps = kFusedQBlockSize / device::kWarpThreads;
@@ -623,6 +637,208 @@ struct FusedQIndexerRopeHadamardQuantKernel {
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
+  }
+};
+
+struct FusedQIndexerRopeHadamardFp4QuantParams {
+  const void* __restrict__ q_input;
+  void* __restrict__ q_fp4;
+  int32_t* __restrict__ q_sf;
+  const void* __restrict__ weight;
+  float* __restrict__ weights_out;
+  float weight_scale;
+  const float* __restrict__ freqs_cis;
+  const void* __restrict__ positions;
+  uint32_t batch_size;
+  uint32_t num_heads;
+};
+
+template <typename DType, typename PosT, bool kUsePDL>
+Q_KERNEL void
+fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRopeHadamardFp4QuantParams params) {
+  using namespace device;
+
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kRopeDim = 64;
+  constexpr int64_t kVecSize = 4;
+  constexpr uint32_t kRopeSize = kRopeDim / kVecSize;
+  static_assert(kHeadDim == kWarpThreads * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * 2);
+  static_assert(kRopeSize <= kWarpThreads);
+
+  using Storage = AlignedVector<DType, kVecSize>;
+  using Float4 = AlignedVector<float, kVecSize>;
+
+  const auto warp_id = threadIdx.x / kWarpThreads;
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
+  const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
+
+  const uint32_t total_works = params.batch_size * params.num_heads;
+  if (work_id >= total_works) return;
+
+  const uint32_t batch_id = work_id / params.num_heads;
+  const auto input_ptr = static_cast<const DType*>(params.q_input) + work_id * kHeadDim;
+  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+
+  PDLWaitPrimary<kUsePDL>();
+  Float4 data, freq;
+  const auto weight_val = cast<float>(static_cast<const DType*>(params.weight)[work_id]);
+
+  {
+    Storage input_vec;
+    input_vec.load(input_ptr, lane_id);
+    if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpThreads - kRopeSize));
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      data[i] = cast<float>(input_vec[i]);
+    }
+  }
+
+  if (is_rope_lane) {
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto y_real = data[2];
+    const auto y_imag = data[3];
+    const auto fxr = freq[0];
+    const auto fxi = freq[1];
+    const auto fyr = freq[2];
+    const auto fyi = freq[3];
+    data[0] = x_real * fxr - x_imag * fxi;
+    data[1] = x_real * fxi + x_imag * fxr;
+    data[2] = y_real * fyr - y_imag * fyi;
+    data[3] = y_real * fyi + y_imag * fyr;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] = cast<float>(cast<DType>(data[i]));
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+
+  {
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a1;
+      data[1] = a0 - a1;
+      data[2] = a2 + a3;
+      data[3] = a2 - a3;
+    }
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a2;
+      data[1] = a1 + a3;
+      data[2] = a0 - a2;
+      data[3] = a1 - a3;
+    }
+#pragma unroll
+    for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
+      }
+    }
+    const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] *= kHadamardScale;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] = cast<float>(cast<DType>(data[i]));
+  }
+
+  {
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    local_max = warp::reduce_max<8>(local_max);
+    const auto scale_raw = fmaxf(1e-4f, local_max) / 6.0f;
+    const auto scale_ue8m0 = static_cast<uint8_t>(cast_to_ue8m0(scale_raw));
+    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+    const uint8_t packed0 = quant_fp4_e2m1(data[0] * inv_scale) | (quant_fp4_e2m1(data[1] * inv_scale) << 4);
+    const uint8_t packed1 = quant_fp4_e2m1(data[2] * inv_scale) | (quant_fp4_e2m1(data[3] * inv_scale) << 4);
+    const uint16_t packed = static_cast<uint16_t>(packed0) | (static_cast<uint16_t>(packed1) << 8);
+    auto out_row = static_cast<uint8_t*>(params.q_fp4) + work_id * (kHeadDim / 2);
+    reinterpret_cast<uint16_t*>(out_row)[lane_id] = packed;
+    if ((lane_id & 7) == 0) {
+      reinterpret_cast<uint8_t*>(params.q_sf + work_id)[lane_id >> 3] = scale_ue8m0;
+    }
+    params.weights_out[work_id] = weight_val * params.weight_scale;
+  }
+}
+
+template <typename DType, bool kUsePDL>
+struct FusedQIndexerRopeHadamardFp4QuantKernel {
+  template <typename PosT>
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_fp4_quant<DType, PosT, kUsePDL>;
+
+  static void forward(
+      const tvm::ffi::TensorView q_input,
+      const tvm::ffi::TensorView q_fp4,
+      const tvm::ffi::TensorView q_sf,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView weights_out,
+      double weight_scale,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions) {
+    using namespace host;
+    constexpr int64_t kHeadDim = 128;
+    constexpr int64_t kRopeDim = 64;
+    constexpr int64_t kFp4Dim = kHeadDim / 2;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto H = SymbolicSize{"num_heads"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({B, H, kHeadDim})
+        .with_strides({-1, kHeadDim, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q_input);
+    TensorMatcher({B, H, kFp4Dim})
+        .with_strides({-1, kFp4Dim, 1})
+        .with_dtype<int8_t>()
+        .with_device(device_)
+        .verify(q_fp4);
+    TensorMatcher({B, H}).with_dtype<int32_t>().with_device(device_).verify(q_sf);
+    TensorMatcher({B, H}).with_dtype<DType>().with_device(device_).verify(weight);
+    TensorMatcher({B, H, 1}).with_dtype<float>().with_device(device_).verify(weights_out);
+    TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
+    auto pos_dtype = SymbolicDType{};
+    TensorMatcher({B}).with_dtype<int32_t, int64_t>(pos_dtype).with_device(device_).verify(positions);
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto num_heads = static_cast<uint32_t>(H.unwrap());
+    if (batch_size == 0) return;
+
+    const int64_t expected_q_stride = static_cast<int64_t>(num_heads) * kHeadDim;
+    const int64_t expected_fp4_stride = static_cast<int64_t>(num_heads) * kFp4Dim;
+    RuntimeCheck(q_input.stride(0) == expected_q_stride, "q_input must be contiguous");
+    RuntimeCheck(q_fp4.stride(0) == expected_fp4_stride, "q_fp4 must be contiguous");
+    RuntimeCheck(q_sf.stride(0) == static_cast<int64_t>(num_heads) && q_sf.stride(1) == 1, "q_sf must be contiguous");
+
+    const auto params = FusedQIndexerRopeHadamardFp4QuantParams{
+        .q_input = q_input.data_ptr(),
+        .q_fp4 = q_fp4.data_ptr(),
+        .q_sf = static_cast<int32_t*>(q_sf.data_ptr()),
+        .weight = weight.data_ptr(),
+        .weights_out = static_cast<float*>(weights_out.data_ptr()),
+        .weight_scale = static_cast<float>(weight_scale),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .positions = positions.data_ptr(),
+        .batch_size = batch_size,
+        .num_heads = num_heads,
+    };
+    const auto total_works = batch_size * num_heads;
+    const auto num_blocks = div_ceil(total_works, kFusedQNumWarps);
+    const auto k_int32 = kernel<int32_t>;
+    const auto k_int64 = kernel<int64_t>;
+    const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
+    LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(k, params);
   }
 };
 
