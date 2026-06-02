@@ -2373,8 +2373,13 @@ class AiterAttnBackend(AttentionBackend):
             # declare the necessary parameter and assign None as default value
             q_descale = None
 
+            _extend_no_prefix = (
+                forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+            )
+
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
+            if self.kv_cache_dtype == fp8_dtype and (not _extend_no_prefix):
                 q = q.to(fp8_dtype)
                 q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
 
@@ -2624,18 +2629,18 @@ class AiterAttnBackend(AttentionBackend):
                         if self.forward_metadata.swa_page_table is not None
                         else self.forward_metadata.kv_indices
                     )
-                    ctx_lens_pa = forward_batch.seq_lens.to(torch.int32)
+                    ctx_lens_pa = forward_batch.seq_lens
                     ctx_part = 256
                     max_part_num = 1
                     sliding_window_arg = int(layer.sliding_window_size)
                 else:
                     block_tables_pa = self.forward_metadata.kv_indices
-                    ctx_lens_pa = forward_batch.seq_lens.to(torch.int32)
+                    ctx_lens_pa = forward_batch.seq_lens
                     ctx_part = 256
                     max_part_num = get_recommended_splits(bs, num_kv_heads)
                     sliding_window_arg = 0
 
-                q_in = q.contiguous().view(-1, num_q_heads, layer.qk_head_dim)
+                q_in = q.view(-1, num_q_heads, layer.qk_head_dim)
                 # Direct view of o as kernel output — saves a per-layer
                 # o.copy_ of bs*H_q*D bf16 elementwise.
                 o_view = o.view(-1, num_q_heads, layer.v_head_dim)
