@@ -382,6 +382,7 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_AG = EnvBool(True)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
