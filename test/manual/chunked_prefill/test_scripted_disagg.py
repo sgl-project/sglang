@@ -104,7 +104,7 @@ class TestDisaggNonOverlap(ScriptedTestCase):
 
     @staticmethod
     def _script_nonoverlap_retract_keeps_sent_send_idx(t: ScriptedContext):
-        """Retract of a partially-sent chunked req resets inflight/chunked_req but NOT start_send_idx."""
+        """Retract of a partially-sent chunked disagg req preserves chunked_req and start_send_idx."""
         # GPU validation pending: scripted single-GPU harness only.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         # Non-overlap mode advances start_send_idx synchronously, so we can land
@@ -119,26 +119,36 @@ class TestDisaggNonOverlap(ScriptedTestCase):
         t.pause_generation(mode="retract")
         yield
 
-        # retract clears the chunked slot and the inflight latch...
-        assert t.scheduler.chunked_req is None
+        # pause_generation(mode="retract") only retracts running_batch reqs and
+        # clears chunked_req inside the `not running_batch.is_empty()` block
+        # (scheduler.py:3728-3736). A disagg-prefill req that is still chunking
+        # lives in chunked_req with an EMPTY running_batch, so that block is
+        # skipped: the retract leaves chunked_req pointing at this same req rather
+        # than clearing it. inflight_middle_chunks is already 0 in the non-overlap
+        # path (it is only set on the overlap branch), so it stays 0 here.
         req = t.find_req_by_rid(r.rid)
         assert req is not None
+        assert t.scheduler.chunked_req is req, (
+            f"non-overlap disagg retract with empty running_batch must leave the "
+            f"chunking req in chunked_req; got "
+            f"{t.scheduler.chunked_req.rid if t.scheduler.chunked_req else None}"
+        )
         assert req.inflight_middle_chunks == 0, (
-            f"retract must reset inflight_middle_chunks; "
+            f"non-overlap path never sets inflight_middle_chunks; "
             f"got {req.inflight_middle_chunks}"
         )
-        # ...but reset_for_retract (schedule_batch.py:1301-1334) deliberately does
-        # NOT clear start_send_idx, so the already-sent offset survives the retract.
-        # Pin this current-main behavior as a regression guard.
+        # The already-sent offset survives the retract: send_kv_chunk advanced
+        # start_send_idx synchronously and nothing in the retract path resets it.
         assert req.start_send_idx == sent, (
-            f"reset_for_retract must NOT reset start_send_idx; "
+            f"retract must NOT reset start_send_idx; "
             f"expected {sent}, got {req.start_send_idx}"
         )
 
         t.continue_generation()
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        # Full re-prefill re-chunks the whole prompt.
+        # chunked_req survived the retract, so prefill resumes from the preserved
+        # send offset and chunks the rest of the long prompt to completion.
         assert r.chunks_done >= 2
 
 
