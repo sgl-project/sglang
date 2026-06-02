@@ -192,6 +192,15 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             Whether to rescale the betas to have zero terminal SNR. This enables the model to generate very bright and
             dark samples instead of limiting it to samples with medium brightness. Loosely related to
             [`--offset_noise`](https://github.com/huggingface/diffusers/blob/74fd735eb073eb1d774b1ab4154a0876eb82f055/examples/dreambooth/train_dreambooth.py#L506).
+        sigma_min (`float`, *optional*):
+            Override the lower bound of the sigma range when `use_karras_sigmas=True` or
+            `use_exponential_sigmas=True`. If `None`, the bound is derived from the trained beta schedule.
+        sigma_max (`float`, *optional*):
+            Override the upper bound of the sigma range when `use_karras_sigmas=True` or
+            `use_exponential_sigmas=True`. If `None`, the bound is derived from the trained beta schedule.
+        shift_terminal (`float`, *optional*):
+            Forward-compat field accepted from diffusers >=0.38 scheduler configs; consulted only by the
+            dynamic-shift code path, which this scheduler does not yet implement.
     """
 
     _compatibles = [e.name for e in KarrasDiffusionSchedulers]
@@ -226,6 +235,9 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         rescale_betas_zero_snr: bool = False,
         use_dynamic_shifting: bool = False,
         time_shift_type: str = "exponential",
+        sigma_min: float | None = None,
+        sigma_max: float | None = None,
+        shift_terminal: float | None = None,
     ):
         if self.config.use_beta_sigmas and not is_scipy_available():
             raise ImportError(
@@ -410,9 +422,16 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             sigmas = self._convert_to_karras(
                 in_sigmas=sigmas, num_inference_steps=num_inference_steps
             )
-            timesteps = np.array(
-                [self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas]
-            ).round()
+            if self.config.use_flow_sigmas:
+                # Karras builds sigmas in EDM space; flow-matching models expect
+                # sigmas in [0, 1]. Map EDM -> flow with sigma / (sigma + 1) and
+                # derive timesteps from the flow sigmas (matches diffusers >=0.38).
+                sigmas = sigmas / (sigmas + 1)
+                timesteps = (sigmas * self.config.num_train_timesteps).copy()
+            else:
+                timesteps = np.array(
+                    [self._sigma_to_t(sigma, log_sigmas) for sigma in sigmas]
+                ).round()
             if self.config.final_sigmas_type == "sigma_min":
                 sigma_last = sigmas[-1]
             elif self.config.final_sigmas_type == "zero":
@@ -492,7 +511,11 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 )
             sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
 
+        # Keep sigmas on the same device as the sampling tensors.
+        # If `device` is None, keep them on CPU.
         self.sigmas = torch.from_numpy(sigmas)
+        if device is not None:
+            self.sigmas = self.sigmas.to(device=device)
         self.timesteps = torch.from_numpy(timesteps).to(
             device=device, dtype=torch.int64
         )
@@ -510,7 +533,9 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         # add an index counter for schedulers that allow duplicated timesteps
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        # Keep CPU sigmas only for CPU inference; for GPU/MPS this would cause device mismatch.
+        if device is None or torch.device(device).type == "cpu":
+            self.sigmas = self.sigmas.to("cpu")
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._threshold_sample
     def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:

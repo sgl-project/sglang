@@ -161,9 +161,10 @@ void flash_attn_kernel_impl(
           }
         }
 
-        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
-
+        for (int row = 0; row < m_size; ++row) {
+          flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
+        }
         // get value and pack
         pack_vnni2<scalar_t>(
             /*    dst */ Btmp,
@@ -344,8 +345,10 @@ void flash_attn_varlen_kernel_impl(
           }
         }
 
-        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+        for (int row = 0; row < m_size; ++row) {
+          flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
+        }
 
         // get value and pack
         pack_vnni2<scalar_t>(
@@ -441,10 +444,6 @@ at::Tensor flash_attn_varlen_func(
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
     bool causal) {
-  RECORD_FUNCTION(
-      "sgl_kernel::flash_attn_varlen_func",
-      std::vector<c10::IValue>({q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);

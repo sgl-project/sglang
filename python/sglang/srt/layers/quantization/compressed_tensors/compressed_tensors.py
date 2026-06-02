@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
 import logging
@@ -182,8 +183,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 use_flashinfer_trtllm_moe = (
                     get_moe_runner_backend().is_flashinfer_trtllm()
                 )
+                use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
                 return UnquantizedFusedMoEMethod(
-                    use_triton_kernels, use_flashinfer_trtllm_moe
+                    use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
         return None
@@ -1021,7 +1023,6 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         layer input.  See LinearMethodBase for param details
 
         """
-
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
