@@ -103,6 +103,59 @@ class MMLUMixin:
         _check_accept_length(self, self.base_url, self.mmlu_accept_length_thres)
 
 
+class GPQAMixin:
+    """Mixin for GPQA-Diamond evaluation (graduate-level multiple choice).
+
+    Required attributes on the test class:
+        base_url: str
+        model: str
+        gpqa_score_threshold: float
+
+    Optional sampling knobs (default to run_eval's defaults when unset). Set
+    these for reasoning models that need a large generation budget and the
+    model's recommended sampling -- e.g. DeepSeek-V4 thinking mode wants
+    gpqa_max_tokens=400000, gpqa_temperature=1.0, gpqa_top_p=1.0.
+    """
+
+    gpqa_score_threshold: float = _THRESHOLD_NOT_SET
+    gpqa_accept_length_thres: Optional[float] = None
+    gpqa_num_examples: Optional[int] = None
+    gpqa_num_threads: int = 1024
+    gpqa_max_tokens: Optional[int] = None
+    gpqa_temperature: Optional[float] = None
+    gpqa_top_p: Optional[float] = None
+
+    def test_gpqa(self):
+        assert (
+            self.gpqa_score_threshold == self.gpqa_score_threshold
+        ), f"{type(self).__name__} must set gpqa_score_threshold"
+
+        kwargs = dict(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gpqa",
+            num_examples=self.gpqa_num_examples,
+            num_threads=self.gpqa_num_threads,
+        )
+        # Only override run_eval's defaults when explicitly set, so the common
+        # case stays identical to the other mixins.
+        if self.gpqa_max_tokens is not None:
+            kwargs["max_tokens"] = self.gpqa_max_tokens
+        if self.gpqa_temperature is not None:
+            kwargs["temperature"] = self.gpqa_temperature
+        if self.gpqa_top_p is not None:
+            kwargs["top_p"] = self.gpqa_top_p
+
+        metrics = run_eval(SimpleNamespace(**kwargs))
+
+        if is_in_ci():
+            write_github_step_summary(f"### test_gpqa\n{metrics['score']=:.4f}\n")
+
+        self.assertGreaterEqual(metrics["score"], self.gpqa_score_threshold)
+
+        _check_accept_length(self, self.base_url, self.gpqa_accept_length_thres)
+
+
 class HumanEvalMixin:
     """Mixin for HumanEval evaluation.
 
