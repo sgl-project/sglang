@@ -929,6 +929,17 @@ class ServerArgs:
         else:
             self._quantization_explicitly_unset = False
 
+        # Allow SGLANG_DTYPE env var to override --dtype when it is "auto".
+        if self.dtype == "auto" and envs.SGLANG_DTYPE is not None:
+            _valid = {"float16", "bfloat16", "float32", "half", "float"}
+            if envs.SGLANG_DTYPE not in _valid:
+                raise ValueError(
+                    f"SGLANG_DTYPE={envs.SGLANG_DTYPE!r} is not valid. "
+                    f"Choose from: {sorted(_valid)}"
+                )
+            logger.info("Overriding dtype from 'auto' to %r via SGLANG_DTYPE", envs.SGLANG_DTYPE)
+            self.dtype = envs.SGLANG_DTYPE
+
         # Set missing default values.
         self._handle_missing_default_values()
 

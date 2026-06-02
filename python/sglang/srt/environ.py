@@ -575,6 +575,11 @@ class Envs:
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
+    # Model dtype override (e.g. "float16", "bfloat16", "float32").
+    # When set, overrides --dtype=auto so you can switch dtype without
+    # changing CLI args — useful on GPUs where bfloat16 is slow (e.g. 3090).
+    SGLANG_DTYPE = EnvStr(None)
+
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
