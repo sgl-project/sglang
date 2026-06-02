@@ -60,12 +60,14 @@ class CpuDeviceMixin(DeviceMixin):
         torch.cpu.set_device(device)
 
     def get_device_name(self, device_id: int = 0) -> str:
-        proc = _platform.processor() or _platform.machine() or "unknown"
+        # Arch-only label. We deliberately avoid platform.processor(): it
+        # spawns a subprocess (~ms) on some platforms (e.g. macOS) and on Linux
+        # is usually empty or redundant with the arch (e.g. "x86_64: x86_64").
         if self.cpu_arch == CpuArchEnum.ARM:
-            return f"cpu (aarch64: {proc})"
+            return "cpu (aarch64)"
         if self.cpu_arch == CpuArchEnum.X86:
-            return f"cpu (x86_64: {proc})"
-        return f"cpu ({proc})"
+            return "cpu (x86_64)"
+        return "cpu"
 
     def get_device_uuid(self, device_id: int = 0) -> str:
         return _platform.machine()
