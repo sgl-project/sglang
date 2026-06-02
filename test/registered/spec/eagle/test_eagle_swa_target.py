@@ -24,16 +24,26 @@ class TestEAGLE3SWATarget(GSM8KMixin, DefaultServerBase):
 
     model = GPTOSS_TARGET
     other_args = [
-        "--speculative-algorithm", "EAGLE3",
-        "--speculative-draft-model-path", DOGACEL_DRAFT,
-        "--speculative-num-steps", "5",
-        "--speculative-eagle-topk", "8",
-        "--speculative-num-draft-tokens", "16",
-        "--mem-fraction-static", "0.7",
-        "--max-running-requests", "32",
-        "--cuda-graph-max-bs", "4",
-        "--dtype", "bfloat16",
-        "--attention-backend", "triton",
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--speculative-draft-model-path",
+        DOGACEL_DRAFT,
+        "--speculative-num-steps",
+        "5",
+        "--speculative-eagle-topk",
+        "8",
+        "--speculative-num-draft-tokens",
+        "16",
+        "--mem-fraction-static",
+        "0.7",
+        "--max-running-requests",
+        "32",
+        "--cuda-graph-max-bs",
+        "4",
+        "--dtype",
+        "bfloat16",
+        "--attention-backend",
+        "triton",
     ]
 
     gsm8k_accuracy_thres = 0.9

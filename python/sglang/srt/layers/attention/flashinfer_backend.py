@@ -482,8 +482,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
                 prefix_lens=(
-                    forward_batch.seq_lens
-                    - forward_batch.spec_info.num_accept_tokens
+                    forward_batch.seq_lens - forward_batch.spec_info.num_accept_tokens
                 ),
                 prefill_wrappers=self.prefill_wrappers_paged,
                 use_ragged=False,
