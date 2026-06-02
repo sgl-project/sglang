@@ -121,6 +121,23 @@ class TestAnchorModes(unittest.TestCase):
         real, _ = self._forced_real("off", 4)
         self.assertEqual(real, [0, 1, 2])  # unchanged
 
+    def test_recency_budget_over_topk_forces_most_recent(self):
+        # top_k=3, seq_len=8, budget 5 > top_k: must force the most-recent 3.
+        real, vl = self._forced_real("recency", 5)
+        self.assertEqual(real, [5, 6, 7])
+        self.assertEqual(vl, 3)
+
+    def test_strided_budget_over_topk_clamps_to_topk(self):
+        # budget 5 > top_k=3: 3 evenly-spaced anchors over [0, 8), not the first 3.
+        real, _ = self._forced_real("strided", 5)
+        self.assertEqual(len(real), 3)
+        self.assertEqual(real, [0, 4, 7])
+
+    def test_recency_budget_over_seq_len(self):
+        # budget >= seq_len: still bounded by the selected count (3).
+        real, _ = self._forced_real("recency", 10)
+        self.assertEqual(real, [5, 6, 7])
+
     def test_no_duplicates_when_anchor_already_selected(self):
         scores = torch.tensor([[10.0, 9.0, 8.0, 1.0, 2.0, 3.0, 0.0, 0.0]])
         sel, _ = select_topk_sequence_order(scores, max_top_k=3)  # {0,1,2}

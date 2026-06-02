@@ -786,10 +786,16 @@ def _force_include_anchor(
         n = int(sl[b])
         if n <= 0:
             continue
-        anchors = _anchor_positions(n, anchor_budget, anchor_mode)
+        real = [int(p) for p in out[b].tolist() if p >= 0]
+        # Clamp the effective anchor budget to the selected count: we can only
+        # force in as many anchors as there are selection slots. Generate the
+        # anchor positions from the EFFECTIVE budget so e.g. recency yields the
+        # most-recent `len(real)` positions (not the first `len(real)` of an
+        # oversized recency set). _anchor_positions further clamps to seq_len.
+        effective_budget = min(anchor_budget, len(real))
+        anchors = _anchor_positions(n, effective_budget, anchor_mode)
         if not anchors:
             continue
-        real = [int(p) for p in out[b].tolist() if p >= 0]
         real_set = set(real)
         anchor_set = set(anchors)
         missing = [p for p in anchors if p not in real_set]
