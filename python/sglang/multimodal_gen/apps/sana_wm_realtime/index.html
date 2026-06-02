@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>SANA-WM · Live World Model</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0d10; color: #d7dee6; font: 14px/1.5 system-ui, sans-serif;
+         display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 18px; }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: .3px; }
+  #wrap { position: relative; }
+  canvas { background: #000; border-radius: 10px; max-width: 96vw; height: auto;
+           box-shadow: 0 8px 40px rgba(0,0,0,.5); }
+  #status { position: absolute; left: 12px; top: 12px; padding: 4px 10px; border-radius: 6px;
+            background: rgba(0,0,0,.55); font-size: 12px; }
+  #status.busy { color: #ffcf6b; } #status.idle { color: #7ee787; }
+  .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  .keys { display: grid; grid-template-columns: repeat(3, 30px); gap: 4px; }
+  .keys .k { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 6px;
+             background: #1b2129; border: 1px solid #2b333d; font-weight: 600; font-size: 12px; }
+  .keys .k.on { background: #2f6df6; border-color: #4b82ff; color: #fff; }
+  .keys .sp { visibility: hidden; }
+  .grp { text-align: center; } .grp small { color: #8b97a4; }
+  button { background: #1b2129; color: #d7dee6; border: 1px solid #2b333d; border-radius: 7px;
+           padding: 7px 14px; cursor: pointer; } button:hover { border-color: #4b82ff; }
+  .hint { color: #8b97a4; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>SANA-WM · live camera-controlled world model</h1>
+  <div id="wrap">
+    <canvas id="cv" width="1280" height="704"></canvas>
+    <div id="status" class="idle">connecting…</div>
+  </div>
+  <div class="row">
+    <div class="grp"><div class="keys" id="wasd">
+      <div class="k sp"></div><div class="k" data-k="w">W</div><div class="k sp"></div>
+      <div class="k" data-k="a">A</div><div class="k" data-k="s">S</div><div class="k" data-k="d">D</div>
+    </div><small>move</small></div>
+    <div class="grp"><div class="keys" id="ijkl">
+      <div class="k sp"></div><div class="k" data-k="i">I</div><div class="k sp"></div>
+      <div class="k" data-k="j">J</div><div class="k" data-k="k">K</div><div class="k" data-k="l">L</div>
+    </div><small>look</small></div>
+    <button id="reset">⟲ reset</button>
+  </div>
+  <div class="hint">Hold/press <b>WASD</b> to move, <b>IJKL</b> to look. Each press generates &amp; streams one chunk.</div>
+<script>
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const statusEl = document.getElementById("status");
+const FPS = 16, MOVE = "wasd", LOOK = "ijkl";
+let ws, busy = false, queue = [], playing = false, held = new Set();
+
+function setStatus(t, cls){ statusEl.textContent = t; statusEl.className = cls; }
+function connect(){
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => setStatus("ready", "idle");
+  ws.onclose = () => { setStatus("disconnected", "busy"); setTimeout(connect, 1500); };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string"){
+      const m = JSON.parse(ev.data);
+      if (m.type === "chunk_begin"){ busy = true; setStatus(`generating '${m.keys}'…`, "busy"); }
+      else if (m.type === "chunk_end"){ busy = false; setStatus("ready", "idle"); flush(); }
+      else if (m.type === "reset_done"){ busy = false; queue = []; setStatus("reset", "idle"); }
+      return;
+    }
+    const blob = new Blob([ev.data], {type:"image/jpeg"});
+    createImageBitmap(blob).then(bmp => { queue.push(bmp); if(!playing) play(); });
+  };
+}
+function play(){
+  playing = true;
+  const tick = () => {
+    if (queue.length === 0){ playing = false; return; }
+    const bmp = queue.shift();
+    ctx.drawImage(bmp, 0, 0, cv.width, cv.height); bmp.close && bmp.close();
+    setTimeout(tick, 1000/FPS);
+  };
+  tick();
+}
+function flush(){ if(!playing && queue.length) play(); }
+function send(keys){
+  if (!ws || ws.readyState !== 1 || busy) return;
+  ws.send(JSON.stringify({action:"step", keys}));
+}
+function curKeys(){
+  let m="", l="";
+  for(const c of held){ if(MOVE.includes(c)) m+=c; else if(LOOK.includes(c)) l+=c; }
+  return (m+l) || "w";
+}
+addEventListener("keydown", e => {
+  const c = e.key.toLowerCase();
+  if (!(MOVE+LOOK).includes(c)) return;
+  e.preventDefault();
+  document.querySelector(`.k[data-k="${c}"]`)?.classList.add("on");
+  if (held.has(c)) return; held.add(c);
+  send(curKeys());
+});
+addEventListener("keyup", e => {
+  const c = e.key.toLowerCase();
+  held.delete(c);
+  document.querySelector(`.k[data-k="${c}"]`)?.classList.remove("on");
+});
+// click the on-screen keys too
+document.querySelectorAll(".k[data-k]").forEach(el => {
+  el.addEventListener("mousedown", () => { el.classList.add("on"); send(el.dataset.k); });
+  el.addEventListener("mouseup", () => el.classList.remove("on"));
+  el.addEventListener("mouseleave", () => el.classList.remove("on"));
+});
+document.getElementById("reset").onclick = () => { if(ws&&ws.readyState===1&&!busy) ws.send(JSON.stringify({action:"reset"})); };
+// auto-advance while a key is held (repeat after each chunk finishes)
+setInterval(() => { if (held.size && !busy) send(curKeys()); }, 200);
+connect();
+</script>
+</body>
+</html>
