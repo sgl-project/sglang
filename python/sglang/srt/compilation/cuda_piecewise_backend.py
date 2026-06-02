@@ -18,8 +18,11 @@ from sglang.srt.compilation.piecewise_context_manager import (
     is_in_pcg_torch_compile,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import print_warning_once
 
 logger = logging.getLogger(__name__)
+_is_hip = is_hip()
 
 
 @dataclasses.dataclass
@@ -151,27 +154,22 @@ class CUDAPiecewiseBackend:
                 return entry.runnable(*args)
 
             # During normal capture (PiecewiseCudaGraphRunner.capture()),
-            # set_pcg_capture_stream() guarantees a valid stream.  However,
-            # Dynamo may silently recompile the graph during serving when it
-            # encounters a shape that exceeds the symbolic constraints
-            # inferred at compile time. This happens on MLA models (e.g.
-            # DeepSeek) where piecewise_cuda_graph_max_tokens is capped well
-            # below chunked_prefill_size - large prefill batches exceed the
-            # captured range, and when they reach the compiled graph (e.g.
-            # via the model_runner eager-fallback wrapping), Dynamo sees an
-            # unseen shape, fails its guards, and creates a brand-new
-            # CUDAPiecewiseBackend whose entries have no CUDA graph.  On
-            # non-MLA models the cap equals chunked_prefill_size so no batch
-            # ever exceeds the captured range - which is why CUDA has not
-            # hit this in practice.  Fall back to eager instead of crashing.
+            # set_pcg_capture_stream() guarantees a valid stream. However,
+            # Dynamo may silently recompile on HIP/MLA serving batches whose
+            # token count exceeds the captured range. The replacement backend
+            # has no capture stream; fall back there instead of crashing while
+            # preserving the original assertion on other platforms.
             stream = get_pcg_capture_stream()
-            if stream is None:
-                logger.warning_once(
-                    "PCG capture stream is not set — likely a Dynamo runtime "
-                    "recompilation.  Falling back to eager execution for this "
+            if _is_hip and stream is None:
+                print_warning_once(
+                    "PCG capture stream is not set; likely a Dynamo runtime "
+                    "recompilation. Falling back to eager execution for this "
                     "subgraph."
                 )
                 return entry.runnable(*args)
+            assert (
+                stream is not None
+            ), "PCG capture stream is not set, please check if runtime recompilation happened"
 
             if self.compile_config.get_enable_debug_mode():
                 input_addresses = [

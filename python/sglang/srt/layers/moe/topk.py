@@ -1459,6 +1459,12 @@ def _post_process_topk_ids(
             topk_config,
         )
 
+    if _is_hip:
+        # Shared-expert append/remap can introduce non-zero weights after the
+        # initial HIP padding mask above. Ensure padded tokens leave this helper
+        # with all expert weights zeroed.
+        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+
     return topk_ids, topk_weights
 
 
