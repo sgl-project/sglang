@@ -18,7 +18,8 @@
       "needle_rank_min": 44,
       "needle_rank_median": 2417,
       "needle_rank_max": 4406,
-      "uplift_gate_recall4096_minus_recall2048": 0.5605,
+      "uplift_4096_minus_2048": 0.4164,
+      "uplift_8192_minus_2048": 0.5605,
       "verdict": "budget-limited"
     },
     "16384": {
@@ -34,8 +35,9 @@
       "needle_rank_min": 80,
       "needle_rank_median": 9318,
       "needle_rank_max": 17599,
-      "uplift_gate_recall4096_minus_recall2048": 0.2287,
-      "verdict": "budget-limited"
+      "uplift_4096_minus_2048": 0.0816,
+      "uplift_8192_minus_2048": 0.2287,
+      "verdict": "budget-partial"
     },
     "65536": {
       "trials": 20,
@@ -50,7 +52,8 @@
       "needle_rank_min": 104,
       "needle_rank_median": 32668,
       "needle_rank_max": 70096,
-      "uplift_gate_recall4096_minus_recall2048": 0.0895,
+      "uplift_4096_minus_2048": 0.042,
+      "uplift_8192_minus_2048": 0.0895,
       "verdict": "scorer-limited"
     }
   }

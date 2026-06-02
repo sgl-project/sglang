@@ -1,0 +1,58 @@
+{
+  "op_point": "DS int8 / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV",
+  "base_url": "http://127.0.0.1:30000",
+  "num_per_length": 20,
+  "max_new_tokens": 64,
+  "index_topk": 2048,
+  "timestamp": "20260602T111641Z",
+  "lengths": [
+    {
+      "length_words": 1024,
+      "num_requested": 20,
+      "served": 20,
+      "admission_fail": 0,
+      "recall_hits": 20,
+      "served_recall": 1.0,
+      "prompt_tokens_min": 1097,
+      "prompt_tokens_max": 1119,
+      "errors": [],
+      "elapsed_s": 42.5
+    },
+    {
+      "length_words": 4096,
+      "num_requested": 20,
+      "served": 20,
+      "admission_fail": 0,
+      "recall_hits": 17,
+      "served_recall": 0.85,
+      "prompt_tokens_min": 4368,
+      "prompt_tokens_max": 4408,
+      "errors": [],
+      "elapsed_s": 43.4
+    },
+    {
+      "length_words": 16384,
+      "num_requested": 20,
+      "served": 20,
+      "admission_fail": 0,
+      "recall_hits": 8,
+      "served_recall": 0.4,
+      "prompt_tokens_min": 17430,
+      "prompt_tokens_max": 17603,
+      "errors": [],
+      "elapsed_s": 61.1
+    },
+    {
+      "length_words": 65536,
+      "num_requested": 20,
+      "served": 20,
+      "admission_fail": 0,
+      "recall_hits": 0,
+      "served_recall": 0.0,
+      "prompt_tokens_min": 69841,
+      "prompt_tokens_max": 70102,
+      "errors": [],
+      "elapsed_s": 207.4
+    }
+  ]
+}

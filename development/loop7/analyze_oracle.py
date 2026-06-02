@@ -24,7 +24,8 @@ import statistics as stats
 from collections import defaultdict
 
 K_GRID = (512, 1024, 2048, 4096, 8192)
-UPLIFT_EPS = 0.10  # recall@4096 must beat recall@2048 by >10pp to call budget-limited
+UPLIFT_EPS = 0.10  # a feasible budget must beat recall@2048 by >10pp to "help"
+RECOVER_EPS = 0.90  # recall@8192 must reach this to call the length fully budget-recovered
 
 
 def _length_of(request_id: str):
@@ -106,7 +107,22 @@ def main():
         r2048 = recall.get(2048) or 0.0
         r4096 = recall.get(4096) or 0.0
         r8192 = recall.get(8192) or 0.0
-        budget_limited = (max(r4096, r8192) - r2048) > UPLIFT_EPS
+        # Two distinct uplift fields (no max-collapse): a feasible 2x budget
+        # (4096) and the max feasible budget (8192), each vs the locked 2048.
+        uplift_4096 = round(r4096 - r2048, 4)
+        uplift_8192 = round(r8192 - r2048, 4)
+        # Three-way verdict: budget RECOVERS (helps materially AND reaches ~full
+        # recall at the max feasible budget); budget-PARTIAL (helps materially but
+        # caps far below recovery — needs a better scorer too); scorer-limited
+        # (budget barely moves recall).
+        helps = max(uplift_4096, uplift_8192) > UPLIFT_EPS
+        recovers = r8192 >= RECOVER_EPS
+        if helps and recovers:
+            verdict = "budget-limited"
+        elif helps:
+            verdict = "budget-partial"
+        else:
+            verdict = "scorer-limited"
         out["lengths"][str(L)] = {
             "trials": len(trials),
             "layer_samples": len(recs),
@@ -114,8 +130,9 @@ def main():
             "needle_rank_min": min(ranks) if ranks else None,
             "needle_rank_median": int(stats.median(ranks)) if ranks else None,
             "needle_rank_max": max(ranks) if ranks else None,
-            "uplift_gate_recall4096_minus_recall2048": round(max(r4096, r8192) - r2048, 4),
-            "verdict": "budget-limited" if budget_limited else "scorer-limited",
+            "uplift_4096_minus_2048": uplift_4096,
+            "uplift_8192_minus_2048": uplift_8192,
+            "verdict": verdict,
         }
 
     with open(args.out, "w", encoding="utf-8") as fh:

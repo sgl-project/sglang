@@ -1,0 +1,173 @@
+{
+  "materiality_rule": "An uplift of a DS variant over the DS-default baseline is MATERIAL only when the variant recall point lies outside the baseline's 95% Clopper-Pearson CI. DSA is the recall ceiling; gap = DSA - DS.",
+  "op_points": {
+    "dsa": "DS int8 / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV",
+    "ds_default": "DS int8 / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV",
+    "ds_hybrid": "DS int8 / mem_fraction_static=0.7 / TP=8 / page64 / fp8-KV"
+  },
+  "ci": "Clopper-Pearson exact 95%",
+  "lengths": {
+    "1024": {
+      "dsa": {
+        "hits": 20,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 1.0,
+        "ci95": [
+          0.8316,
+          1.0
+        ]
+      },
+      "ds_default": {
+        "hits": 20,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 1.0,
+        "ci95": [
+          0.8316,
+          1.0
+        ]
+      },
+      "ds_hybrid": {
+        "hits": 20,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 1.0,
+        "ci95": [
+          0.8316,
+          1.0
+        ]
+      },
+      "hybrid_uplift_vs_default": 0.0,
+      "hybrid_material_uplift_vs_default_CI": false,
+      "hybrid_below_baseline_CI": false,
+      "gap_dsa_minus_ds_default": 0.0,
+      "gap_dsa_minus_ds_hybrid": 0.0
+    },
+    "1536": {
+      "dsa": null,
+      "ds_default": {
+        "hits": 20,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 1.0,
+        "ci95": [
+          0.8316,
+          1.0
+        ]
+      },
+      "ds_hybrid": null
+    },
+    "4096": {
+      "dsa": {
+        "hits": 20,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 1.0,
+        "ci95": [
+          0.8316,
+          1.0
+        ]
+      },
+      "ds_default": {
+        "hits": 15,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 0.75,
+        "ci95": [
+          0.509,
+          0.9134
+        ]
+      },
+      "ds_hybrid": {
+        "hits": 17,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 0.85,
+        "ci95": [
+          0.6211,
+          0.9679
+        ]
+      },
+      "hybrid_uplift_vs_default": 0.1,
+      "hybrid_material_uplift_vs_default_CI": false,
+      "hybrid_below_baseline_CI": false,
+      "gap_dsa_minus_ds_default": 0.25,
+      "gap_dsa_minus_ds_hybrid": 0.15
+    },
+    "16384": {
+      "dsa": {
+        "hits": 20,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 1.0,
+        "ci95": [
+          0.8316,
+          1.0
+        ]
+      },
+      "ds_default": {
+        "hits": 1,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 0.05,
+        "ci95": [
+          0.0013,
+          0.2487
+        ]
+      },
+      "ds_hybrid": {
+        "hits": 8,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 0.4,
+        "ci95": [
+          0.1912,
+          0.6395
+        ]
+      },
+      "hybrid_uplift_vs_default": 0.35,
+      "hybrid_material_uplift_vs_default_CI": true,
+      "hybrid_below_baseline_CI": false,
+      "gap_dsa_minus_ds_default": 0.95,
+      "gap_dsa_minus_ds_hybrid": 0.6
+    },
+    "65536": {
+      "dsa": {
+        "hits": 20,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 1.0,
+        "ci95": [
+          0.8316,
+          1.0
+        ]
+      },
+      "ds_default": {
+        "hits": 1,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 0.05,
+        "ci95": [
+          0.0013,
+          0.2487
+        ]
+      },
+      "ds_hybrid": {
+        "hits": 0,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 0.0,
+        "ci95": [
+          0.0,
+          0.1684
+        ]
+      },
+      "hybrid_uplift_vs_default": -0.05,
+      "hybrid_material_uplift_vs_default_CI": false,
+      "hybrid_below_baseline_CI": true,
+      "gap_dsa_minus_ds_default": 0.95,
+      "gap_dsa_minus_ds_hybrid": 1.0
+    }
+  }
+}
