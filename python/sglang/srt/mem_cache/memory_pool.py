@@ -661,15 +661,21 @@ class HybridReqToTokenPool(ReqToTokenPool):
         Lazy mode allocates 1 slot with the second set to -1 (allocated
         on demand at track boundaries). Normal mode allocates all slots upfront.
         """
-        n = 1 if self.enable_mamba_extra_buffer_lazy else self.mamba_ping_pong_track_buffer_size
+        n = (
+            1
+            if self.enable_mamba_extra_buffer_lazy
+            else self.mamba_ping_pong_track_buffer_size
+        )
         slots = self.mamba_pool.alloc(n)
         assert slots is not None, (
             "Not enough space for mamba ping pong idx, "
             "try to increase --mamba-full-memory-ratio."
         )
         buf = torch.full(
-            (self.mamba_ping_pong_track_buffer_size,), -1,
-            dtype=slots.dtype, device=slots.device,
+            (self.mamba_ping_pong_track_buffer_size,),
+            -1,
+            dtype=slots.dtype,
+            device=slots.device,
         )
         buf[:n] = slots
         req.mamba_ping_pong_track_buffer = buf
@@ -683,9 +689,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
         req.mamba_ping_pong_track_buffer[idx] = value
-        self.req_index_to_mamba_ping_pong_track_buffer_mapping[
-            req.req_pool_idx
-        ] = req.mamba_ping_pong_track_buffer
+        self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx] = (
+            req.mamba_ping_pong_track_buffer
+        )
 
     def donate_mamba_ping_pong_slot(
         self, req: "Req", new_slot: torch.Tensor

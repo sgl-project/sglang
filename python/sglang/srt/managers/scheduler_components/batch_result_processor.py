@@ -640,7 +640,9 @@ class SchedulerBatchResultProcessor:
 
             if is_spec_v1:
                 req.time_stats.set_last_decode_finish_time()
-                self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
@@ -836,7 +838,11 @@ class SchedulerBatchResultProcessor:
                 )
                 if callable(prepare_release):
                     prepare_release(req)
-                is_insert = req.mamba_lazy_is_insert if get_global_server_args().enable_mamba_extra_buffer_lazy() else True
+                is_insert = (
+                    req.mamba_lazy_is_insert
+                    if get_global_server_args().enable_mamba_extra_buffer_lazy()
+                    else True
+                )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
@@ -889,7 +895,6 @@ class SchedulerBatchResultProcessor:
                 )
             )
 
-
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
@@ -912,9 +917,7 @@ class SchedulerBatchResultProcessor:
 
         return False, 0
 
-    def mamba_lazy_post_decode_at_boundary(
-        self, req: Req, batch: ScheduleBatch
-    ):
+    def mamba_lazy_post_decode_at_boundary(self, req: Req, batch: ScheduleBatch):
         """Post-decode cleanup at a lazy-mode track boundary.
 
         Finished reqs return early — ``free_mamba_cache`` handles their
@@ -937,9 +940,7 @@ class SchedulerBatchResultProcessor:
             pool.mamba_pool.free(old_val.unsqueeze(0))
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
 
-    def _mamba_lazy_undo_stale_prealloc(
-        self, req: Req, batch: ScheduleBatch
-    ):
+    def _mamba_lazy_undo_stale_prealloc(self, req: Req, batch: ScheduleBatch):
         """Undo a prealloc that was performed by a stale overlap forward.
 
         With overlap scheduling a finished request gets one extra
