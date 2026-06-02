@@ -13,7 +13,7 @@ echo "===== Install kubernetes - Begin ====="
 KUBERNETES_PKG_PATH_SOURCE=/root/.cache/.cache/kubernetes
 if [ ! -d "${KUBERNETES_PKG_PATH_SOURCE}" ]; then
   echo "Install kubernetes online."
-  pip install kubernetes -i -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+  pip install kubernetes -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 else
   echo "Install kubernetes locally."
   cp -r ${KUBERNETES_PKG_PATH_SOURCE} /tmp/
@@ -34,7 +34,7 @@ if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
     echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} locally."
     TRANSFORMERS_PKG_PATH_TARGET=/tmp/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
     mkdir -p "${TRANSFORMERS_PKG_PATH_TARGET}"
-    cp "${TRANSFORMERS_PKG_PATH_SOURCE}/*" "${TRANSFORMERS_PKG_PATH_TARGET}/"
+    cp "${TRANSFORMERS_PKG_PATH_SOURCE}"/* "${TRANSFORMERS_PKG_PATH_TARGET}/"
     pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
   fi
   echo "===== Install transformers for sglang in virtual env - End ====="

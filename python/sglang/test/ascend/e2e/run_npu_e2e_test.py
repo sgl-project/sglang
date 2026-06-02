@@ -135,7 +135,7 @@ def create_pod(yaml_file, namespace):
                 logger.info(f"Service {doc['metadata']['name']} is created")
 
             else:
-                raise f"Unrecognized kind: {kind}/{api_version}"
+                raise ValueError(f"Unrecognized kind: {kind}/{api_version}")
         except ApiException as e:
             print(f"create resource {kind} error: {e}")
             raise
@@ -208,9 +208,9 @@ def delete_pod(yaml_file, namespace):
                 logger.info(f"Service {service_name} is deleted.")
 
             else:
-                raise f"Unrecognized kind: {kind}/{api_version}"
+                raise ValueError(f"Unrecognized kind: {kind}/{api_version}")
         except ApiException as e:
-            raise f"delete resource {kind} error: {e}"
+            raise RuntimeError(f"delete resource {kind} error: {e}")
 
 
 def check_parent_process():
@@ -315,7 +315,8 @@ def prepare_cm_data(namespace, pod_string):
         pod_name = pod.metadata.name
         if pod_string in pod_name:
             pod_ip = pod.status.pod_ip
-            data[pod_name] = pod_ip
+            if pod_ip:
+                data[pod_name] = pod_ip
     return data
 
 

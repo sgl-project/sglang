@@ -125,7 +125,7 @@ def generate_custom_dataset(
 
     train_data = load_jsonl(train_path)
     test_data = load_jsonl(test_path)
-    if num_prompts > 0 and num_prompts > len(test_data):
+    if num_prompts > 0 and len(test_data) > 0 and num_prompts > len(test_data):
         multiplier = (num_prompts // len(test_data)) + 1
         test_data = (test_data * multiplier)[:num_prompts]
     elif num_prompts > 0:
