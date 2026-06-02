@@ -1022,9 +1022,6 @@ class EagleDraftExtendCudaGraphRunnerAdapter:
     make_forward_batch: Callable[
         [Any, Any, Any, EagleDraftRunnerSettings], ForwardBatch
     ]
-    # Optional hook invoked with `(backend, batch)` before replay() and
-    # `(backend, None)` after for cleanup. Currently unused.
-    pre_replay: Callable[[Any, ForwardBatch], None] = None
     check_case: Callable[[Any, EagleDraftRunnerSettings], None] = (
         lambda _case, _settings: None
     )
@@ -1264,12 +1261,7 @@ def run_eagle_draft_extend_cuda_graph_runner_case(
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
         testcase.assertTrue(graph_runner.can_run(graph_batch))
-        if adapter.pre_replay is not None:
-            adapter.pre_replay(graph_backend, graph_batch)
         actual = graph_runner.replay(graph_batch)
-        if adapter.pre_replay is not None:
-            # Best-effort cleanup of any out-of-band state pre_replay set.
-            adapter.pre_replay(graph_backend, None)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
