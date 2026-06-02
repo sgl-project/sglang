@@ -523,17 +523,33 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_init_next_round_input_resets_chunk_state(t: ScriptedContext):
+        # init_next_round_input rebuilds fill_ids = origin_input_ids + output_ids
+        # (schedule_batch.py:1050); the chunked-admission path then truncates it to the
+        # committed prefix plus the chunk about to run
+        # (schedule_policy.py: fill_ids = fill_ids[:len(prefix_indices)+extend_input_len]).
+        # So mid-chunk the invariant is len(fill_ids) == len(prefix_indices) +
+        # extend_input_len, NOT len(fill_ids) == len(prefix_indices) (that equality only
+        # holds at the instant a chunk boundary commits, before the next chunk is loaded;
+        # with the overlap pipeline the observable state is always mid-chunk where the
+        # current chunk's tokens are appended past the committed prefix).
         r = t.start_req(prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
         saw_mid_chunk = False
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking and r.chunks_done >= 1:
+            req = r.req
+            if (
+                r.is_chunking
+                and r.chunks_done >= 1
+                and req is not None
+                and req.extend_input_len is not None
+            ):
                 saw_mid_chunk = True
-                assert len(r.req.fill_ids) == len(r.req.prefix_indices), (
-                    f"init_next_round_input must reset fill_ids to "
-                    f"prefix_indices at every chunk boundary; "
-                    f"fill_ids_len={len(r.req.fill_ids)}, "
-                    f"prefix_indices_len={len(r.req.prefix_indices)}, "
+                assert len(req.fill_ids) == len(req.prefix_indices) + req.extend_input_len, (
+                    f"init_next_round_input must rebuild fill_ids to the committed "
+                    f"prefix plus the in-flight chunk; "
+                    f"fill_ids_len={len(req.fill_ids)}, "
+                    f"prefix_indices_len={len(req.prefix_indices)}, "
+                    f"extend_input_len={req.extend_input_len}, "
                     f"chunks_done={r.chunks_done}"
                 )
             if r.finished:
