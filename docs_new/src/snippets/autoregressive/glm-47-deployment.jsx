@@ -60,6 +60,20 @@ export const GLM47Deployment = () => {
     }
   };
 
+  // §3.2 support matrix — single source of truth for the greyed-out controls and
+  // generateCommand. hardware -> weight type -> allowed TP sizes (missing key = unsupported).
+  const SUPPORT = {
+    b200: { nvfp4: [2, 4, 8], fp8: [4, 8], bf16: [8] },
+    gb200: { nvfp4: [2, 4], fp8: [4] },
+    h200: { fp8: [8], bf16: [8] },
+    mi300x: { fp8: [2, 4, 8], bf16: [4, 8] },
+    mi325x: { fp8: [2, 4, 8], bf16: [4, 8] },
+    mi355x: { fp8: [2, 4, 8], bf16: [4, 8] },
+  };
+  const quantSupported = (hw, q) => Boolean(SUPPORT[hw] && SUPPORT[hw][q]);
+  const allowedTps = (hw, q) => (SUPPORT[hw] && SUPPORT[hw][q]) || [];
+  const firstSupportedQuant = (hw) => Object.keys(SUPPORT[hw] || {})[0] || 'fp8';
+
   // Initialize state
   const getInitialState = () => {
     const initialState = {};
@@ -93,7 +107,21 @@ export const GLM47Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      // Keep weight type + GPU count within the §3.2 matrix as hardware/quant change,
+      // so the displayed command is always a supported configuration.
+      if (optionName === 'hardware' || optionName === 'quantization') {
+        if (!quantSupported(next.hardware, next.quantization)) {
+          next.quantization = firstSupportedQuant(next.hardware);
+        }
+        const tps = allowedTps(next.hardware, next.quantization);
+        if (tps.length && !tps.includes(parseInt(next.gpus, 10))) {
+          next.gpus = String(tps.includes(4) ? 4 : tps[0]);
+        }
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -115,22 +143,20 @@ export const GLM47Deployment = () => {
     const isNvidiaBlackwell = hardware === 'b200' || hardware === 'gb200';
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
 
-    // Map quantization to the supported set for this hardware. NVFP4 is only
-    // documented on Blackwell (B200, GB200); on H200/AMD, silently fall back
-    // to FP8 so the generated command stays valid (matches the §3.2 matrix).
-    let effectiveQuantization = quantization;
-    if (effectiveQuantization === 'nvfp4' && !isNvidiaBlackwell) {
-      effectiveQuantization = 'fp8';
+    // Only emit §3.2-supported commands; guards any stale (greyed-out) selection.
+    if (!quantSupported(hardware, quantization)) {
+      return (
+        `# ${quantization.toUpperCase()} is not supported on ${hardware.toUpperCase()} per the §3.2 matrix.\n` +
+        `# Pick a highlighted weight type above.`
+      );
     }
 
-    // Pick model checkpoint by effectiveQuantization
+    // Pick model checkpoint by weight type
     let modelName = 'zai-org/GLM-4.7';
-    if (effectiveQuantization === 'nvfp4') {
+    if (quantization === 'nvfp4') {
       modelName = 'nvidia/GLM-4.7-NVFP4';
-    } else if (effectiveQuantization === 'fp8') {
+    } else if (quantization === 'fp8') {
       modelName = 'zai-org/GLM-4.7-FP8';
-    } else {
-      modelName = 'zai-org/GLM-4.7';
     }
 
     let cmd = 'python -m sglang.launch_server \\\n';
@@ -141,12 +167,12 @@ export const GLM47Deployment = () => {
       // TP is fixed per chip + weight type, so the GPU-count selector is unused here.
       let tpValue = 4; // MI300X / MI325X default
       if (hardware === 'mi355x') {
-        tpValue = effectiveQuantization === 'fp8' ? 2 : 4; // MI355X: TP=2 FP8, TP=4 BF16
+        tpValue = quantization === 'fp8' ? 2 : 4; // MI355X: TP=2 FP8, TP=4 BF16
       }
       cmd += ` \\\n  --tp ${tpValue}`;
 
       // MI300X/MI325X BF16 requires extra flags
-      if ((hardware === 'mi300x' || hardware === 'mi325x') && effectiveQuantization === 'bf16') {
+      if ((hardware === 'mi300x' || hardware === 'mi325x') && quantization === 'bf16') {
         cmd += ` \\\n  --max-context-length 8192 \\\n  --mem-fraction-static 0.9`;
       }
       if (strategyArray.includes('dp')) {
@@ -156,16 +182,21 @@ export const GLM47Deployment = () => {
         cmd += ` \\\n  --ep 8`;
       }
     } else {
-      // NVIDIA (B200 / GB200 / H200): TP follows the "Number of GPUs" selector.
-      const tpValue = parseInt(gpus, 10) || 4;
+      // NVIDIA (B200 / GB200 / H200): TP follows the "Number of GPUs" selector,
+      // clamped to a §3.2-supported value for the chosen hardware + weight type.
+      const tps = allowedTps(hardware, quantization);
+      let tpValue = parseInt(gpus, 10) || tps[0];
+      if (!tps.includes(tpValue)) {
+        tpValue = tps.includes(4) ? 4 : tps[0];
+      }
       cmd += ` \\\n  --tp-size ${tpValue}`;
 
       // Blackwell + NVFP4: enable EP when the user selected it
-      if (isNvidiaBlackwell && effectiveQuantization === 'nvfp4' && strategyArray.includes('ep')) {
+      if (isNvidiaBlackwell && quantization === 'nvfp4' && strategyArray.includes('ep')) {
         cmd += ` \\\n  --ep ${tpValue}`;
       }
       // Blackwell + NVFP4: leave headroom for cuda-graph capture
-      if (isNvidiaBlackwell && effectiveQuantization === 'nvfp4') {
+      if (isNvidiaBlackwell && quantization === 'nvfp4') {
         cmd += ` \\\n  --mem-fraction-static 0.85`;
       }
     }
@@ -176,13 +207,11 @@ export const GLM47Deployment = () => {
       cmd += ` \\\n  --speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4`;
     }
 
-    // Add tool call parser if enabled
     if (toolcall === 'enabled') {
       cmd += ` \\\n  --tool-call-parser glm47`;
     }
 
-    // Add thinking parser if enabled (glm45 is the registered reasoning detector;
-    // glm47 is not a valid --reasoning-parser choice)
+    // glm45 is the registered reasoning detector; glm47 is only valid for tool-call.
     if (thinking === 'enabled') {
       cmd += ` \\\n  --reasoning-parser glm45`;
     }
@@ -201,27 +230,26 @@ export const GLM47Deployment = () => {
   const subtitleStyle = { display: 'block', fontSize: '9px', marginTop: '1px', lineHeight: '1.1', opacity: 0.7 };
   const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark ? '#111827' : '#f5f5f5', borderRadius: '6px', fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace", fontSize: '12px', lineHeight: '1.5', color: isDark ? '#e5e7eb' : '#374151', whiteSpace: 'pre-wrap', overflowX: 'auto', margin: 0, border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}` };
 
-  // Hardware-aware strategy availability (mirrors generateCommand): DP is only
-  // wired for AMD; EP only for AMD or Blackwell + NVFP4. Non-applicable items are
-  // greyed out so the UI never offers a toggle the generated command would ignore.
+  // Which Deployment Strategy toggles apply (mirrors generateCommand): DP only on
+  // AMD; EP only on AMD or Blackwell + NVFP4 — greyed otherwise.
   const hwSel = values.hardware;
   const isAMDSel = hwSel === 'mi300x' || hwSel === 'mi325x' || hwSel === 'mi355x';
   const isBlackwellSel = hwSel === 'b200' || hwSel === 'gb200';
-  const effQuantSel = (values.quantization === 'nvfp4' && !isBlackwellSel) ? 'fp8' : values.quantization;
   const strategyApplies = (id) => {
     if (id === 'dp') return isAMDSel;
-    if (id === 'ep') return isAMDSel || (isBlackwellSel && effQuantSel === 'nvfp4');
+    if (id === 'ep') return isAMDSel || (isBlackwellSel && values.quantization === 'nvfp4');
     return true; // tp (required) and mtp (all platforms)
   };
 
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
-        // "Number of GPUs" has no effect on AMD (TP is fixed per chip) — grey it out.
-        const groupDisabled = key === 'gpus' && (values.hardware === 'mi300x' || values.hardware === 'mi325x' || values.hardware === 'mi355x');
+        // GPU count is fixed (greyed) on AMD; on NVIDIA individual counts are greyed
+        // per the §3.2 matrix. Weight types unsupported on the hardware are greyed too.
+        const gpusGroupAMD = key === 'gpus' && isAMDSel;
         return (
         <div key={key} style={cardStyle}>
-          <div style={titleStyle}>{option.title}{groupDisabled ? ' (N/A for AMD)' : ''}</div>
+          <div style={titleStyle}>{option.title}{gpusGroupAMD ? ' (N/A for AMD)' : ''}</div>
           <div style={itemsStyle}>
             {option.type === 'checkbox' ? (
               option.items.map(item => {
@@ -238,9 +266,12 @@ export const GLM47Deployment = () => {
             ) : (
               option.items.map(item => {
                 const isChecked = values[option.name] === item.id;
+                const isDisabled =
+                  (key === 'gpus' && (gpusGroupAMD || !allowedTps(values.hardware, values.quantization).includes(parseInt(item.id, 10)))) ||
+                  (key === 'quantization' && !quantSupported(values.hardware, item.id));
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(groupDisabled ? disabledStyle : {}) }}>
-                    <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={groupDisabled} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>
