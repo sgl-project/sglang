@@ -1279,7 +1279,8 @@ def moe_forward_piecewise_cuda_graph_impl(
     return moe_layer.forward_impl(hidden_states, topk_output)
 
 
-def _fused_moe_bypassed_piecewise_cuda_graph_body(
+@register_custom_op(out_shape="hidden_states")
+def fused_moe_bypassed_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     top_k: int,
@@ -1290,9 +1291,6 @@ def _fused_moe_bypassed_piecewise_cuda_graph_body(
     layer_id: int,
     capture_routed_experts: bool,
 ) -> torch.Tensor:
-    # Plain-Python body of the BYPASS piecewise impl. Lifted out of the
-    # @register_custom_op wrapper so unit tests can drive it on a CPU
-    # host (the registered torch op is CUDA-only).
     topk_output = BypassedTopKOutput(
         hidden_states=hidden_states,
         router_logits=router_logits,
@@ -1308,28 +1306,3 @@ def _fused_moe_bypassed_piecewise_cuda_graph_body(
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
     return moe_layer.forward_impl(hidden_states, topk_output)
-
-
-@register_custom_op(out_shape="hidden_states")
-def fused_moe_bypassed_piecewise_cuda_graph_impl(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    top_k: int,
-    topk_group: Optional[int],
-    num_expert_group: Optional[int],
-    correction_bias: Optional[torch.Tensor],
-    renormalize: bool,
-    layer_id: int,
-    capture_routed_experts: bool,
-) -> torch.Tensor:
-    return _fused_moe_bypassed_piecewise_cuda_graph_body(
-        hidden_states,
-        router_logits,
-        top_k,
-        topk_group,
-        num_expert_group,
-        correction_bias,
-        renormalize,
-        layer_id,
-        capture_routed_experts,
-    )

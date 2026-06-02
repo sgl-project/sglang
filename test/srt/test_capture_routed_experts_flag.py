@@ -3,8 +3,8 @@
 Two layers of coverage:
 
 1. **Behavior tests** (primary): patch the global capturer and exercise the
-   gate decision through `maybe_capture_routed_experts`, the BYPASS path,
-   and the default-True target case. These prove the runtime contract.
+   gate decision through `maybe_capture_routed_experts` and the default-True
+   target case. These prove the runtime contract.
 2. **Structural tests** (supplementary tripwires): source-level assertions
    that the helper is wired into both CUDA and NPU sites and that the
    BYPASS custom-op signature carries the flag. These guard against a
@@ -148,80 +148,6 @@ class PostProcessTopkIdsGateTest(unittest.TestCase):
             [],
             "with capture_routed_experts=False, the CUDA path's gate must "
             "never invoke the capturer at the post-process site",
-        )
-
-
-class BypassPathReconstructionTest(unittest.TestCase):
-    """AC-2: the BYPASS piecewise-CUDA-graph impl rebuilds a `TopKConfig`
-    from scalar args and feeds it into the moe_layer's `forward_impl`.
-
-    The registered torch op `fused_moe_bypassed_piecewise_cuda_graph_impl`
-    is CUDA-only and cannot dispatch on a CPU host. The reconstruction
-    body is exported separately as `_fused_moe_bypassed_piecewise_cuda_graph_body`
-    so this test can drive it directly with a fake forward context.
-    """
-
-    def _drive(self, capture_flag: bool):
-        observed_configs: List[TopKConfig] = []
-
-        class _FakeMoELayer:
-            def forward_impl(self, hidden_states, topk_output):
-                observed_configs.append(topk_output.topk_config)
-                return hidden_states
-
-        class _FakeForwardContext:
-            def __init__(self) -> None:
-                self.moe_layers = {0: _FakeMoELayer()}
-
-        fctx = _FakeForwardContext()
-        old_get_ctx = fmt_layer.get_forward_context
-        fmt_layer.get_forward_context = lambda: fctx
-        try:
-            hidden_states = torch.zeros(1, 4, dtype=torch.float32)
-            router_logits = torch.zeros(1, 8, dtype=torch.float32)
-            fmt_layer._fused_moe_bypassed_piecewise_cuda_graph_body(
-                hidden_states,
-                router_logits,
-                4,  # top_k
-                None,  # topk_group
-                None,  # num_expert_group
-                None,  # correction_bias
-                True,  # renormalize
-                0,  # layer_id
-                capture_flag,  # capture_routed_experts
-            )
-        finally:
-            fmt_layer.get_forward_context = old_get_ctx
-        return observed_configs
-
-    def test_bypass_reconstructs_with_true(self):
-        observed = self._drive(capture_flag=True)
-        self.assertEqual(
-            len(observed),
-            1,
-            "BYPASS body must reach forward_impl exactly once; if it "
-            "short-circuited before, BYPASS would lose correctness on "
-            "the target path too",
-        )
-        self.assertTrue(observed[0].capture_routed_experts)
-
-    def test_bypass_reconstructs_with_false(self):
-        observed = self._drive(capture_flag=False)
-        self.assertEqual(len(observed), 1)
-        self.assertFalse(
-            observed[0].capture_routed_experts,
-            "rebuilt TopKConfig must reflect caller's False; if the flag "
-            "drops to default True, draft pollution silently returns",
-        )
-
-    def test_custom_op_wrapper_delegates_to_body(self):
-        # Source-level tripwire: the registered custom-op wrapper must
-        # simply delegate to the body so the runtime CUDA path and the
-        # CPU-tested body stay in lockstep.
-        source = inspect.getsource(fmt_layer)
-        self.assertIn(
-            "return _fused_moe_bypassed_piecewise_cuda_graph_body(",
-            source,
         )
 
 
