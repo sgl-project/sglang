@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import torch_npu
 from sgl_kernel_npu.attention.sinks_attention import (
-    attention_sinks_prefill_triton,
     attention_sinks_triton,
 )
 
@@ -45,7 +44,9 @@ def _reshape_kv_for_fia_nz(
 
 
 logger = logging.getLogger(__name__)
-SWA_INT_MAX = 2147483647
+
+# default max value of full attention window size
+FULL_ATTENTION_WINDOW = 2147483647
 
 
 @dataclass
@@ -1041,6 +1042,7 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                sinks=sinks,
             )
 
         if not self.use_mla:
@@ -1083,70 +1085,84 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia:
-                    num_token_padding = q.shape[0]
-                    if num_token_padding > forward_batch.num_token_non_padded_cpu:
-                        q, k, v = [
-                            data[: forward_batch.num_token_non_padded_cpu]
-                            for data in [q, k, v]
-                        ]
-                    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                    block_size = self.page_size
-                    attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                        query=q,
-                        key=k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-                        ),
-                        value=v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-                        ),
-                        pre_tokens=(
-                            layer.sliding_window_size
-                            if layer.sliding_window_size != -1
-                            else SWA_INT_MAX
-                        ),
-                        next_tokens=(
-                            0 if layer.sliding_window_size != -1 else SWA_INT_MAX
-                        ),
-                        atten_mask=self.fia_mask,
-                        block_table=block_tables,
-                        input_layout="TND",
-                        block_size=block_size,
-                        num_query_heads=layer.tp_q_head_num,
-                        num_key_value_heads=layer.tp_k_head_num,
-                        actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
-                        actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
-                        softmax_scale=layer.scaling,
-                        sparse_mode=4 if layer.sliding_window_size != -1 else 3,
-                        learnable_sink=sinks,
-                    )
-                    if num_token_padding != forward_batch.num_token_non_padded_cpu:
-                        attn_out = torch.cat(
-                            [
-                                attn_out,
-                                attn_out.new_zeros(
-                                    num_token_padding - attn_out.shape[0],
-                                    *attn_out.shape[1:],
-                                ),
-                            ],
-                            dim=0,
-                        )
-                    attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                k_cache = (
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+                    .contiguous()
+                )
+                v_cache = (
+                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                    .view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+                    .contiguous()
+                )
+                query = q.reshape(
+                    -1, layer.tp_q_head_num, layer.qk_head_dim
+                ).contiguous()
+
+                num_token_padding = query.shape[0]
+                if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    query = query[: forward_batch.num_token_non_padded_cpu]
+
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
-                    attn_out = attention_sinks_prefill_triton(
-                        q,
-                        k_cache,
-                        v_cache,
-                        sinks,
-                        self.forward_metadata.extend_seq_lens,
-                        block_tables,
-                        self.forward_metadata.seq_lens,
-                        layer.scaling,
-                        layer.sliding_window_size,
-                        layer.tp_q_head_num,
-                        layer.tp_k_head_num,
+                    actual_seq_lengths_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
-                return attn_out
+                if self.forward_metadata.extend_seq_lens_cpu_int is None:
+                    actual_seq_lengths = self.forward_metadata.seq_lens_list_cumsum
+                else:
+                    actual_seq_lengths = (
+                        torch.cumsum(
+                            self.forward_metadata.extend_seq_lens_cpu_int, dim=0
+                        )
+                        .int()
+                        .tolist()
+                    )
+
+                is_swa_layer = layer.sliding_window_size != -1
+                num_heads = (
+                    layer.tp_q_head_num
+                    if layer.tp_q_head_num != layer.tp_k_head_num
+                    else layer.tp_k_head_num
+                )
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    query,
+                    k_cache,
+                    v_cache,
+                    num_query_heads=num_heads,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    pre_tokens=(
+                        layer.sliding_window_size
+                        if layer.sliding_window_size != -1
+                        else FULL_ATTENTION_WINDOW
+                    ),
+                    next_tokens=0,
+                    atten_mask=self.fia_mask.to(torch.int8),
+                    sparse_mode=4 if is_swa_layer else 3,
+                    softmax_scale=layer.scaling,
+                    block_table=block_tables,
+                    block_size=self.page_size,
+                    actual_seq_qlen=actual_seq_lengths,
+                    actual_seq_kvlen=actual_seq_lengths_kv,
+                    learnable_sink=sinks,
+                )
+                attn_output = attn_output.view(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
+                )
+                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - attn_output.shape[0],
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
+                return attn_output
 
             if is_cp_mode:
                 if self.use_fia:
@@ -1635,6 +1651,7 @@ class AscendAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
             if self.use_mla:
@@ -1656,16 +1673,22 @@ class AscendAttnBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.num_token_non_padded_cpu]
+
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
                 actual_seq_lengths_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
-            if forward_batch.forward_mode.is_draft_extend():
+
+            if (
+                forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
                 actual_seq_lengths = (
                     np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
                 )
@@ -1675,27 +1698,36 @@ class AscendAttnBackend(AttentionBackend):
                     self.speculative_num_draft_tokens + query.shape[0],
                     self.speculative_num_draft_tokens,
                 )
-            if layer.attn_type == AttentionType.ENCODER_ONLY:
-                mask = None
-                sparse_mode = 0
-            else:
-                mask = self.mtp_mask
-                sparse_mode = 3
 
-            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            is_swa_layer = layer.sliding_window_size != -1
+            if (
+                is_swa_layer
+                and self.is_hybrid_swa
+                and hasattr(self.forward_metadata, "block_tables_swa")
+            ):
+                block_table = self.forward_metadata.block_tables_swa
+            else:
+                block_table = self.forward_metadata.block_tables
+
+            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score_v2(
                 query,
                 k_cache,
                 v_cache,
-                block_table=self.forward_metadata.block_tables,
+                block_table=block_table,
                 block_size=self.page_size,
-                num_heads=layer.tp_q_head_num,
+                num_query_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
-                atten_mask=mask,
-                scale=layer.scaling,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                sparse_mode=sparse_mode,
+                atten_mask=self.mtp_mask,
+                softmax_scale=layer.scaling,
+                actual_seq_qlen=actual_seq_lengths,
+                actual_seq_kvlen=actual_seq_lengths_kv,
+                sparse_mode=4 if is_swa_layer else 3,
+                pre_tokens=(
+                    layer.sliding_window_size if is_swa_layer else FULL_ATTENTION_WINDOW
+                ),
+                next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
+                learnable_sink=sinks,
             )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
@@ -1711,7 +1743,6 @@ class AscendAttnBackend(AttentionBackend):
                             *attn_output.shape[1:],
                         ),
                     ],
-                    dim=0,
                 )
             return attn_output
         else:
@@ -1838,27 +1869,71 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if sinks is not None:
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            # k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            # v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            # Use SWA block tables if hybrid SWA is enabled for this layer
+            # # Use SWA block tables if hybrid SWA is enabled for this layer
             if self.is_hybrid_swa and layer.sliding_window_size != -1:
                 block_tables = self.forward_metadata.block_tables_swa
             else:
                 block_tables = self.forward_metadata.block_tables
-            attn_out = attention_sinks_triton(
-                q,
+            k_cache = (
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+                .contiguous()
+            )
+            v_cache = (
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                .view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+                .contiguous()
+            )
+            query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+
+            if self.forward_metadata.seq_lens_cpu_int is None:
+                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+            else:
+                actual_seq_lengths_kv = (
+                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                )
+            seq_lens_list = (
+                self.forward_metadata.seq_lens_cpu_list
+                if self.forward_metadata.seq_lens_cpu_int is None
+                else self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+            )
+            actual_seq_lengths = (
+                torch.tensor([1] * len(seq_lens_list), dtype=torch.int32)
+                .cumsum(dim=0)
+                .tolist()
+            )
+            if layer.sliding_window_size != -1:
+                sparse_mode = 4
+            else:
+                sparse_mode = 3
+
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                query,
                 k_cache,
                 v_cache,
-                sinks,
-                block_tables,
-                self.forward_metadata.seq_lens,
-                layer.scaling,
-                layer.sliding_window_size,
-                layer.tp_q_head_num,
-                layer.tp_k_head_num,
+                num_query_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="TND",
+                pre_tokens=(
+                    layer.sliding_window_size
+                    if layer.sliding_window_size != -1
+                    else FULL_ATTENTION_WINDOW
+                ),
+                next_tokens=0,
+                atten_mask=self.fia_mask.to(torch.int8),
+                sparse_mode=sparse_mode,
+                softmax_scale=layer.scaling,
+                block_table=block_tables,
+                block_size=self.page_size,
+                actual_seq_qlen=actual_seq_lengths,
+                actual_seq_kvlen=actual_seq_lengths_kv,
+                learnable_sink=sinks,
             )
-            return attn_out
+            attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return attn_output
 
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
@@ -1874,6 +1949,60 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_len_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
+
+            if (layer.qk_head_dim != layer.v_head_dim) and (
+                layer.sliding_window_size == -1
+            ):
+                query_v2 = q.reshape(
+                    -1, layer.tp_q_head_num, layer.qk_head_dim
+                ).contiguous()
+                actual_seq_qlen = (
+                    torch.tensor([1] * len(actual_seq_len_kv), dtype=torch.int32)
+                    .cumsum(dim=0)
+                    .tolist()
+                )
+                common_kwargs = dict(
+                    num_query_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    pre_tokens=FULL_ATTENTION_WINDOW,
+                    next_tokens=0,
+                    atten_mask=self.fia_mask.to(torch.int8),
+                    sparse_mode=3,
+                    softmax_scale=layer.scaling,
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    actual_seq_qlen=actual_seq_qlen,
+                    actual_seq_kvlen=actual_seq_len_kv,
+                )
+                workspace = (
+                    torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                        query_v2,
+                        k_cache.contiguous(),
+                        v_cache.contiguous(),
+                        **common_kwargs,
+                    )
+                )
+                attn_output = torch.empty(
+                    (
+                        query_v2.shape[0],
+                        layer.tp_q_head_num,
+                        layer.v_head_dim,
+                    ),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+                torch_npu.npu_fused_infer_attention_score_v2.out(
+                    query_v2,
+                    k_cache.contiguous(),
+                    v_cache.contiguous(),
+                    **common_kwargs,
+                    workspace=workspace,
+                    out=[attn_output, softmax_lse],
+                )
+                return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
             num_tokens = query.shape[0]
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,

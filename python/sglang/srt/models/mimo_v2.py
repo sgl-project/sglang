@@ -194,9 +194,11 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=torch.bfloat16,
+            )
         )
         if config.topk_method == "noaux_tc":
             correction_bias_dtype = (
@@ -204,7 +206,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.bfloat16
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -213,7 +215,7 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        logits = F.linear(hidden_states, self.weight, None)
 
         return logits
 
@@ -282,7 +284,11 @@ class MiMoV2MoE(nn.Module):
         )
 
         # todo : implement tbo forward needed
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -299,7 +305,9 @@ class MiMoV2MoE(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         )
 
     def get_moe_weights(self):
