@@ -574,6 +574,7 @@ def _check_l2_global_cache(
     all_l1_miss_items: List[MultimodalDataItem],
     all_l1_miss_token_counts: List[int],
     data_embedding_func: DataEmbeddingFunc,
+    device: torch.device,
 ) -> Tuple[Dict[int, torch.Tensor], List[MultimodalDataItem], List[int]]:
     """Check L2 (Global Cache) for L1 misses.
 
@@ -692,9 +693,10 @@ def _check_l2_global_cache(
                         )
                         l2_check_miss.append((item, token_count))
                         continue
-                    hash_to_l2_emb[item.hash] = emb
+                    dev_emb = emb.to(device)
+                    hash_to_l2_emb[item.hash] = dev_emb
                     # Also write to L1 cache for future local hits
-                    emb_result = EmbeddingResult(embedding=emb)
+                    emb_result = EmbeddingResult(embedding=dev_emb)
                     embedding_cache.set(item.hash, emb_result)
                     successful_items.append((item, token_count))
 
@@ -766,7 +768,6 @@ def _sync_tp_cache_hits(
 
     # Items that this rank hit but other ranks missed need to go to ViT
     items_to_recompute = []
-    updated_entries = []
     for item, emb, start, end in overlapping:
         if item.hash not in synced_hash_set and (
             emb is not None or item.hash in hash_to_l2_emb
@@ -825,6 +826,7 @@ def _write_back_l2_cache(locally_encoded: list) -> None:
         f"Submitted {len(locally_encoded)} embeddings to global cache (background)"
     )
 
+
 def _get_chunked_embedding_by_item(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -871,7 +873,7 @@ def _get_chunked_embedding_by_item(
 
     # 3. Check L2 (Global Cache) for L1 misses
     hash_to_l2_emb, l2_miss_items, l2_miss_token_counts = _check_l2_global_cache(
-        all_l1_miss_items, all_l1_miss_token_counts, data_embedding_func
+        all_l1_miss_items, all_l1_miss_token_counts, data_embedding_func, device
     )
 
     # 4. TP-Group synchronization
