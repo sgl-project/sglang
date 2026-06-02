@@ -232,6 +232,7 @@ class ReplicatedLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
+        output_sizes: list[int] | None = None,
         prefix: str = "",
     ):
         super().__init__(
@@ -245,10 +246,11 @@ class ReplicatedLinear(LinearBase):
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
+        output_partition_sizes = output_sizes or [self.output_size]
         self.quant_method.create_weights(
             self,
             self.input_size,
-            [self.output_size],
+            output_partition_sizes,
             self.input_size,
             self.output_size,
             self.params_dtype,
@@ -497,7 +499,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | None = None,
     ) -> None:
-
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
@@ -612,6 +613,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | None = None,
     ) -> None:
+        if isinstance(param, BlockQuantScaleParameter):
+            self._weight_loader_v2_block_quant_scale(
+                param, loaded_weight, loaded_shard_id
+            )
+            return
+
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
@@ -627,25 +634,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         tp_size = self.tp_size
 
-        if isinstance(param, BlockQuantScaleParameter):
-            raise NotImplementedError("FP8 is not implemented yet")
-            # FIXME(will): add fp8 support
-            # from vllm.model_executor.layers.quantization.fp8 import (
-            #     Fp8LinearMethod, Fp8MoEMethod)
-            # assert self.quant_method is not None
-            # assert isinstance(self.quant_method,
-            #                   (Fp8LinearMethod, Fp8MoEMethod))
-            # weight_block_size = self.quant_method.quant_config.weight_block_size
-            # assert weight_block_size is not None
-            # block_n, _ = weight_block_size[0], weight_block_size[1]
-            # shard_offset = (
-            #     (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) //
-            #     block_n) // tp_size
-            # shard_size = ((self.output_sizes[loaded_shard_id] + block_n - 1) //
-            #               block_n // tp_size)
-        else:
-            shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
-            shard_size = self.output_sizes[loaded_shard_id] // tp_size
+        shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
+        shard_size = self.output_sizes[loaded_shard_id] // tp_size
 
         param.load_merged_column_weight(
             loaded_weight=loaded_weight,
@@ -653,6 +643,53 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offset=shard_offset,
             shard_size=shard_size,
         )
+
+    def _weight_loader_v2_block_quant_scale(
+        self,
+        param: BlockQuantScaleParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | None = None,
+    ) -> None:
+        assert self.quant_method is not None
+        weight_block_size = getattr(
+            self.quant_method.quant_config, "weight_block_size", None
+        )
+        if weight_block_size is None:
+            raise ValueError(
+                "MergedColumnParallelLinear block-scale loading requires "
+                "quant_config.weight_block_size."
+            )
+        block_n, _ = weight_block_size
+        output_dim = param.output_dim
+
+        if loaded_shard_id is None:
+            if param.data.shape == loaded_weight.shape:
+                param.data.copy_(loaded_weight)
+                return
+
+            block_offset = 0
+            for shard_id, output_size in enumerate(self.output_sizes):
+                block_size = divide(output_size, block_n)
+                loaded_weight_shard = loaded_weight.narrow(
+                    output_dim, block_offset, block_size
+                )
+                self._weight_loader_v2_block_quant_scale(
+                    param, loaded_weight_shard, shard_id
+                )
+                block_offset += block_size
+            return
+
+        assert loaded_shard_id < len(self.output_sizes)
+        shard_offset = divide(sum(self.output_sizes[:loaded_shard_id]), self.tp_size)
+        shard_size = divide(self.output_sizes[loaded_shard_id], self.tp_size)
+        block_shard_offset = divide(shard_offset, block_n)
+        block_shard_size = divide(shard_size, block_n)
+
+        param_data = param.data.narrow(output_dim, block_shard_offset, block_shard_size)
+        start_idx = self.tp_rank * block_shard_size
+        loaded_weight = loaded_weight.narrow(output_dim, start_idx, block_shard_size)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -829,7 +866,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | None = None,
     ):
-
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
@@ -866,7 +902,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             ]
 
             for shard_id, shard_offset, shard_size in shard_offsets:
-
                 loaded_weight_shard = loaded_weight.narrow(
                     output_dim, shard_offset, shard_size
                 )
@@ -1037,7 +1072,6 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
-
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:

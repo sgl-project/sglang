@@ -1,4 +1,4 @@
-"""Publish diffusion comparison results to sglang-bot/sglang-ci-data repo.
+"""Publish diffusion comparison results to sgl-project/ci-data repo.
 
 Pushes comparison-results.json, dashboard.md, and chart PNG files to the
 ci-data repository for historical tracking. Chart PNGs are stored under
@@ -49,8 +49,8 @@ else:
     )
 
 # Repository configuration
-REPO_OWNER = "sglang-bot"
-REPO_NAME = "sglang-ci-data"
+REPO_OWNER = "sgl-project"
+REPO_NAME = "ci-data"
 BRANCH = "main"
 STORAGE_PREFIX = "diffusion-comparisons"
 
@@ -196,7 +196,7 @@ def publish_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Publish diffusion comparison results to sglang-ci-data"
+        description="Publish diffusion comparison results to ci-data"
     )
     parser.add_argument(
         "--results",

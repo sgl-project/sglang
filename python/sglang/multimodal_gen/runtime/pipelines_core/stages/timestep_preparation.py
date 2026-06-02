@@ -60,13 +60,13 @@ class TimestepPreparationStage(PipelineStage):
     def __init__(
         self,
         scheduler,
-        prepare_extra_set_timesteps_kwargs: list[
-            Callable[[Req, ServerArgs], Tuple[str, Any]]
-        ] = [],
+        prepare_extra_set_timesteps_kwargs: (
+            list[Callable[[Req, ServerArgs], Tuple[str, Any]]] | None
+        ) = None,
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
-        self.prepare_extra_set_timesteps_kwargs = (
+        self.prepare_extra_set_timesteps_kwargs = list(
             prepare_extra_set_timesteps_kwargs or []
         )
 
@@ -191,8 +191,7 @@ class TimestepPreparationStage(PipelineStage):
             and isinstance(batch.timesteps, torch.Tensor)
             and torch.isnan(batch.timesteps).any()
         ):
-            # when num-inference-steps == 1, the last sigma being 1, the 1 / last_sigma could be nan
-            # this a workaround for warmup req only
+            # diffusers flow-match scheduler can emit NaN for one-step warmup
             batch.timesteps = torch.ones(
                 (1,), dtype=torch.float32, device=get_local_torch_device()
             )
