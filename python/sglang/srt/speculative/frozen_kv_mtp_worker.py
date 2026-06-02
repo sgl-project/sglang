@@ -207,10 +207,22 @@ class FrozenKVMTPWorker(TpModelWorker):
             or self.server_args.attention_backend
         )
 
+    def _target_uses_tq(self) -> bool:
+        """Check if the target model uses TurboQuant KV cache."""
+        return self.server_args.kv_cache_dtype == "turboquant"
+
     def _init_draft_attn_backend(self):
         if self.topk == 1:
+            if self._target_uses_tq():
+                return self._init_tq_draft_attn_backend()
             return self.draft_model_runner.attn_backend
 
+        if self._target_uses_tq():
+            logger.warning(
+                "Frozen-KV MTP topk > 1 with TurboQuant uses full-layer "
+                "KV decompression via get_kv_buffer() (no selective decode). "
+                "Use topk=1 for fused Triton selective decode performance."
+            )
         backend_type = self._resolve_draft_backend_type()
         if backend_type != "triton":
             raise ValueError(
@@ -218,6 +230,38 @@ class FrozenKVMTPWorker(TpModelWorker):
                 f"attention backend, got {backend_type}."
             )
         return self._init_triton_draft_attn_backend()
+
+    def _init_tq_draft_attn_backend(self):
+        """Create a FlashInferTQBackend for the draft model, sized to the
+        target's KV pool so selective decode covers all active tokens.
+
+        The draft model in Frozen-KV MTP reads from the target's TQ-compressed
+        KV cache.  A standard FlashInferAttnBackend would decompress the entire
+        layer via ``get_kv_buffer()`` on every decode step.  By using a
+        FlashInferTQBackend we get fused Triton selective decode (only active
+        tokens) and CUDA-graph-safe replay — matching the target's own decode
+        performance.
+        """
+        from sglang.srt.layers.attention.flashinfer_tq_backend import (
+            FlashInferTQBackend,
+        )
+
+        target_pool_size = self.target_worker.model_runner.max_token_pool_size
+        saved_pool_size = self.draft_model_runner.max_total_num_tokens
+        self.draft_model_runner.max_total_num_tokens = target_pool_size
+        try:
+            backend = FlashInferTQBackend(
+                self.draft_model_runner,
+                init_new_workspace=self.draft_model_runner.init_new_workspace,
+            )
+        finally:
+            self.draft_model_runner.max_total_num_tokens = saved_pool_size
+        logger.info(
+            "Frozen-KV MTP: created TQ draft attention backend "
+            "(compact_size=%d from target pool).",
+            target_pool_size,
+        )
+        return backend
 
     def _init_triton_draft_attn_backend(self):
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
