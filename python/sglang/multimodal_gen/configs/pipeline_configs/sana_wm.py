@@ -238,9 +238,12 @@ class SanaWMPipelineConfig(PipelineConfig):
         return latents
 
     def shard_latents_for_sp(self, batch, latents):
+        # Extension hook for future true SP. Stage-level 5D time sharding would
+        # break temporal GDN/GLUMBConvTemp/camera UCPE semantics, so keep stage-1
+        # latents replicated until the DiT grows layout-aware token sharding.
         return latents, False
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         return latents
 
     def get_decode_scale_and_shift(self, device, dtype, vae):

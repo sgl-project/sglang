@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMBeforeDenoisingStage,
     SanaWMDenoisingStage,
@@ -124,6 +125,17 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         batch = SimpleNamespace(height=704, width=1280)
         shape = self.config.prepare_latent_shape(batch, batch_size=1, num_frames=49)
         self.assertEqual(shape, (1, 128, 7, 44, 40))
+
+    def test_sp_latent_sharding_is_replicated_for_stage1_safety(self) -> None:
+        latents = torch.zeros(1, 128, 7, 22, 40)
+        batch = SimpleNamespace(enable_sequence_shard=True)
+
+        sharded, did_shard = self.config.shard_latents_for_sp(batch, latents)
+        gathered = self.config.gather_latents_for_sp(sharded, batch=batch)
+
+        self.assertIs(sharded, latents)
+        self.assertIs(gathered, latents)
+        self.assertFalse(did_shard)
 
     def test_prepare_pos_cond_kwargs_passes_camera_from_batch_extra(self) -> None:
         # SanaWMBeforeDenoisingStage packs c2w + intrinsics into the upstream
@@ -1137,6 +1149,9 @@ class TestSanaWMTextEncodingStage(_GlobalStageArgsMixin, unittest.TestCase):
 
 
 class TestSanaWMDenoisingStage(unittest.TestCase):
+    def test_reuses_shared_denoising_forward(self) -> None:
+        self.assertIs(SanaWMDenoisingStage.forward, DenoisingStage.forward)
+
     def test_stage_attention_backend_head_size_uses_sana_wm_padding(self) -> None:
         stage = object.__new__(SanaWMDenoisingStage)
         stage.server_args = SimpleNamespace(pipeline_config=SanaWMPipelineConfig())

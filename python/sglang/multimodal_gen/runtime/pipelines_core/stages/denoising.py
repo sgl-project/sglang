@@ -1171,6 +1171,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             current_model: the next active dit, transformer_1 or transformer_2
         """
         manager = self._component_residency_manager
+        if manager is None:
+            return
 
         component_name = manager.component_name_for_module(current_model, current_phase)
         phase = str(batch.extra.get("ltx2_phase", current_phase))
@@ -1181,7 +1183,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             preferred_ready_after_request=component_name == "transformer",
             memory_intensive=True,
         )
-        manager.begin_use(use)
+        manager.begin_use(use, module=current_model)
 
     def _select_and_manage_model(
         self,

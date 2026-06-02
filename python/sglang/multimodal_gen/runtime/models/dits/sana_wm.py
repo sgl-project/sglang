@@ -3105,6 +3105,12 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = SanaWMConfig()._fsdp_shard_conditions
     _compile_conditions = SanaWMConfig()._compile_conditions
     _supported_attention_backends = SanaWMConfig()._supported_attention_backends
+    # Extension point for future true SP. SANA-WM needs layout-aware sharding for
+    # non-attention operators (GDN scan, GLUMBConvTemp, camera UCPE, Plucker).
+    # Existing USPAttention only covers softmax attention, so sequence sharding
+    # stays disabled until those operators get explicit state/reduction/halo
+    # exchange.
+    supports_true_sequence_parallel = False
     param_names_mapping = SanaWMConfig().param_names_mapping
     reverse_param_names_mapping = SanaWMConfig().reverse_param_names_mapping
     lora_param_names_mapping: dict = {}
@@ -3233,7 +3239,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "pad_attention_head_dim_to_flash=%s, attention_head_dim=%d, "
             "effective_softmax_head_dim=%d, tp_size=%d, local_attention_heads=%d, "
             "softmax_blocks=%s, chunk_size=%s, chunk_split_strategy=%s, "
-            "use_triton_kernels=%s",
+            "use_triton_kernels=%s, true_sp_supported=%s",
             self.use_chunked_softmax_attention,
             self.pad_attention_head_dim_to_flash,
             arch.linear_head_dim,
@@ -3244,6 +3250,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self.chunk_size,
             self.chunk_split_strategy,
             self.use_triton_kernels,
+            self.supports_true_sequence_parallel,
         )
 
         self.blocks = nn.ModuleList(

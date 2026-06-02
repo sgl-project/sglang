@@ -31,7 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingContext,
     DenoisingStage,
+    DenoisingStepState,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -612,8 +614,9 @@ class SanaWMDenoisingStage(DenoisingStage):
             partial = torch.zeros_like(noise_pred)
         return cfg_model_parallel_all_reduce(partial)
 
-    @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def _prepare_denoising_loop(
+        self, batch: Req, server_args: ServerArgs
+    ) -> DenoisingContext:
         if batch.latents is None:
             raise ValueError("SANA-WM denoising requires initialized latents.")
         if batch.latents.ndim != 5:
@@ -633,6 +636,10 @@ class SanaWMDenoisingStage(DenoisingStage):
         timesteps = batch.timesteps
         if timesteps is None:
             raise ValueError("SANA-WM denoising requires prepared timesteps.")
+
+        num_inference_steps = batch.num_inference_steps
+        num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
+        self._maybe_enable_cache_dit_and_torch_compile(num_inference_steps, batch)
 
         latents = batch.latents.to(device=device, dtype=target_dtype)
         init_condition_latents = latents[:, :, :1].clone()
@@ -740,6 +747,10 @@ class SanaWMDenoisingStage(DenoisingStage):
                 ),
             }
         model_kwargs.update(chunk_kwargs)
+        model_kwargs = self.prepare_extra_func_kwargs(
+            getattr(self.transformer, "forward", self.transformer),
+            model_kwargs,
+        )
 
         condition_mask_input = (
             condition_mask
@@ -759,97 +770,157 @@ class SanaWMDenoisingStage(DenoisingStage):
         )
         log_sana_wm_tensor_stats("denoise.input_latents", latents)
 
-        start_time = time.perf_counter()
-        with self.use_declared_component(
-            component_name="transformer", module=self.transformer
-        ) as transformer:
-            assert transformer is not None
-            self.transformer = transformer
+        return DenoisingContext(
+            scheduler=scheduler,
+            extra_step_kwargs={},
+            target_dtype=target_dtype,
+            autocast_enabled=(
+                bool(getattr(server_args.pipeline_config, "enable_autocast", False))
+                and target_dtype != torch.float32
+                and not getattr(server_args, "disable_autocast", False)
+            ),
+            timesteps=timesteps,
+            num_inference_steps=num_inference_steps,
+            num_warmup_steps=num_warmup_steps,
+            image_kwargs={},
+            pos_cond_kwargs={},
+            neg_cond_kwargs={},
+            latents=latents,
+            boundary_timestep=None,
+            z=None,
+            reserved_frames_mask=None,
+            seq_len=None,
+            guidance=torch.empty(0, device=device, dtype=target_dtype),
+            is_warmup=batch.is_warmup,
+            cfg_policy=None,
+            extra={
+                "cfg_parallel": cfg_parallel,
+                "cfg_rank": cfg_rank,
+                "condition_mask": condition_mask,
+                "condition_mask_input": condition_mask_input,
+                "do_cfg": do_cfg,
+                "init_condition_latents": init_condition_latents,
+                "model_kwargs": model_kwargs,
+                "start_time": time.perf_counter(),
+                "timestep_condition_limit": timestep_condition_limit,
+            },
+        )
 
-            for step_idx, t in enumerate(self.progress_bar(timesteps)):
-                if cfg_parallel:
-                    latent_model_input = latents
-                else:
-                    latent_model_input = (
-                        torch.cat([latents, latents], dim=0) if do_cfg else latents
-                    )
+    def _prepare_step_attn_metadata(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+        t_int: int,
+        timesteps_cpu: torch.Tensor,
+    ) -> Any | None:
+        return None
 
-                timestep = t.expand(condition_mask_input.shape).float()
-                timestep = torch.minimum(timestep, timestep_condition_limit)
-                model_timestep = timestep[:, :1, :, 0, 0]
+    def _run_denoising_step(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        cfg_parallel = bool(ctx.extra["cfg_parallel"])
+        cfg_rank = int(ctx.extra["cfg_rank"])
+        condition_mask = ctx.extra["condition_mask"]
+        condition_mask_input = ctx.extra["condition_mask_input"]
+        do_cfg = bool(ctx.extra["do_cfg"])
+        model_kwargs = ctx.extra["model_kwargs"]
+        timestep_condition_limit = ctx.extra["timestep_condition_limit"]
 
-                if cfg_parallel and cfg_rank > 1:
-                    noise_pred = torch.zeros_like(latents, dtype=target_dtype)
-                else:
-                    with set_forward_context(
-                        current_timestep=step_idx,
-                        attn_metadata=None,
-                        forward_batch=batch,
-                    ):
-                        noise_pred = transformer(
-                            hidden_states=latent_model_input.to(target_dtype),
-                            timestep=model_timestep,
-                            **model_kwargs,
-                        )
+        if cfg_parallel:
+            latent_model_input = ctx.latents
+        else:
+            latent_model_input = (
+                torch.cat([ctx.latents, ctx.latents], dim=0)
+                if do_cfg
+                else ctx.latents
+            )
 
-                if do_cfg:
-                    guidance_scale = float(getattr(batch, "guidance_scale", 1.0) or 1.0)
-                    if cfg_parallel:
-                        noise_pred = self._combine_cfg_parallel_noise(
-                            noise_pred, guidance_scale, cfg_rank
-                        )
-                    else:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (
-                            noise_pred_text - noise_pred_uncond
-                        )
-                        timestep = timestep.chunk(2)[0]
+        timestep = step.t_device.expand(condition_mask_input.shape).float()
+        timestep = torch.minimum(timestep, timestep_condition_limit)
+        model_timestep = timestep[:, :1, :, 0, 0]
 
-                latents_dtype = latents.dtype
-                latents_shape = latents.shape
-                batch_size, channels, _, _, _ = latents_shape
-                scheduler_output = scheduler.step(
-                    -noise_pred.reshape(batch_size, channels, -1).transpose(1, 2),
-                    t,
-                    latents.reshape(batch_size, channels, -1).transpose(1, 2),
-                    per_token_timesteps=timestep.reshape(batch_size, 1, -1)[:, 0],
-                    return_dict=False,
-                )[0]
-                denoised_latents = scheduler_output.transpose(1, 2).reshape(
-                    latents_shape
+        if cfg_parallel and cfg_rank > 1:
+            noise_pred = torch.zeros_like(ctx.latents, dtype=ctx.target_dtype)
+        else:
+            with set_forward_context(
+                current_timestep=step.step_index,
+                attn_metadata=None,
+                forward_batch=batch,
+            ):
+                noise_pred = step.current_model(
+                    hidden_states=latent_model_input.to(ctx.target_dtype),
+                    timestep=model_timestep,
+                    **model_kwargs,
                 )
 
-                tokens_to_denoise = t.float() / 1000.0 - 1e-6 < (1.0 - condition_mask)
-                latents = torch.where(tokens_to_denoise, denoised_latents, latents)
-                if latents.dtype != latents_dtype:
-                    latents = latents.to(latents_dtype)
+        if do_cfg:
+            guidance_scale = float(getattr(batch, "guidance_scale", 1.0) or 1.0)
+            if cfg_parallel:
+                noise_pred = self._combine_cfg_parallel_noise(
+                    noise_pred, guidance_scale, cfg_rank
+                )
+            else:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
+                timestep = timestep.chunk(2)[0]
 
-                if sana_wm_diagnostics_enabled() and (
-                    step_idx == 0 or step_idx == len(timesteps) - 1
-                ):
-                    log_sana_wm_tensor_stats(
-                        f"denoise.step_{step_idx}.noise_pred", noise_pred
-                    )
-                    log_sana_wm_tensor_stats(
-                        f"denoise.step_{step_idx}.latents", latents
-                    )
+        latents_dtype = ctx.latents.dtype
+        latents_shape = ctx.latents.shape
+        batch_size, channels, _, _, _ = latents_shape
+        scheduler_output = ctx.scheduler.step(
+            -noise_pred.reshape(batch_size, channels, -1).transpose(1, 2),
+            step.t_device,
+            ctx.latents.reshape(batch_size, channels, -1).transpose(1, 2),
+            per_token_timesteps=timestep.reshape(batch_size, 1, -1)[:, 0],
+            return_dict=False,
+        )[0]
+        denoised_latents = scheduler_output.transpose(1, 2).reshape(latents_shape)
 
-            clear_inference_caches = getattr(
-                transformer, "clear_sana_wm_inference_caches", None
+        tokens_to_denoise = (
+            step.t_device.float() / 1000.0 - 1e-6 < (1.0 - condition_mask)
+        )
+        ctx.latents = torch.where(tokens_to_denoise, denoised_latents, ctx.latents)
+        if ctx.latents.dtype != latents_dtype:
+            ctx.latents = ctx.latents.to(latents_dtype)
+
+        if sana_wm_diagnostics_enabled() and (
+            step.step_index == 0 or step.step_index == len(ctx.timesteps) - 1
+        ):
+            log_sana_wm_tensor_stats(
+                f"denoise.step_{step.step_index}.noise_pred", noise_pred
             )
-            if clear_inference_caches is not None:
-                clear_inference_caches()
+            log_sana_wm_tensor_stats(
+                f"denoise.step_{step.step_index}.latents", ctx.latents
+            )
 
-        log_sana_wm_tensor_stats("denoise.output_latents", latents)
-        unchanged = (latents[:, :, :1] - init_condition_latents).abs().max().item()
+    def _finalize_denoising_loop(
+        self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> None:
+        clear_inference_caches = getattr(
+            self.transformer, "clear_sana_wm_inference_caches", None
+        )
+        if clear_inference_caches is not None:
+            clear_inference_caches()
+
+        log_sana_wm_tensor_stats("denoise.output_latents", ctx.latents)
+        unchanged = (
+            ctx.latents[:, :, :1] - ctx.extra["init_condition_latents"]
+        ).abs().max().item()
         self.log_info(
             "SANA-WM flow_euler_ltx denoising finished in %.4f seconds; "
             "first_frame_max_delta=%.6g",
-            time.perf_counter() - start_time,
+            time.perf_counter() - ctx.extra["start_time"],
             float(unchanged),
         )
-        batch.latents = server_args.pipeline_config.post_denoising_loop(latents, batch)
-        return batch
+        super()._finalize_denoising_loop(ctx, batch, server_args)
 
 
 class SanaWMBeforeDenoisingStage(PipelineStage):
