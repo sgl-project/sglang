@@ -293,7 +293,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             tokenizer=self.get_module("tokenizer_2"),
             dtype=default_sana_wm_refiner_dtype(server_args),
         )
-        if getattr(pc, "streaming", False):
+        if getattr(pc, "streaming", False) and getattr(pc, "refiner_chunked", True):
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming_refiner import (
                 SanaWMStreamingRefinerStage,
             )

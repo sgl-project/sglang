@@ -95,6 +95,9 @@ class SanaWMPipelineConfig(PipelineConfig):
     refiner_block_size: int = 3
     refiner_kv_max_frames: int = 11
     refiner_seed: int = 42
+    # True -> chunked streaming refiner (low-latency, causal); False -> whole-clip
+    # dense refiner (global context, max quality, non-streaming).
+    refiner_chunked: bool = True
 
     # --- DiT ---
     dit_config: DiTConfig = field(default_factory=SanaWMConfig)
