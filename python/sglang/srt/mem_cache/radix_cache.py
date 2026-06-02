@@ -34,6 +34,12 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Floor priority (just above the root's -sys.maxsize) for KV inserted by a
+# radix-native session (req.session_id set). Session KV must be the FIRST thing
+# reclaimed under pressure, so the pool cannot wedge even though nothing is
+# pinned. Effective under `--radix-eviction-policy priority`; inert under lru.
+RADIX_NATIVE_SESSION_PRIORITY = -(sys.maxsize - 1)
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -422,6 +428,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
+        self._floor_radix_native_priority(req)
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -472,6 +479,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
+        self._floor_radix_native_priority(req)
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
@@ -535,6 +543,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Radix-native session tag (see release_session).
         self._tag_session_leaf(req, radix_key)
+
+    def _floor_radix_native_priority(self, req: Req) -> None:
+        """Floor the priority of KV inserted by a radix-native session so it is
+        evicted before general prefix cache. No-op for non-session requests."""
+        if getattr(req, "session_id", None) is not None:
+            req.priority = RADIX_NATIVE_SESSION_PRIORITY
 
     def _tag_session_leaf(self, req: Req, radix_key) -> None:
         """Tag the leaf node for this request's full key with its session_id, so
