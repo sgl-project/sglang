@@ -2636,7 +2636,9 @@ class AiterAttnBackend(AttentionBackend):
                     sliding_window_arg = 0
 
                 q_in = q.contiguous().view(-1, num_q_heads, layer.qk_head_dim)
-                o_out = torch.empty_like(q_in, dtype=self.input_dtype)
+                # Direct view of o as kernel output — saves a per-layer
+                # o.copy_ of bs*H_q*D bf16 elementwise.
+                o_view = o.view(-1, num_q_heads, layer.v_head_dim)
                 exp_sums = torch.empty(
                     (bs, num_kv_heads, max_part_num, q_group),
                     dtype=torch.float32,
@@ -2649,7 +2651,7 @@ class AiterAttnBackend(AttentionBackend):
                     device=q_in.device,
                 )
                 pa_decode_gluon(
-                    output=o_out,
+                    output=o_view,
                     query=q_in,
                     key_cache=k_cache,
                     value_cache=v_cache,
@@ -2667,7 +2669,6 @@ class AiterAttnBackend(AttentionBackend):
                     sliding_window=sliding_window_arg,
                     ps=True,
                 )
-                o.copy_(o_out.view_as(o))
             elif self.use_triton_unified_attention:
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)

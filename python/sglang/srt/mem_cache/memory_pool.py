@@ -1160,12 +1160,13 @@ class MHATokenToKVPool(KVCache):
                 launch_reshape_and_cache_shuffle_5d,
             )
 
-            # The writer kernel only uses .stride(0) (token stride) of the
-            # source, and assumes (H_kv, D) are contiguous within each token.
-            # Force contiguity here to be safe against non-canonical strides
-            # coming from QKV splits / RoPE in upstream attention code.
-            cache_k = cache_k.contiguous()
-            cache_v = cache_v.contiguous()
+            # The writer kernel uses key.stride(0) directly as the source
+            # token stride; head/dim are assumed contiguous within each
+            # token (stride(1)=head_size, stride(2)=1). Both hold for K/V
+            # produced by QKV split + RoPE in upstream attention even when
+            # the outer per-token stride is non-canonical, so we skip the
+            # protective .contiguous() copies that would otherwise fire
+            # large per-layer elementwise kernels.
             launch_reshape_and_cache_shuffle_5d(
                 cache_k,
                 cache_v,
