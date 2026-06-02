@@ -7,21 +7,45 @@ budget) is a **bounded-secondary** lever — it can only recover the ≤~moderat
 regime where the needle ranks in `(index_topk, lifted_budget_top_k]`; Tier-2.B
 (the landed hybrid scorer) is the only lever for the long-context goal.
 
-## Landed this round: the opt-in ABI (config + validator)
-- `DoubleSparsityConfig.enable_lifted_budget_decode: bool` (default `False`) and
-  `lifted_budget_top_k: int` (default `0`). Validation: `lifted_budget_top_k`
-  must be `> top_k` when enabled; set-without-flag and flag-without-budget both
-  fail closed.
-- Validator: `top_k > index_topk` is **rejected unless `enable_lifted_budget_decode`**,
-  and `lifted_budget_top_k` must be `> index_topk`; the message steers to the ABI
-  and explicitly forbids using `SGLANG_DS_ALLOW_TOPK_MISMATCH` / `max_top_k` /
-  Twilight fields as the mechanism. **Default-off leaves the DSA `dsa_index_topk`
-  assert + the `SGLANG_DS_ALLOW_TOPK_MISMATCH` equality-mismatch ablation
-  unchanged.**
-- Tests: `TestLiftedBudgetABI` (config accept/reject matrix + the validator
-  top_k>index_topk gate via monkeypatched `get_dsa_index_topk`).
+## Landed: the opt-in ABI (config) + fail-closed validator gate
+- **Config fields (R10).** `DoubleSparsityConfig.enable_lifted_budget_decode: bool`
+  (default `False`) and `lifted_budget_top_k: int` (default `0`). Parse-level
+  validation: `lifted_budget_top_k` must be `> top_k` when enabled; set-without-flag
+  and flag-without-budget both fail closed. The config still *parses* a lifted
+  spec (the field is recognized) — the boot-time availability decision lives at
+  the server validator, the layer that knows whether the backend exists.
+- **Fail-closed validator gate (R11).** `validate_double_sparsity` raises a clear
+  *recognized-but-not-implemented/selected* error whenever
+  `enable_lifted_budget_decode` is set, because the opt-in decode backend path is
+  not built yet. This is gated by a single capability seam
+  `ds_lifted_budget_decode_available()` (returns `False` today; the decode-path
+  landing flips it to `True`), mirroring `ds_scorer_is_graph_safe`. The gate is
+  **independent of hf_config resolution** (it fires before the capability/model-topk
+  block), so it cannot be skipped when the model config can't be resolved. This
+  closes the R10-review hole where a lifted config booted into either a **silent
+  no-op** (`top_k == index_topk` → the locked 2048 selector ignored the wider
+  budget) or routed a **wider-than-2048 selection into the default `flashmla_kv`
+  `indices.shape[-1] == dsa_index_topk` assert** (`top_k=4096, lifted_budget_top_k=8192`).
+- **Steering preserved.** For the *no-flag* case, `top_k > index_topk` is still
+  **rejected** with a message that steers to the ABI and forbids
+  `SGLANG_DS_ALLOW_TOPK_MISMATCH` / `max_top_k` / Twilight as the mechanism. The
+  model-topk block's lifted-specific validation (`lifted_budget_top_k > index_topk`,
+  the info log) is retained as the *post-backend* layer: it becomes reachable once
+  `ds_lifted_budget_decode_available()` flips. **Default-off leaves the DSA
+  `dsa_index_topk` assert + the `SGLANG_DS_ALLOW_TOPK_MISMATCH` equality-mismatch
+  ablation unchanged.**
+- Tests: `TestLiftedBudgetABI` — config accept/reject matrix; the no-flag
+  `top_k>index_topk` steering gate (monkeypatched `get_dsa_index_topk`); and the
+  two R10-review fail-closed cases (`top_k=2048 + lifted_budget_top_k=4096`;
+  `top_k=4096 + lifted_budget_top_k=8192`) now both RAISE.
 
 ## Decode-path design for task14–17 (Codex-reviewed)
+> **Enablement seam.** task14 flips `ds_lifted_budget_decode_available()`
+> (`selection_kernel.py`) to `True` once the path below is implemented and
+> selected; that single change lifts the R11 fail-closed validator gate, after
+> which the validator's model-topk block validates the lifted shape
+> (`lifted_budget_top_k > index_topk`) and logs the enabled op-point.
+
 1. **Selection.** When enabled, the selector picks `lifted_budget_top_k` logical
    positions (a FIXED, padded budget; `-1`-pad the tail) via the same graph-safe
    top-K + the R23 deterministic `(score-desc, position-asc)` tie-break. The

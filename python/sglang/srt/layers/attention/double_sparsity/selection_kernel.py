@@ -454,6 +454,24 @@ def ds_recall_oracle_enabled(config) -> bool:
     return bool(getattr(config, "recall_oracle", False))
 
 
+def ds_lifted_budget_decode_available() -> bool:
+    """``True`` iff the opt-in adjustable-budget (lifted) decode backend path is
+    implemented and wired into selection/decode, so ``enable_lifted_budget_decode``
+    can actually be honored.
+
+    Returns ``False`` today: the config ABI (``enable_lifted_budget_decode`` +
+    ``lifted_budget_top_k``) is recognized, but the lifted decode path
+    (wider-than-``index_topk`` selection → request-local compact remap →
+    ``flash_mla_sparse_fwd``) is not built yet. The validator uses this so a
+    boot with the flag set fails closed instead of silently running the locked
+    ``index_topk`` selector or routing a wider selection into the default
+    ``flashmla_kv`` ``indices.shape[-1] == dsa_index_topk`` assert. This is the
+    single capability seam the lifted-budget decode landing flips to ``True``
+    once that path exists (mirroring :func:`ds_scorer_is_graph_safe`).
+    """
+    return False
+
+
 def compute_token_scores(
     queries: torch.Tensor,
     token_signatures: torch.Tensor,

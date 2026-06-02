@@ -507,6 +507,8 @@ class TestLiftedBudgetABI(unittest.TestCase):
         )
 
     def test_validator_topk_gt_index_topk_requires_flag(self):
+        # top_k > index_topk WITHOUT the lifted flag is steered to the ABI
+        # (not SGLANG_DS_ALLOW_TOPK_MISMATCH) by the model-topk gate.
         import sglang.srt.configs.model_config as mc
         from sglang.srt.layers.attention.double_sparsity.validator import (
             validate_double_sparsity,
@@ -515,25 +517,48 @@ class TestLiftedBudgetABI(unittest.TestCase):
         mc.is_deepseek_dsa = lambda hf: True
         mc.get_dsa_index_topk = lambda hf: 2048
         try:
-            # top_k=4096 > index_topk=2048 WITHOUT the lifted flag -> rejected,
-            # steered to the ABI (not SGLANG_DS_ALLOW_TOPK_MISMATCH).
             with self.assertRaises(ValueError) as cm:
                 validate_double_sparsity(self._server_args("", top_k=4096))
             msg = str(cm.exception)
             self.assertIn("lifted-budget", msg)
             self.assertIn("enable_lifted_budget_decode", msg)
-            # WITH the lifted flag (+ top_k stays at index_topk) -> the top_k gate
-            # must NOT fire (a later channel-mask check may raise instead).
-            try:
-                validate_double_sparsity(self._server_args(
-                    ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096',
-                    top_k=2048,
-                ))
-            except Exception as e:
-                self.assertNotIn("lifted-budget", str(e))
-                self.assertNotIn("index_topk", str(e))
         finally:
             mc.is_deepseek_dsa, mc.get_dsa_index_topk = o1, o2
+
+    def test_validator_lifted_flag_fails_closed_no_op_case(self):
+        # R10-review case A: top_k == index_topk + lifted flag. The old code let
+        # this boot and silently run the locked 2048 selector (the lifted budget
+        # was never honored). It must fail closed until the decode backend lands.
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        with self.assertRaises(ValueError) as cm:
+            validate_double_sparsity(self._server_args(
+                ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096',
+                top_k=2048,
+            ))
+        msg = str(cm.exception)
+        self.assertIn("enable_lifted_budget_decode", msg)
+        self.assertIn("not implemented", msg)
+
+    def test_validator_lifted_flag_fails_closed_wide_topk_case(self):
+        # R10-review case B: top_k > index_topk + lifted flag. The old code let
+        # this boot and could route a >2048-wide tensor into the default
+        # flashmla_kv `indices.shape[-1] == dsa_index_topk` assert. It must fail
+        # closed until the decode backend lands. The gate is hf_config-independent,
+        # so it fires before the capability/model-topk block (no monkeypatch
+        # needed here).
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        with self.assertRaises(ValueError) as cm:
+            validate_double_sparsity(self._server_args(
+                ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 8192',
+                top_k=4096,
+            ))
+        msg = str(cm.exception)
+        self.assertIn("enable_lifted_budget_decode", msg)
+        self.assertIn("not implemented", msg)
 
 
 if __name__ == "__main__":

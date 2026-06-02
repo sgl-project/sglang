@@ -93,6 +93,39 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
+    # Lifted-budget decode opt-in: fail closed until the backend path lands.
+    # `enable_lifted_budget_decode` is a recognized opt-in ABI field, but the
+    # adjustable-budget decode backend it selects (wider-than-index_topk
+    # selection -> request-local compact remap -> flash_mla_sparse_fwd) is not
+    # implemented/wired yet. Booting with the flag set would NOT honor a wider
+    # budget — it would either silently run the locked index_topk selector (a
+    # no-op when top_k == index_topk) or route a wider-than-index_topk selection
+    # into the default flashmla_kv `indices.shape[-1] == dsa_index_topk` assert.
+    # Both are silent-wrong / late-crash outcomes, so refuse to boot here. This
+    # gate is independent of hf_config resolution (it fires before the
+    # capability/model-topk block), so it cannot be skipped when the model
+    # config can't be resolved. The lifted-budget decode landing flips
+    # ds_lifted_budget_decode_available() to True to enable this path.
+    from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+        ds_lifted_budget_decode_available,
+    )
+
+    if getattr(config, "enable_lifted_budget_decode", False) and not (
+        ds_lifted_budget_decode_available()
+    ):
+        raise ValueError(
+            "Double Sparsity enable_lifted_budget_decode is recognized but the "
+            "opt-in lifted-budget decode backend path is not implemented/selected "
+            "yet, so the flag cannot be honored. The server fails closed rather "
+            "than booting into a silent no-op (when top_k == DSA index_topk the "
+            "locked selector ignores the wider budget) or routing a wider "
+            "selection into the default flashmla_kv "
+            "'indices.shape[-1] == dsa_index_topk' assert. Remove "
+            "enable_lifted_budget_decode (and lifted_budget_top_k) to run the "
+            "default DSA-budget path; the lifted-budget decode landing will "
+            "enable this flag once that path exists."
+        )
+
     # Production-path selector-variant safety (future-proof guard). As of R9 ALL
     # non-learned variants — scorer_norm (cosine/hybrid) + head_agg (mean) [R6] and
     # anchor_mode (recency/global/strided) [R9] — are graph-safe, so
