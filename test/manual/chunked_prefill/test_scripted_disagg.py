@@ -171,14 +171,21 @@ class TestDisaggInflightQueue(ScriptedTestCase):
 
     @staticmethod
     def _script_inflight_queue_membership_only_on_final_chunk(t: ScriptedContext):
-        """rid joins disagg_prefill_inflight_queue only on the final chunk; never while chunking."""
+        """rid is never in disagg_prefill_inflight_queue while chunking, and is drained once finished."""
         # GPU validation pending: scripted single-GPU harness only.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+
+        # The req is not chunked on the very first scheduler iteration after
+        # submission, so advance to the point where it actually becomes the
+        # chunked_req before sampling per-chunk state. Otherwise the loop below
+        # would break immediately on the pre-chunking is_chunking==False.
+        yield from run_until(r, lambda h: h.is_chunking)
 
         saw_inflight_positive = False
         # Step yield-by-yield through the chunked-prefill phase. On every non-final
         # chunk the else-branch keeps the rid OUT of the inflight queue and holds
-        # inflight_middle_chunks >= 1.
+        # inflight_middle_chunks >= 1 (get_next_batch_to_run increments it for the
+        # chunked_req; the result branch only decrements it on the last chunk).
         for _ in range(800):
             if not r.is_chunking:
                 break
@@ -197,23 +204,30 @@ class TestDisaggInflightQueue(ScriptedTestCase):
             "(inflight_middle_chunks >= 1) during chunked prefill"
         )
 
-        # After the chunked phase completes, the final chunk (inflight <= 0) appends
-        # the rid to the inflight queue exactly once before transfer drains it.
-        appended_once = False
-        for _ in range(800):
-            queued_rids = [req.rid for req in t.scheduler.disagg_prefill_inflight_queue]
-            if queued_rids.count(r.rid) == 1:
-                appended_once = True
-                break
-            if r.finished:
-                break
-            yield
-        assert (
-            appended_once
-        ), "final chunk must append rid to disagg_prefill_inflight_queue exactly once"
-
+        # The final chunk appends the rid to disagg_prefill_inflight_queue
+        # (process_batch_result_disagg_prefill, prefill.py:533) and then, in the
+        # SAME event-loop iteration, process_disagg_prefill_inflight_queue
+        # (prefill.py:459) polls the sender and drains it. With the fake transfer
+        # backend the sender concludes Success instantly, so the rid is appended and
+        # removed between two consecutive script yield points and is never visible in
+        # the queue at a yield boundary. We therefore cannot positively witness the
+        # transient membership here; with a real network sender the rid would linger
+        # in the queue until the transfer poll succeeds.
+        #
+        # What stays observable is the non-membership-while-chunking invariant
+        # asserted above plus the consequence of the final-chunk append: the req
+        # leaves the chunked phase, gets its prefill-completion output token, and
+        # finishes.
+        assert not r.is_chunking
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
+        # The req is no longer anywhere in the inflight queue once finished and
+        # drained.
+        final_queue = [req.rid for req in t.scheduler.disagg_prefill_inflight_queue]
+        assert r.rid not in final_queue, (
+            f"finished disagg-prefill req must have been drained from the inflight "
+            f"queue; queue={final_queue}"
+        )
 
 
 class TestDisaggPartialPage(ScriptedTestCase):
