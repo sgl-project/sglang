@@ -101,6 +101,25 @@ class TboAttnBackend(AttentionBackend):
                 forward_batch=child_fb_view, in_capture=False
             )
 
+    def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
+        # TBO dispatcher: fan out the graph-recordable in-graph step to
+        # primary + children. The full cuda-graph runner calls this inside
+        # `with graph.capture():` separately from _out_graph, so the
+        # dispatcher must forward it too (otherwise a child whose _in_graph
+        # does real work — e.g. DSV4's Raw->Full upgrade — is never recorded
+        # into the captured graph). Capture has populated tbo_children on
+        # forward_batch.
+        self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
+        tbo_children = getattr(forward_batch, "tbo_children", None)
+        if tbo_children is not None:
+            for child, forward_batch_child in zip(
+                self.children, tbo_children, strict=True
+            ):
+                if forward_batch_child.batch_size > 0:
+                    child.init_forward_metadata_in_graph(
+                        forward_batch=forward_batch_child
+                    )
+
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
         self.primary.init_forward_metadata(forward_batch=forward_batch)
         if forward_batch.tbo_children is not None:
@@ -115,6 +134,15 @@ class TboAttnBackend(AttentionBackend):
         for item in self.children:
             # TODO for children, maybe can provide *smaller* max_bs to optimize
             item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
+
+    def on_after_cuda_graph_warmup(self):
+        # TBO dispatcher: fan out the warmup-undo hook to primary + children,
+        # mirroring init_cuda_graph_state. Children that mutated state during
+        # the warmup pass (e.g. a raw->full upgrade) must restore it before
+        # capture freezes kernel pointers.
+        self.primary.on_after_cuda_graph_warmup()
+        for child in self.children:
+            child.on_after_cuda_graph_warmup()
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
