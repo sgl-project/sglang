@@ -1034,6 +1034,7 @@
                   {
                     "group": "StepFun",
                     "pages": [
+                      "cookbook/autoregressive/StepFun/Step-3.7-Flash",
                       "cookbook/autoregressive/StepFun/Step3.5",
                       "cookbook/autoregressive/StepFun/Step3-VL-10B"
                     ]
@@ -1113,6 +1114,12 @@
                 "group": "Diffusion Models",
                 "pages": [
                   "cookbook/diffusion/intro",
+                  {
+                    "group": "Cosmos",
+                    "pages": [
+                      "cookbook/diffusion/Cosmos/Cosmos3"
+                    ]
+                  },
                   {
                     "group": "FLUX",
                     "pages": [
