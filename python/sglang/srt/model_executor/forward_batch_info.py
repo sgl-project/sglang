@@ -1233,6 +1233,46 @@ def enable_num_token_non_padded():
     return get_moe_expert_parallel_world_size() > 1
 
 
+def build_inner_fb_view(
+    forward_batch: ForwardBatch,
+    *,
+    bs: int,
+    forward_mode: ForwardMode,
+    encoder_lens: Optional[torch.Tensor] = None,
+):
+    """Build a ForwardBatch-like view for MultiStep draft wrapper dispatch.
+
+    MultiStep draft wrappers (FlashInferMultiStepDraftBackend,
+    AiterMultiStepDraftBackend, TritonMultiStepDraftBackend, etc.) need
+    to dispatch to per-step inner backends'
+    :py:meth:`AttentionBackend.init_forward_metadata_out_graph` with an
+    overridden ``forward_mode`` (typically pinned to ``DECODE``) and
+    sometimes overridden ``encoder_lens``. The result is a thin
+    namespace mirroring just the fields backend init reads, avoiding
+    the cost of allocating a real ``ForwardBatch``.
+
+    ``actual_forward_mode`` carries the original runtime
+    ``forward_batch.forward_mode`` (e.g., spec-decode draft) so backends
+    that check it for IDLE substitution (DSV4) see the unaltered value.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        batch_size=bs,
+        forward_mode=forward_mode,
+        actual_forward_mode=forward_batch.forward_mode,
+        input_ids=getattr(forward_batch, "input_ids", None),
+        positions=getattr(forward_batch, "positions", None),
+        req_pool_indices=forward_batch.req_pool_indices,
+        seq_lens=forward_batch.seq_lens,
+        seq_lens_sum=forward_batch.seq_lens_sum,
+        seq_lens_cpu=forward_batch.seq_lens_cpu,
+        encoder_lens=encoder_lens,
+        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        spec_info=forward_batch.spec_info,
+    )
+
+
 class PPProxyTensors:
     # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
     tensors: Dict[str, torch.Tensor]
