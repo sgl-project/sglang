@@ -193,12 +193,8 @@ work_dirs/
 
 !logo.png
 !docs_new/images/*.png
-!docs_new/images/progressive/*.png
-!docs_new/images/progressive_d01/*.png
-!docs_new/images/progressive_d02/*.png
-!docs_new/images/progressive_d05/*.png
 !docs_new/images/progressive_4way/*.png
-!docs_new/images/progressive_3way/*.png
+!docs_new/images/progressive_flux2/*.png
 
 # Prerequisites
 *.d
