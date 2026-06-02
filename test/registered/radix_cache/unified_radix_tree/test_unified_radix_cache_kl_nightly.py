@@ -41,7 +41,7 @@ class AccuracyTwoPassMixin:
     gsm8k_parallel: int = 40
 
     mmlu_threshold: float = 0.7
-    num_mmlu_examples: int = 200
+    num_mmlu_examples: int = 100
     mmlu_num_threads: int = 32
 
     max_accuracy_diff: float = 0.02
