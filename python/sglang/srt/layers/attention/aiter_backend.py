@@ -2415,6 +2415,124 @@ class AiterAttnBackend(AttentionBackend):
                     o = o.to(self.input_dtype)
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            # Plan A: when a chunked-prefill (or any non-first-chunk) batch
+            # reaches forward_extend with non-zero extend_prefix_lens, the
+            # aiter `mha_batch_prefill_func` paged path below does not have
+            # a compiled kernel for our (page_size=64, bf16/fp8, SHUFFLE 5D)
+            # configuration and aborts with "no matching kernel found".
+            # Sidestep it for the 5D pool by gathering the full per-request
+            # K/V (prefix + just-written fresh tokens — `set_kv_buffer` has
+            # already happened by the time forward_extend runs) from the 5D
+            # pool into a contiguous (T, H, D) buffer via a triton inverse
+            # of the SHUFFLE writer, then running mha_batch_prefill_func in
+            # 3D LINEAR mode (page_size=1) which *does* have a working
+            # kernel. fp8-store layers are gathered as raw fp8 and the
+            # per-tensor descales are forwarded to the kernel — aiter's
+            # LINEAR-mode prefill supports fp8 KV natively, so no host-side
+            # dequant is needed.
+            if self.kv_cache_is_vectorized_5d:
+                # Late-import to keep the NHD path import-clean.
+                from sglang.srt.layers.attention.utils import (
+                    launch_gather_shuffle_5d_to_linear,
+                )
+
+                bs = forward_batch.batch_size
+
+                # SWA layers gather from the SWA sub-pool via swa_page_table;
+                # full-attn layers gather from the full sub-pool via kv_indices.
+                # Both are per-TOKEN slot id lists populated by
+                # `create_flashinfer_kv_indices_triton` from `req_to_token`
+                # (req_to_token stores one slot id per logical token), so the
+                # first `seq_lens_sum` entries of either tensor are exactly
+                # the per-token absolute pool slot ids in request-major order
+                # — no per-token gather metadata to build on host.
+                is_swa_layer = (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                    and self.forward_metadata.swa_page_table is not None
+                )
+                total_kv = int(forward_batch.seq_lens_sum)
+                if is_swa_layer:
+                    slot_ids = self.forward_metadata.swa_page_table[:total_kv]
+                else:
+                    slot_ids = self.forward_metadata.kv_indices[:total_kv]
+
+                # Resolve the raw 5D K/V buffer for this layer (going through
+                # the SWA→sub-pool mapping when applicable).
+                pool = self.token_to_kv_pool
+                if hasattr(pool, "layers_mapping"):
+                    sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
+                    sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
+                else:
+                    sub_pool = pool
+                    sub_layer_id = layer.layer_id
+                k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
+                v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
+
+                k_lin, v_lin = launch_gather_shuffle_5d_to_linear(
+                    k_buf, v_buf, slot_ids
+                )
+                # k_lin / v_lin come out in `store_dtype` (uint8 for fp8
+                # pools because Tensor.index_put isn't implemented for fp8
+                # — see MHATokenToKVPool ctor). Reinterpret them back to
+                # the compute dtype so aiter sees matching q/k/v dtypes.
+                # The bytes are identical; this is a zero-copy view.
+                if sub_pool.store_dtype != sub_pool.dtype:
+                    k_lin = k_lin.view(sub_pool.dtype)
+                    v_lin = v_lin.view(sub_pool.dtype)
+                # For fp8 K/V we hand the raw fp8 tensors and the layer's
+                # per-tensor descales straight to aiter — its LINEAR-mode
+                # mha_batch_prefill_func supports fp8 K/V/Q natively, so
+                # no host-side dequant is needed.
+                if sub_pool.dtype == fp8_dtype:
+                    q_local = q.to(fp8_dtype)
+                    q_descale_local = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+                    k_descale_local = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+                    v_descale_local = (
+                        layer.v_scale if layer.v_scale is not None else self.v_scale
+                    )
+                else:
+                    q_local = q
+                    q_descale_local = None
+                    k_descale_local = None
+                    v_descale_local = None
+
+                kv_indptr_lin = self.forward_metadata.kv_indptr[:bs0]
+                kv_indices_lin = torch.arange(
+                    total_kv, dtype=torch.int32, device=k_lin.device
+                )
+                max_kv = int(self.forward_metadata.max_kv_len)
+                max_q = int(self.forward_metadata.max_q_len)
+
+                o = mha_batch_prefill_func(
+                    q_local.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_lin,
+                    v_lin,
+                    self.qo_indptr[:bs0],
+                    kv_indptr_lin,
+                    kv_indices_lin,
+                    max_q,
+                    max_kv,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                    window_size=window_size,
+                    sink_ptr=sinks,
+                    q_descale=q_descale_local,
+                    k_descale=k_descale_local,
+                    v_descale=v_descale_local,
+                )
+                if o.dtype != self.input_dtype:
+                    o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # NHD fallback path below — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
                 q = q.to(fp8_dtype)
@@ -2430,18 +2548,7 @@ class AiterAttnBackend(AttentionBackend):
             ):
                 page_table = self.forward_metadata.swa_page_table
 
-            # 5D vectorized KV layout sets page_block_size > 1 from aiter's
-            # perspective, so it requires kv_last_page_lens. NHD 3D layout
-            # is treated as page_block_size=1 by aiter and ignores it.
-            # Plan A v2: both sub-pools (full + SWA) are 5D.
             extra_kwargs = {}
-            if self.kv_cache_is_vectorized_5d:
-                page = self.page_size
-                seq_lens = forward_batch.seq_lens
-                kv_last_page_lens = (
-                    ((seq_lens - 1) % page + 1).to(torch.int32).contiguous()
-                )
-                extra_kwargs["kv_last_page_lens"] = kv_last_page_lens
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
