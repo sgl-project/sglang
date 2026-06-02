@@ -133,7 +133,6 @@ from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.layers.utils.dcp_utils import prepare_decode_context_parallel_metadata
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -3162,20 +3161,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Launch model forward
         if not skip_attn_backend_init:
-            # prepare kv cache buffer for dcp to gather kv cache
-            forward_batch.attn_dcp_metadata = prepare_decode_context_parallel_metadata(
-                forward_batch.seq_lens,
-                forward_batch.extend_prefix_lens,
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_seq_lens,
-                forward_batch.req_pool_indices,
-                get_req_to_token_pool().req_to_token,
-                forward_batch.seq_lens_sum,
-                get_token_to_kv_pool().get_key_buffer(0).shape,
-                self.kv_cache_dtype,
-                self.device,
-                create_chunked_prefix_cache_kv_indices,
-            )
+            if hasattr(self.model, "prepare_context_parallel_metadata_for_dcp"):
+                # prepare kv cache buffer for dcp to gather kv cache
+                forward_batch.attn_dcp_metadata = (
+                    self.model.prepare_context_parallel_metadata_for_dcp(
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_seq_lens,
+                        forward_batch.req_pool_indices,
+                        get_req_to_token_pool().req_to_token,
+                        forward_batch.seq_lens_sum,
+                        get_token_to_kv_pool().get_key_buffer(0).shape,
+                        self.kv_cache_dtype,
+                        self.device,
+                        create_chunked_prefix_cache_kv_indices,
+                    )
+                )
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
