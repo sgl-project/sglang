@@ -8,6 +8,7 @@ template and embedded inside the transformer's UND pathway. The same
 from ``batch.data_type`` and the presence of ``batch.preprocessed_image``.
 """
 
+import copy
 from typing import Any
 
 import numpy as np
@@ -347,6 +348,16 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         batch.extra["vae_scale_factor_spatial"] = vae_scale_factor_spatial
 
         self.log_info(f"Prepared latents with shape {shape}")
+
+        sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
+        if sound_duration > 0.0:
+            sound_latent_fps = self.transformer.sound_latent_fps
+            sound_latent_frames = max(1, round(sound_duration * sound_latent_fps))
+            sound_shape = (1, self.transformer.sound_dim, sound_latent_frames)
+            batch.audio_latents = torch.randn(
+                sound_shape, generator=generator, device=device, dtype=dtype
+            )
+            self.log_info(f"Prepared sound latents with shape {sound_shape}")
         return batch
 
 
@@ -502,7 +513,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
         current_timestep: int | None = None,
-    ) -> torch.Tensor:
+        sound_latents: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run transformer forward pass.
 
         Args:
@@ -529,6 +541,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 cache_key=cache_key,
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=max_text_seq_len,
+                sound_latents=sound_latents,
             )
 
     def _manage_device_placement(self, server_args: ServerArgs):
@@ -565,6 +578,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         self._manage_device_placement(server_args)
 
         latents = batch.latents
+        sound_latents = batch.audio_latents
         timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
 
@@ -581,6 +595,20 @@ class Cosmos3DenoisingStage(PipelineStage):
         do_cfg = guidance_scale > 1.0
 
         enable_cfg_parallel = server_args.enable_cfg_parallel and do_cfg
+        if sound_latents is not None and enable_cfg_parallel:
+            raise NotImplementedError(
+                "Cosmos3 sound generation does not support CFG parallel yet"
+            )
+
+        # Use a separate scheduler instance for sound: UniPC keeps a per-call
+        # output history sized to the last sample, so video (5D) and sound (3D)
+        # steps must not share state.
+        sound_scheduler = None
+        if sound_latents is not None:
+            sound_scheduler = copy.deepcopy(self.scheduler)
+            sound_scheduler.set_timesteps(
+                len(timesteps), device=timesteps.device
+            )
         cfg_rank = get_classifier_free_guidance_rank() if enable_cfg_parallel else 0
         cfg_world_size = (
             get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
@@ -657,6 +685,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         noisy_frame_mask=velocity_mask,
                         max_text_seq_len=batch.extra["cond_text_seq_len"],
                         current_timestep=i,
+                        sound_latents=sound_latents,
                     )
                 else:
                     noise_pred = self._predict_noise_cfg_batched(
@@ -675,6 +704,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                             batch.extra["uncond_text_seq_len"],
                         ),
                         current_timestep=i,
+                        sound_latents=sound_latents,
                     )
             else:
                 noise_pred = self._run_transformer(
@@ -688,7 +718,12 @@ class Cosmos3DenoisingStage(PipelineStage):
                     noisy_frame_mask=velocity_mask,
                     max_text_seq_len=batch.extra["cond_text_seq_len"],
                     current_timestep=i,
+                    sound_latents=sound_latents,
                 )
+
+            sound_noise_pred = None
+            if isinstance(noise_pred, tuple):
+                noise_pred, sound_noise_pred = noise_pred
 
             # I2V: zero-velocity at conditioned frames so the scheduler keeps
             # them clean; UniPC's predictor-corrector still rescales the
@@ -703,6 +738,14 @@ class Cosmos3DenoisingStage(PipelineStage):
                 return_dict=False,
             )[0]
 
+            if sound_noise_pred is not None:
+                sound_latents = sound_scheduler.step(
+                    sound_noise_pred,
+                    t,
+                    sound_latents,
+                    return_dict=False,
+                )[0]
+
             if image_latent is not None:
                 latents[:, :, 0:1, :, :] = image_latent
 
@@ -710,6 +753,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                 self.step_profile()
 
         batch.latents = latents
+        if sound_latents is not None:
+            batch.audio_latents = sound_latents
         self.log_info("Denoising complete")
         return batch
 
@@ -727,7 +772,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
         current_timestep: int | None = None,
-    ) -> torch.Tensor:
+        sound_latents: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run CFG by stacking both branches into a batch_size=2 forward.
 
         Halves the kernel-launch count vs running cond and uncond serially.
@@ -743,8 +789,13 @@ class Cosmos3DenoisingStage(PipelineStage):
             if noisy_frame_mask is not None
             else None
         )
+        sound_batched = (
+            torch.cat([sound_latents, sound_latents], dim=0)
+            if sound_latents is not None
+            else None
+        )
 
-        noise_pred = self._run_transformer(
+        out = self._run_transformer(
             latents=latents_batched,
             timestep=timestep_batched,
             text_ids=text_ids_batched,
@@ -755,13 +806,17 @@ class Cosmos3DenoisingStage(PipelineStage):
             noisy_frame_mask=mask_batched,
             max_text_seq_len=max_text_seq_len,
             current_timestep=current_timestep,
+            sound_latents=sound_batched,
         )
 
-        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
-        # CFG: uncond + g·(cond − uncond).
-        return noise_pred_uncond + guidance_scale * (
-            noise_pred_cond - noise_pred_uncond
-        )
+        def _cfg_combine(pred: torch.Tensor) -> torch.Tensor:
+            uncond, cond = pred.chunk(2, dim=0)
+            return uncond + guidance_scale * (cond - uncond)
+
+        if isinstance(out, tuple):
+            video_pred, sound_pred = out
+            return _cfg_combine(video_pred), _cfg_combine(sound_pred)
+        return _cfg_combine(out)
 
     def _predict_noise_cfg_parallel(
         self,
@@ -830,12 +885,13 @@ class Cosmos3DecodingStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def __init__(self, vae, guardrails: bool = False):
+    def __init__(self, vae, guardrails: bool = False, sound_tokenizer=None):
         super().__init__()
         self.vae = vae
         self._latents_mean = None
         self._latents_std = None
         self._guardrails = guardrails
+        self.sound_tokenizer = sound_tokenizer
         if guardrails:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 _init_guardrails,
@@ -935,7 +991,25 @@ class Cosmos3DecodingStage(PipelineStage):
         elif not is_image_gen:
             self.log_info(f"Postprocessed video tensor shape: {output.shape}")
 
+        audio = None
+        audio_sample_rate = None
+        if (
+            self.sound_tokenizer is not None
+            and batch.audio_latents is not None
+        ):
+            with torch.no_grad():
+                decoded_audio = self.sound_tokenizer.decode(
+                    batch.audio_latents.to(device)
+                )
+            audio = decoded_audio.float().cpu()
+            audio_sample_rate = self.sound_tokenizer.sample_rate
+            self.log_info(
+                f"Decoded audio tensor shape: {tuple(audio.shape)} @ {audio_sample_rate} Hz"
+            )
+
         return OutputBatch(
             output=output,
+            audio=audio,
+            audio_sample_rate=audio_sample_rate,
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
         )

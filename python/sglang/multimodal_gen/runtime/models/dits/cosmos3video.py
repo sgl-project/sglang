@@ -138,6 +138,27 @@ def compute_mrope_position_ids_vision(
     return mrope_ids, next_offset
 
 
+def compute_mrope_position_ids_sound(
+    grid_t: int,
+    temporal_offset: int | float,
+    sound_latent_fps: float,
+    device: torch.device,
+    base_fps: float = 24.0,
+    temporal_compression_factor_sound: int = 1,
+) -> tuple[torch.Tensor, int | float]:
+    """mRoPE position IDs for sound tokens: a (T, 1, 1) grid."""
+    return compute_mrope_position_ids_vision(
+        grid_t=grid_t,
+        grid_h=1,
+        grid_w=1,
+        temporal_offset=temporal_offset,
+        device=device,
+        fps=sound_latent_fps,
+        base_fps=base_fps,
+        temporal_compression_factor=temporal_compression_factor_sound,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Qwen3-style RoPE functions
 # -----------------------------------------------------------------------------
@@ -840,6 +861,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.base_fps = arch.base_fps
         self.temporal_compression_factor = arch.temporal_compression_factor
         self.temporal_margin = arch.unified_3d_mrope_temporal_modality_margin
+        self.sound_latent_fps = arch.sound_latent_fps
+        self.temporal_compression_factor_sound = arch.temporal_compression_factor_sound
         self.rms_norm_eps = arch.rms_norm_eps
 
         # Ulysses sequence parallelism. When CFG-parallel is also enabled
@@ -883,6 +906,23 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             quant_config=quant_config,
             prefix="proj_out",
         )
+
+        self.sound_dim = arch.sound_dim
+        self.audio_proj_in = ReplicatedLinear(
+            self.sound_dim,
+            self.hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix="audio_proj_in",
+        )
+        self.audio_proj_out = ReplicatedLinear(
+            self.hidden_size,
+            self.sound_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix="audio_proj_out",
+        )
+        self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
         # Timestep embedder
         self.time_embedder = Cosmos3TimestepEmbedder(
@@ -969,6 +1009,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         Wp: int,
         fps: float | None,
         device: torch.device,
+        sound_frames: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute mRoPE position IDs for UND text and GEN visual tokens."""
         B = text_mask.shape[0]
@@ -983,16 +1024,30 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             t_pos, t_offset = compute_mrope_position_ids_text(
                 real_len, temporal_offset=0, device=device
             )
+            media_offset = t_offset + self.temporal_margin
             v_pos, _ = compute_mrope_position_ids_vision(
                 T,
                 Hp,
                 Wp,
-                temporal_offset=t_offset + self.temporal_margin,
+                temporal_offset=media_offset,
                 device=device,
                 fps=effective_fps,
                 base_fps=self.base_fps,
                 temporal_compression_factor=self.temporal_compression_factor,
             )
+            if sound_frames > 0:
+                s_pos, _ = compute_mrope_position_ids_sound(
+                    sound_frames,
+                    temporal_offset=media_offset,
+                    sound_latent_fps=self.sound_latent_fps,
+                    device=device,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor_sound=self.temporal_compression_factor_sound,
+                )
+                pos_dtype = torch.promote_types(v_pos.dtype, s_pos.dtype)
+                v_pos = torch.cat(
+                    [v_pos.to(pos_dtype), s_pos.to(pos_dtype)], dim=1
+                )
             if real_len < S_text:
                 t_pos = torch.cat(
                     [
@@ -1007,7 +1062,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             vis_pos_list.append(v_pos)
 
         text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)  # [3, B, S_text]
-        vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)  # [3, B, S_vis]
+        vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)  # [3, B, S_gen]
 
         return text_pos_ids, vis_pos_ids
 
@@ -1049,8 +1104,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
+        sound_latents: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Forward pass for denoising.
 
         Args:
@@ -1083,6 +1139,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         if max_text_seq_len < text_ids.shape[1]:
             text_ids = text_ids[:, :max_text_seq_len]
             text_mask = text_mask[:, :max_text_seq_len]
+
+        sound_frames = 0
+        if sound_latents is not None:
+            if self.sp_size > 1:
+                raise NotImplementedError(
+                    "Cosmos3 sound generation does not support sequence parallelism yet"
+                )
+            sound_frames = sound_latents.shape[-1]
 
         # Check if sequence parallelism is enabled
         sequence_shard_enabled = self.sp_size > 1
@@ -1141,6 +1205,15 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         else:
             hidden_gen = hidden_gen + time_embed.unsqueeze(1)
 
+        if sound_latents is not None:
+            packed_sound = sound_latents.permute(0, 2, 1).to(hidden_gen.dtype)
+            hidden_sound, _ = self.audio_proj_in(packed_sound)
+            hidden_sound = hidden_sound + self.audio_modality_embed.to(
+                hidden_sound.dtype
+            )
+            hidden_sound = hidden_sound + time_embed.unsqueeze(1)
+            hidden_gen = torch.cat([hidden_gen, hidden_sound], dim=1)
+
         self._ensure_cache_dicts()
 
         # Compute UND K/V cache for this cache_key if not already cached
@@ -1150,7 +1223,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             or cache_key not in self.cached_gen_rope_inputs
         ):
             text_pos_ids, vis_pos_ids = self._compute_rope_position_ids(
-                text_mask, T, Hp, Wp, fps, hidden_states.device
+                text_mask, T, Hp, Wp, fps, hidden_states.device,
+                sound_frames=sound_frames,
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN
@@ -1198,14 +1272,26 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # this cuts the post-loop SP collective bandwidth ~21x.
         hidden_gen = hidden_gen + residual
         hidden_gen = self.norm_moe_gen(hidden_gen)
-        output, _ = self.proj_out(hidden_gen)
+
+        if sound_frames > 0:
+            s_video = hidden_gen.shape[1] - sound_frames
+            video_hidden = hidden_gen[:, :s_video, :]
+            sound_hidden = hidden_gen[:, s_video:, :]
+            output, _ = self.proj_out(video_hidden)
+            sound_output, _ = self.audio_proj_out(sound_hidden)
+            sound_pred = sound_output.permute(0, 2, 1).contiguous()
+        else:
+            output, _ = self.proj_out(hidden_gen)
 
         if sequence_shard_enabled:
             output = sequence_model_parallel_all_gather(output, dim=1)
             if seq_shard_pad > 0:
                 output = output[:, :seq_len_orig, :]
 
-        return self.unpatchify(output, T, H, W)
+        video_pred = self.unpatchify(output, T, H, W)
+        if sound_frames > 0:
+            return video_pred, sound_pred
+        return video_pred
 
     def preprocess_loaded_state_dict(
         self, iterator: Iterable[tuple[str, torch.Tensor]]

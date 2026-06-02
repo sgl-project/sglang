@@ -41,6 +41,7 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         "vae",
         "transformer",
         "scheduler",
+        "sound_tokenizer",
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
@@ -58,6 +59,7 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         vae = self.get_module("vae")
         transformer = self.get_module("transformer")
         scheduler = self.get_module("scheduler")
+        sound_tokenizer = self.get_module("sound_tokenizer")
 
         guardrails_disabled = (
             os.environ.get("SGLANG_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
@@ -86,7 +88,11 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
         self.add_stage(Cosmos3DenoisingStage(transformer, scheduler, server_args))
-        self.add_stage(Cosmos3DecodingStage(vae, guardrails=guardrails_on))
+        self.add_stage(
+            Cosmos3DecodingStage(
+                vae, guardrails=guardrails_on, sound_tokenizer=sound_tokenizer
+            )
+        )
 
         logger.info(
             "Cosmos3 pipeline stages created successfully (guardrails=%s)",

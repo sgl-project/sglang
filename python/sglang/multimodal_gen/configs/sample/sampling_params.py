@@ -158,6 +158,9 @@ class SamplingParams:
         default=None, metadata={"batch_sig_exclude": True}
     )  # None means all resolutions allowed
 
+    # Output audio duration in seconds (models without an audio modality ignore this).
+    sound_duration: float = 0.0
+
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = 1.0
@@ -840,6 +843,11 @@ class SamplingParams:
             "--num-frames",
             type=int,
             help="Number of frames to generate",
+        )
+        add_argument(
+            "--sound-duration",
+            type=float,
+            help="Duration of generated audio in seconds; 0 disables audio output (audio-capable models only)",
         )
         add_argument(
             "--height",
