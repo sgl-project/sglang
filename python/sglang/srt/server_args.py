@@ -773,6 +773,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
     enable_return_indexer_topk: bool = False
+    enable_deepseek_v4_fp4_indexer: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -2066,6 +2067,20 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
 
+            if is_sm120_supported():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "marlin"
+                    logger.info(
+                        "Use marlin as MoE runner backend on SM120 for DeepseekV4"
+                    )
+                # SM120 lacks tcgen05/TMEM: disable features that depend on
+                # DeepGEMM or require >99KB SMEM (topk_v2).
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
@@ -2148,6 +2163,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
+                    # The AITER MXFP4 fused-MoE path for GPT-OSS expects the
+                    # SEPARATED gate/up tile layout (matches the
+                    # `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+                    # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
+                    # callers default to INTERLEAVE; opt this path out
+                    # unless the user explicitly overrode it.
+                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
@@ -3127,17 +3149,14 @@ class ServerArgs:
     def _handle_linear_attn_backend(self):
         import torch
 
-        # SM100+: default to FlashInfer GDN decode when the user hasn't
-        # explicitly chosen a decode backend and mamba-ssm-dtype is bf16
-        # (required by FlashInfer GDN on SM100+).
+        # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
+        # when the user hasn't explicitly chosen a decode backend and
+        # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
-        # Excluded when MTP speculative decoding is enabled because
-        # FlashInfer GDN MTP verify is not yet supported on SM100+.
         if (
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
-            and self.speculative_algorithm is None
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
@@ -4060,6 +4079,11 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
+        if self.enable_deepseek_v4_fp4_indexer and not is_sm100_supported():
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
+                "DeepGEMM FP4 indexer support."
+            )
         # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
         if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
             if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
@@ -6653,6 +6677,11 @@ class ServerArgs:
             help="Enable returning indexer topk indices of layers with indexer with responses.",
         )
         parser.add_argument(
+            "--enable-deepseek-v4-fp4-indexer",
+            action="store_true",
+            help="Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -6833,9 +6862,12 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
-            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+            help="The InfiniBand devices for disaggregation transfer. Supports a single device "
+            "(e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list "
+            "(e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping "
+            '(e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), '
+            "or a path to a JSON file containing that mapping. Default is None, which triggers "
+            "automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",

@@ -339,6 +339,10 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_decode_hicache = (
+            server_args.disaggregation_decode_enable_radix_cache
+            and self.enable_hierarchical_cache
+        )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -2628,6 +2632,8 @@ class Scheduler(
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
+            # Account for LoRAs that are already loaded in the adder, such as chunked requests
+            running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
