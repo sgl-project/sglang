@@ -464,6 +464,7 @@ class CommonKVManager(BaseKVManager):
                 if not disconnected:
                     return sock
                 sock.close(linger=0)
+                monitor.close()
                 self._monitor_cache.pop(endpoint, None)
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
