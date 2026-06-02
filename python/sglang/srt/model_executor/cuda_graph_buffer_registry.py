@@ -759,3 +759,108 @@ def build_decode_registry(
                 )
 
     return reg
+
+
+def build_prefill_registry(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    cache_loc_dtype: torch.dtype,
+    is_multimodal: bool = False,
+    hidden_size: int = 0,
+    embed_dtype: Optional[torch.dtype] = None,
+    enable_mamba_track: bool = False,
+    share_pool: bool = True,
+    source: Optional[Any] = None,
+) -> CudaGraphBufferRegistry:
+    """Registry mirroring the **token-axis** FB-shared buffers for the
+    piecewise / breakable (prefill) cuda-graph runners.
+
+    Padding policies match the inline copy/zero in
+    ``PiecewiseCudaGraphRunner.replay_prepare``: ``input_ids`` / ``positions``
+    / ``out_cache_loc`` / ``mrope_positions`` / ``input_embeds`` reset their
+    padded tail ``[raw_num_tokens:padded_num_tokens]`` to ``0`` (the padded
+    tokens *are* processed by the graph, so they must be benign), then the head
+    ``[:raw_num_tokens]`` is copied from the FB. ``input_embeds`` is not an FB
+    copy — the model writes the embeds into it inside the graph — so it is
+    reset-only (``copy_from_fb=False``). ``mamba_track_*`` are bs-axis copies
+    with no padding reset (bs is not padded on this path).
+
+    When ``source`` is given, each slot adopts the same-named tensor off
+    ``source`` (the ``PrefillInputBuffers``) instead of allocating, so the
+    registry shares one physical allocation (and ``data_ptr``) with it.
+    """
+    reg = CudaGraphBufferRegistry(
+        device=device,
+        max_bs=max_bs,
+        max_num_tokens=max_num_token,
+        share_pool=share_pool,
+    )
+
+    def _tokens(_bs: int, mt: int) -> Tuple[int, ...]:
+        return (mt,)
+
+    def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
+        return (bs,)
+
+    slots = [
+        GraphSlot(
+            "input_ids",
+            _tokens,
+            torch.int64,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+        ),
+        GraphSlot(
+            "positions",
+            _tokens,
+            torch.int64,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+        ),
+        GraphSlot(
+            "out_cache_loc",
+            _tokens,
+            cache_loc_dtype,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+        ),
+    ]
+    if is_multimodal:
+        slots.append(
+            GraphSlot(
+                "mrope_positions",
+                lambda _bs2, mt: (3, mt),
+                torch.int64,
+                axis="tokens",
+                padding_policy=PaddingPolicy.ZERO,
+                slice_fn=lambda buf, n: buf[:, :n],
+            )
+        )
+        slots.append(
+            GraphSlot(
+                "input_embeds",
+                lambda _bs2, mt: (mt, hidden_size),
+                embed_dtype,
+                axis="tokens",
+                padding_policy=PaddingPolicy.ZERO,
+                copy_from_fb=False,
+            )
+        )
+    if enable_mamba_track:
+        slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
+        slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
+        slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
+
+    for slot in slots:
+        bind = None
+        if source is not None:
+            bind = getattr(source, slot.name, None)
+            if bind is None:
+                raise ValueError(
+                    f"source is missing buffer {slot.name!r} required by the "
+                    "prefill registry; cannot adopt."
+                )
+        reg.register_slot(slot, bind=bind)
+    return reg

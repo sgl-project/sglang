@@ -50,6 +50,10 @@ class _MiniForwardBatch:
     ngram_embedding_info: Optional[object] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
+    input_embeds: Optional[torch.Tensor] = None
+    mamba_track_indices: Optional[torch.Tensor] = None
+    mamba_track_mask: Optional[torch.Tensor] = None
+    mamba_track_seqlens: Optional[torch.Tensor] = None
     forward_mode: Optional[str] = None
     spec_info: Optional[object] = None
 
@@ -930,6 +934,124 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(torch.equal(rids[:2], torch.tensor([10, 11], dtype=torch.int64)))
         self.assertTrue(torch.equal(boot[:2], torch.tensor([20, 21], dtype=torch.int64)))
         self.assertTrue(torch.all(boot[2:] == -1))
+
+
+class TestBuildPrefillRegistry(unittest.TestCase):
+    """Token-axis prefill registry (piecewise / breakable runners): ZERO-tail
+    padding, input_embeds reset-only, mamba bs-axis copy, source adoption."""
+
+    def _src(self, **extra):
+        base = dict(
+            input_ids=torch.zeros(16, dtype=torch.int64),
+            positions=torch.zeros(16, dtype=torch.int64),
+            out_cache_loc=torch.zeros(16, dtype=torch.int64),
+        )
+        base.update(extra)
+        return SimpleNamespace(**base)
+
+    def test_core_token_slots_zero_tail_and_copy_head(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        src = self._src()
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        for name in ("input_ids", "positions", "out_cache_loc"):
+            self.assertEqual(
+                reg.get_slot(name).buffer.data_ptr(),
+                getattr(src, name).data_ptr(),
+                name,
+            )
+        # poison tails so the ZERO reset is observable
+        for name in ("input_ids", "positions", "out_cache_loc"):
+            reg.get_slot(name).buffer.fill_(7)
+        fb = _MiniForwardBatch(
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
+            positions=torch.tensor([4, 5, 6], dtype=torch.int64),
+            out_cache_loc=torch.tensor([8, 9, 10], dtype=torch.int64),
+        )
+        # raw 3 tokens, padded (static) bucket 8
+        reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
+        ids = reg.get_slot("input_ids").buffer
+        self.assertTrue(torch.equal(ids[:3], torch.tensor([1, 2, 3], dtype=torch.int64)))
+        self.assertTrue(torch.all(ids[3:8] == 0))  # padded tail reset
+        self.assertTrue(torch.all(ids[8:] == 7))  # beyond the bucket: untouched
+
+    def test_multimodal_input_embeds_reset_only(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        src = self._src(
+            mrope_positions=torch.zeros((3, 16), dtype=torch.int64),
+            input_embeds=torch.zeros((16, 4), dtype=torch.float32),
+        )
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=True,
+            hidden_size=4,
+            embed_dtype=torch.float32,
+            source=src,
+        )
+        self.assertTrue(reg.has_slot("mrope_positions"))
+        self.assertTrue(reg.has_slot("input_embeds"))
+        emb = reg.get_slot("input_embeds").buffer
+        emb.fill_(5.0)  # the model would write real embeds here; we just check reset
+        fb = _MiniForwardBatch(
+            input_ids=torch.zeros(3, dtype=torch.int64),
+            positions=torch.zeros(3, dtype=torch.int64),
+            out_cache_loc=torch.zeros(3, dtype=torch.int64),
+            mrope_positions=torch.ones((3, 3), dtype=torch.int64),
+            input_embeds=torch.full((3, 4), 9.0),  # must be ignored (copy_from_fb=False)
+        )
+        reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
+        # input_embeds: head NOT copied from FB; padded tail zeroed.
+        self.assertTrue(torch.all(emb[:3] == 5.0))
+        self.assertTrue(torch.all(emb[3:8] == 0.0))
+        # mrope: head copied, 2D tail zeroed.
+        mr = reg.get_slot("mrope_positions").buffer
+        self.assertTrue(torch.all(mr[:, :3] == 1))
+        self.assertTrue(torch.all(mr[:, 3:8] == 0))
+
+    def test_mamba_bs_axis_copy(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        idx = torch.zeros(2, dtype=torch.int64)
+        src = self._src(
+            mamba_track_indices=idx,
+            mamba_track_mask=torch.zeros(2, dtype=torch.bool),
+            mamba_track_seqlens=torch.zeros(2, dtype=torch.int32),
+        )
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_track=True,
+            source=src,
+        )
+        self.assertTrue(reg.has_slot("mamba_track_indices"))
+        fb = _MiniForwardBatch(
+            input_ids=torch.zeros(3, dtype=torch.int64),
+            positions=torch.zeros(3, dtype=torch.int64),
+            out_cache_loc=torch.zeros(3, dtype=torch.int64),
+            mamba_track_indices=torch.tensor([3, 4], dtype=torch.int64),
+            mamba_track_mask=torch.zeros(2, dtype=torch.bool),
+            mamba_track_seqlens=torch.zeros(2, dtype=torch.int32),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=3, padded_num_tokens=8)
+        self.assertTrue(torch.equal(idx, torch.tensor([3, 4], dtype=torch.int64)))
 
 
 class TestFillOncePolicy(unittest.TestCase):
