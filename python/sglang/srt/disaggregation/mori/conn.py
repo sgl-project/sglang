@@ -35,6 +35,10 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     group_concurrent_contiguous,
+    pack_int_lists,
+    pack_list_of_buffers,
+    unpack_int_lists,
+    unpack_list_of_buffers,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
@@ -65,6 +69,21 @@ def _unpack_mem_desc_list(blob: bytes) -> List[MemoryDesc]:
         return []
     desc_blobs = msgspec.msgpack.decode(blob)
     return [MemoryDesc.unpack(b) for b in desc_blobs]
+
+
+def _pack_mem_desc_lists(grouped: List[List[MemoryDesc]]) -> bytes:
+    """Pack a list of MemoryDesc components (each itself a list of descs).
+    Matches the nested wire format used by `pack_int_lists` so that
+    component boundaries survive the round-trip."""
+    if not grouped:
+        return b""
+    return pack_list_of_buffers([_pack_mem_desc_list(g) for g in grouped])
+
+
+def _unpack_mem_desc_lists(blob: bytes) -> List[List[MemoryDesc]]:
+    if not blob:
+        return []
+    return [_unpack_mem_desc_list(b) for b in unpack_list_of_buffers(blob)]
 
 
 @dataclasses.dataclass
@@ -125,13 +144,13 @@ class KVArgsRegisterInfo:
     engine_desc: EngineDesc
     dst_kv_mem_descs: List[MemoryDesc]
     dst_aux_mem_descs: List[MemoryDesc]
-    dst_state_mem_descs: List[MemoryDesc]
+    dst_state_mem_descs: List[List[MemoryDesc]]
     gpu_id: int
     decode_tp_size: int
     decode_tp_rank: int
     dst_kv_item_len: int
-    dst_state_item_lens: List[int]
-    dst_state_dim_per_tensor: List[int]
+    dst_state_item_lens: List[List[int]]
+    dst_state_dim_per_tensor: List[List[int]]
 
     @property
     def engine_key(self) -> str:
@@ -144,18 +163,18 @@ class KVArgsRegisterInfo:
         engine_desc = EngineDesc.unpack(payload[3])
         dst_kv_mem_descs = _unpack_mem_desc_list(payload[4])
         dst_aux_mem_descs = _unpack_mem_desc_list(payload[5])
-        dst_state_mem_descs = _unpack_mem_desc_list(payload[6])
+        dst_state_mem_descs = _unpack_mem_desc_lists(payload[6])
         gpu_id = int(payload[7].decode("ascii"))
         decode_tp_size = int(payload[8].decode("ascii"))
         decode_tp_rank = int(payload[9].decode("ascii"))
         dst_kv_item_len = int(payload[10].decode("ascii"))
         dst_state_item_lens = (
-            list(struct.unpack(f"{len(payload[11]) // 4}I", payload[11]))
+            unpack_int_lists(payload[11], "I")
             if len(payload) > 11 and len(payload[11]) > 0
             else []
         )
         dst_state_dim_per_tensor = (
-            list(struct.unpack(f"{len(payload[12]) // 4}I", payload[12]))
+            unpack_int_lists(payload[12], "I")
             if len(payload) > 12 and len(payload[12]) > 0
             else []
         )
@@ -244,7 +263,7 @@ class MoriKVManager(CommonKVManager):
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
         self.aux_mem_descs: List[MemoryDesc] = []
-        self.state_mem_descs: List[MemoryDesc] = []
+        self.state_mem_descs: List[List[MemoryDesc]] = []
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
@@ -338,6 +357,7 @@ class MoriKVManager(CommonKVManager):
             self.kv_args.state_data_ptrs,
             getattr(self.kv_args, "state_data_lens", []),
         ):
+            component_descs: List[MemoryDesc] = []
             for ptr, length in zip(component_ptrs, component_lens):
                 desc = self.engine.register_memory(
                     ptr,
@@ -345,7 +365,8 @@ class MoriKVManager(CommonKVManager):
                     self.kv_args.gpu_id,
                     MemoryLocationType.GPU,
                 )
-                self.state_mem_descs.append(desc)
+                component_descs.append(desc)
+            self.state_mem_descs.append(component_descs)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -911,7 +932,28 @@ class MoriKVManager(CommonKVManager):
         if not self.state_mem_descs:
             return []
 
-        state_type = getattr(self.kv_args, "state_type", "none")
+        # Derive state_type from the rebase's per-component state_types list.
+        # MORI's current send_state interface takes a single flat
+        # src_state_indices/dst_state_indices pair, so we only support the
+        # homogeneous-component case (all components of the same StateType).
+        state_types = getattr(self.kv_args, "state_types", None)
+        if state_types:
+            first = state_types[0]
+            first_val = first.value if hasattr(first, "value") else first
+            if not all(
+                (t.value if hasattr(t, "value") else t) == first_val
+                for t in state_types
+            ):
+                raise RuntimeError(
+                    "PD state transfer failed: MORI does not yet support "
+                    f"heterogeneous state_types={state_types}; please add "
+                    "per-component dispatch in send_state."
+                )
+            state_type = str(first_val).lower()
+        else:
+            state_type = str(
+                getattr(self.kv_args, "state_type", "none")
+            ).lower()
 
         if state_type == "none":
             raise RuntimeError(
@@ -927,17 +969,36 @@ class MoriKVManager(CommonKVManager):
 
         if len(peer_info.dst_state_mem_descs) != len(self.state_mem_descs):
             raise RuntimeError(
-                f"PD state transfer failed: state descriptor count mismatch "
+                f"PD state transfer failed: state component count mismatch "
                 f"(local={len(self.state_mem_descs)}, remote={len(peer_info.dst_state_mem_descs)}), "
                 f"likely PP configuration mismatch (state_type={state_type})"
             )
+        for c, (local_comp, remote_comp) in enumerate(
+            zip(self.state_mem_descs, peer_info.dst_state_mem_descs)
+        ):
+            if len(local_comp) != len(remote_comp):
+                raise RuntimeError(
+                    f"PD state transfer failed: component {c} descriptor count "
+                    f"mismatch (local={len(local_comp)}, remote={len(remote_comp)}), "
+                    f"state_type={state_type}"
+                )
 
         if len(self.kv_args.state_item_lens) != len(self.state_mem_descs):
             raise RuntimeError(
-                f"PD state transfer failed: local state_item_lens count "
-                f"({len(self.kv_args.state_item_lens)}) does not match state descriptor "
-                f"count ({len(self.state_mem_descs)}) (state_type={state_type})"
+                f"PD state transfer failed: local state_item_lens component count "
+                f"({len(self.kv_args.state_item_lens)}) does not match state "
+                f"descriptor component count ({len(self.state_mem_descs)}) "
+                f"(state_type={state_type})"
             )
+        for c, (lens_comp, descs_comp) in enumerate(
+            zip(self.kv_args.state_item_lens, self.state_mem_descs)
+        ):
+            if len(lens_comp) != len(descs_comp):
+                raise RuntimeError(
+                    f"PD state transfer failed: component {c} state_item_lens "
+                    f"length ({len(lens_comp)}) does not match descriptor count "
+                    f"({len(descs_comp)}) (state_type={state_type})"
+                )
 
         if state_type == "mamba":
             return self._send_mamba_state(
@@ -988,54 +1049,74 @@ class MoriKVManager(CommonKVManager):
         local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank = peer_info.decode_tp_rank % peer_info.decode_tp_size
 
-        for i in range(len(self.state_mem_descs)):
-            src_desc = self.state_mem_descs[i]
-            dst_desc = peer_info.dst_state_mem_descs[i]
-            src_item_len = self.kv_args.state_item_lens[i]
-
-            if not tp_mismatch:
-                # same-TP: whole item copy
-                src_offset = src_idx * src_item_len
-                dst_offset = dst_idx * src_item_len
-                size = src_item_len
-            else:
-                # TP mismatch slice copy
-                dst_item_len = peer_info.dst_state_item_lens[i]
-                src_dim = src_state_dim_per_tensor[i]
-                dst_dim = dst_state_dim_per_tensor[i]
-
-                src_bytes_per_dim = src_item_len // src_dim
-
-                if self.attn_tp_size > peer_info.decode_tp_size:
-                    src_dim_start = 0
-                    num_dims_to_send = src_dim
-                    writers_per_decode = self.attn_tp_size // peer_info.decode_tp_size
-                    local_writer_idx = local_tp_rank % writers_per_decode
-                    dst_dim_start = local_writer_idx * src_dim
-                else:
-                    src_dim_start = (dst_tp_rank * dst_dim) % src_dim
-                    num_dims_to_send = dst_dim
-                    dst_dim_start = 0
-
-                dst_bytes_per_dim = dst_item_len // dst_dim
-                src_dim_offset = src_dim_start * src_bytes_per_dim
-                dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-                bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-                src_offset = src_idx * src_item_len + src_dim_offset
-                dst_offset = dst_idx * dst_item_len + dst_dim_offset
-                size = bytes_to_send
-
-            transfer_uid = self.engine.allocate_transfer_uid()
-            batch_statuses = self.engine.batch_write(
-                [src_desc],
-                [[src_offset]],
-                [dst_desc],
-                [[dst_offset]],
-                [[size]],
-                [transfer_uid],
+        for c, src_comp_descs in enumerate(self.state_mem_descs):
+            dst_comp_descs = peer_info.dst_state_mem_descs[c]
+            src_item_lens_comp = self.kv_args.state_item_lens[c]
+            dst_item_lens_comp = (
+                peer_info.dst_state_item_lens[c]
+                if c < len(peer_info.dst_state_item_lens)
+                else []
             )
-            statuses.extend(batch_statuses)
+            src_dim_comp = (
+                src_state_dim_per_tensor[c]
+                if c < len(src_state_dim_per_tensor)
+                else []
+            )
+            dst_dim_comp = (
+                dst_state_dim_per_tensor[c]
+                if c < len(dst_state_dim_per_tensor)
+                else []
+            )
+            for b in range(len(src_comp_descs)):
+                src_desc = src_comp_descs[b]
+                dst_desc = dst_comp_descs[b]
+                src_item_len = src_item_lens_comp[b]
+
+                if not tp_mismatch:
+                    # same-TP: whole item copy
+                    src_offset = src_idx * src_item_len
+                    dst_offset = dst_idx * src_item_len
+                    size = src_item_len
+                else:
+                    # TP mismatch slice copy
+                    dst_item_len = dst_item_lens_comp[b]
+                    src_dim = src_dim_comp[b]
+                    dst_dim = dst_dim_comp[b]
+
+                    src_bytes_per_dim = src_item_len // src_dim
+
+                    if self.attn_tp_size > peer_info.decode_tp_size:
+                        src_dim_start = 0
+                        num_dims_to_send = src_dim
+                        writers_per_decode = (
+                            self.attn_tp_size // peer_info.decode_tp_size
+                        )
+                        local_writer_idx = local_tp_rank % writers_per_decode
+                        dst_dim_start = local_writer_idx * src_dim
+                    else:
+                        src_dim_start = (dst_tp_rank * dst_dim) % src_dim
+                        num_dims_to_send = dst_dim
+                        dst_dim_start = 0
+
+                    dst_bytes_per_dim = dst_item_len // dst_dim
+                    src_dim_offset = src_dim_start * src_bytes_per_dim
+                    dst_dim_offset = dst_dim_start * dst_bytes_per_dim
+                    bytes_to_send = num_dims_to_send * src_bytes_per_dim
+
+                    src_offset = src_idx * src_item_len + src_dim_offset
+                    dst_offset = dst_idx * dst_item_len + dst_dim_offset
+                    size = bytes_to_send
+
+                transfer_uid = self.engine.allocate_transfer_uid()
+                batch_statuses = self.engine.batch_write(
+                    [src_desc],
+                    [[src_offset]],
+                    [dst_desc],
+                    [[dst_offset]],
+                    [[size]],
+                    [transfer_uid],
+                )
+                statuses.extend(batch_statuses)
 
         return statuses
 
@@ -1079,18 +1160,23 @@ class MoriKVManager(CommonKVManager):
         )
 
         statuses = []
-        for i in range(len(self.state_mem_descs)):
-            src_desc = self.state_mem_descs[i]
-            dst_desc = peer_info.dst_state_mem_descs[i]
-            state_item_len = self.kv_args.state_item_lens[i]
+        for c, src_comp_descs in enumerate(self.state_mem_descs):
+            dst_comp_descs = peer_info.dst_state_mem_descs[c]
+            item_lens_comp = self.kv_args.state_item_lens[c]
+            for b in range(len(src_comp_descs)):
+                src_desc = src_comp_descs[b]
+                dst_desc = dst_comp_descs[b]
+                state_item_len = item_lens_comp[b]
 
-            statuses.extend(
-                self._submit_batch_transfer_plan(
-                    src_desc,
-                    dst_desc,
-                    self._build_contiguous_transfer_plan(grouped_plan, state_item_len),
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        src_desc,
+                        dst_desc,
+                        self._build_contiguous_transfer_plan(
+                            grouped_plan, state_item_len
+                        ),
+                    )
                 )
-            )
 
         return statuses
 
@@ -1382,19 +1468,17 @@ class MoriKVReceiver(CommonKVReceiver):
         engine_desc_blob = self.kv_mgr.engine_desc.pack()
         packed_kv_descs = _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
         packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
-        packed_state_descs = _pack_mem_desc_list(self.kv_mgr.state_mem_descs)
+        packed_state_descs = _pack_mem_desc_lists(self.kv_mgr.state_mem_descs)
         gpu_id = str(self.kv_mgr.kv_args.gpu_id).encode("ascii")
         decode_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
         decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
         kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
-        packed_state_item_lens = b"".join(
-            struct.pack("I", item_len)
-            for item_len in self.kv_mgr.kv_args.state_item_lens
+        state_item_lens = self.kv_mgr.kv_args.state_item_lens
+        state_dim_per_tensor = (
+            getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or []
         )
-        state_dim_per_tensor = getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", [])
-        packed_state_dim_per_tensor = b"".join(
-            struct.pack("I", dim) for dim in state_dim_per_tensor
-        )
+        packed_state_item_lens = pack_int_lists(state_item_lens, "I")
+        packed_state_dim_per_tensor = pack_int_lists(state_dim_per_tensor, "I")
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
