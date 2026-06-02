@@ -91,7 +91,7 @@ class SessionSlot:
         # is None`, or the retract cleanup) sees no dangling pointers
         # into slot-owned tensors. Without this the alloc path can decide
         # the req still has a ping-pong buffer and skip alloc, causing
-        # the slot's tensor to be re-used by a new req and leaked when
+        # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
         req.req_pool_idx = None
         req.mamba_pool_idx = None
