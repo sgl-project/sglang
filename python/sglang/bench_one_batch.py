@@ -459,6 +459,11 @@ def extend(reqs, model_runner):
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
+    # bench_one_batch bypasses the scheduler so resolve_forward_inputs() never
+    # runs; materialize the deferred H2D copy that #25945 moved out of prepare_for_extend.
+    if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+        batch.input_ids = batch.prefill_input_ids_cpu.to(batch.device)
+        batch.prefill_input_ids_cpu = None
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     forward_batch = ForwardBatch.init_new(batch, model_runner)
     logits_output = model_runner.forward(forward_batch).logits_output

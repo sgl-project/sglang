@@ -43,7 +43,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 WORKDIR /sgl-workspace
 
 RUN  pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
-     pip install --no-cache-dir torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+     pip install --no-cache-dir torch==2.11.0+xpu torchvision torchaudio==2.11.0+xpu \
+         --index-url https://download.pytorch.org/whl/xpu \
+         --extra-index-url https://pypi.org/simple/
 
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
