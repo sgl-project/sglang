@@ -1,0 +1,55 @@
+{
+  "what": "oracle sampling-stride reference + dense-DS within-budget reference (AC-1)",
+  "oracle_sampling_stride": {
+    "hardcoded_stride": 1,
+    "source": "selection_kernel.py::_maybe_record_recall_oracle -> oracle_payload_for_row(stride=1)",
+    "emitted_stride_value_counts": {
+      "1": 14640
+    },
+    "records_total": 14640,
+    "records_success": 14640,
+    "default_equals_stride1": true,
+    "interpretation": "The oracle samples score-only recall over ALL needle tokens (stride=1, dense); it never subsamples. So the 'default stride' IS stride=1 and a separate sparse-stride run is N/A \u2014 proven: every success record carries stride==1."
+  },
+  "score_only_recall_at_k_by_length": {
+    "4096": {
+      "512": 0.1747950819672131,
+      "1024": 0.2752049180327869,
+      "2048": 0.4395491803278688,
+      "4096": 0.8559426229508197,
+      "8192": 1.0
+    },
+    "16384": {
+      "512": 0.12069672131147541,
+      "1024": 0.16577868852459016,
+      "2048": 0.23073770491803278,
+      "4096": 0.3122950819672131,
+      "8192": 0.4594262295081967
+    },
+    "65536": {
+      "512": 0.02889344262295082,
+      "1024": 0.09692622950819672,
+      "2048": 0.1543032786885246,
+      "4096": 0.19631147540983607,
+      "8192": 0.24385245901639344
+    }
+  },
+  "dense_ds_within_budget_reference": {
+    "length_words": 1024,
+    "tokenized_le_2048": true,
+    "ds_default_recall": 1.0,
+    "ds_hybrid_recall": 1.0,
+    "note": "context <= 2048 budget => DS selects densely (dense-DS) => 100%"
+  },
+  "default_stride_beyond_budget_served_recall": {
+    "4096": {
+      "ds_default_recall": 0.8,
+      "ds_hybrid_recall": 0.8
+    },
+    "16384": {
+      "ds_default_recall": 0.06,
+      "ds_hybrid_recall": 0.38
+    }
+  },
+  "verdict": "PASS"
+}

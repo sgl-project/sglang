@@ -13,6 +13,7 @@ def main():
     ap.add_argument("--num", type=int, default=200)
     ap.add_argument("--data-dir", default=os.environ.get("AC12_MMLU_DATA_DIR", "/root/ac12_mmlu_data"))
     ap.add_argument("--label", default="ds")
+    ap.add_argument("--op-point", default="graph-mode int8 / mem 0.7 / TP=8 (or DSA native-NSA)")
     ap.add_argument("--out", default="development/loop7/mmlu_result.json")
     args = ap.parse_args()
     url = os.environ.get("DS_BASE_URL", "http://127.0.0.1:30000")
@@ -31,7 +32,10 @@ def main():
         if (i + 1) % 50 == 0:
             print(f"  {i+1}/{n} acc={correct/(i+1)*100:.1f}% ({time.time()-t0:.0f}s)", flush=True)
     acc = correct / n if n else 0.0
-    out = {"label": args.label, "num_examples": n, "hits": correct,
+    out = {"label": args.label, "op_point": args.op_point, "graph_mode": "cuda_graph",
+           "transport": "raw /generate, 5-shot Answer: prompt, max_new_tokens=4",
+           "example_seed": "deterministic (_load_mmlu_examples seed=0xAC12) -> same questions across servers",
+           "data_dir": args.data_dir, "num_examples": n, "hits": correct,
            "score_pct": round(acc * 100, 2), "elapsed_s": round(time.time() - t0, 1)}
     with open(args.out, "w") as fh:
         json.dump(out, fh, indent=2)

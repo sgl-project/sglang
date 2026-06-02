@@ -1,0 +1,20 @@
+{
+  "what": "oracle-off graph-safe DS selector: byte-identical vs eager + zero-alloc under CUDA-graph replay",
+  "recall_oracle": false,
+  "graph_mode": "cuda_graph_capture_replay",
+  "dtype": "fp32_signatures",
+  "top_k": 8,
+  "bs": 2,
+  "max_seq_len": 48,
+  "num_heads": 4,
+  "label_dim": 8,
+  "replay_steps": 120,
+  "eager_indices_sha16": "87426fc4269cd235",
+  "replay_indices_sha16": "87426fc4269cd235",
+  "eager_lengths_sha16": "c0cdbb6e45249a71",
+  "replay_indices_byte_identical_to_eager": true,
+  "replay_lengths_byte_identical_to_eager": true,
+  "replay_allocation_delta_bytes": 0,
+  "replay_zero_new_allocations": true,
+  "verdict": "PASS"
+}

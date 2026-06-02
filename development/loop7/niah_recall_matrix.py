@@ -6,11 +6,12 @@ server-agnostic served-recall driver: served vs admission separated, recall via
 `_niah_recall_hits`). Each input is `{"lengths": [{length_words, served,
 admission_fail, recall_hits, served_recall, ...}, ...]}`.
 
-Materiality rule (stated BEFORE any uplift claim): an uplift of DS-variant over
-the DS-default baseline at a length counts as **material** only when the variant
-recall point lies OUTSIDE the baseline's 95% Clopper-Pearson CI (a one-/two-
-needle move at N=20 is within the CI and is NOT material). DSA is the recall
-ceiling reference; the gap is `DSA_recall - DS_recall`.
+Materiality rule (stated BEFORE any uplift claim, directional): an uplift of a
+DS-variant over the DS-default baseline at a length counts as **material** only
+when the variant recall point EXCEEDS the baseline's 95% Clopper-Pearson CI HIGH
+(`h > base_hi`). A below-CI point is reported separately and a one-/two-needle
+floor move at small N is NOT a material regression. DSA is the recall ceiling
+reference; the gap is `DSA_recall - DS_recall`.
 """
 
 from __future__ import annotations

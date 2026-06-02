@@ -3710,6 +3710,43 @@ class TestCUDAGraphCapture(unittest.TestCase):
         )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_oracle_off_replay_byte_identical_and_zero_alloc(self):
+        """AC-1 'zero hot-path cost': with the recall oracle OFF (default), the
+        production graph-safe selector under CUDA-graph capture/replay is
+        byte-identical to the eager path AND allocates nothing under replay."""
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state, assert_no_alloc_in_region, capture_decode_step,
+        )
+        device = torch.device("cuda")
+        sel, req_to_token = self._make_bound_selector_cuda(device)
+        self.assertIs(sel.config.recall_oracle, False)  # oracle OFF (default)
+        state = allocate_graph_state(
+            max_bs=1, max_top_k=2, max_seq_len=4,
+            num_local_heads=1, label_dim=1, device=device,
+        )
+        queries = torch.ones(1, 1, 1, dtype=torch.float32, device=device)
+        req_pool = torch.zeros(1, dtype=torch.int32, device=device)
+        sparse_mask = torch.ones(1, 4, dtype=torch.int32, device=device)
+        seq_lens = torch.tensor([4], dtype=torch.int32, device=device)
+        idx_e, len_e = sel.retrieve_topk(
+            queries=queries, layer_id=0, req_pool_indices=req_pool,
+            sparse_mask=sparse_mask, seq_lens=seq_lens, req_to_token=req_to_token,
+        )
+        replay = capture_decode_step(
+            sel, state=state, queries=queries, layer_id=0, req_pool_indices=req_pool,
+            sparse_mask=sparse_mask, seq_lens=seq_lens, req_to_token=req_to_token,
+        )
+        torch.cuda.synchronize()
+        for _ in range(5):
+            replay()
+            torch.cuda.synchronize()
+        with assert_no_alloc_in_region("oracle-off-replay"):
+            idx_r, len_r = replay()
+            torch.cuda.synchronize()
+        self.assertTrue(torch.equal(idx_r[:1, :2], idx_e))
+        self.assertTrue(torch.equal(len_r[:1], len_e))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_retrieve_topk_graph_safe_zero_allocs_after_warmup(self):
         """retrieve_topk_graph_safe with pre-allocated scratch is 0-alloc after warmup."""
         from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
