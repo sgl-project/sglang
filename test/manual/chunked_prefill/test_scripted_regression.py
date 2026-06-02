@@ -169,9 +169,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert len(r1.req.output_ids) == 2 and len(r2.req.output_ids) == 2
 
     def test_chunked_pending_tokens_subtract_prefix(self):
-        self.server.execute_script(
-            self._script_chunked_pending_tokens_subtract_prefix
-        )
+        self.server.execute_script(self._script_chunked_pending_tokens_subtract_prefix)
 
     @staticmethod
     def _script_chunked_pending_tokens_subtract_prefix(t: ScriptedContext):
@@ -253,9 +251,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.lock_refs == 0
 
     def test_multiturn_full_hit_no_reuse_branch(self):
-        self.server.execute_script(
-            self._script_multiturn_full_hit_no_reuse_branch
-        )
+        self.server.execute_script(self._script_multiturn_full_hit_no_reuse_branch)
 
     @staticmethod
     def _script_multiturn_full_hit_no_reuse_branch(t: ScriptedContext):
