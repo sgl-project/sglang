@@ -94,7 +94,7 @@ tracing = [
 srt_hip = [
   "sglang[runtime_common]",
   "torch",
-  "petit_kernel==0.0.2",
+  "petit_kernel==0.0.4",
   "wave-lang==3.8.2",
   # Pin to 0.15.0: 0.16.0 needs torch>=2.10 (incompatible with ROCm torch
   # 2.9.1). An open-ended `<0.16.0` made pip backtrack into an unbuildable

@@ -94,7 +94,7 @@ rocm720 = [
 #   pip install "amd-sglang[srt_hip,rocm720]"
 srt_hip = [
   "amd-sglang[runtime_common]",
-  "petit_kernel==0.0.2",
+  "petit_kernel==0.0.4",
   "wave-lang==3.8.2",
 ]
 

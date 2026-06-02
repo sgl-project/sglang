@@ -1,32 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
+from __future__ import annotations
 
-
+import fnmatch
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
 
 import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.parameter import (
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoEScheme
 from sglang.srt.layers.quantization.petit_utils import (
+    apply_petit_mxfp4_dense,
+    apply_petit_mxfp4_moe_layer,
     apply_petit_nvfp4_linear,
+    prepare_mxfp4_layer_for_petit,
+    prepare_mxfp4_moe_layer_for_petit,
     prepare_nvfp4_layer_for_petit,
     verify_petit_nvfp4_supported,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import (
+    get_device_capability,
+    is_hip,
+    mxfp_supported,
+    set_weight_attrs,
+)
 
 _is_hip = is_hip()
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -72,16 +93,48 @@ class PetitNvFp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "PetitNvFp4Config":
-        quant_config = cls.get_from_keys(config, ["quantization"])
-        quant_method = quant_config["quant_algo"]
-        group_size = quant_config.get("group_size", None)
+        quant_config = config.get("quantization")
+        if quant_config is not None:
+            quant_method = quant_config["quant_algo"]
+            group_size = quant_config.get("group_size", None)
+            kv_cache_quant_algo = quant_config["kv_cache_quant_algo"]
+            exclude_modules = quant_config.get("exclude_modules", None)
+        else:
+            quant_method = config.get("quant_algo")
+            group_size = config.get("group_size")
+            if group_size is None:
+                config_groups = config.get("config_groups", {})
+                if config_groups:
+                    first_group = next(iter(config_groups.values()), {})
+                    weights_config = first_group.get("weights", {})
+                    group_size = weights_config.get("group_size")
+
+            kv_cache_scheme = config.get("kv_cache_scheme")
+            if isinstance(kv_cache_scheme, dict):
+                if (
+                    kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_algo = "FP8"
+                else:
+                    kv_cache_quant_algo = "auto"
+            elif isinstance(kv_cache_scheme, str):
+                scheme_name = kv_cache_scheme.strip().upper()
+                if scheme_name in ("FP8", "FLOAT8"):
+                    kv_cache_quant_algo = "FP8"
+                elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
+                    kv_cache_quant_algo = "NVFP4"
+                else:
+                    kv_cache_quant_algo = "auto"
+            else:
+                kv_cache_quant_algo = "auto"
+            exclude_modules = config.get("ignore", [])
+
         verify_petit_nvfp4_supported(quant_method, group_size)
 
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
-        kv_cache_quant_algo = quant_config["kv_cache_quant_algo"]
         if not kv_cache_quant_algo:
             kv_cache_quant_algo = "auto"
-        exclude_modules = quant_config.get("exclude_modules", None)
         if not (group_size and kv_cache_quant_algo and (exclude_modules is not None)):
             logger.warning(
                 f"group_size: {group_size},"
@@ -103,14 +156,26 @@ class PetitNvFp4Config(QuantizationConfig):
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
         can_convert = cls.is_petit_nvfp4_compatible(hf_quant_cfg)
-        if can_convert:
+        if can_convert and user_quant == cls.get_name():
             return cls.get_name()
+        if can_convert and user_quant is None:
+            logger.info(
+                "Detected a ModelOpt checkpoint that may contain NVFP4 linear "
+                "layers, but Petit NVFP4 is linear-only. Not auto-overriding "
+                "to petit_nvfp4; use quantization=petit_nvfp4 explicitly for "
+                "linear-only models."
+            )
         return None
 
     @classmethod
     def is_petit_nvfp4_compatible(cls, quant_config: Dict[str, Any]) -> bool:
         quant_method = quant_config.get("quant_method", "").lower()
-        return _is_hip and quant_method == "modelopt"
+        quant_algo = quant_config.get("quant_algo", "").upper()
+        return (
+            _is_hip
+            and quant_method in ("modelopt", "modelopt_fp4")
+            and ("NVFP4" in quant_algo or "FP4" in quant_algo)
+        )
 
     def is_layer_excluded(self, prefix: str, exclude_modules: list):
         for pattern in exclude_modules:
@@ -253,3 +318,649 @@ class PetitNvFp4LinearMethod(LinearMethodBase):
             size_k=layer.input_size_per_partition,
             bias=bias,
         )
+
+
+OCP_MX_BLOCK_SIZE = 32
+
+
+class Mxfp4LinearScheme(BaseLinearScheme):
+    is_petit_mxfp4_linear = True
+
+    def __init__(
+        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
+    ):
+        self.qscheme = "per_group"
+        self.weight_quant_spec = weight_quant_spec
+        self.input_quant_spec = input_quant_spec
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 90
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        prepare_mxfp4_layer_for_petit(layer)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        output_partition_sizes: list[int],
+        input_size_per_partition: int,
+        params_dtype: torch.dtype,
+        weight_loader: Callable,
+        **kwargs,
+    ):
+        del params_dtype, kwargs
+        output_size_per_partition = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+
+        if input_size_per_partition % OCP_MX_BLOCK_SIZE != 0:
+            raise ValueError(
+                "Unsupported model when in features size is not divisible by "
+                f"group_size={OCP_MX_BLOCK_SIZE}."
+            )
+        if input_size_per_partition % 2 != 0:
+            raise ValueError("MXFP4 packed weights require even K dimension.")
+
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // 2,
+                dtype=torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // OCP_MX_BLOCK_SIZE,
+                dtype=torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return apply_petit_mxfp4_dense(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            global_scale=layer.weight_scale_2,
+            size_n=layer.output_size_per_partition,
+            size_k=layer.input_size_per_partition,
+            bias=bias,
+        )
+
+
+class PetitMxfp4MoEScheme(BaseMoEScheme):
+    is_petit_mxfp4_moe = True
+
+    def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
+        self.weight_quant = weight_config
+        self.input_quant = input_config
+
+        weight_qscheme = self.weight_quant.get("qscheme")
+        input_qscheme = self.input_quant.get("qscheme")
+        if not (weight_qscheme == "per_group" and input_qscheme == "per_group"):
+            raise ValueError(
+                "Petit MXFP4 MoE requires per-group scales for weights and activations."
+            )
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 90
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
+
+        params_dtype = torch.uint8
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 2,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // OCP_MX_BLOCK_SIZE,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // OCP_MX_BLOCK_SIZE,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        prepare_mxfp4_moe_layer_for_petit(layer)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if self.moe_runner_config.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "Petit MXFP4 MoE does not support apply_router_weight_on_input."
+            )
+
+        if hasattr(dispatch_output, "topk_output"):
+            topk_weights = dispatch_output.topk_output.topk_weights
+            topk_ids = dispatch_output.topk_output.topk_ids
+        else:
+            topk_weights = dispatch_output.topk_weights
+            topk_ids = dispatch_output.topk_ids
+
+        num_local_tokens = getattr(dispatch_output, "num_token_non_padded", None)
+        if num_local_tokens is None and hasattr(dispatch_output, "topk_output"):
+            num_local_tokens = getattr(
+                dispatch_output.topk_output, "num_token_non_padded", None
+            )
+        if num_local_tokens is None:
+            from sglang.srt.compilation.piecewise_context_manager import (
+                get_forward_context,
+            )
+
+            forward_context = get_forward_context()
+            if (
+                forward_context is not None
+                and forward_context.forward_batch is not None
+            ):
+                num_local_tokens = getattr(
+                    forward_context.forward_batch, "num_token_non_padded", None
+                )
+
+        output = apply_petit_mxfp4_moe_layer(
+            layer=layer,
+            hidden_states=dispatch_output.hidden_states,
+            hidden_states_scale=getattr(dispatch_output, "hidden_states_scale", None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=self.moe_runner_config.activation,
+            expert_mask=getattr(layer, "expert_mask_gpu", None),
+            num_local_tokens=num_local_tokens,
+        )
+        return StandardCombineInput(hidden_states=output)
+
+
+class PetitMxfp4Config(QuantizationConfig):
+    def __init__(
+        self,
+        quant_config: dict[str, Any],
+        kv_cache_group: Optional[list[str]] = None,
+        kv_cache_config: Optional[dict[str, Any]] = None,
+        pack_method: str = "reorder",
+    ):
+        super().__init__()
+        self.quant_config = quant_config
+        self.kv_cache_group = kv_cache_group or []
+        self.kv_cache_config = kv_cache_config
+        self.pack_method = pack_method
+        self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
+        self.exclude_layer_patterns = self._compile_exclude_layer_patterns(
+            self.exclude_layers
+        )
+        self.packed_modules_mapping = cast(
+            dict[str, list[str]], self.quant_config.get("packed_modules_mapping", {})
+        )
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "petit_mxfp4"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 90
+
+    @classmethod
+    def get_config_filenames(cls) -> list[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "PetitMxfp4Config":
+        export_config = config.get("export")
+        if export_config is None:
+            raise ValueError(
+                "The export key should be included in the configurations of "
+                "Petit MXFP4 quantized model"
+            )
+
+        kv_cache_group = cast(list[str], export_config.get("kv_cache_group") or [])
+        return cls(
+            quant_config=config,
+            kv_cache_group=kv_cache_group,
+            kv_cache_config=None,
+            pack_method=cast(str, export_config.get("pack_method", "reorder")),
+        )
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper):
+        self.exclude_layers = hf_to_sglang_mapper.apply_list(self.exclude_layers)
+        self.exclude_layer_patterns = self._compile_exclude_layer_patterns(
+            self.exclude_layers
+        )
+
+    @staticmethod
+    def _compile_exclude_layer_patterns(exclude_layers: list[str]):
+        patterns = []
+        for pattern in exclude_layers:
+            if pattern.startswith("re:"):
+                patterns.append((True, re.compile(pattern[3:])))
+            else:
+                regex_str = pattern.replace(".", r"\.").replace("*", r".*")
+                patterns.append((False, re.compile(regex_str)))
+        return patterns
+
+    def is_layer_excluded(self, prefix: str) -> bool:
+        if not self.exclude_layer_patterns:
+            return False
+
+        prefixes_to_check = [prefix]
+        if prefix.startswith("language_model."):
+            prefixes_to_check.append(prefix.removeprefix("language_model."))
+
+        for is_regex, pattern in self.exclude_layer_patterns:
+            for pfx in prefixes_to_check:
+                if is_regex:
+                    if pattern.match(pfx):
+                        return True
+                    continue
+
+                if pattern.fullmatch(pfx):
+                    return True
+                for part in pfx.split("."):
+                    if pattern.fullmatch(part):
+                        return True
+
+        return False
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        can_convert = cls.is_petit_mxfp4_compatible(hf_quant_cfg)
+        is_valid_user_quant = user_quant is None or user_quant == cls.get_name()
+        can_override = can_convert and not mxfp_supported()
+
+        if can_override and is_valid_user_quant:
+            logger.info(
+                "The model is convertible to %s during runtime. Using %s kernel.",
+                cls.get_name(),
+                cls.get_name(),
+            )
+            return cls.get_name()
+
+        if can_override and user_quant in ("quark", "mxfp4"):
+            logger.info(
+                "Detected that the model can run with petit_mxfp4, however "
+                "quantization=%s was specified explicitly, so forcing %s. "
+                "Use quantization=petit_mxfp4 for Petit kernels.",
+                user_quant,
+                user_quant,
+            )
+        elif can_convert and user_quant is None:
+            logger.info(
+                "Detected a Petit MXFP4-compatible %s checkpoint, but Petit "
+                "MXFP4 auto override is disabled on ROCm devices with native "
+                "MXFP4 support. Keeping the checkpoint quantization method.",
+                hf_quant_cfg.get("quant_method", ""),
+            )
+        return None
+
+    @classmethod
+    def is_petit_mxfp4_compatible(cls, quant_config: dict[str, Any]) -> bool:
+        if not _is_hip:
+            return False
+        if quant_config.get("quant_method", "").lower() not in ("quark", "mxfp4"):
+            return False
+
+        global_quant_config = quant_config.get("global_quant_config") or {}
+        weight_config = global_quant_config.get("weight")
+        input_config = global_quant_config.get("input_tensors")
+        return cls._is_mx_fp4_config(weight_config, input_config)
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional["QuantizeMethodBase"]:
+        is_excluded = is_layer_skipped(
+            prefix, self.exclude_layers, self.packed_modules_mapping
+        ) or self.is_layer_excluded(prefix)
+        if is_excluded:
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            return None
+
+        if isinstance(layer, LinearBase):
+            layer.scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            return Mxfp4LinearMethod(self)
+
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            layer.scheme = self.get_moe_scheme(layer, prefix)
+            return PetitMxfp4FusedMoEMethod(self)
+
+        return None
+
+    def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        capability_tuple = get_device_capability()
+        if capability_tuple is None:
+            return False
+
+        assert 0 <= capability_tuple[1] < 10
+        capability = capability_tuple[0] * 10 + capability_tuple[1]
+        supported = capability >= min_capability
+        if error and not supported:
+            raise RuntimeError(
+                "Quantization scheme is not supported for ",
+                f"the current GPU. Min capability: {min_capability}. ",
+                f"Current capability: {capability}.",
+            )
+        return supported
+
+    @staticmethod
+    def _is_mx_fp4_config(
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        if weight_quant is None or input_quant is None:
+            logger.debug(
+                "Petit MXFP4 model is not in MX-FP4 format: "
+                "weight_quant or input_quant not set"
+            )
+            return False
+        if weight_quant.get("dtype") != "fp4" or input_quant.get("dtype") != "fp4":
+            logger.debug("Petit MXFP4 model is not in MX-FP4 format: dtype not fp4")
+            return False
+        if (
+            weight_quant.get("qscheme") != "per_group"
+            or input_quant.get("qscheme") != "per_group"
+        ):
+            logger.debug("Petit MXFP4 model is not in MX-FP4 format: not per_group")
+            return False
+        if weight_quant.get("group_size") != 32 or input_quant.get("group_size") != 32:
+            logger.debug("Petit MXFP4 model is not in MX-FP4 format: not group_size=32")
+            return False
+        if weight_quant.get("is_dynamic") is True:
+            logger.debug("Petit MXFP4 model is not in MX-FP4 format: not weight static")
+            return False
+        if input_quant.get("is_dynamic") is False:
+            logger.debug(
+                "Petit MXFP4 model is not in MX-FP4 format: not activation dynamic"
+            )
+            return False
+        if (
+            weight_quant.get("scale_format") != "e8m0"
+            or input_quant.get("scale_format") != "e8m0"
+        ):
+            logger.debug(
+                "Petit MXFP4 model is not in MX-FP4 format: not scale_format e8m0"
+            )
+            return False
+        return True
+
+    def _is_mx_fp4(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        return self._is_mx_fp4_config(weight_quant, input_quant)
+
+    def _find_matched_config(
+        self, layer_name: str, module: torch.nn.Module
+    ) -> dict[str, Any]:
+        proj_name = layer_name.split(".")[-1]
+        if proj_name in self.packed_modules_mapping:
+            shard_proj_names = self.packed_modules_mapping[proj_name]
+            shard_names = [
+                layer_name.replace(proj_name, shard_proj_name)
+                for shard_proj_name in shard_proj_names
+            ]
+            shard_configs = [
+                self._find_unpacked_matched_config(shard_name, module)
+                for shard_name in shard_names
+            ]
+            quant_algos = {
+                self._config_quant_algo(q_config) for q_config in shard_configs
+            }
+            if len(quant_algos) > 1:
+                raise ValueError(
+                    f"Mixed quant_algo within fused layer {layer_name}: "
+                    f"{sorted(quant_algos)}. All shards must use the same quantization."
+                )
+            return shard_configs[0]
+
+        return self._find_unpacked_matched_config(layer_name, module)
+
+    def _find_unpacked_matched_config(
+        self, layer_name: str, module: torch.nn.Module
+    ) -> dict[str, Any]:
+        layer_quant_config = cast(
+            dict[str, Any], self.quant_config.get("layer_quant_config", {})
+        )
+        for name_pattern in layer_quant_config:
+            if fnmatch.fnmatch(layer_name, name_pattern):
+                return layer_quant_config[name_pattern]
+
+        layer_type = type(module).__name__
+        layer_type_quant_config = cast(
+            dict[str, Any], self.quant_config.get("layer_type_quant_config", {})
+        )
+        if layer_type in layer_type_quant_config:
+            return layer_type_quant_config[layer_type]
+
+        return cast(dict[str, Any], self.quant_config.get("global_quant_config"))
+
+    def _config_quant_algo(self, config: dict[str, Any]) -> str:
+        quant_algo = config.get("quant_algo")
+        if quant_algo is not None:
+            return str(quant_algo).upper()
+
+        weight_config = config.get("weight")
+        input_config = config.get("input_tensors")
+        if self._is_mx_fp4(weight_config, input_config):
+            return "NVFP4"
+
+        weight_dtype = str((weight_config or {}).get("dtype", "")).lower()
+        input_dtype = str((input_config or {}).get("dtype", "")).lower()
+        if "fp8" in weight_dtype or "fp8" in input_dtype:
+            return "FP8"
+
+        return "UNQUANTIZED"
+
+    def _get_linear_scheme_from_config(self, config: dict[str, Any]):
+        if config.get("bias"):
+            raise NotImplementedError("Petit MXFP4 does not support bias.")
+
+        weight_config = config.get("weight")
+        input_config = config.get("input_tensors")
+
+        if self._is_mx_fp4(weight_config, input_config):
+            return Mxfp4LinearScheme(weight_config, input_config)
+
+        raise NotImplementedError(
+            "No MXFP4 compatible linear scheme was found. "
+            f"Weight config: {weight_config}, "
+            f"Input config: {input_config}"
+        )
+
+    def get_linear_scheme(self, layer: torch.nn.Module, layer_name: str):
+        scheme = self._get_linear_scheme_from_config(
+            self._find_matched_config(layer_name, layer)
+        )
+        self._check_scheme_supported(scheme.get_min_capability())
+        return scheme
+
+    def get_moe_scheme(
+        self,
+        module: torch.nn.Module,
+        layer_name: str,
+    ):
+        layer_quant_config = self._find_matched_config(layer_name, module)
+
+        if layer_quant_config.get("output_tensors") or layer_quant_config.get("bias"):
+            raise NotImplementedError(
+                "Petit MXFP4 does not support quantized MoE bias/output tensors."
+            )
+
+        weight_config = layer_quant_config.get("weight")
+        input_config = layer_quant_config.get("input_tensors")
+
+        if self._is_mx_fp4(weight_config, input_config):
+            scheme = PetitMxfp4MoEScheme(weight_config, input_config)
+            self._check_scheme_supported(scheme.get_min_capability())
+            return scheme
+
+        raise RuntimeError(
+            "Unsupported Petit MXFP4 FusedMoE scheme. "
+            f"Weight config: {weight_config}, "
+            f"Input config: {input_config}"
+        )
+
+    def get_scaled_act_names(self) -> list[str]:
+        return []
+
+
+class Mxfp4LinearMethod(LinearMethodBase):
+    def __init__(self, quantization_config: PetitMxfp4Config):
+        self.quantization_config = quantization_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading(layer)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.scheme.create_weights(
+            layer=layer,
+            input_size=input_size,
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            output_size=output_size,
+            params_dtype=params_dtype,
+            weight_loader=weight_loader,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ):
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights(layer, x, bias=bias)
+
+
+class PetitMxfp4FusedMoEMethod(FusedMoEMethodBase):
+    def __init__(self, quantization_config: PetitMxfp4Config):
+        self.quantization_config = quantization_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading(layer)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        layer.scheme.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ):
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights(layer, dispatch_output)
