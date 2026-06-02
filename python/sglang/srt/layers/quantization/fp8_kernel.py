@@ -814,6 +814,7 @@ def _static_quant_fp8(
         tl.store(y_s_repeat_ptr, y_s)
 
 
+@torch.compiler.disable
 def static_quant_fp8(
     x: torch.Tensor,
     x_s: torch.Tensor,
