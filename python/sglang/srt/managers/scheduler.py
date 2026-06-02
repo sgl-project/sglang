@@ -1915,6 +1915,18 @@ class Scheduler(
         # such requests build a plain Req (no create_req reconstruction, no slot) and
         # are tagged + floor-priced in the radix cache keyed on req.session_id.
         radix_native_session = session_id is not None and _radix_native_enabled()
+        if radix_native_session:
+            sp = recv_req.session_params
+            # The native path does not reconstruct server-side history, so these
+            # streaming-session params are ignored -- warn rather than silently
+            # produce wrong context. (The intended client sends full context.)
+            if sp.rid or sp.offset or sp.replace or sp.drop_previous_output:
+                logger.warning(
+                    "Radix-native session %s ignores session_params "
+                    "rid/offset/replace/drop_previous_output; send full context "
+                    "each turn.",
+                    session_id,
+                )
 
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request

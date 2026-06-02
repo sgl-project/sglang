@@ -28,7 +28,7 @@ import sys
 import time
 from array import array
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -440,7 +440,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
-        self._floor_radix_native_priority(req)
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -462,7 +461,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
-            priority = getattr(req, "priority", 0) or 0
+            priority = self._radix_node_priority(req)
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
@@ -491,7 +490,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
-        self._floor_radix_native_priority(req)
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
@@ -508,7 +506,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 key=radix_key,
                 value=values,
                 chunked=chunked,
-                priority=getattr(req, "priority", 0) or 0,
+                priority=self._radix_node_priority(req),
             )
         )
         new_prefix_len = result.prefix_len
@@ -553,31 +551,41 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         req.last_node = new_last_node
 
-        # Radix-native session tag (see release_session).
-        self._tag_session_leaf(req, radix_key)
+        # Radix-native session tag (reuse the leaf we just matched -- see
+        # release_session).
+        self._tag_session_leaf(req, radix_key, node=new_last_node)
 
-    def _floor_radix_native_priority(self, req: Req) -> None:
-        """Floor the priority of KV inserted by a radix-native session so it is
-        evicted before general prefix cache. No-op for non-session requests."""
+    def _radix_node_priority(self, req: Req) -> int:
+        """Eviction priority for the radix node a request inserts. Radix-native
+        session KV gets the floor so it is reclaimed before general prefix cache;
+        everything else keeps the request's own priority. This only sets NODE
+        priority -- it does not touch req.priority (which drives scheduling)."""
         if getattr(req, "session_id", None) is not None:
-            req.priority = RADIX_NATIVE_SESSION_PRIORITY
+            return RADIX_NATIVE_SESSION_PRIORITY
+        return getattr(req, "priority", 0) or 0
 
-    def _tag_session_leaf(self, req: Req, radix_key) -> None:
+    def register_session(self, session_id: str) -> None:
+        """Start tracking a radix-native session's leaves. Called at session open;
+        release_session pops the entry. _tag_session_leaf only records leaves for
+        registered sessions, so a request that finishes AFTER its session closed
+        cannot re-create a dangling entry (no leak)."""
+        self._session_leaves.setdefault(session_id, set())
+
+    def _tag_session_leaf(self, req: Req, radix_key, node=None) -> None:
         """Tag the leaf node for this request's full key with its session_id, so
         release_session can later free the session's unique chain. No-op for
-        non-session requests. ``req.session_id`` is set natively for radix-native
-        sessions (see Req); fall back to req.session for the RPC transport."""
+        non-session requests, and for sessions no longer registered (closed)."""
         sid = getattr(req, "session_id", None)
         if sid is None:
             session = getattr(req, "session", None)
             sid = getattr(session, "session_id", None) if session is not None else None
-        if sid is None:
+        if sid is None or sid not in self._session_leaves:
             return
-        result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        node = result.last_device_node
+        if node is None:
+            node = self.match_prefix(MatchPrefixParams(key=radix_key)).last_device_node
         if node is not None and node is not self.root_node:
             node.session_id = sid
-            self._session_leaves.setdefault(sid, set()).add(node)
+            self._session_leaves[sid].add(node)
 
     def release_session(self, session_id: str) -> int:
         """Queue a radix-native session's KV for deferred release at close. The
@@ -592,7 +600,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         registered = self._session_leaves.pop(session_id, None)
         if not registered:
             return 0
-        seeds = [n for n in registered if n in self.evictable_leaves and n.lock_ref == 0]
+        seeds = [
+            n for n in registered if n in self.evictable_leaves and n.lock_ref == 0
+        ]
         self._pending_release.extend(seeds)
         return len(seeds)
 
