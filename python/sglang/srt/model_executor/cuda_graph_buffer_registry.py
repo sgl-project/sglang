@@ -401,3 +401,120 @@ class CudaGraphBufferRegistry:
                 continue
             replace_kwargs[slot.name] = slot.view(padded_bs, padded_num_tokens)
         return dataclasses.replace(forward_batch_template, **replace_kwargs)
+
+
+def build_decode_registry(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    seq_len_fill_value: int,
+    cache_loc_dtype: torch.dtype,
+    enable_mamba_track: bool = False,
+    share_pool: bool = True,
+) -> CudaGraphBufferRegistry:
+    """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
+    buffers, with padding policies matching
+    ``DecodeInputBuffers.populate_from_forward_batch``:
+
+      - ``seq_lens`` / ``seq_lens_cpu`` -> FILL_SENTINEL(seq_len_fill_value)
+      - ``req_pool_indices`` / ``out_cache_loc`` / ``mamba_track_*`` -> ZERO
+      - ``input_ids`` / ``positions`` / ``mrope_positions`` -> FOREACH_COPY
+        (head ``[:raw_n]`` is always overwritten by the copy; the old code's
+        full-buffer ``zero_()`` / ``fill_()`` on ``bs != raw_bs`` is therefore
+        equivalent to the tail-only reset the policies apply here).
+
+    Computed / structured / init-fill-without-per-iter-reset fields
+    (``num_token_non_padded``, ``global_num_tokens_*``, ``encoder_lens``,
+    ``pp_proxy_tensors``, ``ngram_embedding_info``, ``custom_mask``,
+    ``next_token_logits_buffer``, ``input_embeds``, canary ids) are *not*
+    registered here; the runner fills them out-of-band until the registry
+    grows the matching hooks. Not wired into any runner yet.
+    """
+    reg = CudaGraphBufferRegistry(
+        device=device,
+        max_bs=max_bs,
+        max_num_tokens=max_num_token,
+        share_pool=share_pool,
+    )
+
+    def _tokens(_bs: int, mt: int) -> Tuple[int, ...]:
+        return (mt,)
+
+    def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
+        return (bs,)
+
+    reg.register_slot(
+        GraphSlot("input_ids", _tokens, torch.int64, axis="tokens")
+    )
+    reg.register_slot(
+        GraphSlot("positions", _tokens, torch.int64, axis="tokens")
+    )
+    reg.register_slot(
+        GraphSlot(
+            "out_cache_loc",
+            _tokens,
+            cache_loc_dtype,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+        )
+    )
+    reg.register_slot(
+        GraphSlot(
+            "req_pool_indices",
+            _bs,
+            torch.int64,
+            axis="bs",
+            padding_policy=PaddingPolicy.ZERO,
+        )
+    )
+    reg.register_slot(
+        GraphSlot(
+            "seq_lens",
+            _bs,
+            torch.int32,
+            axis="bs",
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=seq_len_fill_value,
+        )
+    )
+    reg.register_slot(
+        GraphSlot(
+            "seq_lens_cpu",
+            _bs,
+            torch.int32,
+            axis="bs",
+            device=torch.device("cpu"),
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=seq_len_fill_value,
+        )
+    )
+    reg.register_slot(
+        GraphSlot(
+            "mrope_positions",
+            lambda _bs2, mt: (3, mt),
+            torch.int64,
+            axis="tokens",
+            slice_fn=lambda buf, n: buf[:, :n],
+        )
+    )
+    if enable_mamba_track:
+        reg.register_slot(
+            GraphSlot(
+                "mamba_track_indices",
+                _bs,
+                torch.int64,
+                axis="bs",
+                padding_policy=PaddingPolicy.ZERO,
+            )
+        )
+        reg.register_slot(
+            GraphSlot(
+                "mamba_track_mask",
+                _bs,
+                torch.bool,
+                axis="bs",
+                padding_policy=PaddingPolicy.ZERO,
+            )
+        )
+    return reg
