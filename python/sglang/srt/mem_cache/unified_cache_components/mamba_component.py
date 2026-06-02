@@ -370,7 +370,10 @@ class MambaComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
-            if cd.value is None:
+            # Skip when device value is missing or host value already exists,
+            # so partial write_backup does not re-back-up an already-backed-up
+            # component (which would leak the previous host slot).
+            if cd.value is None or cd.host_value is not None:
                 return None
             return [
                 PoolTransfer(
