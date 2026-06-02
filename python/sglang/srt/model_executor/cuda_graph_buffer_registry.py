@@ -262,12 +262,19 @@ class CudaGraphBufferRegistry:
 
     # ---- registration ------------------------------------------------------
 
-    def register_slot(self, slot: GraphSlot) -> GraphSlot:
-        """Register a slot and allocate its physical buffer.
+    def register_slot(
+        self, slot: GraphSlot, bind: Optional[torch.Tensor] = None
+    ) -> GraphSlot:
+        """Register a slot and allocate (or adopt) its physical buffer.
 
-        Returns the slot for caller convenience. Idempotent only on
-        identical re-register — re-registering with different shape/dtype
-        raises.
+        If ``bind`` is given, the slot adopts that existing tensor instead of
+        allocating a fresh one (and skips the pool / sentinel init — the bound
+        tensor is assumed already initialized). This lets a registry share
+        storage with the legacy ``DecodeInputBuffers`` by adopting its fields,
+        guaranteeing a stable, identical ``data_ptr`` for capture vs replay.
+
+        Returns the slot for caller convenience. Re-registering an existing
+        name raises.
         """
         if slot.name in self._slots:
             raise ValueError(
@@ -281,6 +288,21 @@ class CudaGraphBufferRegistry:
             return slot
         shape = slot.shape_fn(self.max_bs, self.max_num_tokens)
         device = slot.device if slot.device is not None else self.device
+        if bind is not None:
+            expected = tuple(shape)
+            if tuple(bind.shape) != expected:
+                raise ValueError(
+                    f"bind tensor for slot {slot.name!r} has shape "
+                    f"{tuple(bind.shape)}, expected {expected}."
+                )
+            if bind.dtype != slot.dtype:
+                raise ValueError(
+                    f"bind tensor for slot {slot.name!r} has dtype {bind.dtype}, "
+                    f"expected {slot.dtype}."
+                )
+            slot.buffer = bind
+            self._slots[slot.name] = slot
+            return slot
         buffer = torch.zeros(shape, dtype=slot.dtype, device=device)
         if self.share_pool:
             # Coalesce with any same-named buffer (e.g. the legacy
@@ -412,6 +434,7 @@ def build_decode_registry(
     cache_loc_dtype: torch.dtype,
     enable_mamba_track: bool = False,
     share_pool: bool = True,
+    source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
     buffers, with padding policies matching
@@ -429,7 +452,11 @@ def build_decode_registry(
     ``pp_proxy_tensors``, ``ngram_embedding_info``, ``custom_mask``,
     ``next_token_logits_buffer``, ``input_embeds``, canary ids) are *not*
     registered here; the runner fills them out-of-band until the registry
-    grows the matching hooks. Not wired into any runner yet.
+    grows the matching hooks.
+
+    When ``source`` is given, each slot adopts the same-named tensor off
+    ``source`` (e.g. a ``DecodeInputBuffers``) instead of allocating, so the
+    registry shares one physical allocation with that object.
     """
     reg = CudaGraphBufferRegistry(
         device=device,
@@ -444,31 +471,23 @@ def build_decode_registry(
     def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
         return (bs,)
 
-    reg.register_slot(
-        GraphSlot("input_ids", _tokens, torch.int64, axis="tokens")
-    )
-    reg.register_slot(
-        GraphSlot("positions", _tokens, torch.int64, axis="tokens")
-    )
-    reg.register_slot(
+    slots = [
+        GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
+        GraphSlot("positions", _tokens, torch.int64, axis="tokens"),
         GraphSlot(
             "out_cache_loc",
             _tokens,
             cache_loc_dtype,
             axis="tokens",
             padding_policy=PaddingPolicy.ZERO,
-        )
-    )
-    reg.register_slot(
+        ),
         GraphSlot(
             "req_pool_indices",
             _bs,
             torch.int64,
             axis="bs",
             padding_policy=PaddingPolicy.ZERO,
-        )
-    )
-    reg.register_slot(
+        ),
         GraphSlot(
             "seq_lens",
             _bs,
@@ -476,9 +495,7 @@ def build_decode_registry(
             axis="bs",
             padding_policy=PaddingPolicy.FILL_SENTINEL,
             pad_value=seq_len_fill_value,
-        )
-    )
-    reg.register_slot(
+        ),
         GraphSlot(
             "seq_lens_cpu",
             _bs,
@@ -487,19 +504,17 @@ def build_decode_registry(
             device=torch.device("cpu"),
             padding_policy=PaddingPolicy.FILL_SENTINEL,
             pad_value=seq_len_fill_value,
-        )
-    )
-    reg.register_slot(
+        ),
         GraphSlot(
             "mrope_positions",
             lambda _bs2, mt: (3, mt),
             torch.int64,
             axis="tokens",
             slice_fn=lambda buf, n: buf[:, :n],
-        )
-    )
+        ),
+    ]
     if enable_mamba_track:
-        reg.register_slot(
+        slots.append(
             GraphSlot(
                 "mamba_track_indices",
                 _bs,
@@ -508,7 +523,7 @@ def build_decode_registry(
                 padding_policy=PaddingPolicy.ZERO,
             )
         )
-        reg.register_slot(
+        slots.append(
             GraphSlot(
                 "mamba_track_mask",
                 _bs,
@@ -517,4 +532,15 @@ def build_decode_registry(
                 padding_policy=PaddingPolicy.ZERO,
             )
         )
+
+    for slot in slots:
+        bind = None
+        if source is not None:
+            bind = getattr(source, slot.name, None)
+            if bind is None:
+                raise ValueError(
+                    f"source is missing buffer {slot.name!r} required by the "
+                    "decode registry; cannot adopt."
+                )
+        reg.register_slot(slot, bind=bind)
     return reg

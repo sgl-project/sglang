@@ -653,6 +653,38 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertEqual(fb_view.input_ids.shape[0], padded_nt)
         self.assertEqual(fb_view.seq_lens.shape[0], padded_bs)
 
+    def test_source_adopts_buffers(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+        )
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        # Registry slots share storage with the source's tensors.
+        for name in ("input_ids", "seq_lens", "seq_lens_cpu", "mrope_positions"):
+            self.assertEqual(
+                reg.get_slot(name).buffer.data_ptr(),
+                getattr(src, name).data_ptr(),
+                name,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
