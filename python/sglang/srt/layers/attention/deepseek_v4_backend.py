@@ -88,7 +88,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     if _is_sm120:
         return None
-    import sgl_kernel.flash_mla as flash_mla
+    import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
 
@@ -1078,7 +1078,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )[0]
             else:
-                import sgl_kernel.flash_mla as flash_mla
+                import flash_mla
 
                 o = flash_mla.flash_mla_with_kvcache(
                     q=q,
