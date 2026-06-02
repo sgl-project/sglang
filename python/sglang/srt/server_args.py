@@ -1864,8 +1864,8 @@ class ServerArgs:
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
                         assert (
-                            self.tp_size <= 8
-                        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                            self.nnodes == 1
+                        ), "Context parallel only supports single-machine runs. Cross-machine CP has precision issues."
                         # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                         # DSACPLayerCommunicator does not all-reduce attention-TP
                         # partial o_proj outputs before replicated dense FFNs.
