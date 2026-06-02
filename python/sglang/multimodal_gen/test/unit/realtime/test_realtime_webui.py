@@ -56,7 +56,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;" in app_js
     assert "const DEFAULT_UPSCALING_SCALE = 2;" in app_js
     assert "const DEFAULT_PREVIEW_SCALE = 120;" in app_js
-    assert "setPreviewState(\"waiting\")" in app_js
+    assert 'setPreviewState("waiting")' in app_js
     assert "stage.dataset.previewState = state" in app_js
     assert 'document.querySelector(".preview-frame")' in app_js
     assert 'previewFrame.style.setProperty("--preview-scale"' in app_js
