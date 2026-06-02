@@ -1331,7 +1331,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    return get_moe_expert_parallel_world_size() > 1
+    return get_moe_expert_parallel_world_size() > 1 or (
+        not get_global_server_args().disable_cuda_graph
+        and not get_global_server_args().enable_dp_attention
+    )
 
 
 def build_inner_fb_view(

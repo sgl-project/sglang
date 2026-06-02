@@ -246,6 +246,10 @@ class FusedMoE(torch.nn.Module):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
 
+        from sglang.srt.model_executor.forward_batch_info import (
+            enable_num_token_non_padded,
+        )
+
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
@@ -265,6 +269,9 @@ class FusedMoE(torch.nn.Module):
             swiglu_limit=swiglu_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            # Quantized kernels can't skip -1 sentinels; only enable for unquantized.
+            enable_pad_token_mask=enable_num_token_non_padded()
+            and quant_config is None,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None

@@ -760,6 +760,7 @@ def build_prefill_registry(
     hidden_size: int = 0,
     embed_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
+    enable_num_token_non_padded: bool = False,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
@@ -842,6 +843,25 @@ def build_prefill_registry(
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
         slots.append(GraphSlot("mamba_track_seqlens", _bs, torch.int32, axis="bs"))
+
+    if enable_num_token_non_padded:
+
+        def _num_token_non_padded_post_fill(buf, fb, ctx):
+            if fb.num_token_non_padded is not None:
+                buf.copy_(fb.num_token_non_padded.view(1))
+            else:
+                buf.fill_(ctx.raw_num_tokens)
+
+        slots.append(
+            GraphSlot(
+                "num_token_non_padded",
+                lambda _bs2, _mt: (1,),
+                torch.int32,
+                axis="none",
+                copy_from_fb=False,
+                post_fill=_num_token_non_padded_post_fill,
+            )
+        )
 
     for slot in slots:
         bind = None
