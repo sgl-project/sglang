@@ -35,6 +35,7 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils.custom_op import register_custom_op
 
 Qwen3Config = None
 
@@ -58,6 +59,55 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+
+    def _split_qkv_rmsnorm_rope_fake_impl(
+        qkv: torch.Tensor,
+        sin: torch.Tensor,
+        cos: torch.Tensor,
+        q_size: int,
+        kv_size: int,
+        head_dim: int,
+        eps: float = 1e-6,
+        q_weight: Optional[torch.Tensor] = None,
+        k_weight: Optional[torch.Tensor] = None,
+        q_bias: Optional[torch.Tensor] = None,
+        k_bias: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del sin, cos, head_dim, eps, q_weight, k_weight, q_bias, k_bias
+        output_shape = qkv.shape[:-1]
+        return (
+            qkv.new_empty((*output_shape, q_size)),
+            qkv.new_empty((*output_shape, kv_size)),
+            qkv.new_empty((*output_shape, kv_size)),
+        )
+
+    @register_custom_op(fake_impl=_split_qkv_rmsnorm_rope_fake_impl)
+    def _split_qkv_rmsnorm_rope_custom(
+        qkv: torch.Tensor,
+        sin: torch.Tensor,
+        cos: torch.Tensor,
+        q_size: int,
+        kv_size: int,
+        head_dim: int,
+        eps: float = 1e-6,
+        q_weight: Optional[torch.Tensor] = None,
+        k_weight: Optional[torch.Tensor] = None,
+        q_bias: Optional[torch.Tensor] = None,
+        k_bias: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return split_qkv_rmsnorm_rope(
+            qkv,
+            sin,
+            cos,
+            q_size,
+            kv_size,
+            head_dim,
+            eps=eps,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            q_bias=q_bias,
+            k_bias=k_bias,
+        )
 
 
 class Qwen3Attention(nn.Module):
@@ -188,7 +238,7 @@ class Qwen3Attention(nn.Module):
 
         if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
-        q, k, v = split_qkv_rmsnorm_rope(
+        q, k, v = _split_qkv_rmsnorm_rope_custom(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,
@@ -424,8 +474,8 @@ class Qwen3DecoderLayer(nn.Module):
             ),
         )
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
+        if _is_npu and get_cmo_stream() is not None:
+            hidden_states = wait_cmo_stream(hidden_states)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
