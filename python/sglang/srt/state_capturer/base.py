@@ -142,6 +142,15 @@ class BaseTopkCapturer:
         num_tokens = forward_batch.out_cache_loc.shape[0]
         return self.device_cache.buffer[:num_tokens, :, : self.topk_size]
 
+    def _get_out_cache_loc(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: Optional[int],
+    ) -> torch.Tensor:
+        del can_run_graph, cuda_graph_batch  # reserved for subclass override
+        return forward_batch.out_cache_loc
+
     def get_topk(
         self,
         req_pool_idx: int,
@@ -173,12 +182,15 @@ class BaseTopkCapturer:
         slice_gpu = self._get_local_slice(
             forward_batch, can_run_graph, cuda_graph_batch
         )
+        out_cache_loc_gpu = self._get_out_cache_loc(
+            forward_batch, can_run_graph, cuda_graph_batch
+        )
         if no_copy_to_cpu:
             return TopkCaptureOutput(
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc_gpu,
                 topk=slice_gpu,
                 host_cache=self.host_cache,
             )
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+        out_cache_loc_cpu = out_cache_loc_gpu.cpu()
         self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
         return None

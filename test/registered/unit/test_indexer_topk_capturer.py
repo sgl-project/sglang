@@ -14,6 +14,9 @@ class TestIndexerTopkCapturer(unittest.TestCase):
         capturer.device_cache = SimpleNamespace(
             buffer=torch.arange(6 * 1 * 3, dtype=torch.int32).reshape(6, 1, 3)
         )
+        capturer.host_cache = SimpleNamespace(
+            buffer=torch.zeros((32, 1, 2), dtype=torch.int32)
+        )
         return capturer
 
     def test_non_dp_attention_uses_forward_batch_length(self):
@@ -51,6 +54,43 @@ class TestIndexerTopkCapturer(unittest.TestCase):
 
             expected = capturer.device_cache.buffer[2:5, :, :2]
             self.assertTrue(torch.equal(actual, expected))
+        finally:
+            indexer_topk.is_dp_attention_enabled = old_is_dp_attention_enabled
+            indexer_topk.get_dp_local_slice_cpu = old_get_dp_local_slice_cpu
+
+    def test_dp_attention_slices_cache_locations_with_topk(self):
+        capturer = self._make_capturer()
+        forward_batch = SimpleNamespace(
+            out_cache_loc=torch.tensor([10, 11, 12, 13, 14], dtype=torch.int64)
+        )
+
+        old_is_dp_attention_enabled = indexer_topk.is_dp_attention_enabled
+        old_get_dp_local_slice_cpu = indexer_topk.get_dp_local_slice_cpu
+        try:
+            indexer_topk.is_dp_attention_enabled = lambda: True
+            indexer_topk.get_dp_local_slice_cpu = (
+                lambda forward_batch, can_run_graph, cuda_graph_batch: (2, 3)
+            )
+
+            output = capturer.on_forward_end(
+                forward_batch,
+                can_run_graph=False,
+                cuda_graph_batch=None,
+                no_copy_to_cpu=True,
+            )
+
+            self.assertEqual(output.out_cache_loc.tolist(), [12, 13, 14])
+            self.assertTrue(
+                torch.equal(output.topk, capturer.device_cache.buffer[2:5, :, :2])
+            )
+
+            output.finalize()
+            self.assertTrue(
+                torch.equal(
+                    capturer.host_cache.buffer[12:15],
+                    capturer.device_cache.buffer[2:5, :, :2],
+                )
+            )
         finally:
             indexer_topk.is_dp_attention_enabled = old_is_dp_attention_enabled
             indexer_topk.get_dp_local_slice_cpu = old_get_dp_local_slice_cpu

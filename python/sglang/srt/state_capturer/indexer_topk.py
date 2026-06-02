@@ -62,6 +62,23 @@ class IndexerTopkCapturer(BaseTopkCapturer):
             local_start_pos:local_end_pos, :, : self.topk_size
         ]
 
+    def _get_out_cache_loc(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: Optional[int],
+    ) -> torch.Tensor:
+        if not is_dp_attention_enabled():
+            return super()._get_out_cache_loc(
+                forward_batch, can_run_graph, cuda_graph_batch
+            )
+
+        local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
+            forward_batch, can_run_graph, cuda_graph_batch
+        )
+        local_end_pos = local_start_pos + local_num_tokens
+        return forward_batch.out_cache_loc[local_start_pos:local_end_pos]
+
 
 _global_indexer_capturer: Optional[IndexerTopkCapturer] = None
 
