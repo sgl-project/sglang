@@ -271,6 +271,7 @@ class DoubleSparsitySelector:
                 hybrid_threshold=getattr(self.config, "scorer_norm_hybrid_threshold", 8192),
                 anchor_mode=getattr(self.config, "anchor_mode", "off"),
                 anchor_budget=getattr(self.config, "anchor_budget", 0),
+                recall_oracle=getattr(self.config, "recall_oracle", False),
             )
 
         batch_size = req_pool_indices.shape[0]

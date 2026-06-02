@@ -376,6 +376,20 @@ def ds_scorer_is_default(config) -> bool:
     )
 
 
+def ds_recall_oracle_enabled(config) -> bool:
+    """``True`` iff the config-borne recall-oracle diagnostic is on.
+
+    Config-borne (not env) so it reaches TP worker subprocesses
+    (BL-20260602-ds-flag-must-be-config-borne-not-env). Like a non-default
+    scorer it forces the eager selector path so the host-syncing oracle hook
+    actually re-runs every decode step (under CUDA-graph replay the Python does
+    not re-run); the validator additionally requires ``--disable-cuda-graph``.
+    """
+    if config is None:
+        return False
+    return bool(getattr(config, "recall_oracle", False))
+
+
 def compute_token_scores(
     queries: torch.Tensor,
     token_signatures: torch.Tensor,
@@ -838,6 +852,7 @@ def retrieve_topk_via_labels(
     hybrid_threshold: int = 8192,
     anchor_mode: str = "off",
     anchor_budget: int = 0,
+    recall_oracle: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """End-to-end selector flow: score → all-reduce → per-request mask → top-K → ascend.
 
@@ -928,7 +943,12 @@ def retrieve_topk_via_labels(
         # capture check as the metrics call: the oracle does host syncs
         # (``.item()``/dict build) that are illegal during CUDA-graph capture.
         _maybe_record_recall_oracle(
-            scores, indices, layer_id, max_top_k, process_group=process_group
+            scores,
+            indices,
+            layer_id,
+            max_top_k,
+            process_group=process_group,
+            recall_oracle=recall_oracle,
         )
     return indices, valid_lengths
 
@@ -939,58 +959,91 @@ def _maybe_record_recall_oracle(
     layer_id: int,
     max_top_k: int,
     process_group=None,
+    recall_oracle: bool = False,
 ) -> None:
     """Record one recall-oracle sample for the active NIAH trial, if enabled.
 
-    Pure no-op (single env lookup, immediate return) when the oracle flag is off
-    or no trial is registered — so production selection is byte-for-byte
-    unchanged. NIAH trials are single-request; the active context carries the
-    harness-provided needle span. Records ONLY on the primary TP rank: the
-    scores are identical across ranks after ``all_reduce_token_scores``, so
-    rank-0-only recording avoids 8× duplicate writes + cross-process file
-    contention on the sink. Best-effort: a diagnostic failure must never break
-    selection.
-    """
-    import os as _os
+    Pure no-op (immediate return) when the oracle is off — so production
+    selection is byte-for-byte unchanged. Enabled either by the config-borne
+    ``recall_oracle`` flag (the path that reaches TP workers) or the env flag
+    (harness / unit tests).
 
+    **Fail-closed when enabled** — a diagnostic must never silently guess or
+    silently drop a sample. With no active trial, an out-of-range harness needle
+    position, or a payload-build exception, we emit an explicit ``failure``
+    record keyed by ``(request_id, trial_id, layer_id, decode_step)`` instead of
+    returning quietly; the sweep asserts on these + on missing successes. We do
+    NOT filter out-of-range positions (that silently masked the absent 64K
+    records) and we do NOT swallow exceptions.
+
+    Records ONLY on the primary TP rank: the scores are identical across ranks
+    after ``all_reduce_token_scores``, so rank-0-only recording avoids 8×
+    duplicate writes + cross-process file contention on the sink.
+    """
     from sglang.srt.layers.attention.double_sparsity import oracle_artifact_sink as _sink
 
-    _dbg = _os.environ.get("SGLANG_DS_RECALL_ORACLE_DEBUG") == "1"
-
-    def _log(reason):
-        if _dbg and layer_id == 0:
-            print(f"[recall-oracle] layer0 skip: {reason}", flush=True)
-
+    if recall_oracle:
+        # Latch the config-borne enable so the sink + trial-file paths resolve
+        # to the fixed cross-process defaults (env does not reach TP workers).
+        _sink.enable_via_config()
     if not _sink.oracle_enabled():
-        _log("oracle disabled")
         return
     # Primary-rank guard (scores are all-reduce-identical across TP ranks).
     try:
+        _rk = -1
         if (
             process_group is not None
             and torch.distributed.is_available()
             and torch.distributed.is_initialized()
-            and torch.distributed.get_rank(group=process_group) != 0
         ):
+            _rk = torch.distributed.get_rank(group=process_group)
+        if _rk not in (-1, 0):
             return  # non-primary rank (silent — every rank but 0)
     except Exception:
         pass
+
+    sample_idx = _sink.next_sample_index()
     trial = _sink.get_active_trial()
     if trial is None:
-        _log("no active trial")
+        # Fail-closed: enabled but no trial registered for this decode. Emit a
+        # marker (the harness clears the sink before measured trials, so warmup
+        # markers do not pollute the measured run).
+        _sink.record_oracle_failure(
+            reason="no_active_trial",
+            request_id=None,
+            trial_id=None,
+            layer_id=int(layer_id),
+            decode_step=int(sample_idx),
+        )
         return
+
+    max_tokens = int(scores.shape[-1])
+    out_of_range = [p for p in trial.needle_positions if not (0 <= p < max_tokens)]
+    if out_of_range:
+        # Fail-closed: reject (do NOT filter) — a partial/empty span would
+        # silently mis-measure recall.
+        _sink.record_oracle_failure(
+            reason="span_out_of_range",
+            request_id=trial.request_id,
+            trial_id=trial.trial_id,
+            layer_id=int(layer_id),
+            decode_step=int(sample_idx),
+            extra={
+                "needle_positions": list(trial.needle_positions),
+                "out_of_range": out_of_range,
+                "max_tokens": max_tokens,
+            },
+        )
+        return
+
     try:
         from sglang.srt.layers.attention.double_sparsity.selection_recall_oracle import (
             oracle_payload_for_row,
         )
 
-        max_tokens = int(scores.shape[-1])
-        span = [p for p in trial.needle_positions if 0 <= p < max_tokens]
-        if not span:
-            _log(f"empty span (needle {trial.needle_positions} vs max_tokens {max_tokens})")
-            return
-        needle = torch.as_tensor(span, dtype=torch.int64, device=scores.device)
-        sample_idx = _sink.next_sample_index()
+        needle = torch.as_tensor(
+            trial.needle_positions, dtype=torch.int64, device=scores.device
+        )
         payload = oracle_payload_for_row(
             scores[0],
             needle,
@@ -998,17 +1051,22 @@ def _maybe_record_recall_oracle(
             stride=1,
             index_topk=int(max_top_k),
         )
-        wrote = _sink.record_oracle_sample(
+        _sink.record_oracle_sample(
             request_id=trial.request_id,
             trial_id=trial.trial_id,
             layer_id=int(layer_id),
             decode_step=int(sample_idx),
             payload=payload,
         )
-        if _dbg and layer_id == 0:
-            print(f"[recall-oracle] layer0 RECORDED wrote={wrote} span={span[:3]} rank={payload.get('needle_worst_rank')}", flush=True)
     except Exception as _e:
-        _log(f"exception {type(_e).__name__}: {_e}")
+        # Fail-closed: surface the failure as a record rather than swallowing it.
+        _sink.record_oracle_failure(
+            reason=f"exception:{type(_e).__name__}:{_e}",
+            request_id=trial.request_id,
+            trial_id=trial.trial_id,
+            layer_id=int(layer_id),
+            decode_step=int(sample_idx),
+        )
         return
 
 
@@ -1107,6 +1165,7 @@ def retrieve_topk_graph_safe(
     scratch_throwaway_idx: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
     token_scales: Optional[torch.Tensor] = None,           # fp16 [L, T, H] int8 dequant scale, else None
     process_group=None,
+    recall_oracle: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Capture-safe retrieve_topk that writes results into caller-owned buffers.
 
@@ -1157,6 +1216,7 @@ def retrieve_topk_graph_safe(
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             token_scales=token_scales,
+            recall_oracle=recall_oracle,
         )
         mtk = indices.shape[1]
         out_indices[:bs, :mtk].copy_(indices)
@@ -1281,7 +1341,12 @@ def retrieve_topk_graph_safe(
     # decode (under graph replay this Python does not re-run).
     if not torch.cuda.is_current_stream_capturing():
         _maybe_record_recall_oracle(
-            scores_view, out_indices[:bs], layer_id, max_top_k, process_group=process_group
+            scores_view,
+            out_indices[:bs],
+            layer_id,
+            max_top_k,
+            process_group=process_group,
+            recall_oracle=recall_oracle,
         )
 
     return out_indices, out_lengths

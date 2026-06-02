@@ -209,5 +209,47 @@ class TestNonDefaultScorerGraphGuard(unittest.TestCase):
             self.assertNotIn("CUDA graph", str(e))
 
 
+class TestRecallOracleGraphGuard(unittest.TestCase):
+    """Server init rejects the recall_oracle diagnostic under CUDA graph (the
+    hook host-syncs and would record nothing under replay), and allows it with
+    --disable-cuda-graph."""
+
+    def _server_args(self, recall_oracle, disable_cuda_graph):
+        from types import SimpleNamespace
+        cfg = (
+            '{"channel_mask_path": "/tmp/cm.safetensors", "recall_oracle": '
+            + ("true" if recall_oracle else "false")
+            + "}"
+        )
+        return SimpleNamespace(
+            enable_double_sparsity=True,
+            enable_hisparse=False,
+            disaggregation_mode=None,
+            double_sparsity_config=cfg,
+            disable_cuda_graph=disable_cuda_graph,
+            page_size=64,
+        )
+
+    def test_recall_oracle_with_cuda_graph_rejected(self):
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        with self.assertRaises(ValueError) as cm:
+            validate_double_sparsity(self._server_args(True, disable_cuda_graph=False))
+        self.assertIn("recall_oracle", str(cm.exception))
+
+    def test_recall_oracle_eager_passes_guard(self):
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        try:
+            validate_double_sparsity(self._server_args(True, disable_cuda_graph=True))
+        except Exception as e:
+            # A later check (missing channel-mask file) may raise, but the
+            # recall_oracle/cuda-graph guard must NOT be what fired.
+            self.assertNotIn("recall_oracle", str(e))
+            self.assertNotIn("CUDA graph", str(e))
+
+
 if __name__ == "__main__":
     unittest.main()

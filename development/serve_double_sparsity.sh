@@ -73,9 +73,23 @@ SCORER_NORM_HYBRID_THRESHOLD="${SCORER_NORM_HYBRID_THRESHOLD:-8192}"
 HEAD_AGG="${HEAD_AGG:-max}"                                # max | mean
 ANCHOR_MODE="${ANCHOR_MODE:-off}"                          # off | recency | global | strided
 ANCHOR_BUDGET="${ANCHOR_BUDGET:-0}"
-DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s", "scorer_norm": "%s", "scorer_norm_hybrid_threshold": %s, "head_agg": "%s", "anchor_mode": "%s", "anchor_budget": %s}' \
-  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}" "${SCORER_NORM_HYBRID_THRESHOLD}" "${HEAD_AGG}" "${ANCHOR_MODE}" "${ANCHOR_BUDGET}")
+# Fail-closed NIAH recall-oracle diagnostic (config-borne so it reaches TP
+# workers). RECALL_ORACLE=1 emits "recall_oracle": true and forces eager
+# (--disable-cuda-graph), which the validator requires.
+RECALL_ORACLE="${RECALL_ORACLE:-0}"                        # 0 | 1
+if [[ "${RECALL_ORACLE}" == "1" ]]; then RECALL_ORACLE_JSON=true; else RECALL_ORACLE_JSON=false; fi
+DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s", "scorer_norm": "%s", "scorer_norm_hybrid_threshold": %s, "head_agg": "%s", "anchor_mode": "%s", "anchor_budget": %s, "recall_oracle": %s}' \
+  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}" "${SCORER_NORM_HYBRID_THRESHOLD}" "${HEAD_AGG}" "${ANCHOR_MODE}" "${ANCHOR_BUDGET}" "${RECALL_ORACLE_JSON}")
 echo ">>> effective double_sparsity_config = ${DS_CONFIG}"
+
+# The recall oracle and any non-default scorer variant run the eager (non-graph-
+# safe) selector path; the validator rejects them under CUDA graph. Auto-add
+# --disable-cuda-graph so the operator does not have to remember it.
+CUDA_GRAPH_ARGS=()
+if [[ "${RECALL_ORACLE}" == "1" || "${SCORER_NORM}" != "off" || "${HEAD_AGG}" != "max" || "${ANCHOR_MODE}" != "off" ]]; then
+  CUDA_GRAPH_ARGS=(--disable-cuda-graph)
+  echo ">>> eager selector path required (recall_oracle/non-default scorer): adding --disable-cuda-graph"
+fi
 
 # Radix cache: DS serves radix-off by default. To serve radix-on, set
 # RADIX_FIXTURE_ARTIFACT to a fixtures-passed state file (written by
@@ -107,6 +121,7 @@ echo "    channel_mask     = ${CHANNEL_MASK_PATH}"
 echo "    top_k            = ${TOP_K}"
 echo "    device_buffer    = ${DEVICE_BUFFER_SIZE}"
 echo "    signature_dtype  = ${SIGNATURE_DTYPE}"
+echo "    recall_oracle    = ${RECALL_ORACLE} (eager: ${#CUDA_GRAPH_ARGS[@]} cuda-graph arg(s))"
 echo "    radix_cache      = $([[ -n "${RADIX_FIXTURE_ARTIFACT}" ]] && echo "ENABLED (fixture artifact: ${RADIX_FIXTURE_ARTIFACT})" || echo "disabled (no fixture artifact)")"
 echo "    log              = ${LOG_FILE}"
 
@@ -124,6 +139,7 @@ exec python3 -m sglang.launch_server \
   --disable-piecewise-cuda-graph \
   --enable-double-sparsity \
   --double-sparsity-config "${DS_CONFIG}" \
+  "${CUDA_GRAPH_ARGS[@]}" \
   `# Radix cache: --disable-radix-cache (default radix-off) or the` \
   `# fixtures-passed artifact path (radix-on), selected above.` \
   "${RADIX_ARGS[@]}" \

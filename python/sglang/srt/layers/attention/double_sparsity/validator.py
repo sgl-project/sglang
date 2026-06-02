@@ -114,6 +114,21 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Re-run with --disable-cuda-graph, or use the default scorer."
         )
 
+    # Recall-oracle diagnostic safety. The oracle hook does host syncs
+    # (.item()/dict build) that are illegal during CUDA-graph capture, and under
+    # graph replay the Python would not re-run at all (so it would record
+    # nothing). It must run the eager selector path, which requires
+    # --disable-cuda-graph.
+    if getattr(config, "recall_oracle", False) and not getattr(
+        server_args, "disable_cuda_graph", False
+    ):
+        raise ValueError(
+            "Double Sparsity recall_oracle diagnostic is not supported under CUDA "
+            "graph capture (the oracle hook host-syncs, and under graph replay it "
+            "would record nothing). Re-run with --disable-cuda-graph, or disable "
+            "recall_oracle."
+        )
+
     # Page size pairing (config vs server) + supported set.
     server_page_size = getattr(server_args, "page_size", None)
     if config.page_size not in _SUPPORTED_PAGE_SIZES:

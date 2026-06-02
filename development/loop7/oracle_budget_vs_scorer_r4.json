@@ -1,0 +1,57 @@
+{
+  "op_point": "DS int8 / mem 0.7 / TP=8, eager (--disable-cuda-graph), recall_oracle config-borne",
+  "method": "score-only recall@K on live all-reduced score tensor (after all_reduce, before top-K); needle span via raw-prompt offset mapping; per (trial,layer) sample; recall@K = all needle tokens ranked < K (needle_worst_rank < K)",
+  "index_topk": 2048,
+  "sink": "/sgl-workspace/sglang/.sglang_ds_oracle/sink.jsonl",
+  "failure_markers": {},
+  "lengths": {
+    "4096": {
+      "trials": 20,
+      "layer_samples": 4880,
+      "score_only_recall_at_k": {
+        "512": 0.1747950819672131,
+        "1024": 0.2752049180327869,
+        "2048": 0.4395491803278688,
+        "4096": 0.8559426229508197,
+        "8192": 1.0
+      },
+      "needle_rank_min": 44,
+      "needle_rank_median": 2417,
+      "needle_rank_max": 4406,
+      "uplift_gate_recall4096_minus_recall2048": 0.5605,
+      "verdict": "budget-limited"
+    },
+    "16384": {
+      "trials": 20,
+      "layer_samples": 4880,
+      "score_only_recall_at_k": {
+        "512": 0.12069672131147541,
+        "1024": 0.16577868852459016,
+        "2048": 0.23073770491803278,
+        "4096": 0.3122950819672131,
+        "8192": 0.4594262295081967
+      },
+      "needle_rank_min": 80,
+      "needle_rank_median": 9318,
+      "needle_rank_max": 17599,
+      "uplift_gate_recall4096_minus_recall2048": 0.2287,
+      "verdict": "budget-limited"
+    },
+    "65536": {
+      "trials": 20,
+      "layer_samples": 4880,
+      "score_only_recall_at_k": {
+        "512": 0.02889344262295082,
+        "1024": 0.09692622950819672,
+        "2048": 0.1543032786885246,
+        "4096": 0.19631147540983607,
+        "8192": 0.24385245901639344
+      },
+      "needle_rank_min": 104,
+      "needle_rank_median": 32668,
+      "needle_rank_max": 70096,
+      "uplift_gate_recall4096_minus_recall2048": 0.0895,
+      "verdict": "scorer-limited"
+    }
+  }
+}

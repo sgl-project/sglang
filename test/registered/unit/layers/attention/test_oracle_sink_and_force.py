@@ -245,14 +245,114 @@ class TestRetrieveTopkOracleWiring(unittest.TestCase):
         # invariant holds for the wired call (recall@index_topk == selected_contains_needle)
         self.assertTrue(r["recall_at_index_topk_matches_selected"])
 
-    def test_oracle_on_without_active_trial_is_noop(self):
+    def test_oracle_on_without_active_trial_records_failure(self):
+        # Fail-closed: enabled but no trial -> explicit failure marker (NOT a
+        # silent no-op). The selection is still byte-identical (no perturbation).
+        sel_off, vl_off = self._baseline_off()
         os.environ["SGLANG_DS_RECALL_ORACLE"] = "1"
         sink_mod.reset_sink_for_testing(None)
         sink_mod.clear_active_trial()  # enabled, but no needle span registered
+        sel_on, vl_on = self._run()
+        self.assertTrue(torch.equal(sel_off, sel_on))
+        self.assertTrue(torch.equal(vl_off, vl_on))
+        recs = sink_mod.get_sink().records
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["failure"], "no_active_trial")
+        # keyed: required schema present even for failures
+        for k in ("request_id", "trial_id", "layer_id", "decode_step"):
+            self.assertIn(k, recs[0])
+
+    def test_oracle_on_out_of_range_span_records_failure(self):
+        # Fail-closed: a needle position outside [0, max_tokens) is REJECTED with
+        # a span_out_of_range marker (NOT filtered, which silently mis-measures).
+        os.environ["SGLANG_DS_RECALL_ORACLE"] = "1"
+        sink_mod.reset_sink_for_testing(None)
+        sink_mod.set_active_trial("req-oob", 1, [2, 999])  # 999 >= T=8
         self._run()
-        sink = sink_mod.get_sink()
-        # sink may be lazily created, but nothing recorded without a trial
-        self.assertEqual([] if sink is None else sink.records, [])
+        recs = sink_mod.get_sink().records
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["failure"], "span_out_of_range")
+        self.assertEqual(recs[0]["out_of_range"], [999])
+        self.assertEqual(recs[0]["request_id"], "req-oob")
+        # no success payload fields leaked
+        self.assertNotIn("needle_worst_rank", recs[0])
+
+    def test_oracle_on_exception_records_failure(self):
+        # Fail-closed: a payload-build exception surfaces as an exception marker
+        # rather than being swallowed. Force it by monkeypatching the payload fn.
+        import sglang.srt.layers.attention.double_sparsity.selection_recall_oracle as oracle_mod
+
+        os.environ["SGLANG_DS_RECALL_ORACLE"] = "1"
+        sink_mod.reset_sink_for_testing(None)
+        sink_mod.set_active_trial("req-exc", 2, [2, 5])
+        orig = oracle_mod.oracle_payload_for_row
+        oracle_mod.oracle_payload_for_row = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        try:
+            self._run()
+        finally:
+            oracle_mod.oracle_payload_for_row = orig
+        recs = sink_mod.get_sink().records
+        self.assertEqual(len(recs), 1)
+        self.assertTrue(recs[0]["failure"].startswith("exception:RuntimeError"))
+        self.assertEqual(recs[0]["request_id"], "req-exc")
+
+
+class TestConfigBorneOracleActivation(unittest.TestCase):
+    """The config-borne ``recall_oracle`` flag activates the oracle without the
+    env (the path that reaches TP workers), and resolves the fixed cross-process
+    sink/trial-file defaults."""
+
+    def setUp(self):
+        import tempfile
+
+        self._prev = os.environ.get("SGLANG_DS_RECALL_ORACLE")
+        self._prev_path = os.environ.get("SGLANG_DS_RECALL_ORACLE_PATH")
+        os.environ.pop("SGLANG_DS_RECALL_ORACLE", None)
+        # Point the (config-borne) sink at a temp file so the test does not write
+        # the fixed /dev/shm cross-process default.
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        self._tmp.close()
+        os.environ["SGLANG_DS_RECALL_ORACLE_PATH"] = self._tmp.name
+        sink_mod.reset_sink_for_testing(None)
+        sink_mod.clear_active_trial()
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("SGLANG_DS_RECALL_ORACLE", None)
+        else:
+            os.environ["SGLANG_DS_RECALL_ORACLE"] = self._prev
+        if self._prev_path is None:
+            os.environ.pop("SGLANG_DS_RECALL_ORACLE_PATH", None)
+        else:
+            os.environ["SGLANG_DS_RECALL_ORACLE_PATH"] = self._prev_path
+        os.remove(self._tmp.name)
+        sink_mod.reset_sink_for_testing(None)
+        sink_mod.clear_active_trial()
+
+    def test_recall_oracle_param_activates_without_env(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+
+        self.assertFalse(sink_mod.oracle_enabled())  # env off, config not latched
+        sink_mod.set_active_trial("req-cfg", 7, [2, 5])
+        retrieve_topk_via_labels(
+            queries=torch.randn(1, 2, 4),
+            token_signatures=torch.randn(1, 8, 2, 2),
+            written=torch.ones(1, 8, dtype=torch.bool),
+            channel_selection=torch.tensor([[[0, 1], [2, 3]]], dtype=torch.int32),
+            channel_weights=torch.ones(1, 2, 2, dtype=torch.float32),
+            layer_id=0,
+            max_top_k=4,
+            recall_oracle=True,  # config-borne enable
+        )
+        self.assertTrue(sink_mod.oracle_enabled())  # latched on
+        recs = sink_mod.get_sink().records
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["request_id"], "req-cfg")
+        self.assertIn("needle_worst_rank", recs[0])
 
 
 if __name__ == "__main__":

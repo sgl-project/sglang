@@ -38,6 +38,7 @@ _ALLOWED_FIELDS = {
     "head_agg",
     "anchor_mode",
     "anchor_budget",
+    "recall_oracle",
     "extra",
 }
 
@@ -52,6 +53,10 @@ _ALLOWED_FIELDS = {
 #   selection — "off" (default, none), "recency" (most-recent), "global"
 #   (earliest stable), or "strided" (evenly spaced over [0, seq_len)).
 # anchor_budget: how many anchor positions to force-include; 0 disables.
+# recall_oracle: config-borne enable for the fail-closed NIAH recall-oracle
+#   diagnostic (off by default; byte-identical selection). Config-borne so it
+#   reaches TP workers; forces the eager selector path and requires
+#   --disable-cuda-graph (the hook does host syncs illegal under graph capture).
 _ALLOWED_SCORER_NORM = ("off", "cosine", "hybrid")
 _DEFAULT_SCORER_NORM = "off"
 _DEFAULT_HYBRID_THRESHOLD = 8192
@@ -81,6 +86,7 @@ class DoubleSparsityConfig:
     head_agg: str = _DEFAULT_HEAD_AGG
     anchor_mode: str = _DEFAULT_ANCHOR_MODE
     anchor_budget: int = _DEFAULT_ANCHOR_BUDGET
+    recall_oracle: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -109,6 +115,11 @@ class DoubleSparsityConfig:
                 f"Double Sparsity 'anchor_budget' must be a non-negative integer, "
                 f"got {self.anchor_budget!r}."
             )
+        if not isinstance(self.recall_oracle, bool):
+            raise ValueError(
+                f"Double Sparsity 'recall_oracle' must be a boolean, "
+                f"got {self.recall_oracle!r}."
+            )
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError(
                 f"Double Sparsity 'top_k' must be a positive integer, got {self.top_k!r}."
@@ -135,6 +146,21 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'extra' must be a dict, got {type(self.extra).__name__}."
             )
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Accept JSON booleans plus the common string/int spellings the serve
+    script may emit (``true``/``1``/``yes`` etc.) so a config flag never silently
+    no-ops because of a quoting mismatch."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    raise ValueError(
+        f"Double Sparsity 'recall_oracle' must be a boolean, got {value!r}."
+    )
 
 
 def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
@@ -191,5 +217,6 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         head_agg=str(data.get("head_agg", _DEFAULT_HEAD_AGG)),
         anchor_mode=str(data.get("anchor_mode", _DEFAULT_ANCHOR_MODE)),
         anchor_budget=int(data.get("anchor_budget", _DEFAULT_ANCHOR_BUDGET)),
+        recall_oracle=_coerce_bool(data.get("recall_oracle", False)),
         extra=data.get("extra", {}),
     )

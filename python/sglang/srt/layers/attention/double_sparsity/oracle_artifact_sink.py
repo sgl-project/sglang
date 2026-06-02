@@ -30,14 +30,77 @@ from typing import Any, Dict, List, Optional
 _ORACLE_ENV_FLAG = "SGLANG_DS_RECALL_ORACLE"
 _ORACLE_SINK_PATH_ENV = "SGLANG_DS_RECALL_ORACLE_PATH"
 
+# Fixed default trial/sink paths so the harness (writer) and the server's TP
+# worker (reader of the trial, writer of the sink) agree WITHOUT env propagation
+# — env vars set at launch do not reach SGLang TP worker subprocesses
+# (BL-20260602-ds-flag-must-be-config-borne-not-env), which is why oracle
+# records were silently absent for 64K. Both paths are env-overridable.
+_ORACLE_DIR_ENV = "SGLANG_DS_RECALL_ORACLE_DIR"
+
+
+def _oracle_dir() -> str:
+    """Directory for the shared cross-process trial/sink files.
+
+    MUST live on a mount both the driver and the TP worker share. ``/dev/shm`` is
+    NOT safe: each sandboxed process gets its own tmpfs ``/dev/shm``, so a trial
+    the driver writes is invisible to the worker. The repository working tree IS
+    the shared mount (the worker's CWD is the repo root), so anchor the default
+    there via ``os.getcwd()``. ``SGLANG_DS_RECALL_ORACLE_DIR`` overrides.
+    """
+    return os.environ.get(_ORACLE_DIR_ENV) or os.path.join(
+        os.getcwd(), ".sglang_ds_oracle"
+    )
+
+
+def default_trial_file() -> str:
+    return os.path.join(_oracle_dir(), "trial.json")
+
+
+def default_sink_path() -> str:
+    return os.path.join(_oracle_dir(), "sink.jsonl")
+
+
+# Set True by the selector hook when the config-borne ``recall_oracle`` flag is
+# on. This is how the oracle activates on TP worker subprocesses: env vars set
+# at launch do NOT reach them, but the DS config does
+# (BL-20260602-ds-flag-must-be-config-borne-not-env). Once a worker's hook sees
+# the flag it latches this on, so the sink + trial-file paths resolve to the
+# fixed defaults that the harness (driver) and the worker agree on.
+_CONFIG_ENABLED = False
+
+
+def enable_via_config() -> None:
+    """Latch the oracle on from the config-borne ``recall_oracle`` flag.
+
+    Idempotent. Called by the selector hook on the worker; thereafter
+    ``oracle_enabled()`` is True and ``_sink_path()`` / ``_trial_file()`` resolve
+    to the fixed default cross-process paths.
+    """
+    global _CONFIG_ENABLED
+    _CONFIG_ENABLED = True
+
+
+def _env_enabled() -> bool:
+    return os.environ.get(_ORACLE_ENV_FLAG, "0") not in ("0", "", "false", "False")
+
+
+def _sink_path() -> Optional[str]:
+    """Resolve the JSONL sink path. Env override wins; otherwise the fixed
+    cross-process default when config-borne-enabled; otherwise ``None``
+    (in-memory only, the unit-test default — no on-disk side effect)."""
+    return os.environ.get(_ORACLE_SINK_PATH_ENV) or (
+        default_sink_path() if _CONFIG_ENABLED else None
+    )
+
 
 def oracle_enabled() -> bool:
-    """``True`` iff the recall oracle is opt-in enabled via the env flag.
+    """``True`` iff the recall oracle is opt-in enabled.
 
-    Read fresh each call so tests can toggle it; the cost is one ``os.environ``
-    lookup, only paid when a caller explicitly probes the oracle.
+    Two activation paths: the env flag (harness/unit tests) and the config-borne
+    latch (TP workers, where env does not propagate). Read fresh each call so
+    tests can toggle it.
     """
-    return os.environ.get(_ORACLE_ENV_FLAG, "0") not in ("0", "", "false", "False")
+    return _CONFIG_ENABLED or _env_enabled()
 
 
 @dataclass
@@ -64,6 +127,9 @@ class OracleArtifactSink:
         with self._lock:
             self.records.append(payload)
             if self.path is not None:
+                _d = os.path.dirname(self.path)
+                if _d:
+                    os.makedirs(_d, exist_ok=True)
                 with open(self.path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(payload) + "\n")
 
@@ -88,17 +154,18 @@ def get_sink() -> Optional[OracleArtifactSink]:
     if _ACTIVE_SINK is None:
         with _ACTIVE_SINK_LOCK:
             if _ACTIVE_SINK is None:
-                _ACTIVE_SINK = OracleArtifactSink(
-                    path=os.environ.get(_ORACLE_SINK_PATH_ENV) or None
-                )
+                _ACTIVE_SINK = OracleArtifactSink(path=_sink_path())
     return _ACTIVE_SINK
 
 
 def reset_sink_for_testing(sink: Optional[OracleArtifactSink] = None) -> None:
-    """Install (or clear) the active sink. Test-only."""
-    global _ACTIVE_SINK
+    """Install (or clear) the active sink, and clear the config-borne latch.
+    Test-only."""
+    global _ACTIVE_SINK, _CONFIG_ENABLED, _GLOBAL_SAMPLE_COUNTER
     with _ACTIVE_SINK_LOCK:
         _ACTIVE_SINK = sink
+    _CONFIG_ENABLED = False
+    _GLOBAL_SAMPLE_COUNTER = 0
 
 
 @dataclass
@@ -122,7 +189,11 @@ _TRIAL_FILE_ENV = "SGLANG_DS_RECALL_ORACLE_TRIAL_FILE"
 
 
 def _trial_file() -> Optional[str]:
-    return os.environ.get(_TRIAL_FILE_ENV) or None
+    """Resolve the cross-process trial-span file. Env override wins; otherwise
+    the fixed default when config-borne-enabled; otherwise ``None``."""
+    return os.environ.get(_TRIAL_FILE_ENV) or (
+        default_trial_file() if _CONFIG_ENABLED else None
+    )
 
 
 def set_active_trial(request_id: Any, trial_id: Any, needle_positions) -> None:
@@ -143,6 +214,9 @@ def set_active_trial(request_id: Any, trial_id: Any, needle_positions) -> None:
         )
     path = _trial_file()
     if path is not None:
+        _d = os.path.dirname(path)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
         tmp = f"{path}.tmp.{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(
@@ -189,13 +263,26 @@ def get_active_trial() -> Optional[OracleTrialContext]:
         return None
 
 
+_GLOBAL_SAMPLE_COUNTER = 0
+
+
 def next_sample_index() -> int:
-    """Advance and return the active trial's per-call sample counter."""
+    """Advance and return a per-call sample ordinal that distinguishes each
+    recorded (layer, decode-step) sample.
+
+    Prefers the in-process active trial's counter (harness/unit-test path). On a
+    TP worker the trial lives only in the cross-process file (``_ACTIVE_TRIAL``
+    is ``None`` there), so fall back to a module-global monotonic counter —
+    otherwise every worker record would collide on ``decode_step=0``.
+    """
+    global _GLOBAL_SAMPLE_COUNTER
     with _ACTIVE_TRIAL_LOCK:
-        if _ACTIVE_TRIAL is None:
-            return 0
-        idx = _ACTIVE_TRIAL.sample_counter
-        _ACTIVE_TRIAL.sample_counter = idx + 1
+        if _ACTIVE_TRIAL is not None:
+            idx = _ACTIVE_TRIAL.sample_counter
+            _ACTIVE_TRIAL.sample_counter = idx + 1
+            return idx
+        idx = _GLOBAL_SAMPLE_COUNTER
+        _GLOBAL_SAMPLE_COUNTER = idx + 1
         return idx
 
 
@@ -224,5 +311,39 @@ def record_oracle_sample(
         "decode_step": int(decode_step),
         **payload,
     }
+    sink.record(record)
+    return True
+
+
+def record_oracle_failure(
+    *,
+    reason: str,
+    request_id: Any,
+    trial_id: Any,
+    layer_id: int,
+    decode_step: int,
+    extra: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Write one explicit oracle FAILURE record (fail-closed marker).
+
+    The oracle is a diagnostic that must never silently guess or silently drop a
+    sample: when an active trial is missing, a harness-provided needle position
+    is out of range, or the payload build raises, we emit a keyed record with a
+    ``"failure"`` field instead of returning quietly. The sweep asserts on these
+    + on missing successes, so a regression surfaces as a loud artifact rather
+    than an absent row. Returns ``True`` iff a record was written.
+    """
+    sink = get_sink()
+    if sink is None:
+        return False
+    record = {
+        "request_id": request_id,
+        "trial_id": trial_id,
+        "layer_id": int(layer_id),
+        "decode_step": int(decode_step),
+        "failure": str(reason),
+    }
+    if extra:
+        record.update(extra)
     sink.record(record)
     return True

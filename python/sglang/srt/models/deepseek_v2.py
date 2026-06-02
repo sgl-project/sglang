@@ -2242,6 +2242,12 @@ class DeepseekV2AttentionMLA(
                     ds_scorer_is_default as _ds_scorer_is_default,
                 )
 
+                # NOTE: the recall-oracle diagnostic does NOT force eager. The
+                # eager logical scorer allocates per-token intermediates that do
+                # not scale to long-context int8 tensors (error_containment then
+                # silently drops DS to dense), so the oracle must ride the
+                # production graph-safe Triton path; recall_oracle is threaded
+                # into retrieve_topk_graph_safe below instead.
                 _force_eager_select = (
                     os.environ.get("SGLANG_DS_FORCE_EAGER_SELECT", "0") == "1"
                     or not _ds_scorer_is_default(getattr(_selector, "config", None))
@@ -2313,6 +2319,9 @@ class DeepseekV2AttentionMLA(
                         scratch_throwaway_idx=_ds_graph_state.scratch_throwaway_idx,
                         token_scales=_selector.token_label_table.scales,
                         process_group=getattr(_selector, "process_group", None),
+                        recall_oracle=bool(
+                            getattr(_selector.config, "recall_oracle", False)
+                        ),
                     )
                     selected_indices = _ds_graph_state.selected_indices[:_bs]
                     valid_lengths = _ds_graph_state.valid_lengths[:_bs]

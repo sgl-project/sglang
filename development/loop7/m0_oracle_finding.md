@@ -1,5 +1,12 @@
 # Loop 7 M0 — oracle budget-vs-scorer finding (the A-vs-B decider)
 
+> **SUPERSEDED (R4) for the 64K row and N.** This run recorded **nothing for 64K**
+> (the oracle env did not reach TP workers; see the caveat at the bottom) and used
+> N=3–4. The binding re-run — fail-closed, config-borne, N=20, with **64K measured**
+> — is `m0_oracle_finding_r4.md` (artifact `oracle_budget_vs_scorer_r4.json`). The
+> A-vs-B *decision* below is unchanged and confirmed; only the 64K evidence moved
+> from inferred to measured and 16K is now characterized as budget-partial.
+
 **What this measures:** for each NIAH trial, the needle's score rank on the **live all-reduced DS token-score tensor** (after `all_reduce_token_scores`, before `select_topk_sequence_order`) and the **score-only** recall@K — i.e. would a budget of K have selected every needle token, judged purely from the score ranking (no decode). Needle logical positions located via raw-prompt offset mapping with `token_match` verified against the server's `prompt_tokens`. Server: DS int8 / mem 0.7 / TP=8, **eager** (`--disable-cuda-graph`; the Python oracle hook does not re-run under graph replay). Raw artifacts: `oracle_sink.jsonl`, aggregate `oracle_budget_vs_scorer.json`.
 
 | length | tokenized | trials × layers | r@2048 | r@4096 | r@8192 | needle rank (min/med/max) | **verdict** |
