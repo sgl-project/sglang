@@ -310,7 +310,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 num_experts=self.num_experts,
                 num_local_experts=config.num_experts // self.tp_size,
                 hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
+                params_dtype=config.dtype,
                 deepep_mode=get_deepep_mode(),
                 async_finish=True,  # TODO
                 return_recv_hook=True,

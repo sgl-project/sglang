@@ -79,7 +79,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.utils import fused_qk_gemma_rmsnorm
+from sglang.srt.models.utils import WeightsMapper, fused_qk_gemma_rmsnorm
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -178,7 +178,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_ba = self.create_ba_proj(
             hidden_size=self.hidden_size,
             num_v_heads=self.num_v_heads,
-            quant_config=quant_config,
+            # output_sizes=[num_v_heads]*2 is typically not divisible by
+            # Marlin's tile_n_size=64, causing gptq_marlin_repack to crash.
+            quant_config=None,
             prefix=add_prefix("in_proj_ba", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -242,7 +244,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             group_size=None,
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
-            dtype=config.torch_dtype,
+            dtype=config.dtype,
             **(
                 {"activation": self.output_gate_type}
                 if self.output_gate_type is not None
@@ -1490,7 +1492,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-    hf_to_sglang_mapper = None
+    # Qwen3.5 already remaps weight names in load_weights().
+    # Keep mapper simple so quant ignore names still match Qwen3.5 layer names.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn.qkv": "attn.qkv_proj",
+        },
+    )
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -1644,7 +1652,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-    hf_to_sglang_mapper = None
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn.qkv": "attn.qkv_proj",
+        },
+    )
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 

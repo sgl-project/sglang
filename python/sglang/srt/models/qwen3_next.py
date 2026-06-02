@@ -139,7 +139,10 @@ class Qwen3GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_sizes=[self.num_v_heads] * 2,
             bias=False,
-            quant_config=quant_config,
+            # output_sizes=[num_v_heads]*2 is typically not divisible by
+            # Marlin's tile_n_size=64, causing gptq_marlin_repack to crash.
+            # These weights are also absent from auto-round checkpoints.
+            quant_config=None,
             prefix=add_prefix("in_proj_ba", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -189,7 +192,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 group_size=None,
                 norm_before_gate=True,
                 device=torch.get_device_module().current_device(),
-                dtype=config.torch_dtype,
+                dtype=config.dtype,
                 **(
                     {"activation": self.output_gate_type}
                     if self.output_gate_type is not None
@@ -206,7 +209,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                     else self.activation
                 ),
                 device=torch.get_device_module().current_device(),
-                dtype=config.torch_dtype,
+                dtype=config.dtype,
             )
         )
 
