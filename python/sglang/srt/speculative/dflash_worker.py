@@ -1359,7 +1359,7 @@ class DFlashWorker:
 
         # Feed acceptance signal to adaptive controller (no-op when adaptive is disabled).
         if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(num_accepted_drafts_per_req_cpu)
+            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req_cpu)
 
         return GenerationBatchResult(
             logits_output=logits_output,
