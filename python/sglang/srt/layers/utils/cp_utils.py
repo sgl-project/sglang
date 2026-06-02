@@ -70,16 +70,14 @@ def is_prefill_cp_in_seq_split():
 
 def get_cp_padding_align_size() -> int:
     """Token-count alignment for CP padding of global_num_tokens: 2 * cp_size
-    for zigzag (in-seq-split) CP, cp_size for other CP modes, and 1 when CP is
-    off so callers skip padding (extra padding breaks EAGLE/MTP draft prefill,
-    see #23269). Keep prepare_mlp_sync_batch and cal_padded_tokens consistent
+    for zigzag (in-seq-split) CP, otherwise cp_size (1 when CP is off, so the
+    padding is a no-op; extra padding breaks EAGLE/MTP draft prefill, see
+    #23269). Keep prepare_mlp_sync_batch and cal_padded_tokens consistent
     through this helper.
     """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 
     attn_cp_size = get_attention_cp_size()
-    if attn_cp_size <= 1:
-        return 1
     if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
         return attn_cp_size * 2
     return attn_cp_size
