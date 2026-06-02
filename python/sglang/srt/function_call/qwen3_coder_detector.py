@@ -468,7 +468,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return StreamingParseResult(calls=calls, normal_text=normal_text)
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
+
+    def get_structural_tag_name(self) -> str:
+        return "qwen_3_coder"
