@@ -537,6 +537,7 @@ class PiecewiseCudaGraphRunner:
         )
 
         global_dp_buffer_len = None
+        global_num_tokens_cpu = None
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -611,6 +612,7 @@ class PiecewiseCudaGraphRunner:
                     global_dp_buffer_len,
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
+                    global_num_tokens_cpu,
                 )
                 # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
                 # It is True in this context but we need to set it to use low latency deepep mode.
