@@ -1329,17 +1329,16 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         if skip_final_projection:
             return hidden_states
 
+        temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
+        shift, scale = (self.scale_shift_table.unsqueeze(1) + temb).chunk(2, dim=2)
+        hidden_states = self.norm_out(hidden_states, shift, scale)
+        hidden_states = self.proj_out(hidden_states)
         if sequence_shard_enabled:
             hidden_states = _sequence_all_gather_varlen(
                 hidden_states.contiguous(),
                 list(forward_batch.sequence_shard_splits),
                 get_sp_group().device_group,
             )
-
-        temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
-        shift, scale = (self.scale_shift_table.unsqueeze(1) + temb).chunk(2, dim=2)
-        hidden_states = self.norm_out(hidden_states, shift, scale)
-        hidden_states = self.proj_out(hidden_states)
         hidden_states = hidden_states.reshape(
             batch_size,
             post_patch_num_frames,
