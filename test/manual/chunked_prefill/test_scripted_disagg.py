@@ -231,17 +231,20 @@ class TestDisaggInflightQueue(ScriptedTestCase):
 
 
 class TestDisaggPartialPage(ScriptedTestCase):
-    # page_size=16 with a chunk size and prompt length that are NOT multiples of
-    # 16 makes send_kv_chunk's partial-page deferral (prefill.py:787-789,
-    # `if not last_chunk: end_idx -= end_idx % page_size`) load-bearing: every
-    # all-disagg-class default of page_size=1 makes that line a no-op. Non-overlap
-    # so the send (and start_send_idx update) happens synchronously per chunk.
+    # page_size=16 with a prompt length that is NOT a multiple of 16 keeps the
+    # final send non-page-aligned while every non-final chunk send stays page
+    # aligned. The scheduler itself page-aligns each chunk boundary
+    # (schedule_policy.py:932,949 round trunc_len/now_input_len down to page_size),
+    # and the server-args check forbids a chunked_prefill_size that is not a
+    # multiple of page_size (server_args.py:7279-7281), so chunked_prefill_size
+    # must be a multiple of PAGE_SIZE. Non-overlap so the send (and start_send_idx
+    # update) happens synchronously per chunk.
     PAGE_SIZE = 16
     PARTIAL_PROMPT_LEN = 60  # 60 % 16 == 12 -> final send is NOT page-aligned
 
     ENGINE_KWARGS = base_engine_kwargs(
         model_path=DEFAULT_MODEL_NAME_FOR_TEST,
-        chunked_prefill_size=15,  # 15 % 16 != 0 -> non-final fill boundaries misalign
+        chunked_prefill_size=PAGE_SIZE,  # must be divisible by page_size
         page_size=PAGE_SIZE,
         disaggregation_mode="prefill",
         disaggregation_transfer_backend="fake",
@@ -255,17 +258,21 @@ class TestDisaggPartialPage(ScriptedTestCase):
 
     @staticmethod
     def _script_partial_page_deferred_on_non_final_chunk(t: ScriptedContext):
-        """Non-final disagg sends defer the partial last page (start_send_idx page-aligned); final send does not."""
+        """Non-final disagg sends stay page-aligned (start_send_idx % page_size == 0); the final send reaches the non-page-aligned prompt length."""
         # GPU validation pending: scripted single-GPU harness only.
         page_size = TestDisaggPartialPage.PAGE_SIZE
         prompt_len = TestDisaggPartialPage.PARTIAL_PROMPT_LEN
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
 
+        # The req is not chunked on the very first scheduler iteration after
+        # submission, so advance until it becomes the chunked_req before sampling
+        # per-chunk send state.
+        yield from run_until(r, lambda h: h.is_chunking)
+
         saw_nonzero_aligned_send = False
-        # While chunking, every synchronous non-final send rounds end_idx down to a
-        # page boundary, so start_send_idx is always a multiple of page_size and
-        # never overshoots the prompt. This is exactly the `if not last_chunk`
-        # deferral; with page_size=1 it would instead track the raw fill boundary.
+        # While chunking, the scheduler page-aligns each chunk boundary and the
+        # non-final send rounds end_idx down to a page boundary, so start_send_idx
+        # is always a multiple of page_size and never overshoots the prompt.
         for _ in range(800):
             if not r.is_chunking:
                 break
@@ -284,16 +291,24 @@ class TestDisaggPartialPage(ScriptedTestCase):
             "(0 < start_send_idx < prompt_len) during chunked prefill"
         )
 
-        yield from run_until_finished(r, max_steps=800)
+        # Step to completion, capturing the last live start_send_idx. The final
+        # send (last_chunk=True) skips the deferral and reaches the full prompt
+        # length, which is NOT a multiple of page_size -- proving the non-final
+        # page-alignment above came from the deferral, not an already-aligned
+        # prompt.
+        final_ssi = None
+        for _ in range(800):
+            req = t.find_req_by_rid(r.rid)
+            if req is not None:
+                final_ssi = req.start_send_idx
+            if r.finished:
+                break
+            yield
         assert r.finished
-        # The final send (last_chunk=True) skips the deferral and reaches the full
-        # prompt length, which is NOT a multiple of page_size -- proving the
-        # non-final page-alignment above was the `if not last_chunk` branch, not an
-        # accident of an already-aligned prompt.
         assert prompt_len % page_size != 0
-        assert r.req.start_send_idx == prompt_len, (
+        assert final_ssi == prompt_len, (
             f"final send must reach full (non-page-aligned) prompt length; "
-            f"start_send_idx={r.req.start_send_idx}, prompt_len={prompt_len}"
+            f"start_send_idx={final_ssi}, prompt_len={prompt_len}"
         )
 
 
