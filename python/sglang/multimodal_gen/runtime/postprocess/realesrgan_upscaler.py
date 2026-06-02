@@ -33,6 +33,7 @@ _REALESRGAN_TILE_PAD = 32
 
 # Module-level cache: model_path -> UpscalerModel instance
 _MODEL_CACHE: dict[str, "UpscalerModel"] = {}
+_RESOLVED_MODEL_PATH_CACHE: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +669,12 @@ def _resolve_model_path(model_path: str) -> str:
     - A HuggingFace ``repo_id:filename`` → downloads *filename* from *repo_id*,
       allowing users to specify custom weight files hosted on HF.
     """
+    cached_path = _RESOLVED_MODEL_PATH_CACHE.get(model_path)
+    if cached_path is not None:
+        return cached_path
+
     if os.path.isfile(model_path):
+        _RESOLVED_MODEL_PATH_CACHE[model_path] = model_path
         return model_path
 
     # Parse optional "repo_id:filename" syntax; fall back to default filename.
@@ -704,6 +710,7 @@ def _resolve_model_path(model_path: str) -> str:
             f"'repo_id:filename' format (e.g. 'my-org/my-esrgan:weights.pth'). "
             f"Original error: {e}"
         ) from e
+    _RESOLVED_MODEL_PATH_CACHE[model_path] = local_path
     return local_path
 
 

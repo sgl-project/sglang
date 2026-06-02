@@ -745,7 +745,7 @@ function drawFrame(image) {
 function renderLoop(now) {
   const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
   const queueSeconds = queue.length / Math.max(1, targetFps);
-  const catchupFps = queueSeconds > LOW_LATENCY_QUEUE_SECONDS
+  const catchupFps = !$("superResolution").checked && queueSeconds > LOW_LATENCY_QUEUE_SECONDS
     ? Math.min(MAX_CATCHUP_FPS, Math.ceil(queue.length / LOW_LATENCY_QUEUE_SECONDS))
     : targetFps;
   const targetMs = 1000 / Math.max(1, catchupFps);
@@ -1125,9 +1125,10 @@ function updatePlaybackPace(header, now, frameCount) {
   if (waitSeconds > 0) {
     const generatedFps = currentReceiveChunkFrames / Math.max(0.001, waitSeconds);
     const requestedFps = Number($("fps").value || DEFAULT_TARGET_FPS);
+    const playbackFloor = $("superResolution").checked ? 1 : LOW_LATENCY_FPS_FLOOR;
     playbackFps = Math.min(
       requestedFps,
-      Math.max(LOW_LATENCY_FPS_FLOOR, generatedFps * 1.05),
+      Math.max(playbackFloor, generatedFps * 1.05),
     );
     const latencyText = `${waitSeconds.toFixed(1)}s · ${playbackFps.toFixed(1)}fps`;
     $("latencyText").textContent = latencyText;
