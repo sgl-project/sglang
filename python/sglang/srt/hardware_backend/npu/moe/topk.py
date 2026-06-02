@@ -7,7 +7,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
-    maybe_capture_routed_experts,
+    capture_routed_experts_if_allowed,
     select_experts,
 )
 
@@ -86,6 +86,6 @@ def fused_topk_npu(
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    maybe_capture_routed_experts(topk_config, layer_id, topk_ids)
+    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

@@ -143,7 +143,7 @@ class Gemma4MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         *,
-        capture_routed_experts: bool = True,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -180,7 +180,7 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             layer_id=layer_id,
             custom_routing_function=routing_function,
-            capture_routed_experts=capture_routed_experts,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
         experts_type = get_moe_impl_class(quant_config)
@@ -436,7 +436,7 @@ class Gemma4DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         *,
-        capture_routed_experts: bool = True,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -533,7 +533,7 @@ class Gemma4DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("moe", prefix),
-                capture_routed_experts=capture_routed_experts,
+                allow_routed_experts_capture=allow_routed_experts_capture,
             )
 
             self.post_feedforward_layernorm_1 = RMSNorm(
@@ -674,7 +674,7 @@ class Gemma4TextModel(PreTrainedModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         *,
-        capture_routed_experts: bool = True,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__(config=config)
         self.config = config
@@ -736,7 +736,7 @@ class Gemma4TextModel(PreTrainedModel):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
-                capture_routed_experts=capture_routed_experts,
+                allow_routed_experts_capture=allow_routed_experts_capture,
             ),
             prefix=add_prefix("layers", prefix),
         )

@@ -9,7 +9,7 @@ loads its model and before any forward runs). The guard:
        - Unknown architecture                   -> RuntimeError (refuse start).
        - MoE-bearing but `opted_out=False`      -> RuntimeError (pending plumbing).
        - MoE-bearing and `opted_out=True`       -> walk modules; every
-         `TopK.topk_config.capture_routed_experts` must be False.
+         `TopK.topk_config.allow_routed_experts_capture` must be False.
        - Dense allowlist                        -> walk modules; assert 0 TopK.
   3. Failure modes raise `RuntimeError` with a message that names the
      architecture and the specific contract violated, so the operator
@@ -91,7 +91,7 @@ def check_draft_capture_optout(
     if entry.moe_bearing and not entry.opted_out:
         raise RuntimeError(
             f"draft architecture {arch!r} is registered as MoE-bearing but "
-            "its per-TopKConfig capture_routed_experts opt-out is not yet "
+            "its per-TopKConfig allow_routed_experts_capture opt-out is not yet "
             "plumbed (opted_out=False). Refusing to start to prevent silent "
             "R3 pollution. See "
             f"{entry.opt_out_injection_point!r} for the planned injection site."
@@ -100,14 +100,14 @@ def check_draft_capture_optout(
     topks = _collect_topk_modules(model)
 
     if entry.moe_bearing:
-        # Every TopK on this draft model must carry capture_routed_experts=False.
+        # Every TopK on this draft model must carry allow_routed_experts_capture=False.
         offenders = [
-            t for t in topks if getattr(t.topk_config, "capture_routed_experts", True)
+            t for t in topks if getattr(t.topk_config, "allow_routed_experts_capture", True)
         ]
         if offenders:
             raise RuntimeError(
                 f"draft architecture {arch!r} has {len(offenders)} TopK "
-                "module(s) with capture_routed_experts=True; expected all "
+                "module(s) with allow_routed_experts_capture=True; expected all "
                 "False on a draft worker. The per-model opt-out at "
                 f"{entry.opt_out_injection_point!r} is missing or incomplete."
             )

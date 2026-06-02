@@ -2,8 +2,8 @@
 opt-out.
 
 A draft model whose MoE layers can write into the target's R3 capture buffer
-must explicitly opt out via `TopKConfig.capture_routed_experts=False` at
-construction time. A draft model that contains no `TopK` (`dense_no_topk`)
+must explicitly opt out via `TopKConfig.allow_routed_experts_capture=False`
+during construction. A draft model that contains no `TopK` (`dense_no_topk`)
 needs no opt-out but must be listed here so the runtime guard can recognize
 it instead of failing closed.
 
@@ -49,7 +49,7 @@ class DraftInventoryEntry:
         correct (cite a code path / signal). Required so future readers can
         re-verify the claim without recomputing.
       - `opted_out`: True when the family's draft `TopK` instances are
-        already constructed with `capture_routed_experts=False`. False for
+        already constructed with `allow_routed_experts_capture=False`. False for
         MoE-bearing entries whose opt-out plumbing is still pending. The
         fail-closed runtime guard treats `opted_out=False` (with
         `moe_bearing=True`) the same as an unknown architecture: it refuses
@@ -82,7 +82,7 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         rationale=(
             "deepseek_nextn.py instantiates DeepseekV2DecoderLayer with "
             "is_nextn=True; the shared DeepseekV2MoE passes "
-            "capture_routed_experts=not is_nextn to TopK."
+            "allow_routed_experts_capture=not is_nextn to TopK."
         ),
     ),
     DraftInventoryEntry(
@@ -94,7 +94,7 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         rationale=(
             "deepseek_v4_nextn.py constructs DeepseekV4DecoderLayer with "
             "is_nextn=True; DeepseekV4DecoderLayer reuses DeepseekV2MoE which "
-            "already keys capture_routed_experts on is_nextn."
+            "already keys allow_routed_experts_capture on is_nextn."
         ),
     ),
     DraftInventoryEntry(
@@ -106,7 +106,7 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         rationale=(
             "glm4_moe_nextn.py instantiates Glm4MoeDecoderLayer with "
             "is_nextn=True; the shared Glm4MoeSparseMoeBlock passes "
-            "capture_routed_experts=not is_nextn to TopK."
+            "allow_routed_experts_capture=not is_nextn to TopK."
         ),
     ),
     DraftInventoryEntry(
@@ -162,8 +162,8 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         opt_out_injection_point="python/sglang/srt/models/step3p5.py:Step3p5MoEMLP",
         rationale=(
             "step3p5_mtp.py:83 constructs Step3p5DecoderLayer(..., "
-            "capture_routed_experts=False); the kwarg threads to Step3p5MoEMLP "
-            "and lands as `capture_routed_experts=False` on the MoE TopK."
+            "allow_routed_experts_capture=False); the kwarg threads to Step3p5MoEMLP "
+            "and lands as `allow_routed_experts_capture=False` on the MoE TopK."
         ),
     ),
     DraftInventoryEntry(
@@ -175,7 +175,7 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         rationale=(
             "bailing_moe_nextn.py:107 passes is_nextn=True to BailingMoEBlock; "
             "the block threads is_nextn to BailingMoESparseMoeBlock which sets "
-            "capture_routed_experts=not is_nextn on its TopK."
+            "allow_routed_experts_capture=not is_nextn on its TopK."
         ),
     ),
     DraftInventoryEntry(
@@ -198,7 +198,7 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         opt_out_injection_point="python/sglang/srt/models/qwen2_moe.py:Qwen2MoeSparseMoeBlock",
         rationale=(
             "qwen3_next.py reuses Qwen2MoeSparseMoeBlock with is_nextn=True; "
-            "the shared block passes capture_routed_experts=not is_nextn to TopK."
+            "the shared block passes allow_routed_experts_capture=not is_nextn to TopK."
         ),
     ),
     DraftInventoryEntry(
@@ -220,9 +220,9 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         opt_out_injection_point="python/sglang/srt/models/exaone_moe.py:ExaoneMoESparseMoEBlock",
         rationale=(
             "exaone_moe_mtp.py constructs ExaoneMoEModel(..., "
-            "capture_routed_experts=False); the kwarg threads through "
+            "allow_routed_experts_capture=False); the kwarg threads through "
             "ExaoneMoEModel / ExaoneMoEDecoderLayer / ExaoneMoESparseMoEBlock "
-            "and lands as `capture_routed_experts=False` on the MoE TopK."
+            "and lands as `allow_routed_experts_capture=False` on the MoE TopK."
         ),
     ),
     DraftInventoryEntry(
@@ -233,9 +233,9 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         opt_out_injection_point="python/sglang/srt/models/nemotron_h.py:NemotronHMoE",
         rationale=(
             "nemotron_h_mtp.py:115 NemotronHMTPMoEDecoderLayer calls "
-            "super().__init__(..., capture_routed_experts=False); the kwarg "
+            "super().__init__(..., allow_routed_experts_capture=False); the kwarg "
             "threads through NemotronHMoEDecoderLayer to NemotronHMoE and "
-            "lands as `capture_routed_experts=False` on the MoE TopK."
+            "lands as `allow_routed_experts_capture=False` on the MoE TopK."
         ),
     ),
     DraftInventoryEntry(
@@ -246,8 +246,8 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         opt_out_injection_point="python/sglang/srt/models/hunyuan_v3.py:HYV3MoEFused",
         rationale=(
             "hunyuan_v3_nextn.py:67 constructs HYV3DecoderLayer(..., "
-            "capture_routed_experts=False); the kwarg threads to HYV3MoEFused "
-            "and lands as `capture_routed_experts=False` on the MoE TopK."
+            "allow_routed_experts_capture=False); the kwarg threads to HYV3MoEFused "
+            "and lands as `allow_routed_experts_capture=False` on the MoE TopK."
         ),
     ),
     # ---- Independent EAGLE-style draft architectures ----
@@ -282,11 +282,10 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         draft_signal="always_draft",
         opt_out_injection_point="python/sglang/srt/models/mistral_large_3_eagle.py:MistralLarge3EagleModel",
         rationale=(
-            "mistral_large_3_eagle.py:48 constructs DeepseekV2DecoderLayer "
-            "with explicit capture_routed_experts=False. DeepseekV2MoE was "
-            "extended in round 2 to accept this Optional[bool] keyword and "
-            "use it when not None (otherwise falling back to `not is_nextn` "
-            "for the target path)."
+            "mistral_large_3_eagle.py constructs DeepseekV2DecoderLayer with "
+            "is_nextn=False, then marks every constructed TopK with "
+            "allow_routed_experts_capture=False at the always-draft wrapper "
+            "boundary. DeepseekV2MoE itself keeps the `not is_nextn` contract."
         ),
     ),
     DraftInventoryEntry(
@@ -316,9 +315,9 @@ INVENTORY: Tuple[DraftInventoryEntry, ...] = (
         opt_out_injection_point="python/sglang/srt/models/gemma4_causal.py:Gemma4MoE",
         rationale=(
             "gemma4_mtp.py:95 constructs Gemma4TextModel(..., "
-            "capture_routed_experts=False); the kwarg threads through "
+            "allow_routed_experts_capture=False); the kwarg threads through "
             "Gemma4DecoderLayer / Gemma4MoE and lands as "
-            "`capture_routed_experts=False` on the MoE TopK. This is the "
+            "`allow_routed_experts_capture=False` on the MoE TopK. This is the "
             "only assistant arch that auto-promotes to FROZEN_KV_MTP in "
             "server_args._resolve_speculative_algorithm_alias."
         ),

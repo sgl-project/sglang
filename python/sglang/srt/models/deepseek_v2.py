@@ -441,8 +441,6 @@ class DeepseekV2MoE(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
-        *,
-        capture_routed_experts: Optional[bool] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -564,11 +562,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
-                capture_routed_experts=(
-                    not is_nextn
-                    if capture_routed_experts is None
-                    else capture_routed_experts
-                ),
+                allow_routed_experts_capture=not is_nextn,
                 # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
                 output_format=(
@@ -1796,8 +1790,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        *,
-        capture_routed_experts: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1863,7 +1855,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
-                capture_routed_experts=capture_routed_experts,
             )
         else:
             if enable_moe_dense_fully_dp():

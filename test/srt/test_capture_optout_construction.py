@@ -1,4 +1,4 @@
-"""Real construction-level verification of the `capture_routed_experts`
+"""Real construction-level verification of the `allow_routed_experts_capture`
 opt-out for MoE-bearing draft families and dense allowlist entries.
 
 The fixture below patches SGLang's INFRASTRUCTURE boundaries (distributed
@@ -48,6 +48,7 @@ def _fake_group() -> MagicMock:
     g = MagicMock()
     g.world_size = 1
     g.rank.return_value = 0
+    g.rank_in_group = 0
     g.local_rank = 0
     inner = MagicMock()
     inner.world_size = 1
@@ -315,9 +316,9 @@ class Qwen2MoEConstructionTest(unittest.TestCase):
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1, "Qwen2MoeSparseMoeBlock builds 1 TopK")
         self.assertFalse(
-            topks[0].topk_config.capture_routed_experts,
+            topks[0].topk_config.allow_routed_experts_capture,
             "draft block (is_nextn=True) must produce TopK with "
-            "capture_routed_experts=False",
+            "allow_routed_experts_capture=False",
         )
 
     def test_target_path_constructs_topk_with_capture_true(self):
@@ -329,15 +330,15 @@ class Qwen2MoEConstructionTest(unittest.TestCase):
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
         self.assertTrue(
-            topks[0].topk_config.capture_routed_experts,
+            topks[0].topk_config.allow_routed_experts_capture,
             "target block (is_nextn=False) must produce TopK with "
-            "capture_routed_experts=True (default)",
+            "allow_routed_experts_capture=True (default)",
         )
 
 
 class ExaoneMoEConstructionTest(unittest.TestCase):
     """AC-4 real construction for the Exaone MoE block (new-plumbing
-    family). Exercises the `capture_routed_experts: bool = True` kwarg
+    family). Exercises the `allow_routed_experts_capture: bool = True` kwarg
     threaded into `ExaoneMoESparseMoEBlock`."""
 
     def _config(self) -> SimpleNamespace:
@@ -360,20 +361,20 @@ class ExaoneMoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            blk = ExaoneMoESparseMoEBlock(0, cfg, capture_routed_experts=False)
+            blk = ExaoneMoESparseMoEBlock(0, cfg, allow_routed_experts_capture=False)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
     def test_target_default_true(self):
         from sglang.srt.models.exaone_moe import ExaoneMoESparseMoEBlock
 
         cfg = self._config()
         with construction_fixture():
-            blk = ExaoneMoESparseMoEBlock(0, cfg)  # default capture_routed_experts=True
+            blk = ExaoneMoESparseMoEBlock(0, cfg)  # default allow_routed_experts_capture=True
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class HunyuanV3MoEConstructionTest(unittest.TestCase):
@@ -396,10 +397,10 @@ class HunyuanV3MoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            blk = HYV3MoEFused(cfg, layer_id=0, capture_routed_experts=False)
+            blk = HYV3MoEFused(cfg, layer_id=0, allow_routed_experts_capture=False)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
     def test_target_default_true(self):
         from sglang.srt.models.hunyuan_v3 import HYV3MoEFused
@@ -409,7 +410,7 @@ class HunyuanV3MoEConstructionTest(unittest.TestCase):
             blk = HYV3MoEFused(cfg, layer_id=0)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class Step3p5MoEConstructionTest(unittest.TestCase):
@@ -438,10 +439,10 @@ class Step3p5MoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            blk = Step3p5MoEMLP(cfg, layer_id=0, capture_routed_experts=False)
+            blk = Step3p5MoEMLP(cfg, layer_id=0, allow_routed_experts_capture=False)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
     def test_target_default_true(self):
         from sglang.srt.models.step3p5 import Step3p5MoEMLP
@@ -451,7 +452,7 @@ class Step3p5MoEConstructionTest(unittest.TestCase):
             blk = Step3p5MoEMLP(cfg, layer_id=0)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class NemotronHMoEConstructionTest(unittest.TestCase):
@@ -478,10 +479,10 @@ class NemotronHMoEConstructionTest(unittest.TestCase):
 
         cfg = self._config()
         with construction_fixture():
-            blk = NemotronHMoE(cfg, layer_idx=0, capture_routed_experts=False)
+            blk = NemotronHMoE(cfg, layer_idx=0, allow_routed_experts_capture=False)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
     def test_target_default_true(self):
         from sglang.srt.models.nemotron_h import NemotronHMoE
@@ -491,21 +492,21 @@ class NemotronHMoEConstructionTest(unittest.TestCase):
             blk = NemotronHMoE(cfg, layer_idx=0)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class NewPlumbingChainTest(unittest.TestCase):
     """Chain-level construction for new-plumbing families: verify the
-    `capture_routed_experts` kwarg actually propagates from the wrapper
+    `allow_routed_experts_capture` kwarg actually propagates from the wrapper
     / decoder layer down to the inner MoE block's TopK. A dropped kwarg
     between the layer and the block would fail this test.
     """
 
     def test_nemotron_h_mtp_decoder_subclass_propagates_false(self):
         """`NemotronHMTPMoEDecoderLayer.__init__` calls
-        `super().__init__(..., capture_routed_experts=False)`; the
+        `super().__init__(..., allow_routed_experts_capture=False)`; the
         parent `NemotronHMoEDecoderLayer.__init__` then constructs
-        `NemotronHMoE(..., capture_routed_experts=capture_routed_experts)`,
+        `NemotronHMoE(..., allow_routed_experts_capture=allow_routed_experts_capture)`,
         which sets the flag on TopK. If the subclass forgot the
         explicit False, the block defaults to True and this test fails.
         """
@@ -531,18 +532,16 @@ class NewPlumbingChainTest(unittest.TestCase):
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
         self.assertFalse(
-            topks[0].topk_config.capture_routed_experts,
+            topks[0].topk_config.allow_routed_experts_capture,
             "NemotronHMTPMoEDecoderLayer must propagate "
-            "capture_routed_experts=False through to NemotronHMoE / TopK",
+            "allow_routed_experts_capture=False through to NemotronHMoE / TopK",
         )
 
 
 class DeepseekV2MoEConstructionTest(unittest.TestCase):
     """AC-4 real construction for the deepseek-family shared MoE block
     (covers `DeepseekV3ForCausalLMNextN` and `DeepseekV4ForCausalLMNextN`
-    via the `is_nextn` signal, plus the always-draft
-    `MistralLarge3ForCausalLMEagle` via the explicit
-    `capture_routed_experts=False` keyword)."""
+    via the `is_nextn` signal)."""
 
     def _config(self) -> SimpleNamespace:
         return SimpleNamespace(
@@ -586,25 +585,7 @@ class DeepseekV2MoEConstructionTest(unittest.TestCase):
             blk = DeepseekV2MoE(cfg, layer_id=0, is_nextn=True)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
-
-    def test_explicit_capture_false_overrides_is_nextn_default(self):
-        """`MistralLarge3ForCausalLMEagle` passes `capture_routed_experts=False`
-        explicitly; this must win even when `is_nextn=False` (the deepseek
-        target default)."""
-        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
-
-        cfg = self._config()
-        with construction_fixture():
-            blk = DeepseekV2MoE(
-                cfg,
-                layer_id=0,
-                is_nextn=False,
-                capture_routed_experts=False,
-            )
-        topks = _collect_topks(blk)
-        self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class GLM4MoEConstructionTest(unittest.TestCase):
@@ -635,7 +616,7 @@ class GLM4MoEConstructionTest(unittest.TestCase):
             )
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class DenseInnerBlockConstructionTest(unittest.TestCase):
@@ -859,7 +840,7 @@ class BailingMoEConstructionTest(unittest.TestCase):
             blk = BailingMoEBlock(cfg, layer_id=0, is_nextn=True)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
     def test_target_default_true(self):
         from sglang.srt.models.bailing_moe import BailingMoEBlock
@@ -879,12 +860,12 @@ class BailingMoEConstructionTest(unittest.TestCase):
             "Bailing target block must construct exactly one TopK on the "
             "sparse path (is_nextn=False, first_k_dense_replace=0).",
         )
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class Gemma4DecoderLayerConstructionTest(unittest.TestCase):
     """AC-4 chain construction for Gemma4: `Gemma4DecoderLayer` is the
-    layer above `Gemma4MoE` and threads `capture_routed_experts` through.
+    layer above `Gemma4MoE` and threads `allow_routed_experts_capture` through.
     """
 
     def _config(self) -> SimpleNamespace:
@@ -911,7 +892,7 @@ class Gemma4DecoderLayerConstructionTest(unittest.TestCase):
         cfg = self._config()
         with construction_fixture():
             layer = Gemma4DecoderLayer(
-                layer_id=0, config=cfg, capture_routed_experts=False
+                layer_id=0, config=cfg, allow_routed_experts_capture=False
             )
         topks = _collect_topks(layer)
         # `enable_moe_block=True` forces `Gemma4MoE` construction; the
@@ -925,7 +906,7 @@ class Gemma4DecoderLayerConstructionTest(unittest.TestCase):
             "got zero, indicating the MoE branch was bypassed.",
         )
         for t in topks:
-            self.assertFalse(t.topk_config.capture_routed_experts)
+            self.assertFalse(t.topk_config.allow_routed_experts_capture)
 
     def test_target_chain_default_true(self):
         from sglang.srt.models.gemma4_causal import Gemma4DecoderLayer
@@ -940,7 +921,7 @@ class Gemma4DecoderLayerConstructionTest(unittest.TestCase):
             "Gemma4 target chain test must construct at least one TopK.",
         )
         for t in topks:
-            self.assertTrue(t.topk_config.capture_routed_experts)
+            self.assertTrue(t.topk_config.allow_routed_experts_capture)
 
 
 class ExaoneChainConstructionTest(unittest.TestCase):
@@ -973,11 +954,11 @@ class ExaoneChainConstructionTest(unittest.TestCase):
         cfg = self._config()
         with construction_fixture():
             layer = ExaoneMoEDecoderLayer(
-                cfg, layer_id=0, capture_routed_experts=False
+                cfg, layer_id=0, allow_routed_experts_capture=False
             )
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
     def test_decoder_chain_target_default_true(self):
         from sglang.srt.models.exaone_moe import ExaoneMoEDecoderLayer
@@ -987,7 +968,7 @@ class ExaoneChainConstructionTest(unittest.TestCase):
             layer = ExaoneMoEDecoderLayer(cfg, layer_id=0)
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class HunyuanV3ChainConstructionTest(unittest.TestCase):
@@ -1020,11 +1001,11 @@ class HunyuanV3ChainConstructionTest(unittest.TestCase):
         cfg = self._config()
         with construction_fixture():
             layer = HYV3DecoderLayer(
-                cfg, layer_id=0, capture_routed_experts=False
+                cfg, layer_id=0, allow_routed_experts_capture=False
             )
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
     def test_decoder_chain_target_default_true(self):
         from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
@@ -1034,14 +1015,14 @@ class HunyuanV3ChainConstructionTest(unittest.TestCase):
             layer = HYV3DecoderLayer(cfg, layer_id=0)
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class Step3p5ChainConstructionTest(unittest.TestCase):
     """AC-4 chain construction for Step3p5 via `Step3p5DecoderLayer`.
     The decoder layer constructs `Step3p5MoEMLP` when the layer's
     `moe_layers_enum` includes its id; the test ensures the
-    `capture_routed_experts` kwarg propagates through that branch."""
+    `allow_routed_experts_capture` kwarg propagates through that branch."""
 
     def _config(self) -> SimpleNamespace:
         common = _attn_common()
@@ -1084,20 +1065,18 @@ class Step3p5ChainConstructionTest(unittest.TestCase):
         cfg = self._config()
         with construction_fixture():
             layer = Step3p5DecoderLayer(
-                cfg, layer_id=0, capture_routed_experts=False
+                cfg, layer_id=0, allow_routed_experts_capture=False
             )
         topks = _collect_topks(layer)
         self.assertEqual(len(topks), 1)
-        self.assertFalse(topks[0].topk_config.capture_routed_experts)
+        self.assertFalse(topks[0].topk_config.allow_routed_experts_capture)
 
 
 class MistralLarge3ChainConstructionTest(unittest.TestCase):
     """AC-4 chain construction for the always-draft MistralLarge3
-    EAGLE wrapper. Constructs `DeepseekV2DecoderLayer(...,
-    capture_routed_experts=False)` -- the layer above `DeepseekV2MoE`
-    that the actual EAGLE wrapper instantiates at
-    `mistral_large_3_eagle.py:48-58`. A dropped kwarg between the
-    decoder layer and the MoE block would fail this test."""
+    EAGLE wrapper. It reuses `DeepseekV2DecoderLayer` with `is_nextn=False`,
+    so the wrapper itself must mark the constructed TopK modules as not
+    allowed to capture."""
 
     def _config(self) -> SimpleNamespace:
         common = _attn_common()
@@ -1123,15 +1102,13 @@ class MistralLarge3ChainConstructionTest(unittest.TestCase):
             **common,
         )
 
-    def test_decoder_chain_explicit_false_propagates(self):
-        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+    def test_eagle_wrapper_marks_reused_deepseek_topks_false(self):
+        from sglang.srt.models.mistral_large_3_eagle import MistralLarge3EagleModel
 
         cfg = self._config()
         with construction_fixture():
-            layer = DeepseekV2DecoderLayer(
-                cfg, layer_id=0, capture_routed_experts=False
-            )
-        topks = _collect_topks(layer)
+            model = MistralLarge3EagleModel(cfg)
+        topks = _collect_topks(model)
         # `first_k_dense_replace=0` + `moe_layer_freq=1` forces layer 0
         # sparse, so the constructor MUST build at least one `TopK` —
         # otherwise the test is vacuous and a future regression that
@@ -1143,7 +1120,7 @@ class MistralLarge3ChainConstructionTest(unittest.TestCase):
             "got zero, suggesting the sparse branch was skipped.",
         )
         for t in topks:
-            self.assertFalse(t.topk_config.capture_routed_experts)
+            self.assertFalse(t.topk_config.allow_routed_experts_capture)
 
 
 class MoETargetDefaultConstructionTest(unittest.TestCase):
@@ -1195,7 +1172,7 @@ class MoETargetDefaultConstructionTest(unittest.TestCase):
             blk = DeepseekV2MoE(cfg, layer_id=0, is_nextn=False)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
     def test_glm4_moe_sparse_target_default_true(self):
         from sglang.srt.models.glm4_moe import Glm4MoeSparseMoeBlock
@@ -1216,7 +1193,7 @@ class MoETargetDefaultConstructionTest(unittest.TestCase):
             blk = Glm4MoeSparseMoeBlock(cfg, layer_id=0, is_nextn=False)
         topks = _collect_topks(blk)
         self.assertEqual(len(topks), 1)
-        self.assertTrue(topks[0].topk_config.capture_routed_experts)
+        self.assertTrue(topks[0].topk_config.allow_routed_experts_capture)
 
 
 # =============================================================================

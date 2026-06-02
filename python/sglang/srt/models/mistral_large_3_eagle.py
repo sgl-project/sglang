@@ -11,6 +11,7 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import RowParallelLinear
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -43,10 +44,6 @@ class MistralLarge3EagleModel(DeepseekV2Model):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        # EAGLE draft layers must not record routed-expert capture into the
-        # target's R3 buffer. Pass capture_routed_experts=False explicitly so
-        # the DeepseekV2MoE TopK lands with the flag False without changing
-        # the default `not is_nextn` semantics on the target path.
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -54,11 +51,16 @@ class MistralLarge3EagleModel(DeepseekV2Model):
                     prefix=add_prefix(prefix, f"layers.{i}"),
                     quant_config=quant_config,
                     layer_id=i,
-                    capture_routed_experts=False,
                 )
                 for i in range(self.config.num_hidden_layers)
             ]
         )
+        # This EAGLE draft reuses DeepseekV2DecoderLayer with is_nextn=False;
+        # opt out at the wrapper boundary without changing Deepseek NextN semantics.
+        for layer in self.layers:
+            for module in layer.modules():
+                if isinstance(module, TopK):
+                    module.topk_config.allow_routed_experts_capture = False
         self.start_layer = 0
         self.end_layer = self.config.num_hidden_layers
 

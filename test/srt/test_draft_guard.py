@@ -48,7 +48,7 @@ def _make_class(name: str) -> type:
 
 
 def _make_topk(flag: bool) -> TopK:
-    return TopK(top_k=4, capture_routed_experts=flag)
+    return TopK(top_k=4, allow_routed_experts_capture=flag)
 
 
 def _make_hf_config(arch: str) -> _FakeHfConfig:
@@ -71,7 +71,7 @@ class GuardSuccessTest(unittest.TestCase):
 
     def test_moe_optout_satisfied(self):
         """A properly opted-out MoE draft must pass: every TopK has
-        capture_routed_experts=False."""
+        allow_routed_experts_capture=False."""
         cls = _make_class("DeepseekV3ForCausalLMNextN")
         model = cls(_make_topk(False), _make_topk(False))
         check_draft_capture_optout(

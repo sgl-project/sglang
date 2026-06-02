@@ -1,9 +1,9 @@
-"""Tests for the per-config `capture_routed_experts` opt-out.
+"""Tests for the per-config `allow_routed_experts_capture` opt-out.
 
 Two layers of coverage:
 
 1. **Behavior tests** (primary): patch the global capturer and exercise the
-   gate decision through `maybe_capture_routed_experts` and the default-True
+   gate decision through `capture_routed_experts_if_allowed` and the default-True
    target case. These prove the runtime contract.
 2. **Structural tests** (supplementary tripwires): source-level assertions
    that the helper is wired into both CUDA and NPU sites and that the
@@ -28,7 +28,7 @@ from sglang.srt.layers.moe.topk import (
     TopK,
     TopKConfig,
     _post_process_topk_ids,
-    maybe_capture_routed_experts,
+    capture_routed_experts_if_allowed,
 )
 
 
@@ -65,7 +65,7 @@ class _InstallGlobalCapturer:
 # -------------------------------------------------------------------------
 
 
-class MaybeCaptureRoutedExpertsBehaviorTest(unittest.TestCase):
+class CaptureRoutedExpertsIfAllowedBehaviorTest(unittest.TestCase):
     """AC-1 (CUDA + NPU share this helper) + AC-7 (default True still captures)."""
 
     def _topk_ids(self) -> torch.Tensor:
@@ -76,20 +76,20 @@ class MaybeCaptureRoutedExpertsBehaviorTest(unittest.TestCase):
         target path. Proves the dataclass default doesn't accidentally
         suppress capture."""
         cfg = TopKConfig(top_k=8)
-        self.assertTrue(cfg.capture_routed_experts)
+        self.assertTrue(cfg.allow_routed_experts_capture)
         fake = _FakeCapturer()
         with _InstallGlobalCapturer(fake):
-            maybe_capture_routed_experts(cfg, layer_id=3, topk_ids=self._topk_ids())
+            capture_routed_experts_if_allowed(cfg, layer_id=3, topk_ids=self._topk_ids())
         self.assertEqual(len(fake.calls), 1)
         self.assertEqual(fake.calls[0]["layer_id"], 3)
 
     def test_explicit_false_skips_capture(self):
-        """AC-1: draft-side MoE layers (`capture_routed_experts=False`)
+        """AC-1: draft-side MoE layers (`allow_routed_experts_capture=False`)
         must not call into the capturer."""
-        cfg = TopKConfig(top_k=8, capture_routed_experts=False)
+        cfg = TopKConfig(top_k=8, allow_routed_experts_capture=False)
         fake = _FakeCapturer()
         with _InstallGlobalCapturer(fake):
-            maybe_capture_routed_experts(cfg, layer_id=0, topk_ids=self._topk_ids())
+            capture_routed_experts_if_allowed(cfg, layer_id=0, topk_ids=self._topk_ids())
         self.assertEqual(fake.calls, [])
 
     def test_no_global_capturer_is_safe(self):
@@ -101,7 +101,7 @@ class MaybeCaptureRoutedExpertsBehaviorTest(unittest.TestCase):
         old = topk_module.get_global_experts_capturer
         topk_module.get_global_experts_capturer = lambda: None
         try:
-            maybe_capture_routed_experts(cfg, layer_id=0, topk_ids=self._topk_ids())
+            capture_routed_experts_if_allowed(cfg, layer_id=0, topk_ids=self._topk_ids())
         finally:
             topk_module.get_global_experts_capturer = old
 
@@ -110,11 +110,11 @@ class PostProcessTopkIdsGateTest(unittest.TestCase):
     """AC-1 (CUDA path): the production capture site
     `_post_process_topk_ids` must consult the helper."""
 
-    def _drive(self, capture_flag: bool):
+    def _drive(self, allow_flag: bool):
         topk_ids = torch.zeros(2, 4, dtype=torch.int32)
         topk_weights = torch.zeros(2, 4, dtype=torch.float32)
         router_logits = torch.zeros(2, 8, dtype=torch.float32)
-        cfg = TopKConfig(top_k=4, capture_routed_experts=capture_flag)
+        cfg = TopKConfig(top_k=4, allow_routed_experts_capture=allow_flag)
         fake = _FakeCapturer()
         with _InstallGlobalCapturer(fake):
             try:
@@ -133,20 +133,20 @@ class PostProcessTopkIdsGateTest(unittest.TestCase):
         return fake
 
     def test_post_process_true_calls_capture(self):
-        fake = self._drive(capture_flag=True)
+        fake = self._drive(allow_flag=True)
         self.assertEqual(
             len(fake.calls),
             1,
-            "with capture_routed_experts=True, the CUDA path's gate must "
+            "with allow_routed_experts_capture=True, the CUDA path's gate must "
             "invoke the capturer exactly once at the post-process site",
         )
 
     def test_post_process_false_skips_capture(self):
-        fake = self._drive(capture_flag=False)
+        fake = self._drive(allow_flag=False)
         self.assertEqual(
             fake.calls,
             [],
-            "with capture_routed_experts=False, the CUDA path's gate must "
+            "with allow_routed_experts_capture=False, the CUDA path's gate must "
             "never invoke the capturer at the post-process site",
         )
 
@@ -161,29 +161,29 @@ class TopKConfigStructuralTest(unittest.TestCase):
 
     def test_dataclass_default_is_true(self):
         cfg = TopKConfig(top_k=8)
-        self.assertTrue(cfg.capture_routed_experts)
+        self.assertTrue(cfg.allow_routed_experts_capture)
 
     def test_dataclass_accepts_explicit_false(self):
-        cfg = TopKConfig(top_k=8, capture_routed_experts=False)
-        self.assertFalse(cfg.capture_routed_experts)
+        cfg = TopKConfig(top_k=8, allow_routed_experts_capture=False)
+        self.assertFalse(cfg.allow_routed_experts_capture)
 
     def test_topk_init_propagates_default(self):
         topk = TopK(top_k=8)
-        self.assertTrue(topk.topk_config.capture_routed_experts)
+        self.assertTrue(topk.topk_config.allow_routed_experts_capture)
 
     def test_topk_init_propagates_false(self):
-        topk = TopK(top_k=8, capture_routed_experts=False)
-        self.assertFalse(topk.topk_config.capture_routed_experts)
+        topk = TopK(top_k=8, allow_routed_experts_capture=False)
+        self.assertFalse(topk.topk_config.allow_routed_experts_capture)
 
 
 class CaptureSiteRoutingStructuralTest(unittest.TestCase):
     """Tripwires that catch a future refactor inlining a capture call
-    instead of routing through `maybe_capture_routed_experts`."""
+    instead of routing through `capture_routed_experts_if_allowed`."""
 
     def test_cuda_post_process_calls_helper(self):
         source = inspect.getsource(_post_process_topk_ids)
         self.assertIn(
-            "maybe_capture_routed_experts(",
+            "capture_routed_experts_if_allowed(",
             source,
             "the CUDA capture site must route through the shared helper",
         )
@@ -203,7 +203,7 @@ class CaptureSiteRoutingStructuralTest(unittest.TestCase):
         )
         npu_source = npu_topk_path.read_text()
         self.assertIn(
-            "maybe_capture_routed_experts(",
+            "capture_routed_experts_if_allowed(",
             npu_source,
             "the NPU capture site must route through the shared helper "
             "to inherit the per-TopKConfig opt-out",
@@ -219,21 +219,21 @@ class CaptureSiteRoutingStructuralTest(unittest.TestCase):
 class BypassPathStructuralTest(unittest.TestCase):
     """AC-2 structural tripwires."""
 
-    def test_caller_decomposes_capture_flag(self):
+    def test_caller_decomposes_allow_flag(self):
         source = inspect.getsource(fmt_layer)
-        self.assertIn("topk_output.topk_config.capture_routed_experts", source)
+        self.assertIn("topk_output.topk_config.allow_routed_experts_capture", source)
 
     def test_custom_op_signature_declares_flag(self):
         source = inspect.getsource(fmt_layer)
         self.assertRegex(
             source,
             r"def fused_moe_bypassed_piecewise_cuda_graph_impl\([^)]*"
-            r"capture_routed_experts:\s*bool",
+            r"allow_routed_experts_capture:\s*bool",
         )
 
     def test_rebuilt_topkconfig_carries_flag(self):
         source = inspect.getsource(fmt_layer)
-        self.assertIn("capture_routed_experts=capture_routed_experts", source)
+        self.assertIn("allow_routed_experts_capture=allow_routed_experts_capture", source)
 
 
 if __name__ == "__main__":

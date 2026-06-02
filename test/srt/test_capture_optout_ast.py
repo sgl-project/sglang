@@ -1,18 +1,18 @@
-"""AST-level verification for per-family `capture_routed_experts` opt-out.
+"""AST-level verification for per-family `allow_routed_experts_capture` opt-out.
 
 Tighter than the regex-based `test_capture_optout_per_family.py` checks:
 this suite parses each wrapper file's AST and confirms that the wrapper
-class's `__init__` contains a `Call` node whose keyword arguments declare
-the opt-out signal explicitly. A dropped kwarg in the middle of a multi-
-line constructor invocation would slip past `grep -n` but is caught here
-because the AST walker reads structured call sites rather than file
-prose.
+class's `__init__` declares the opt-out signal explicitly, either as a
+constructor keyword or as a wrapper-boundary assignment. A dropped signal
+in the middle of a multi-line constructor invocation would slip past
+`grep -n` but is caught here because the AST walker reads structured
+nodes rather than file prose.
 
 Construction-level runtime tests (instantiating each MoE block and
 walking `model.modules()` for `TopK`) require substantial distributed-
 state fixtures (CUDA streams, model-parallel groups, MoE backend
 selection) that are not feasible on a CPU loop host. The AST checks plus
-the runtime mock-capturer tests in `test_capture_routed_experts_flag.py`
+the runtime mock-capturer tests in `test_allow_routed_experts_capture_flag.py`
 plus the GPU CI tests in `test_return_routed_experts_mtp.py` together
 cover the contract on every layer that can be exercised here.
 """
@@ -44,17 +44,20 @@ _WRAPPER_KWARG_EXPECTATIONS = {
     "BailingMoeForCausalLMNextN": ("bailing_moe_nextn.py", "is_nextn", True),
     "Qwen3NextForCausalLMMTP": ("qwen3_next_mtp.py", "is_nextn", True),
     "Qwen3_5ForCausalLMMTP": ("qwen3_5_mtp.py", "is_nextn", True),
-    # capture_routed_experts=False pattern (explicit opt-out kwarg).
-    "ExaoneMoEForCausalLMMTP": ("exaone_moe_mtp.py", "capture_routed_experts", False),
-    "NemotronHForCausalLMMTP": ("nemotron_h_mtp.py", "capture_routed_experts", False),
-    "HYV3ForCausalLMNextN": ("hunyuan_v3_nextn.py", "capture_routed_experts", False),
-    "Step3p5MTP": ("step3p5_mtp.py", "capture_routed_experts", False),
+    # allow_routed_experts_capture=False pattern (explicit opt-out kwarg).
+    "ExaoneMoEForCausalLMMTP": ("exaone_moe_mtp.py", "allow_routed_experts_capture", False),
+    "NemotronHForCausalLMMTP": ("nemotron_h_mtp.py", "allow_routed_experts_capture", False),
+    "HYV3ForCausalLMNextN": ("hunyuan_v3_nextn.py", "allow_routed_experts_capture", False),
+    "Step3p5MTP": ("step3p5_mtp.py", "allow_routed_experts_capture", False),
+    "Gemma4AssistantForCausalLM": ("gemma4_mtp.py", "allow_routed_experts_capture", False),
+}
+
+_WRAPPER_ASSIGN_EXPECTATIONS = {
     "MistralLarge3ForCausalLMEagle": (
         "mistral_large_3_eagle.py",
-        "capture_routed_experts",
+        "allow_routed_experts_capture",
         False,
     ),
-    "Gemma4AssistantForCausalLM": ("gemma4_mtp.py", "capture_routed_experts", False),
 }
 
 
@@ -83,23 +86,49 @@ def _keyword_value_matches(kw: ast.keyword, expected) -> bool:
     return False
 
 
-class WrapperKwargASTTest(unittest.TestCase):
-    """AC-4: every MoE-bearing draft wrapper must declare an explicit
-    opt-out kwarg at the call site that constructs the draft model
-    component. The AST walk confirms the specific keyword=value pair is
-    present, defending against a dropped kwarg that file-wide regex
-    would still match because the literal appears elsewhere."""
+def _find_attr_assignment_values(module_ast: ast.Module, attr_name: str) -> list[ast.AST]:
+    """Collect values assigned to an attribute named `attr_name`."""
+    values: list[ast.AST] = []
+    for node in ast.walk(module_ast):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr == attr_name:
+                    values.append(node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Attribute)
+                and node.target.attr == attr_name
+                and node.value is not None
+            ):
+                values.append(node.value)
+    return values
 
-    def test_each_wrapper_passes_expected_kwarg(self):
+
+def _ast_value_matches(value: ast.AST, expected) -> bool:
+    if isinstance(value, ast.Constant):
+        return value.value == expected
+    if isinstance(value, ast.Name):
+        return value.id == expected
+    return False
+
+
+class WrapperSignalASTTest(unittest.TestCase):
+    """AC-4: every MoE-bearing draft wrapper must declare an explicit
+    opt-out signal where it constructs or adjusts the draft model component.
+    The AST walk confirms the specific keyword or assignment is present,
+    defending against a dropped signal that file-wide regex would still match
+    because the literal appears elsewhere."""
+
+    def test_each_wrapper_declares_expected_signal(self):
         moe_entries = [e for e in INVENTORY if e.moe_bearing]
         for entry in moe_entries:
             arch = entry.draft_architecture
             self.assertIn(
                 arch,
-                _WRAPPER_KWARG_EXPECTATIONS,
+                _WRAPPER_KWARG_EXPECTATIONS | _WRAPPER_ASSIGN_EXPECTATIONS,
                 f"AST expectation table missing entry for MoE-bearing arch "
-                f"{arch!r}; add it to _WRAPPER_KWARG_EXPECTATIONS so the "
-                f"wrapper's opt-out kwarg can be verified at AST level",
+                f"{arch!r}; add it to the wrapper expectation tables so the "
+                f"wrapper's opt-out signal can be verified at AST level",
             )
 
         for arch, (
@@ -129,6 +158,29 @@ class WrapperKwargASTTest(unittest.TestCase):
                 f"the draft opt-out signal is wrong",
             )
 
+        for arch, (
+            wrapper_name,
+            expected_attr,
+            expected_value,
+        ) in _WRAPPER_ASSIGN_EXPECTATIONS.items():
+            wrapper_path = MODELS_DIR / wrapper_name
+            self.assertTrue(
+                wrapper_path.is_file(),
+                f"{arch}: wrapper file {wrapper_name!r} not found",
+            )
+            tree = ast.parse(wrapper_path.read_text())
+            values = _find_attr_assignment_values(tree, expected_attr)
+            self.assertTrue(
+                values,
+                f"{arch}: wrapper {wrapper_name!r} has no assignment to "
+                f"`*.{expected_attr}`; the draft opt-out signal is missing",
+            )
+            self.assertTrue(
+                any(_ast_value_matches(value, expected_value) for value in values),
+                f"{arch}: wrapper {wrapper_name!r} assigns `*.{expected_attr}`, "
+                f"but none has expected value {expected_value!r}",
+            )
+
 
 class InventoryConsistencyASTTest(unittest.TestCase):
     """AC-3/AC-4 consistency: every MoE-bearing inventory entry must have
@@ -139,7 +191,8 @@ class InventoryConsistencyASTTest(unittest.TestCase):
         missing = [
             e.draft_architecture
             for e in moe_entries
-            if e.draft_architecture not in _WRAPPER_KWARG_EXPECTATIONS
+            if e.draft_architecture
+            not in (_WRAPPER_KWARG_EXPECTATIONS | _WRAPPER_ASSIGN_EXPECTATIONS)
         ]
         self.assertEqual(
             missing,

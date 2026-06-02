@@ -143,7 +143,7 @@ class NemotronHMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         *,
-        capture_routed_experts: bool = True,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
 
@@ -182,7 +182,7 @@ class NemotronHMoE(nn.Module):
             scoring_func="sigmoid",
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=1.0,
-            capture_routed_experts=capture_routed_experts,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
@@ -359,7 +359,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         *,
-        capture_routed_experts: bool = True,
+        allow_routed_experts_capture: bool = True,
     ) -> None:
         super().__init__()
 
@@ -368,7 +368,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
-            capture_routed_experts=capture_routed_experts,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)

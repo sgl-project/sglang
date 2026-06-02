@@ -665,7 +665,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Fail-closed runtime guard: when a draft worker is configured to
         # participate in routed-experts capture (R3), every MoE TopK on the
-        # draft model must already carry capture_routed_experts=False (or
+        # draft model must already carry allow_routed_experts_capture=False (or
         # the architecture must be on the dense allowlist). Unknown
         # architectures or stale opt-outs raise here rather than silently
         # polluting the target's R3 buffer at runtime.

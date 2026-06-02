@@ -96,7 +96,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             config=text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
-            capture_routed_experts=False,
+            allow_routed_experts_capture=False,
         )
         self.post_projection = ReplicatedLinear(
             self.hidden_size,

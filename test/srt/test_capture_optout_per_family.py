@@ -1,7 +1,7 @@
-"""Per-family verification for the `capture_routed_experts` opt-out.
+"""Per-family verification for the `allow_routed_experts_capture` opt-out.
 
 The plan's AC-4 requires every MoE-bearing draft family to construct its
-`TopK` modules with `capture_routed_experts=False`. AC-5 requires every
+`TopK` modules with `allow_routed_experts_capture=False`. AC-5 requires every
 dense allowlist entry to construct zero `TopK` modules.
 
 Building each full draft model from a HuggingFace config + weights is not
@@ -9,17 +9,17 @@ feasible on a CPU loop host (most need real weights and a CUDA-capable
 runtime), so this suite verifies the opt-out at the source level:
 
   - For every MoE-bearing inventory entry with `opted_out=True`, the file
-    named in `opt_out_injection_point` must declare a `capture_routed_experts`
+    named in `opt_out_injection_point` must declare a `allow_routed_experts_capture`
     expression that lands as `False` on the draft path.
   - The corresponding *_mtp / *_nextn / *_eagle wrapper (when it exists)
-    must pass either `capture_routed_experts=False`, `is_nextn=True`,
+    must pass either `allow_routed_experts_capture=False`, `is_nextn=True`,
     `is_mtp=True`, or use a hardcoded subclass equivalent.
   - For every dense allowlist entry, the rationale must explain why no
     `TopK` is constructed, and the named file must not introduce an
     unconditional `self.topk = TopK(` on the draft path.
 
 These checks are structural regression tripwires; the runtime contract is
-also exercised by `test_capture_routed_experts_flag.py` (helper-level)
+also exercised by `test_allow_routed_experts_capture_flag.py` (helper-level)
 and by `test_return_routed_experts_mtp.py` (e2e under GPU CI).
 """
 
@@ -72,37 +72,37 @@ _WRAPPER_EXPECTATIONS = {
     ),
     "ExaoneMoEForCausalLMMTP": (
         "exaone_moe_mtp.py",
-        r"capture_routed_experts=False",
+        r"allow_routed_experts_capture=False",
     ),
     "NemotronHForCausalLMMTP": (
         "nemotron_h_mtp.py",
-        r"capture_routed_experts=False",
+        r"allow_routed_experts_capture=False",
     ),
     "HYV3ForCausalLMNextN": (
         "hunyuan_v3_nextn.py",
-        r"capture_routed_experts=False",
+        r"allow_routed_experts_capture=False",
     ),
     "Step3p5MTP": (
         "step3p5_mtp.py",
-        r"capture_routed_experts=False",
+        r"allow_routed_experts_capture=False",
     ),
     "MistralLarge3ForCausalLMEagle": (
         "mistral_large_3_eagle.py",
-        r"capture_routed_experts=False",
+        r"allow_routed_experts_capture\s*=\s*False",
     ),
     "Gemma4AssistantForCausalLM": (
         "gemma4_mtp.py",
-        r"capture_routed_experts=False",
+        r"allow_routed_experts_capture=False",
     ),
 }
 
 
 # For each MoE-bearing entry: the file named at opt_out_injection_point
-# must declare a `capture_routed_experts=` expression at the TopK call. We
+# must declare an `allow_routed_experts_capture=` expression at the TopK call. We
 # also accept `not is_nextn` patterns used by shared blocks.
 _INJECTION_POINT_PATTERN = re.compile(
-    r"capture_routed_experts\s*=\s*"
-    r"(not\s+is_nextn|capture_routed_experts|False|not\s+self\.is_nextn)"
+    r"allow_routed_experts_capture\s*=\s*"
+    r"(not\s+is_nextn|allow_routed_experts_capture|False|not\s+self\.is_nextn)"
 )
 
 
@@ -118,12 +118,12 @@ def _dense_entries() -> list[DraftInventoryEntry]:
 
 class MoEEntryOptOutSourceTest(unittest.TestCase):
     """AC-4: every MoE-bearing inventory entry that claims `opted_out=True`
-    must actually have a `capture_routed_experts=...` expression at the
+    must actually have an `allow_routed_experts_capture=...` expression at the
     TopK call inside the file named by its `opt_out_injection_point`."""
 
-    def test_injection_point_file_contains_capture_flag_assignment(self):
+    def test_injection_point_file_contains_allow_flag_assignment(self):
         # Every MoE-bearing entry's injection-point file must contain a
-        # capture_routed_experts assignment near a TopK construction.
+        # allow_routed_experts_capture assignment near a TopK construction.
         for entry in _moe_entries():
             file_part = entry.opt_out_injection_point.split(":")[0]
             path = REPO_ROOT / file_part
@@ -137,7 +137,7 @@ class MoEEntryOptOutSourceTest(unittest.TestCase):
                 source,
                 _INJECTION_POINT_PATTERN,
                 f"{entry.draft_architecture}: {file_part!r} does not contain "
-                f"a `capture_routed_experts=...` assignment matching the "
+                f"an `allow_routed_experts_capture=...` assignment matching the "
                 f"recognized opt-out patterns",
             )
 

@@ -253,7 +253,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
-            capture_routed_experts=not is_nextn,
+            allow_routed_experts_capture=not is_nextn,
             # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
