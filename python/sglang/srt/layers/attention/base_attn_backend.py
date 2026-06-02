@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
+    needs_cpu_seq_lens: bool = True
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on
