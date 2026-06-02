@@ -371,6 +371,9 @@ class DeepseekV4AttnBackend(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
 
+        self.enable_deepseek_v4_fp4_indexer: bool = (
+            model_runner.server_args.enable_deepseek_v4_fp4_indexer
+        )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0

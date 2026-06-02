@@ -40,11 +40,13 @@ This section provides deployment configurations optimized for different hardware
 
 <DeepSeekOCR2Deployment />
 
-**Note**: DeepSeek-OCR-2 has ~3.58B parameters and easily fits on a single modern GPU. For low-latency serving, no model parallelism is needed. For high-throughput requirements, consider using data parallelism with the SGLang Model Gateway — see [DP, DPA and SGLang DP Router](../../../docs/advanced_features/sgl_model_gateway) for more details.
+**Note**: DeepSeek-OCR-2 has ~3B parameters and easily fits on a single modern GPU. For low-latency serving, no model parallelism is needed. For high-throughput requirements, consider using data parallelism with the SGLang Model Gateway — see [DP, DPA and SGLang DP Router](../../../docs/advanced_features/sgl_model_gateway) for more details.
 
 ### 3.2 Configuration Tips
 
-For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage](../../../docs/basic_usage/deepseek_v3).
+- **Single GPU Deployment:** DeepSeek-OCR-2 (~3B parameters) fits on a single modern GPU — no tensor parallelism required for low-latency serving.
+- **High Throughput:** For high-throughput scenarios, use data parallelism with the SGLang Model Gateway. See [DP, DPA and SGLang DP Router](../../../docs/advanced_features/sgl_model_gateway).
+- **NCCL timeout:** If model loading is slow, increase `--dist-timeout 3600`.
 
 ## 4. Model Invocation
 
