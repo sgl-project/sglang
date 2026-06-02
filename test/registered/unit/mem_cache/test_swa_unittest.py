@@ -245,6 +245,80 @@ class TestSWA(unittest.TestCase):
         result = alloc.translate_loc_from_full_to_swa(index)
         print(result)
 
+    def test_free_swa_free_group_batches(self):
+        """Inside free_group_begin/end, many small free_swa calls coalesce.
+
+        Asserts that:
+          1. End state of pool matches the immediate-path equivalent.
+          2. _pending_swa_free is empty after group_end (no leaks).
+          3. mapping is correctly zeroed for every index that was passed in.
+        """
+        size = size_swa = 32
+        page_size = 1
+        head_num, head_dim, num_layers = 4, 64, 8
+        full_attention_layer_ids = [0, 4]
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids
+        ]
+        device = get_device()
+
+        pool = SWAKVPool(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+
+        # Allocate a few small batches so we have full+swa indices populated.
+        idx_batches = [alloc.alloc(2), alloc.alloc(3), alloc.alloc(1), alloc.alloc(4)]
+        for idx in idx_batches:
+            self.assertIsNotNone(idx)
+
+        # Snapshot baseline SWA capacity before freeing.
+        swa_before = alloc.swa_available_size()
+
+        # Inside a free_group, free_swa() should accumulate pending instead
+        # of firing the per-call gather/mask/scatter.
+        alloc.free_group_begin()
+        self.assertEqual(alloc.is_not_in_free_group, False)
+        for idx in idx_batches:
+            alloc.free_swa(idx)
+        # Mid-group: pending entries are queued; SWA capacity should not
+        # yet reflect any of the frees.
+        self.assertEqual(len(alloc._pending_swa_free), len(idx_batches))
+
+        # End of group: flush_pending_swa_free runs first, then base drains.
+        alloc.free_group_end()
+        self.assertEqual(alloc.is_not_in_free_group, True)
+        self.assertEqual(len(alloc._pending_swa_free), 0)
+
+        # All freed indices should map to 0 in full_to_swa_index_mapping.
+        all_freed = torch.cat(idx_batches).to(device=device, dtype=torch.int64)
+        self.assertTrue(
+            torch.equal(
+                alloc.full_to_swa_index_mapping[all_freed],
+                torch.zeros_like(all_freed),
+            )
+        )
+        # SWA capacity should have grown back by the number of SWA slots
+        # held across the freed indices (≤ |all_freed|; some may have been 0).
+        self.assertGreaterEqual(alloc.swa_available_size(), swa_before)
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10

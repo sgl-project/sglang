@@ -366,6 +366,13 @@ class MambaPool:
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
+        # Deferred-free state. When `is_not_in_free_group` is False, `free`
+        # appends to `_pending_free` instead of issuing a `torch.cat` per call.
+        # `free_group_end` then does a single cat over all pending tensors,
+        # collapsing N kernel launches + N intermediate allocations into one.
+        self.is_not_in_free_group = True
+        self._pending_free: List[torch.Tensor] = []
+
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
@@ -402,12 +409,30 @@ class MambaPool:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        self.free_slots = torch.cat((self.free_slots, free_index))
+        if self.is_not_in_free_group:
+            self.free_slots = torch.cat((self.free_slots, free_index))
+        else:
+            self._pending_free.append(free_index)
+
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self._pending_free.clear()
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self._pending_free:
+            # Single cat over current free_slots + all pending tensors; this
+            # replaces N per-call torch.cat calls (one per free()) and avoids
+            # the O(N) intermediate allocations they would do.
+            self.free_slots = torch.cat([self.free_slots, *self._pending_free])
+            self._pending_free.clear()
 
     def clear(self):
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        self._pending_free.clear()
+        self.is_not_in_free_group = True
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):

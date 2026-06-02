@@ -489,8 +489,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
 
+        # Coalesce per-leaf allocator.free / free_swa / mamba_pool.free
+        # calls in the components' eviction loops into a single batched
+        # flush at the end. With SWA enabled the savings are dominated by
+        # `free_swa` (4 kernels/call → 4 total per batch).
+        self.token_to_kv_pool_allocator.free_group_begin()
+        has_mamba = ComponentType.MAMBA in self.tree_components
+        if has_mamba:
+            self.req_to_token_pool.mamba_pool.free_group_begin()
+
         for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
+
+        if has_mamba:
+            self.req_to_token_pool.mamba_pool.free_group_end()
+        self.token_to_kv_pool_allocator.free_group_end()
 
         if (
             self.cache_controller is not None
