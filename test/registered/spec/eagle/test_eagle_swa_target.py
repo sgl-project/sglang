@@ -1,57 +1,62 @@
 import unittest
+from types import SimpleNamespace
 
-import sglang as sgl
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin, _check_accept_length
+from sglang.test.run_eval import run_eval
+from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=600, suite="base-b-test-1-gpu-large")
+register_cuda_ci(est_time=1200, suite="base-b-test-1-gpu-large")
 
 
 GPTOSS_TARGET = "openai/gpt-oss-20b"
 DOGACEL_DRAFT = "Dogacel/specdrift-gpt-oss-20b-eagle3"
 
 
-class TestEAGLE3SWATarget(CustomTestCase):
-    """Regression for #22679: EAGLE on SWA target."""
+class TestEAGLE3SWATarget(GSM8KMixin, DefaultServerBase):
+    """Regression for #22679: EAGLE3 on a SWA target (gpt-oss-20b).
 
-    BASE_CONFIG = {
-        "model_path": GPTOSS_TARGET,
-        "speculative_draft_model_path": DOGACEL_DRAFT,
-        "speculative_algorithm": "EAGLE3",
-        "speculative_num_steps": 5,
-        "speculative_eagle_topk": 8,
-        "speculative_num_draft_tokens": 16,
-        "mem_fraction_static": 0.85,
-        "cuda_graph_max_bs": 4,
-        "dtype": "bfloat16",
-    }
+    GSM8K confirms the SWA spec-decoding paths produce correct output, and
+    the accept-length check confirms speculation is effective.
+    """
 
-    BACKENDS = ["triton"]
+    model = GPTOSS_TARGET
+    other_args = [
+        "--speculative-algorithm", "EAGLE3",
+        "--speculative-draft-model-path", DOGACEL_DRAFT,
+        "--speculative-num-steps", "5",
+        "--speculative-eagle-topk", "8",
+        "--speculative-num-draft-tokens", "16",
+        "--mem-fraction-static", "0.7",
+        "--max-running-requests", "32",
+        "--cuda-graph-max-bs", "4",
+        "--dtype", "bfloat16",
+        "--attention-backend", "triton",
+    ]
 
-    def setUp(self):
-        self.prompt = "The capital of South Korea is"
-        self.sampling_params = {"temperature": 0, "max_new_tokens": 32}
+    gsm8k_accuracy_thres = 0.9
+    gsm8k_accept_length_thres = 1.0
 
-    def test_correctness_per_backend(self):
-        for backend in self.BACKENDS:
-            with self.subTest(backend=backend):
-                config = {**self.BASE_CONFIG, "attention_backend": backend}
-                print(f"{config=}")
-                engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
-                try:
-                    output = engine.generate(self.prompt, self.sampling_params)
-                    self.assertIn("text", output)
-                    self.assertGreater(len(output["text"]), 0)
-
-                    info = engine.get_server_info()
-                    accept_len = info["internal_states"][0].get(
-                        "avg_spec_accept_length", 0.0
-                    )
-                    print(f"backend={backend} accept_len={accept_len}")
-                    self.assertGreater(accept_len, 1.0)
-                finally:
-                    engine.flush_cache()
-                    engine.shutdown()
+    def test_gsm8k(self):
+        # gpt-oss is a reasoning model; evaluate via its native chat API
+        # (the mixin's completion mode underperforms on reasoning models).
+        requests.get(self.base_url + "/flush_cache")
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="chat",
+            max_tokens=2048,
+            num_examples=self.gsm8k_num_questions,
+            num_threads=32,
+            num_shots=self.gsm8k_num_shots,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreaterEqual(metrics["score"], self.gsm8k_accuracy_thres)
+        _check_accept_length(self, self.base_url, self.gsm8k_accept_length_thres)
 
 
 if __name__ == "__main__":
