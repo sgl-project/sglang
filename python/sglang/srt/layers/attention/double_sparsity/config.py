@@ -154,6 +154,16 @@ class DoubleSparsityConfig:
                     "when enable_lifted_budget_decode is set (a lifted budget must "
                     "widen selection beyond the base index_topk)."
                 )
+            # flash_mla_sparse_fwd tiles the topk index width by 2*B_TOPK (=128);
+            # a non-multiple width trips an in-kernel `topk % (2*B_TOPK) == 0`
+            # assert. The realistic budgets (4096/8192) satisfy this.
+            if self.lifted_budget_top_k % 128 != 0:
+                raise ValueError(
+                    "Double Sparsity 'lifted_budget_top_k' "
+                    f"({self.lifted_budget_top_k}) must be a multiple of 128 (the "
+                    "flash_mla_sparse_fwd index-width block constraint "
+                    "topk % (2*B_TOPK) == 0)."
+                )
         elif self.lifted_budget_top_k > 0:
             # Fail closed: a lifted budget set without the enable flag would
             # silently no-op (the default path keeps top_k == index_topk).

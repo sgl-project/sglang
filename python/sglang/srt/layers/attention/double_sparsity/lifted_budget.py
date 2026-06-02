@@ -171,3 +171,45 @@ def build_compact_decode_index(
         total_valid=total_valid,
         dropped_duplicates=dropped_duplicates,
     )
+
+
+def build_lifted_compact_kv(
+    kv_store: torch.Tensor,
+    physical_slots: torch.Tensor,
+    *,
+    store_is_fp8: bool,
+):
+    """Materialize the compact KV buffer + compact indices for the lifted-budget
+    decode kernel call.
+
+    Given the per-request selected physical KV slots (``[bs, width]``, selector
+    order, ``-1`` pads) and the paged KV store, this derives ``valid_lengths``
+    from the pad sentinel, runs :func:`build_compact_decode_index`, and produces
+    the dense compact KV buffer that ``flash_mla_sparse_fwd`` attends:
+
+    * ``store_is_fp8``: the fp8 op-point. The store is the quantized
+      ``[*, 656]`` layout, so the selected rows are dequantized with
+      ``dequantize_k_cache_paged`` (which gathers by ``page_table_1_flattened``
+      and returns ``[total_valid, 1, 576]`` bf16).
+    * otherwise: a bf16 store (``[*, d]``); the selected rows are gathered
+      directly into ``[total_valid, 1, d]`` (no dequant needed).
+
+    Returns ``(compact_kv, compact_indices, valid_counts)`` where ``compact_kv``
+    is ``[total_valid, 1, d]`` and ``compact_indices`` is ``[bs, width]`` int32
+    (request-local ordinals, ``-1`` pads) ready for ``flash_mla_sparse_fwd``
+    (after an ``unsqueeze(1)``). ``compact_kv`` has 0 rows iff no request selected
+    any valid slot (a degenerate batch the caller must avoid at decode).
+    """
+    valid_lengths = (physical_slots >= 0).sum(dim=1)
+    remap = build_compact_decode_index(physical_slots, valid_lengths)
+    kv_flat = kv_store.reshape(-1, kv_store.shape[-1])
+    ptf = remap.page_table_1_flattened
+    if store_is_fp8:
+        from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+            dequantize_k_cache_paged,
+        )
+
+        compact_kv = dequantize_k_cache_paged(kv_flat, ptf)
+    else:
+        compact_kv = kv_flat.index_select(0, ptf.to(torch.int64)).unsqueeze(1)
+    return compact_kv, remap.compact_indices, remap.valid_counts

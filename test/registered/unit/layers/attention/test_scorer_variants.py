@@ -492,7 +492,21 @@ class TestLiftedBudgetABI(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self._parse(", " + bad)
 
-    def _server_args(self, cfg_extra, top_k):
+    def test_rejects_lifted_budget_not_multiple_of_128(self):
+        # flash_mla_sparse_fwd tiles topk by 128 (topk % (2*B_TOPK) == 0).
+        with self.assertRaises(ValueError) as cm:
+            self._parse(
+                ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4097'
+            )
+        self.assertIn("128", str(cm.exception))
+
+    def test_accepts_lifted_budget_multiple_of_128(self):
+        c = self._parse(
+            ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 8192'
+        )
+        self.assertEqual(c.lifted_budget_top_k, 8192)
+
+    def _server_args(self, cfg_extra, top_k, disable_cuda_graph=False):
         from types import SimpleNamespace
         cfg = (
             '{"channel_mask_path": "/tmp/cm.safetensors", "top_k": %d' % top_k
@@ -501,8 +515,8 @@ class TestLiftedBudgetABI(unittest.TestCase):
         hf = object()
         return SimpleNamespace(
             enable_double_sparsity=True, enable_hisparse=False, disaggregation_mode=None,
-            double_sparsity_config=cfg, disable_cuda_graph=False, page_size=64,
-            kv_cache_dtype="auto",
+            double_sparsity_config=cfg, disable_cuda_graph=disable_cuda_graph,
+            page_size=64, kv_cache_dtype="auto",
             get_model_config=lambda: SimpleNamespace(hf_config=hf),
         )
 
@@ -525,40 +539,65 @@ class TestLiftedBudgetABI(unittest.TestCase):
         finally:
             mc.is_deepseek_dsa, mc.get_dsa_index_topk = o1, o2
 
-    def test_validator_lifted_flag_fails_closed_no_op_case(self):
-        # R10-review case A: top_k == index_topk + lifted flag. The old code let
-        # this boot and silently run the locked 2048 selector (the lifted budget
-        # was never honored). It must fail closed until the decode backend lands.
+    def test_validator_lifted_requires_disable_cuda_graph(self):
+        # The lifted path is eager-only (dequantize_k_cache_paged allocates and is
+        # not graph-safe). With CUDA graph enabled it must be rejected — and this
+        # gate is hf_config-independent, so no monkeypatch is needed.
         from sglang.srt.layers.attention.double_sparsity.validator import (
             validate_double_sparsity,
         )
         with self.assertRaises(ValueError) as cm:
             validate_double_sparsity(self._server_args(
                 ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096',
-                top_k=2048,
+                top_k=2048, disable_cuda_graph=False,
             ))
-        msg = str(cm.exception)
-        self.assertIn("enable_lifted_budget_decode", msg)
-        self.assertIn("not implemented", msg)
+        self.assertIn("disable-cuda-graph", str(cm.exception))
 
-    def test_validator_lifted_flag_fails_closed_wide_topk_case(self):
-        # R10-review case B: top_k > index_topk + lifted flag. The old code let
-        # this boot and could route a >2048-wide tensor into the default
-        # flashmla_kv `indices.shape[-1] == dsa_index_topk` assert. It must fail
-        # closed until the decode backend lands. The gate is hf_config-independent,
-        # so it fires before the capability/model-topk block (no monkeypatch
-        # needed here).
+    def test_validator_lifted_requires_top_k_eq_index_topk(self):
+        # The base budget must stay == index_topk; lifted_budget_top_k is the
+        # SEPARATE wider width. top_k=4096 (!= index_topk 2048) is rejected.
+        import sglang.srt.configs.model_config as mc
         from sglang.srt.layers.attention.double_sparsity.validator import (
             validate_double_sparsity,
         )
-        with self.assertRaises(ValueError) as cm:
-            validate_double_sparsity(self._server_args(
-                ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 8192',
-                top_k=4096,
-            ))
-        msg = str(cm.exception)
-        self.assertIn("enable_lifted_budget_decode", msg)
-        self.assertIn("not implemented", msg)
+        o1, o2 = mc.is_deepseek_dsa, mc.get_dsa_index_topk
+        mc.is_deepseek_dsa = lambda hf: True
+        mc.get_dsa_index_topk = lambda hf: 2048
+        try:
+            with self.assertRaises(ValueError) as cm:
+                validate_double_sparsity(self._server_args(
+                    ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 8192',
+                    top_k=4096, disable_cuda_graph=True,
+                ))
+            self.assertIn("index_topk", str(cm.exception))
+        finally:
+            mc.is_deepseek_dsa, mc.get_dsa_index_topk = o1, o2
+
+    def test_validator_lifted_valid_config_passes_lifted_gates(self):
+        # top_k==index_topk, lifted>index_topk, %128, eager: the lifted gates must
+        # NOT fire. (A later channel-mask load on the fake path may raise, but it
+        # must not be one of the lifted-gate rejections.)
+        import sglang.srt.configs.model_config as mc
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        o1, o2 = mc.is_deepseek_dsa, mc.get_dsa_index_topk
+        mc.is_deepseek_dsa = lambda hf: True
+        mc.get_dsa_index_topk = lambda hf: 2048
+        try:
+            try:
+                validate_double_sparsity(self._server_args(
+                    ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096',
+                    top_k=2048, disable_cuda_graph=True,
+                ))
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                self.assertNotIn("disable-cuda-graph", msg)
+                self.assertNotIn("must be > DSA index_topk", msg)
+                self.assertNotIn("base top_k to equal", msg)
+                self.assertNotIn("not implemented", msg)
+        finally:
+            mc.is_deepseek_dsa, mc.get_dsa_index_topk = o1, o2
 
 
 if __name__ == "__main__":

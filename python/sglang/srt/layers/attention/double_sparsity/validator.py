@@ -93,38 +93,37 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
-    # Lifted-budget decode opt-in: fail closed until the backend path lands.
-    # `enable_lifted_budget_decode` is a recognized opt-in ABI field, but the
-    # adjustable-budget decode backend it selects (wider-than-index_topk
-    # selection -> request-local compact remap -> flash_mla_sparse_fwd) is not
-    # implemented/wired yet. Booting with the flag set would NOT honor a wider
-    # budget — it would either silently run the locked index_topk selector (a
-    # no-op when top_k == index_topk) or route a wider-than-index_topk selection
-    # into the default flashmla_kv `indices.shape[-1] == dsa_index_topk` assert.
-    # Both are silent-wrong / late-crash outcomes, so refuse to boot here. This
-    # gate is independent of hf_config resolution (it fires before the
-    # capability/model-topk block), so it cannot be skipped when the model
-    # config can't be resolved. The lifted-budget decode landing flips
-    # ds_lifted_budget_decode_available() to True to enable this path.
+    # Lifted-budget decode opt-in gate. The backend path now exists
+    # (ds_lifted_budget_decode_available() == True): the selector widens to
+    # lifted_budget_top_k and decode routes the selected slots through the
+    # request-local compact remap -> dequantize_k_cache_paged ->
+    # flash_mla_sparse_fwd path. Two hf_config-independent requirements (the
+    # top_k == index_topk shape check lives in the model-topk block below):
+    #   * It is an EAGER research path — the internally-allocating dequant is not
+    #     CUDA-graph-safe, so the opt-in requires --disable-cuda-graph until the
+    #     alloc-free out= hardening lands.
+    #   * If a future build ever ships the flag without a wired backend, fail
+    #     closed rather than booting into a silent no-op / the flashmla_kv assert.
     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
         ds_lifted_budget_decode_available,
     )
 
-    if getattr(config, "enable_lifted_budget_decode", False) and not (
-        ds_lifted_budget_decode_available()
-    ):
-        raise ValueError(
-            "Double Sparsity enable_lifted_budget_decode is recognized but the "
-            "opt-in lifted-budget decode backend path is not implemented/selected "
-            "yet, so the flag cannot be honored. The server fails closed rather "
-            "than booting into a silent no-op (when top_k == DSA index_topk the "
-            "locked selector ignores the wider budget) or routing a wider "
-            "selection into the default flashmla_kv "
-            "'indices.shape[-1] == dsa_index_topk' assert. Remove "
-            "enable_lifted_budget_decode (and lifted_budget_top_k) to run the "
-            "default DSA-budget path; the lifted-budget decode landing will "
-            "enable this flag once that path exists."
-        )
+    if getattr(config, "enable_lifted_budget_decode", False):
+        if not ds_lifted_budget_decode_available():
+            raise ValueError(
+                "Double Sparsity enable_lifted_budget_decode is recognized but the "
+                "opt-in lifted-budget decode backend path is not implemented in this "
+                "build, so the flag cannot be honored and the server fails closed "
+                "rather than booting into a silent no-op or the flashmla_kv "
+                "'indices.shape[-1] == dsa_index_topk' assert."
+            )
+        if not getattr(server_args, "disable_cuda_graph", False):
+            raise ValueError(
+                "Double Sparsity enable_lifted_budget_decode is an eager research "
+                "path: its dequantize_k_cache_paged step allocates internally and is "
+                "not CUDA-graph-safe, so it requires --disable-cuda-graph. Re-run "
+                "with --disable-cuda-graph, or disable enable_lifted_budget_decode."
+            )
 
     # Production-path selector-variant safety (future-proof guard). As of R9 ALL
     # non-learned variants — scorer_norm (cosine/hybrid) + head_agg (mean) [R6] and
@@ -233,6 +232,14 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             model_topk = get_dsa_index_topk(hf_config)
             lifted = config.enable_lifted_budget_decode
             if model_topk > 0:
+                if lifted and config.top_k != model_topk:
+                    raise ValueError(
+                        f"Double Sparsity enable_lifted_budget_decode requires the base "
+                        f"top_k to equal DSA index_topk ({model_topk}); got "
+                        f"top_k={config.top_k}. The base budget stays the DSA budget — "
+                        "lifted_budget_top_k is the SEPARATE, wider lifted selection "
+                        "width (it is what widens the decode, not top_k)."
+                    )
                 if lifted and config.lifted_budget_top_k <= model_topk:
                     raise ValueError(
                         f"Double Sparsity lifted_budget_top_k={config.lifted_budget_top_k} "

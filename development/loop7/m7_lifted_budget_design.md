@@ -120,22 +120,57 @@ tests, and the kernel half is proven on GPU:
   The realistic budgets 4096/8192 satisfy this; the next-round config/validator
   must enforce `lifted_budget_top_k % 128 == 0`.
 
-## Open risks (carry to the decode-branch wiring)
-- The internally-allocating `dequantize_k_cache_paged` is not graph-safe → the
-  research path must run eager (gate it off the production capture path; the
-  validator already requires `--disable-cuda-graph` for the opt-in until the
-  `out=`/scratch hardening lands).
-- ~~`flash_mla_sparse_fwd` accuracy at top-k > 512 is unproven locally~~
-  **RESOLVED (R12)**: the direct 4K smoke + the fp8 end-to-end smoke pass.
-- The selection budget must be widened from `max_top_k = top_k` to
-  `lifted_budget_top_k` for the opt-in path (selector + the `ds_graph_state` /
-  `ds_topk_indices_out` scratch shapes); enforce the `%128` width constraint.
-- Small oracle N at 4K → the recall recovery must be measured served at N≥20 with
-  CIs, not inferred from the score-only oracle.
+## Landed (served eager decode branch — wired + enabled)
+The opt-in eager lifted-budget decode branch is wired end-to-end and the
+availability seam is flipped (`ds_lifted_budget_decode_available()` → `True`):
+- **Config**: `lifted_budget_top_k % 128 == 0` is enforced (the kernel-block
+  constraint), alongside `> top_k`.
+- **Validator**: when enabled, requires `top_k == index_topk` (base budget stays
+  the DSA budget; `lifted_budget_top_k` is the separate wider width),
+  `lifted_budget_top_k > index_topk`, `% 128 == 0`, **and `--disable-cuda-graph`**
+  (the dequant is not graph-safe). The R11 fail-closed "not implemented" gate is
+  replaced by these checks (kept as defense if a build ever ships the flag without
+  the backend).
+- **Selection width**: `DoubleSparsitySelector.max_top_k` and the backend's
+  `ds_max_top_k` (which sizes `ds_topk_indices_out` + `ds_graph_state`) become
+  `lifted_budget_top_k` when enabled, so the selector emits a lifted-width
+  selection with the R23 tie-break unchanged.
+- **Decode branch**: `DeepseekSparseAttnBackend.forward_decode` routes the lifted
+  case (physical `page_table_1`, the FUSE_TOPK default) to `_forward_lifted_budget`
+  → `build_lifted_compact_kv` (remap + `dequantize_k_cache_paged` for the fp8
+  store, gather for bf16) → the existing `_forward_flashmla_sparse`
+  (`flash_mla_sparse_fwd`). Everything is behind a default-off
+  `getattr(self, "ds_lifted_budget_decode", False)` guard, so the default DSA/DS
+  decode is byte-identical and the `flashmla_kv` `dsa_index_topk` assert is untouched.
+- **Tests**: `TestLiftedBudgetABI` (config `%128` reject/accept; validator
+  eager-required, `top_k==index_topk`, valid-config-passes); `test_lifted_budget_decode`
+  GPU served-helper tests at **4096 and 8192** widths incl. prefix-sharing,
+  `valid_lengths` < width, and an **interior `-1` from within-row dedup**, all vs a
+  reference attention. 337 DS unit tests + 9 subtests pass.
+
+## Open items (carry to served measurement + hardening)
+- **Served recall (next)**: the wired branch must be booted with
+  `--disable-cuda-graph` + an `enable_lifted_budget_decode` config and the 4K NIAH
+  recall recovery measured served at N≥20 with CIs (the M0 oracle predicted
+  4K recall@4096 ≈ 100% vs recall@2048 ≈ 44%) — the binding evidence, not the
+  score-only oracle. This is an eager-mode number (label it as such — eager vs
+  graph recall differs).
+- **TP=8 equality (next)**: extend the TP determinism harness to the lifted
+  4096/8192 width.
+- ~~`flash_mla_sparse_fwd` accuracy at top-k > 512 unproven~~ **RESOLVED (R12)**.
+- ~~selection budget widening / `%128` enforcement / decode wiring~~
+  **RESOLVED (R13)**: selector + backend widen to `lifted_budget_top_k`, config
+  enforces `%128`, the decode branch + validator gating are wired.
+- **task16 hardening**: the dequant is not graph-safe → the path is eager-required
+  (validator-enforced); an alloc-free `out=`/scratch dequant + CUDA-graph capture is
+  needed before production graph use.
 
 ## Artifacts
-`config.py` (ABI fields + validation), `validator.py` (fail-closed gate),
-`selection_kernel.py::ds_lifted_budget_decode_available` (seam),
-`double_sparsity/lifted_budget.py` (remap), `test_scorer_variants.py::TestLiftedBudgetABI`,
-`test_lifted_budget_decode.py` (remap + kernel smokes), this doc. Codex review:
+`config.py` (ABI + `%128`), `validator.py` (lifted gating: eager-required,
+`top_k==index_topk`, `%128`), `selector.py` + `dsa_backend.py` (lifted width +
+`_forward_lifted_budget` decode branch),
+`selection_kernel.py::ds_lifted_budget_decode_available` (seam → True),
+`double_sparsity/lifted_budget.py` (`build_compact_decode_index` +
+`build_lifted_compact_kv`), `test_scorer_variants.py::TestLiftedBudgetABI`,
+`test_lifted_budget_decode.py` (remap + kernel/served-helper tests). Codex review:
 `.humanize/skill/<ts>/output.md`.

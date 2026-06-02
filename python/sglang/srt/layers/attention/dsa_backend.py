@@ -479,6 +479,12 @@ class DeepseekSparseAttnBackend(
                 "write; NIAH @ 16K is expected to drop > 30 pp."
             )
         self.ds_max_top_k: int = 2048
+        # Opt-in lifted-budget decode (eager research path): the selector emits a
+        # WIDER fixed budget (lifted_budget_top_k > index_topk) and decode attends
+        # the dequantized selected slots via flash_mla_sparse_fwd instead of the
+        # default flashmla_kv. When off, every lifted code path below is skipped
+        # and the default decode is byte-identical.
+        self.ds_lifted_budget_decode: bool = False
         if self.enable_double_sparsity:
             try:
                 from sglang.srt.layers.attention.double_sparsity.config import (
@@ -488,7 +494,16 @@ class DeepseekSparseAttnBackend(
                 ds_cfg = parse_double_sparsity_config(
                     model_runner.server_args.double_sparsity_config
                 )
-                self.ds_max_top_k = int(ds_cfg.top_k)
+                self.ds_lifted_budget_decode = bool(
+                    ds_cfg.enable_lifted_budget_decode
+                )
+                # ds_max_top_k sizes ds_topk_indices_out + ds_graph_state, so the
+                # selection/output buffers are lifted-width on the opt-in path.
+                self.ds_max_top_k = (
+                    int(ds_cfg.lifted_budget_top_k)
+                    if ds_cfg.enable_lifted_budget_decode
+                    else int(ds_cfg.top_k)
+                )
             except Exception:
                 # Fall back to the canonical V3.2 default.
                 self.ds_max_top_k = 2048
@@ -1956,6 +1971,20 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        # Opt-in lifted-budget decode (eager research path): the physical
+        # page_table_1 here is the wider lifted-width selection; attend it via
+        # the dequantized compact KV + flash_mla_sparse_fwd (no 2048 cap) instead
+        # of the default flashmla_kv. Default off => skipped (byte-identical).
+        if getattr(self, "ds_lifted_budget_decode", False):
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_lifted_budget(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2060,6 +2089,39 @@ class DeepseekSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_lifted_budget(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Opt-in lifted-budget decode (eager research path).
+
+        ``page_table_1`` is the wider lifted-width selection of PHYSICAL KV slots
+        (``[bs, lifted_budget_top_k]``, ``-1`` pads). Build the request-local
+        compact KV buffer (dequantizing the selected fp8 slots, or gathering bf16)
+        and attend it with ``flash_mla_sparse_fwd`` (no 2048 cap). The default
+        ``flashmla_kv`` path and its ``dsa_index_topk`` assert are untouched.
+        """
+        from sglang.srt.layers.attention.double_sparsity.lifted_budget import (
+            build_lifted_compact_kv,
+        )
+
+        compact_kv, compact_indices, _ = build_lifted_compact_kv(
+            kv_cache,
+            page_table_1,
+            store_is_fp8=self.dsa_kv_cache_store_fp8,
+        )
+        return self._forward_flashmla_sparse(
+            q_all=q_all,
+            kv_cache=compact_kv,
+            page_table_1=compact_indices,
+            sm_scale=sm_scale,
+            v_head_dim=v_head_dim,
+        )
 
     def _forward_flashmla_sparse(
         self,

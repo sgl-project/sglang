@@ -234,6 +234,80 @@ class TestLiftedBudgetKernelSmoke(unittest.TestCase):
             out.float(), ref.to(out.dtype).float(), atol=3e-2, rtol=3e-2
         )
 
+    def _quant_store(self, P, d_qk=576):
+        from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
+
+        phys = (
+            torch.randn(P, 1, 1, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        )
+        phys.clamp_(-6, 6)
+        return quantize_k_cache(phys)  # [P,1,1,656] fp8
+
+    def test_wired_lifted_decode_4096(self):
+        # The production decode helper at the 4096 lifted width: one request
+        # selects 3000 > 2048 slots; matches a reference attention.
+        from sglang.srt.layers.attention.double_sparsity.lifted_budget import (
+            build_lifted_compact_kv,
+        )
+
+        d_qk = 576
+        quant = self._quant_store(3200, d_qk)
+        width, v0, v1 = 4096, 3000, 1500
+        sel = torch.full((2, width), -1, dtype=torch.int64, device=self.device)
+        sel[0, :v0] = torch.arange(v0, device=self.device)
+        sel[1, :v1] = torch.arange(100, 100 + v1, device=self.device)
+
+        compact_kv, compact_indices, vcounts = build_lifted_compact_kv(
+            quant, sel, store_is_fp8=True
+        )
+        self.assertEqual(int(vcounts[0]), v0)
+        self.assertGreater(int((compact_indices[0] >= 0).sum().item()), 2048)
+
+        sm_scale = 1.0 / (d_qk**0.5)
+        q = torch.randn(2, self.h, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        q.clamp_(-6, 6)
+        out = self._sparse_fwd(q, compact_kv, compact_indices, sm_scale)
+        ref = _ref_sparse_attention(q, compact_kv, compact_indices, sm_scale)
+        torch.testing.assert_close(
+            out.float(), ref.to(out.dtype).float(), atol=3e-2, rtol=3e-2
+        )
+
+    def test_wired_lifted_decode_8192_dedup_and_prefix_share(self):
+        # 8192 lifted width; request 1 has a within-row duplicate physical slot
+        # (interior -1 after dedup) and shares slots with request 0 (prefix
+        # sharing → its own compact span). Matches a reference attention.
+        from sglang.srt.layers.attention.double_sparsity.lifted_budget import (
+            build_lifted_compact_kv,
+        )
+
+        d_qk = 576
+        quant = self._quant_store(3200, d_qk)
+        width, v0 = 8192, 3000
+        sel = torch.full((2, width), -1, dtype=torch.int64, device=self.device)
+        sel[0, :v0] = torch.arange(v0, device=self.device)
+        # slot 5 duplicated at lane 2; slots 5/7/9/11 shared with request 0.
+        sel[1, :5] = torch.tensor([5, 7, 5, 9, 11], device=self.device)
+
+        compact_kv, compact_indices, vcounts = build_lifted_compact_kv(
+            quant, sel, store_is_fp8=True
+        )
+        # request 1 deduped to 4 valid; the duplicate (lane 2) is an interior -1.
+        self.assertEqual(int(vcounts[1]), 4)
+        self.assertEqual(int(compact_indices[1, 2].item()), -1)
+        # prefix-sharing: request 1's slot 5 maps to ITS OWN compact span base,
+        # not request 0's copy of slot 5.
+        base1 = int(vcounts[0].item())
+        self.assertEqual(int(compact_indices[1, 0].item()), base1)
+
+        sm_scale = 1.0 / (d_qk**0.5)
+        q = torch.randn(2, self.h, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        q.clamp_(-6, 6)
+        out = self._sparse_fwd(q, compact_kv, compact_indices, sm_scale)
+        ref = _ref_sparse_attention(q, compact_kv, compact_indices, sm_scale)
+        torch.testing.assert_close(
+            out.float(), ref.to(out.dtype).float(), atol=3e-2, rtol=3e-2
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

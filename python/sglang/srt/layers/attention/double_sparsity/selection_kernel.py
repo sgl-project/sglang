@@ -459,17 +459,16 @@ def ds_lifted_budget_decode_available() -> bool:
     implemented and wired into selection/decode, so ``enable_lifted_budget_decode``
     can actually be honored.
 
-    Returns ``False`` today: the config ABI (``enable_lifted_budget_decode`` +
-    ``lifted_budget_top_k``) is recognized, but the lifted decode path
-    (wider-than-``index_topk`` selection → request-local compact remap →
-    ``flash_mla_sparse_fwd``) is not built yet. The validator uses this so a
-    boot with the flag set fails closed instead of silently running the locked
-    ``index_topk`` selector or routing a wider selection into the default
-    ``flashmla_kv`` ``indices.shape[-1] == dsa_index_topk`` assert. This is the
-    single capability seam the lifted-budget decode landing flips to ``True``
-    once that path exists (mirroring :func:`ds_scorer_is_graph_safe`).
+    Returns ``True`` as of the lifted decode-branch landing: the selector widens
+    its budget to ``lifted_budget_top_k`` and the decode routes the selected slots
+    through ``build_compact_decode_index`` → ``dequantize_k_cache_paged`` →
+    ``flash_mla_sparse_fwd`` (an EAGER research path — the internally-allocating
+    dequant is not CUDA-graph-safe, so the validator additionally requires
+    ``--disable-cuda-graph`` for the opt-in until the alloc-free hardening lands).
+    The validator's lifted-budget shape/eager checks govern enablement now that
+    this seam is open (mirroring :func:`ds_scorer_is_graph_safe`).
     """
-    return False
+    return True
 
 
 def compute_token_scores(
