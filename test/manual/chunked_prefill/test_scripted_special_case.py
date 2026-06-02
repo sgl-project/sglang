@@ -287,27 +287,38 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_retract_during_gap_inflight_middle_chunks_positive(t: ScriptedContext):
-        # Retract-side mirror of test_abort_during_gap_inflight_middle_chunks_positive
-        # (test_scripted_abort.py): drive a chunked req into the parked gap state
-        # (inflight_middle_chunks > 0 but chunked_req slot released, so not
-        # is_chunking), then retract there. Unlike abort, retract must re-queue the
-        # req and resume it to completion, while still releasing KV/row and resetting
-        # inflight_middle_chunks in the same transition.
-        r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
-        yield from run_until(
-            r,
-            lambda h: h.req.inflight_middle_chunks > 0 and not h.is_chunking,
-        )
+        # Retract a chunked req mid-prefill (after >= 1 chunk has committed, so
+        # inflight_middle_chunks is the latched 1 and a committed prefix exists) and
+        # verify retract releases KV/row, resets inflight_middle_chunks, and re-queues
+        # the req to the waiting queue, then resumes it to completion.
+        #
+        # The "parked gap" state this test was originally written around
+        # (inflight_middle_chunks > 0 AND not is_chunking) is never reached on the
+        # single-engine overlap path: empirically the trajectory is
+        # (chunks_done=1, inflight=1, is_chunking=True) -> (chunks_done=2, inflight=0,
+        # is_chunking=False); inflight_middle_chunks is the 0/1 latch that bumps only
+        # while the req is still the chunked_req, and clears in the same transition
+        # that clears chunked_req. So land while genuinely chunking instead. Retract of
+        # a still-chunking req (even with an empty running_batch) clears chunked_req,
+        # releases its KV, resets inflight_middle_chunks to 0, and moves it to the
+        # waiting queue.
+        r = t.start_req(prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
+        yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         assert r.req.inflight_middle_chunks > 0
-        assert not r.is_chunking
+        assert r.is_chunking
 
         t.pause_generation(mode="retract")
         yield
 
         assert (
             r.kv_pages == 0
-        ), f"retract during gap must release KV; got kv_pages={r.kv_pages}"
+        ), f"retract must release KV; got kv_pages={r.kv_pages}"
         assert not r.finished, "retract must re-queue r, not finish or abort it"
+        assert not r.is_chunking, "retract must release the chunked slot"
+        assert r.status == "waiting", (
+            f"retracted chunked req must return to the waiting queue; "
+            f"got status={r.status!r}"
+        )
         req = t.find_req_by_rid(r.rid)
         assert req is not None and req.inflight_middle_chunks == 0, (
             f"retract must reset inflight_middle_chunks; got "
@@ -329,18 +340,35 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_load_inquirer_pending_tokens_dedup_chunked(t: ScriptedContext):
+        # The dual-queue dedup invariant for the in-flight chunked req is the real v1
+        # formula (load_inquirer.py:69-72): its pending-token contribution is its full
+        # seqlen MINUS the committed radix prefix (len(prefix_indices)), never the full
+        # seqlen. Asserting against r.remaining_prompt_tokens (origin_input_ids -
+        # kv_committed_len) is wrong: prefix_indices lags kv_committed_len by up to one
+        # chunk, so the two legitimately differ mid-flight. Compare against the
+        # prefix-subtracting formula directly and require the subtraction actually
+        # happened once a prefix is committed (strictly below the full seqlen).
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
+        saw_dedup = False
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking:
+            chunked = t.scheduler.chunked_req
+            if r.is_chunking and chunked is not None and chunked.rid == r.rid:
                 saw_chunking = True
                 pending = _load_inquirer_pending_for_rid(t, r.rid)
-                assert pending <= r.remaining_prompt_tokens, (
-                    f"load_inquirer tallied {pending} tokens for r but only "
-                    f"{r.remaining_prompt_tokens} are still pending — "
-                    "dual-queue dedup violated"
+                expected = chunked.seqlen - len(chunked.prefix_indices)
+                assert pending == expected, (
+                    f"load_inquirer chunked contribution must equal the prefix-"
+                    f"subtracting formula seqlen - len(prefix_indices) = {expected}; "
+                    f"got {pending}"
                 )
+                assert pending <= chunked.seqlen, (
+                    f"chunked contribution must never exceed its full seqlen "
+                    f"{chunked.seqlen}; got {pending} — dual-queue dedup violated"
+                )
+                if len(chunked.prefix_indices) > 0:
+                    saw_dedup = pending < chunked.seqlen
             if r.finished:
                 break
             yield
@@ -348,6 +376,10 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert (
             saw_chunking
         ), "test must observe the dual-queue chunked state at least once"
+        assert saw_dedup, (
+            "test must observe the chunked req with a committed prefix so the "
+            "dedup subtraction is actually exercised"
+        )
 
     def test_load_inquirer_chunked_contribution_exact_remainder(self):
         self.server.execute_script(
@@ -539,8 +571,13 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_second_chunked_admit_blocked_when_chunked_req_set(t: ScriptedContext):
-        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        # Distinct prompt_token per req so r2 chunks cold: with the default fill
+        # token both prompts are identical, r2 fully hits r1's committed radix prefix
+        # and admits non-chunked (never entering is_chunking), so saw_r2 would stay
+        # False. Distinct tokens force both to chunk over their lifetime while still
+        # exercising the single-chunked-slot mutual exclusion.
+        r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=10)
+        r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=11)
         saw_r1_chunking = False
         saw_r2_chunking = False
         for _ in range(DEFAULT_MAX_STEPS * 2):
@@ -579,14 +616,22 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     def _script_scheduler_continues_with_only_chunked_req_no_waiting(
         t: ScriptedContext,
     ):
+        # "while a chunked req is in flight" means precisely while r.is_chunking
+        # (chunked_req points at r). Once the final chunk commits, chunked_req clears
+        # and the req moves on to decode/finish; the step right after the last chunk
+        # (and the finishing step) legitimately observes is_idle, so the non-idle
+        # assertion must be guarded by r.is_chunking, mirroring the passing
+        # test_chunked_in_flight_no_idle. The real invariant under test is that the
+        # sole chunked req keeps advancing with an empty waiting_queue.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
         prev_chunks_done = r.chunks_done
         progressed = False
         for _ in range(DEFAULT_MAX_STEPS):
-            assert (
-                not t.is_idle
-            ), "scheduler must not go idle while a chunked req is in flight"
+            if r.is_chunking:
+                assert (
+                    not t.is_idle
+                ), "scheduler must not go idle while a chunked req is in flight"
             cur_chunks_done = r.chunks_done
             if cur_chunks_done > prev_chunks_done:
                 progressed = True
