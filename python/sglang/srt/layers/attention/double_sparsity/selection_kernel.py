@@ -357,7 +357,23 @@ def _scorer_norm_mode() -> str:
     import os as _os
 
     mode = _os.environ.get("SGLANG_DS_SCORER_NORM", "off").strip().lower()
-    return mode if mode in ("off", "cosine") else "off"
+    return mode if mode in ("off", "cosine", "hybrid") else "off"
+
+
+def ds_scorer_is_default(config) -> bool:
+    """``True`` iff the DS selector config uses the production raw channel-dot /
+    cross-head-max scorer with no variant flags — i.e. the graph-safe Triton
+    scorer path is valid. Any non-default variant (scorer_norm/head_agg/
+    anchor_budget) must run the eager logical scorer instead, since the graph-
+    safe Triton scorer only implements the production path.
+    """
+    if config is None:
+        return True
+    return (
+        getattr(config, "scorer_norm", "off") == "off"
+        and getattr(config, "head_agg", "max") == "max"
+        and getattr(config, "anchor_budget", 0) == 0
+    )
 
 
 def compute_token_scores(
@@ -369,6 +385,7 @@ def compute_token_scores(
     layer_id: int,
     token_scales: Optional[torch.Tensor] = None,
     scorer_norm: Optional[str] = None,
+    head_agg: str = "max",
 ) -> torch.Tensor:
     """Compute per-(batch, token) scalar scores.
 
@@ -398,9 +415,14 @@ def compute_token_scores(
     q_proj = project_query_onto_channels(queries, sel_layer, w_layer)  # [bs, H, D]
 
     norm_mode = scorer_norm if scorer_norm is not None else _scorer_norm_mode()
+    # Physical mode has no per-request seq_len, so "hybrid" degrades to cosine
+    # here (this path is the sanity probe / unit tests; production decode uses
+    # the logical scorer, which thresholds hybrid by seq_len).
+    cosine_like = norm_mode in ("cosine", "hybrid")
 
     if (
-        norm_mode == "off"
+        not cosine_like
+        and head_agg == "max"
         and _TRITON_AVAILABLE
         and q_proj.is_cuda
         and sig_layer.is_cuda
@@ -415,7 +437,7 @@ def compute_token_scores(
 
     qf = q_proj.to(torch.float32)
     sf = sig_layer.to(torch.float32)
-    if norm_mode == "cosine":
+    if cosine_like:
         # Direction-only score: unit-normalize per (head) channel vector. The
         # int8 dequant scale is a positive per-(token,head) magnitude factor and
         # cancels under normalization, so scale_layer is intentionally ignored.
@@ -426,9 +448,9 @@ def compute_token_scores(
     else:
         scores_full = torch.einsum("bhd,thd->bth", qf, sf)  # [bs, T, H]
         if scale_layer is not None:
-            # Dequant the int8 dot per (token, head) before the cross-head max.
+            # Dequant the int8 dot per (token, head) before the cross-head agg.
             scores_full = scores_full * scale_layer.unsqueeze(0).to(torch.float32)
-    scores = scores_full.amax(dim=-1)  # [bs, T]
+    scores = scores_full.mean(dim=-1) if head_agg == "mean" else scores_full.amax(dim=-1)
     return scores.masked_fill(~written_layer.unsqueeze(0), float("-inf"))
 
 
@@ -624,6 +646,8 @@ def _compute_logical_token_scores(
     max_seq_len: int = 0,
     token_scales: Optional[torch.Tensor] = None,
     scorer_norm: str = "off",
+    head_agg: str = "max",
+    hybrid_threshold: int = 8192,
 ) -> torch.Tensor:
     """Score tokens in logical-sequence-position space.
 
@@ -674,23 +698,33 @@ def _compute_logical_token_scores(
     # q_proj: [bs, H, D] → [bs, 1, H, D]; gathered_sig: [bs, max_seq_len, H, D]
     qf = q_proj.unsqueeze(1).to(torch.float32)          # [bs, 1, H, D]
     sf = gathered_sig.to(torch.float32)                  # [bs, max_seq_len, H, D]
-    if scorer_norm == "cosine":
-        # Direction-only score (Loop-7 Tier-2.B): unit-normalize per (head)
-        # channel vector so per-token background magnitude can't dominate. The
-        # int8 dequant scale is a positive magnitude factor and cancels under
-        # normalization, so token_scales is intentionally ignored.
-        eps = 1e-6
-        qf = qf / (qf.norm(dim=-1, keepdim=True) + eps)
-        sf = sf / (sf.norm(dim=-1, keepdim=True) + eps)
-        dot = (qf * sf).sum(-1)  # [bs, max_seq_len, H]
+
+    # Raw channel-dot (production), dequant-scaled for the int8 path.
+    raw_dot = (qf * sf).sum(-1)  # [bs, max_seq_len, H]
+    if token_scales is not None:
+        scale_layer = token_scales[layer_id]                       # [max_tokens, H]
+        scale_gathered = scale_layer[safe_phys].to(torch.float32)  # [bs, max_seq_len, H]
+        raw_dot = raw_dot * scale_gathered
+
+    if scorer_norm == "off":
+        dot = raw_dot
     else:
-        dot = (qf * sf).sum(-1)  # [bs, max_seq_len, H]
-        if token_scales is not None:
-            # Dequant the int8 dot per (slot, head) before the cross-head max.
-            scale_layer = token_scales[layer_id]                # [max_tokens, H]
-            scale_gathered = scale_layer[safe_phys].to(torch.float32)  # [bs, max_seq_len, H]
-            dot = dot * scale_gathered
-    scores = dot.amax(dim=-1)  # [bs, max_seq_len]
+        # Direction-only (cosine) score: unit-normalize per (head) channel vector
+        # so per-token background magnitude can't dominate. Scale-invariant, so
+        # token_scales is intentionally ignored for the cosine contribution.
+        eps = 1e-6
+        cos_dot = (
+            (qf / (qf.norm(dim=-1, keepdim=True) + eps))
+            * (sf / (sf.norm(dim=-1, keepdim=True) + eps))
+        ).sum(-1)  # [bs, max_seq_len, H]
+        if scorer_norm == "cosine":
+            dot = cos_dot
+        else:  # "hybrid": raw for short context, cosine for long (per request)
+            use_cos = (seq_lens.to(device) > hybrid_threshold).view(-1, 1, 1)
+            dot = torch.where(use_cos, cos_dot, raw_dot)
+
+    # Cross-head aggregation.
+    scores = dot.mean(dim=-1) if head_agg == "mean" else dot.amax(dim=-1)  # [bs, max_seq_len]
 
     # Mask: unwritten physical slots and positions >= seq_len
     written_layer = written[layer_id]  # [max_tokens] bool
@@ -701,6 +735,48 @@ def _compute_logical_token_scores(
     scores = scores.masked_fill(~seq_len_mask, float("-inf"))
 
     return scores
+
+
+def _force_include_recency_anchor(
+    indices: torch.Tensor,
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    anchor_budget: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Force each request's ``anchor_budget`` most-recent logical positions into
+    the selection, evicting the lowest-scoring non-anchor selected positions and
+    preserving the per-row selected count. Eager/research path (per-row loop).
+    """
+    bs, budget = indices.shape
+    out = indices.to(torch.int32).clone()
+    sl = seq_lens.to(torch.int64).tolist()
+    for b in range(bs):
+        n = int(sl[b])
+        if n <= 0:
+            continue
+        anchors = list(range(max(0, n - anchor_budget), n))
+        if not anchors:
+            continue
+        real = [int(p) for p in out[b].tolist() if p >= 0]
+        real_set = set(real)
+        anchor_set = set(anchors)
+        missing = [p for p in anchors if p not in real_set]
+        if not missing:
+            continue
+        evictable = [p for p in real if p not in anchor_set]
+        evictable.sort(key=lambda p: float(scores[b, p].item()))  # lowest score first
+        k = min(len(missing), len(evictable))
+        if k == 0:
+            continue
+        keep = [p for p in real if p not in set(evictable[:k])]
+        new_real = sorted(set(keep) | set(missing[:k]))[: len(real)]
+        filled = torch.full((budget,), -1, dtype=torch.int32, device=out.device)
+        filled[: len(new_real)] = torch.tensor(
+            new_real, dtype=torch.int32, device=out.device
+        )
+        out[b] = filled
+    valid = (out >= 0).to(torch.int32).sum(dim=-1)
+    return out, valid
 
 
 def retrieve_topk_via_labels(
@@ -720,6 +796,9 @@ def retrieve_topk_via_labels(
     max_seq_len: int = 0,
     token_scales: Optional[torch.Tensor] = None,
     scorer_norm: Optional[str] = None,
+    head_agg: str = "max",
+    hybrid_threshold: int = 8192,
+    anchor_budget: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """End-to-end selector flow: score → all-reduce → per-request mask → top-K → ascend.
 
@@ -762,6 +841,8 @@ def retrieve_topk_via_labels(
             max_seq_len=max_seq_len,
             token_scales=token_scales,
             scorer_norm=_norm,
+            head_agg=head_agg,
+            hybrid_threshold=hybrid_threshold,
         )
         scores = all_reduce_token_scores(scores, process_group=process_group)
     else:
@@ -774,6 +855,7 @@ def retrieve_topk_via_labels(
             layer_id=layer_id,
             token_scales=token_scales,
             scorer_norm=_norm,
+            head_agg=head_agg,
         )
         scores = all_reduce_token_scores(scores, process_group=process_group)
 
@@ -785,6 +867,10 @@ def retrieve_topk_via_labels(
             )
         scores = scores.masked_fill(~per_request_valid.to(torch.bool), float("-inf"))
     indices, valid_lengths = select_topk_sequence_order(scores, max_top_k)
+    if anchor_budget > 0 and use_logical and seq_lens is not None:
+        indices, valid_lengths = _force_include_recency_anchor(
+            indices, scores, seq_lens, int(anchor_budget)
+        )
     if not torch.cuda.is_current_stream_capturing():
         from sglang.srt.layers.attention.double_sparsity import metrics as _metrics
 

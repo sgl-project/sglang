@@ -52,6 +52,17 @@ SIGNATURE_DTYPE="${SIGNATURE_DTYPE:-fp16}"
 # generation on V3.2/H200. 0.6 boots and serves stably (verified): weights are
 # ~80 GB/rank, leaving a small KV pool plus ~38 GB of runtime headroom.
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.6}"
+
+# Loop-7 measurement op-point. The stock defaults (fp16 / mem 0.6) are the safe
+# fp16-table boot point, NOT the Loop-7 baseline/oracle/M1 operating point
+# (int8 compact table / mem 0.7). Set LOOP7_MEASUREMENT=1 to PIN the Loop-7
+# op-point so a measurement run cannot silently reproduce the old regime.
+if [[ "${LOOP7_MEASUREMENT:-0}" == "1" ]]; then
+  SIGNATURE_DTYPE="int8"
+  MEM_FRACTION_STATIC="0.7"
+  echo ">>> LOOP7_MEASUREMENT=1: pinned SIGNATURE_DTYPE=int8 MEM_FRACTION_STATIC=0.7"
+fi
+
 LOG_DIR="${LOG_DIR:-$(pwd)/development/logs}"
 mkdir -p "${LOG_DIR}"
 
@@ -60,6 +71,7 @@ mkdir -p "${LOG_DIR}"
 SCORER_NORM="${SCORER_NORM:-off}"
 DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s", "scorer_norm": "%s"}' \
   "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}")
+echo ">>> effective double_sparsity_config = ${DS_CONFIG}"
 
 # Radix cache: DS serves radix-off by default. To serve radix-on, set
 # RADIX_FIXTURE_ARTIFACT to a fixtures-passed state file (written by

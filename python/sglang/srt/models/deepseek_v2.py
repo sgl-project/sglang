@@ -2233,16 +2233,18 @@ class DeepseekV2AttentionMLA(
                         _dsa_metadata, "ds_graph_state", None
                     )
                 # Route decode through the eager selector.retrieve_topk path
-                # (which honors flag-gated scorer variants like scorer_norm) when
-                # a non-default scorer norm is configured, OR via the env escape
-                # hatch. Config-borne scorer_norm reaches the TP workers (env does
-                # not). Off by default; production keeps the graph-safe path.
-                _scorer_norm_cfg = getattr(
-                    getattr(_selector, "config", None), "scorer_norm", "off"
+                # (which honors flag-gated scorer variants) when ANY non-default
+                # scorer variant is configured, OR via the env escape hatch. The
+                # graph-safe Triton scorer only implements the production raw/max
+                # path, so a non-default scorer must NOT enter it. Config-borne so
+                # it reaches the TP workers (env does not). Off by default.
+                from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                    ds_scorer_is_default as _ds_scorer_is_default,
                 )
+
                 _force_eager_select = (
                     os.environ.get("SGLANG_DS_FORCE_EAGER_SELECT", "0") == "1"
-                    or _scorer_norm_cfg != "off"
+                    or not _ds_scorer_is_default(getattr(_selector, "config", None))
                 )
                 _use_graph_safe = (
                     not _force_eager_select

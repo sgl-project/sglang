@@ -34,13 +34,27 @@ _ALLOWED_FIELDS = {
     "device_buffer_size",
     "signature_dtype",
     "scorer_norm",
+    "scorer_norm_hybrid_threshold",
+    "head_agg",
+    "anchor_budget",
     "extra",
 }
 
-# Allowed values for the Loop-7 Tier-2.B flag-gated scorer normalization. Config-
-# borne (not env) so it reaches the TP worker processes that run the selector.
-_ALLOWED_SCORER_NORM = ("off", "cosine")
+# Flag-gated non-learned selector variants (config-borne, not env, so they reach
+# the TP worker processes that run the selector). Each is independent and
+# defaults to the production behaviour (byte-identical when all are at default).
+#
+# scorer_norm: "off" (raw channel-dot), "cosine" (direction-only), "hybrid"
+#   (raw for context <= scorer_norm_hybrid_threshold tokens, cosine above).
+# head_agg: cross-head score reduction, "max" (default) or "mean".
+# anchor_budget: reserve this many recency (most-recent-position) slots that are
+#   always force-included in the selection; 0 disables (default).
+_ALLOWED_SCORER_NORM = ("off", "cosine", "hybrid")
 _DEFAULT_SCORER_NORM = "off"
+_DEFAULT_HYBRID_THRESHOLD = 8192
+_ALLOWED_HEAD_AGG = ("max", "mean")
+_DEFAULT_HEAD_AGG = "max"
+_DEFAULT_ANCHOR_BUDGET = 0
 
 
 _DEFAULT_TOP_K = 2048           # matches DeepSeek-V3.2 index_topk (max tokens per request)
@@ -58,6 +72,9 @@ class DoubleSparsityConfig:
     device_buffer_size: int = _DEFAULT_DEVICE_BUFFER_SIZE
     signature_dtype: str = _DEFAULT_SIGNATURE_DTYPE
     scorer_norm: str = _DEFAULT_SCORER_NORM
+    scorer_norm_hybrid_threshold: int = _DEFAULT_HYBRID_THRESHOLD
+    head_agg: str = _DEFAULT_HEAD_AGG
+    anchor_budget: int = _DEFAULT_ANCHOR_BUDGET
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -65,6 +82,21 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'scorer_norm' must be one of "
                 f"{list(_ALLOWED_SCORER_NORM)}, got {self.scorer_norm!r}."
+            )
+        if not isinstance(self.scorer_norm_hybrid_threshold, int) or self.scorer_norm_hybrid_threshold <= 0:
+            raise ValueError(
+                f"Double Sparsity 'scorer_norm_hybrid_threshold' must be a positive "
+                f"integer, got {self.scorer_norm_hybrid_threshold!r}."
+            )
+        if self.head_agg not in _ALLOWED_HEAD_AGG:
+            raise ValueError(
+                f"Double Sparsity 'head_agg' must be one of "
+                f"{list(_ALLOWED_HEAD_AGG)}, got {self.head_agg!r}."
+            )
+        if not isinstance(self.anchor_budget, int) or self.anchor_budget < 0:
+            raise ValueError(
+                f"Double Sparsity 'anchor_budget' must be a non-negative integer, "
+                f"got {self.anchor_budget!r}."
             )
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError(
@@ -142,5 +174,10 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         device_buffer_size=int(data.get("device_buffer_size", _DEFAULT_DEVICE_BUFFER_SIZE)),
         signature_dtype=str(data.get("signature_dtype", _DEFAULT_SIGNATURE_DTYPE)),
         scorer_norm=str(data.get("scorer_norm", _DEFAULT_SCORER_NORM)),
+        scorer_norm_hybrid_threshold=int(
+            data.get("scorer_norm_hybrid_threshold", _DEFAULT_HYBRID_THRESHOLD)
+        ),
+        head_agg=str(data.get("head_agg", _DEFAULT_HEAD_AGG)),
+        anchor_budget=int(data.get("anchor_budget", _DEFAULT_ANCHOR_BUDGET)),
         extra=data.get("extra", {}),
     )
