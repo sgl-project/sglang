@@ -64,8 +64,8 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
-from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
