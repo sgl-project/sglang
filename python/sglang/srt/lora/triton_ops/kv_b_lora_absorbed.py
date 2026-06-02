@@ -322,6 +322,7 @@ def _step_b_q_kernel(
     num_segments,
     # meta
     SORTED_BY_ADAPTER: tl.constexpr,
+    N_DIV: tl.constexpr,  # N % BLOCK_N == 0 -> drop safe_n (keep the store coalesced)
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -365,7 +366,10 @@ def _step_b_q_kernel(
     row_mask = s_offset < seg_len
     safe_row = tl.minimum(s_physical, S - 1)
     n_mask = n_offset[None, :] < N
-    safe_n = tl.minimum(n_offset, N - 1)
+    # safe_n only matters when N isn't a BLOCK_N multiple; otherwise the raw affine
+    # index keeps the W load + output store coalesced. Clamping the contiguous
+    # kv_lora_rank axis here is a ~4-5x scatter/gather cliff (forces non-affine addrs).
+    safe_n = n_offset if N_DIV else tl.minimum(n_offset, N - 1)
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):
@@ -463,6 +467,7 @@ def step_b_q_fwd(
         batch_info.scalings,
         num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
+        N_DIV=(kv_lora_rank % _STEP_B_BLOCK_N == 0),
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_B_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
@@ -691,6 +696,7 @@ def _step_b_v_kernel(
     FULL_K: tl.constexpr,  # qk_nope + v_head_dim
     QK_NOPE_OFFSET: tl.constexpr,  # offset of V-half within each head's row block
     SORTED_BY_ADAPTER: tl.constexpr,
+    N_DIV: tl.constexpr,  # N % BLOCK_N == 0 -> drop safe_n (keep the store coalesced)
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -733,7 +739,10 @@ def _step_b_v_kernel(
     row_mask = s_offset < seg_len
     safe_row = tl.minimum(s_physical, S - 1)
     n_mask = n_offset[None, :] < N
-    safe_n = tl.minimum(n_offset, N - 1)
+    # safe_n only matters when N isn't a BLOCK_N multiple; otherwise the raw affine
+    # index keeps the W load + output store coalesced. Clamping the contiguous
+    # v_head_dim axis here is a ~4-5x scatter/gather cliff (forces non-affine addrs).
+    safe_n = n_offset if N_DIV else tl.minimum(n_offset, N - 1)
 
     # V-half row base for this head: h*FULL_K + qk_nope
     head_row_base = head_id * FULL_K + QK_NOPE_OFFSET
@@ -840,6 +849,7 @@ def step_b_v_fwd(
         FULL_K=full_K_per_head,
         QK_NOPE_OFFSET=qk_nope_head_dim,
         SORTED_BY_ADAPTER=sorted_by_adapter,
+        N_DIV=(v_head_dim % _STEP_B_BLOCK_N == 0),
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_B_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
