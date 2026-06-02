@@ -107,6 +107,17 @@ class ServerArgsAutoTuner:
             components = (
                 self._deployment_config().auto_disable_component_offload_components
             )
+            if (
+                "dit" in components
+                and args.num_gpus >= 2
+                and self._can_apply_fsdp_policy(require_memory_headroom=True)
+            ):
+                # Keep DiT offload visible to the later FSDP auto-selection
+                # pass. Multi-GPU FSDP+CFG parallel is preferred over simple
+                # component residency when both are viable.
+                components = tuple(
+                    component for component in components if component != "dit"
+                )
             if args._uses_ltx23_snapshot_two_stage_residency():
                 # ltx2 snapshot mode uses DiT offload to release/prefetch stage DiTs between phases
                 components = tuple(

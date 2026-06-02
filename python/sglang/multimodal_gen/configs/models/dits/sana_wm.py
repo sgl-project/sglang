@@ -53,9 +53,6 @@ class SanaWMArchConfig(DiTArchConfig):
     chunk_gdn_chunk_size: int = 21
     update_rule: str = "torch_chunk"   # main branch update rule
     cam_update_rule: str = "torch_chunk"  # camera branch update rule
-    # main GDN scan backend: "auto" uses the SANA-WM Triton fast path on
-    # supported CUDA inference runs, otherwise falls back to the torch scan.
-    gdn_backend: str = "auto"
 
     # --- Camera conditioning ---
     cam_attn_compress: int = 1        # cam_dim == in_dim
@@ -71,6 +68,10 @@ class SanaWMArchConfig(DiTArchConfig):
     # does not apply a chunk-causal mask there. Keep this disabled by default
     # for checkpoint-output parity; it can be enabled for experiments.
     use_chunked_softmax_attention: bool = False
+    # SANA-WM's released checkpoint uses 112-wide softmax attention heads, which
+    # FlashAttention backends do not accept. Pad to 128 inside SANA-WM attention
+    # by default; users can still disable this with the top-level DiT option.
+    pad_attention_head_dim_to_flash: bool = True
 
     # --- Temporal FFN (GLUMBConvTemp) ---
     ffn_type: str = "GLUMBConvTemp"
@@ -102,3 +103,18 @@ class SanaWMArchConfig(DiTArchConfig):
 class SanaWMConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=SanaWMArchConfig)
     prefix: str = "SanaWM"
+    use_chunked_softmax_attention: bool | None = None
+    pad_attention_head_dim_to_flash: bool | None = None
+
+    def apply_user_flags_to_arch_config(self) -> None:
+        if self.use_chunked_softmax_attention is not None:
+            self.arch_config.use_chunked_softmax_attention = (
+                self.use_chunked_softmax_attention
+            )
+        if self.pad_attention_head_dim_to_flash is not None:
+            self.arch_config.pad_attention_head_dim_to_flash = (
+                self.pad_attention_head_dim_to_flash
+            )
+
+    def __post_init__(self):
+        self.apply_user_flags_to_arch_config()

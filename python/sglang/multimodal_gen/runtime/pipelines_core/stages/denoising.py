@@ -179,11 +179,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cached_num_steps = None
         self._torch_compiled_module_ids: set[int] = set()
 
-        hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
-        num_attention_heads = (
-            self.server_args.pipeline_config.dit_config.num_attention_heads
-        )
-        attn_head_size = hidden_size // num_attention_heads
+        attn_head_size = self._infer_transformer_attention_head_size()
 
         # torch compile
         for transformer in filter(None, [self.transformer, self.transformer_2]):
@@ -207,6 +203,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.profiler = None
         self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
+
+    def _infer_transformer_attention_head_size(self) -> int:
+        dit_config = self.server_args.pipeline_config.dit_config
+        hidden_size = dit_config.hidden_size
+        num_attention_heads = dit_config.num_attention_heads
+        attn_head_size = hidden_size // num_attention_heads
+
+        arch_config = getattr(dit_config, "arch_config", None)
+        if (
+            str(getattr(dit_config, "prefix", "")).lower() == "sanawm"
+            and bool(getattr(arch_config, "pad_attention_head_dim_to_flash", False))
+        ):
+            from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+                _sana_wm_padded_attention_head_size,
+            )
+
+            return _sana_wm_padded_attention_head_size(attn_head_size)
+        return attn_head_size
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
         backends = {

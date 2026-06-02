@@ -52,23 +52,9 @@ SANA_WM_CHI_PROMPT: tuple[str, ...] = (
 
 @dataclass
 class SanaWMPipelineConfig(PipelineConfig):
-    """
-    Pipeline configuration for SANA-WM TI2V world model.
-
-    Supports:
-    - Text + first-frame image → video (TI2V)
-    - Optional 6-DoF camera trajectory conditioning via camera_to_world + intrinsics
-    - Two-stage inference: Stage-1 (SANA-WM DiT) + optional Stage-2 (LTX-2 Refiner)
-    """
 
     task_type: ModelTaskType = ModelTaskType.TI2V
 
-    # SanaWMBeforeDenoisingStage._splice_first_frame handles condition-image
-    # resize + VAE-encode itself, so bypass the framework's generic TI2V
-    # preprocessing in InputValidationStage. Without this, the framework path
-    # reads `vae_config.arch_config.scale_factor_spatial` which LTXVideoVAEArchConfig
-    # does not expose (it uses `spatial_compression_ratio` instead). LTX-2 sets
-    # the same flag for the same reason -- both are TI2V on LTXVideoVAEConfig.
     skip_input_image_preprocess: bool = True
 
     # --- Guidance ---
@@ -95,6 +81,9 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # Load both encoder and decoder (need encoder for first-frame conditioning)
     def __post_init__(self):
+        if hasattr(self.dit_config, "apply_user_flags_to_arch_config"):
+            self.dit_config.apply_user_flags_to_arch_config()
+
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
         self.vae_config.use_tiling = self.vae_tiling
@@ -106,6 +95,10 @@ class SanaWMPipelineConfig(PipelineConfig):
         self.vae_config.blend_num_frames = (
             self.vae_tile_sample_min_num_frames - self.vae_tile_sample_stride_num_frames
         )
+
+    def update_config_from_dict(self, args: dict, prefix: str = "") -> None:
+        super().update_config_from_dict(args, prefix)
+        self.__post_init__()
 
     # --- Text encoder: Gemma-2-2b-it (single encoder, same as SANA T2I) ---
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
@@ -148,6 +141,11 @@ class SanaWMPipelineConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
+            # The SANA-WM DiT is small enough to stay resident on high-memory
+            # GPUs even when the LTX-2 refiner is loaded. Avoid the expensive
+            # post-denoising CPU offload in that case.
+            auto_disable_component_offload_min_available_memory_gb=70,
+            auto_disable_component_offload_components=("dit",),
             # Conservative auto-FSDP gate for the 720p world-model path. Users
             # can still force FSDP explicitly on smaller cards.
             fsdp_auto_min_available_memory_gb=60,
@@ -198,15 +196,6 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # --- Conditioning kwargs for DenoisingStage ---
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        """Build positive conditioning kwargs passed to SanaWMTransformer3DModel.forward.
-
-        The DiT forward signature consumes:
-          * encoder_hidden_states  -- Gemma-2 embeddings (set by DenoisingStage)
-          * timestep               -- diffusion step (set by DenoisingStage)
-          * encoder_attention_mask -- text padding mask
-          * camera_conditions      -- (B, T_lat, 20) latent-frame UCPE raymap
-          * chunk_plucker          -- (B, 48, T_lat, H, W) packed Plücker raymap
-        """
         out = {}
 
         # Text attention mask
@@ -228,12 +217,6 @@ class SanaWMPipelineConfig(PipelineConfig):
         return out
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        """Build negative conditioning kwargs for CFG.
-
-        Camera/plucker are structural video conditions, not text conditions.
-        NVlabs SANA-WM duplicates them for both CFG branches and only swaps
-        text embeddings/masks.
-        """
         out = {}
         m = batch.negative_attention_mask
         if isinstance(m, (list, tuple)):
@@ -255,24 +238,12 @@ class SanaWMPipelineConfig(PipelineConfig):
         return latents
 
     def shard_latents_for_sp(self, batch, latents):
-        # SANA-WM uses frame-wise GDN recurrent scan and a temporal depth-wise
-        # conv (GLUMBConvTemp, t_kernel=3) that both span across frames. Splitting
-        # the latent along T would truncate the GDN hidden state and drop the
-        # GLUMBConvTemp halo at rank boundaries, producing silent wrong outputs.
-        # Camera/Plücker tensors are also indexed in lockstep with T and would
-        # need matching shards. Disable SP until a halo-exchange-aware impl lands.
         return latents, False
 
     def gather_latents_for_sp(self, latents):
         return latents
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        """Invert the LTX-2 latent normalization used before denoising.
-
-        SANA-WM uses the LTX-2 VAE. Upstream encodes as
-        ``(z - latents_mean) * scaling_factor / latents_std`` and decodes by
-        applying the inverse transform.
-        """
         latents_mean = getattr(vae, "latents_mean", None)
         latents_std = getattr(vae, "latents_std", None)
 

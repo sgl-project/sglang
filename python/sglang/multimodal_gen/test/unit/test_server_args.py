@@ -447,6 +447,13 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
+        self.assertEqual(
+            sana_wm_deployment.auto_disable_component_offload_min_available_memory_gb,
+            70,
+        )
+        self.assertEqual(
+            sana_wm_deployment.auto_disable_component_offload_components, ("dit",)
+        )
 
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
@@ -1239,6 +1246,26 @@ class TestPerRoleParallelism(unittest.TestCase):
 class TestPipelineResolutionCliOverride(unittest.TestCase):
     def setUp(self):
         _get_config_info.cache_clear()
+
+    def test_sana_wm_attention_flags_from_cli(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Efficient-Large-Model/SANA-WM_bidirectional",
+            "--dit-config.use-chunked-softmax-attention",
+            "true",
+            "--dit-config.pad-attention-head-dim-to-flash",
+            "true",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        arch = server_args.pipeline_config.dit_config.arch_config
+        self.assertTrue(arch.use_chunked_softmax_attention)
+        self.assertTrue(arch.pad_attention_head_dim_to_flash)
 
     def test_resolution_flag_overrides_qwen_image_layered_pipeline_config(self):
         parser = FlexibleArgumentParser()

@@ -46,6 +46,8 @@ _SANA_WM_DIAGNOSTICS_ENVS = (
     "SGLANG_SANA_WM_DIAGNOSTICS",
     "SGLANG_SANA_WM_LOG_TENSOR_STATS",
 )
+_SANA_WM_DIAGNOSTIC_MAX_EXACT_ELEMENTS = 4_194_304
+_SANA_WM_DIAGNOSTIC_MAX_SAMPLE_ELEMENTS = 65_536
 
 _SANA_WM_DEFAULT_VAE_TILE_MIN_FRAMES = 96
 _SANA_WM_DEFAULT_VAE_TILE_STRIDE_FRAMES = 64
@@ -235,10 +237,20 @@ def log_sana_wm_tensor_stats(label: str, tensor: torch.Tensor | None) -> None:
             )
             return
 
-        stats = data.float()
+        numel = data.numel()
+        sampled = numel > _SANA_WM_DIAGNOSTIC_MAX_EXACT_ELEMENTS
+        sample_stride = 1
+        if sampled:
+            sample_stride = max(
+                1, math.ceil(numel / _SANA_WM_DIAGNOSTIC_MAX_SAMPLE_ELEMENTS)
+            )
+            indices = torch.arange(0, numel, sample_stride, device=data.device)
+            stats = torch.take(data, indices).float()
+        else:
+            stats = data.float().reshape(-1)
         finite = torch.isfinite(stats)
         finite_ratio = float(finite.float().mean().item())
-        finite_stats = stats[finite] if bool(finite.any().item()) else stats.reshape(-1)
+        finite_stats = stats[finite] if bool(finite.any().item()) else stats
         flat = finite_stats.reshape(-1)
         stride = max(1, flat.numel() // 4096)
         fingerprint = float(flat[::stride].sum().item())
@@ -246,7 +258,7 @@ def log_sana_wm_tensor_stats(label: str, tensor: torch.Tensor | None) -> None:
         logger.info(
             "[SANA-WM diagnostics] %s: shape=%s dtype=%s device=%s "
             "finite=%.6f min=%.6g max=%.6g mean=%.6g std=%.6g "
-            "l2=%.6g fingerprint=%.6g",
+            "l2=%.6g fingerprint=%.6g sampled=%s sample_stride=%d sample_size=%d",
             label,
             tuple(data.shape),
             data.dtype,
@@ -258,6 +270,9 @@ def log_sana_wm_tensor_stats(label: str, tensor: torch.Tensor | None) -> None:
             std,
             float(torch.linalg.vector_norm(finite_stats).item()),
             fingerprint,
+            sampled,
+            sample_stride,
+            stats.numel(),
         )
 
 
@@ -653,8 +668,18 @@ class SanaWMDenoisingStage(DenoisingStage):
             raise ValueError("SANA-WM denoising requires prepared timesteps.")
 
         latents = batch.latents.to(device=device, dtype=target_dtype)
-        init_latents = latents.clone()
-        condition_mask = torch.zeros_like(latents)
+        init_condition_latents = latents[:, :, :1].clone()
+        condition_mask = torch.zeros(
+            (
+                latents.shape[0],
+                1,
+                latents.shape[2],
+                latents.shape[3],
+                latents.shape[4],
+            ),
+            device=latents.device,
+            dtype=latents.dtype,
+        )
         condition_mask[:, :, :1] = 1
 
         pos_embeds = _to_device_dtype(
@@ -817,9 +842,7 @@ class SanaWMDenoisingStage(DenoisingStage):
                     -noise_pred.reshape(batch_size, channels, -1).transpose(1, 2),
                     t,
                     latents.reshape(batch_size, channels, -1).transpose(1, 2),
-                    per_token_timesteps=timestep.reshape(batch_size, channels, -1)[
-                        :, 0
-                    ],
+                    per_token_timesteps=timestep.reshape(batch_size, 1, -1)[:, 0],
                     return_dict=False,
                 )[0]
                 denoised_latents = scheduler_output.transpose(1, 2).reshape(
@@ -841,8 +864,14 @@ class SanaWMDenoisingStage(DenoisingStage):
                         f"denoise.step_{step_idx}.latents", latents
                     )
 
+            clear_inference_caches = getattr(
+                transformer, "clear_sana_wm_inference_caches", None
+            )
+            if clear_inference_caches is not None:
+                clear_inference_caches()
+
         log_sana_wm_tensor_stats("denoise.output_latents", latents)
-        unchanged = (latents[:, :, :1] - init_latents[:, :, :1]).abs().max().item()
+        unchanged = (latents[:, :, :1] - init_condition_latents).abs().max().item()
         self.log_info(
             "SANA-WM flow_euler_ltx denoising finished in %.4f seconds; "
             "first_frame_max_delta=%.6g",

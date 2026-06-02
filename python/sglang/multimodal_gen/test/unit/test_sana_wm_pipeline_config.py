@@ -19,12 +19,17 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _downscale_to_reference_rms,
     _gdn_chunk_scan_forward,
     _gdn_scan_forward,
+    GLUMBConvTemp,
     _RMSNorm,
+    _SanaWMPaddedLocalAttention,
+    _make_sana_wm_local_attention,
     _sana_wm_chunk_index_from_chunk_size,
     _sana_wm_chunked_attention,
     _sana_wm_normalize_chunk_index,
+    _sana_wm_padded_attention_head_size,
     _single_path_delta_chunk_scan_forward,
     _single_path_delta_scan_forward,
+    _tensor_cache_key,
     compute_chunk_plucker,
 )
 from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
@@ -138,6 +143,10 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
     def test_get_model_deployment_config_enables_dit_layerwise_offload(self) -> None:
         deployment = self.config.get_model_deployment_config()
         self.assertTrue(deployment.auto_dit_layerwise_offload)
+        self.assertEqual(
+            deployment.auto_disable_component_offload_min_available_memory_gb, 70
+        )
+        self.assertEqual(deployment.auto_disable_component_offload_components, ("dit",))
         self.assertEqual(deployment.fsdp_auto_min_available_memory_gb, 60)
 
     def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
@@ -150,6 +159,29 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
     def test_inference_flow_shift_matches_official_reference(self) -> None:
         self.assertEqual(self.config.flow_shift, 9.95)
         self.assertEqual(self.config.inference_flow_shift, 9.8)
+
+    def test_dit_attention_flags_sync_to_arch_config(self) -> None:
+        dit_config = SanaWMConfig(
+            use_chunked_softmax_attention=True,
+            pad_attention_head_dim_to_flash=True,
+        )
+
+        self.assertTrue(dit_config.arch_config.use_chunked_softmax_attention)
+        self.assertTrue(dit_config.arch_config.pad_attention_head_dim_to_flash)
+
+    def test_pipeline_config_dict_can_enable_dit_attention_flags(self) -> None:
+        self.config.update_pipeline_config(
+            {
+                "dit_config": {
+                    "use_chunked_softmax_attention": True,
+                    "pad_attention_head_dim_to_flash": True,
+                }
+            }
+        )
+        arch = self.config.dit_config.arch_config
+
+        self.assertTrue(arch.use_chunked_softmax_attention)
+        self.assertTrue(arch.pad_attention_head_dim_to_flash)
 
     def test_dit_arch_text_norm_defaults_match_upstream(self) -> None:
         arch = SanaWMConfig().arch_config
@@ -989,6 +1021,14 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         norm = _RMSNorm(4, scale_factor=0.01)
         self.assertTrue(torch.allclose(norm.weight, torch.full((4,), 0.01)))
 
+    def test_tensor_cache_key_accepts_inference_tensors(self) -> None:
+        with torch.inference_mode():
+            tensor = torch.ones(2, 3)
+            key = _tensor_cache_key(tensor)
+
+        self.assertEqual(key[0], (2, 3))
+        self.assertEqual(key[-1], 0)
+
     def test_prepare_timesteps_uses_inference_flow_shift(self) -> None:
         class FakeScheduler:
             def __init__(self):
@@ -1028,6 +1068,20 @@ class TestSanaWMTextEncodingStage(unittest.TestCase):
 
 
 class TestSanaWMDenoisingStage(unittest.TestCase):
+    def test_stage_attention_backend_head_size_uses_sana_wm_padding(self) -> None:
+        stage = object.__new__(SanaWMDenoisingStage)
+        stage.server_args = SimpleNamespace(pipeline_config=SanaWMPipelineConfig())
+
+        self.assertEqual(stage._infer_transformer_attention_head_size(), 128)
+
+        pipeline_config = SanaWMPipelineConfig()
+        pipeline_config.update_pipeline_config(
+            {"dit_config": {"pad_attention_head_dim_to_flash": False}}
+        )
+        stage.server_args = SimpleNamespace(pipeline_config=pipeline_config)
+
+        self.assertEqual(stage._infer_transformer_attention_head_size(), 112)
+
     def test_parallelism_type_follows_cfg_parallel_flag(self) -> None:
         stage = object.__new__(SanaWMDenoisingStage)
 
@@ -1063,16 +1117,167 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
         self.assertTrue(torch.allclose(combined_from_neg_rank, serial))
 
 
+class TestSanaWMOptionalAttentionPadding(unittest.TestCase):
+    def test_attention_head_padding_default_can_be_disabled(self) -> None:
+        self.assertTrue(SanaWMConfig().arch_config.pad_attention_head_dim_to_flash)
+        self.assertFalse(
+            SanaWMConfig(
+                pad_attention_head_dim_to_flash=False
+            ).arch_config.pad_attention_head_dim_to_flash
+        )
+        self.assertEqual(_sana_wm_padded_attention_head_size(112), 128)
+
+        created_attn = []
+
+        class RecordingLocalAttention(torch.nn.Module):
+            def __init__(
+                self,
+                num_heads,
+                head_size,
+                num_kv_heads=None,
+                softmax_scale=None,
+                causal=False,
+                **extra_impl_args,
+            ) -> None:
+                super().__init__()
+                self.num_heads = num_heads
+                self.head_size = head_size
+                self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+                self.softmax_scale = softmax_scale
+                self.backend = "recording"
+                self.dtype = torch.float32
+                created_attn.append(self)
+
+            def forward(self, q, k, v, attn_mask=None):
+                return torch.nn.functional.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.models.dits.sana_wm.LocalAttention",
+            RecordingLocalAttention,
+        ):
+            attn = _make_sana_wm_local_attention(num_heads=2, head_size=112)
+
+        self.assertIsInstance(attn, RecordingLocalAttention)
+        self.assertEqual(created_attn[0].head_size, 112)
+
+    def test_opt_in_padding_preserves_unpadded_attention_result(self) -> None:
+        torch.manual_seed(0)
+        created_attn = []
+
+        class RecordingLocalAttention(torch.nn.Module):
+            def __init__(
+                self,
+                num_heads,
+                head_size,
+                num_kv_heads=None,
+                softmax_scale=None,
+                causal=False,
+                **extra_impl_args,
+            ) -> None:
+                super().__init__()
+                self.num_heads = num_heads
+                self.head_size = head_size
+                self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+                self.softmax_scale = softmax_scale
+                self.backend = "recording"
+                self.dtype = torch.float32
+                self.last_q_shape = None
+                created_attn.append(self)
+
+            def forward(self, q, k, v, attn_mask=None):
+                self.last_q_shape = tuple(q.shape)
+                return torch.nn.functional.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.models.dits.sana_wm.LocalAttention",
+            RecordingLocalAttention,
+        ):
+            attn = _make_sana_wm_local_attention(
+                num_heads=2,
+                head_size=112,
+                pad_head_dim_to_flash=True,
+            )
+            q = torch.randn(1, 5, 2, 112)
+            k = torch.randn(1, 5, 2, 112)
+            v = torch.randn(1, 5, 2, 112)
+            out = attn(q, k, v)
+
+        self.assertIsInstance(attn, _SanaWMPaddedLocalAttention)
+        self.assertEqual(attn.padded_head_size, 128)
+        self.assertEqual(created_attn[0].head_size, 128)
+        self.assertEqual(created_attn[0].last_q_shape, (1, 5, 2, 128))
+        self.assertEqual(tuple(out.shape), tuple(q.shape))
+
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=112**-0.5,
+        ).transpose(1, 2)
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+class TestSanaWMGLUMBConvTemp(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_cuda_channels_last_spatial_path_matches_nchw_path(self) -> None:
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        dtype = torch.float16
+        batch_size, channels = 1, 8
+        hw = (2, 4, 4)
+        tokens = hw[0] * hw[1] * hw[2]
+        module = GLUMBConvTemp(channels, hidden_features=16).to(
+            device=device, dtype=dtype
+        )
+        module.eval()
+        x = torch.randn(batch_size, tokens, channels, device=device, dtype=dtype)
+
+        def nchw_forward() -> torch.Tensor:
+            t, h, w = hw
+            x_sp = (
+                x.reshape(batch_size * t, h, w, channels)
+                .permute(0, 3, 1, 2)
+                .contiguous()
+            )
+            x_sp = module._apply_spatial_autochunked(x_sp)
+            x_t = (
+                x_sp.view(batch_size, t, channels, h * w)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )
+            x_out = x_t + module.t_conv(x_t)
+            return x_out.permute(0, 2, 3, 1).reshape(batch_size, tokens, channels)
+
+        with torch.no_grad():
+            expected = nchw_forward()
+            actual = module(x, hw)
+
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+
 class TestSanaWMNativeDiTChunking(unittest.TestCase):
     def test_softmax_chunking_is_disabled_by_default_for_upstream_parity(self) -> None:
         arch = SanaWMConfig().arch_config
 
         self.assertFalse(arch.use_chunked_softmax_attention)
-
-    def test_main_gdn_backend_defaults_to_auto(self) -> None:
-        arch = SanaWMConfig().arch_config
-
-        self.assertEqual(arch.gdn_backend, "auto")
 
     def test_first_chunk_plus_one_chunk_indices_match_upstream(self) -> None:
         self.assertEqual(

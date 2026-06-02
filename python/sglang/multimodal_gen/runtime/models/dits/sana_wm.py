@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -18,44 +19,30 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_SANA_WM_TRITON_GDN_DISABLED_REASON: Optional[str] = None
-_SANA_WM_TRITON_GDN_FALLBACK_LOGGED = False
-_SANA_WM_TRITON_CAM_GDN_DISABLED_REASON: Optional[str] = None
-_SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED = False
+_SANA_WM_FLASH_ATTN_HEAD_SIZES = (32, 64, 96, 128, 160, 192, 224, 256)
+_SANA_WM_DISABLE_FUSED_RMSNORM = os.getenv(
+    "SGLANG_SANA_WM_DISABLE_FUSED_RMSNORM", ""
+).lower() in {"1", "true", "yes", "on"} or os.getenv(
+    "SGLANG_ENABLE_DETERMINISTIC_INFERENCE", ""
+).lower() in {"1", "true", "yes", "on"}
 
 
 def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
+    try:
+        version = int(tensor._version)
+    except RuntimeError:
+        # Inference-mode tensors do not track version counters. The cache users
+        # here only memoize immutable inference inputs/weights, so shape/stride/
+        # device/dtype/data_ptr is sufficient for that path.
+        version = 0
     return (
         tuple(tensor.shape),
         tuple(tensor.stride()),
         str(tensor.device),
         tensor.dtype,
         tensor.data_ptr(),
-        int(getattr(tensor, "_version", 0)),
+        version,
     )
-
-
-def _log_sana_wm_triton_gdn_fallback(reason: str) -> None:
-    global _SANA_WM_TRITON_GDN_FALLBACK_LOGGED
-    if not _SANA_WM_TRITON_GDN_FALLBACK_LOGGED:
-        logger.warning(
-            "SANA-WM Triton GDN fast path is unavailable; falling back to torch "
-            "GDN scan. reason=%s",
-            reason,
-        )
-        _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = True
-
-
-def _log_sana_wm_triton_cam_gdn_fallback(reason: str) -> None:
-    global _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED
-    if not _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED:
-        logger.warning(
-            "SANA-WM Triton camera GDN fast path is unavailable; falling back "
-            "to torch camera scan. reason=%s",
-            reason,
-        )
-        _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED = True
-
 
 # ---------------------------------------------------------------------------
 # Small primitives (RMSNorm, ShortConvolution) -- shapes match upstream
@@ -80,6 +67,18 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim) * scale_factor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Avoid materializing full-size fp32 intermediates on the large SANA-WM
+        # hidden states. The fallback below is kept for deterministic inference
+        # and for dtype/platform combinations without a fused torch RMSNorm path.
+        if (
+            not _SANA_WM_DISABLE_FUSED_RMSNORM
+            and x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and self.weight.dtype == x.dtype
+            and x.shape[-1] == self.weight.shape[0]
+        ):
+            return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
+
         # Upstream Sana RMSNorm does both normalization and weight multiply in
         # fp32 before casting back to the input dtype.
         x_in = x
@@ -89,14 +88,6 @@ class _RMSNorm(nn.Module):
 
 
 class _ShortConvolution(nn.Module):
-    """Depth-wise causal Conv1d along the temporal axis.
-
-    Mirrors FLA's ``ShortConvolution(hidden_size, kernel_size=K)``:
-      * weight shape: ``(hidden_size, 1, K)`` (groups=hidden_size)
-
-    Input is ``(B, T, C)``.  Causal padding of ``K-1`` on the left.
-    """
-
     def __init__(self, hidden_size: int, kernel_size: int) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -119,10 +110,6 @@ def _bidirectional_short_conv(
     x: torch.Tensor,  # (B*S, T, C)
     conv: _ShortConvolution,
 ) -> torch.Tensor:
-    """Forward + backward causal pass with shared kernel, minus the shared
-    center tap.  Equivalent to a symmetric (non-causal) filter, matching
-    upstream's ``BidirectionalGDN._bidirectional_causal_conv_1d``.
-    """
     y_fwd, _ = conv(x)
     y_bwd, _ = conv(x.flip(1))
     y_bwd = y_bwd.flip(1)
@@ -389,6 +376,85 @@ def _sana_wm_sdpa(
     return out.transpose(1, 2).to(dtype_orig)
 
 
+def _sana_wm_padded_attention_head_size(head_size: int) -> int:
+    if head_size in _SANA_WM_FLASH_ATTN_HEAD_SIZES:
+        return head_size
+    for supported_head_size in _SANA_WM_FLASH_ATTN_HEAD_SIZES:
+        if head_size < supported_head_size:
+            return supported_head_size
+    return head_size
+
+
+class _SanaWMPaddedLocalAttention(nn.Module):
+    """Opt-in SANA-WM attention-head padding for FlashAttention experiments.
+
+    Padding Q/K/V from head_dim=112 to 128 leaves logits unchanged when the
+    original softmax scale is kept, then slices away the padded output channels.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        num_kv_heads: int | None = None,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+        **extra_impl_args,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.padded_head_size = _sana_wm_padded_attention_head_size(head_size)
+        self.pad_size = self.padded_head_size - self.head_size
+        self.softmax_scale = head_size**-0.5 if softmax_scale is None else softmax_scale
+
+        self.attn = LocalAttention(
+            num_heads=num_heads,
+            head_size=self.padded_head_size,
+            num_kv_heads=num_kv_heads,
+            softmax_scale=self.softmax_scale,
+            causal=causal,
+            **extra_impl_args,
+        )
+        self.num_kv_heads = self.attn.num_kv_heads
+        self.backend = self.attn.backend
+        self.dtype = self.attn.dtype
+
+    def _pad_head_dim(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.pad_size <= 0:
+            return tensor
+        return F.pad(tensor, (0, self.pad_size))
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.pad_size <= 0 or attn_mask is not None:
+            return self.attn(q, k, v, attn_mask=attn_mask)
+
+        out = self.attn(
+            self._pad_head_dim(q),
+            self._pad_head_dim(k),
+            self._pad_head_dim(v),
+            attn_mask=attn_mask,
+        )
+        return out[..., : self.head_size]
+
+
+def _make_sana_wm_local_attention(
+    *,
+    num_heads: int,
+    head_size: int,
+    pad_head_dim_to_flash: bool = False,
+    **kwargs,
+) -> nn.Module:
+    attn_cls = _SanaWMPaddedLocalAttention if pad_head_dim_to_flash else LocalAttention
+    return attn_cls(num_heads=num_heads, head_size=head_size, **kwargs)
+
+
 def _sana_wm_chunked_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -620,19 +686,6 @@ def compute_chunk_plucker(
     vae_temporal_stride: int = 8,
     patch_size: Tuple[int, int, int] = (1, 1, 1),
 ) -> torch.Tensor:
-    """Compute the 48-channel packed Plücker raymap consumed by
-    ``plucker_embedder``.
-
-    Official SANA-WM centers each chunk on the latent-frame timestamp:
-    ``0, stride, 2*stride, ...``. For timestamp 0 the chunk is clamped to the
-    first ``stride`` frames; for later timestamps it uses the preceding
-    ``stride - 1`` frames plus the current frame. Short tail chunks are padded
-    by repeating the final available frame.
-
-    Each latent frame packs ``vae_temporal_stride`` original-frame Plücker
-    coords ``[d, o x d]`` (6D each) into 48 channels. Output shape is
-    ``(B, 48, T, H, W)`` for direct consumption by Conv3d.
-    """
     B, F_orig, _ = camera_conditions.shape
     T, H, W = HW
     device = camera_conditions.device
@@ -813,11 +866,6 @@ class T2IFinalLayer(nn.Module):
         return self.linear(x)
 
 
-# ---------------------------------------------------------------------------
-# Timestep embedder (upstream sana_blocks.TimestepEmbedder, key names
-# ``t_embedder.mlp.0/2.{weight,bias}``)
-# ---------------------------------------------------------------------------
-
 
 def _sinusoidal_timestep_embedding(
     t: torch.Tensor, dim: int, max_period: float = 10000.0
@@ -853,19 +901,6 @@ class TimestepEmbedder(nn.Module):
         # use the dtype of the first linear's weight to match upstream
         return self.mlp(t_freq.to(self.mlp[0].weight.dtype))
 
-
-# ---------------------------------------------------------------------------
-# GLUMBConvTemp -- upstream basic_modules.GLUMBConvTemp.
-#
-# Stored sub-modules (all referenced by their checkpoint key prefix):
-#   * inverted_conv.conv      Conv2d(in, hidden*2, 1)
-#   * depth_conv.conv         Conv2d(hidden*2, hidden*2, 3, groups=hidden*2)
-#   * point_conv.conv         Conv2d(hidden, out, 1, bias=False)
-#   * t_conv                  Conv2d(out, out, kernel=(t_k, 1), padding=(t_pad, 0), bias=False)
-#
-# Upstream wraps each Conv2d in a ``ConvLayer`` that owns the conv as
-# ``.conv``; that's why the key has the extra ``.conv`` segment.
-# ---------------------------------------------------------------------------
 
 _INT32_SAFE_CONV_ELEMENTS = 1 << 30
 
@@ -959,23 +994,25 @@ class GLUMBConvTemp(nn.Module):
         assert N == T * H * W, f"GLUMBConvTemp: N={N} != T*H*W={T * H * W}"
 
         # Spatial path -- (B*T, C, H, W)
-        x_sp = x.reshape(B * T, H, W, C).permute(0, 3, 1, 2).contiguous()
+        memory_format = (
+            torch.channels_last
+            if x.device.type == "cuda" and x.dtype in (torch.float16, torch.bfloat16)
+            else torch.contiguous_format
+        )
+        x_sp = (
+            x.reshape(B * T, H, W, C)
+            .permute(0, 3, 1, 2)
+            .contiguous(memory_format=memory_format)
+        )
         x_sp = self._apply_spatial_autochunked(x_sp)  # (B*T, C, H, W)
 
         # Temporal additive path -- (B, C, T, S=H*W)
+        x_sp = x_sp.contiguous()
         x_t = x_sp.view(B, T, C, H * W).permute(0, 2, 1, 3).contiguous()
         x_out = x_t + self.t_conv(x_t)
 
         # back to (B, N, C)
         return x_out.permute(0, 2, 3, 1).reshape(B, N, C)
-
-
-# ---------------------------------------------------------------------------
-# Frame-gate and DeltaNet update rule (torch port of upstream
-# torch_chunk_sana_gdn / torch_recurrent_sana_gdn).  Inference path uses
-# the recurrent form for simplicity and clarity; chunk-parallel form is
-# numerically equivalent.
-# ---------------------------------------------------------------------------
 
 
 def _compute_frame_gates(
@@ -1165,9 +1202,6 @@ def _gdn_chunk_scan_forward(
 
 
 def _flip_and_shift(x: torch.Tensor, dim: int, shift_val: float = 0.0) -> torch.Tensor:
-    """``flip_and_shift`` helper from upstream: flip along ``dim`` then shift
-    by one with ``shift_val`` filling the head.  Used for the backward pass
-    of bidirectional GDN."""
     x_flipped = x.flip(dim)
     idx = [slice(None)] * x.ndim
     idx[dim] = slice(0, 1)
@@ -1188,10 +1222,6 @@ def _gdn_scan_bidirectional(
     chunk_size: Optional[int] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Bidirectional GDN: forward (inclusive) + backward (exclusive) scan,
-    summed in numerator/denominator space (mirrors upstream
-    ``BidirectionalGDN.forward``).
-    """
     def run_scan(
         q_in: torch.Tensor,
         k_in: torch.Tensor,
@@ -1286,14 +1316,6 @@ def _single_path_delta_scan_forward(
     beta: torch.Tensor,
     decay: torch.Tensor,
 ) -> torch.Tensor:
-    """Numerator-only camera delta-rule recurrence from SANA-WM upstream.
-
-    This is intentionally separate from ``_gdn_scan_forward``. The
-    SANA-WM camera branch in ``BidirectionalGDNUCPESinglePathLiteLA`` does not
-    use the GDN denominator path; using the main-branch GDN recurrence here
-    changes the latent distribution substantially once camera conditioning is
-    enabled.
-    """
     B, H, D, N = q_rot.shape
     T = beta.shape[2]
     S = N // T
@@ -1405,12 +1427,6 @@ def _single_path_delta_scan_bidirectional(
     HW: Tuple[int, int, int],
     chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Bidirectional single-path camera scan.
-
-    Mirrors upstream ``BidirectionalGDNUCPESinglePathLiteLA``: inclusive
-    forward scan plus exclusive backward scan with ``flip_and_shift`` on K/V,
-    beta, and decay.
-    """
     scan_forward = (
         _single_path_delta_chunk_scan_forward
         if chunk_size is not None
@@ -1470,13 +1486,6 @@ def _downscale_to_reference_rms(
     transformed: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Clamp UCPE-transformed channel RMS to the pre-transform envelope.
-
-    SANA-WM's released checkpoint uses the PostUCPERenorm camera variant.
-    The UCPE matrices include translations that can inflate transformed Q/K/V
-    magnitudes; upstream downscales per (batch, head, token) before the camera
-    recurrence so inference stays on the training distribution.
-    """
     ref_rms = ref.square().mean(dim=2, keepdim=True).add(eps).sqrt()
     transformed_rms = transformed.square().mean(dim=2, keepdim=True).add(eps).sqrt()
     scale = (ref_rms / transformed_rms.clamp_min(eps)).clamp(max=1.0)
@@ -1491,13 +1500,6 @@ def _downscale_to_reference_rms(
 
 
 class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
-    """Bidirectional GDN main branch + UCPE camera branch (single-path
-    output: ``main + out_proj_cam(cam_raw)`` then shared output gate +
-    shared output projection).
-
-    Parameter naming follows upstream exactly so the checkpoint loads.
-    """
-
     def __init__(
         self,
         in_dim: int,
@@ -1512,7 +1514,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         cam_update_rule: str = "torch_chunk",
         chunk_gdn_chunk_size: int = 21,
         use_chunked_softmax_attention: bool = False,
-        gdn_backend: str = "auto",
+        pad_attention_head_dim_to_flash: bool = False,
     ) -> None:
         super().__init__()
         out_dim = heads * head_dim
@@ -1529,17 +1531,11 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.cam_update_rule = cam_update_rule
         self.chunk_gdn_chunk_size = chunk_gdn_chunk_size
         self.use_chunked_softmax_attention = use_chunked_softmax_attention
-        self.gdn_backend = gdn_backend
         if self.update_rule not in ("torch_chunk", "torch_recurrent"):
             raise ValueError(f"Unsupported SANA-WM update_rule: {self.update_rule}")
         if self.cam_update_rule not in ("torch_chunk", "torch_recurrent"):
             raise ValueError(
                 f"Unsupported SANA-WM cam_update_rule: {self.cam_update_rule}"
-            )
-        if self.gdn_backend not in ("auto", "torch", "triton"):
-            raise ValueError(
-                "Unsupported SANA-WM gdn_backend: "
-                f"{self.gdn_backend}. Expected one of auto, torch, triton."
             )
 
         # Main branch: fused QKV + output proj (shared with cam branch)
@@ -1565,13 +1561,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.register_buffer("recall_gate", torch.zeros(1))
         self.output_gate = nn.Linear(in_dim, out_dim, bias=True)
 
-        # Short convs on K (k_conv_only=True). The upstream softmax variant
-        # ``BidirectionalSoftmaxUCPESinglePathLiteLA`` does NOT carry these
-        # short convs in either the main or the cam branch, so the released
-        # checkpoint has no conv_k/conv_k_cam tensors for softmax blocks
-        # (indices {3, 7, 11, 15, 19} when softmax_every_n=4). Creating them
-        # here would leave the loader staring at missing checkpoint keys it
-        # cannot synthesize. Skip creation when softmax_main=True.
         if conv_kernel_size > 0 and not softmax_main:
             self.conv_k = _ShortConvolution(out_dim, conv_kernel_size)
             if not k_conv_only:
@@ -1585,8 +1574,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.conv_kernel_size = conv_kernel_size
         self.k_conv_only = k_conv_only
 
-        # Camera branch -- separate QKV + zero-init output proj, plus a
-        # separate ShortConvolution for K.  Both branches share ``proj``.
         self.q_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
         self.k_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
         self.v_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
@@ -1604,21 +1591,12 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         else:
             self.conv_k_cam = self.conv_q_cam = self.conv_v_cam = None
 
-        # Softmax-variant blocks (every Nth block, controlled by softmax_main)
-        # route attention through SGLang's pluggable backend (FA3 / FlashInfer /
-        # Triton / SDPA). GDN blocks compute attention via _gdn_scan_bidirectional
-        # and don't go through this path.
         if softmax_main:
-            self.softmax_attn = LocalAttention(
+            self.softmax_attn = _make_sana_wm_local_attention(
                 num_heads=heads,
                 head_size=head_dim,
+                pad_head_dim_to_flash=pad_attention_head_dim_to_flash,
             )
-        self._triton_rope_tables_cache: Optional[
-            Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
-        ] = None
-        self._triton_norm_weights_cache: Optional[
-            Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
-        ] = None
         self._cam_qkv_params_cache: Optional[
             Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
         ] = None
@@ -1680,264 +1658,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         qkv_weight, qkv_bias = self._get_cam_qkv_params()
         return F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
 
-    # ------------------------------------------------------------------ #
-
-    def _triton_gdn_unavailable_reason(
-        self,
-        qkv: torch.Tensor,
-        beta: torch.Tensor,
-        decay: torch.Tensor,
-        HW: Tuple[int, int, int],
-    ) -> Optional[str]:
-        if self.gdn_backend == "torch":
-            return "gdn_backend=torch"
-        if _SANA_WM_TRITON_GDN_DISABLED_REASON is not None:
-            return _SANA_WM_TRITON_GDN_DISABLED_REASON
-        if self.training or torch.is_grad_enabled():
-            return "requires eval/inference mode"
-        if not qkv.is_cuda:
-            return "requires CUDA tensor"
-        if qkv.dtype not in (torch.float16, torch.bfloat16):
-            return f"requires fp16/bf16 qkv, got {qkv.dtype}"
-        if not qkv.is_contiguous():
-            return "qkv must be contiguous"
-        if beta.ndim != 4:
-            return f"requires beta shape (B, H, T, S), got {tuple(beta.shape)}"
-
-        B, N, three, heads, head_dim = qkv.shape
-        T, H_sp, W_sp = HW
-        S = H_sp * W_sp
-        if three != 3:
-            return f"requires qkv third dim=3, got {three}"
-        if N != T * S:
-            return f"requires N=T*S, got N={N}, T*S={T * S}"
-        if head_dim > 128:
-            return f"requires head_dim <= 128, got {head_dim}"
-        if beta.shape != (B, heads, T, S):
-            return f"requires beta shape {(B, heads, T, S)}, got {tuple(beta.shape)}"
-        if decay.shape != (B, heads, T):
-            return f"requires decay shape {(B, heads, T)}, got {tuple(decay.shape)}"
-        if not hasattr(self.q_norm, "weight") or not hasattr(self.k_norm, "weight"):
-            return "requires learned q/k RMSNorm weights"
-        return None
-
-    def _get_triton_norm_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        q_weight = self.q_norm.weight
-        k_weight = self.k_norm.weight
-        key = (
-            "triton_norm_weights",
-            _tensor_cache_key(q_weight),
-            _tensor_cache_key(k_weight),
-        )
-        cached = self._triton_norm_weights_cache
-        if cached is not None and cached[0] == key:
-            return cached[1]
-
-        weights = (
-            q_weight.float().contiguous(),
-            k_weight.float().contiguous(),
-        )
-        self._triton_norm_weights_cache = (key, weights)
-        return weights
-
-    def _get_triton_rope_tables(
-        self,
-        prepare_rope_tables: Callable,
-        rotary_emb: Optional[torch.Tensor],
-        *,
-        N: int,
-        head_dim: int,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        key = (
-            "triton_rope_tables",
-            N,
-            head_dim,
-            str(device),
-            None if rotary_emb is None else _tensor_cache_key(rotary_emb),
-        )
-        cached = self._triton_rope_tables_cache
-        if cached is not None and cached[0] == key:
-            return cached[1]
-
-        tables = prepare_rope_tables(rotary_emb, N, head_dim, device)
-        self._triton_rope_tables_cache = (key, tables)
-        return tables
-
-    def _maybe_main_branch_triton_gdn(
-        self,
-        qkv: torch.Tensor,
-        beta: torch.Tensor,
-        decay: torch.Tensor,
-        HW: Tuple[int, int, int],
-        rotary_emb: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        global _SANA_WM_TRITON_GDN_DISABLED_REASON
-
-        reason = self._triton_gdn_unavailable_reason(qkv, beta, decay, HW)
-        if reason is not None:
-            if self.gdn_backend == "triton":
-                raise RuntimeError(f"SANA-WM Triton GDN backend unavailable: {reason}")
-            return None
-
-        try:
-            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
-                fused_bigdn_func,
-                fused_qk_inv_rms,
-                prepare_rope_tables,
-            )
-
-            B, N, _, heads, head_dim = qkv.shape
-            T, H_sp, W_sp = HW
-            S = H_sp * W_sp
-            q_norm_weight, k_norm_weight = self._get_triton_norm_weights()
-            norm_eps = float(getattr(self.q_norm, "eps", 1e-5))
-            q_inv_rms, k_inv_rms = fused_qk_inv_rms(qkv, eps=norm_eps)
-            rope_cos, rope_sin = self._get_triton_rope_tables(
-                prepare_rope_tables,
-                rotary_emb,
-                N=N,
-                head_dim=head_dim,
-                device=qkv.device,
-            )
-            out = fused_bigdn_func(
-                qkv,
-                q_inv_rms,
-                k_inv_rms,
-                q_norm_weight=q_norm_weight,
-                k_norm_weight=k_norm_weight,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                beta=beta.contiguous(),
-                decay=decay.contiguous(),
-                F=T,
-                S=S,
-                k_scale=(head_dim**-0.5) * (S**-0.5),
-                eps=self.eps,
-            )
-            return out.reshape(B, N, heads * head_dim)
-        except Exception as exc:
-            if self.gdn_backend == "triton":
-                raise
-            _SANA_WM_TRITON_GDN_DISABLED_REASON = str(exc)
-            _log_sana_wm_triton_gdn_fallback(str(exc))
-            return None
-
-    # ------------------------------------------------------------------ #
-
-    def _triton_cam_gdn_unavailable_reason(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        beta: torch.Tensor,
-        decay: torch.Tensor,
-        HW: Tuple[int, int, int],
-    ) -> Optional[str]:
-        if self.gdn_backend == "torch":
-            return "gdn_backend=torch"
-        if _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
-            return _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
-        if self.training or torch.is_grad_enabled():
-            return "requires eval/inference mode"
-        if not q.is_cuda:
-            return "requires CUDA tensor"
-        if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
-            return f"requires fp32 q/k/v, got {q.dtype}/{k.dtype}/{v.dtype}"
-        if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-            return "q/k/v must be contiguous"
-        if beta.ndim not in (3, 4):
-            return f"requires beta rank 3 or 4, got {tuple(beta.shape)}"
-
-        B, heads, head_dim, N = q.shape
-        T, H_sp, W_sp = HW
-        S = H_sp * W_sp
-        if k.shape != q.shape or v.shape != q.shape:
-            return f"q/k/v shape mismatch: {q.shape}/{k.shape}/{v.shape}"
-        if N != T * S:
-            return f"requires N=T*S, got N={N}, T*S={T * S}"
-        if beta.ndim == 3 and beta.shape != (B, heads, T):
-            return f"requires beta shape {(B, heads, T)}, got {tuple(beta.shape)}"
-        if beta.ndim == 4 and beta.shape != (B, heads, T, S):
-            return (
-                f"requires beta shape {(B, heads, T, S)}, "
-                f"got {tuple(beta.shape)}"
-            )
-        if decay.shape != (B, heads, T):
-            return f"requires decay shape {(B, heads, T)}, got {tuple(decay.shape)}"
-        if head_dim > 128:
-            return f"requires head_dim <= 128, got {head_dim}"
-        return None
-
-    def _maybe_cam_branch_triton_scan(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        beta: torch.Tensor,
-        decay: torch.Tensor,
-        HW: Tuple[int, int, int],
-    ) -> Optional[torch.Tensor]:
-        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
-
-        precheck_reason = None
-        if self.gdn_backend == "torch":
-            precheck_reason = "gdn_backend=torch"
-        elif _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
-            precheck_reason = _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
-        elif self.training or torch.is_grad_enabled():
-            precheck_reason = "requires eval/inference mode"
-        elif not q.is_cuda:
-            precheck_reason = "requires CUDA tensor"
-
-        if precheck_reason is not None:
-            if self.gdn_backend == "triton":
-                raise RuntimeError(
-                    "SANA-WM Triton camera GDN backend unavailable: "
-                    f"{precheck_reason}"
-                )
-            return None
-
-        q = q.float().contiguous()
-        k = k.float().contiguous()
-        v = v.float().contiguous()
-        reason = self._triton_cam_gdn_unavailable_reason(q, k, v, beta, decay, HW)
-        if reason is not None:
-            if self.gdn_backend == "triton":
-                raise RuntimeError(
-                    f"SANA-WM Triton camera GDN backend unavailable: {reason}"
-                )
-            return None
-
-        try:
-            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn_chunkwise import (
-                cam_scan_bidi_chunkwise,
-            )
-
-            B, heads, _, _ = q.shape
-            T, H_sp, W_sp = HW
-            S = H_sp * W_sp
-            if beta.ndim == 3:
-                beta_in = beta.unsqueeze(-1).expand(B, heads, T, S).contiguous()
-            else:
-                beta_in = beta.contiguous()
-            out = cam_scan_bidi_chunkwise(
-                q,
-                k,
-                v,
-                beta_in.float(),
-                decay.float().contiguous(),
-            )
-            return out
-        except Exception as exc:
-            if self.gdn_backend == "triton":
-                raise
-            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
-            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
-            return None
-
-    # ------------------------------------------------------------------ #
-
     def _main_branch_gdn(
         self,
         x: torch.Tensor,
@@ -1971,16 +1691,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             self.dt_bias,
             self.A_log,
         )
-
-        triton_out = self._maybe_main_branch_triton_gdn(
-            qkv,
-            beta,
-            decay,
-            HW,
-            rotary_emb,
-        )
-        if triton_out is not None:
-            return triton_out, beta, decay
 
         q, k, v = qkv.unbind(2)
 
@@ -2135,8 +1845,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v_bhnd = v.permute(0, 2, 1, 3)
 
         q_proj = apply_q(q_bhnd)
-        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
-        k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
+        k_proj = apply_kv(k_bhnd)
+        v_proj = apply_kv(v_bhnd)
 
         q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         q_dn = q_proj.permute(0, 1, 3, 2)
@@ -2163,27 +1873,26 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             beta = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
 
         dtype = q_dn.dtype
-        out = self._maybe_cam_branch_triton_scan(q_dn, k_dn, v_dn, beta, decay, HW)
-        if out is None:
-            scan_chunk_size = (
-                self.chunk_gdn_chunk_size
-                if self.cam_update_rule == "torch_chunk"
-                else None
-            )
-            out = _single_path_delta_scan_bidirectional(
-                q_dn.float(),
-                k_dn.float(),
-                v_dn.float(),
-                beta.float(),
-                decay.float(),
-                HW=HW,
-                chunk_size=scan_chunk_size,
-            )
-        out = out.to(dtype)
+        scan_chunk_size = (
+            self.chunk_gdn_chunk_size
+            if self.cam_update_rule == "torch_chunk"
+            else None
+        )
+        out = _single_path_delta_scan_bidirectional(
+            q_dn.float(),
+            k_dn.float(),
+            v_dn.float(),
+            beta.float(),
+            decay.float(),
+            HW=HW,
+            chunk_size=scan_chunk_size,
+        )
+        out_bhnd = out.to(dtype).permute(0, 1, 3, 2)
+
         # apply inverse UCPE projection on output
-        out_bhnd = out.permute(0, 1, 3, 2)
         out_bhnd = apply_o(out_bhnd)
-        return out_bhnd.permute(0, 2, 1, 3).reshape(B, N, C)
+        out = out_bhnd.permute(0, 2, 1, 3).reshape(B, N, C)
+        return out
 
     def _cam_branch_softmax(
         self,
@@ -2217,8 +1926,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v_bhnd = v.permute(0, 2, 1, 3)
 
         q_proj = apply_q(q_bhnd)
-        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
-        k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
+        k_proj = apply_kv(k_bhnd)
+        v_proj = apply_kv(v_bhnd)
 
         q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
         k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
@@ -2298,17 +2007,18 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         # the SiLU gate in fp32 and multiplies before casting for proj.
         gate = F.silu(self.output_gate(x).to(torch.float32))
         combined = combined * gate
-        return self.proj(combined.to(self.proj.weight.dtype))
-
-
-# ---------------------------------------------------------------------------
-# Cross-attention (text conditioning) -- upstream MultiHeadCrossAttention,
-# stored as ``cross_attn.{q_linear, kv_linear, proj, q_norm, k_norm}``.
-# ---------------------------------------------------------------------------
+        out = self.proj(combined.to(self.proj.weight.dtype))
+        return out
 
 
 class MultiHeadCrossAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, qk_norm: bool = True) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        qk_norm: bool = True,
+        pad_attention_head_dim_to_flash: bool = False,
+    ) -> None:
         super().__init__()
         assert d_model % num_heads == 0
         self.d_model = d_model
@@ -2327,9 +2037,10 @@ class MultiHeadCrossAttention(nn.Module):
         # Cross-attention dispatched through SGLang's pluggable backend.
         # The padding-mask path falls back to SDPA internally; the unmasked
         # path can pick FA3 / FlashInfer / etc.
-        self.attn = LocalAttention(
+        self.attn = _make_sana_wm_local_attention(
             num_heads=num_heads,
             head_size=self.head_dim,
+            pad_head_dim_to_flash=pad_attention_head_dim_to_flash,
         )
 
     def forward(
@@ -2381,7 +2092,7 @@ class SanaWMBlock(nn.Module):
         cam_update_rule: str = "torch_chunk",
         chunk_gdn_chunk_size: int = 21,
         use_chunked_softmax_attention: bool = False,
-        gdn_backend: str = "auto",
+        pad_attention_head_dim_to_flash: bool = False,
     ) -> None:
         super().__init__()
         self.softmax_main = softmax_main
@@ -2403,13 +2114,14 @@ class SanaWMBlock(nn.Module):
             cam_update_rule=cam_update_rule,
             chunk_gdn_chunk_size=chunk_gdn_chunk_size,
             use_chunked_softmax_attention=use_chunked_softmax_attention,
-            gdn_backend=gdn_backend,
+            pad_attention_head_dim_to_flash=pad_attention_head_dim_to_flash,
         )
 
         self.cross_attn = MultiHeadCrossAttention(
             d_model=hidden_size,
             num_heads=num_heads,
             qk_norm=cross_norm,
+            pad_attention_head_dim_to_flash=pad_attention_head_dim_to_flash,
         )
 
         self.mlp = GLUMBConvTemp(
@@ -2550,6 +2262,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     def __init__(self, config: SanaWMConfig, hf_config=None, **kwargs) -> None:
         super().__init__(config, hf_config=hf_config or {}, **kwargs)
+        if hasattr(config, "apply_user_flags_to_arch_config"):
+            config.apply_user_flags_to_arch_config()
         arch = config.arch_config
 
         self.patch_size = (arch.patch_size_t, arch.patch_size, arch.patch_size)
@@ -2617,6 +2331,17 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.use_chunk_plucker_input = arch.use_chunk_plucker_input
         self.chunk_size = getattr(arch, "chunk_size", None)
         self.chunk_split_strategy = getattr(arch, "chunk_split_strategy", "uniform")
+        self.use_chunked_softmax_attention = bool(
+            getattr(arch, "use_chunked_softmax_attention", False)
+        )
+        self.pad_attention_head_dim_to_flash = bool(
+            getattr(arch, "pad_attention_head_dim_to_flash", False)
+        )
+        effective_softmax_head_dim = (
+            _sana_wm_padded_attention_head_size(arch.linear_head_dim)
+            if self.pad_attention_head_dim_to_flash
+            else arch.linear_head_dim
+        )
 
         # --- RoPE ---
         self.rope = WanRotaryPosEmbed(
@@ -2634,6 +2359,19 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if arch.softmax_every_n > 0 and (i + 1) % arch.softmax_every_n == 0
         )
         self.softmax_block_indices = tuple(sorted(softmax_idx))
+        logger.info(
+            "SANA-WM attention config: use_chunked_softmax_attention=%s, "
+            "pad_attention_head_dim_to_flash=%s, attention_head_dim=%d, "
+            "effective_softmax_head_dim=%d, softmax_blocks=%s, chunk_size=%s, "
+            "chunk_split_strategy=%s",
+            self.use_chunked_softmax_attention,
+            self.pad_attention_head_dim_to_flash,
+            arch.linear_head_dim,
+            effective_softmax_head_dim,
+            self.softmax_block_indices,
+            self.chunk_size,
+            self.chunk_split_strategy,
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -2660,15 +2398,12 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     update_rule=getattr(arch, "update_rule", "torch_chunk"),
                     cam_update_rule=getattr(arch, "cam_update_rule", "torch_chunk"),
                     chunk_gdn_chunk_size=getattr(arch, "chunk_gdn_chunk_size", 21),
-                    use_chunked_softmax_attention=getattr(
-                        arch, "use_chunked_softmax_attention", False
-                    ),
-                    gdn_backend=getattr(arch, "gdn_backend", "auto"),
+                    use_chunked_softmax_attention=self.use_chunked_softmax_attention,
+                    pad_attention_head_dim_to_flash=self.pad_attention_head_dim_to_flash,
                 )
                 for i in range(depth)
             ]
         )
-
         self.final_layer = T2IFinalLayer(
             self.inner_dim, self.patch_size, self.out_channels
         )
@@ -2698,6 +2433,10 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
+
+    def clear_sana_wm_inference_caches(self) -> None:
+        self._ucpe_apply_fns_cache = None
+        self._plucker_emb_cache = None
 
     def _get_freqs(self, T: int, H: int, W: int, device: torch.device) -> torch.Tensor:
         key = (T, H, W, str(device))
