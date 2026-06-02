@@ -60,6 +60,37 @@ _SANA_WM_ALLOWED_ACTION_KEYS: frozenset[str] = frozenset("wasdijkl")
 _SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY = "sana_wm_condition_image_preprocess"
 
 
+def _sana_wm_effective_guidance_scale(batch: Req) -> float:
+    cfg_scale = getattr(batch, "true_cfg_scale", None)
+    if cfg_scale is None:
+        cfg_scale = getattr(batch, "guidance_scale", 1.0)
+    if cfg_scale is None:
+        return 1.0
+    return float(cfg_scale)
+
+
+def _sana_wm_has_negative_condition(batch: Req) -> bool:
+    if getattr(batch, "negative_prompt", None) is not None:
+        return True
+
+    neg_embeds = getattr(batch, "negative_prompt_embeds", None)
+    if neg_embeds is None:
+        return False
+    if isinstance(neg_embeds, torch.Tensor):
+        return True
+    try:
+        return len(neg_embeds) > 0
+    except TypeError:
+        return bool(neg_embeds)
+
+
+def _sana_wm_should_do_cfg(batch: Req) -> bool:
+    return bool(getattr(batch, "do_classifier_free_guidance", False)) or (
+        _sana_wm_effective_guidance_scale(batch) > 1.0
+        and _sana_wm_has_negative_condition(batch)
+    )
+
+
 def _sana_wm_rot_x(angle_rad: float) -> torch.Tensor:
     c, s = math.cos(angle_rad), math.sin(angle_rad)
     return torch.tensor(
@@ -532,7 +563,10 @@ class SanaWMTextEncodingStage(TextEncodingStage):
         ]
         prompt_seq_lens_list = self._seq_lens_from_masks(prompt_masks_list)
 
-        if batch.do_classifier_free_guidance:
+        has_preencoded_negative = (
+            _first_tensor(getattr(batch, "negative_prompt_embeds", None)) is not None
+        )
+        if batch.do_classifier_free_guidance and not has_preencoded_negative:
             negative_prompt = batch.negative_prompt
             if not isinstance(negative_prompt, (str, list)) or (
                 isinstance(negative_prompt, list)
@@ -569,15 +603,18 @@ class SanaWMTextEncodingStage(TextEncodingStage):
         )
 
         if batch.do_classifier_free_guidance:
-            self._append_negative_text_outputs(
-                batch,
-                prompt_embeds_list,
-                neg_embeds_list,
-                neg_masks_list,
-                neg_pooler_embeds_list,
-                neg_embeds_masks_list,
-                neg_seq_lens_list,
-            )
+            if has_preencoded_negative:
+                self._align_preencoded_negative_text_outputs(batch, prompt_embeds_list)
+            else:
+                self._append_negative_text_outputs(
+                    batch,
+                    prompt_embeds_list,
+                    neg_embeds_list,
+                    neg_masks_list,
+                    neg_pooler_embeds_list,
+                    neg_embeds_masks_list,
+                    neg_seq_lens_list,
+                )
 
         self.log_info(
             "SANA-WM text encoded with chi_prompt=%s, prompt_window=%d, "
@@ -588,7 +625,12 @@ class SanaWMTextEncodingStage(TextEncodingStage):
         )
         log_sana_wm_tensor_stats("text.prompt_embeds", prompt_embeds_list[0])
         if batch.do_classifier_free_guidance:
-            log_sana_wm_tensor_stats("text.negative_prompt_embeds", neg_embeds_list[0])
+            neg_for_log = (
+                _first_tensor(batch.negative_prompt_embeds)
+                if has_preencoded_negative
+                else neg_embeds_list[0]
+            )
+            log_sana_wm_tensor_stats("text.negative_prompt_embeds", neg_for_log)
 
         return batch
 
@@ -667,7 +709,8 @@ class SanaWMDenoisingStage(DenoisingStage):
         if pos_embeds is None:
             raise ValueError("SANA-WM denoising requires positive prompt embeds.")
 
-        do_cfg = bool(batch.do_classifier_free_guidance)
+        do_cfg = _sana_wm_should_do_cfg(batch)
+        guidance_scale = _sana_wm_effective_guidance_scale(batch)
         neg_embeds = None
         neg_mask = None
         if do_cfg:
@@ -766,7 +809,7 @@ class SanaWMDenoisingStage(DenoisingStage):
             len(timesteps),
             do_cfg,
             cfg_parallel,
-            float(getattr(batch, "guidance_scale", 1.0) or 1.0),
+            guidance_scale,
         )
         log_sana_wm_tensor_stats("denoise.input_latents", latents)
 
@@ -799,6 +842,7 @@ class SanaWMDenoisingStage(DenoisingStage):
                 "condition_mask": condition_mask,
                 "condition_mask_input": condition_mask_input,
                 "do_cfg": do_cfg,
+                "guidance_scale": guidance_scale,
                 "init_condition_latents": init_condition_latents,
                 "model_kwargs": model_kwargs,
                 "start_time": time.perf_counter(),
@@ -860,7 +904,7 @@ class SanaWMDenoisingStage(DenoisingStage):
                 )
 
         if do_cfg:
-            guidance_scale = float(getattr(batch, "guidance_scale", 1.0) or 1.0)
+            guidance_scale = float(ctx.extra["guidance_scale"])
             if cfg_parallel:
                 noise_pred = self._combine_cfg_parallel_noise(
                     noise_pred, guidance_scale, cfg_rank
@@ -2240,16 +2284,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 )
             )
         except Exception as e:
-            if self._has_explicit_camera_request(batch):
-                raise RuntimeError(
-                    "SANA-WM camera conditioning failed for an explicitly "
-                    "provided camera/intrinsics request."
-                ) from e
-            logger.warning(
-                "SANA-WM camera conditioning failed: %s. Disabling camera branch.",
-                e,
-            )
-            camera_conditions, chunk_plucker, camera_source = None, None, "error"
+            raise RuntimeError("SANA-WM camera conditioning failed.") from e
 
         if camera_conditions is not None:
             batch.extra["camera_conditions"] = camera_conditions
@@ -2276,7 +2311,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             batch.negative_prompt_embeds = [batch.negative_prompt_embeds]
 
         # --- 7. CFG setup ---
-        batch.do_classifier_free_guidance = getattr(batch, "guidance_scale", 1.0) > 1.0
+        batch.do_classifier_free_guidance = _sana_wm_should_do_cfg(batch)
 
         self.log_info(
             "BeforeDenoisingStage done: latent=%s, T_lat=%d, H_sp=%d, W_sp=%d, "

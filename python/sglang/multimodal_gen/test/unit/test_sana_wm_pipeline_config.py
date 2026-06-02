@@ -13,7 +13,11 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
-from sglang.multimodal_gen.registry import _get_config_info, get_pipeline_config_classes
+from sglang.multimodal_gen.registry import (
+    _get_config_info,
+    get_non_diffusers_pipeline_name,
+    get_pipeline_config_classes,
+)
 from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _downscale_to_reference_rms,
@@ -48,6 +52,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMDenoisingStage,
     SanaWMTextEncodingStage,
     _align_sana_wm_cfg_text_conditions,
+    _sana_wm_effective_guidance_scale,
+    _sana_wm_should_do_cfg,
     configure_sana_wm_ltx2_vae_for_long_video,
     parse_sana_wm_action_string,
     sana_wm_action_to_camera_to_world,
@@ -443,6 +449,16 @@ class TestSanaWMRegistry(unittest.TestCase):
         pipeline_config_cls, sampling_param_cls = classes
         self.assertIs(pipeline_config_cls, SanaWMPipelineConfig)
         self.assertIs(sampling_param_cls, SanaWMSamplingParams)
+
+    def test_raw_sana_wm_path_uses_native_two_stage_pipeline(self) -> None:
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("Efficient-Large-Model/SANA-WM_bidirectional"),
+            "SanaWMTwoStagePipeline",
+        )
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("/models/sana_wm_bidirectional"),
+            "SanaWMTwoStagePipeline",
+        )
 
     def test_overlay_resolver_matches_hf_cache_snapshot_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1078,6 +1094,29 @@ class TestSanaWMBeforeDenoisingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(key[0], (2, 3))
         self.assertEqual(key[-1], 0)
 
+    def test_cfg_uses_true_cfg_scale_when_present(self) -> None:
+        batch = Req(
+            prompt="drive forward",
+            negative_prompt="",
+            guidance_scale=1.0,
+            true_cfg_scale=4.5,
+        )
+
+        self.assertTrue(batch.do_classifier_free_guidance)
+        self.assertTrue(_sana_wm_should_do_cfg(batch))
+        self.assertEqual(_sana_wm_effective_guidance_scale(batch), 4.5)
+
+    def test_cfg_accepts_preencoded_negative_prompt_embeds(self) -> None:
+        batch = Req(
+            prompt="drive forward",
+            negative_prompt=None,
+            negative_prompt_embeds=[torch.zeros(1, 4, 2304)],
+            guidance_scale=4.5,
+        )
+
+        self.assertTrue(batch.do_classifier_free_guidance)
+        self.assertTrue(_sana_wm_should_do_cfg(batch))
+
     def test_prepare_timesteps_uses_inference_flow_shift(self) -> None:
         class FakeScheduler:
             def __init__(self):
@@ -1116,7 +1155,8 @@ class TestSanaWMTextEncodingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertTrue(torch.equal(selected.squeeze(-1), torch.tensor([[0, 3, 4]])))
 
     def test_forward_accepts_batched_negative_prompts(self) -> None:
-        stage = SanaWMTextEncodingStage(text_encoders=[object()], tokenizers=[object()])
+        tokenizer = SimpleNamespace(encode=lambda text: [0, 1])
+        stage = SanaWMTextEncodingStage(text_encoders=[object()], tokenizers=[tokenizer])
         batch = Req(
             prompt=["turn left", "turn right"],
             negative_prompt=["blur", "distortion"],
@@ -1146,6 +1186,32 @@ class TestSanaWMTextEncodingStage(_GlobalStageArgsMixin, unittest.TestCase):
         self.assertEqual(out.negative_prompt_embeds[0].shape[0], 2)
         self.assertTrue(torch.equal(out.negative_attention_mask[0], neg_mask))
         self.assertEqual(out.negative_prompt_seq_lens[0], [2, 1])
+
+    def test_forward_reuses_preencoded_negative_prompt_embeds(self) -> None:
+        tokenizer = SimpleNamespace(encode=lambda text: [0, 1])
+        stage = SanaWMTextEncodingStage(text_encoders=[object()], tokenizers=[tokenizer])
+        neg_embeds = torch.zeros(1, 4, 2304)
+        batch = Req(
+            prompt="drive forward",
+            negative_prompt=None,
+            negative_prompt_embeds=[neg_embeds],
+            guidance_scale=4.5,
+        )
+        server_args = SimpleNamespace(pipeline_config=SanaWMPipelineConfig())
+        pos_mask = torch.ones(1, 4, dtype=torch.long)
+        pos_outputs = (
+            [torch.ones(1, 4, 2304)],
+            [pos_mask],
+            [],
+            [pos_mask.bool()],
+            [[4]],
+        )
+
+        with patch.object(stage, "encode_text", return_value=pos_outputs) as encode_text:
+            out = stage.forward(batch, server_args)
+
+        self.assertEqual(encode_text.call_count, 1)
+        self.assertIs(out.negative_prompt_embeds[0], neg_embeds)
 
 
 class TestSanaWMDenoisingStage(unittest.TestCase):
