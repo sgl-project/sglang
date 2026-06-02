@@ -17,5 +17,42 @@
   "per_req_decode_tps_min": 40.84,
   "system_throughput_tok_s": 39.8,
   "total_out_tokens": 256,
-  "wall_s": 6.4
+  "wall_s": 6.4,
+  "run_provenance": {
+    "reconstructed": true,
+    "reconstructed_in_round": 21,
+    "note": "Provenance reconstructed in R21 from the R20 boot logs + launch commands + nvidia-smi + git history; the metric fields in this file are UNCHANGED from the R20 streaming run (no rerun).",
+    "server_code_commit": "68969deb0",
+    "server_code_note": "Servers launched from the R19 tree HEAD=68969deb0. DS/DSA production serving code is unchanged across R18 (f9f6ec056) -> R19 (68969deb0) -> R20 (30173f08b): the R19 and R20 commits touched only development/loop7/ (no python/sglang/srt change).",
+    "measurement_tool_commit": "30173f08b",
+    "tree_dirty_during_run": true,
+    "gpu": "NVIDIA H200",
+    "gpu_count": 8,
+    "tp_size": 8,
+    "op_point": "DS int8 / mem_fraction_static=0.7 / fp8-KV / TP=8 / page 64 / flashmla_kv prefill+decode / radix-off / overlap-off / piecewise-cuda-graph-off; CUDA graph ON",
+    "launch_cmd": "LOOP7_MEASUREMENT=1 bash development/serve_double_sparsity.sh",
+    "server_config": {
+      "enable_double_sparsity": true,
+      "top_k": 2048,
+      "signature_dtype": "int8",
+      "page_size": 64,
+      "scorer_norm": "off",
+      "head_agg": "max",
+      "anchor_mode": "off",
+      "enable_lifted_budget_decode": false,
+      "mem_fraction_static": 0.7,
+      "kv_cache_dtype": "fp8_e4m3",
+      "attention_backend": "dsa",
+      "dsa_decode_backend": "flashmla_kv"
+    },
+    "mem_fraction_static": 0.7,
+    "gpu_mem_per_gpu": "125 GB",
+    "mem_source": "nvidia-smi during run: 125116 MiB/GPU",
+    "graph": true,
+    "graph_evidence": "[TP0] Decode batch, #running-req: 16, #token: 14336, cuda graph: True, gen throughput (token/s): 442.58, #queue-req: 0 (this boot)",
+    "radix_cache": "off (--disable-radix-cache)",
+    "overlap_schedule": "off (--disable-overlap-schedule)",
+    "served": 1,
+    "artifact_path": "development/loop7/ttft_ds_default_c1_p770.json"
+  }
 }

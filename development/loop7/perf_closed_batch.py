@@ -27,8 +27,95 @@ import argparse
 import concurrent.futures
 import json
 import os
+import subprocess
 import time
 import urllib.request
+
+
+def _git_commit():
+    """Best-effort short HEAD of the repo this file lives in (None on failure)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        return (
+            subprocess.check_output(
+                ["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+            or None
+        )
+    except Exception:
+        return None
+
+
+def _git_tree_dirty():
+    """Best-effort: True if the working tree has uncommitted changes (None on failure)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.check_output(
+            ["git", "-C", here, "status", "--porcelain"], stderr=subprocess.DEVNULL
+        ).decode()
+        return bool(out.strip())
+    except Exception:
+        return None
+
+
+def _gpu_info():
+    """Best-effort (gpu_name, gpu_count) via nvidia-smi ((None, None) on failure)."""
+    try:
+        out = (
+            subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+            .splitlines()
+        )
+        return (out[0].strip() if out else None), len(out)
+    except Exception:
+        return None, None
+
+
+def build_run_provenance(**fields):
+    """Assemble a run_provenance object for a measurement artifact (single schema source).
+
+    All fields are caller-supplied so the SAME schema serves both a live `--stream` run
+    (which auto-detects git/GPU and passes server-side facts via CLI) and a reconstructed
+    backfill (which passes every field explicitly + ``reconstructed=True``). Keys with a
+    None value are dropped so the object stays compact.
+    """
+    schema = [
+        "reconstructed",
+        "reconstructed_in_round",
+        "note",
+        "server_code_commit",
+        "server_code_note",
+        "measurement_tool_commit",
+        "tree_dirty_during_run",
+        "gpu",
+        "gpu_count",
+        "tp_size",
+        "op_point",
+        "launch_cmd",
+        "server_config",
+        "mem_fraction_static",
+        "gpu_mem_per_gpu",
+        "mem_source",
+        "graph",
+        "graph_evidence",
+        "radix_cache",
+        "overlap_schedule",
+        "served",
+        "artifact_path",
+    ]
+    out = {}
+    for k in schema:
+        v = fields.get(k)
+        if v is not None:
+            out[k] = v
+    return out
 
 
 def _pct(xs, q):
@@ -155,9 +242,17 @@ def main():
         default=1,
         help="repeat the prompt sentence N times to build a longer (prefill-bound) prompt",
     )
+    # Optional run-provenance pass-through (server-side facts the probe can't introspect);
+    # the git commit / tree-dirty / GPU are auto-detected. Recorded under run_provenance so
+    # every `--stream` artifact is self-documenting.
+    ap.add_argument("--launch-cmd", default=None, help="exact server launch command")
+    ap.add_argument("--op-point", default=None, help="operating-point summary string")
+    ap.add_argument("--mem-per-gpu", default=None, help="e.g. '125 GB'")
+    ap.add_argument("--graph-evidence", default=None, help="a server-log decode line")
     args = ap.parse_args()
     base = os.environ.get("DS_BASE_URL", "http://127.0.0.1:30000")
     prompt = (" ".join([args.prompt] * args.prompt_repeat)).strip()
+    _gpu_name, _gpu_n = _gpu_info()
 
     if args.stream:
         _one_stream(base, 16, prompt)  # warmup (capture/JIT)
@@ -191,6 +286,20 @@ def main():
             "total_out_tokens": sum(cts),
             "wall_s": round(wall, 1),
         }
+        _tool_commit = _git_commit()
+        out["run_provenance"] = build_run_provenance(
+            measurement_tool_commit=_tool_commit,
+            server_code_commit=_tool_commit,
+            tree_dirty_during_run=_git_tree_dirty(),
+            gpu=_gpu_name,
+            gpu_count=_gpu_n,
+            launch_cmd=args.launch_cmd,
+            op_point=args.op_point,
+            gpu_mem_per_gpu=args.mem_per_gpu,
+            graph_evidence=args.graph_evidence,
+            served=len(res),
+            artifact_path=args.out,
+        )
     else:
         _one(base, 16, prompt)  # warmup (capture/JIT)
         t0 = time.time()

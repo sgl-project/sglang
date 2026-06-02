@@ -4,7 +4,14 @@ Consolidated guardrail report for Loop 7 (the source artifact for the task20
 decision record). All measurements are at the Loop-7 op-point under **CUDA graph**:
 DS int8 / `mem_fraction_static=0.7` / fp8-KV / TP=8 / page 64 / `flashmla_kv`
 prefill+decode / radix-off / `--disable-overlap-schedule` / `--disable-piecewise-cuda-graph`.
-GPU: 8× NVIDIA H200 (sm90). Commit: R19 decode-TPS on `f9f6ec056`; R20 TTFT guardrails on `68969deb0`.
+GPU: 8× NVIDIA H200 (sm90), TP=8. **Commit provenance** (verified via `git log`;
+`f9f6ec056`=R18, `68969deb0`=R19, `30173f08b`=R20 — R19 and R20 commits touched only
+`development/loop7/`, so the DS/DSA production serving code is unchanged across R18→R19→R20):
+the **R19 decode-TPS** servers were launched from the R18 tree `f9f6ec056`, with the R19
+probe+artifacts uncommitted, committed as `68969deb0`; the **R20 TTFT** servers were launched
+from the R19 tree `68969deb0`, with the `--stream` probe uncommitted, committed as
+`30173f08b`. Each `ttft_*.json` carries a per-run `run_provenance` block (launch command,
+effective config, mem, graph evidence, served count, GPU, commits) reconstructed in R21.
 
 ## Perf guardrails (conc-1 / conc-16, graph mode)
 Per-request decode TPS measured by the **closed-batch** method (the trustworthy
@@ -102,7 +109,7 @@ methods.
 | length | DSA | DS-default | DS-hybrid (Tier-2.B) | DS-lifted-4096 |
 |---|---|---|---|---|
 | within-budget 1024w | 100% | 100% | 100% | — |
-| 4K | 100% | 75% | 80% (R7) | **95%** (R14 eager / R17 graph) |
+| 4K | 100% | 80% (graph N=50, R7) | 80% (R7) | **95%** (R14 eager / R17 graph) |
 | 16K | 100% | 6% | **38%** material (R7, +32pp) | — (scorer-limited) |
 | 64K | 100% | ~5% (floor) | floor | — (scorer-limited) |
 | MMLU 5-shot | 89.0% | 88.5% | 88.5% (−0.5pp ≤1.0pp) | — |
