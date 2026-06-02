@@ -6,6 +6,9 @@ import pybase64
 import torch
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_dp_local_slice_cpu
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
@@ -28,8 +31,6 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         attn_tp_size = get_attention_tp_size()
         assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
 
-        # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
-        # to its own device_cache, so the buffer only needs to fit one rank's batch.
         server_args = get_global_server_args()
         max_batch_size = max(server_args.chunked_prefill_size, max_running_requests)
 
@@ -41,6 +42,25 @@ class IndexerTopkCapturer(BaseTopkCapturer):
             device=device,
             name="indexer_topk",
         )
+
+    def _get_local_slice(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: Optional[int],
+    ) -> torch.Tensor:
+        if not is_dp_attention_enabled():
+            return super()._get_local_slice(
+                forward_batch, can_run_graph, cuda_graph_batch
+            )
+
+        local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
+            forward_batch, can_run_graph, cuda_graph_batch
+        )
+        local_end_pos = local_start_pos + local_num_tokens
+        return self.device_cache.buffer[
+            local_start_pos:local_end_pos, :, : self.topk_size
+        ]
 
 
 _global_indexer_capturer: Optional[IndexerTopkCapturer] = None
