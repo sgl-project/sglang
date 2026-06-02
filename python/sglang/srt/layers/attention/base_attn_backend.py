@@ -154,9 +154,8 @@ class AttentionBackend(ABC):
         / mask / page table / indexer / compressor data — those are aux
         data with explicit channels above.
 
-        Step 08 follow-up: enumerate layer-level extras explicitly and
-        drop ``**kwargs`` catch-all once the backend signatures are
-        aligned (see ``attention/08-decouple-aux-data.md``).
+        TODO: enumerate the layer-level extras explicitly and drop the
+        ``**kwargs`` catch-all once the backend signatures are aligned.
         """
         if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
