@@ -218,6 +218,15 @@ class SamplingParams:
 
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
+    diffusers_kwargs: dict | None = None
+    max_sequence_length: int | None = None
+    flow_shift: float | None = None
+
+    # cosmos-related
+    use_duration_template: bool | None = None
+    use_resolution_template: bool | None = None
+    use_system_prompt: bool | None = None
+    use_guardrails: bool | None = None
 
     # Prompt enhancement (ErnieImage)
     use_pe: bool | None = None
@@ -510,6 +519,7 @@ class SamplingParams:
             "wan" in pipeline_name_lower
             or "helios" in pipeline_name_lower
             or "joy" in pipeline_name_lower
+            or "cosmos3" in pipeline_name_lower
         ) and (self.enable_sequence_shard is None or self.enable_sequence_shard):
             self.enable_sequence_shard = True
             logger.debug("Automatically enabled enable_sequence_shard")

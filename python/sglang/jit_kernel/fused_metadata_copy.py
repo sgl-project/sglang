@@ -1,5 +1,5 @@
 """
-Fused metadata copy kernel for NSA backend CUDA graph replay.
+Fused metadata copy kernel for DSA backend CUDA graph replay.
 
 This module provides JIT-compiled CUDA kernels for fusing multiple tensor
 copy operations into single kernel launches, reducing kernel launch overhead
@@ -98,18 +98,18 @@ def fused_metadata_copy_cuda(
     cache_seqlens_src: torch.Tensor,
     cu_seqlens_k_src: torch.Tensor,
     page_indices_src: torch.Tensor,
-    nsa_cache_seqlens_src: torch.Tensor,
+    dsa_cache_seqlens_src: torch.Tensor,
     seqlens_expanded_src: Optional[torch.Tensor],
-    nsa_cu_seqlens_k_src: torch.Tensor,
+    dsa_cu_seqlens_k_src: torch.Tensor,
     real_page_table_src: Optional[torch.Tensor],
     flashmla_num_splits_src: Optional[torch.Tensor],
     flashmla_metadata_src: Optional[torch.Tensor],
     cache_seqlens_dst: torch.Tensor,
     cu_seqlens_k_dst: torch.Tensor,
     page_table_1_dst: torch.Tensor,
-    nsa_cache_seqlens_dst: torch.Tensor,
+    dsa_cache_seqlens_dst: torch.Tensor,
     seqlens_expanded_dst: Optional[torch.Tensor],
-    nsa_cu_seqlens_k_dst: torch.Tensor,
+    dsa_cu_seqlens_k_dst: torch.Tensor,
     real_page_table_dst: Optional[torch.Tensor],
     flashmla_num_splits_dst: Optional[torch.Tensor],
     flashmla_metadata_dst: Optional[torch.Tensor],
@@ -120,7 +120,7 @@ def fused_metadata_copy_cuda(
     seqlens_expanded_size: int,
 ) -> None:
     """
-    Fused metadata copy kernel for NSA backend CUDA graph replay.
+    Fused metadata copy kernel for DSA backend CUDA graph replay.
 
     This function fuses multiple tensor copy operations into a single kernel launch,
     reducing kernel launch overhead and improving performance.
@@ -129,18 +129,18 @@ def fused_metadata_copy_cuda(
         cache_seqlens_src: Source cache sequence lengths [bs]
         cu_seqlens_k_src: Source cumulative sequence lengths [bs+1]
         page_indices_src: Source page indices [rows, max_len]
-        nsa_cache_seqlens_src: Source NSA cache sequence lengths [size]
+        dsa_cache_seqlens_src: Source DSA cache sequence lengths [size]
         seqlens_expanded_src: Optional source expanded sequence lengths [size] (required for TARGET_VERIFY/DRAFT_EXTEND)
-        nsa_cu_seqlens_k_src: Source NSA cumulative sequence lengths [size+1]
+        dsa_cu_seqlens_k_src: Source DSA cumulative sequence lengths [size+1]
         real_page_table_src: Optional source real page table [rows, cols]
         flashmla_num_splits_src: Optional source FlashMLA num_splits [size+1]
         flashmla_metadata_src: Optional source FlashMLA metadata tensor
         cache_seqlens_dst: Destination cache sequence lengths [bs]
         cu_seqlens_k_dst: Destination cumulative sequence lengths [bs+1]
         page_table_1_dst: Destination page table [rows, stride]
-        nsa_cache_seqlens_dst: Destination NSA cache sequence lengths [size]
+        dsa_cache_seqlens_dst: Destination DSA cache sequence lengths [size]
         seqlens_expanded_dst: Optional destination expanded sequence lengths [size] (required for TARGET_VERIFY/DRAFT_EXTEND)
-        nsa_cu_seqlens_k_dst: Destination NSA cumulative sequence lengths [size+1]
+        dsa_cu_seqlens_k_dst: Destination DSA cumulative sequence lengths [size+1]
         real_page_table_dst: Optional destination real page table [rows, cols]
         flashmla_num_splits_dst: Optional destination FlashMLA num_splits [size+1]
         flashmla_metadata_dst: Optional destination FlashMLA metadata tensor
@@ -164,28 +164,28 @@ def fused_metadata_copy_cuda(
     cache_seqlens_src = cache_seqlens_src.contiguous()
     cu_seqlens_k_src = cu_seqlens_k_src.contiguous()
     page_indices_src = page_indices_src.contiguous()
-    nsa_cache_seqlens_src = nsa_cache_seqlens_src.contiguous()
+    dsa_cache_seqlens_src = dsa_cache_seqlens_src.contiguous()
     if seqlens_expanded_src is not None:
         seqlens_expanded_src = seqlens_expanded_src.contiguous()
-    nsa_cu_seqlens_k_src = nsa_cu_seqlens_k_src.contiguous()
+    dsa_cu_seqlens_k_src = dsa_cu_seqlens_k_src.contiguous()
 
     # Call JIT-compiled kernel (None values are passed as Optional with no value)
     module.fused_metadata_copy(
         cache_seqlens_src,
         cu_seqlens_k_src,
         page_indices_src,
-        nsa_cache_seqlens_src,
+        dsa_cache_seqlens_src,
         seqlens_expanded_src,
-        nsa_cu_seqlens_k_src,
+        dsa_cu_seqlens_k_src,
         real_page_table_src,
         flashmla_num_splits_src,
         flashmla_metadata_src,
         cache_seqlens_dst,
         cu_seqlens_k_dst,
         page_table_1_dst,
-        nsa_cache_seqlens_dst,
+        dsa_cache_seqlens_dst,
         seqlens_expanded_dst,
-        nsa_cu_seqlens_k_dst,
+        dsa_cu_seqlens_k_dst,
         real_page_table_dst,
         flashmla_num_splits_dst,
         flashmla_metadata_dst,
@@ -200,32 +200,32 @@ def fused_metadata_copy_multi_cuda(
     cache_seqlens_src: torch.Tensor,
     cu_seqlens_k_src: torch.Tensor,
     page_indices_src: torch.Tensor,
-    nsa_cache_seqlens_src: torch.Tensor,
-    nsa_cu_seqlens_k_src: torch.Tensor,
+    dsa_cache_seqlens_src: torch.Tensor,
+    dsa_cu_seqlens_k_src: torch.Tensor,
     real_page_table_src: Optional[torch.Tensor],
     flashmla_num_splits_src: Optional[torch.Tensor],
     flashmla_metadata_src: Optional[torch.Tensor],
     cache_seqlens_dst0: torch.Tensor,
     cu_seqlens_k_dst0: torch.Tensor,
     page_table_1_dst0: torch.Tensor,
-    nsa_cache_seqlens_dst0: torch.Tensor,
-    nsa_cu_seqlens_k_dst0: torch.Tensor,
+    dsa_cache_seqlens_dst0: torch.Tensor,
+    dsa_cu_seqlens_k_dst0: torch.Tensor,
     real_page_table_dst0: Optional[torch.Tensor],
     flashmla_num_splits_dst0: Optional[torch.Tensor],
     flashmla_metadata_dst0: Optional[torch.Tensor],
     cache_seqlens_dst1: torch.Tensor,
     cu_seqlens_k_dst1: torch.Tensor,
     page_table_1_dst1: torch.Tensor,
-    nsa_cache_seqlens_dst1: torch.Tensor,
-    nsa_cu_seqlens_k_dst1: torch.Tensor,
+    dsa_cache_seqlens_dst1: torch.Tensor,
+    dsa_cu_seqlens_k_dst1: torch.Tensor,
     real_page_table_dst1: Optional[torch.Tensor],
     flashmla_num_splits_dst1: Optional[torch.Tensor],
     flashmla_metadata_dst1: Optional[torch.Tensor],
     cache_seqlens_dst2: torch.Tensor,
     cu_seqlens_k_dst2: torch.Tensor,
     page_table_1_dst2: torch.Tensor,
-    nsa_cache_seqlens_dst2: torch.Tensor,
-    nsa_cu_seqlens_k_dst2: torch.Tensor,
+    dsa_cache_seqlens_dst2: torch.Tensor,
+    dsa_cu_seqlens_k_dst2: torch.Tensor,
     real_page_table_dst2: Optional[torch.Tensor],
     flashmla_num_splits_dst2: Optional[torch.Tensor],
     flashmla_metadata_dst2: Optional[torch.Tensor],
@@ -234,7 +234,7 @@ def fused_metadata_copy_multi_cuda(
     seqlens_expanded_size: int,
 ) -> None:
     """
-    Multi-backend fused metadata copy kernel for NSA backend CUDA graph replay.
+    Multi-backend fused metadata copy kernel for DSA backend CUDA graph replay.
 
     This function copies metadata from one source to THREE destinations in a single
     kernel launch, eliminating the overhead of 3 separate kernel calls. Currently
@@ -244,16 +244,16 @@ def fused_metadata_copy_multi_cuda(
         cache_seqlens_src: Source cache sequence lengths [bs]
         cu_seqlens_k_src: Source cumulative sequence lengths [bs+1]
         page_indices_src: Source page indices [bs, max_len]
-        nsa_cache_seqlens_src: Source NSA cache sequence lengths [bs]
-        nsa_cu_seqlens_k_src: Source NSA cumulative sequence lengths [bs+1]
+        dsa_cache_seqlens_src: Source DSA cache sequence lengths [bs]
+        dsa_cu_seqlens_k_src: Source DSA cumulative sequence lengths [bs+1]
         real_page_table_src: Optional source real page table [bs, cols]
         flashmla_num_splits_src: Optional source FlashMLA num_splits [bs+1]
         flashmla_metadata_src: Optional source FlashMLA metadata tensor
         cache_seqlens_dst0-2: Destination cache sequence lengths for backends 0-2
         cu_seqlens_k_dst0-2: Destination cumulative sequence lengths for backends 0-2
         page_table_1_dst0-2: Destination page tables for backends 0-2
-        nsa_cache_seqlens_dst0-2: Destination NSA cache sequence lengths for backends 0-2
-        nsa_cu_seqlens_k_dst0-2: Destination NSA cumulative sequence lengths for backends 0-2
+        dsa_cache_seqlens_dst0-2: Destination DSA cache sequence lengths for backends 0-2
+        dsa_cu_seqlens_k_dst0-2: Destination DSA cumulative sequence lengths for backends 0-2
         real_page_table_dst0-2: Optional destination real page tables for backends 0-2
         flashmla_num_splits_dst0-2: Optional destination FlashMLA num_splits for backends 0-2
         flashmla_metadata_dst0-2: Optional destination FlashMLA metadata tensors for backends 0-2
@@ -273,40 +273,40 @@ def fused_metadata_copy_multi_cuda(
     cache_seqlens_src = cache_seqlens_src.contiguous()
     cu_seqlens_k_src = cu_seqlens_k_src.contiguous()
     page_indices_src = page_indices_src.contiguous()
-    nsa_cache_seqlens_src = nsa_cache_seqlens_src.contiguous()
-    nsa_cu_seqlens_k_src = nsa_cu_seqlens_k_src.contiguous()
+    dsa_cache_seqlens_src = dsa_cache_seqlens_src.contiguous()
+    dsa_cu_seqlens_k_src = dsa_cu_seqlens_k_src.contiguous()
 
     # Call JIT-compiled kernel (None values are passed as Optional with no value)
     module.fused_metadata_copy_multi(
         cache_seqlens_src,
         cu_seqlens_k_src,
         page_indices_src,
-        nsa_cache_seqlens_src,
-        nsa_cu_seqlens_k_src,
+        dsa_cache_seqlens_src,
+        dsa_cu_seqlens_k_src,
         real_page_table_src,
         flashmla_num_splits_src,
         flashmla_metadata_src,
         cache_seqlens_dst0,
         cu_seqlens_k_dst0,
         page_table_1_dst0,
-        nsa_cache_seqlens_dst0,
-        nsa_cu_seqlens_k_dst0,
+        dsa_cache_seqlens_dst0,
+        dsa_cu_seqlens_k_dst0,
         real_page_table_dst0,
         flashmla_num_splits_dst0,
         flashmla_metadata_dst0,
         cache_seqlens_dst1,
         cu_seqlens_k_dst1,
         page_table_1_dst1,
-        nsa_cache_seqlens_dst1,
-        nsa_cu_seqlens_k_dst1,
+        dsa_cache_seqlens_dst1,
+        dsa_cu_seqlens_k_dst1,
         real_page_table_dst1,
         flashmla_num_splits_dst1,
         flashmla_metadata_dst1,
         cache_seqlens_dst2,
         cu_seqlens_k_dst2,
         page_table_1_dst2,
-        nsa_cache_seqlens_dst2,
-        nsa_cu_seqlens_k_dst2,
+        dsa_cache_seqlens_dst2,
+        dsa_cu_seqlens_k_dst2,
         real_page_table_dst2,
         flashmla_num_splits_dst2,
         flashmla_metadata_dst2,

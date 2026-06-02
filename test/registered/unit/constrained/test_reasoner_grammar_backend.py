@@ -15,7 +15,8 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(2.0, "stage-a-test-cpu")
+register_cpu_ci(2.0, "base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 
 class _DummyTokenizer:

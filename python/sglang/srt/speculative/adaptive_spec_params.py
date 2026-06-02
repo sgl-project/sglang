@@ -73,6 +73,39 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
     return cfg
 
 
+def _resolve_candidate_steps(
+    initial_steps: int,
+    cfg: dict[str, object],
+    default_candidates: tuple[int, ...] = (1, 3, 7),
+) -> list[int]:
+    """Return sorted, deduplicated candidate steps; inserts *initial_steps* when missing."""
+    raw = cfg.get("candidate_steps") or default_candidates
+    candidates: set[int] = set(raw)
+
+    # Ensure the worker's initial speculative_num_steps is itself a candidate.
+    # Otherwise AdaptiveController.register() would store the worker's pre-built
+    # runtime state under a key that _activate() never queries, leaking that
+    # state's draft attn backend and cuda graph buffers for the process lifetime.
+    if initial_steps not in candidates:
+        log_info_on_rank0(
+            logger,
+            f"Adding initial speculative_num_steps={initial_steps} to "
+            f"candidate_steps={sorted(candidates)} so the pre-built "
+            f"runtime state is reused.",
+        )
+        candidates.add(initial_steps)
+
+    return sorted(candidates)
+
+
+def resolve_candidate_steps_from_config(
+    initial_steps: int, cfg_path: str | None
+) -> list[int]:
+    """Load adaptive config and resolve candidate steps."""
+    cfg = load_adaptive_config(cfg_path)
+    return _resolve_candidate_steps(initial_steps, cfg)
+
+
 class AdaptiveSpeculativeParams:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
@@ -88,36 +121,19 @@ class AdaptiveSpeculativeParams:
     def __init__(
         self,
         initial_steps: int,
-        config: dict[str, object] | None = None,
+        cfg_path: str | None = None,
         is_dflash: bool = False,
     ):
-        cfg = config or {}
+        cfg = load_adaptive_config(cfg_path)
         # TODO: Wider range of candidate_steps (once lazy init is supported).
         # DFlash uses drafted-token counts [3,7,11,15] → verify query-lens [4,8,12,16].
         # EAGLE/EAGLE3 uses [1, 3, 7] draft steps by default.
-        _default_candidates = [3, 7, 11, 15] if is_dflash else [1, 3, 7]
-        candidates = set(cfg.get("candidate_steps", _default_candidates))
-
-        # Ensure the worker's initial speculative_num_steps is itself a candidate.
-        # Otherwise AdaptiveController.register() would store the worker's pre-built
-        # runtime state under a key that _activate() never queries, leaking that
-        # state's draft attn backend and cuda graph buffers for the process lifetime.
-        if initial_steps not in candidates:
-            log_info_on_rank0(
-                logger,
-                f"Adding initial speculative_num_steps={initial_steps} to "
-                f"candidate_steps={sorted(candidates)} so the pre-built "
-                f"runtime state is reused.",
-            )
-            candidates.add(initial_steps)
-
-        self.candidate_steps = sorted(candidates)
+        default_candidates = (3, 7, 11, 15) if is_dflash else (1, 3, 7)
+        self.candidate_steps = _resolve_candidate_steps(initial_steps, cfg, default_candidates)
         assert (
             len(self.candidate_steps) >= 2
         ), "candidate_steps must have at least 2 distinct values"
 
-        self.min_steps = self.candidate_steps[0]
-        self.max_steps = self.candidate_steps[-1]
         self.ema_alpha = cfg.get("ema_alpha", 0.2)
         self.update_interval = cfg.get("update_interval", 5)
         self.warmup_batches = cfg.get("warmup_batches", 10)
@@ -136,16 +152,16 @@ class AdaptiveSpeculativeParams:
             f"steps={self.current_steps}, candidate_steps={self.candidate_steps}",
         )
 
-    def update(self, num_accepted_drafts_per_req: list[int]) -> bool:
+    def update(self, num_correct_drafts_per_req: list[int]) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
 
         Args:
-            num_accepted_drafts_per_req: Per-request accepted draft token counts from last verify.
+            num_correct_drafts_per_req: Per-request accepted draft token counts from last verify.
         """
-        if not num_accepted_drafts_per_req:
+        if not num_correct_drafts_per_req:
             return False
 
-        batch_avg = sum(num_accepted_drafts_per_req) / len(num_accepted_drafts_per_req)
+        batch_avg = sum(num_correct_drafts_per_req) / len(num_correct_drafts_per_req)
         self.ema_accept_len = (
             1 - self.ema_alpha
         ) * self.ema_accept_len + self.ema_alpha * batch_avg

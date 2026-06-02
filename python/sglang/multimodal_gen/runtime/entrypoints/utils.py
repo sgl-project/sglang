@@ -19,6 +19,7 @@ from typing import Any, Callable, List, Optional, Sequence, Union
 import imageio
 import numpy as np
 import torch
+from PIL import Image
 
 try:
     import scipy.io.wavfile as scipy_wavfile
@@ -48,6 +49,7 @@ class SetLoraReq:
     lora_path: Optional[Union[str, List[Optional[str]]]] = None
     target: Union[str, List[str]] = "all"
     strength: Union[float, List[float]] = 1.0
+    merge_mode: Optional[str] = None
 
 
 @dataclass
@@ -418,8 +420,12 @@ def prepare_request(
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    if getattr(sampling_params, "max_sequence_length", None) is not None:
+        req.max_sequence_length = sampling_params.max_sequence_length
 
-    req.adjust_size(server_args)
+    diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
+    if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
+        req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
     if not isinstance(req.prompt, str):
         raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
@@ -641,11 +647,30 @@ def post_process_sample(
                             indexed_path = f"{parts[0]}_{i}.{parts[1]}"
                         else:
                             indexed_path = f"{save_file_path}_{i}"
-                        imageio.imwrite(indexed_path, image, quality=quality)
+                        _save_image_frame(
+                            indexed_path, image, quality, output_compression
+                        )
                 else:
-                    imageio.imwrite(save_file_path, frames[0], quality=quality)
+                    _save_image_frame(
+                        save_file_path, frames[0], quality, output_compression
+                    )
             logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
             logger.info(f"No output path provided, output not saved")
 
     return frames
+
+
+def _save_image_frame(
+    path: str, frame: np.ndarray, quality: int | None, output_compression: int | None
+) -> None:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".png":
+        compress_level = 1
+        if output_compression is not None and output_compression != 75:
+            compress_level = max(0, min(9, round(output_compression / 100 * 9)))
+        if frame.ndim == 3 and frame.shape[-1] == 1:
+            frame = frame[..., 0]
+        Image.fromarray(frame).save(path, format="PNG", compress_level=compress_level)
+    else:
+        imageio.imwrite(path, frame, quality=quality)

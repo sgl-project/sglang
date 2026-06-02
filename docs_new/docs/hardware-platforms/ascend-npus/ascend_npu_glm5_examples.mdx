@@ -11,6 +11,10 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 ### Model Weight
 
+<Warning>
+If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
 - `GLM-5.0`(BF16 version): [Download model weight](https://www.modelscope.cn/models/ZhipuAI/GLM-5).
 - `GLM-5.0-w4a8`(Quantized version without mtp): [Download model weight](https://modelers.cn/models/Eco-Tech/GLM-5-w4a8).
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantify the model naively.
@@ -18,15 +22,18 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 ### Installation
 
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+</Warning>
+
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
 
-```bash Command
-#Atlas 800 A3
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-a3-glm5
-#Atlas 800 A2
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-910b-glm5
+<Tabs>
+  <Tab title="Atlas 800I A3">
 
-#start container
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
@@ -53,8 +60,38 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
+quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+```
+
+  </Tab>
+</Tabs>
 
 ### Best Practices
 Note: Using this image for **best practices**, you need to update transformers to version 5.3.0
@@ -116,7 +153,6 @@ python3 -m sglang.launch_server \
         --port 8000 \
         --served-model-name glm-5 \
         --cuda-graph-bs 16 \
-        --quantization modelslim \
         --moe-a2a-backend deepep --deepep-mode auto
 ```
 
@@ -196,7 +232,11 @@ done
 
 ### Prefill-Decode Disaggregation
 
-Not test yet.
+Not tested yet.
+
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For testing examples (Health Check, Chat Completions, and port usage guidance), see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
 
 ### Using Benchmark
 

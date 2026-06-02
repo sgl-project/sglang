@@ -69,6 +69,7 @@ class ChunkCache(BasePrefixCache):
             device_indices=torch.empty((0,), dtype=torch.int64),
             last_device_node=None,
             last_host_node=None,
+            best_match_node=None,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:

@@ -387,14 +387,42 @@ class LayerNorm(CustomOp):
 # NOTE(will): Needed to match behavior of diffusers and wan2.1 even while using
 # FSDP's MixedPrecisionPolicy
 class FP32LayerNorm(nn.LayerNorm):
+    def _cached_fp32_param(
+        self, attr: str, param: torch.Tensor | None, device: torch.device
+    ) -> torch.Tensor | None:
+        if param is None:
+            return None
+
+        # Keep autograd semantics identical to the old path. The diffusion
+        # runtime enters here for inference, where grad is disabled.
+        if torch.is_grad_enabled():
+            return param.float().to(device=device)
+
+        key = (
+            param.data_ptr(),
+            param._version,
+            param.device,
+            device,
+            param.dtype,
+        )
+        cache = self.__dict__.get(attr)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+
+        fp32_param = param.detach().to(device=device, dtype=torch.float32)
+        self.__dict__[attr] = (key, fp32_param)
+        return fp32_param
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         origin_dtype = inputs.dtype
         device = inputs.device
+        weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
+        bias = self._cached_fp32_param("_bias_fp32_cache", self.bias, device)
         return F.layer_norm(
             inputs.float(),
             self.normalized_shape,
-            self.weight.float().to(device=device) if self.weight is not None else None,
-            self.bias.float().to(device=device) if self.bias is not None else None,
+            weight,
+            bias,
             self.eps,
         ).to(origin_dtype)
 
@@ -445,6 +473,9 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual.numel() == 0 or x.numel() == 0:
+            return self.forward_native(residual, x, gate, shift, scale)
+
         if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
             import warnings
 
@@ -490,6 +521,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    @torch.compile(disable=current_platform.is_npu())
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -518,6 +550,38 @@ class _ScaleResidualNormScaleShift(CustomOp):
             raise ValueError(f"Gate type {type(gate)} not supported")
         normalized = self.norm(residual_output)
         modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        return modulated, residual_output
+
+    def forward_npu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+        # x.shape: [batch_size, seq_len, inner_dim]
+        if isinstance(gate, int):
+            # used by cross-attention, should be 1
+            assert gate == 1
+            residual_output = residual + x
+        elif isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_output = residual + (
+                    x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                ).flatten(1, 2)
+            else:
+                # gate.shape: [batch_size, 1, inner_dim]
+                residual_output = residual + x * gate
+        else:
+            raise ValueError(f"Gate type {type(gate)} not supported")
+        normalized = self.norm(residual_output)
+        modulated = fused_scale_shift(normalized, scale, shift)
         return modulated, residual_output
 
 
@@ -599,11 +663,21 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    @torch.compile(disable=current_platform.is_npu())
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         normalized = self.norm(x)
         modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        return modulated.to(x.dtype)
+
+    def forward_npu(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+        normalized = self.norm(x)
+        modulated = fused_scale_shift(normalized, scale, shift)
         return modulated.to(x.dtype)
 
 
@@ -674,6 +748,7 @@ class _NormTanhMulAdd(CustomOp):
         # Fallback to native because ROCm does not support CuTeDSL.
         return self.forward_native(*args, **kwargs)
 
+    @torch.compile(disable=current_platform.is_npu())
     def forward_native(
         self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
     ) -> torch.Tensor:
@@ -902,9 +977,19 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     src_dtype = x.dtype
     weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
     x_fp32 = x.float()
-    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    if _is_npu:
+        from sgl_kernel_npu.norm.rmsnorm_split import fused_rsqrt_mul, fused_variance
+
+        variance = fused_variance(x_fp32)
+    else:
+        variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+
     variance = get_tp_group().all_reduce(
         variance, op=torch._C._distributed_c10d.ReduceOp.AVG
     )
-    output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
+
+    if _is_npu:
+        output = fused_rsqrt_mul(x_fp32, variance, weight, norm.variance_epsilon)
+    else:
+        output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
     return output.to(dtype=src_dtype)
