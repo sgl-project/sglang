@@ -410,15 +410,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
-        full_token = full_token // page_size * page_size
-        swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+        def _align(x: int) -> int:
+            return (int(x) // page_size) * page_size
+
+        full_token = _align(full_token)
+        swa_tokens = _align(int(full_token * self.swa_ratio))
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
-            c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
-            c128_max_total_num_tokens=full_token // 128,
-            c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
-            c128_state_pool_size=swa_tokens // self.swa_page_size * self.c128_ring_size,
+            c4_max_total_num_tokens=_align(full_token // (4 * self.c4_shrink_factor)),
+            c128_max_total_num_tokens=_align(full_token // 128),
+            c4_state_pool_size=_align(
+                swa_tokens // self.swa_page_size * self.c4_ring_size
+            ),
+            c128_state_pool_size=_align(
+                swa_tokens // self.swa_page_size * self.c128_ring_size
+            ),
         )
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
