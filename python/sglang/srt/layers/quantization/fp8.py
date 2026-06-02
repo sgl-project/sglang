@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    transform_mxfp8_scale_ue8m0,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -267,7 +268,9 @@ class Fp8Config(QuantizationConfig):
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
                 return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                    layer.use_triton_kernels,
+                    layer.use_flashinfer_trtllm_moe,
+                    layer.use_deep_gemm,
                 )
 
             fp8_method = Fp8MoEMethod(self)
@@ -610,6 +613,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
+        elif get_fp8_gemm_runner_backend().is_deep_gemm():
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_deepgemm",
+                transform_mxfp8_scale_ue8m0(layer.weight_scale_inv.data),
+            )
         else:
             # Triton path consumes canonical 2D UE8M0 scales directly.
             return
@@ -762,7 +771,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+            if get_fp8_gemm_runner_backend().is_deep_gemm():
+                weight_scale = layer.weight_scale_inv_deepgemm
+            elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv
@@ -853,6 +864,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert (
                 is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
+        if self.use_mxfp8 and get_moe_runner_backend().is_deep_gemm():
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            assert (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            ), "DeepGEMM MXFP8 MoE requires the deep_gemm package."
+            assert is_sm100_supported(), "DeepGEMM MXFP8 MoE requires SM100 GPUs."
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
@@ -1432,10 +1450,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             num_experts, m, k = weight_shape
             aligned_m = ((m + 127) // 128) * 128
-            scale = scale.view(num_experts, aligned_m, k // 32)
+            expected_k_groups = k // 32
+            scale = scale.contiguous()
+            scale_mn = num_experts * aligned_m
+            if scale.numel() % scale_mn != 0:
+                raise ValueError(
+                    "MXFP8 MoE scale size is not divisible by the padded expert rows: "
+                    f"scale_numel={scale.numel()} {scale_mn=} {weight_shape=} "
+                    f"scale_shape={tuple(scale.shape)}."
+                )
+            actual_k_groups = scale.numel() // scale_mn
+            if actual_k_groups < expected_k_groups:
+                raise ValueError(
+                    "MXFP8 MoE scale has fewer K groups than the weight shard: "
+                    f"{actual_k_groups=} {expected_k_groups=} {weight_shape=} "
+                    f"scale_shape={tuple(scale.shape)}."
+                )
+            scale = scale.view(num_experts, aligned_m, actual_k_groups)
+            if actual_k_groups > expected_k_groups:
+                scale = scale[:, :, :expected_k_groups].contiguous()
             num_warps = 8
             scale = _swizzle_mxfp8_sf(scale, num_warps)
-            scale = scale.data.view(num_experts, aligned_m, k // 32)
+            actual_k_groups = scale.data.numel() // scale_mn
+            if actual_k_groups < expected_k_groups:
+                raise ValueError(
+                    "MXFP8 MoE swizzled scale has fewer K groups than the weight shard: "
+                    f"{actual_k_groups=} {expected_k_groups=} {weight_shape=} "
+                    f"scale_shape={tuple(scale.data.shape)}."
+                )
+            scale = scale.data.view(num_experts, aligned_m, actual_k_groups)
+            if actual_k_groups > expected_k_groups:
+                scale = scale[:, :, :expected_k_groups].contiguous()
             return scale
 
         def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
@@ -1448,6 +1493,61 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             qweight, scale = mxfp8_group_quantize(weight_flat)
             qweight = qweight.view_as(weight)
             scale = _swizzle_with_triton_kernel(weight.shape, scale)
+            return qweight, scale
+
+        def _canonical_mxfp8_scale_for_weight(
+            weight_shape: tuple[int, int, int],
+            scale: torch.Tensor,
+        ) -> torch.Tensor:
+            num_experts, n, k = weight_shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+            expected_k_groups = k // 32
+            scale = scale.contiguous()
+            scale_mn = num_experts * n
+            aligned_n = ((n + 127) // 128) * 128
+            aligned_scale_mn = num_experts * aligned_n
+            if scale.numel() % scale_mn == 0:
+                scale_n = n
+            elif scale.numel() % aligned_scale_mn == 0:
+                scale_n = aligned_n
+                scale_mn = aligned_scale_mn
+            else:
+                raise ValueError(
+                    "MXFP8 MoE scale size is not divisible by expert rows: "
+                    f"scale_numel={scale.numel()} scale_mn={num_experts * n} "
+                    f"aligned_scale_mn={aligned_scale_mn} {weight_shape=} "
+                    f"scale_shape={tuple(scale.shape)}."
+                )
+            actual_k_groups = scale.numel() // scale_mn
+            if actual_k_groups < expected_k_groups:
+                raise ValueError(
+                    "MXFP8 MoE scale has fewer K groups than the weight shard: "
+                    f"{actual_k_groups=} {expected_k_groups=} {weight_shape=} "
+                    f"scale_shape={tuple(scale.shape)}."
+                )
+            scale = scale.view(num_experts, scale_n, actual_k_groups)
+            if scale_n != n:
+                scale = scale[:, :n, :]
+            if actual_k_groups > expected_k_groups:
+                scale = scale[:, :, :expected_k_groups].contiguous()
+            return scale
+
+        def _pack_deepgemm_mxfp8_scale(
+            weight_shape: tuple[int, int, int],
+            scale: torch.Tensor,
+        ) -> torch.Tensor:
+            return transform_mxfp8_scale_ue8m0(
+                _canonical_mxfp8_scale_for_weight(weight_shape, scale)
+            )
+
+        def _quantize_with_deepgemm(weight: torch.Tensor):
+            weight = weight.contiguous()
+            _, _, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+
+            weight_flat = weight.view(-1, k).contiguous()
+            qweight, scale = mxfp8_group_quantize(weight_flat)
+            qweight = qweight.view_as(weight)
             return qweight, scale
 
         def _quantize_with_flashinfer_trtllm(weight: torch.Tensor):
@@ -1480,6 +1580,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # 2) do row/layout shuffling in align_mxfp8_moe_weights_for_flashinfer_trtllm.
                 w13_q, w13_s = _quantize_with_flashinfer_trtllm(layer.w13_weight.data)
                 w2_q, w2_s = _quantize_with_flashinfer_trtllm(layer.w2_weight.data)
+            elif get_moe_runner_backend().is_deep_gemm():
+                w13_q, w13_s = _quantize_with_deepgemm(layer.w13_weight.data)
+                w2_q, w2_s = _quantize_with_deepgemm(layer.w2_weight.data)
             else:
                 w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
                     layer.w13_weight.data
@@ -1492,6 +1595,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
             ):
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
+            elif get_moe_runner_backend().is_deep_gemm():
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
@@ -1521,6 +1629,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         _copy_or_rebind(layer.w2_weight, w2_q)
         _copy_or_rebind(layer.w13_weight_scale_inv, w13_s)
         _copy_or_rebind(layer.w2_weight_scale_inv, w2_s)
+        if get_moe_runner_backend().is_deep_gemm():
+            copy_or_rebind_param(
+                layer,
+                "w13_weight_scale_inv_deepgemm",
+                _pack_deepgemm_mxfp8_scale(layer.w13_weight.data.shape, w13_s),
+            )
+            copy_or_rebind_param(
+                layer,
+                "w2_weight_scale_inv_deepgemm",
+                _pack_deepgemm_mxfp8_scale(layer.w2_weight.data.shape, w2_s),
+            )
         layer.w13_weight.requires_grad_(False)
         layer.w2_weight.requires_grad_(False)
         layer.w13_weight_scale_inv.requires_grad_(False)
@@ -1671,7 +1790,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+            dispatcher_quant_config = {"weight_dtype": layer.w13_weight.dtype}
+            if (
+                self.use_mxfp8
+                and hasattr(self, "runner")
+                and self.runner.runner_backend.is_deep_gemm()
+            ):
+                dispatcher_quant_config["fp8_activation_group_size"] = 32
+            layer.dispatcher.set_quant_config(dispatcher_quant_config)
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added
@@ -1893,8 +2019,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if self.block_quant:
                 block_shape = self.quant_config.weight_block_size
-                w13_scale = layer.w13_weight_scale_inv
-                w2_scale = layer.w2_weight_scale_inv
+                if self.use_mxfp8:
+                    w13_scale = layer.w13_weight_scale_inv_deepgemm
+                    w2_scale = layer.w2_weight_scale_inv_deepgemm
+                else:
+                    w13_scale = layer.w13_weight_scale_inv
+                    w2_scale = layer.w2_weight_scale_inv
             else:
                 # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
                 scale_block_size = 128
@@ -1923,6 +2053,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale=w2_scale,
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
+                is_mxfp8=self.use_mxfp8,
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

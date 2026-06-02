@@ -842,16 +842,16 @@ def ep_scatter(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    quant_group_size: int = 128,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
-    BLOCK_D = 128  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-    # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
     grid = num_experts
 
-    scale_hidden_size = hidden_size // BLOCK_D
+    assert hidden_size % quant_group_size == 0
+    scale_hidden_size = hidden_size // quant_group_size
     if scale_ue8m0:
         # ue8m0 scales are packed here (4 scales per int32),
         # hence the effective size of this dimension is divided by 4.
@@ -1172,6 +1172,7 @@ def moe_ep_deepgemm_preprocess(
     top_k: int,
     block_shape,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
+    scale_ue8m0: bool = False,
 ):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.zeros(
@@ -1212,7 +1213,13 @@ def moe_ep_deepgemm_preprocess(
     block_n, block_k = block_shape[0], block_shape[1]
 
     # TODO: fuse this with the preprocess
-    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+    if scale_ue8m0:
+        from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+
+        assert block_k == 32, f"{block_k=} must be 32 for MXFP8 UE8M0 scales"
+        hidden_states, scale = mxfp8_group_quantize(hidden_states)
+    else:
+        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
 
     gateup_input_scale = torch.empty(
         (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
@@ -1232,6 +1239,13 @@ def moe_ep_deepgemm_preprocess(
         scale.size(1),
         BLOCK_SIZE=1024,
     )
+
+    if scale_ue8m0:
+        from sglang.srt.layers.quantization.fp8_utils import (
+            transform_mxfp8_scale_ue8m0,
+        )
+
+        gateup_input_scale = transform_mxfp8_scale_ue8m0(gateup_input_scale)
 
     return (
         masked_m,

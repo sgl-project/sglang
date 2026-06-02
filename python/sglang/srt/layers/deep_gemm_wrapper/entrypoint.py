@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 import torch
 
@@ -46,7 +46,15 @@ def grouped_gemm_nt_f8f8bf16_masked(
     rhs = _ensure_cuda(rhs)
 
     with compile_utils.deep_gemm_execution_hook(
-        expected_m, n, k, num_groups, kernel_type
+        expected_m,
+        n,
+        k,
+        num_groups,
+        kernel_type,
+        recipe_a=recipe_a,
+        recipe_b=recipe_b,
+        sf_dtype_a=lhs[1].dtype,
+        sf_dtype_b=rhs[1].dtype,
     ):
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
@@ -100,7 +108,10 @@ def grouped_gemm_nt_bf16_masked(
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
+        fn = getattr(deep_gemm, "m_grouped_bf16_gemm_nt_masked", None)
+        if fn is None:
+            fn = getattr(deep_gemm, "bf16_m_grouped_gemm_nt_masked")
+        return fn(
             a,
             b,
             d,
@@ -133,27 +144,88 @@ def grouped_gemm_nt_f8f8bf16_contig(
     if recipe_b is not None:
         fp4_kwargs["recipe_b"] = recipe_b
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+    with compile_utils.deep_gemm_execution_hook(
+        m,
+        n,
+        k,
+        num_groups,
+        kernel_type,
+        recipe_a=recipe_a,
+        recipe_b=recipe_b,
+        sf_dtype_a=lhs[1].dtype,
+        sf_dtype_b=rhs[1].dtype,
+    ):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             lhs, rhs, out, m_indices, **fp4_kwargs
         )
 
 
 def grouped_gemm_nt_bf16_contig(
-    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    m_indices: torch.Tensor,
+    num_tokens_per_expert: Optional[Sequence[int]] = None,
 ):
     m, k = a.shape
     num_groups, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+    grouped_fn = getattr(deep_gemm, "m_grouped_bf16_gemm_nt_contiguous", None)
+    if grouped_fn is not None:
+        with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+            grouped_fn(a, b, d, m_indices)
+        return
+
+    if num_tokens_per_expert is None:
+        raise AttributeError(
+            "The installed deep_gemm package does not expose "
+            "m_grouped_bf16_gemm_nt_contiguous, and num_tokens_per_expert was "
+            "not provided for the per-expert BF16 fallback."
+        )
+
+    _grouped_gemm_nt_bf16_contig_fallback(a, b, d, num_tokens_per_expert)
+
+
+def _grouped_gemm_nt_bf16_contig_fallback(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    num_tokens_per_expert: Sequence[int],
+) -> None:
+    if len(num_tokens_per_expert) != b.shape[0]:
+        raise ValueError(
+            "num_tokens_per_expert length must match the number of expert groups: "
+            f"{len(num_tokens_per_expert)} != {b.shape[0]}."
+        )
+
+    start = 0
+    for expert_id, count in enumerate(num_tokens_per_expert):
+        end = start + int(count)
+        if end > start:
+            gemm_nt_bf16bf16f32(
+                a[start:end],
+                b[expert_id],
+                d[start:end],
+            )
+        start = end
+
+    if start != a.shape[0]:
+        raise ValueError(
+            "num_tokens_per_expert does not sum to the grouped BF16 input tokens: "
+            f"{start} != {a.shape[0]}."
+        )
 
 
 def gemm_nt_f8f8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+    compiled_dims: str = "nk",
+    disable_ue8m0_cast: bool = False,
 ):
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
@@ -163,11 +235,35 @@ def gemm_nt_f8f8bf16(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+    fp8_kwargs = {}
+    if recipe is not None:
+        fp8_kwargs["recipe"] = recipe
+    if recipe_a is not None:
+        fp8_kwargs["recipe_a"] = recipe_a
+    if recipe_b is not None:
+        fp8_kwargs["recipe_b"] = recipe_b
+    if compiled_dims != "nk":
+        fp8_kwargs["compiled_dims"] = compiled_dims
+    if disable_ue8m0_cast:
+        fp8_kwargs["disable_ue8m0_cast"] = disable_ue8m0_cast
+
+    with compile_utils.deep_gemm_execution_hook(
+        m,
+        n,
+        k,
+        num_groups,
+        kernel_type,
+        recipe=recipe,
+        recipe_a=recipe_a,
+        recipe_b=recipe_b,
+        sf_dtype_a=lhs[1].dtype,
+        sf_dtype_b=rhs[1].dtype,
+    ):
         deep_gemm.fp8_gemm_nt(
             lhs,
             rhs,
             out,
+            **fp8_kwargs,
         )
 
 
