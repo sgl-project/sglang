@@ -177,7 +177,7 @@ class AttentionBackend(ABC):
             )
 
     # ------------------------------------------------------------------
-    # Canonical forward methods (attention refactor step 09)
+    # Canonical forward methods
     # ------------------------------------------------------------------
     # Backends should override the canonical names. The deprecated
     # ``forward_extend`` / ``forward_decode`` / ``forward_mixed`` overrides

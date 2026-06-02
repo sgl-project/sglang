@@ -79,7 +79,7 @@ _is_npu = is_npu()
 class ForwardMode(IntEnum):
     """Forward mode for an attention batch.
 
-    Shape-classified canonical names (introduced in attention refactor step 09):
+    Shape-classified canonical names:
 
     * ``VAR_LEN`` — each request has a different per-request length
       (extend / prefill / chunked-prefill mixed / draft-extend /
@@ -110,8 +110,7 @@ class ForwardMode(IntEnum):
     ``is_var_len()`` / ``is_single_token()`` / ``is_uniform_len()``.
     """
 
-    # ---- New canonical shape-class members (explicit values; IntEnum
-    # aliases pinned to keep cross-version pickle / IPC compatibility) ----
+    # ---- New canonical shape-class members ----
     VAR_LEN = 1
     SINGLE_TOKEN = 2
     UNIFORM_LEN = 3
