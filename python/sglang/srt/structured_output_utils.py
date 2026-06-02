@@ -4,7 +4,6 @@
 import json
 from typing import Any, Optional
 
-
 _CONSTRAINT_KEYS = ("json_schema", "regex", "ebnf", "structural_tag")
 
 

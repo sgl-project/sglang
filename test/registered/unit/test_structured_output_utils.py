@@ -7,7 +7,6 @@ from sglang.srt.structured_output_utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 
@@ -31,9 +30,7 @@ class TestStructuredOutputUtils(unittest.TestCase):
     def test_apply_response_format_does_not_override_existing_constraint(self):
         params = {"json_schema": '{"type":"array"}'}
         self.assertEqual(
-            apply_response_format_to_sampling_params(
-                params, {"type": "json_object"}
-            ),
+            apply_response_format_to_sampling_params(params, {"type": "json_object"}),
             params,
         )
 

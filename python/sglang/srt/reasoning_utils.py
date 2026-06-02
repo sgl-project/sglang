@@ -4,7 +4,6 @@
 import logging
 from typing import Any, Optional
 
-
 logger = logging.getLogger(__name__)
 _REASONING_DEFAULT_UNSET = object()
 
@@ -21,10 +20,7 @@ def _resolve_by_mode(
     if mode == "mistral":
         return reasoning_effort is not None and reasoning_effort != "none"
     if mode in ("thinking", "enable_thinking"):
-        return (
-            not chat_template_kwargs
-            or chat_template_kwargs.get(mode) is not False
-        )
+        return not chat_template_kwargs or chat_template_kwargs.get(mode) is not False
     if mode in ("explicit_thinking", "explicit_enable_thinking"):
         toggle = mode.replace("explicit_", "")
         return (
@@ -79,7 +75,9 @@ def resolve_require_reasoning(
         )
 
     if reasoning_default is not _REASONING_DEFAULT_UNSET:
-        return _resolve_by_mode(reasoning_default, chat_template_kwargs, reasoning_effort)
+        return _resolve_by_mode(
+            reasoning_default, chat_template_kwargs, reasoning_effort
+        )
 
     if reasoning_parser == "deepseek-v3":
         return (
