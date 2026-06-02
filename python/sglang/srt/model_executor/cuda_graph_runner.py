@@ -958,18 +958,25 @@ class CudaGraphRunner:
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
-        req_pool_indices = buffers.req_pool_indices[:bs]
-        seq_lens = buffers.seq_lens[:bs]
-        seq_lens_cpu = buffers.seq_lens_cpu[:bs]
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
-        positions = buffers.positions[:num_tokens]
+        # Graph inputs. The registry-owned FB-shared slots come from the
+        # registry (it adopted the DecodeInputBuffers storage, so these are the
+        # same physical tensors); the rest still come off `buffers` directly.
+        registry = self.buffer_registry
+
+        def _slot(name):
+            return registry.get_slot(name).view(bs, num_tokens)
+
+        input_ids = _slot("input_ids")
+        req_pool_indices = _slot("req_pool_indices")
+        seq_lens = _slot("seq_lens")
+        seq_lens_cpu = _slot("seq_lens_cpu")
+        out_cache_loc = _slot("out_cache_loc")
+        positions = _slot("positions")
         if self.is_encoder_decoder:
             encoder_lens = buffers.encoder_lens[:bs]
         else:
             encoder_lens = None
-        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        mrope_positions = _slot("mrope_positions")
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
@@ -1046,15 +1053,15 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
-        # mamba state tracking
+        # mamba state tracking (registry-owned when enabled)
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
+            _slot("mamba_track_mask")
+            if registry.has_slot("mamba_track_mask")
             else None
         )
 
