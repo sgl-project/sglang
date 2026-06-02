@@ -594,7 +594,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # snapshot, while global_num_tokens_cpu may be padded in place later
             # (prepare_mlp_sync_batch). Without the copy both would alias the same
             # schedule-batch list and the snapshot would be lost.
-            ret.original_global_num_tokens_cpu = list(batch.global_num_tokens)
+            # original_* must be the SPEC-ADJUSTED actual row count
+            # (global_num_tokens), not the raw per-request count
+            # (batch.global_num_tokens): for a spec target_verify batch each
+            # request occupies num_draft_tokens rows, and _zero_dp_global_padding_rows
+            # treats rows in [original_, padded) as DP padding and zeros them. Using
+            # the raw count would wrongly zero the 2nd..Nth verify token of every
+            # request under dp-attention (corrupting all but position 0). For the
+            # non-spec path global_num_tokens is batch.global_num_tokens (no-op).
+            ret.original_global_num_tokens_cpu = list(global_num_tokens)
             ret.global_num_tokens_cpu = list(global_num_tokens)
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
