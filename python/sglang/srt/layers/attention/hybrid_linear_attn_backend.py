@@ -495,9 +495,10 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
                     spec_info.retrieve_next_sibling
                 )
-                self.retrieve_parent_token_list[bs - 1][:bs_without_pad].copy_(
-                    spec_info.retrieve_parent_token
-                )
+                if getattr(spec_info, "retrieve_parent_token", None) is not None:
+                    self.retrieve_parent_token_list[bs - 1][:bs_without_pad].copy_(
+                        spec_info.retrieve_parent_token
+                    )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
