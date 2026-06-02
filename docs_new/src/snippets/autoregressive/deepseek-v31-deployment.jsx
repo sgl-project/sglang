@@ -130,27 +130,29 @@ export const DeepSeekV31Deployment = () => {
       'v31terminusint8': 'IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8'
     };
 
-    const isXeon = hardware === 'xeon';
-
-    if (modelname === 'v31terminusint8' && !isXeon) {
-      return '# Error: DeepSeek-V3.1-Terminus-Channel-int8 is only supported on Intel Xeon CPUs\n# Please select XEON hardware';
-    }
-
     const modelName = modelMap[modelname];
+    const isXeon = hardware === 'xeon';
 
     let cmd = 'python3 -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelName}`;
 
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+      if (modelname === 'v31terminusint8') {
+        cmd += ` \\\n  --quantization w8a8_int8`;
+      }
+    }
+
     // TP is mandatory
     cmd += isXeon ? ` \\\n  --tp 6` : ` \\\n  --tp 8`;
     if (strategyArray.includes('dp')) {
-      cmd += isXeon ? ` \\\n  --dp 6 \\\n  --enable-dp-attention` : ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
     }
     if (strategyArray.includes('ep')) {
-      cmd += isXeon ? ` \\\n  --ep 6` : ` \\\n  --ep 8`;
+      cmd += ` \\\n  --ep 8`;
     }
     // Multi-token prediction (MTP) configuration
-    if (strategyArray.includes('mtp') && !isXeon) {
+    if (strategyArray.includes('mtp')) {
       cmd += ` \\\n  --speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4`;
     }
 
@@ -169,9 +171,6 @@ export const DeepSeekV31Deployment = () => {
       cmd += ` \\\n  --chat-template ./examples/chat_template/tool_chat_template_deepseekv31.jinja`;
     }
 
-    if (isXeon) {
-      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
-    }
 
     return cmd;
   };
