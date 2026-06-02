@@ -264,6 +264,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             retrieve_index,
             retrieve_next_token,
             retrieve_next_sibling,
+            retrieve_parent_token,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             draft_input.bonus_tokens,
@@ -287,6 +288,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
             retrieve_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
