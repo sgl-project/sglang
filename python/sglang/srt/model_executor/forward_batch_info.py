@@ -962,18 +962,60 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
-            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            if self.spec_info is not None and not self.spec_info.is_draft_input():
+                # Spec target-verify batch. Keep the num_tokens_per_req structure so
+                # every DP rank runs the SAME verify forward with identical collectives
+                # (the decode-style IDLE->EXTEND conversion below collapses verify's
+                # multi-token reqs and leaves idle ranks empty -> NCCL deadlock). An
+                # idle rank is promoted to TARGET_VERIFY; _pad_inputs_to_size then fills
+                # num_tokens fake rows / (num_tokens//ntpr) fake reqs whose req_pool
+                # indices drive generate_attn_arg_prefill (draft_token content is unused).
+                if self.forward_mode.is_idle():
+                    setattr(self, "_original_forward_mode", self.forward_mode)
+                    self.forward_mode = ForwardMode.TARGET_VERIFY
+                bs = self.batch_size = (
+                    num_tokens // self.spec_info.num_tokens_per_req
+                )
+            elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
-                self.extend_num_tokens = bs
-                self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
-                self.extend_prefix_lens = self.seq_lens - 1
-                self.extend_start_loc = torch.arange(
-                    bs, dtype=torch.int32, device=self.seq_lens.device
+                # MAX_LEN reaches here only for an idle/empty rank (assert below).
+                # Build extend metadata sized by num_tokens (not bs) so seq_lens/
+                # req_pool_indices stay non-empty -> the attention plan never calls
+                # max() on a 0-size tensor and the idle rank issues the same
+                # collectives as busy ranks.
+                # Represent the rank as ONE fake request spanning all num_tokens tokens
+                # (prefix 0), NOT num_tokens single-token requests -- the latter
+                # inflates bs past the attention backend's per-rank kv_indptr buffer
+                # (sized for ~max_running/dp_size reqs) and overflows it. One fake req
+                # keeps bs == 1 while still producing num_tokens rows; the output is
+                # discarded downstream (real_tokens == 0).
+                dev = self.seq_lens.device
+                assert (
+                    self.seq_lens.shape[0] == 0
+                ), "extend-idle conversion expects an empty rank"
+                self.extend_num_tokens = num_tokens
+                self.extend_seq_lens = torch.tensor(
+                    [num_tokens], dtype=torch.int32, device=dev
                 )
-                self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
-                self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
-                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
+                self.extend_prefix_lens = torch.zeros(
+                    1, dtype=self.seq_lens.dtype, device=dev
+                )
+                self.extend_start_loc = torch.zeros(
+                    1, dtype=torch.int32, device=dev
+                )
+                self.seq_lens = torch.tensor(
+                    [num_tokens], dtype=self.seq_lens.dtype, device=dev
+                )
+                self.seq_lens_sum = int(num_tokens)
+                if self.seq_lens_cpu is not None:
+                    self.seq_lens_cpu = torch.tensor(
+                        [num_tokens], dtype=self.seq_lens.dtype
+                    )
+                self.extend_prefix_lens_cpu = [0]
+                self.extend_seq_lens_cpu = [int(num_tokens)]
+                self.extend_logprob_start_lens_cpu = [0]
+                bs = self.batch_size = 1
             else:
                 if self.spec_info is not None:
                     bs = self.batch_size = (

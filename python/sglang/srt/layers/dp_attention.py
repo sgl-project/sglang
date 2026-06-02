@@ -74,6 +74,13 @@ class DpPaddingMode(IntEnum):
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
         # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
+            # If any rank is idle (0 tokens), SUM_LEN leaves it on the forward_idle
+            # path while busy ranks run the extend path -> mismatched per-rank DP
+            # collective sequence -> NCCL deadlock (hits spec/NEXTN target-verify,
+            # where bs=1 leaves the other DP rank idle). MAX_LEN pads idle ranks up
+            # so they convert to EXTEND and issue the same collectives.
+            if min(global_num_tokens) == 0:
+                return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
