@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 import einops
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import silu_and_mul_masked_post_quant
+from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -77,7 +77,7 @@ _dsv4_fp4_shape_stats_total = 0
 
 
 def _fp4_bf16_scale_supported(
-    expected_m: int,
+    _expected_m: int,
     num_groups: int,
     m: int,
     n: int,
@@ -90,9 +90,7 @@ def _fp4_bf16_scale_supported(
         return False
     if os.getenv("DG_W4_SCALE_B_POW2_PROMOTE", "0") != "0":
         return False
-    return expected_m <= 16 or _fp4_pathb_bm32_direct_load_supported(
-        num_groups, m, n, k, masked_m_max_hint
-    )
+    return _fp4_pathb_bm32_direct_load_supported(num_groups, m, n, k, masked_m_max_hint)
 
 
 def _fp4_pathb_bm32_direct_load_supported(
@@ -121,7 +119,7 @@ def _fp4_pathb_bm32_direct_load_supported(
 
 
 def _fp4_e8m0_scale_supported(
-    expected_m: int,
+    _expected_m: int,
     num_groups: int,
     m: int,
     n: int,
@@ -137,9 +135,7 @@ def _fp4_e8m0_scale_supported(
         return False
     if os.getenv("DG_W4_SCALE_B_POW2_PROMOTE", "0") != "0":
         return False
-    return expected_m <= 16 or _fp4_pathb_bm32_direct_load_supported(
-        num_groups, m, n, k, masked_m_max_hint
-    )
+    return _fp4_pathb_bm32_direct_load_supported(num_groups, m, n, k, masked_m_max_hint)
 
 
 def _raise_fp4_e8m0_only_unsupported(
