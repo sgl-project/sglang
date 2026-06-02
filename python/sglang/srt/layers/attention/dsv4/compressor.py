@@ -194,7 +194,13 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if self.enable_deepseek_v4_fp4_indexer:
+            token_to_kv_pool.set_index_k_fp4(
+                layer_id=layer_id,
+                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                cache_k=new_compressed_kv,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
