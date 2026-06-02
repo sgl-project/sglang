@@ -512,7 +512,6 @@ class FlashInferWorkspaceManager:
             self.initialized = False
             return
 
-
     def is_buffer_size_sufficient(
         self,
         token_num: int,
