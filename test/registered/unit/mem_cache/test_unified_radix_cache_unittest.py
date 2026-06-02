@@ -1114,6 +1114,51 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
+    def test_swa_leaf_capped_to_window_on_insert(self):
+        """A long SWA leaf is split so locking it protects one window of SWA
+        while full attention still protects the whole sequence."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        tail_size = ((window + ps - 1) // ps) * ps
+        tail_pages = tail_size // ps
+
+        for case in ("long_splits", "short_keeps"):
+            with self.subTest(case=case):
+                tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+                num_pages = tail_pages + 2 if case == "long_splits" else tail_pages
+                seq = self._make_seq(1, num_pages)
+                self._insert(tree, allocator, req_to_token_pool, seq)
+                tree.sanity_check()
+
+                leaf = tree.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq)))
+                ).last_device_node
+                swa_val = leaf.component_data[ComponentType.SWA].value
+                self.assertIsNotNone(swa_val)
+
+                if case == "long_splits":
+                    # Capped to one page-aligned window; prefix is a real ancestor.
+                    self.assertEqual(len(swa_val), tail_size)
+                    self.assertIsNot(leaf.parent, tree.root_node)
+                else:
+                    # Already within one window — no split.
+                    self.assertEqual(len(swa_val), len(seq))
+                    self.assertIs(leaf.parent, tree.root_node)
+
+                lock_result = tree.inc_lock_ref(leaf)
+                # SWA pins one window; full attention pins everything.
+                self.assertEqual(tree.swa_protected_size(), len(swa_val))
+                self.assertEqual(tree.full_protected_size(), len(seq))
+                tree.sanity_check()
+                tree.dec_lock_ref(
+                    leaf,
+                    DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
+                )
+                tree.sanity_check()
+
     def _swa_lru_order(self, tree):
         lru = tree.lru_lists[ComponentType.SWA]
         pt = lru._pt
@@ -1153,29 +1198,29 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, seq_side)
 
         pre = self._swa_lru_order(tree)
-        self.assertEqual(len(pre), 4)
-        side_node, c_node, b_node, a_node = pre
+        # Each 8-page segment is cap-split into [prefix, tail]; the tail leads
+        # the pair in MRU order, so segment tails sit at even indices.
+        self.assertEqual(len(pre), 8)
+        side_node, c_node, b_node, a_node = pre[0], pre[2], pre[4], pre[6]
 
         seq_abcd = seq_abc + self._make_seq(300, 8)
         self._insert(tree, allocator, req_to_token_pool, seq_abcd)
 
         post = self._swa_lru_order(tree)
-        # new leaf E exists now, length 5
-        self.assertEqual(len(post), 5)
+        # New segment E adds two nodes (prefix + tail).
+        self.assertEqual(len(post), 10)
         # side branch must still appear BEFORE B and A in MRU->LRU order:
-        # bounded refresh on new leaf E (size=8 >= cushion=5) refreshes only E.
+        # walk-down on the new segment must not refresh old ancestors.
         side_pos = post.index(side_node)
-        b_pos = post.index(b_node)
-        a_pos = post.index(a_node)
         self.assertLess(
             side_pos,
-            b_pos,
+            post.index(b_node),
             f"side branch must remain ahead of B (no walk-down refresh); "
             f"post={[n.id for n in post]}, side={side_node.id}, B={b_node.id}",
         )
         self.assertLess(
             side_pos,
-            a_pos,
+            post.index(a_node),
             f"side branch must remain ahead of A (no walk-down refresh); "
             f"post={[n.id for n in post]}, side={side_node.id}, A={a_node.id}",
         )
@@ -1197,26 +1242,30 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, seq_side)
 
         pre = self._swa_lru_order(tree)
-        self.assertEqual(len(pre), 4)
-        side_node, c_node, b_node, a_node = pre
+        # Each 8-page segment is cap-split into [prefix, tail]; tails lead in
+        # MRU order, so segment tails sit at even indices.
+        self.assertEqual(len(pre), 8)
+        side_node, c_node, b_node, a_node = pre[0], pre[2], pre[4], pre[6]
 
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
         self.assertEqual(len(m.device_indices), len(seq_abc))
 
         post = self._swa_lru_order(tree)
-        self.assertIs(post[0], c_node, "C (last matched node) must be MRU")
-        self.assertIs(
-            post[-1],
-            a_node,
-            "Oldest out-of-cushion ancestor A must remain at LRU tail; "
-            f"got post={[n.id for n in post]}, "
-            f"pre={[n.id for n in pre]}",
-        )
+        # Matching seq_abc refreshes only the window cushion (C's capped nodes)
+        # to the MRU side; out-of-cushion ancestors B and A keep their order.
         self.assertIn(
-            side_node,
-            post[:2],
-            "Side branch must NOT be pushed below ancestors after deep match; "
-            f"got post={[n.id for n in post]}",
+            c_node, post[:2], f"C must be refreshed to MRU; post={[n.id for n in post]}"
+        )
+        self.assertLess(
+            post.index(side_node),
+            post.index(b_node),
+            "Side branch must NOT be pushed below ancestors after deep match",
+        )
+        self.assertLess(post.index(b_node), post.index(a_node), "B must stay above A")
+        self.assertGreaterEqual(
+            post.index(a_node),
+            len(post) - 2,
+            "Oldest out-of-cushion ancestor A must stay at the LRU-tail end",
         )
         tree.sanity_check()
 
@@ -1272,20 +1321,24 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, seq_side)
 
         pre = self._swa_lru_order(tree)
-        self.assertEqual(len(pre), 4)
-        side_node, c_node, b_node, a_node = pre
+        self.assertEqual(len(pre), 8)
+        side_node, c_node, b_node, a_node = pre[0], pre[2], pre[4], pre[6]
+        c_prefix = pre[3]  # C's prefix pairs with its tail (c_node) at pre[2:4]
 
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
         self.assertEqual(len(m.device_indices), len(seq_abc))
         post = self._swa_lru_order(tree)
 
         cushion = self.cfg.sliding_window_size + self.cfg.page_size
-        self.assertGreaterEqual(len(c_node.key), cushion)
-        self.assertIs(post[0], c_node, "C alone exhausts cushion → only C refreshed")
-        # B and A: untouched ordering relative to each other AND to side_node
+        # Under leaf-cap no single node exceeds the cushion; it spans C's capped
+        # tail plus its prefix, so both of C's nodes are refreshed to the MRU
+        # side while B and A keep their relative order below.
+        self.assertLess(len(c_node.key), cushion)
+        self.assertIn(c_node, post[:2])
+        self.assertIn(c_prefix, post[:2])
+        side_pos = post.index(side_node)
         b_pos = post.index(b_node)
         a_pos = post.index(a_node)
-        side_pos = post.index(side_node)
         self.assertLess(side_pos, b_pos, "B was below side in pre, must stay below")
         self.assertLess(b_pos, a_pos, "A was below B in pre, must stay below")
         tree.sanity_check()
