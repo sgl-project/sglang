@@ -123,9 +123,9 @@ class TestRegressionBasic(ScriptedTestCase):
             f"observed max={observed_max} (pre-fix bug would bump to 2 "
             f"at the last-chunk admit boundary)"
         )
-        assert cleared_inflight, (
-            "inflight_middle_chunks should be 0 once the chunk loop clears"
-        )
+        assert (
+            cleared_inflight
+        ), "inflight_middle_chunks should be 0 once the chunk loop clears"
 
         yield from run_until_finished(r)
         assert r.finished
