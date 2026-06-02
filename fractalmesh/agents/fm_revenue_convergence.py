@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fm-revenue-convergence")
 
 DB = os.path.expanduser(os.getenv("SOVEREIGN_DB", "~/fmsaas/data/sovereign.db"))
-PORT = int(os.getenv("REVENUE_CONVERGENCE_PORT", "7867"))
+PORT = int(os.getenv("REVENUE_CONVERGENCE_PORT", "7910"))
 DAILY_TARGET_AUD = float(os.getenv("DAILY_TARGET_AUD", "1070"))
 
 # ── Credentials (from vault, never hardcoded) ─────────────────────────────────

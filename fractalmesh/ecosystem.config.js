@@ -1240,7 +1240,8 @@ module.exports = {
             ['fm-rss-ingest',     'fm_rss_ingest',       '30M'],
             ['fm-stripe-worker',  'fm_stripe_worker',    '25M'],
             ['fm-negotiator',           'fm_negotiator',           '25M'],
-            ['fm-revenue-convergence',  'fm_revenue_convergence',  '30M'],
+            // fm-revenue-convergence has its own env block for the port override
+
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,
@@ -1258,5 +1259,25 @@ module.exports = {
             out_file:   `${ROOT}/logs/${name}-out.log`,
             time:       true,
         })),
+
+        // ── Revenue Convergence Monitor (port 7910) ───────────────────────
+        {
+            name:              'fm-revenue-convergence',
+            script:            'agents/fm_revenue_convergence.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'30M',
+            env_production: {
+                FRACTALMESH_HOME:          ROOT,
+                NODE_ENV:                  'production',
+                PYTHONUNBUFFERED:          '1',
+                REVENUE_CONVERGENCE_PORT:  '7910',
+            },
+            error_file: `${ROOT}/logs/fm-revenue-convergence-error.log`,
+            out_file:   `${ROOT}/logs/fm-revenue-convergence-out.log`,
+            time:       true,
+        },
     ],
 };
