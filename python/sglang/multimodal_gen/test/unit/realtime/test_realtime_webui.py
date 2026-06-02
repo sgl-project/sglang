@@ -42,10 +42,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-fixes-v25" in index_html
     assert "app.js?v=realtime-fixes-v30" in index_html
-    assert (
-        'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";'
-        in app_js
-    )
+    assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";' in app_js
     assert "const DEFAULT_TARGET_FPS = 25;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;" in app_js
