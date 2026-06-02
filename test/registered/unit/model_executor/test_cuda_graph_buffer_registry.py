@@ -558,5 +558,101 @@ class TestPoolBackedAlloc(unittest.TestCase):
         )
 
 
+class TestBuildDecodeRegistry(unittest.TestCase):
+    """``build_decode_registry`` registers the always-on FB-shared decode
+    slots with padding policies matching
+    ``DecodeInputBuffers.populate_from_forward_batch``."""
+
+    def setUp(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+
+    def test_factory_slot_set_and_padding(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        FILL = 5
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=FILL,
+            cache_loc_dtype=torch.int64,
+            share_pool=False,
+        )
+        for name in (
+            "input_ids",
+            "positions",
+            "out_cache_loc",
+            "req_pool_indices",
+            "seq_lens",
+            "seq_lens_cpu",
+            "mrope_positions",
+        ):
+            self.assertTrue(reg.has_slot(name), name)
+        self.assertFalse(reg.has_slot("mamba_track_indices"))
+
+        raw_bs, padded_bs, raw_nt, padded_nt = 2, 4, 2, 4
+        fb = _MiniForwardBatch(
+            batch_size=raw_bs,
+            input_ids=torch.tensor([10, 11], dtype=torch.int64),
+            positions=torch.tensor([0, 1], dtype=torch.int64),
+            out_cache_loc=torch.tensor([100, 101], dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
+            seq_lens=torch.tensor([7, 8], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([7, 8], dtype=torch.int32),
+            mrope_positions=torch.tensor(
+                [[0, 1], [0, 1], [0, 1]], dtype=torch.int64
+            ),
+        )
+        # Poison tails so resets are observable.
+        for n in ("input_ids", "positions", "out_cache_loc", "req_pool_indices"):
+            reg.get_slot(n).buffer.fill_(99)
+        reg.fill_from(
+            fb,
+            raw_bs=raw_bs,
+            padded_bs=padded_bs,
+            raw_num_tokens=raw_nt,
+            padded_num_tokens=padded_nt,
+        )
+
+        # FOREACH_COPY: head copied, tail kept (poison).
+        ids = reg.get_slot("input_ids").buffer
+        self.assertTrue(torch.equal(ids[:2], torch.tensor([10, 11])))
+        self.assertTrue(torch.equal(ids[2:4], torch.tensor([99, 99])))
+        # ZERO: head copied, tail zeroed.
+        oc = reg.get_slot("out_cache_loc").buffer
+        self.assertTrue(torch.equal(oc[:2], torch.tensor([100, 101])))
+        self.assertTrue(torch.equal(oc[2:4], torch.tensor([0, 0])))
+        rp = reg.get_slot("req_pool_indices").buffer
+        self.assertTrue(torch.equal(rp[:2], torch.tensor([1, 2])))
+        self.assertTrue(torch.equal(rp[2:4], torch.tensor([0, 0])))
+        # FILL_SENTINEL: head copied, tail = seq_len_fill_value.
+        sl = reg.get_slot("seq_lens").buffer
+        self.assertTrue(torch.equal(sl[:2], torch.tensor([7, 8], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(sl[2:4], torch.tensor([FILL, FILL], dtype=torch.int32))
+        )
+        slc = reg.get_slot("seq_lens_cpu").buffer
+        self.assertEqual(slc.device.type, "cpu")
+        self.assertTrue(
+            torch.equal(slc[2:4], torch.tensor([FILL, FILL], dtype=torch.int32))
+        )
+        # 2D mrope via slice_fn.
+        mr = reg.get_slot("mrope_positions").buffer
+        self.assertTrue(torch.equal(mr[:, :2], fb.mrope_positions))
+
+        fb_view = reg.extract_buffer(
+            padded_bs=padded_bs,
+            padded_num_tokens=padded_nt,
+            forward_batch_template=fb,
+        )
+        self.assertEqual(fb_view.batch_size, padded_bs)
+        self.assertEqual(fb_view.input_ids.shape[0], padded_nt)
+        self.assertEqual(fb_view.seq_lens.shape[0], padded_bs)
+
+
 if __name__ == "__main__":
     unittest.main()
