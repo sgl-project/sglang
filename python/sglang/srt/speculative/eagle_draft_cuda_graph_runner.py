@@ -509,15 +509,26 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            forward_batch, bs
+        raw_seq_lens_sum = forward_batch.seq_lens_sum
+        padded_seq_lens_sum = (
+            None
+            if raw_seq_lens_sum is None
+            else raw_seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
         )
-        self.raw_bs = raw_bs
-        self.bs = bs
-        # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
+        # Keep seq_lens_sum consistent with the padded seq_lens while backends
+        # build replay metadata and the captured graph runs.
+        forward_batch.seq_lens_sum = padded_seq_lens_sum
+        try:
+            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+                forward_batch, bs
+            )
+            self.raw_bs = raw_bs
+            self.bs = bs
 
-        # Replay
-        self._replay(forward_batch)
+            # Replay
+            self._replay(forward_batch)
+        finally:
+            forward_batch.seq_lens_sum = raw_seq_lens_sum
         out = self.output_buffers[bs]
 
         if bs != raw_bs:
