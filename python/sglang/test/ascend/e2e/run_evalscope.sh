@@ -4,7 +4,7 @@ set -e
 
 PYTHON_ENV_FOR_EVALSCOPE=test_env_evalscope
 PIP_FOR_EVALSCOPE=${PYTHON_ENV_FOR_EVALSCOPE}/bin/pip
-EVALSCOPE_SOURCE_PATH=/root/sglang/python/sglang/test/ascend/e2e/evalscope
+EVALSCOPE_SOURCE_PATH=/root/.cache/.cache/evalscope_source
 pip_mirror_source="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 
 if [ -d "${PYTHON_ENV_FOR_EVALSCOPE}" ]; then
