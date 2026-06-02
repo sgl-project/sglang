@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import requests
 from prometheus_client.parser import text_string_to_metric_families
 
-from sglang.srt.disaggregation.prefill import should_force_optimistic_prefill_retry
+from sglang.srt.disaggregation.prefill import should_force_retry
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -31,7 +31,7 @@ def rid_that_forces_retry(prefix: str) -> str:
             is_retracted=False,
             time_stats=SimpleNamespace(prefill_retry_count=0),
         )
-        if should_force_optimistic_prefill_retry(req):
+        if should_force_retry(req):
             return rid
     raise RuntimeError("Failed to sample an optimistic prefill retry rid")
 
