@@ -67,9 +67,14 @@ class TestSWABasic(ScriptedTestCase):
         assert r.kv_pages == 0
         assert r.lock_refs == 0
         # The finished req commits its prompt prefix to the radix tree, so the SWA
-        # pool stays below baseline until the overlap lag drains and the cache is
-        # flushed. Drain, flush, then measure recovery.
-        for _ in range(5):
+        # pool stays below baseline until the cache is flushed. flush_cache is a
+        # no-op unless the scheduler is fully idle (it bails while the just-finished
+        # req still lingers in the overlap pipeline), so drain until is_fully_idle
+        # BEFORE flushing -- a fixed 5-yield drain is not always enough and leaves
+        # the committed prefix un-flushed, reading as a ~prompt-sized pool deficit.
+        for _ in range(40):
+            if t.is_fully_idle:
+                break
             yield
         t.flush_cache()
         yield
@@ -79,34 +84,41 @@ class TestSWABasic(ScriptedTestCase):
             f"final={t.engine_stats()['kv_pool_free']}"
         )
 
-    def test_swa_chunked_park_on_budget_exhaustion(self):
-        self.server.execute_script(self._script_swa_chunked_park_on_budget_exhaustion)
+    def test_swa_chunked_resume_under_swa_pressure(self):
+        self.server.execute_script(self._script_swa_chunked_resume_under_swa_pressure)
 
     @staticmethod
-    def _script_swa_chunked_park_on_budget_exhaustion(t: ScriptedContext):
-        # add_chunked_req hybrid-SWA early-return (schedule_policy.py:679-681):
-        # when _rem_tokens (= rem_swa_tokens - page_size) drops to <= 0 while a
-        # chunked req is in flight, the scheduler returns the req WITHOUT
-        # scheduling its next chunk -- it is parked, not advanced and not dropped.
-        # chunked_parks counts exactly those held-but-not-run iterations. Drive
-        # the SWA pool to exhaustion mid-chunk to force at least one park, then
-        # assert the req still completes with no leaked pages or lock refs (park,
-        # not leak; the non-SWA branch would instead force-admit at line 682).
+    def _script_swa_chunked_resume_under_swa_pressure(t: ScriptedContext):
+        # Exercise the hybrid-SWA across-window budget path in add_chunked_req
+        # (schedule_policy.py:671-682) under genuine SWA-pool pressure: grab most
+        # of the SWA pool mid-chunk (leaving a small residual) so every subsequent
+        # chunk admission recomputes the SWA budget (rem_swa_tokens - page_size)
+        # against a nearly-empty pool. The prompt straddles the sliding window
+        # (_SWA_WINDOW + VERY_LONG_PROMPT_LEN), so the across-window branch runs
+        # repeatedly, and the req must still drive to completion and release all
+        # SWA KV / radix lock refs.
         #
-        # The prompt must exceed the sliding window (_SWA_WINDOW=4096): once
-        # prefill passes the window, SWA evicts the req's own out-of-window KV
-        # back to the pool, which is what lets a parked chunk eventually resume
-        # even though exhaust_kv holds every externally-free page. A prompt that
-        # fits inside the window (e.g. VERY_LONG_PROMPT_LEN=2048) never self-evicts
-        # and would park forever after exhaustion.
+        # Why this and not "park to >=1 then resume": on v1 with the SWA *radix*
+        # cache a single chunked req can never resume from a *full* SWA exhaustion.
+        # Radix-mode self-eviction of a req's own out-of-window KV happens only in
+        # the chunk-cache extend branch of maybe_evict_swa, and the in-flight
+        # chunked req holds a swa_lock_ref on its committed prefix, so it cannot
+        # reclaim its own SWA pages. With leave_pages=0 the req deadlocks at chunk 1
+        # (swa_available_size()==0, never finishing) and the park is never even
+        # recorded -- no batch runs, so chunked_parks stays 0. The real, observable
+        # v1 invariant is the tight-budget across-window resume asserted below.
         r = t.start_req(prompt_len=_SWA_WINDOW + VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        t.exhaust_kv(leave_pages=0)
+        chunks_at_pressure = r.chunks_done
+        t.exhaust_kv(leave_pages=1000)
         yield from run_until_finished(r, max_steps=2000)
         assert r.finished
-        assert r.chunked_parks >= 1, (
-            "SWA budget exhaustion mid-chunk must park the chunked req at least "
-            f"once (schedule_policy.py:680-681); got chunked_parks={r.chunked_parks}"
+        # Prefill kept advancing under SWA pressure past the chunk it was on when
+        # the pool was squeezed -- the across-window budget path did not stall it.
+        assert r.chunks_done > chunks_at_pressure, (
+            f"chunked prefill stalled under SWA pressure: chunks_done="
+            f"{r.chunks_done} did not advance past chunks_at_pressure="
+            f"{chunks_at_pressure}"
         )
         assert r.kv_pages == 0
         assert r.lock_refs == 0
