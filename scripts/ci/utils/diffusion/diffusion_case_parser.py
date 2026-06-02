@@ -89,6 +89,11 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             case_id = self._extract_factory_case_id(stmt)
             if case_id:
                 self.factory_case_ids[stmt.name] = case_id
+
+        for stmt in node.body:
+            if isinstance(stmt, ast.Expr):
+                self._process_expr(stmt.value)
+
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):
@@ -102,10 +107,6 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign):
         self._process_aug_assignment(node.target, node.op, node.value)
-        self.generic_visit(node)
-
-    def visit_Expr(self, node: ast.Expr):
-        self._process_expr(node.value)
         self.generic_visit(node)
 
     def _process_assignment(self, targets: List[ast.AST], value: ast.AST):
