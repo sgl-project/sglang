@@ -132,13 +132,6 @@ def compute_mrope_position_ids_vision(
 # -----------------------------------------------------------------------------
 
 
-def qwen3_rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Qwen3/Llama-style rotate_half: split first/second half of head_dim."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def qwen3_apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -153,8 +146,19 @@ def qwen3_apply_rotary_pos_emb(
         cos: [1, S, 1, D] or broadcastable
         sin: [1, S, 1, D] or broadcastable
     """
-    q_embed = (q * cos) + (qwen3_rotate_half(q) * sin)
-    k_embed = (k * cos) + (qwen3_rotate_half(k) * sin)
+    half = q.shape[-1] // 2
+    q1 = q[..., :half]
+    q2 = q[..., half:]
+    q_embed = torch.empty_like(q)
+    q_embed[..., :half] = q1 * cos[..., :half] - q2 * sin[..., :half]
+    q_embed[..., half:] = q2 * cos[..., half:] + q1 * sin[..., half:]
+
+    half = k.shape[-1] // 2
+    k1 = k[..., :half]
+    k2 = k[..., half:]
+    k_embed = torch.empty_like(k)
+    k_embed[..., :half] = k1 * cos[..., :half] - k2 * sin[..., :half]
+    k_embed[..., half:] = k2 * cos[..., half:] + k1 * sin[..., half:]
     return q_embed, k_embed
 
 
