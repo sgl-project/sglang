@@ -397,50 +397,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         return metadata
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        """Initialize metadata for CUDA graph capture."""
-        seq_lens_cpu = seq_lens.cpu()
-        self._build_cuda_graph_metadata(
-            bs, num_tokens, forward_mode, spec_info, seq_lens.device
-        )
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens_cpu,
-        )
-        if forward_mode.is_draft_extend():
-            # CUDA graph bakes max_seq_len_q as a constant.  replay() sets it to
-            # max(num_accept_tokens_cpu) which is None/empty at capture time,
-            # falling back to 1.  Restore the correct upper bound so the kernel
-            # sees num_tokens_per_bs (not 1) for all replays of this graph.
-            self.forward_metadata.max_seq_len_q = num_tokens // bs
-
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """Replay CUDA graph with new inputs."""
+        """Shared capture+replay body for the cuda-graph init path.
+
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
+        """
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -570,6 +539,48 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v_scale=layer.v_scale,  # May be None
             page_size=self.page_size,
         )
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        encoder_lens = forward_batch.encoder_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        if in_capture:
+            num_tokens = forward_batch.positions.numel()
+            seq_lens_cpu = seq_lens.cpu()
+            self._build_cuda_graph_metadata(
+                bs, num_tokens, forward_mode, spec_info, seq_lens.device
+            )
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_cpu=seq_lens_cpu,
+            )
+            if forward_mode.is_draft_extend():
+                # CUDA graph bakes max_seq_len_q as a constant. replay() sets it
+                # to max(num_accept_tokens_cpu) which is None/empty at capture
+                # time, falling back to 1. Restore the correct upper bound so
+                # the kernel sees num_tokens_per_bs (not 1) for all replays.
+                self.forward_metadata.max_seq_len_q = num_tokens // bs
+        else:
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -899,39 +910,25 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
+        in_capture: bool = False,
     ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
+        # TRTLLM-MHA uses encoder_lens from the original fb for inner dispatch
+        # (FlashInfer parent forces encoder_lens=None instead).
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
+        )
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        assert forward_batch.spec_info is not None
-        assert forward_batch.spec_info.is_draft_input()
-
-        for i in range(self.speculative_num_steps - 1):
-
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
+            self.attn_backends[i].init_forward_metadata_out_graph(
+                inner_fb, in_capture=in_capture
             )

@@ -831,6 +831,11 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 is_insert = req.mamba_lazy_is_insert if get_global_server_args().enable_mamba_extra_buffer_lazy() else True
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
