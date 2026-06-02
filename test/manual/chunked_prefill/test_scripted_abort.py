@@ -477,13 +477,17 @@ class TestAbortBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_abort_during_gap_inflight_middle_chunks_positive(t: ScriptedContext):
+        # The "gap" state (inflight_middle_chunks > 0 AND not is_chunking) is
+        # unreachable on v1: the in-flight latch bumps and clears in the same
+        # transition as the chunked_req slot. Abort while the req is mid-flight in a
+        # middle chunk -- inflight_middle_chunks > 0 holds during chunking once at
+        # least one chunk has run.
         r = t.start_req(prompt_len=2 * DEFAULT_CHUNK_SIZE, max_new_tokens=2)
         yield from run_until(
             r,
-            lambda h: h.req.inflight_middle_chunks > 0 and not h.is_chunking,
+            lambda h: h.is_chunking and h.chunks_done >= 1,
         )
         assert r.req.inflight_middle_chunks > 0
-        assert not r.is_chunking
 
         t.abort(r)
         yield from _drain_until_released(t, r)
