@@ -348,15 +348,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         dsts = []
         srcs = []
 
-        if self.ngram_embedding_info is not None:
-            ngram_embedding_info = forward_batch.ngram_embedding_info
-            self.ngram_embedding_info.column_starts[:raw_bs].copy_(
-                ngram_embedding_info.column_starts
-            )
-            self.ngram_embedding_info.req_lens[:raw_bs].copy_(
-                ngram_embedding_info.req_lens
-            )
-
         if self.rids_int is not None and forward_batch.rids_int is not None:
             dsts.append(self.rids_int[:raw_bs])
             srcs.append(forward_batch.rids_int)

@@ -687,4 +687,34 @@ def build_decode_registry(
                     "decode registry; cannot adopt."
                 )
         reg.register_slot(slot, bind=bind)
+
+    # Structured slots whose backing storage still lives on the source object
+    # (adopt-only during migration): registered only when the source actually
+    # carries them. The per-replay copy source is a nested FB dataclass field,
+    # supplied via source_fn; head is copied (source-length slice), tail kept.
+    if source is not None:
+        ngram = getattr(source, "ngram_embedding_info", None)
+        if ngram is not None:
+
+            def _ngram_source(attr):
+                def _fn(fb, _ctx):
+                    info = getattr(fb, "ngram_embedding_info", None)
+                    return None if info is None else getattr(info, attr)
+
+                return _fn
+
+            for _attr in ("column_starts", "req_lens"):
+                backing = getattr(ngram, _attr)
+                reg.register_slot(
+                    GraphSlot(
+                        name=f"ngram_embedding_info.{_attr}",
+                        shape_fn=lambda _bs, _mt, _s=tuple(backing.shape): _s,
+                        dtype=backing.dtype,
+                        axis="none",
+                        padding_policy=PaddingPolicy.KEEP_PAD,
+                        source_fn=_ngram_source(_attr),
+                    ),
+                    bind=backing,
+                )
+
     return reg

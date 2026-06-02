@@ -796,6 +796,51 @@ class TestBuildDecodeRegistry(unittest.TestCase):
                 name,
             )
 
+    def test_source_with_ngram_registers_structured_slots(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        col = torch.zeros(4, dtype=torch.int32)
+        req = torch.ones(4, dtype=torch.int32)
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+            ngram_embedding_info=SimpleNamespace(column_starts=col, req_lens=req),
+        )
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        # Structured slots adopt the source's nested storage.
+        self.assertTrue(reg.has_slot("ngram_embedding_info.column_starts"))
+        self.assertEqual(
+            reg.get_slot("ngram_embedding_info.column_starts").buffer.data_ptr(),
+            col.data_ptr(),
+        )
+        # And fill_from copies the head from the FB's nested dataclass.
+        fb = _MiniForwardBatch(
+            batch_size=3,
+            ngram_embedding_info=SimpleNamespace(
+                column_starts=torch.tensor([7, 8, 9], dtype=torch.int32),
+                req_lens=torch.tensor([1, 1, 2], dtype=torch.int32),
+            ),
+        )
+        reg.fill_from(fb, raw_bs=3, padded_bs=4, raw_num_tokens=3, padded_num_tokens=8)
+        self.assertTrue(torch.equal(col[:3], torch.tensor([7, 8, 9], dtype=torch.int32)))
+        self.assertTrue(torch.equal(req[:3], torch.tensor([1, 1, 2], dtype=torch.int32)))
+
 
 class TestFillOncePolicy(unittest.TestCase):
     """FILL_ONCE initializes the whole buffer at alloc and never resets the
