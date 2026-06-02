@@ -7,7 +7,8 @@ from sglang.srt.layers.attention.fla.op import safe_exp
 from sglang.srt.layers.attention.fla.utils import (
     autotune_cache_kwargs,
 )
-from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+
+from .wy_fast import recompute_w_u_fwd
 
 _MERGE_DOT_PRECISION = tl.constexpr("tf32")
 

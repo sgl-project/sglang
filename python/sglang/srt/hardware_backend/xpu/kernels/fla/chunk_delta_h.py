@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.fla.utils import (
     autotune_cache_kwargs,
 )
 
-CHUNK_SIZE = 64
+CHUNK_SIZE = 128
 
 
 # This kernel handles K blocks in a for loop to minimize register spills.
