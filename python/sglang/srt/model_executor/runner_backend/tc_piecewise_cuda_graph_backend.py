@@ -49,7 +49,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -85,6 +85,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         model_runner = cuda_graph_runner.model_runner
+        self.set_torch_compile_config()
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = model_runner.tp_group
@@ -99,6 +100,20 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         # model_runner.model.forward is the wrapper that builds LogitsProcessorOutput.
         # The compiled trampoline is dispatched internally by it.
         self._compiled_fn: Callable = model_runner.model.forward
+
+    @staticmethod
+    def set_torch_compile_config() -> None:
+        import torch._dynamo.config
+
+        torch._dynamo.config.accumulated_cache_size_limit = 1024
+
+        if is_npu():
+            try:
+                from torch_npu.utils import patch_getenv
+
+                patch_getenv._log_once = lambda *args, **kwargs: None
+            except Exception:
+                pass
 
     @staticmethod
     def build_compilation_config(server_args: ServerArgs) -> CompilationConfig:
