@@ -6,7 +6,7 @@ the scattered ``DecodeInputBuffers`` / ``PrefillInputBuffers`` dataclasses
 and their ad-hoc ``populate_from_forward_batch`` methods with a single
 ``GraphSlot``-driven registry.
 
-Scope (step 05 of the attention refactor):
+Scope:
 
   * ``GraphSlot``   — single FB-field spec (shape / dtype / padding policy /
                       optional post-fill hook).
@@ -22,9 +22,6 @@ Scope (step 05 of the attention refactor):
 Backend-private buffers (kernel workspaces, derived page tables, etc.) stay
 on ``AttentionBackend.cuda_graph_*`` — the registry only owns FB-shared
 slots (FB attribute name maps 1:1 to slot name).
-
-See ``attention/05-unified-buffer-api.md`` in the plan repo for the design
-rationale and landing plan.
 """
 
 from __future__ import annotations
@@ -210,7 +207,7 @@ class GraphSlot:
 
 
 class CudaGraphBufferRegistry:
-    """FB → graph-resident buffer mirror; eager / capture / replay 三路统一走它.
+    """FB → graph-resident buffer mirror, shared across eager / capture / replay.
 
     The registry holds a dict of ``GraphSlot`` instances, each mirroring
     one ``ForwardBatch`` attribute. Slots are registered up-front (during
@@ -222,7 +219,7 @@ class CudaGraphBufferRegistry:
     schedule_stream owns the FB tensors; ``fill_from`` issues D2D copies
     on the forward_stream so the registry buffer becomes the
     forward_stream's exclusive view of FB-shared inputs. This removes the
-    need for FB-shared-field clones on stream handoff (R3 step 08 invariant).
+    need for FB-shared-field clones on stream handoff.
 
     Backend-private buffers (kernel workspace, derived page tables) are
     NOT managed here — backends keep them on ``self.cuda_graph_*`` and
