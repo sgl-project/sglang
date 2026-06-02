@@ -407,6 +407,10 @@ class StreamingSession(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
+    def drain_pending_release(self, max_nodes: int = 64) -> int:
+        drain = getattr(self.inner, "drain_pending_release", None)
+        return drain(max_nodes) if drain is not None else 0
+
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         result = self.try_inc_lock_ref(node)
         if result is not None:

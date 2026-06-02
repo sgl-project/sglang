@@ -1631,6 +1631,10 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        # Bounded deferred free of closed radix-native sessions (non-blocking).
+        drain = getattr(self.tree_cache, "drain_pending_release", None)
+        if drain is not None:
+            drain()
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(

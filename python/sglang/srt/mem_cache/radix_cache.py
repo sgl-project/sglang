@@ -322,6 +322,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         self.evictable_leaves = set()
+        # Per-session leaf index for radix-native sessions: session_id -> set of
+        # nodes its requests tagged as leaves. release_session seeds from this so
+        # a close is O(session) instead of O(all tree leaves).
+        self._session_leaves: Dict[str, set] = {}
+        # Deferred-release stack: close() enqueues a session's leaf seeds here and
+        # drain_pending_release() frees them a bounded number of nodes per
+        # scheduler iteration, so a close never blocks (no synchronous free spike).
+        self._pending_release: list = []
         self.reset()
 
     @classmethod
@@ -355,6 +363,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        if hasattr(self, "_session_leaves"):
+            self._session_leaves.clear()
+        if hasattr(self, "_pending_release"):
+            self._pending_release.clear()
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -590,42 +602,50 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         node = result.last_device_node
         if node is not None and node is not self.root_node:
             node.session_id = sid
+            self._session_leaves.setdefault(sid, set()).add(node)
 
     def release_session(self, session_id: str) -> int:
-        """Free the KV uniquely owned by a radix-native session: seed from leaves
-        tagged with this session_id and walk up the single-child chain, freeing
-        each node until a branch point (a shared prefix where another turn or
-        session diverges) or a locked node. Shared prefixes are branch points, so
-        they are never freed. Returns the number of tokens freed.
+        """Queue a radix-native session's KV for deferred release at close. The
+        actual free is done by drain_pending_release() a few nodes at a time on
+        the scheduler's idle path, so close never causes a synchronous free spike.
 
-        This is the deterministic 'evict on close' for radix-native sessions; it
-        complements floor-priority lazy eviction (which handles live pressure)."""
-        freed = 0
-        seeds = [
-            n
-            for n in list(self.evictable_leaves)
-            if getattr(n, "session_id", None) == session_id and n.lock_ref == 0
-        ]
-        for leaf in seeds:
-            node = leaf
-            while (
-                node is not self.root_node
-                and node.lock_ref == 0
-                and len(node.children) == 0
-                and not node.evicted
+        Enqueues only the session's own tagged leaves (O(session), from the leaf
+        registry -- not a scan of all tree leaves). Each seed starts a free of the
+        session's unique leaf->branch chain; shared prefixes are branch points and
+        are preserved. Floor-priority eviction is the live-pressure backstop, so a
+        not-yet-drained session can still be reclaimed under load."""
+        registered = self._session_leaves.pop(session_id, None)
+        if not registered:
+            return 0
+        seeds = [n for n in registered if n in self.evictable_leaves and n.lock_ref == 0]
+        self._pending_release.extend(seeds)
+        return len(seeds)
+
+    def drain_pending_release(self, max_nodes: int = 64) -> int:
+        """Free up to ``max_nodes`` queued radix-native session nodes. Called once
+        per scheduler iteration so deferred releases never block: a large session
+        is spread across iterations. `node not in self.evictable_leaves` is the
+        liveness guard -- a node already reclaimed by normal eviction (which
+        removes it from evictable_leaves) is skipped, so there is no double free."""
+        freed_nodes = 0
+        while self._pending_release and freed_nodes < max_nodes:
+            node = self._pending_release[-1]
+            if (
+                node is self.root_node
+                or node.lock_ref != 0
+                or len(node.children) != 0
+                or node not in self.evictable_leaves
             ):
-                parent = node.parent
-                self.token_to_kv_pool_allocator.free(node.value)
-                freed += len(node.value)
-                self._delete_leaf(node)
-                node = parent
-        if freed:
-            logger.info(
-                "Radix-native session released: %s (%d tokens freed)",
-                session_id,
-                freed,
-            )
-        return freed
+                # Chain finished, hit a branch/lock, or already evicted -> drop it.
+                self._pending_release.pop()
+                continue
+            parent = node.parent
+            self.token_to_kv_pool_allocator.free(node.value)
+            self._delete_leaf(node)
+            freed_nodes += 1
+            # Walk up: the parent may now be a freeable leaf of this chain.
+            self._pending_release[-1] = parent
+        return freed_nodes
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
