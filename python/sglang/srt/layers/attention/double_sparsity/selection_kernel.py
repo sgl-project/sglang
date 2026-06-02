@@ -342,6 +342,24 @@ def project_query_onto_channels(
     return gathered * channel_weights.unsqueeze(0)
 
 
+def _scorer_norm_mode() -> str:
+    """Flag-gated DS scorer normalization (Loop-7 Tier-2.B candidate).
+
+    ``SGLANG_DS_SCORER_NORM``:
+      - ``"off"`` (default): the production raw channel-dot scorer, byte-identical.
+      - ``"cosine"``: unit-normalize the query projection and each token signature
+        per head before the dot, so the score is direction-only (magnitude
+        invariant). Rationale (M0 oracle): at 16K the needle ranks ~= its
+        position, i.e. per-token background magnitude dominates the raw dot — a
+        cosine score removes that bias so a salient needle can outrank bulk
+        filler. Scale-invariant, so the int8 dequant scale cancels (ignored).
+    """
+    import os as _os
+
+    mode = _os.environ.get("SGLANG_DS_SCORER_NORM", "off").strip().lower()
+    return mode if mode in ("off", "cosine") else "off"
+
+
 def compute_token_scores(
     queries: torch.Tensor,
     token_signatures: torch.Tensor,
@@ -378,8 +396,11 @@ def compute_token_scores(
 
     q_proj = project_query_onto_channels(queries, sel_layer, w_layer)  # [bs, H, D]
 
+    norm_mode = _scorer_norm_mode()
+
     if (
-        _TRITON_AVAILABLE
+        norm_mode == "off"
+        and _TRITON_AVAILABLE
         and q_proj.is_cuda
         and sig_layer.is_cuda
         and written_layer.is_cuda
@@ -391,12 +412,21 @@ def compute_token_scores(
             scale_layer=scale_layer,
         )
 
-    scores_full = torch.einsum(
-        "bhd,thd->bth", q_proj.to(torch.float32), sig_layer.to(torch.float32)
-    )  # [bs, T, H]
-    if scale_layer is not None:
-        # Dequant the int8 dot per (token, head) before the cross-head max.
-        scores_full = scores_full * scale_layer.unsqueeze(0).to(torch.float32)
+    qf = q_proj.to(torch.float32)
+    sf = sig_layer.to(torch.float32)
+    if norm_mode == "cosine":
+        # Direction-only score: unit-normalize per (head) channel vector. The
+        # int8 dequant scale is a positive per-(token,head) magnitude factor and
+        # cancels under normalization, so scale_layer is intentionally ignored.
+        eps = 1e-6
+        qf = qf / (qf.norm(dim=-1, keepdim=True) + eps)
+        sf = sf / (sf.norm(dim=-1, keepdim=True) + eps)
+        scores_full = torch.einsum("bhd,thd->bth", qf, sf)  # [bs, T, H]
+    else:
+        scores_full = torch.einsum("bhd,thd->bth", qf, sf)  # [bs, T, H]
+        if scale_layer is not None:
+            # Dequant the int8 dot per (token, head) before the cross-head max.
+            scores_full = scores_full * scale_layer.unsqueeze(0).to(torch.float32)
     scores = scores_full.amax(dim=-1)  # [bs, T]
     return scores.masked_fill(~written_layer.unsqueeze(0), float("-inf"))
 
