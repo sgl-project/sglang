@@ -388,15 +388,10 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        # Breakable capture uses the eager entry `init_forward_metadata`, which
-        # already covers both legs (the ABC default = `_out_graph + _in_graph`;
-        # backends like DSV4 that override the eager body chain `_in_graph` at
-        # the end). We deliberately do NOT call `_out_graph` / `_in_graph`
-        # separately like the full-graph runner: (a) `_out_graph(in_capture=True)`
-        # does bucket-keyed wrapper prep BCG doesn't use and raises "Invalid
-        # mode" on EXTEND (prefill), which BCG captures; (b) BCG re-runs
-        # `init_forward_metadata` host-side on every replay (see `replay`), so
-        # `_in_graph` never needs to be recorded into the captured graph.
+        # Eager entry covers both legs (ABC default = _out_graph + _in_graph;
+        # DSV4 chains _in_graph) and handles EXTEND, which the full runner's
+        # _out_graph(in_capture=True) bucket-prep path rejects. BCG re-runs it
+        # host-side every replay, so nothing needs recording into the graph.
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
@@ -473,12 +468,9 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                # Replay path. Outer model.forward runs eagerly here and only
-                # `layer_model.forward` is captured, so call the eager entry
-                # `init_forward_metadata` to materialize forward_metadata host-
-                # side (it covers both legs: `_out_graph + _in_graph`). This
-                # runs on every replay, so capture doesn't record `_in_graph`
-                # into the graph.
+                # Outer model.forward runs eagerly here (only layer_model.forward
+                # is captured), so the eager entry materializes forward_metadata
+                # host-side every replay — both legs, no recorded _in_graph needed.
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 with set_forward_context(
                     static_forward_batch,

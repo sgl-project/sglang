@@ -102,13 +102,9 @@ class TboAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
-        # TBO dispatcher: fan out the graph-recordable in-graph step to
-        # primary + children. The full cuda-graph runner calls this inside
-        # `with graph.capture():` separately from _out_graph, so the
-        # dispatcher must forward it too (otherwise a child whose _in_graph
-        # does real work — e.g. DSV4's Raw->Full upgrade — is never recorded
-        # into the captured graph). Capture has populated tbo_children on
-        # forward_batch.
+        # Fan out to primary + children. The full-graph runner calls this
+        # separately inside graph.capture(), so a child's recordable _in_graph
+        # (e.g. DSV4's Raw->Full upgrade) must be forwarded too.
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
@@ -136,10 +132,7 @@ class TboAttnBackend(AttentionBackend):
             item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
 
     def on_after_cuda_graph_warmup(self):
-        # TBO dispatcher: fan out the warmup-undo hook to primary + children,
-        # mirroring init_cuda_graph_state. Children that mutated state during
-        # the warmup pass (e.g. a raw->full upgrade) must restore it before
-        # capture freezes kernel pointers.
+        # Fan out to primary + children, mirroring init_cuda_graph_state.
         self.primary.on_after_cuda_graph_warmup()
         for child in self.children:
             child.on_after_cuda_graph_warmup()

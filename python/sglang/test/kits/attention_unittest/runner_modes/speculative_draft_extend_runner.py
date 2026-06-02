@@ -1022,12 +1022,8 @@ class EagleDraftExtendCudaGraphRunnerAdapter:
     make_forward_batch: Callable[
         [Any, Any, Any, EagleDraftRunnerSettings], ForwardBatch
     ]
-    # Optional hook invoked with `(draft_extend_attn_backend, batch)` right
-    # before `graph_runner.replay(batch)`, then again with `(backend, None)`
-    # afterwards for cleanup. Currently unused — kept as an extension point
-    # for backends that need to stage out-of-band replay state. (The DSV4
-    # `_replay_forward_batch` side channel that previously used this hook was
-    # removed; replay now reads everything off the reconstructed fb_view.)
+    # Optional hook invoked with `(backend, batch)` before replay() and
+    # `(backend, None)` after for cleanup. Currently unused.
     pre_replay: Callable[[Any, ForwardBatch], None] = None
     check_case: Callable[[Any, EagleDraftRunnerSettings], None] = (
         lambda _case, _settings: None

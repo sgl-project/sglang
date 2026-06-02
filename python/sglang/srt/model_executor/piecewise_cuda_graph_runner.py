@@ -597,16 +597,10 @@ class PiecewiseCudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            # PCG capture path. Use the eager entry `init_forward_metadata`,
-            # which already covers both legs (the ABC default = `_out_graph +
-            # _in_graph`; DSV4 and other eager-body overrides chain `_in_graph`
-            # at the end). We deliberately do NOT call `_out_graph` / `_in_graph`
-            # separately like the full-graph runner: (a) `_out_graph(in_capture=
-            # True)` does bucket-keyed wrapper prep PCG doesn't use and raises
-            # "Invalid mode" on EXTEND (prefill chunks), which PCG captures; (b)
-            # PCG re-runs `init_forward_metadata` host-side on every replay (see
-            # replay below), so `_in_graph` never needs to be recorded into the
-            # captured graph.
+            # Eager entry covers both legs (ABC default = _out_graph + _in_graph;
+            # DSV4 chains _in_graph) and handles EXTEND, which the full runner's
+            # _out_graph(in_capture=True) bucket-prep path rejects. PCG re-runs
+            # it host-side every replay, so nothing needs recording into the graph.
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
             # Run and capture
@@ -809,14 +803,9 @@ class PiecewiseCudaGraphRunner:
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
             ):
-                # Due to the dispatch kernel for MLA model, we init the metadata
-                # with the original forward_batch. Replay path — the outer
-                # model.forward runs eagerly between this site and the
-                # piecewise-captured layer body, so call the eager entry
-                # `init_forward_metadata` to materialize forward_metadata host-
-                # side (it covers both legs: `_out_graph + _in_graph`). This
-                # runs on every replay, so capture doesn't record `_in_graph`
-                # into the graph.
+                # Outer model.forward runs eagerly here (only the layer body is
+                # captured), so the eager entry materializes forward_metadata
+                # host-side every replay — both legs, no recorded _in_graph needed.
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
