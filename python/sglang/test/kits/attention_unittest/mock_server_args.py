@@ -62,9 +62,9 @@ def make_mock_server_args(**overrides) -> ServerArgs:
     if sa.cuda_graph_config is None:
         sa.cuda_graph_config = default_cuda_graph_config()
         bs = legacy_cuda_graph_bs if legacy_cuda_graph_bs is not None else [4]
-        sa.cuda_graph_config[Phase.DECODE]["bs"] = list(bs)
-        sa.cuda_graph_config[Phase.DECODE]["max_bs"] = max(bs)
-        sa.cuda_graph_config[Phase.PREFILL]["max_bs"] = max(bs)
+        sa.cuda_graph_config[Phase.DECODE].bs = list(bs)
+        sa.cuda_graph_config[Phase.DECODE].max_bs = max(bs)
+        sa.cuda_graph_config[Phase.PREFILL].max_bs = max(bs)
     if not hasattr(sa, "_cuda_graph_config_locked"):
         sa._cuda_graph_config_locked = set()
     return sa
