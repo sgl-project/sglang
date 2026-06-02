@@ -91,10 +91,12 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
                 self.factory_case_ids[stmt.name] = case_id
 
         for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef):
+                continue
             if isinstance(stmt, ast.Expr):
                 self._process_expr(stmt.value)
-
-        self.generic_visit(node)
+                continue
+            self.visit(stmt)
 
     def visit_Assign(self, node: ast.Assign):
         self._process_assignment(node.targets, node.value)
