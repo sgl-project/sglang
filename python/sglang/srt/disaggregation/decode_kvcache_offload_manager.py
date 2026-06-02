@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -13,6 +12,9 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.hicache_storage import (
+    parse_hicache_storage_backend_extra_config,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -78,16 +80,17 @@ class DecodeKVCacheOffloadManager:
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
-        hicache_storage_backend_extra_config = {}
-        if server_args.hicache_storage_backend_extra_config:
-            try:
-                hicache_storage_backend_extra_config = json.loads(
+        try:
+            hicache_storage_backend_extra_config = (
+                parse_hicache_storage_backend_extra_config(
                     server_args.hicache_storage_backend_extra_config
                 )
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Invalid hicache storage backend extra config JSON: {e}"
-                )
+            )
+        except Exception as e:
+            logger.error(f"Invalid backend extra config: {e}")
+            raise ValueError(
+                f"Invalid hicache storage backend extra config: {e}"
+            ) from e
 
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
