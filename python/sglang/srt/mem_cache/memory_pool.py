@@ -343,6 +343,12 @@ class MambaPool:
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
+        # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
+        # When non-None, `alloc(1)` consumes the next slot from this iterator
+        # instead of calling `_do_alloc(1)` per request. Reset to None outside
+        # a group window so `alloc` falls through to the per-call path.
+        self._alloc_iter: Optional[Iterator] = None
+
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
@@ -355,7 +361,7 @@ class MambaPool:
 
     # -- Batched alloc for match_prefix --
     def alloc_group_begin(self, num_reqs: int):
-        self._alloc_iter: Optional[Iterator] = None
+        self._alloc_iter = None
         if num_reqs > 0:
             result = self._do_alloc(num_reqs)
             if result is not None:
@@ -369,7 +375,7 @@ class MambaPool:
         self._alloc_iter = None
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        if getattr(self, "_alloc_iter", None) is not None and need_size == 1:
+        if self._alloc_iter is not None and need_size == 1:
             slot = next(self._alloc_iter, None)
             if slot is not None:
                 return slot
