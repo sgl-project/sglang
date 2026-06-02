@@ -443,6 +443,8 @@ def build_decode_registry(
     seq_len_fill_value: int,
     cache_loc_dtype: torch.dtype,
     enable_mamba_track: bool = False,
+    is_encoder_decoder: bool = False,
+    encoder_len_fill_value: int = 0,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
@@ -457,12 +459,11 @@ def build_decode_registry(
         full-buffer ``zero_()`` / ``fill_()`` on ``bs != raw_bs`` is therefore
         equivalent to the tail-only reset the policies apply here).
 
-    Computed / structured / init-fill-without-per-iter-reset fields
-    (``num_token_non_padded``, ``global_num_tokens_*``, ``encoder_lens``,
-    ``pp_proxy_tensors``, ``ngram_embedding_info``, ``custom_mask``,
-    ``next_token_logits_buffer``, ``input_embeds``, canary ids) are *not*
-    registered here; the runner fills them out-of-band until the registry
-    grows the matching hooks.
+    Computed / structured fields (``num_token_non_padded``,
+    ``global_num_tokens_*``, ``pp_proxy_tensors``, ``ngram_embedding_info``,
+    ``custom_mask``, ``next_token_logits_buffer``, ``input_embeds``, canary
+    ids) are *not* registered here; the runner fills them out-of-band until
+    the registry grows the matching hooks.
 
     When ``source`` is given, each slot adopts the same-named tensor off
     ``source`` (e.g. a ``DecodeInputBuffers``) instead of allocating, so the
@@ -540,6 +541,19 @@ def build_decode_registry(
                 torch.bool,
                 axis="bs",
                 padding_policy=PaddingPolicy.ZERO,
+            )
+        )
+    if is_encoder_decoder:
+        # Initialized once to encoder_len_fill_value, copied head-only, never
+        # reset per iter — matching the legacy DecodeInputBuffers behavior.
+        slots.append(
+            GraphSlot(
+                "encoder_lens",
+                _bs,
+                torch.int32,
+                axis="bs",
+                padding_policy=PaddingPolicy.FILL_ONCE,
+                pad_value=encoder_len_fill_value,
             )
         )
 

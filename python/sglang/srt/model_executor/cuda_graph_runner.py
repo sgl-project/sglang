@@ -728,6 +728,8 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            is_encoder_decoder=self.is_encoder_decoder,
+            encoder_len_fill_value=self.encoder_len_fill_value,
             source=self.buffers,
         )
 
