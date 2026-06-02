@@ -457,6 +457,7 @@ def launch_http_server_only(server_args):
         host=server_args.host,
         port=server_args.port,
         reload=False,
+        ws_per_message_deflate=False,
     )
 
 
