@@ -11,6 +11,7 @@ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -79,30 +80,34 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
+        # `pin_memory=True` raises at construction time on hosts without a
+        # CUDA driver (CPU-only CI runners). Gate it the same way other
+        # call sites do (schedule_batch.py, logits_processor.py).
+        pin = is_pin_memory_available(device)
         temperatures = (
             torch.tensor(
                 [r.sampling_params.temperature for r in reqs],
                 dtype=torch.float,
-                pin_memory=True,
+                pin_memory=pin,
             )
-            .to(device, non_blocking=True)
+            .to(device, non_blocking=pin)
             .view(-1, 1)
         )
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs],
             dtype=torch.float,
-            pin_memory=True,
-        ).to(device, non_blocking=True)
+            pin_memory=pin,
+        ).to(device, non_blocking=pin)
         top_ks = torch.tensor(
             [r.sampling_params.top_k for r in reqs],
             dtype=torch.int32,
-            pin_memory=True,
-        ).to(device, non_blocking=True)
+            pin_memory=pin,
+        ).to(device, non_blocking=pin)
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs],
             dtype=torch.float,
-            pin_memory=True,
-        ).to(device, non_blocking=True)
+            pin_memory=pin,
+        ).to(device, non_blocking=pin)
         sampling_seed = (
             torch.tensor(
                 [
@@ -114,8 +119,8 @@ class SamplingBatchInfo:
                     for r in reqs
                 ],
                 dtype=torch.int64,
-                pin_memory=True,
-            ).to(device, non_blocking=True)
+                pin_memory=pin,
+            ).to(device, non_blocking=pin)
             if enable_deterministic
             else None
         )

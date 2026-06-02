@@ -64,6 +64,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -616,9 +617,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mamba_ping_pong_track_buffers
             ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         # Convert CPU list to a pinned tensor, then async-copy to GPU once.
+        _pin = is_pin_memory_available(self.device)
         select_index_gpu = torch.tensor(
-            select_index, dtype=torch.int64, pin_memory=True
-        ).to(device=self.device, non_blocking=True)
+            select_index, dtype=torch.int64, pin_memory=_pin
+        ).to(device=self.device, non_blocking=_pin)
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index_gpu] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:

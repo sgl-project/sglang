@@ -1450,14 +1450,15 @@ def set_mamba_track_indices_from_reqs(batch):
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
         batch.req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
+    _pin = is_pin_memory_available(all_buffers.device)
     idx = (
         torch.tensor(
             [req.mamba_next_track_idx for req in batch.reqs],
             dtype=torch.int64,
-            pin_memory=True,
+            pin_memory=_pin,
         )
         .unsqueeze(1)
-        .to(device=all_buffers.device, non_blocking=True)
+        .to(device=all_buffers.device, non_blocking=_pin)
     )
     batch.mamba_track_indices = (
         torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
@@ -2088,12 +2089,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mask = extend_lens >= mamba_cache_chunk_size
 
         # 2) track_indices: single GPU gather from the ping-pong mapping tensor
+        _pin = is_pin_memory_available(self.device)
         req_pool_idx_tensor = torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64, pin_memory=True
-        ).to(self.device, non_blocking=True)
+            [r.req_pool_idx for r in reqs], dtype=torch.int64, pin_memory=_pin
+        ).to(self.device, non_blocking=_pin)
         track_col_idx = torch.tensor(
-            [r.mamba_next_track_idx for r in reqs], dtype=torch.int64, pin_memory=True
-        ).to(self.device, non_blocking=True)
+            [r.mamba_next_track_idx for r in reqs], dtype=torch.int64, pin_memory=_pin
+        ).to(self.device, non_blocking=_pin)
         track_indices_gpu = (
             self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
                 req_pool_idx_tensor, track_col_idx

@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_hip, support_triton
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 _is_hip = is_hip()
 
@@ -128,11 +128,12 @@ def write_cache_indices(
     req_to_token_pool: ReqToTokenPool,
 ):
     if support_triton(get_global_server_args().attention_backend):
+        _pin = is_pin_memory_available(req_to_token_pool.device)
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
-            pin_memory=True,
-        ).to(req_to_token_pool.device, non_blocking=True)
+            pin_memory=_pin,
+        ).to(req_to_token_pool.device, non_blocking=_pin)
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
             req_to_token_pool.req_to_token,
