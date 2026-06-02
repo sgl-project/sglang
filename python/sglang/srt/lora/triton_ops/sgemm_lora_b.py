@@ -54,9 +54,9 @@ def _sgemm_lora_b_kernel(
             the base model's output for a fused add operation.
     """
 
-    # Current block computes sequence with batch_id,
-    # which starts from row seg_start of x with length seg_len
-    batch_id = tl.program_id(axis=1)
+    pid_s = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    batch_id = tl.program_id(axis=2)
     w_index = tl.load(weight_indices + batch_id)
     rank = tl.load(lora_ranks + w_index)
 
@@ -64,25 +64,12 @@ def _sgemm_lora_b_kernel(
     if rank == 0:
         return
 
-    pid = tl.program_id(axis=0)
     seg_len = tl.load(seg_lens + batch_id)
-    if seg_len == 0:
+    if pid_s * BLOCK_S >= seg_len:  # also covers seg_len == 0
         return
     seg_start = tl.load(seg_indptr + batch_id)
     scaling = tl.load(scalings + w_index)
-    # Adjust K (rank) according to the specific LoRA adapter
-    K = tl.minimum(K, rank)
 
-    # The tile in output matrix will have (pid_s, pid_n) as id
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    pid_s = pid // num_pid_n
-    pid_n = pid % num_pid_n
-    if pid_s * BLOCK_S >= seg_len:
-        return
-
-    # Create pointers for the first block of x and weights[batch_id]
-    # The pointers will be advanced as we move in the K direction
-    # and accumulate
     s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
@@ -94,34 +81,28 @@ def _sgemm_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    # Iterate to compute the block in output matrix
     n_mask = n_offset[None, :] < N
-    partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        x_tile = tl.load(
-            x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
-            other=0.0,
-        )
-        w_tile = tl.load(
-            w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
-            other=0.0,
-        )
-        partial_sum += tl.dot(x_tile, w_tile)
-
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
-
-    # Store result to output matrix
-    partial_sum *= scaling
-    partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
     output_mask = (s_offset[:, None] < seg_len) & n_mask
-    partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
-    tl.store(output_ptr, partial_sum, mask=output_mask)
+
+    x_tile = tl.load(
+        x_ptrs,
+        mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K),
+        other=0.0,
+    )
+    w_tile = tl.load(
+        w_ptrs,
+        mask=(k_offset[:, None] < K) & n_mask,
+        other=0.0,
+    )
+
+    partial_sum = tl.dot(x_tile, w_tile) * scaling
+
+    # Store result to output matrix
+    partial_sum = partial_sum.to(x.dtype.element_ty)
+    tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
 
 
 def sgemm_lora_b_fwd(
@@ -147,11 +128,12 @@ def sgemm_lora_b_fwd(
 
     # Block shapes
     BLOCK_S = 16
-    BLOCK_R = 16
+    BLOCK_R = triton.next_power_of_2(R)
     BLOCK_N = 256
 
     grid = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(N, BLOCK_N),
+        triton.cdiv(batch_info.max_len, BLOCK_S),
+        triton.cdiv(N, BLOCK_N),
         batch_info.bs,
     )
 
