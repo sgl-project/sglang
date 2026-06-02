@@ -278,10 +278,14 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
     if (
         server_args.speculative_eagle_topk is not None
         and server_args.speculative_eagle_topk > 1
+        and server_args.page_size > 1
         and not server_args.disable_overlap_schedule
     ):
+        # Spec v2 tree drafting supports topk > 1 with page_size == 1. The
+        # page_size > 1 + topk > 1 draft KV allocation (partial-page duplication)
+        # is not yet ported to v2, so fall back to v1 only for that case.
         server_args.disable_overlap_schedule = True
-        spec_v1_reason = "spec v2 currently only supports topk = 1"
+        spec_v1_reason = "spec v2 topk > 1 currently requires page_size == 1"
     elif (
         not envs.SGLANG_ENABLE_SPEC_V2.get()
         and not server_args.disable_overlap_schedule
