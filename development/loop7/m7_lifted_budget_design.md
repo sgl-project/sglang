@@ -88,15 +88,54 @@ Tier-2.B already serves), the planned disposition is:
   production-hardening is carried to a follow-on with the DSA default untouched —
   which **closes AC-4** under the plan's "deferred-with-evidence" branch.
 
-## Open risks (carry to task14)
+## Landed (decode index core + kernel proof)
+The trap-laden correctness core of the decode path — the request-local
+physical→compact remap — is implemented as a standalone, deterministic module
+(`double_sparsity/lifted_budget.py::build_compact_decode_index`) with CPU unit
+tests, and the kernel half is proven on GPU:
+- **Remap.** Given per-request selected physical slots (selector order, fixed
+  padded width) + `valid_lengths`, it emits `page_table_1_flattened` (valid
+  slots only, **no `-1`** — `dequantize_k_cache_paged` blindly loads it) and
+  request-local **compact-domain** ordinals (`request_base + rank`, `-1` pads).
+  Prefix-sharing is isolated (each request its own compact span), within-row
+  duplicates are collapsed to the highest-rank occurrence (and counted), and the
+  selector's deterministic order is carried into the ordinals. CPU tests pin all
+  cases (`test_lifted_budget_decode.py::TestCompactDecodeIndex`, 8 tests).
+- **Kernel proof (GPU, H200/sm90).** `flash_mla_sparse_fwd` attends a request
+  selecting **3000 > 2048** rows inside a 4096-wide padded budget and matches a
+  reference attention (proves the no-cap behavior the lifted budget needs); a
+  full **fp8 → `dequantize_k_cache_paged` → `flash_mla_sparse_fwd`** pipe with
+  prefix-sharing matches a reference attending the dequantized selected slots,
+  and the compact rows are bit-identical to the full-dequant gather
+  (`TestLiftedBudgetKernelSmoke`, 2 tests).
+
+### Kernel contract confirmed (binds the wiring)
+- `flash_mla_sparse_fwd` masks indices that are `< 0` **or** `>= s_kv` — so the
+  compact pad lane is simply `-1` (no safe-placeholder gymnastics needed in the
+  COMPACT domain; the placeholder concern was about `page_table_1_flattened`,
+  which we keep pad-free instead).
+- **The padded index width (`lifted_budget_top_k`) must be a multiple of the
+  kernel block — `topk % (2*B_TOPK) == 0`, i.e. a multiple of 128** (a `width=8`
+  smoke hit `Assertion params.topk % (2*B_TOPK) == 0`; `width=256`/`4096` pass).
+  The realistic budgets 4096/8192 satisfy this; the next-round config/validator
+  must enforce `lifted_budget_top_k % 128 == 0`.
+
+## Open risks (carry to the decode-branch wiring)
 - The internally-allocating `dequantize_k_cache_paged` is not graph-safe → the
-  research path must run eager (gate it off the production capture path).
-- `flash_mla_sparse_fwd` accuracy at top-k > 512 is unproven locally → add the
-  direct smoke/accuracy test before any served claim.
+  research path must run eager (gate it off the production capture path; the
+  validator already requires `--disable-cuda-graph` for the opt-in until the
+  `out=`/scratch hardening lands).
+- ~~`flash_mla_sparse_fwd` accuracy at top-k > 512 is unproven locally~~
+  **RESOLVED (R12)**: the direct 4K smoke + the fp8 end-to-end smoke pass.
+- The selection budget must be widened from `max_top_k = top_k` to
+  `lifted_budget_top_k` for the opt-in path (selector + the `ds_graph_state` /
+  `ds_topk_indices_out` scratch shapes); enforce the `%128` width constraint.
 - Small oracle N at 4K → the recall recovery must be measured served at N≥20 with
   CIs, not inferred from the score-only oracle.
 
 ## Artifacts
-`config.py` (ABI fields + validation), `validator.py` (top_k>index_topk gate),
-`test_scorer_variants.py::TestLiftedBudgetABI`, this doc. Codex review:
+`config.py` (ABI fields + validation), `validator.py` (fail-closed gate),
+`selection_kernel.py::ds_lifted_budget_decode_available` (seam),
+`double_sparsity/lifted_budget.py` (remap), `test_scorer_variants.py::TestLiftedBudgetABI`,
+`test_lifted_budget_decode.py` (remap + kernel smokes), this doc. Codex review:
 `.humanize/skill/<ts>/output.md`.
