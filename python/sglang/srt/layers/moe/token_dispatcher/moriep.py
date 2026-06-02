@@ -44,6 +44,14 @@ from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 FP8_BLOCK_SIZE = 128
 MXFP4_BLOCK_SIZE = 32
 
+# Smallest get_padded_M tier that survives CUDA-graph capture in the mori decode
+# path. Capture shrinks the decode batch toward bs=1, so the raw expected_m
+# collapses and would otherwise pick a tier (<=64) whose fused-MoE kernel indexes
+# the padded mori recv buffer out of bounds (GPU memory access fault). Empirically
+# validated on DSR1 EP8 (num_max_dispatch_tokens_per_rank=64): tier 64 faults,
+# tier 128 captures cleanly. Used only as a floor on the decode expected_m hint.
+_EXPECTED_M_CAPTURE_SAFE_FLOOR = 128
+
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -495,14 +503,18 @@ class _MoriEPDispatcherImplBase:
             return (self.num_max_dispatch_tokens_per_rank * world_size) // 2
         # decode: match the legacy decode-side truncation sizing.
         raw = (topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10
-        # Floor to the per-rank dispatch buffer capacity. During CUDA-graph
-        # capture topk_ids.shape[0] shrinks to tiny batch sizes, which would
-        # drive get_padded_M(expected_m) below the real LL recv-buffer row
-        # count (num_max_dispatch_tokens_per_rank * world_size) and make the
-        # fused-MoE kernel index out of bounds (GPU memory access fault). The
-        # floor maps to the same nextPow2 tier the CI truncation used, so it
-        # never changes the conc-128 steady-state tier, only stabilizes capture.
-        floor = self.num_max_dispatch_tokens_per_rank * world_size
+        # Floor to a capture-safe minimum tier. During CUDA-graph capture the
+        # decode batch shrinks toward bs=1, so raw collapses to single digits
+        # and get_padded_M(raw) would select a tiny tier whose fused-MoE kernel
+        # indexes the (padded) mori recv buffer out of bounds -> GPU memory
+        # access fault during capture. Empirically (DSR1 EP8, num_max=64):
+        # get_padded_M tier 64 still faults, tier 128 is the smallest that
+        # captures cleanly, so floor to 128. At the steady-state operating point
+        # raw (>=358 at conc=128) dominates this floor and lands on tier 512
+        # exactly as before -- the floor only right-sizes the small capture
+        # graphs and low-concurrency steps (where a tighter tier is also no
+        # slower per the tuned fused-MoE configs).
+        floor = _EXPECTED_M_CAPTURE_SAFE_FLOOR
         return max(raw, floor)
 
     def dispatch_a(
