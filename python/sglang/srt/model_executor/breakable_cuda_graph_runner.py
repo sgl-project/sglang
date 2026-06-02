@@ -388,22 +388,21 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        # Breakable capture uses the eager entry (both legs: `_out_graph` +
-        # `_in_graph`) — like PCG it doesn't use bucket-keyed wrappers, and
-        # also captures `forward_mode=EXTEND` (prefill) where the bucket-prep
-        # path in backends like FlashInfer raises "Invalid mode". The
-        # `_in_graph` call inside `run_once` below still records GPU side
-        # effects (e.g., DSV4's Raw→Full upgrade) into the captured graph.
+        # Breakable capture uses the eager entry `init_forward_metadata`, which
+        # already covers both legs (the ABC default = `_out_graph + _in_graph`;
+        # backends like DSV4 that override the eager body chain `_in_graph` at
+        # the end). We deliberately do NOT call `_out_graph` / `_in_graph`
+        # separately like the full-graph runner: (a) `_out_graph(in_capture=True)`
+        # does bucket-keyed wrapper prep BCG doesn't use and raises "Invalid
+        # mode" on EXTEND (prefill), which BCG captures; (b) BCG re-runs
+        # `init_forward_metadata` host-side on every replay (see `replay`), so
+        # `_in_graph` never needs to be recorded into the captured graph.
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
             # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-            # In-graph metadata step (recordable companion to the out-of-graph
-            # init that ran above with in_capture=True). Default ABC impl is
-            # no-op; DSV4 uses it for Raw→Full upgrade.
-            self.model_runner.attn_backend.init_forward_metadata_in_graph(forward_batch)
             return self._run_forward(forward_batch, num_tokens)
 
         with forward_context(
@@ -474,13 +473,12 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                # Replay path. Outer model.forward runs eagerly here and
-                # only `layer_model.forward` is captured, so call the eager
-                # entry to materialize forward_metadata host-side (both
-                # legs: _out_graph + _in_graph). The captured graph's
-                # recorded `_in_graph` re-fires via `captured_graph.replay()`
-                # inside the layer closure; for DSV4 the second pass is
-                # idempotent via its isinstance check.
+                # Replay path. Outer model.forward runs eagerly here and only
+                # `layer_model.forward` is captured, so call the eager entry
+                # `init_forward_metadata` to materialize forward_metadata host-
+                # side (it covers both legs: `_out_graph + _in_graph`). This
+                # runs on every replay, so capture doesn't record `_in_graph`
+                # into the graph.
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 with set_forward_context(
                     static_forward_batch,

@@ -597,13 +597,16 @@ class PiecewiseCudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            # PCG capture path. Use the eager entry (both legs: `_out_graph`
-            # + `_in_graph`) — PCG doesn't use bucket-keyed wrappers like the
-            # full-graph runner, so the `in_capture=True` branch in backends
-            # (which preps per-bs wrappers for decode/target_verify/draft_extend
-            # via `_prepare_cuda_graph_metadata`) doesn't apply. PCG also
-            # captures `forward_mode=EXTEND` (prefill chunks), which the
-            # bucket-prep path doesn't handle.
+            # PCG capture path. Use the eager entry `init_forward_metadata`,
+            # which already covers both legs (the ABC default = `_out_graph +
+            # _in_graph`; DSV4 and other eager-body overrides chain `_in_graph`
+            # at the end). We deliberately do NOT call `_out_graph` / `_in_graph`
+            # separately like the full-graph runner: (a) `_out_graph(in_capture=
+            # True)` does bucket-keyed wrapper prep PCG doesn't use and raises
+            # "Invalid mode" on EXTEND (prefill chunks), which PCG captures; (b)
+            # PCG re-runs `init_forward_metadata` host-side on every replay (see
+            # replay below), so `_in_graph` never needs to be recorded into the
+            # captured graph.
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
             # Run and capture
@@ -611,13 +614,6 @@ class PiecewiseCudaGraphRunner:
                 # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
                 if self.model_runner.is_hybrid_swa:
                     self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
-                # In-graph metadata step (recordable companion to the
-                # out-of-graph init that ran above with in_capture=True).
-                # Default ABC impl is no-op; DSV4 uses it for Raw→Full upgrade.
-                self.model_runner.attn_backend.init_forward_metadata_in_graph(
-                    forward_batch
-                )
 
                 # Clean intermediate result cache for DP attention
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
@@ -814,13 +810,13 @@ class PiecewiseCudaGraphRunner:
                 dsa_indexers=self.dsa_indexers,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata
-                # with the original forward_batch. Replay path — outer
+                # with the original forward_batch. Replay path — the outer
                 # model.forward runs eagerly between this site and the
                 # piecewise-captured layer body, so call the eager entry
-                # to materialize forward_metadata host-side (both legs:
-                # `_out_graph + _in_graph`). The piecewise-captured layers
-                # re-execute `_in_graph` via `graph.replay()`; for DSV4 the
-                # second pass is idempotent via its isinstance check.
+                # `init_forward_metadata` to materialize forward_metadata host-
+                # side (it covers both legs: `_out_graph + _in_graph`). This
+                # runs on every replay, so capture doesn't record `_in_graph`
+                # into the graph.
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
