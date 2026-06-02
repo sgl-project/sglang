@@ -530,15 +530,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
     && case "${CUDA_VERSION}" in \
            11.*) \
-               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
                python3 -m pip install "/tmp/mscclpp[cuda11,benchmark,test]"; \
                ;; \
            12.*) \
-               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
                python3 -m pip install "/tmp/mscclpp[cuda12,benchmark,test]"; \
                ;; \
            13.*) \
-               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
                python3 -m pip install "/tmp/mscclpp[cuda13,benchmark,test]"; \
                ;; \
            *) \
