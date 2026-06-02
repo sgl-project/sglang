@@ -2591,12 +2591,13 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 o = torch.empty_like(q, dtype=self.input_dtype)
 
-            # Plan A: full-attn layers use the SHUFFLE 5D pool which cannot
-            # be `.view()`'d into the NHD shape unified_attention requires;
-            # route them through mha_batch_prefill_func (q_len=1 per seq).
-            # SWA layers stay on the NHD path because the SWA sub-pool is
-            # forced to NHD and unified_attention handles its sliding-window
-            # semantics natively.
+            # Plan A: when the env-driven SHUFFLE 5D layout is active both
+            # the full-attn and SWA sub-pools are allocated 5D (see
+            # SWAKVPool ctor), so we route BOTH layer kinds through
+            # pa_decode_gluon below. SWA layers pass swa_page_table +
+            # sliding_window=layer.sliding_window_size; full-attn layers
+            # pass the normal kv_indices + sliding_window=0. The legacy
+            # unified_attention path is only taken when the layout is NHD.
             is_swa_layer = (
                 layer.sliding_window_size is not None and layer.sliding_window_size > -1
             )
