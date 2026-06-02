@@ -468,7 +468,10 @@ class TritonAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None:
+            if spec_info is None or spec_info.kv_indptr is None:
+                # spec_info.kv_indptr is None for the draft-extend backend's
+                # idle batch (padded for DP MLP-sync): no precomputed tree
+                # indices, so build plain metadata from seq_lens.
                 kv_indices = torch.empty(
                     forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
                 )
