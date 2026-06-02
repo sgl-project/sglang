@@ -96,33 +96,60 @@ def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
 
 
 def get_workflow_runs(repo: str, hours: int = 24) -> list[dict]:
-    """Get workflow runs from the last N hours."""
+    """Get workflow runs created in the last N hours.
+
+    Paginates the runs API newest-first and filters by `created_at`
+    client-side. Important: do NOT add a server-side `created=...`
+    filter -- the runs API silently invokes a search-style backend
+    when filter params are present, which caps total results at 1000
+    regardless of pagination. Plain unfiltered pagination has no such
+    cap, so we collect what we need and stop at the first run older
+    than the cutoff.
+
+    Previously this function had a hard `page > 50` (5000-run) safety
+    cap. Once daily CI volume passed that threshold, the cap silently
+    truncated the OLDEST end of the window -- the Daily report's first
+    ~10 hours looked empty for that reason. The cap is now raised to
+    200 pages (20k runs), and we log a warning if it ever fires
+    instead of breaking silently.
+    """
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     runs = []
     page = 1
-    while True:
+    # Soft guard against runaway pagination. At ~6 runs/min sustained
+    # SGLang volume, 200 pages = ~57h of runs -- comfortable headroom
+    # for a 24h window. If this ever fires we want to know, not have
+    # the chart silently lose data again.
+    MAX_PAGES = 200
+    while page <= MAX_PAGES:
         data = run_gh_command(
             [
                 f"repos/{repo}/actions/runs?per_page=100&page={page}",
             ]
         )
         page_runs = data.get("workflow_runs", [])
+        if not page_runs:
+            return runs
 
-        # Filter by time
         for run in page_runs:
             created_at = parse_time(run.get("created_at"))
             if created_at and created_at >= since:
                 runs.append(run)
             elif created_at and created_at < since:
-                # Runs are ordered by created_at desc, so we can stop
+                # Runs are ordered by created_at desc, so the first
+                # run older than `since` means we've passed the cutoff.
                 return runs
 
         if len(page_runs) < 100:
-            break
+            return runs
         page += 1
-        if page > 50:  # Safety limit (5000 runs)
-            break
+
+    print(
+        f"WARNING: pagination reached MAX_PAGES={MAX_PAGES} "
+        f"({len(runs)} runs collected). The window may be truncated -- "
+        f"consider narrowing --hours or raising MAX_PAGES."
+    )
     return runs
 
 
