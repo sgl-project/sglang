@@ -1166,33 +1166,59 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
+def _still_holding_resources(procs):
+    """Procs still holding GPU context, pinned memory or fds.
+
+    A zombie has already had its resources freed by the kernel (only the exit
+    status lingers), so it counts as gone; NoSuchProcess / OSError (see
+    _wait_for_reap_or_raise) mean the same.
+    """
+    alive = []
+    for p in procs:
+        try:
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                alive.append(p)
+        except (psutil.NoSuchProcess, OSError):
+            pass
+    return alive
+
+
 def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
     """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
 
     SIGKILL is asynchronous -- children hold GPU context, pinned memory and
     fds until the kernel reaps them. Raise on timeout so a stuck process
     surfaces instead of leaving a latent race.
+
+    Polls /proc via is_running()/status() rather than psutil.wait_procs, whose
+    os.pidfd_open path (used for non-child procs) raises OSError(EINVAL) against
+    a just-killed process on some kernels and aborts the whole wait.
     """
     warn_at = min(10.0, wait_timeout / 2)
-    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
-    if not alive:
-        return
-    logger.warning(
-        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
-        "continuing to wait up to %.1fs total. pids=%s",
-        len(alive),
-        warn_at,
-        wait_timeout,
-        [p.pid for p in alive],
-    )
-    remaining = wait_timeout - warn_at
-    if remaining > 0:
-        _, alive = psutil.wait_procs(alive, timeout=remaining)
-    if alive:
-        raise RuntimeError(
-            f"kill_process_tree: {len(alive)} process(es) not reaped within "
-            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
-        )
+    deadline = time.monotonic() + wait_timeout
+    warn_deadline = time.monotonic() + warn_at
+    warned = False
+    while True:
+        alive = _still_holding_resources(procs)
+        if not alive:
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"kill_process_tree: {len(alive)} process(es) not reaped within "
+                f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+            )
+        if not warned and now >= warn_deadline:
+            logger.warning(
+                "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+                "continuing to wait up to %.1fs total. pids=%s",
+                len(alive),
+                warn_at,
+                wait_timeout,
+                [p.pid for p in alive],
+            )
+            warned = True
+        time.sleep(0.1)
 
 
 def kill_process_tree(
