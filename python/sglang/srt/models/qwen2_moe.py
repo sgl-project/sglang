@@ -124,9 +124,10 @@ def can_fuse_shared_expert(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
+    """Whether the shared expert may be fused as an extra MoE expert (Qwen MoE + Aiter).
 
     Caller must still gate on ``support_shared_expert_fusion`` and ``_use_aiter``.
+    Optional ``quant_config.can_fuse_shared_expert()`` (e.g. Quark) may forbid fusion.
     """
     if (
         get_global_server_args().disable_shared_experts_fusion is True
@@ -136,17 +137,9 @@ def can_fuse_shared_expert(
     ):
         return False
 
-    # If the shared expert is excluded from quantization (stored as FP32 in the
-    # checkpoint), fusing it into the quantized MoE weight tensor requires online
-    # quantization which is not supported. Disable fusion in this case.
     if quant_config is not None:
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            "shared_expert" in layer
-            and "shared_expert_gate" not in layer
-            and not layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
+        can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+        if can_fuse_fn is not None and not can_fuse_fn():
             return False
 
     return True
