@@ -84,12 +84,17 @@ class PaddingPolicy(Enum):
                     left as whatever the previous replay (or the init
                     zeros) wrote. Caller is responsible for proving
                     safety.
+    FILL_ONCE     — Fill the whole buffer to ``pad_value`` once at alloc;
+                    never reset per iter (e.g. ``encoder_lens`` init to
+                    ``encoder_len_fill_value``, copied head-only with the
+                    tail kept).
     """
 
     KEEP_PAD = "keep_pad"
     FILL_SENTINEL = "fill_sentinel"
     ZERO = "zero"
     FOREACH_COPY = "foreach_copy"
+    FILL_ONCE = "fill_once"
 
 
 @dataclass
@@ -181,7 +186,11 @@ class GraphSlot:
         """Reset the padded tail according to ``padding_policy``."""
         if self.buffer is None or raw_n >= padded_n:
             return
-        if self.padding_policy in (PaddingPolicy.KEEP_PAD, PaddingPolicy.FOREACH_COPY):
+        if self.padding_policy in (
+            PaddingPolicy.KEEP_PAD,
+            PaddingPolicy.FOREACH_COPY,
+            PaddingPolicy.FILL_ONCE,
+        ):
             return
         # slice_fn governs non-trivial layouts (e.g. mrope_positions [3, T]);
         # the pad region is the same axis the slot exposes via view().
@@ -310,7 +319,8 @@ class CudaGraphBufferRegistry:
             # physical allocation with a stable data_ptr.
             buffer = share_input_buffer(slot.name, buffer)
         if (
-            slot.padding_policy == PaddingPolicy.FILL_SENTINEL
+            slot.padding_policy
+            in (PaddingPolicy.FILL_SENTINEL, PaddingPolicy.FILL_ONCE)
             and slot.pad_value is not None
         ):
             buffer.fill_(slot.pad_value)

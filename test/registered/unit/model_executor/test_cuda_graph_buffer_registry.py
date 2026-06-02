@@ -686,5 +686,37 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             )
 
 
+class TestFillOncePolicy(unittest.TestCase):
+    """FILL_ONCE initializes the whole buffer at alloc and never resets the
+    padded tail per iter (unlike FILL_SENTINEL)."""
+
+    def test_fill_once_inits_once_and_keeps_tail(self):
+        reg = CudaGraphBufferRegistry(
+            device=torch.device("cpu"), max_bs=4, max_num_tokens=8
+        )
+        reg.register_slot(
+            GraphSlot(
+                "encoder_lens",
+                lambda bs, mt: (bs,),
+                torch.int32,
+                axis="bs",
+                padding_policy=PaddingPolicy.FILL_ONCE,
+                pad_value=9,
+            )
+        )
+        buf = reg.get_slot("encoder_lens").buffer
+        self.assertTrue(torch.equal(buf, torch.tensor([9, 9, 9, 9], dtype=torch.int32)))
+        buf[2:].fill_(99)  # poison the tail
+        fb = _MiniForwardBatch(
+            batch_size=2, encoder_lens=torch.tensor([1, 2], dtype=torch.int32)
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4)
+        # Head copied; tail NOT reset (FILL_ONCE skips the per-iter reset).
+        self.assertTrue(torch.equal(buf[:2], torch.tensor([1, 2], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(buf[2:], torch.tensor([99, 99], dtype=torch.int32))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
