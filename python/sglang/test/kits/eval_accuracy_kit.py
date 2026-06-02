@@ -21,6 +21,54 @@ def _check_accept_length(test_case, base_url, threshold=None):
         test_case.assertGreater(val, threshold)
 
 
+def _run_accuracy_eval(
+    test_case,
+    *,
+    eval_name: str,
+    score_threshold: float,
+    num_examples: Optional[int],
+    num_threads: int,
+    accept_length_thres: Optional[float] = None,
+    summary_label: Optional[str] = None,
+    **eval_overrides,
+):
+    """Shared driver for the accuracy mixins below.
+
+    Runs ``run_eval`` for ``eval_name`` against the test class's server
+    (``base_url`` / ``model``), records a CI step summary, asserts the score
+    meets ``score_threshold``, and checks the speculative accept length.
+
+    ``eval_overrides`` (e.g. ``api``, ``max_tokens``, ``temperature``,
+    ``top_p``, ``num_shots``) are forwarded to ``run_eval`` only when not
+    ``None``, so the common case stays identical to ``run_eval``'s defaults.
+    Returns the metrics dict.
+    """
+    # NaN sentinel (NaN != NaN) means the subclass forgot to set the threshold.
+    assert (
+        score_threshold == score_threshold
+    ), f"{type(test_case).__name__} must set the {eval_name} score threshold"
+
+    kwargs = dict(
+        base_url=test_case.base_url,
+        model=getattr(test_case, "model", None),
+        eval_name=eval_name,
+        num_examples=num_examples,
+        num_threads=num_threads,
+    )
+    kwargs.update({k: v for k, v in eval_overrides.items() if v is not None})
+
+    metrics = run_eval(SimpleNamespace(**kwargs))
+    print(f"{eval_name} {metrics=}")
+
+    if is_in_ci():
+        label = summary_label or f"test_{eval_name}"
+        write_github_step_summary(f"### {label}\n{metrics['score']=:.4f}\n")
+
+    test_case.assertGreaterEqual(metrics["score"], score_threshold)
+    _check_accept_length(test_case, test_case.base_url, accept_length_thres)
+    return metrics
+
+
 class GSM8KMixin:
     """Mixin for GSM8K evaluation via OpenAI Chat API.
 
@@ -39,31 +87,18 @@ class GSM8KMixin:
     gsm8k_num_shots: int = 5
 
     def test_gsm8k(self):
-        assert (
-            self.gsm8k_accuracy_thres == self.gsm8k_accuracy_thres
-        ), f"{type(self).__name__} must set gsm8k_accuracy_thres"
-
         requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
+        _run_accuracy_eval(
+            self,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
+            score_threshold=self.gsm8k_accuracy_thres,
             num_examples=self.gsm8k_num_questions,
             num_threads=self.gsm8k_num_threads,
+            accept_length_thres=self.gsm8k_accept_length_thres,
+            api="completion",
+            max_tokens=512,
             num_shots=self.gsm8k_num_shots,
         )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-
-        if is_in_ci():
-            write_github_step_summary(f"### test_gsm8k\n{metrics['score']=:.4f}\n")
-
-        self.assertGreaterEqual(metrics["score"], self.gsm8k_accuracy_thres)
-
-        _check_accept_length(self, self.base_url, self.gsm8k_accept_length_thres)
 
 
 class MMLUMixin:
@@ -81,26 +116,14 @@ class MMLUMixin:
     mmlu_num_threads: int = 1024
 
     def test_mmlu(self):
-        assert (
-            self.mmlu_score_threshold == self.mmlu_score_threshold
-        ), f"{type(self).__name__} must set mmlu_score_threshold"
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
+        _run_accuracy_eval(
+            self,
             eval_name="mmlu",
+            score_threshold=self.mmlu_score_threshold,
             num_examples=self.mmlu_num_examples,
             num_threads=self.mmlu_num_threads,
+            accept_length_thres=self.mmlu_accept_length_thres,
         )
-
-        metrics = run_eval(args)
-
-        if is_in_ci():
-            write_github_step_summary(f"### test_mmlu\n{metrics['score']=:.4f}\n")
-
-        self.assertGreaterEqual(metrics["score"], self.mmlu_score_threshold)
-
-        _check_accept_length(self, self.base_url, self.mmlu_accept_length_thres)
 
 
 class GPQAMixin:
@@ -126,34 +149,17 @@ class GPQAMixin:
     gpqa_top_p: Optional[float] = None
 
     def test_gpqa(self):
-        assert (
-            self.gpqa_score_threshold == self.gpqa_score_threshold
-        ), f"{type(self).__name__} must set gpqa_score_threshold"
-
-        kwargs = dict(
-            base_url=self.base_url,
-            model=self.model,
+        _run_accuracy_eval(
+            self,
             eval_name="gpqa",
+            score_threshold=self.gpqa_score_threshold,
             num_examples=self.gpqa_num_examples,
             num_threads=self.gpqa_num_threads,
+            accept_length_thres=self.gpqa_accept_length_thres,
+            max_tokens=self.gpqa_max_tokens,
+            temperature=self.gpqa_temperature,
+            top_p=self.gpqa_top_p,
         )
-        # Only override run_eval's defaults when explicitly set, so the common
-        # case stays identical to the other mixins.
-        if self.gpqa_max_tokens is not None:
-            kwargs["max_tokens"] = self.gpqa_max_tokens
-        if self.gpqa_temperature is not None:
-            kwargs["temperature"] = self.gpqa_temperature
-        if self.gpqa_top_p is not None:
-            kwargs["top_p"] = self.gpqa_top_p
-
-        metrics = run_eval(SimpleNamespace(**kwargs))
-
-        if is_in_ci():
-            write_github_step_summary(f"### test_gpqa\n{metrics['score']=:.4f}\n")
-
-        self.assertGreaterEqual(metrics["score"], self.gpqa_score_threshold)
-
-        _check_accept_length(self, self.base_url, self.gpqa_accept_length_thres)
 
 
 class AIME25Mixin:
@@ -180,34 +186,17 @@ class AIME25Mixin:
     aime25_top_p: Optional[float] = None
 
     def test_aime25(self):
-        assert (
-            self.aime25_score_threshold == self.aime25_score_threshold
-        ), f"{type(self).__name__} must set aime25_score_threshold"
-
-        kwargs = dict(
-            base_url=self.base_url,
-            model=self.model,
+        _run_accuracy_eval(
+            self,
             eval_name="aime25",
+            score_threshold=self.aime25_score_threshold,
             num_examples=self.aime25_num_examples,
             num_threads=self.aime25_num_threads,
+            accept_length_thres=self.aime25_accept_length_thres,
+            max_tokens=self.aime25_max_tokens,
+            temperature=self.aime25_temperature,
+            top_p=self.aime25_top_p,
         )
-        # Only override run_eval's defaults when explicitly set, so the common
-        # case stays identical to the other mixins.
-        if self.aime25_max_tokens is not None:
-            kwargs["max_tokens"] = self.aime25_max_tokens
-        if self.aime25_temperature is not None:
-            kwargs["temperature"] = self.aime25_temperature
-        if self.aime25_top_p is not None:
-            kwargs["top_p"] = self.aime25_top_p
-
-        metrics = run_eval(SimpleNamespace(**kwargs))
-
-        if is_in_ci():
-            write_github_step_summary(f"### test_aime25\n{metrics['score']=:.4f}\n")
-
-        self.assertGreaterEqual(metrics["score"], self.aime25_score_threshold)
-
-        _check_accept_length(self, self.base_url, self.aime25_accept_length_thres)
 
 
 class HumanEvalMixin:
@@ -224,30 +213,18 @@ class HumanEvalMixin:
     humaneval_num_threads: int = 1024
 
     def test_human_eval(self):
-        assert (
-            self.humaneval_score_threshold == self.humaneval_score_threshold
-        ), f"{type(self).__name__} must set humaneval_score_threshold"
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="humaneval",
-            num_examples=None,
-            num_threads=self.humaneval_num_threads,
-        )
-
-        metrics = run_eval(args)
-
-        if is_in_ci():
-            write_github_step_summary(f"### test_human_eval\n{metrics['score']=:.4f}\n")
-
         threshold = self.humaneval_score_threshold
         if is_in_amd_ci() and self.humaneval_score_threshold_amd is not None:
             threshold = self.humaneval_score_threshold_amd
 
-        self.assertGreaterEqual(metrics["score"], threshold)
-
-        _check_accept_length(self, self.base_url)
+        _run_accuracy_eval(
+            self,
+            eval_name="humaneval",
+            score_threshold=threshold,
+            num_examples=None,
+            num_threads=self.humaneval_num_threads,
+            summary_label="test_human_eval",
+        )
 
 
 class MGSMEnMixin:
@@ -264,23 +241,10 @@ class MGSMEnMixin:
     mgsm_en_num_threads: int = 1024
 
     def test_mgsm_en(self):
-        assert (
-            self.mgsm_en_score_threshold == self.mgsm_en_score_threshold
-        ), f"{type(self).__name__} must set mgsm_en_score_threshold"
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
+        _run_accuracy_eval(
+            self,
             eval_name="mgsm_en",
+            score_threshold=self.mgsm_en_score_threshold,
             num_examples=self.mgsm_en_num_examples,
             num_threads=self.mgsm_en_num_threads,
         )
-
-        metrics = run_eval(args)
-
-        if is_in_ci():
-            write_github_step_summary(f"### test_mgsm_en\n{metrics['score']=:.4f}\n")
-
-        self.assertGreaterEqual(metrics["score"], self.mgsm_en_score_threshold)
-
-        _check_accept_length(self, self.base_url)
