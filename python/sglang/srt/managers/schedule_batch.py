@@ -749,6 +749,13 @@ class Req(ReqDllmMixin):
         # Rebuilt at the top of each init_next_round_input; admission only
         # updates fill_len, never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
+        # Length cursor into full_untruncated_fill_ids: the prefix length (from
+        # sequence start) the KV cache should cover after this extend step. The
+        # tokens to fill this round are full_untruncated_fill_ids[:fill_len], and
+        # fill_len == len(prefix_indices) + extend_input_len (cached prefix plus
+        # newly computed tokens). Equals the full sequence length for an unchunked
+        # request; for chunked prefill / DLLM it is the current chunk's cutoff and
+        # advances toward the sequence end chunk by chunk.
         self.fill_len: int = 0
 
         self.session = session
