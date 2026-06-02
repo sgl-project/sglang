@@ -120,6 +120,93 @@ class TestTP8ScorerMatrixDeterminism(unittest.TestCase):
                 )
 
 
+def _lifted_worker(rank, ret, max_top_k, max_seq_len, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=WORLD)
+    try:
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels,
+        )
+
+        label_dim = 4
+        g = torch.Generator().manual_seed(4321)
+        sig_full = torch.randn(1, max_seq_len, HEADS_TOTAL, label_dim, generator=g)
+        q_full = torch.randn(1, HEADS_TOTAL, label_dim, generator=g)
+        h0 = rank * HEADS_PER_RANK
+        h1 = h0 + HEADS_PER_RANK
+        bs = 2
+        # request 0: shorter than the lifted budget (selects all of its tokens);
+        # request 1: full length >= max_top_k (selects exactly max_top_k).
+        seq_lens = torch.tensor([max_top_k // 2, max_seq_len], dtype=torch.int32)
+        sig_shard = sig_full[:, :, h0:h1, :]
+        q_shard = q_full[:, h0:h1, :].expand(bs, HEADS_PER_RANK, label_dim).contiguous()
+        written = torch.ones(1, max_seq_len, dtype=torch.bool)
+        chan_sel = (
+            torch.arange(label_dim).view(1, 1, -1).expand(1, HEADS_PER_RANK, -1).to(torch.int32)
+        )
+        chan_w = torch.ones(1, HEADS_PER_RANK, label_dim)
+        req_pool = torch.arange(bs, dtype=torch.int32)
+        req_to_token = (
+            torch.arange(max_seq_len, dtype=torch.int32).unsqueeze(0).expand(bs, -1).contiguous()
+        )
+        idx, vl = retrieve_topk_via_labels(
+            queries=q_shard,
+            token_signatures=sig_shard,
+            written=written,
+            channel_selection=chan_sel,
+            channel_weights=chan_w,
+            layer_id=0,
+            max_top_k=max_top_k,
+            process_group=dist.group.WORLD,
+            req_pool_indices=req_pool,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            scorer_norm="off",
+            head_agg="max",
+            hybrid_threshold=HYBRID_THRESHOLD,
+            anchor_mode="off",
+            anchor_budget=0,
+        )
+        # request 1 spans the full length: it must select exactly the lifted width.
+        ret[rank] = (idx.tolist(), vl.tolist())
+    finally:
+        dist.destroy_process_group()
+
+
+class TestTP8LiftedWidthDeterminism(unittest.TestCase):
+    """The opt-in lifted-budget path widens max_top_k to lifted_budget_top_k. Pin
+    cross-rank selected-index / valid-length equality at 4096 and 8192 through the
+    same production logical selector + 8-rank all-reduce."""
+
+    def _run_width(self, max_top_k, port):
+        ctx = mp.get_context("spawn")
+        ret = ctx.Manager().dict()
+        max_seq_len = 8192  # >= max_top_k for both widths
+        procs = [
+            ctx.Process(target=_lifted_worker, args=(r, ret, max_top_k, max_seq_len, port))
+            for r in range(WORLD)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=300)
+            self.assertEqual(p.exitcode, 0, f"a rank process failed (exit {p.exitcode})")
+        self.assertEqual(len(ret), WORLD, "not all ranks reported")
+        base_idx, base_vl = ret[0]
+        # request 1 (full length) selects exactly the lifted width.
+        self.assertEqual(base_vl[1], max_top_k)
+        for r in range(1, WORLD):
+            self.assertEqual(ret[r], (base_idx, base_vl), f"rank {r} diverged at width {max_top_k}")
+
+    def test_lifted_width_4096_identical_across_8_ranks(self):
+        self._run_width(4096, port=29601)
+
+    def test_lifted_width_8192_identical_across_8_ranks(self):
+        self._run_width(8192, port=29602)
+
+
 class TestTPMisconfigGuardPreserved(unittest.TestCase):
     def test_fail_fast_guards(self):
         from sglang.srt.layers.attention.double_sparsity.selector import (

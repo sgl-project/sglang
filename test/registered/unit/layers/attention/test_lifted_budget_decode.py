@@ -309,5 +309,96 @@ class TestLiftedBudgetKernelSmoke(unittest.TestCase):
         )
 
 
+def _ref_lifted_from_physical(q, full_dequant, physical_slots, sm_scale):
+    """Reference for the wired backend method: per request, softmax-attend the
+    DISTINCT (dedup keep-first), non-`-1` selected physical slots' dequantized
+    rows. Independent of the module's compact remap."""
+    bs, h, _ = q.shape
+    qf = q.float()
+    kvf = full_dequant[:, 0, :].float()  # [P, 576]
+    out = torch.zeros(bs, h, 512, dtype=torch.float32, device=q.device)
+    for i in range(bs):
+        seen, kept = set(), []
+        for s in physical_slots[i].tolist():
+            if s < 0 or s in seen:
+                continue
+            seen.add(s)
+            kept.append(s)
+        if not kept:
+            continue
+        ksel = kvf[torch.tensor(kept, device=q.device, dtype=torch.long)]
+        scores = (qf[i] @ ksel.t()) * sm_scale
+        p = torch.softmax(scores, dim=-1)
+        out[i] = p @ ksel[:, :512]
+    return out
+
+
+@unittest.skipUnless(_HAS_CUDA, "lifted-budget backend smoke requires CUDA")
+class TestLiftedBudgetBackendDecode(unittest.TestCase):
+    """Drive the actual wired backend method `_forward_lifted_budget` (not just
+    the helper) at 4096/8192 widths, with prefix sharing, a duplicate physical
+    slot, and valid_lengths < width."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = "cuda"
+        torch.manual_seed(0xB14)
+
+    def _backend(self):
+        # Construct a minimal backend without running __init__: the lifted decode
+        # method only reads device_sm_major (head padding) + dsa_kv_cache_store_fp8.
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        be = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        be.device_sm_major = torch.cuda.get_device_capability()[0]
+        be.dsa_kv_cache_store_fp8 = True
+        return be
+
+    def _run(self, width):
+        from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+            dequantize_k_cache_paged,
+        )
+        from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
+
+        d_qk, P = 576, 3300
+        phys = (
+            torch.randn(P, 1, 1, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        )
+        phys.clamp_(-6, 6)
+        quant = quantize_k_cache(phys)  # [P,1,1,656] fp8
+        full_dequant = dequantize_k_cache_paged(
+            quant, torch.arange(P, device=self.device, dtype=torch.int32)
+        )
+
+        v0 = 3000  # > 2048: exercises the no-cap path
+        sel = torch.full((2, width), -1, dtype=torch.int32, device=self.device)
+        sel[0, :v0] = torch.arange(v0, device=self.device, dtype=torch.int32)
+        # request 1: prefix-shares slots 5/7/9/11 with request 0, with slot 5
+        # duplicated (interior dedup); valid_lengths (5) << width.
+        sel[1, :5] = torch.tensor([5, 7, 5, 9, 11], device=self.device, dtype=torch.int32)
+
+        be = self._backend()
+        # V3.2 per-rank head count (128 heads / TP8) exercises the head-padding path.
+        h = 16
+        sm_scale = 1.0 / (d_qk**0.5)
+        q = torch.randn(2, h, d_qk, device=self.device, dtype=torch.bfloat16) / 8
+        q.clamp_(-6, 6)
+
+        out = be._forward_lifted_budget(
+            q_all=q, kv_cache=quant, v_head_dim=512, page_table_1=sel, sm_scale=sm_scale
+        )
+        self.assertEqual(tuple(out.shape), (2, h, 512))
+        ref = _ref_lifted_from_physical(q, full_dequant, sel, sm_scale)
+        torch.testing.assert_close(
+            out.float(), ref.to(out.dtype).float(), atol=3e-2, rtol=3e-2
+        )
+
+    def test_backend_lifted_decode_4096(self):
+        self._run(4096)
+
+    def test_backend_lifted_decode_8192(self):
+        self._run(8192)
+
+
 if __name__ == "__main__":
     unittest.main()

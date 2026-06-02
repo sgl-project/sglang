@@ -148,15 +148,14 @@ availability seam is flipped (`ds_lifted_budget_decode_available()` → `True`):
   `valid_lengths` < width, and an **interior `-1` from within-row dedup**, all vs a
   reference attention. 337 DS unit tests + 9 subtests pass.
 
-## Open items (carry to served measurement + hardening)
-- **Served recall (next)**: the wired branch must be booted with
-  `--disable-cuda-graph` + an `enable_lifted_budget_decode` config and the 4K NIAH
-  recall recovery measured served at N≥20 with CIs (the M0 oracle predicted
-  4K recall@4096 ≈ 100% vs recall@2048 ≈ 44%) — the binding evidence, not the
-  score-only oracle. This is an eager-mode number (label it as such — eager vs
-  graph recall differs).
-- **TP=8 equality (next)**: extend the TP determinism harness to the lifted
-  4096/8192 width.
+## Open items (carry to hardening)
+- ~~**Served recall**~~ **RESOLVED (R14, `m8_lifted_recall_finding.md`)**: served
+  NIAH 4K, N=20, both eager same node — DS-lifted-4096 **95% [75.1,99.9]** vs
+  DS-default-2048 **75% [50.9,91.3]**, **+20pp material** (lifted > base CI-high).
+  Confirms the M0 4K budget-limited attribution on the served path (eager-mode number).
+- ~~**TP=8 equality**~~ **RESOLVED (R14)**: lifted-width 4096/8192 selected-index +
+  valid-length equality across 8 gloo ranks
+  (`test_ds_scorer_tp_determinism.py::TestTP8LiftedWidthDeterminism`).
 - ~~`flash_mla_sparse_fwd` accuracy at top-k > 512 unproven~~ **RESOLVED (R12)**.
 - ~~selection budget widening / `%128` enforcement / decode wiring~~
   **RESOLVED (R13)**: selector + backend widen to `lifted_budget_top_k`, config

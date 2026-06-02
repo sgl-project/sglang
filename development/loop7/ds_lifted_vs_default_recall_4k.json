@@ -1,0 +1,45 @@
+{
+  "comparison": "DS-default top_k=2048 vs DS-lifted lifted_budget_top_k=4096",
+  "mode": "EAGER (--disable-cuda-graph) on BOTH, same node \u2014 isolates the selection BUDGET (2048 vs 4096), not the eager-vs-graph numerics gap",
+  "ci": "Clopper-Pearson exact 95%",
+  "materiality_rule": "A lifted UPLIFT over the DS-default baseline is MATERIAL only when the lifted recall point EXCEEDS the DS-default baseline 95% CP CI HIGH (directional, lifted > base_hi). N=20 makes one needle = 5pp.",
+  "op_points": {
+    "ds_default": "DS int8 top_k=2048 (default) / mem0.7 / eager / TP=8 / page64 / fp8-KV",
+    "ds_lifted": "DS int8 lifted_budget_top_k=4096 top_k=2048 / mem0.7 / eager / TP=8 / page64 / fp8-KV"
+  },
+  "lengths": {
+    "4096": {
+      "ds_default": {
+        "hits": 15,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 0.75,
+        "ci95": [
+          0.509,
+          0.9134
+        ],
+        "prompt_tokens": [
+          4368,
+          4408
+        ]
+      },
+      "ds_lifted": {
+        "hits": 19,
+        "served": 20,
+        "admission_fail": 0,
+        "recall": 0.95,
+        "ci95": [
+          0.7513,
+          0.9987
+        ],
+        "prompt_tokens": [
+          4368,
+          4408
+        ]
+      },
+      "uplift_pp": 20.0,
+      "material_uplift": true,
+      "rule": "lifted 0.95 > base_hi 0.9134 -> True"
+    }
+  }
+}

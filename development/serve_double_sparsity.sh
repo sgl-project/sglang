@@ -78,18 +78,32 @@ ANCHOR_BUDGET="${ANCHOR_BUDGET:-0}"
 # (--disable-cuda-graph), which the validator requires.
 RECALL_ORACLE="${RECALL_ORACLE:-0}"                        # 0 | 1
 if [[ "${RECALL_ORACLE}" == "1" ]]; then RECALL_ORACLE_JSON=true; else RECALL_ORACLE_JSON=false; fi
-DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s", "scorer_norm": "%s", "scorer_norm_hybrid_threshold": %s, "head_agg": "%s", "anchor_mode": "%s", "anchor_budget": %s, "recall_oracle": %s}' \
-  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}" "${SCORER_NORM_HYBRID_THRESHOLD}" "${HEAD_AGG}" "${ANCHOR_MODE}" "${ANCHOR_BUDGET}" "${RECALL_ORACLE_JSON}")
+# Opt-in lifted-budget decode (eager research path). LIFTED_BUDGET=1 emits
+# "enable_lifted_budget_decode": true + a wider "lifted_budget_top_k" (must be
+# > top_k and a multiple of 128) and forces eager (--disable-cuda-graph), which
+# the validator requires (dequantize_k_cache_paged is not graph-safe). Off => the
+# config emits the default-off pair (lifted_budget_top_k must be 0 when off, else
+# the config fails closed).
+LIFTED_BUDGET="${LIFTED_BUDGET:-0}"                        # 0 | 1
+if [[ "${LIFTED_BUDGET}" == "1" ]]; then
+  LIFTED_BUDGET_JSON=true
+  LIFTED_BUDGET_TOP_K="${LIFTED_BUDGET_TOP_K:-4096}"
+else
+  LIFTED_BUDGET_JSON=false
+  LIFTED_BUDGET_TOP_K=0
+fi
+DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s", "scorer_norm": "%s", "scorer_norm_hybrid_threshold": %s, "head_agg": "%s", "anchor_mode": "%s", "anchor_budget": %s, "recall_oracle": %s, "enable_lifted_budget_decode": %s, "lifted_budget_top_k": %s}' \
+  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}" "${SCORER_NORM_HYBRID_THRESHOLD}" "${HEAD_AGG}" "${ANCHOR_MODE}" "${ANCHOR_BUDGET}" "${RECALL_ORACLE_JSON}" "${LIFTED_BUDGET_JSON}" "${LIFTED_BUDGET_TOP_K}")
 echo ">>> effective double_sparsity_config = ${DS_CONFIG}"
 
-# Only the recall-oracle diagnostic still needs eager (it host-syncs). As of R9
-# ALL non-learned selector variants — scorer_norm (cosine/hybrid), head_agg
-# (mean) [R6], anchor_mode (recency/global/strided) [R9] — are graph-safe and run
-# under CUDA graph. Auto-add --disable-cuda-graph only for RECALL_ORACLE.
+# Eager is required for the recall-oracle diagnostic (it host-syncs) AND for the
+# lifted-budget decode path (its dequantize_k_cache_paged allocates and is not
+# CUDA-graph-safe). As of R9 all non-learned scorer/anchor variants are graph-safe
+# and run under CUDA graph; auto-add --disable-cuda-graph only for those two.
 CUDA_GRAPH_ARGS=()
-if [[ "${RECALL_ORACLE}" == "1" ]]; then
+if [[ "${RECALL_ORACLE}" == "1" || "${LIFTED_BUDGET}" == "1" ]]; then
   CUDA_GRAPH_ARGS=(--disable-cuda-graph)
-  echo ">>> recall_oracle diagnostic requires eager: adding --disable-cuda-graph"
+  echo ">>> recall_oracle/lifted-budget require eager: adding --disable-cuda-graph"
 fi
 
 # Radix cache: DS serves radix-off by default. To serve radix-on, set

@@ -1,0 +1,22 @@
+{
+  "op_point": "DS int8 lifted_budget_top_k=4096 top_k=2048 / mem0.7 / eager / TP=8 / page64 / fp8-KV",
+  "base_url": "http://127.0.0.1:30000",
+  "num_per_length": 20,
+  "max_new_tokens": 64,
+  "index_topk": 2048,
+  "timestamp": "20260602T161353Z",
+  "lengths": [
+    {
+      "length_words": 4096,
+      "num_requested": 20,
+      "served": 20,
+      "admission_fail": 0,
+      "recall_hits": 19,
+      "served_recall": 0.95,
+      "prompt_tokens_min": 4368,
+      "prompt_tokens_max": 4408,
+      "errors": [],
+      "elapsed_s": 46.8
+    }
+  ]
+}
