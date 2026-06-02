@@ -98,6 +98,16 @@ def main():
                     help="decode coarse stage-1 only (faster, lower quality)")
     args = ap.parse_args()
 
+    # uvicorn silently serves HTTP but rejects /ws with HTTP 403 ("Unsupported
+    # upgrade request") if NO WebSocket library is installed. Fail loudly here,
+    # before the slow model load, instead of as a cryptic 403 at connect time.
+    import importlib.util
+    if (importlib.util.find_spec("websockets") is None
+            and importlib.util.find_spec("wsproto") is None):
+        raise SystemExit(
+            "[sana_wm_realtime] No WebSocket library found — uvicorn would reject "
+            "/ws with HTTP 403.\n  Fix:  pip install websockets")
+
     import uvicorn
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_realtime_engine import (
         SanaWMRealtimeEngine,

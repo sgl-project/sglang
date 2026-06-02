@@ -15,6 +15,9 @@ This is the same chunk-wise pipeline the upstream NVlabs streaming inference use
 ## Setup
 
 ```bash
+# websockets (or wsproto) is REQUIRED — without it uvicorn rejects /ws with HTTP 403
+# ("Unsupported upgrade request") while still serving the page, so the canvas shows
+# "disconnected". The server checks for it at startup.
 pip install fastapi uvicorn websockets pillow
 
 # Assemble the streaming model dir (test-anas-smoke DiT/VAE/refiner + gemma-2-2b
