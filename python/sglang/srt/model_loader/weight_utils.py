@@ -914,7 +914,9 @@ def safetensors_weights_iterator(
     )
 
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted(hf_weights_files), num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
 
     for st_file in tqdm(
         hf_weights_files,
@@ -1050,7 +1052,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted(hf_weights_files), num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
