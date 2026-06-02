@@ -176,7 +176,10 @@ def sgemm_lora_a_fwd(
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         base_grid = batch_info.bs * num_s_tiles
         num_sms = _num_sms(x.device.index)
-        if base_grid < num_sms and num_k_tiles >= 8:
+        # Require K >= 4096 (>= 16 K-tiles): split-K has a ~5us floor (buffer
+        # zeroing + atomics + launch), so at K=2048 the non-split path is
+        # already below that floor and split-K regresses at higher batch.
+        if base_grid < num_sms and num_k_tiles >= 16:
             split_k = max(1, min(2 * num_sms // base_grid, num_k_tiles, 16))
 
     launch_kwargs = {}
