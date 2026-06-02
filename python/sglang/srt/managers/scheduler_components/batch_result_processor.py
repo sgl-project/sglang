@@ -864,22 +864,26 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
+        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
         at_boundary, track_seqlen = self._mamba_check_track_boundary(
             req, batch, result, i
         )
+
         if not at_boundary:
+            if lazy and req.finished():
+                self._mamba_lazy_undo_stale_prealloc(req, batch)
             return
 
-        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
-        if not lazy:
+        req.mamba_last_track_seqlen = track_seqlen
+        if lazy:
+            self.mamba_lazy_post_decode_at_boundary(req, batch)
+        else:
             req.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
                 )
             )
-        req.mamba_last_track_seqlen = track_seqlen
-        if lazy:
-            self.mamba_lazy_post_decode_at_boundary(req, batch)
+
 
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
@@ -908,19 +912,41 @@ class SchedulerBatchResultProcessor:
     ):
         """Post-decode cleanup at a lazy-mode track boundary.
 
-        For running reqs: free the old ping-pong slot so we go back to
+        Finished reqs return early — ``free_mamba_cache`` handles their
+        slots.  If prealloc failed (other slot is -1), the forward
+        overwrote the only slot with corrupted state, so mark
+        is_insert=False to skip the cache insert.
+
+        Running reqs: free the old ping-pong slot so we go back to
         holding only 1 slot until the next boundary.
-        For finished reqs: if prealloc failed (other slot is -1), the
-        forward overwrote the only slot with corrupted state — mark
-        is_insert=False so cache_finished_req skips the insert.
         """
-        other_idx = 1 - req.mamba_next_track_idx
         if req.finished():
+            other_idx = 1 - req.mamba_next_track_idx
             if req.mamba_ping_pong_track_buffer[other_idx].item() == -1:
                 req.mamba_lazy_is_insert = False
             return
-        pool = batch.req_to_token_pool
+        other_idx = 1 - req.mamba_next_track_idx
         old_val = req.mamba_ping_pong_track_buffer[other_idx]
         if old_val.item() != -1:
+            pool = batch.req_to_token_pool
             pool.mamba_pool.free(old_val.unsqueeze(0))
-        pool.set_mamba_ping_pong_slot(req, other_idx, -1)
+            pool.set_mamba_ping_pong_slot(req, other_idx, -1)
+
+    def _mamba_lazy_undo_stale_prealloc(
+        self, req: Req, batch: ScheduleBatch
+    ):
+        """Undo a prealloc that was performed by a stale overlap forward.
+
+        With overlap scheduling a finished request gets one extra
+        ``prepare_for_decode`` before its EOS token is processed.
+        If that extra step hit a track boundary, prealloc allocated a
+        second slot and swapped ``next_track_idx``.  The post-decode
+        cleanup never ran for that step (overlap skips finished reqs).
+
+        Swap ``next_track_idx`` back to the old slot whose state matches
+        ``mamba_last_track_seqlen``.  The stale slot is freed later by
+        ``free_mamba_cache``.
+        """
+        other_idx = 1 - req.mamba_next_track_idx
+        if req.mamba_ping_pong_track_buffer[other_idx].item() != -1:
+            req.mamba_next_track_idx = other_idx
