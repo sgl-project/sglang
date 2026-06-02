@@ -1,11 +1,12 @@
 """SANA-WM realtime engine — in-process backend for the Live Web UI (S3).
 
-Loads the streaming pipeline in-process (no scheduler subprocess), bootstraps the
-incremental SanaWMRealtimeSession (encode prompt + first frame -> reset), and
-exposes step(keys) that takes a WASD/IJKL keypress, extends the camera trajectory
-(pose-continuous), generates ONE chunk via forward_long with the carried KV cache,
-decodes it through the causal VAE, and returns RGB frames. Both the websocket
-handler and the scripted validator below call engine.step(keys).
+Loads the streaming TWO-STAGE pipeline in-process (no scheduler subprocess) and
+bootstraps the incremental SanaWMRealtimeSession (encode prompt + first frame ->
+reset). step(keys) takes a WASD/IJKL keypress, extends the camera trajectory
+(pose-continuous), generates ONE stage-1 chunk via forward_long with the carried
+KV cache, REFINES it with the chunked LTX-2 refiner (RefinerChunkRunner carrying a
+sink/history KV cache), and decodes through the causal VAE. The DMD stage-1 is
+coarse by design, so the refiner is required for sharp output.
 """
 from __future__ import annotations
 import os
@@ -18,15 +19,17 @@ STRIDE = 8  # LTX-2 VAE temporal stride
 
 
 class SanaWMRealtimeEngine:
-    def __init__(self, model_path=MODEL, height=704, width=1280, seed=42, port="29699"):
+    def __init__(self, model_path=MODEL, height=704, width=1280, seed=42, port="29699",
+                 use_refiner=True):
         from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
         from sglang.multimodal_gen.runtime.pipelines_core import build_pipeline
         from sglang.multimodal_gen.runtime.distributed import (
             maybe_init_distributed_environment_and_model_parallel,
         )
+        self.use_refiner = use_refiner
         sa = ServerArgs.from_kwargs(
             model_path=model_path, pipeline_config={"streaming": True},
-            pipeline_class_name="SanaWMPipeline",
+            pipeline_class_name="SanaWMTwoStagePipeline" if use_refiner else "SanaWMPipeline",
             dit_cpu_offload=False, dit_layerwise_offload=False)
         for k, v in dict(MASTER_ADDR="localhost", MASTER_PORT=port, LOCAL_RANK="0",
                          RANK="0", WORLD_SIZE="1").items():
@@ -44,7 +47,6 @@ class SanaWMRealtimeEngine:
         self.vae = self.pipeline.get_module("vae")
         self.height, self.width, self.seed = height, width, seed
         self.nfpb = int(getattr(self.pcfg, "num_frame_per_block", 3))
-        # locate the before-denoising stage (camera builder) + prefix stages
         self._before = next(s for s in self.pipeline.stages
                             if s.__class__.__name__ == "SanaWMBeforeDenoisingStage")
         self._decstage = next(s for s in self.pipeline.stages
@@ -55,9 +57,19 @@ class SanaWMRealtimeEngine:
             self._prefix.append(s)
             if s.__class__.__name__ == "SanaWMBeforeDenoisingStage":
                 break
+        self._refiner_stage = None
+        if use_refiner:
+            self._refiner_stage = next(
+                (s for s in self.pipeline.stages
+                 if s.__class__.__name__ == "SanaWMStreamingRefinerStage"), None)
+            # refiner modules resident on GPU (no residency manager in-engine)
+            for m in ("transformer_2", "connectors", "text_encoder_2"):
+                mod = self.pipeline.get_module(m)
+                if mod is not None and hasattr(mod, "to"):
+                    mod.to(self.device)
         self.session = None
         self._segments = []
-        self._T_lat = 1   # condition frame
+        self._T_lat = 1
         self._dtype = None
 
     def reset(self, prompt, image_path, init_keys="w"):
@@ -68,7 +80,7 @@ class SanaWMRealtimeEngine:
         )
         req = Req(prompt=prompt, image_path=image_path, num_frames=49, num_inference_steps=4,
                   height=self.height, width=self.width, seed=self.seed, save_output=False)
-        req.extra = {"action": f"{init_keys}-8"}  # placeholder; per-step camera rebuilt
+        req.extra = {"action": f"{init_keys}-8"}
         full = list(self.pipeline.stages)
         self.pipeline._stages = self._prefix
         try:
@@ -93,21 +105,40 @@ class SanaWMRealtimeEngine:
         self._segments = []
         self._T_lat = 1
         self._H, self._W = first_latent.shape[3], first_latent.shape[4]
-        # Engine-owned causal-VAE decode (scale_and_shift + decode_chunk), mirroring
-        # SanaWMStreamingDecodingStage. decode_end tracks the last decoded latent frame.
         self._conv = self.vae.reset_decoder_cache()
         self._decode_end = 0
-        return None
+        # build the chunked refiner runner (carries sink/history KV across steps)
+        self._runner = None
+        if self.use_refiner and self._refiner_stage is not None:
+            self._build_refiner_runner(prompt, first_latent)
+
+    def _build_refiner_runner(self, prompt, first_latent):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
+            STAGE_2_DISTILLED_SIGMA_VALUES, _unwrap_diffusers_ltx2_refiner,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming_refiner import (
+            RefinerChunkRunner, _RefinerCore,
+        )
+        rs = self._refiner_stage
+        embeds, mask = rs._encode_prompt(prompt, self.device)
+        unwrapped = _unwrap_diffusers_ltx2_refiner(rs.transformer)
+        core = _RefinerCore(unwrapped, self.device, rs.dtype)
+        sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device)
+        self._sink = int(rs.sink_size)
+        self._runner = RefinerChunkRunner(
+            core, prompt_embeds=embeds, prompt_attention_mask=mask, fps=16.0, sigmas=sigmas,
+            source_sink_frames=self._sink, block_size=int(rs.block_size),
+            kv_max_frames=int(rs.kv_max_frames), seed=int(rs.seed), spatial_shape=(self._H, self._W))
+        # refined buffer: [0:sink] = stage-1 sink frame(s) (unrefined, as the official does)
+        self._refined = first_latent.clone()
 
     def _build_camera(self, total_T_lat):
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import _to_device_dtype
         num_pixel = (total_T_lat - 1) * STRIDE + 1
-        action = ",".join(self._segments)
         req = Req(prompt=self._prompt, num_frames=num_pixel, num_inference_steps=4,
                   height=self.height, width=self.width, seed=self.seed)
-        req.extra = {"action": action}
-        cc, cp, src = self._before._build_camera_conditioning(
+        req.extra = {"action": ",".join(self._segments)}
+        cc, cp, _ = self._before._build_camera_conditioning(
             req, batch_size=1, num_frames=num_pixel,
             latent_shape=(1, 128, total_T_lat, self._H, self._W),
             device=self.device, dtype=self._dtype)
@@ -115,18 +146,32 @@ class SanaWMRealtimeEngine:
 
     @torch.no_grad()
     def step(self, keys):
+        from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
         if self.session is None:
             raise RuntimeError("call reset() first")
         keys = "".join(c for c in keys.lower() if c in "wasdijkl") or "w"
         self._segments.append(f"{keys}-{self.nfpb * STRIDE}")
-        from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
         total_T_lat = self._T_lat + self.nfpb
         cc, cp = self._build_camera(total_T_lat)
         with set_forward_context(current_timestep=0, attn_metadata=None, forward_batch=None):
             self.session.step(camera_conditions=cc, chunk_plucker=cp,
                               n_frames=self.nfpb, decode=False)
         new_end = self.session.latents.shape[2]
-        seg = self.session.latents[:, :, self._decode_end:new_end].to(self._vae_dtype)
+
+        if self._runner is not None:
+            # refine the freshly generated stage-1 chunk, carrying sink/history
+            start_f = self._refined.shape[2]            # = sink + already-refined frames
+            clean = self.session.latents[:, :, start_f:new_end].contiguous()
+            sink_seed = self.session.latents[:, :, :self._sink] if start_f == self._sink else None
+            refined = self._runner.refine_block(
+                block_idx=start_f, clean_block=clean,
+                block_start=start_f, block_end=new_end, sink_seed_frames=sink_seed)
+            self._refined = torch.cat([self._refined, refined.to(self._refined.dtype)], dim=2)
+            src = self._refined
+        else:
+            src = self.session.latents
+
+        seg = src[:, :, self._decode_end:new_end].to(self._vae_dtype)
         z = self._decstage.scale_and_shift(seg, self.sa)
         px = self.vae.decode_chunk(z, self._conv)
         self._decode_end = new_end
@@ -135,9 +180,8 @@ class SanaWMRealtimeEngine:
 
     @staticmethod
     def _to_rgb(px):
-        px = (px / 2 + 0.5).clamp(0, 1).float().cpu()  # (B,C,T,H,W)
-        v = (px[0].permute(1, 2, 3, 0).numpy() * 255).round().astype(np.uint8)  # (T,H,W,C)
-        return v
+        px = (px / 2 + 0.5).clamp(0, 1).float().cpu()
+        return (px[0].permute(1, 2, 3, 0).numpy() * 255).round().astype(np.uint8)
 
 
 def main():
@@ -146,13 +190,13 @@ def main():
     prompt = open(f"{ASSET}/demo_0.txt").read().strip()
     eng.reset(prompt, f"{ASSET}/demo_0.png")
     frames = []
-    print("RESET ok", flush=True)
+    print("RESET ok (refiner=%s)" % bool(eng._runner), flush=True)
     for keys in ["w", "wl", "l"]:
         f = eng.step(keys)
         frames.append(f)
         print(f"STEP {keys!r}: {f.shape} latent_T={eng.session.latents.shape[2]}", flush=True)
     vid = np.concatenate(frames, axis=0)
-    out = "/data/yihao/sana-wm-streaming-tree/outputs/sana_wm_realtime_scripted.mp4"
+    out = "/data/yihao/sana-wm-streaming-tree/outputs/sana_wm_realtime_refined.mp4"
     iio.imwrite(out, vid, fps=16, codec="libx264")
     print("SAVED", out, vid.shape, flush=True)
 
