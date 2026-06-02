@@ -94,12 +94,14 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.precision import (
-    autocast_enabled as precision_autocast_enabled,
-    resolve_precision,
-)
 from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
     RolloutDenoisingMixin,
+)
+from sglang.multimodal_gen.runtime.precision import (
+    autocast_enabled as precision_autocast_enabled,
+)
+from sglang.multimodal_gen.runtime.precision import (
+    resolve_precision,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

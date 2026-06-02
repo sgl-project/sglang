@@ -142,7 +142,11 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
                 self.assertEqual(spec.dtype, expected_dtype, module_name)
                 self.assertTrue(spec.is_user_policy, module_name)
 
-            for invalid_module_name in ("text_encoder_0", "text_encoder_3", "text_encoder_20"):
+            for invalid_module_name in (
+                "text_encoder_0",
+                "text_encoder_3",
+                "text_encoder_20",
+            ):
                 with self.assertRaises(ValueError, msg=invalid_module_name):
                     resolve_component_precision(server_args, invalid_module_name)
 
