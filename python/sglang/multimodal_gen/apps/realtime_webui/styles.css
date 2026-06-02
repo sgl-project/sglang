@@ -32,7 +32,7 @@ button:disabled { cursor: wait; opacity: 0.64; transform: none; }
 
 .shell {
   display: grid;
-  grid-template-columns: minmax(260px, 320px) minmax(420px, 1fr) minmax(260px, 320px);
+  grid-template-columns: minmax(260px, 320px) minmax(560px, 1fr);
   gap: 18px;
   min-height: 100vh;
   padding: 18px;
@@ -136,6 +136,13 @@ textarea { resize: vertical; line-height: 1.45; }
 input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.12); }
 
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.output-options {
+  align-items: end;
+}
+.output-options .toggle-row {
+  min-height: 40px;
+  margin: 12px 0;
+}
 .actions { display: grid; grid-template-columns: 1fr 0.7fr; gap: 10px; margin-top: 16px; }
 .toggle-row {
   display: flex;
@@ -208,6 +215,12 @@ button:focus-visible {
 }
 .wide { width: 100%; margin-top: 10px; }
 
+.workspace {
+  display: grid;
+  gap: 18px;
+  min-width: 0;
+}
+
 .stage {
   position: relative;
   display: grid;
@@ -215,12 +228,46 @@ button:focus-visible {
   align-self: start;
   justify-self: center;
   width: 100%;
-  max-width: 1040px;
+  max-width: min(1500px, 100%);
   overflow: hidden;
   border: 1px solid #11140f;
   border-radius: 8px;
   background: #11140f;
   box-shadow: var(--shadow);
+}
+
+.preview-frame {
+  position: relative;
+  display: grid;
+  place-items: center;
+  justify-self: center;
+  width: min(calc(1040px * var(--preview-scale, 1.2)), 100%);
+  overflow: hidden;
+  background: #11140f;
+  contain: paint;
+  isolation: isolate;
+}
+
+.preview-frame::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    rgba(238, 241, 236, 0.045),
+    transparent 34%,
+    rgba(0, 0, 0, 0.18)
+  );
+}
+
+.preview-frame::after {
+  content: none;
+}
+
+.stage[data-preview-state="waiting"] .preview-frame::after {
+  animation: none;
 }
 
 .topbar, .timeline {
@@ -235,6 +282,28 @@ button:focus-visible {
 }
 
 .topbar-spacer { flex: 1; }
+.preview-scale-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 190px;
+  margin: 0;
+  color: rgba(232, 234, 223, 0.72);
+  font-size: 11px;
+}
+.preview-scale-control input {
+  width: 92px;
+  min-width: 72px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: #eef1ec;
+}
+.preview-scale-control b {
+  min-width: 36px;
+  color: #fffdf7;
+  font-weight: 650;
+}
 #statusText {
   display: inline-block;
   min-width: 92px;
@@ -261,13 +330,61 @@ button:focus-visible {
 .dot.error { background: var(--accent); }
 
 #viewport {
+  position: relative;
+  z-index: 1;
   display: block;
   width: 100%;
   height: auto;
-  max-height: min(56vh, 560px);
+  max-height: min(calc(56vh * var(--preview-scale, 1.2)), 82vh);
   min-height: 0;
   object-fit: contain;
   image-rendering: auto;
+  transform: translateZ(0);
+}
+
+.preview-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: none;
+  place-items: center;
+  pointer-events: none;
+  background: transparent;
+}
+
+.stage[data-preview-state="waiting"] .preview-overlay {
+  display: grid;
+}
+
+.preview-loader {
+  position: relative;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(238, 241, 236, 0.88);
+  animation: previewDotPulse 1.05s ease-in-out infinite;
+}
+
+.preview-loader::before,
+.preview-loader::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(238, 241, 236, 0.88);
+  animation: previewDotPulse 1.05s ease-in-out infinite;
+}
+
+.preview-loader::before {
+  left: -16px;
+  animation-delay: -0.18s;
+}
+
+.preview-loader::after {
+  left: 16px;
+  animation-delay: 0.18s;
 }
 
 .stage-controls {
@@ -366,7 +483,7 @@ button:focus-visible {
 
 .spec-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
   gap: 8px;
   margin-bottom: 12px;
 }
@@ -390,18 +507,18 @@ button:focus-visible {
 }
 
 .presets {
-  position: sticky;
-  top: 18px;
-  max-height: calc(100vh - 36px);
-  overflow: auto;
+  position: static;
+  max-height: none;
+  overflow: visible;
   scrollbar-gutter: stable;
 }
 
 .preset-list {
   display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 7px;
-  min-height: 320px;
-  max-height: min(54vh, 560px);
+  min-height: 0;
+  max-height: 230px;
   margin-bottom: 12px;
   overflow: auto;
   padding-right: 3px;
@@ -483,7 +600,7 @@ button:focus-visible {
 .history-list {
   display: grid;
   gap: 7px;
-  max-height: 76px;
+  max-height: 92px;
   overflow: auto;
 }
 
@@ -499,10 +616,17 @@ button:focus-visible {
 @media (max-width: 980px) {
   .shell { grid-template-columns: 1fr; }
   .presets { position: static; max-height: none; overflow: visible; }
+  .spec-grid { grid-template-columns: repeat(2, 1fr); }
   .preset-list { min-height: 260px; max-height: 420px; }
   #viewport { max-height: 420px; }
   .stage-controls { grid-template-columns: 1fr; }
   .stage-telemetry { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topbar { flex-wrap: wrap; height: auto; min-height: 44px; padding: 10px 14px; }
   .topbar-spacer { display: none; }
+  .preview-scale-control { min-width: 160px; }
+}
+
+@keyframes previewDotPulse {
+  0%, 80%, 100% { opacity: 0.32; }
+  40% { opacity: 1; }
 }

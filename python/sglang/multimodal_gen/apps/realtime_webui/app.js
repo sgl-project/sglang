@@ -10,6 +10,8 @@ const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
 const DEFAULT_TARGET_FPS = 25;
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
 const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
+const DEFAULT_UPSCALING_SCALE = 2;
+const DEFAULT_PREVIEW_SCALE = 120;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
@@ -222,9 +224,13 @@ let encodedDecodeErrors = 0;
 let socketHadError = false;
 let socketCloseExpected = false;
 let socketServerError = "";
+let renderedPreviewFrames = 0;
+let previewScaleFrame = 0;
 const decodeRequests = new Map();
 let controlStateController = null;
 
+const stage = document.querySelector(".stage");
+const previewFrame = document.querySelector(".preview-frame");
 const canvas = $("viewport");
 const ctx = canvas.getContext("2d", { alpha: false });
 const scratchCanvas = document.createElement("canvas");
@@ -235,6 +241,12 @@ function setStatus(text, kind = "") {
   $("statusDot").className = "dot" + (kind ? ` ${kind}` : "");
 }
 
+function setPreviewState(state) {
+  if (!stage) return;
+  stage.dataset.previewState = state;
+  canvas.setAttribute("aria-busy", state === "waiting" ? "true" : "false");
+}
+
 function addHistory(text) {
   const item = document.createElement("span");
   item.textContent = text;
@@ -243,19 +255,40 @@ function addHistory(text) {
 }
 
 function drawIdle() {
-  const w = canvas.width, h = canvas.height;
-  const g = ctx.createLinearGradient(0, 0, w, h);
-  g.addColorStop(0, "#171a16");
-  g.addColorStop(0.58, "#253628");
-  g.addColorStop(1, "#8f4a37");
-  ctx.fillStyle = g;
+  const w = 1280, h = 720;
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  setPreviewState("idle");
+  renderedPreviewFrames = 0;
+  ctx.fillStyle = "#11140f";
   ctx.fillRect(0, 0, w, h);
-  ctx.fillStyle = "rgba(238,241,236,.82)";
-  ctx.font = "600 46px Avenir Next, sans-serif";
-  ctx.fillText("sglang-diffusion", 56, 86);
-  for (let i = 0; i < 18; i++) {
-    ctx.fillStyle = `rgba(238,241,236,${0.05 + i * 0.015})`;
-    ctx.fillRect(56 + i * 64, h - 86 - i * 7, 42, 42 + i * 4);
+
+  const surface = ctx.createLinearGradient(0, 0, 0, h);
+  surface.addColorStop(0, "rgba(238,241,236,0.045)");
+  surface.addColorStop(0.5, "rgba(238,241,236,0.012)");
+  surface.addColorStop(1, "rgba(0,0,0,0.16)");
+  ctx.fillStyle = surface;
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.strokeStyle = "rgba(238,241,236,0.11)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+  ctx.strokeStyle = "rgba(238,241,236,0.08)";
+  ctx.beginPath();
+  if (ctx.roundRect) {
+    ctx.roundRect(w * 0.38, h * 0.42, w * 0.24, h * 0.16, 18);
+  } else {
+    ctx.rect(w * 0.38, h * 0.42, w * 0.24, h * 0.16);
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(238,241,236,0.22)";
+  for (let i = -1; i <= 1; i++) {
+    ctx.beginPath();
+    ctx.arc(w * 0.5 + i * 22, h * 0.5, 4.5, 0, Math.PI * 2);
+    ctx.fill();
   }
 }
 
@@ -277,6 +310,7 @@ function resetStreamStats() {
   currentReceiveChunk = null;
   currentReceiveChunkFrames = 0;
   encodedDecodeErrors = 0;
+  renderedPreviewFrames = 0;
   controlStateController?.reset({ sendRelease: false });
   resetDecoderState();
   updateStats();
@@ -290,6 +324,7 @@ function resetStreamStats() {
   $("theoreticalFpsText").textContent = "-";
   $("chunkText").textContent = "chunk -";
   $("payloadMode").textContent = selectedTransportLabel();
+  updateOutputSizeText();
 }
 
 function rejectPendingDecodes(message) {
@@ -669,27 +704,22 @@ function drawFrame(image) {
     drawSource = scratchCanvas;
   }
 
-  const rect = canvas.getBoundingClientRect();
-  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
-  const targetWidth = Math.max(1, Math.round(rect.width * dpr));
-  const targetHeight = Math.max(
-    1,
-    Math.round((targetWidth * sourceHeight) / sourceWidth),
-  );
-  if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-    canvas.width = targetWidth;
-    canvas.height = targetHeight;
+  if (canvas.width !== sourceWidth || canvas.height !== sourceHeight) {
+    canvas.width = sourceWidth;
+    canvas.height = sourceHeight;
   }
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(drawSource, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(drawSource, 0, 0, sourceWidth, sourceHeight);
+  renderedPreviewFrames += 1;
+  setPreviewState("live");
   if (!(image instanceof ImageData)) image.close?.();
 }
 
 function renderLoop(now) {
   const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
   const queueSeconds = queue.length / Math.max(1, targetFps);
-  const catchupFps = queueSeconds > LOW_LATENCY_QUEUE_SECONDS
+  const catchupFps = !$("superResolution").checked && queueSeconds > LOW_LATENCY_QUEUE_SECONDS
     ? Math.min(MAX_CATCHUP_FPS, Math.ceil(queue.length / LOW_LATENCY_QUEUE_SECONDS))
     : targetFps;
   const targetMs = 1000 / Math.max(1, catchupFps);
@@ -770,6 +800,7 @@ async function setPresetReference(preset) {
 
 function showError(error) {
   setStatus("Reference load failed", "error");
+  if (!renderedPreviewFrames) setPreviewState("idle");
   addHistory(error.message || "reference load failed");
 }
 
@@ -795,10 +826,12 @@ function abortCurrentSession(reason = "session closed by client", {
     clearQueueOnClose = false;
     if (!keepConnectDisabled) $("connectBtn").disabled = false;
     setStatus("Closed");
+    if (!renderedPreviewFrames) setPreviewState("idle");
     return null;
   }
   if (!keepConnectDisabled) $("connectBtn").disabled = false;
   setStatus(expectedClose ? "Closing" : "Aborting");
+  if (!renderedPreviewFrames) setPreviewState("idle");
   addHistory(reason);
   socket.close(expectedClose ? 1000 : 1011, reason.slice(0, 120));
   return socket;
@@ -828,6 +861,7 @@ function waitForSocketClose(socket, timeoutMs = RECONNECT_CLOSE_TIMEOUT_MS) {
 async function connect() {
   $("connectBtn").disabled = true;
   setStatus("Preparing");
+  setPreviewState("waiting");
   addHistory("preparing session");
   try {
     if (ws && ws.readyState !== WebSocket.CLOSED) {
@@ -845,12 +879,14 @@ async function connect() {
     const firstFrame = await readFirstFrame();
     if (!firstFrame) {
       setStatus("Pick a reference", "error");
+      setPreviewState("idle");
       addHistory("reference image required");
       $("connectBtn").disabled = false;
       return;
     }
     const previewTransportParams = readPreviewTransportParams();
     const frameInterpolationParams = readFrameInterpolationParams();
+    const superResolutionParams = readSuperResolutionParams();
     const init = compact({
       type: "init",
       model: $("model").value,
@@ -867,6 +903,7 @@ async function connect() {
       first_frame: firstFrame,
       ...previewTransportParams,
       ...frameInterpolationParams,
+      ...superResolutionParams,
     });
     document.activeElement?.blur?.();
     canvas.tabIndex = 0;
@@ -908,6 +945,7 @@ async function connect() {
         setStatus("Closed");
         addHistory(closeText);
       }
+      if (!renderedPreviewFrames) setPreviewState("idle");
       socketCloseExpected = false;
     };
     socket.onerror = () => {
@@ -928,6 +966,7 @@ async function connect() {
   } catch (error) {
     $("connectBtn").disabled = false;
     setStatus("Init failed", "error");
+    if (!renderedPreviewFrames) setPreviewState("idle");
     addHistory(error.message || "init failed");
   }
 }
@@ -1019,6 +1058,7 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   frames += chunkFrameCount;
   bytes += payloadBytes;
   $("payloadMode").textContent = header.encoding || "raw RGB";
+  updateOutputSizeFromHeader(header);
   updatePlaybackPace(header, performance.now(), chunkFrameCount);
   setStatus("Live", "live");
   updateStats(header);
@@ -1059,9 +1099,10 @@ function updatePlaybackPace(header, now, frameCount) {
   if (waitSeconds > 0) {
     const generatedFps = currentReceiveChunkFrames / Math.max(0.001, waitSeconds);
     const requestedFps = Number($("fps").value || DEFAULT_TARGET_FPS);
+    const playbackFloor = $("superResolution").checked ? 1 : LOW_LATENCY_FPS_FLOOR;
     playbackFps = Math.min(
       requestedFps,
-      Math.max(LOW_LATENCY_FPS_FLOOR, generatedFps * 1.05),
+      Math.max(playbackFloor, generatedFps * 1.05),
     );
     const latencyText = `${waitSeconds.toFixed(1)}s · ${playbackFps.toFixed(1)}fps`;
     $("latencyText").textContent = latencyText;
@@ -1114,6 +1155,7 @@ async function applyPreset(preset, options = {}) {
   $("prompt").value = preset.prompt;
   $("size").value = preset.size;
   $("fps").value = preset.fps;
+  updateOutputSizeText();
   await setPresetReference(preset);
   if (sendRuntimeEvents) {
     sendEvent("prompt", preset.prompt, `prompt update · ${preset.name}`);
@@ -1249,6 +1291,67 @@ function readFrameInterpolationParams() {
   };
 }
 
+function readUpscalingScale() {
+  return Number($("upscalingScale").value || DEFAULT_UPSCALING_SCALE);
+}
+
+function readSuperResolutionParams() {
+  if (!$("superResolution").checked) return {};
+  return {
+    enable_upscaling: true,
+    upscaling_scale: readUpscalingScale(),
+  };
+}
+
+function parseSizeValue(sizeText) {
+  const match = /^(\d+)\s*x\s*(\d+)$/i.exec(String(sizeText || "").trim());
+  if (!match) return null;
+  return {
+    width: Number(match[1]),
+    height: Number(match[2]),
+  };
+}
+
+function updateOutputSizeText(width = null, height = null) {
+  let outputWidth = Number(width || 0);
+  let outputHeight = Number(height || 0);
+  const srEnabled = $("superResolution").checked;
+  const scale = srEnabled ? readUpscalingScale() : 1;
+  if (!outputWidth || !outputHeight) {
+    const base = parseSizeValue($("size").value);
+    if (base) {
+      outputWidth = base.width * scale;
+      outputHeight = base.height * scale;
+    }
+  }
+  $("outputSizeText").textContent = outputWidth && outputHeight
+    ? `${outputWidth}x${outputHeight}${srEnabled ? ` · SR ${scale}x` : ""}`
+    : "-";
+}
+
+function updateOutputSizeFromHeader(header) {
+  const width = Number(header.width || 0);
+  const height = Number(header.height || 0);
+  if (width && height) updateOutputSizeText(width, height);
+}
+
+function updateSuperResolutionControls() {
+  $("upscalingScale").disabled = !$("superResolution").checked;
+  updateOutputSizeText();
+}
+
+function setPreviewScale(value) {
+  if (!previewFrame) return;
+  const scale = Math.max(80, Math.min(170, Number(value || DEFAULT_PREVIEW_SCALE)));
+  $("previewScale").value = String(scale);
+  $("previewScaleText").textContent = `${scale}%`;
+  if (previewScaleFrame) cancelAnimationFrame(previewScaleFrame);
+  previewScaleFrame = requestAnimationFrame(() => {
+    previewScaleFrame = 0;
+    previewFrame.style.setProperty("--preview-scale", String(scale / 100));
+  });
+}
+
 function selectedTransportLabel() {
   const select = $("transportFormat");
   return select.options[select.selectedIndex]?.textContent || "raw RGB";
@@ -1299,6 +1402,11 @@ async function applyQueryParams() {
   if (model) $("model").value = model;
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  const srParam = params.get("sr");
+  $("superResolution").checked = srParam === "1" || srParam === "true";
+  $("upscalingScale").value = params.get("sr_scale") || String(DEFAULT_UPSCALING_SCALE);
+  setPreviewScale(params.get("preview_scale") || params.get("zoom"));
+  updateSuperResolutionControls();
   return {
     model: Boolean(model),
     preset: Boolean(presetKey && appliedPreset),
@@ -1394,6 +1502,8 @@ function unpack(buf) {
 
 renderPresets();
 drawIdle();
+setPreviewScale(DEFAULT_PREVIEW_SCALE);
+updateSuperResolutionControls();
 applyPreset(presets[0], { sendRuntimeEvents: false })
   .then(applyQueryParams)
   .then((query) => queryServerModelInfo({
@@ -1406,6 +1516,10 @@ $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
 $("enhanceBtn").onclick = enhancePrompt;
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
+$("size").addEventListener("input", () => updateOutputSizeText());
+$("superResolution").addEventListener("change", updateSuperResolutionControls);
+$("upscalingScale").addEventListener("change", () => updateOutputSizeText());
+$("previewScale").addEventListener("input", () => setPreviewScale($("previewScale").value));
 $("serverUrl").addEventListener("change", () => {
   queryServerModelInfo({ applyPresetForModel: true }).catch(showError);
 });
