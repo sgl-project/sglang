@@ -83,6 +83,8 @@ class CpuDeviceMixin(DeviceMixin):
         return "cpu"
 
     def get_device_uuid(self, device_id: int = 0) -> str:
+        # CPU has no per-device UUID; return the arch string as a stable
+        # host-level identifier (matches the multimodal CpuPlatform).
         return _platform.machine()
 
     def get_device_capability(self, device_id: int = 0) -> Optional[DeviceCapability]:
@@ -116,16 +118,13 @@ class CpuDeviceMixin(DeviceMixin):
 
 
 class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
-    """Default in-tree CPU SRT platform."""
+    """Default in-tree CPU SRT platform.
 
-    def supports_fp8(self) -> bool:
-        return False
-
-    def support_cuda_graph(self) -> bool:
-        return False
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        return False
+    supports_fp8 / support_cuda_graph / support_piecewise_cuda_graph keep the
+    conservative SRTPlatform defaults (all False), so they are not repeated
+    here. Only is_pin_memory_available is overridden: the base defaults to
+    True, but CPU has no GPU to pin host memory to.
+    """
 
     def is_pin_memory_available(self) -> bool:
         return False

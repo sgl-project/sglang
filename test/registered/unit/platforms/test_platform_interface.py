@@ -431,7 +431,7 @@ class TestCpuDeviceMixin(CustomTestCase):
         name = base.get_device_name()
         self.assertIn("x86_64", name)
 
-    @patch("sglang.srt.platforms.cpu._platform.machine", return_value="aarch64")
+    @patch("platform.machine", return_value="aarch64")
     def test_get_device_uuid_returns_machine(self, _mock_machine):
         base = CpuSRTPlatform()
         self.assertEqual(base.get_device_uuid(), "aarch64")
