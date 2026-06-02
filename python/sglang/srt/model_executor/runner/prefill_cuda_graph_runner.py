@@ -50,7 +50,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.cuda_graph_config import Phase
-from sglang.srt.model_executor.runner.base_runner import (
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )

@@ -33,7 +33,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.model_executor.runner_backend.base_cudagraph_backend import (
+from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (

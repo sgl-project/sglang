@@ -2845,7 +2845,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.decode_cuda_graph_runner = GraphRunnerCls(self)
         else:
-            from sglang.srt.model_executor.runner.decode_runner import (
+            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
                 DecodeCudaGraphRunner,
             )
 
