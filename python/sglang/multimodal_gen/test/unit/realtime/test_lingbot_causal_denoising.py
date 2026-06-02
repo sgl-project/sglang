@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
 )
 from sglang.multimodal_gen.runtime.models.dits.lingbot_world import (
     CausalLingBotWorldTransformer3DModel,
+    _sequence_splits_are_uniform,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
     LingBotWorldCausalDMDDenoisingStage,
@@ -239,6 +240,12 @@ def test_lingbot_condition_embedding_skips_text_when_crossattn_cache_ready():
     assert torch.equal(temb, torch.tensor([[7.0]]))
     assert torch.equal(timestep_proj, torch.tensor([[8.0]]))
     assert image_states is None
+
+
+def test_lingbot_sequence_split_uniform_fast_path_guard():
+    assert _sequence_splits_are_uniform([1170, 1170, 1170, 1170])
+    assert not _sequence_splits_are_uniform([1170, 1170, 1169, 1171])
+    assert not _sequence_splits_are_uniform([])
 
 
 def test_lingbot_context_cache_update_skips_unused_projection(monkeypatch):
