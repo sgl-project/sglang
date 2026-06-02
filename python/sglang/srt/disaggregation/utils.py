@@ -36,6 +36,7 @@ class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
+    HYBRID = "hybrid"
 
     @staticmethod
     def to_engine_type(mode: str) -> str:
@@ -43,6 +44,8 @@ class DisaggregationMode(Enum):
             return "prefill"
         elif mode == DisaggregationMode.DECODE.value:
             return "decode"
+        elif mode == DisaggregationMode.HYBRID.value:
+            return "hybrid"
         return "unified"
 
 

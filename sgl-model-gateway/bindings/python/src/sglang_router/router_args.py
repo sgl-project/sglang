@@ -50,6 +50,11 @@ class RouterArgs:
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
 
+    # Hybrid PD mode: nodes do local P+D but can overflow to dedicated decode nodes
+    hybrid_mode: bool = False
+    hybrid_node_urls: List[str] = dataclasses.field(default_factory=list)
+    hybrid_decode_urls: List[str] = dataclasses.field(default_factory=list)
+
     # Routing policy
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
@@ -397,6 +402,25 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hybrid-mode",
+            action="store_true",
+            help="Enable hybrid PD mode: nodes do local P+D with optional overflow to dedicated decode nodes",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hybrid-node",
+            nargs=1,
+            action="append",
+            metavar=("URL",),
+            help="Hybrid P+D node URL. Can be specified multiple times.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hybrid-decode",
+            nargs=1,
+            action="append",
+            metavar=("URL",),
+            help="Dedicated decode node URL for hybrid overflow. Can be specified multiple times.",
         )
         pd_group.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -996,6 +1020,12 @@ class RouterArgs:
         args_dict["decode_urls"] = cls._parse_decode_urls(
             cli_args_dict.get(f"{prefix}decode", None)
         )
+        args_dict["hybrid_node_urls"] = cls._parse_decode_urls(
+            cli_args_dict.get(f"{prefix}hybrid_node", None)
+        )
+        args_dict["hybrid_decode_urls"] = cls._parse_decode_urls(
+            cli_args_dict.get(f"{prefix}hybrid_decode", None)
+        )
         args_dict["selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}selector", None)
         )
@@ -1020,7 +1050,18 @@ class RouterArgs:
 
     def _validate_router_args(self):
         # Validate configuration based on mode
-        if self.pd_disaggregation:
+        if self.hybrid_mode:
+            if not self.hybrid_node_urls and not self.service_discovery:
+                logger.warning(
+                    "Hybrid mode enabled but no --hybrid-node URLs specified. "
+                    "Use --hybrid-node to specify P+D node URLs."
+                )
+            if not self.hybrid_decode_urls and not self.service_discovery:
+                logger.warning(
+                    "Hybrid mode enabled but no --hybrid-decode URLs specified. "
+                    "Overflow requests will have no external decode target."
+                )
+        elif self.pd_disaggregation:
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:
                 logger.warning(

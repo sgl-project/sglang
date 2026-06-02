@@ -92,6 +92,12 @@ Examples:
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --prefill-policy cache_aware --decode-policy power_of_two
 
+  # Hybrid PD mode: 3 P+D nodes with 1 dedicated decode overflow node
+  python -m sglang_router.launch_router --hybrid-mode \\
+    --hybrid-node http://node1:8000 --hybrid-node http://node2:8000 --hybrid-node http://node3:8000 \\
+    --hybrid-decode http://decode1:8001 \\
+    --policy round_robin
+
     """,
         formatter_class=CustomHelpFormatter,
     )

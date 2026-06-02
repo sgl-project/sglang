@@ -224,6 +224,8 @@ class MooncakeKVManager(CommonKVManager):
                     name="MooncakeFailedSessionProbe",
                     daemon=True,
                 ).start()
+        elif self.disaggregation_mode == DisaggregationMode.HYBRID:
+            self._init_hybrid_sender()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
@@ -234,6 +236,52 @@ class MooncakeKVManager(CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _init_hybrid_sender(self):
+        """Initialize sender infrastructure for hybrid mode (same as prefill but on-demand)."""
+        self.start_prefill_thread()
+        self.session_failures = defaultdict(int)
+        self.failed_sessions = set()
+        self.session_lock = threading.Lock()
+        cpu_count = os.cpu_count()
+        transfer_thread_pool_size = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
+        if transfer_thread_pool_size is None:
+            transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
+        transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+        self.transfer_queues: List[FastQueue] = [
+            FastQueue() for _ in range(transfer_queue_size)
+        ]
+        assert transfer_thread_pool_size >= transfer_queue_size
+        self.executors = [
+            concurrent.futures.ThreadPoolExecutor(
+                transfer_thread_pool_size // transfer_queue_size
+            )
+            for _ in range(transfer_queue_size)
+        ]
+        self.enable_custom_mem_pool, self.custom_mem_pool_type = (
+            check_mooncake_custom_mem_pool_enabled()
+        )
+        self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
+        if self.enable_staging:
+            self._init_staging_buffers(len(self.transfer_queues))
+        for i, (queue, executor) in enumerate(
+            zip(self.transfer_queues, self.executors)
+        ):
+            threading.Thread(
+                target=self.transfer_worker,
+                args=(
+                    queue,
+                    executor,
+                    (
+                        self._staging_ctx.buffers[i]
+                        if self.enable_staging and self._staging_ctx.buffers
+                        else None
+                    ),
+                ),
+                daemon=True,
+            ).start()
+        self.enable_failed_session_probe = False
+        logger.info("Hybrid mode: KV sender infrastructure initialized")
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers

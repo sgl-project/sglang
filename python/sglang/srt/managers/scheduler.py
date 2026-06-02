@@ -51,6 +51,10 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.hybrid import (
+    check_and_offload_requests,
+    init_hybrid_disaggregation,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -1144,6 +1148,9 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+        elif self.disaggregation_mode == DisaggregationMode.HYBRID:
+            init_hybrid_disaggregation(self)
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
@@ -1439,6 +1446,10 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
 
+            # Poll hybrid offload inflight queue
+            if self.disaggregation_mode == DisaggregationMode.HYBRID:
+                self.process_disagg_prefill_inflight_queue()
+
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -1496,6 +1507,10 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
+
+            # Poll hybrid offload inflight queue
+            if self.disaggregation_mode == DisaggregationMode.HYBRID:
+                self.process_disagg_prefill_inflight_queue()
 
             # Update last_batch
             self.last_batch = batch
@@ -3174,6 +3189,9 @@ class Scheduler(
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.process_batch_result_disagg_prefill(batch, result)
+            elif self.disaggregation_mode == DisaggregationMode.HYBRID:
+                self.batch_result_processor.process_batch_result_prefill(batch, result)
+                check_and_offload_requests(self)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
@@ -3864,6 +3882,13 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_overlap_disagg_decode()
         else:
             scheduler.event_loop_normal_disagg_decode()
+    elif disaggregation_mode == DisaggregationMode.HYBRID:
+        if server_args.pp_size > 1:
+            scheduler.event_loop_pp()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
 
 
 def configure_scheduler_process(

@@ -807,8 +807,8 @@ class ServerArgs:
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
 
-    # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
-    disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
+    # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), "decode" (decode-only), or "hybrid" (local P+D with optional offload)
+    disaggregation_mode: Literal["null", "prefill", "decode", "hybrid"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
@@ -817,6 +817,12 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+
+    # Hybrid PD mode: nodes do local prefill+decode but can offload to external decode nodes
+    hybrid_external_decode_addresses: List[str] = dataclasses.field(default_factory=list)
+    hybrid_offload_watermark: float = 0.8  # KV cache usage ratio triggering offload
+    hybrid_local_decode_limit: int = 0  # max concurrent local decode requests (0=unlimited)
+    hybrid_long_output_threshold: int = 0  # output len estimate above which to offload (0=disabled)
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -1036,7 +1042,7 @@ class ServerArgs:
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
 
     def _handle_load_balance_method(self):
-        if self.disaggregation_mode not in ("null", "prefill", "decode"):
+        if self.disaggregation_mode not in ("null", "prefill", "decode", "hybrid"):
             raise ValueError(
                 f"Invalid disaggregation_mode={self.disaggregation_mode!r}"
             )

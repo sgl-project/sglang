@@ -78,3 +78,15 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                 f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
+
+    elif server_args.disaggregation_mode == "hybrid":
+        if not server_args.hybrid_external_decode_addresses:
+            logger.warning(
+                "Hybrid mode enabled without --hybrid-external-decode-addresses. "
+                "All requests will be decoded locally until external decode nodes are configured."
+            )
+        if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+            raise ValueError(
+                f"Hybrid mode requires disaggregation_transfer_backend='mooncake' or 'nixl', "
+                f"got '{server_args.disaggregation_transfer_backend}'."
+            )
