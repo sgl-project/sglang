@@ -434,7 +434,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
                 conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
+                    mixed_qkv_to_track.to(conv_states.dtype)
                 )
 
             mixed_qkv = causal_conv1d_fn(
