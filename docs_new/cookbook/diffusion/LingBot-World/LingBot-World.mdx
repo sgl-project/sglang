@@ -42,9 +42,7 @@ This is different from offline diffusion video models such as Wan or LTX. Offlin
 ```bash Command
 sglang serve \
   --model-path robbyant/lingbot-world-fast-diffusers \
-  --model-type diffusion \
   --pipeline-class-name LingBotWorldCausalDMDPipeline \
-  --port 30000 \
   --num-gpus 4 \
   --ulysses-degree 4 \
   --dit-cpu-offload false \
