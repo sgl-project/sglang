@@ -29,6 +29,21 @@ def _in_flight_other_mb_rids(t: ScriptedContext) -> List[str]:
     return rids
 
 
+def _drain_until_released(t, *handles):
+    # Under the overlap scheduler an abort/retract releases a req's KV/row/lock_ref
+    # over several forward steps, not in the single step right after the call.
+    # Advance the loop until every handle has fully released, then return.
+    for _ in range(12):
+        if all(
+            h.kv_pages == 0
+            and h.lock_refs == 0
+            and (h.req is None or h.req.req_pool_idx is None)
+            for h in handles
+        ):
+            return
+        yield
+
+
 class TestRegressionBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
@@ -41,7 +56,7 @@ class TestRegressionBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert r.req.req_pool_idx is None
@@ -78,17 +93,25 @@ class TestRegressionBasic(ScriptedTestCase):
 
         # Step one at a time so observed_max sees every intermediate value of
         # inflight_middle_chunks, not just the values at the run_until landings.
+        # Read r.req once per iter and skip None: once the req finishes its object
+        # is recycled to None, and under the overlap scheduler that can happen on
+        # the same step the chunk loop would otherwise break.
         observed_max = 0
         saw_chunking_bump = False
+        cleared_inflight = False
         for _ in range(DEFAULT_MAX_STEPS):
-            observed_max = max(observed_max, r.req.inflight_middle_chunks)
-            if r.chunks_done >= 1 and r.is_chunking:
-                saw_chunking_bump = saw_chunking_bump or (
-                    r.req.inflight_middle_chunks > 0
-                )
-            if not r.is_chunking and r.chunks_done >= 2:
-                break
+            req = r.req
+            if req is not None:
+                observed_max = max(observed_max, req.inflight_middle_chunks)
+                if r.chunks_done >= 1 and r.is_chunking:
+                    saw_chunking_bump = saw_chunking_bump or (
+                        req.inflight_middle_chunks > 0
+                    )
+                if not r.is_chunking and r.chunks_done >= 2:
+                    cleared_inflight = req.inflight_middle_chunks == 0
+                    break
             if r.finished:
+                cleared_inflight = True
                 break
             yield
         else:
@@ -100,9 +123,8 @@ class TestRegressionBasic(ScriptedTestCase):
             f"observed max={observed_max} (pre-fix bug would bump to 2 "
             f"at the last-chunk admit boundary)"
         )
-        assert r.req.inflight_middle_chunks == 0, (
-            f"inflight_middle_chunks should be 0 after chunk loop clears; "
-            f"got {r.req.inflight_middle_chunks}"
+        assert cleared_inflight, (
+            "inflight_middle_chunks should be 0 once the chunk loop clears"
         )
 
         yield from run_until_finished(r)
@@ -195,18 +217,20 @@ class TestRegressionBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_chunked_admission_reuse_branch_balanced(t: ScriptedContext):
-        baseline_refs = t.get_all_node_lock_refs()
+        # get_all_node_lock_refs returns a per-node {node_id: ref_count} map; the
+        # invariant is on the total ref count across nodes, so sum the values.
+        baseline_refs = sum(t.get_all_node_lock_refs().values())
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
 
         yield from run_until(r, lambda h: h.chunks_done >= 3 and h.is_chunking)
-        mid_refs = t.get_all_node_lock_refs()
+        mid_refs = sum(t.get_all_node_lock_refs().values())
         assert mid_refs - baseline_refs == 1, (
             f"reuse branch must not re-acquire lock_ref per chunk; "
             f"baseline={baseline_refs}, mid={mid_refs}"
         )
 
         yield from run_until_finished(r)
-        final_refs = t.get_all_node_lock_refs()
+        final_refs = sum(t.get_all_node_lock_refs().values())
         assert final_refs == baseline_refs, (
             f"chunked lifecycle must net to zero lock_ref delta; "
             f"baseline={baseline_refs}, final={final_refs}"
@@ -258,7 +282,7 @@ class TestRegressionBasic(ScriptedTestCase):
         assert r.lock_refs >= 1, "radix lock_ref must be held mid-chunk"
 
         t.abort(r)
-        yield
+        yield from _drain_until_released(t, r)
 
         assert (
             r.req.req_pool_idx is None
@@ -319,7 +343,10 @@ class TestRegressionBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         r2 = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r1, lambda h: h.is_chunking and h.chunks_done >= 1)
-        yield from run_until(r2, lambda h: h.is_chunking)
+        # Only one chunked_req slot exists: while r1 holds it, r2 cannot become the
+        # chunked req and instead sits in the waiting_queue, so wait for r2 to be
+        # admitted as "waiting" rather than for an is_chunking state it never reaches.
+        yield from run_until(r2, lambda h: h.status == "waiting")
 
         t.pause_generation(mode="retract")
         yield

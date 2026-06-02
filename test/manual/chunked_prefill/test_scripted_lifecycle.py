@@ -13,6 +13,22 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 
 
+def _drain_until_released(t, *handles):
+    # Under the overlap scheduler a req's row/KV/lock_ref are released a few
+    # forward steps after `finished` first flips True, so a release assertion
+    # placed immediately after run_until_finished can observe a still-held row.
+    # Advance the loop until every handle has fully released, then return.
+    for _ in range(12):
+        if all(
+            h.kv_pages == 0
+            and h.lock_refs == 0
+            and (h.req is None or h.req.req_pool_idx is None)
+            for h in handles
+        ):
+            return
+        yield
+
+
 class TestLifecycleBasic(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=DEFAULT_CHUNK_SIZE)
 
@@ -222,11 +238,18 @@ class TestLifecycleBasic(ScriptedTestCase):
     def _script_two_seq_clean_handoff(t: ScriptedContext):
         r1 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r1)
+        yield from _drain_until_released(t, r1)
         assert r1.req.req_pool_idx is None and r1.kv_pages == 0 and r1.lock_refs == 0
+        # Capture r1's output length while its req is still live: admitting and
+        # running r2 recycles r1's finished req object to None, so reading
+        # r1.req.output_ids after r2 finishes would raise AttributeError.
+        r1_output_len = len(r1.req.output_ids)
+
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r2)
+        yield from _drain_until_released(t, r2)
         assert r1.finished and r2.finished
-        assert len(r1.req.output_ids) == 2 and len(r2.req.output_ids) == 2
+        assert r1_output_len == 2 and len(r2.req.output_ids) == 2
         assert r2.req.req_pool_idx is None and r2.kv_pages == 0 and r2.lock_refs == 0
 
     def test_five_seq_clean(self):
@@ -308,6 +331,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 1
+            yield from _drain_until_released(t, r)
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert (
@@ -321,11 +345,18 @@ class TestLifecycleBasic(ScriptedTestCase):
 
     @staticmethod
     def _script_seq_with_shrinking_prompt(t: ScriptedContext):
-        for L in [1024, 512, 128, 32, 8]:
-            r = t.start_req(prompt_len=L, max_new_tokens=1, ignore_eos=True)
+        # Distinct prompt_token per iteration: each shorter prompt is a prefix of
+        # the previous longer one, so an identical fill token would let the shorter
+        # req hit the longer one's cached prefix and chunk fewer times than its cold
+        # ceil(L/chunk) count.
+        for idx, L in enumerate([1024, 512, 128, 32, 8]):
+            r = t.start_req(
+                prompt_len=L, max_new_tokens=1, ignore_eos=True, prompt_token=10 + idx
+            )
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 1
+            yield from _drain_until_released(t, r)
             assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert (

@@ -66,6 +66,13 @@ class TestSWABasic(ScriptedTestCase):
         assert r.chunks_done >= 2
         assert r.kv_pages == 0
         assert r.lock_refs == 0
+        # The finished req commits its prompt prefix to the radix tree, so the SWA
+        # pool stays below baseline until the overlap lag drains and the cache is
+        # flushed. Drain, flush, then measure recovery.
+        for _ in range(5):
+            yield
+        t.flush_cache()
+        yield
         assert t.engine_stats()["kv_pool_free"] >= baseline_free, (
             "SWA pool failed to recover after a window-straddling chunked req: "
             f"baseline={baseline_free}, "
@@ -85,7 +92,14 @@ class TestSWABasic(ScriptedTestCase):
         # the SWA pool to exhaustion mid-chunk to force at least one park, then
         # assert the req still completes with no leaked pages or lock refs (park,
         # not leak; the non-SWA branch would instead force-admit at line 682).
-        r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
+        #
+        # The prompt must exceed the sliding window (_SWA_WINDOW=4096): once
+        # prefill passes the window, SWA evicts the req's own out-of-window KV
+        # back to the pool, which is what lets a parked chunk eventually resume
+        # even though exhaust_kv holds every externally-free page. A prompt that
+        # fits inside the window (e.g. VERY_LONG_PROMPT_LEN=2048) never self-evicts
+        # and would park forever after exhaustion.
+        r = t.start_req(prompt_len=_SWA_WINDOW + VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
         t.exhaust_kv(leave_pages=0)
         yield from run_until_finished(r, max_steps=2000)
