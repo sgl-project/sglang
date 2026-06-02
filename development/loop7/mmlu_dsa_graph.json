@@ -7,5 +7,6 @@
   "op_point": "DSA native-NSA (no double-sparsity) / mem 0.7 / TP=8",
   "graph_mode": "cuda_graph",
   "transport": "raw /generate, 5-shot Answer: prompt, max_new_tokens=4",
-  "example_seed": "deterministic (seed=0xAC12) -> identical questions across servers (paired)"
+  "example_seed": "deterministic (seed=0xAC12) -> identical questions across servers (paired)",
+  "data_dir": "/root/ac12_mmlu_data"
 }

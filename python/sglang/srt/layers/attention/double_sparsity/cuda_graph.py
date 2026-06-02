@@ -286,12 +286,11 @@ def capture_decode_step(
         and state.scratch_scores is not None
     )
 
-    # Fail fast: scorer_norm (cosine/hybrid) + head_agg (mean) are ported into the
-    # graph-safe Triton scorer (R6) and are safe to capture. A non-default
-    # anchor_mode (post-topK force-include) is NOT yet graph-safe and would be
-    # SILENTLY dropped under capture — refuse rather than capture a wrong
-    # selection; such a configuration must serve eager (--disable-cuda-graph)
-    # until the anchor path is ported.
+    # Fail-fast future-proof guard. As of R9 every non-learned variant is
+    # graph-safe — scorer_norm (cosine/hybrid) + head_agg (mean) in the Triton
+    # scorer [R6], anchor_mode (recency/global/strided) as a tensorized post-topK
+    # force-include [R9] — so this does not fire. It remains so a future
+    # non-graph-safe variant can re-enable the eager requirement.
     if use_graph_safe:
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
             ds_scorer_is_graph_safe,
@@ -299,11 +298,8 @@ def capture_decode_step(
 
         if not ds_scorer_is_graph_safe(getattr(selector, "config", None)):
             raise RuntimeError(
-                "Double Sparsity: a non-default anchor_mode "
-                f"(anchor_mode={getattr(selector.config, 'anchor_mode', 'off')!r}) "
-                "is not yet supported by the graph-safe Triton scorer; serve with "
-                "--disable-cuda-graph until it is ported. Capturing here would "
-                "silently drop the anchor force-include."
+                "Double Sparsity: a non-graph-safe selector variant cannot be "
+                "captured; serve with --disable-cuda-graph or use the default selector."
             )
 
     def _call_into_state() -> None:
@@ -343,6 +339,8 @@ def capture_decode_step(
                 hybrid_threshold=getattr(
                     selector.config, "scorer_norm_hybrid_threshold", 8192
                 ),
+                anchor_mode=getattr(selector.config, "anchor_mode", "off"),
+                anchor_budget=getattr(selector.config, "anchor_budget", 0),
             )
         else:
             out_idx, out_len = selector.retrieve_topk(

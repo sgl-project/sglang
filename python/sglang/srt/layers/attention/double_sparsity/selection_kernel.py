@@ -426,17 +426,18 @@ def ds_scorer_is_default(config) -> bool:
 
 
 def ds_scorer_is_graph_safe(config) -> bool:
-    """``True`` iff the configured scorer variants are all implemented on the
-    graph-safe Triton path, so the selector can run under CUDA-graph capture.
+    """``True`` iff the configured selector variants are all on the graph-safe
+    path, so the selector can run under CUDA-graph capture.
 
-    As of R6 ``scorer_norm`` (cosine/hybrid) and ``head_agg`` (mean) are ported
-    into ``_logical_score_kernel`` and ARE graph-safe. ``anchor_mode`` is a
-    post-topK per-row force-include that is NOT yet graph-safe — a non-default
-    ``anchor_mode`` still requires the eager selector (and ``--disable-cuda-graph``).
+    As of R9 ALL non-learned variants are graph-safe: ``scorer_norm``
+    (cosine/hybrid) + ``head_agg`` (mean) live in ``_logical_score_kernel`` (R6),
+    and ``anchor_mode`` (recency/global/strided) is a tensorized fixed-shape
+    post-topK force-include in ``retrieve_topk_graph_safe`` (R9). None require
+    ``--disable-cuda-graph``. (The ``recall_oracle`` diagnostic is gated
+    separately by ``ds_recall_oracle_enabled``.) Retained as the single guard
+    predicate so a future non-graph-safe variant can re-introduce a gate here.
     """
-    if config is None:
-        return True
-    return getattr(config, "anchor_mode", "off") == "off"
+    return True
 
 
 def ds_recall_oracle_enabled(config) -> bool:
@@ -845,6 +846,52 @@ def _anchor_positions(n: int, budget: int, mode: str) -> list:
     return []
 
 
+def _anchor_positions_tensor(
+    seq_lens: torch.Tensor, eb: torch.Tensor, A: int, mode: str
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Tensorized ``_anchor_positions``: ``[bs, A]`` anchor logical positions +
+    ``[bs, A]`` validity (slot ``i`` valid iff ``i < eb`` and, for strided, it is
+    the first occurrence of its value). Graph-safe (no host sync, fixed shape)."""
+    device = seq_lens.device
+    bs = seq_lens.shape[0]
+    i = torch.arange(A, device=device).view(1, A)
+    n = seq_lens.view(bs, 1).to(torch.int64)
+    ebv = eb.view(bs, 1)
+    valid = i < ebv
+    if mode == "recency":
+        pos = n - ebv + i
+    elif mode == "global":
+        pos = i.expand(bs, A).clone()
+    elif mode == "strided":
+        denom = (ebv - 1).clamp(min=1).to(torch.float64)
+        step = (n - 1).to(torch.float64) / denom
+        pos = torch.round(i.to(torch.float64) * step).to(torch.int64)
+        pos = torch.where(ebv == 1, torch.zeros_like(pos), pos)
+        # strided's set-dedup: values are ascending in i, so a duplicate is == prev.
+        prev = torch.cat(
+            [torch.full((bs, 1), -1, dtype=torch.int64, device=device), pos[:, :-1]],
+            dim=1,
+        )
+        valid = valid & (pos != prev)
+    else:
+        pos = torch.zeros(bs, A, dtype=torch.int64, device=device)
+        valid = torch.zeros(bs, A, dtype=torch.bool, device=device)
+    pos = torch.where(valid, pos, torch.full_like(pos, -1))
+    return pos, valid
+
+
+def _stable_argsort_ascending(
+    key: torch.Tensor, tiebreak_pos: torch.Tensor
+) -> torch.Tensor:
+    """Argsort ``key`` ascending with ``tiebreak_pos`` ascending as the stable
+    tie-break (two stable passes). Mirrors the eager list ``.sort(key=score)``,
+    which keeps the original position-ascending order among equal scores."""
+    order_p = torch.argsort(tiebreak_pos, dim=1, stable=True)
+    key_p = torch.gather(key, 1, order_p)
+    order_k = torch.argsort(key_p, dim=1, stable=True)
+    return torch.gather(order_p, 1, order_k)
+
+
 def _force_include_anchor(
     indices: torch.Tensor,
     scores: torch.Tensor,
@@ -854,44 +901,68 @@ def _force_include_anchor(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Force each request's deterministic anchor positions (per ``anchor_mode``)
     into the selection, evicting the lowest-scoring non-anchor selected positions
-    and preserving the per-row selected count. Eager/research path (per-row loop).
+    (stable position-ascending tie-break) and preserving the per-row selected
+    count.
+
+    Fully tensorized (no per-row Python loop, no ``.item()`` host sync, fixed
+    shapes), so it is graph-safe and is used by BOTH the eager logical path and
+    the graph-safe Triton path — guaranteeing identical selection. Bit-identical
+    to the former per-row reference (fuzz-verified) including the R3 over-budget
+    clamp (``effective_budget = min(anchor_budget, valid_count, seq_len)``) and
+    strided set-dedup.
     """
-    bs, budget = indices.shape
-    out = indices.to(torch.int32).clone()
-    sl = seq_lens.to(torch.int64).tolist()
-    for b in range(bs):
-        n = int(sl[b])
-        if n <= 0:
-            continue
-        real = [int(p) for p in out[b].tolist() if p >= 0]
-        # Clamp the effective anchor budget to the selected count: we can only
-        # force in as many anchors as there are selection slots. Generate the
-        # anchor positions from the EFFECTIVE budget so e.g. recency yields the
-        # most-recent `len(real)` positions (not the first `len(real)` of an
-        # oversized recency set). _anchor_positions further clamps to seq_len.
-        effective_budget = min(anchor_budget, len(real))
-        anchors = _anchor_positions(n, effective_budget, anchor_mode)
-        if not anchors:
-            continue
-        real_set = set(real)
-        anchor_set = set(anchors)
-        missing = [p for p in anchors if p not in real_set]
-        if not missing:
-            continue
-        evictable = [p for p in real if p not in anchor_set]
-        evictable.sort(key=lambda p: float(scores[b, p].item()))  # lowest score first
-        k = min(len(missing), len(evictable))
-        if k == 0:
-            continue
-        keep = [p for p in real if p not in set(evictable[:k])]
-        new_real = sorted(set(keep) | set(missing[:k]))[: len(real)]
-        filled = torch.full((budget,), -1, dtype=torch.int32, device=out.device)
-        filled[: len(new_real)] = torch.tensor(
-            new_real, dtype=torch.int32, device=out.device
-        )
-        out[b] = filled
-    valid = (out >= 0).to(torch.int32).sum(dim=-1)
-    return out, valid
+    if anchor_mode == "off" or anchor_budget <= 0:
+        return indices.to(torch.int32), (indices >= 0).to(torch.int32).sum(-1)
+    device = indices.device
+    bs, K = indices.shape
+    A = int(anchor_budget)
+    max_seq = scores.shape[1]
+    pos = indices.to(torch.int64)
+    real_mask = pos >= 0
+    real_count = real_mask.sum(1)
+    n = seq_lens.to(torch.int64)
+    eb = torch.minimum(torch.full_like(real_count, A), real_count)
+    eb = torch.minimum(eb, n)  # _anchor_positions further clamps the budget to n
+
+    apos, avalid = _anchor_positions_tensor(n, eb, A, anchor_mode)
+    psafe = pos.clamp(min=0)
+
+    # max_seq-wide membership masks (an extra sentinel column absorbs -1 pads).
+    sel_mask = torch.zeros(bs, max_seq + 1, dtype=torch.bool, device=device)
+    sel_mask.scatter_(1, torch.where(real_mask, pos, torch.full_like(pos, max_seq)), True)
+    sel_mask = sel_mask[:, :max_seq]
+    anc_mask = torch.zeros(bs, max_seq + 1, dtype=torch.bool, device=device)
+    anc_mask.scatter_(1, torch.where(avalid, apos, torch.full_like(apos, max_seq)), True)
+    anc_mask = anc_mask[:, :max_seq]
+
+    missing = avalid & ~torch.gather(sel_mask, 1, apos.clamp(min=0))   # [bs,A]
+    evictable = real_mask & ~torch.gather(anc_mask, 1, psafe)          # [bs,K]
+    k = torch.minimum(missing.sum(1), evictable.sum(1))               # [bs]
+
+    # Evict the k lowest-score evictables (score asc, position asc tie-break).
+    big_score = torch.finfo(torch.float32).max
+    evict_score = torch.where(
+        evictable, torch.gather(scores, 1, psafe),
+        torch.full((bs, K), big_score, dtype=scores.dtype, device=device),
+    )
+    order = _stable_argsort_ascending(evict_score, pos)
+    rank = torch.empty_like(order)
+    rank.scatter_(1, order, torch.arange(K, device=device).view(1, K).expand(bs, K))
+    drop = evictable & (rank < k.view(bs, 1))
+    keep = real_mask & ~drop
+
+    # Insert the first k missing anchors (ascending position).
+    miss_rank = torch.cumsum(missing.to(torch.int64), dim=1) - 1
+    insert = missing & (miss_rank < k.view(bs, 1))
+
+    # Combine keep + inserted positions, sort ascending, pad to K with -1.
+    big = max_seq + 10
+    keep_pos = torch.where(keep, psafe, torch.full_like(psafe, big))
+    ins_pos = torch.where(insert, apos.clamp(min=0), torch.full((bs, A), big, dtype=torch.int64, device=device))
+    combined, _ = torch.sort(torch.cat([keep_pos, ins_pos], dim=1), dim=1)
+    out = combined[:, :K]
+    out = torch.where(out >= big, torch.full_like(out, -1), out).to(torch.int32)
+    return out, (out >= 0).to(torch.int32).sum(-1)
 
 
 def retrieve_topk_via_labels(
@@ -1241,6 +1312,8 @@ def retrieve_topk_graph_safe(
     scorer_norm: str = "off",
     head_agg: str = "max",
     hybrid_threshold: int = 8192,
+    anchor_mode: str = "off",
+    anchor_budget: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Capture-safe retrieve_topk that writes results into caller-owned buffers.
 
@@ -1295,6 +1368,8 @@ def retrieve_topk_graph_safe(
             scorer_norm=scorer_norm,
             head_agg=head_agg,
             hybrid_threshold=hybrid_threshold,
+            anchor_mode=anchor_mode,
+            anchor_budget=anchor_budget,
         )
         mtk = indices.shape[1]
         out_indices[:bs, :mtk].copy_(indices)
@@ -1413,6 +1488,18 @@ def retrieve_topk_graph_safe(
         sorted_vals_view, boundary_view, right=False, out=valid_i64_view
     )
     out_lengths[:bs].copy_(valid_i64_view.squeeze(-1))
+
+    # Graph-safe anchor-budget force-include (R9): tensorized, fixed-shape, no
+    # host sync — bit-identical to the eager path (same _force_include_anchor).
+    # Off by default; under CUDA-graph capture the extra ops are captured once and
+    # replay reuses their memory (alloc-free on replay).
+    if anchor_mode != "off" and anchor_budget > 0:
+        a_idx, a_len = _force_include_anchor(
+            out_indices[:bs, :max_top_k], scores_view, seq_lens,
+            int(anchor_budget), anchor_mode,
+        )
+        out_indices[:bs, :max_top_k].copy_(a_idx)
+        out_lengths[:bs].copy_(a_len)
 
     # Flag-gated recall oracle on the production GPU decode path. ``scores_view``
     # is the all-reduced + per-request-masked score tensor (after the all_reduce

@@ -2232,12 +2232,14 @@ class DeepseekV2AttentionMLA(
                     _ds_graph_state = getattr(
                         _dsa_metadata, "ds_graph_state", None
                     )
-                # Route decode through the eager selector.retrieve_topk path only
-                # for scorer variants NOT yet on the graph-safe Triton path. As of
-                # R6 scorer_norm (cosine/hybrid) + head_agg (mean) are ported into
-                # _logical_score_kernel and ride the graph-safe path; only a
-                # non-default anchor_mode (post-topK force-include) still requires
-                # the eager selector. Config-borne so it reaches the TP workers.
+                # As of R9 ALL non-learned selector variants ride the graph-safe
+                # path — scorer_norm (cosine/hybrid) + head_agg (mean) in
+                # _logical_score_kernel [R6] and anchor_mode (recency/global/
+                # strided) as a tensorized post-topK force-include in
+                # retrieve_topk_graph_safe [R9] — so ds_scorer_is_graph_safe() is
+                # True and nothing here forces eager. The SGLANG_DS_FORCE_EAGER_SELECT
+                # env escape hatch is retained for debugging. Config-borne flags
+                # reach the TP workers.
                 from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
                     ds_scorer_is_graph_safe as _ds_scorer_is_graph_safe,
                 )
@@ -2327,6 +2329,8 @@ class DeepseekV2AttentionMLA(
                         hybrid_threshold=getattr(
                             _selector.config, "scorer_norm_hybrid_threshold", 8192
                         ),
+                        anchor_mode=getattr(_selector.config, "anchor_mode", "off"),
+                        anchor_budget=getattr(_selector.config, "anchor_budget", 0),
                     )
                     selected_indices = _ds_graph_state.selected_indices[:_bs]
                     valid_lengths = _ds_graph_state.valid_lengths[:_bs]

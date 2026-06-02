@@ -93,11 +93,11 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
-    # Production-path scorer-variant safety. As of R6 scorer_norm (cosine/hybrid)
-    # + head_agg (mean) are ported into the graph-safe Triton scorer and run under
-    # CUDA-graph capture. A non-default anchor_mode (post-topK force-include) is
-    # NOT yet graph-safe — it runs the eager selector, so it still requires
-    # --disable-cuda-graph until ported.
+    # Production-path selector-variant safety (future-proof guard). As of R9 ALL
+    # non-learned variants — scorer_norm (cosine/hybrid) + head_agg (mean) [R6] and
+    # anchor_mode (recency/global/strided) [R9] — are graph-safe, so
+    # ds_scorer_is_graph_safe() is True and this guard does not fire. It remains as
+    # the single startup gate so any future non-graph-safe variant can re-enable it.
     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
         ds_scorer_is_graph_safe,
     )
@@ -106,10 +106,8 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
         server_args, "disable_cuda_graph", False
     ):
         raise ValueError(
-            "Double Sparsity non-default anchor_mode "
-            f"(anchor_mode={config.anchor_mode!r}) is not yet supported under CUDA "
-            "graph capture (the anchor force-include runs the non-graph-safe eager "
-            "selector). Re-run with --disable-cuda-graph, or use anchor_mode=off."
+            "Double Sparsity selector variant is not graph-safe under CUDA graph "
+            "capture. Re-run with --disable-cuda-graph, or use the default selector."
         )
 
     # Recall-oracle diagnostic safety. The oracle hook does host syncs
