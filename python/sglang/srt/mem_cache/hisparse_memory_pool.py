@@ -187,6 +187,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.hisparse_coordinator = None
         self.clear()
         self._kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
@@ -200,10 +201,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def size(self) -> int:
         return self._size_full
 
+    def register_hisparse_coordinator(self, coordinator) -> None:
+        self.hisparse_coordinator = coordinator
+
     def available_size(self) -> int:
+        hisparse_available = self.hisparse_attn_allocator.available_size()
+        if self.hisparse_coordinator is not None and self.hisparse_coordinator.dynamic:
+            hisparse_available += (
+                self.hisparse_coordinator.reclaimable_resident_tokens()
+            )
         return min(
             self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
+            hisparse_available,
         )
 
     def get_kvcache(self):
@@ -548,6 +557,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.hisparse_coordinator = None
         self.clear()
 
         self.hisparse_kvcache.register_mapping(
@@ -581,6 +591,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def register_hisparse_coordinator(self, coordinator) -> None:
+        self.hisparse_coordinator = coordinator
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
@@ -597,9 +610,15 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free_swa(free_indices)
 
     def available_size(self) -> int:
+        hisparse_available = self.hisparse_attn_allocator.available_size()
+        if self.hisparse_coordinator is not None and self.hisparse_coordinator.dynamic:
+            hisparse_available += (
+                self.hisparse_coordinator.reclaimable_resident_tokens()
+                // self.compress_ratio
+            )
         return min(
             self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+            hisparse_available * self.compress_ratio,
         )
 
     def alloc(self, need_size: int):

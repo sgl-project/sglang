@@ -1499,6 +1499,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse (engine-level coordinator ref, same across batches)
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    hisparse_use_swap: bool = False
 
     # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
     # Tell whether the current running batch is full so that we can skip
@@ -2368,6 +2369,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
+        self.hisparse_use_swap = False
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
@@ -2457,6 +2459,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices,
                 self.seq_lens_cpu,
                 self.req_pool_indices_cpu,
+            )
+            self.hisparse_use_swap = self.hisparse_coordinator.batch_uses_swap(
+                self.reqs
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
@@ -2611,6 +2616,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
+        self.hisparse_use_swap |= other.hisparse_use_swap
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
@@ -2644,6 +2650,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            hisparse_use_swap=self.hisparse_use_swap,
         )
 
     def maybe_evict_swa(self):

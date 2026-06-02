@@ -802,6 +802,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         else self.tp_group.cpu_group
                     ),
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                    dynamic=hisparse_cfg.dynamic,
                 )
             self.init_attention_backend()
             self.kernel_warmup()
@@ -3342,6 +3343,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            forward_batch.hisparse_coordinator = self.hisparse_coordinator
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
@@ -3358,7 +3360,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.forward_mode.is_decode()
                 and self.hisparse_coordinator is not None
             ):
-                self.hisparse_coordinator.wait_for_pending_backup()
+                if self.hisparse_coordinator.should_wait_for_pending_backup_before_forward(
+                    forward_batch
+                ):
+                    self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
             if self.is_hybrid_swa:

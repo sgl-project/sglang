@@ -128,6 +128,11 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
 
         # Get page indices from cache
         page_indices = self.req_to_token[req_pool_indices, :max_len].contiguous()
+        if getattr(self, "_cuda_graph_hisparse_variant", None) == "resident":
+            coordinator = self._cuda_graph_hisparse_coordinator
+            page_indices = coordinator.mem_pool_device.translate_loc_to_hisparse_device(
+                page_indices
+            )
 
         # Compute DSA seqlens
         dsa_cache_seqlens = compute_dsa_seqlens(

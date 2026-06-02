@@ -736,6 +736,16 @@ class CudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+        key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+        return f"{variant_label}_{key}" if variant_label is not None else key
+
+    def _resolve_graph_variant(self, forward_batch: ForwardBatch):
+        coordinator = self.model_runner.hisparse_coordinator
+        if coordinator is None:
+            return None
+        return coordinator.cuda_graph_variant_label(None, forward_batch=forward_batch)
+
     def can_run(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -751,9 +761,11 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        graph_key = self._make_graph_key(
+            cuda_graph_bs,
+            get_current_stream_idx() if self.enable_pdmux else None,
+            self._resolve_graph_variant(forward_batch),
+        )
 
         is_bs_supported = (
             graph_key in self.graphs
@@ -848,6 +860,14 @@ class CudaGraphRunner:
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
             )
+            hisparse_coordinator = self.model_runner.hisparse_coordinator
+            hisparse_variants = (
+                hisparse_coordinator.cuda_graph_capture_variants(
+                    self.capture_forward_mode
+                )
+                if hisparse_coordinator is not None
+                else (None,)
+            )
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
@@ -859,20 +879,29 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                with patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                    # For pd_multiplexing, we need to save the graph and output buffers
-                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                    self.graphs[key] = graph
-                    self.output_buffers[key] = output_buffers
+                for hisparse_variant in hisparse_variants:
+                    variant_label = (
+                        hisparse_coordinator.cuda_graph_variant_label(
+                            None, hisparse_variant=hisparse_variant
+                        )
+                        if hisparse_coordinator is not None
+                        else None
+                    )
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(
+                            bs, forward, stream_idx, hisparse_variant
+                        )
+                        key = self._make_graph_key(bs, stream_idx, variant_label)
+                        self.graphs[key] = graph
+                        self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -936,7 +965,11 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        hisparse_variant: Optional[str] = None,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
@@ -1081,11 +1114,11 @@ class CudaGraphRunner:
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
-        # Trip the coordinator so the hisparse code path is captured into the
-        # graph; backends read it from self.model_runner.hisparse_coordinator.
         hisparse_coordinator = self.model_runner.hisparse_coordinator
         if hisparse_coordinator is not None:
-            hisparse_coordinator.num_real_reqs.fill_(bs)
+            hisparse_coordinator.prepare_cuda_graph_forward_batch(
+                forward_batch, bs, hisparse_variant
+            )
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
@@ -1098,6 +1131,9 @@ class CudaGraphRunner:
 
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
+            if hisparse_coordinator is not None:
+                hisparse_coordinator.set_cuda_graph_replay(attn_backend, forward_batch)
 
             attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -1272,6 +1308,10 @@ class CudaGraphRunner:
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
         attn_backend._replay_forward_batch = forward_batch
+        if forward_batch.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator.set_cuda_graph_replay(
+                attn_backend, forward_batch
+            )
         seq_lens_sum_arg = (
             None
             if forward_batch.seq_lens_sum is None
@@ -1321,10 +1361,11 @@ class CudaGraphRunner:
                 )
 
         # Replay
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
-        else:
-            graph_key = self.bs
+        graph_key = self._make_graph_key(
+            self.bs,
+            get_current_stream_idx() if self.enable_pdmux else None,
+            self._resolve_graph_variant(forward_batch),
+        )
         ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={
