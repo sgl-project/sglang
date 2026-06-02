@@ -50,7 +50,6 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
-    ALLOWED_KEYS_PER_PHASE,
     Backend,
     CudaGraphConfig,
     Phase,
@@ -1729,9 +1728,7 @@ class ServerArgs:
                 # likely due to some inefficiencies in torch allocator or our implementation.
                 # So we need to reserve more memory.
                 if decode_cuda_graph_config.max_bs > 300:
-                    reserved_mem += (
-                        decode_cuda_graph_config.max_bs * self.dp_size * 1.5
-                    )
+                    reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 1.5
 
             # For piecewise cuda graphs
             if prefill_cuda_graph_config.backend != Backend.DISABLED:
@@ -2016,9 +2013,7 @@ class ServerArgs:
                         # DSACPLayerCommunicator does not all-reduce attention-TP
                         # partial o_proj outputs before replicated dense FFNs.
                         self.attn_cp_size = self.tp_size // self.dp_size
-                        self.cuda_graph_config.prefill[
-                            "backend"
-                        ] = Backend.DISABLED
+                        self.cuda_graph_config.prefill.backend = Backend.DISABLED
                         logger.warning(
                             f"Enable DSA Context Parallel opt, "
                             f"Setting dp_size == {self.dp_size} and "
@@ -3540,12 +3535,10 @@ class ServerArgs:
         else:
             num_tokens_per_bs = 1
         prefill_tokens = self.max_prefill_tokens
-        cg_config = self.cuda_graph_config or {}
-        prefill_cfg = cg_config.get(Phase.PREFILL) or {}
-        if prefill_cfg.get("backend") == Backend.TC_PIECEWISE:
-            prefill_tokens = max(prefill_tokens, prefill_cfg.get("max_bs") or 0)
-        decode_cfg = cg_config.get(Phase.DECODE) or {}
-        decode_max_bs = decode_cfg.get("max_bs") or 0
+        cg_config = self.cuda_graph_config
+        if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
+            prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
+        decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
         decode_tokens = decode_max_bs * num_tokens_per_bs
         return max(prefill_tokens, decode_tokens)
 

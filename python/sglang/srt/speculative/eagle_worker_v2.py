@@ -202,9 +202,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.init_lm_head()
 
         # Init attention backend and cuda graphs
-        self.draft_runner.server_args.cuda_graph_config.decode[
-            "backend"
-        ] = backup_decode_mode
+        self.draft_runner.server_args.cuda_graph_config.decode.backend = (
+            backup_decode_mode
+        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )

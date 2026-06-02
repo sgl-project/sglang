@@ -176,9 +176,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].server_args.cuda_graph_config.decode[
-                "backend"
-            ] = backup_decode_mode
+            self.draft_runner_list[i].server_args.cuda_graph_config.decode.backend = (
+                backup_decode_mode
+            )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -513,7 +513,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.reset_cuda_graph_buffers(forward_batch, batch_result)
         else:
             logger.warning_once(
-                f"can't use cuda graph for draft extend! may have correctness issue!"
+                "can't use cuda graph for draft extend! may have correctness issue!"
             )
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)

@@ -56,8 +56,6 @@ def set_default_server_args(args: "ServerArgs"):
         args.page_size = 128
 
     # NPU memory settings
-    from sglang.srt.model_executor.cuda_graph_config import Phase
-
     decode = args.cuda_graph_config.decode
     npu_mem = get_npu_memory_capacity()
     if npu_mem <= 32 * 1024:
@@ -65,21 +63,21 @@ def set_default_server_args(args: "ServerArgs"):
         # (chunked_prefill_size 4k, max_bs 16 if tp < 4 else 64)
         if args.chunked_prefill_size is None:
             args.chunked_prefill_size = 4 * 1024
-        if decode["max_bs"] is None:
+        if decode.max_bs is None:
             if args.tp_size < 4:
-                decode["max_bs"] = 16
+                decode.max_bs = 16
             else:
-                decode["max_bs"] = 64
+                decode.max_bs = 64
     elif npu_mem <= 64 * 1024:
         # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
         # (chunked_prefill_size 8k, max_bs 64 if tp < 4 else 256)
         if args.chunked_prefill_size is None:
             args.chunked_prefill_size = 8 * 1024
-        if decode["max_bs"] is None:
+        if decode.max_bs is None:
             if args.tp_size < 4:
-                decode["max_bs"] = 64
+                decode.max_bs = 64
             else:
-                decode["max_bs"] = 256
+                decode.max_bs = 256
 
     # NPU does not support CustomAllReduce
     args.disable_custom_all_reduce = True
@@ -219,7 +217,7 @@ def init_zbal(world_size, gpu_id, world_rank, do_check=True):
         gva_is_inited = True
 
         if do_check and not ret:
-            logger.error(f"[ZBAL] zbal init failed!")
+            logger.error("[ZBAL] zbal init failed!")
             sys.exit(-1)
 
         return ret
@@ -274,7 +272,7 @@ def lazy_init_zbal_gva_mem(
 
     gva_is_inited = True
     if do_check and not res:
-        logger.error(f"[ZBAL] zbal lazy init failed!")
+        logger.error("[ZBAL] zbal lazy init failed!")
         sys.exit(-1)
     return res
 

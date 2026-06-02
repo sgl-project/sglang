@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional, Sequence, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -30,8 +30,11 @@ def decide_needs_cpu_seq_lens(
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    prefill_cfg = (server_args.cuda_graph_config or {}).get(Phase.PREFILL) or {}
-    if prefill_cfg.get("backend") == Backend.TC_PIECEWISE:
+    cuda_graph_config = server_args.cuda_graph_config
+    if (
+        cuda_graph_config is not None
+        and cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE
+    ):
         # FIXME: support PCG without seq lens cpu value
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);

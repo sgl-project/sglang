@@ -214,9 +214,9 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.cuda_graph_config.decode[
-            "backend"
-        ] = backup_decode_mode
+        self.draft_model_runner.server_args.cuda_graph_config.decode.backend = (
+            backup_decode_mode
+        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )

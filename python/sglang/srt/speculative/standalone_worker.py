@@ -8,7 +8,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -101,9 +101,9 @@ class StandaloneWorker(EAGLEWorker):
             )
 
         # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.cuda_graph_config.decode[
-            "backend"
-        ] = backup_decode_mode
+        self.draft_model_runner.server_args.cuda_graph_config.decode.backend = (
+            backup_decode_mode
+        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
