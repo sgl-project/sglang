@@ -117,6 +117,19 @@ class TestReasonerGrammarObject(unittest.TestCase):
         self.assertIs(obj.move_vocab_mask(mask, "cpu"), mask)
         self.assertIsNotNone(obj.apply_vocab_mask)
 
+    def test_try_jump_forward_disabled_during_thinking(self):
+        grammar = MagicMock()
+        grammar.try_jump_forward.return_value = "jump"
+        obj = ReasonerGrammarObject(grammar=grammar, think_end_id=7)
+        obj.maybe_init_reasoning(True)
+
+        self.assertIsNone(obj.try_jump_forward(tokenizer=None))
+        grammar.try_jump_forward.assert_not_called()
+
+        obj.accept_token(7)
+        self.assertEqual(obj.try_jump_forward(tokenizer=None), "jump")
+        grammar.try_jump_forward.assert_called_once_with(None)
+
 
 class TestReasonerGrammarBackend(unittest.TestCase):
     def setUp(self):
