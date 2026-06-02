@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+from collections import deque
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1118,6 +1119,48 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
         self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
+
+    def test_overlap_loop_materializes_prefill_input_ids(self):
+        # Regression: the MLX overlap loop must materialize batch.input_ids
+        # (deferred input materialization) before launching the forward.
+        # Without resolve_forward_inputs in _launch_fresh, input_ids stays
+        # None and async_forward_batch_generation_mlx dereferences a None.
+        class _StopLoop(Exception):
+            pass
+
+        captured = {}
+
+        def fake_forward(batch):
+            captured["input_ids"] = batch.input_ids
+            raise _StopLoop
+
+        scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
+        scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
+        scheduler.process_input_requests = lambda recv_reqs: None
+        scheduler._engine_paused = False
+        scheduler.waiting_queue = []
+        scheduler.result_queue = deque()
+        scheduler.future_map = SimpleNamespace()
+        scheduler.cur_batch = None
+        scheduler.last_batch = None
+        scheduler.tp_worker = SimpleNamespace(
+            async_forward_batch_generation_mlx=fake_forward
+        )
+
+        batch = SimpleNamespace(
+            prefill_input_ids_cpu=torch.tensor([1, 2, 3], dtype=torch.int64),
+            input_ids=None,
+            mix_running_indices=None,
+            is_spec_v2=False,
+            device="cpu",
+        )
+        scheduler.get_next_batch_to_run = lambda: batch
+
+        with self.assertRaises(_StopLoop):
+            scheduler.event_loop_overlap_mlx()
+
+        self.assertIsNotNone(captured["input_ids"])
+        self.assertTrue(torch.equal(captured["input_ids"], torch.tensor([1, 2, 3])))
 
     def test_finished_request_snapshots_before_release(self):
         events = []
