@@ -275,17 +275,28 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
         )
 
     spec_v1_reason = None
+    # Models that keep mamba / linear-attn recurrent state only support topk == 1
+    # under spec v2 (EAGLEWorkerV2._mamba_verify_update raises otherwise). The
+    # config class exposes `mamba2_cache_params` iff it carries such state; check
+    # the class descriptor so the property getter is not invoked here.
+    text_config = server_args.get_model_config().hf_config.get_text_config()
+    is_mamba_state_model = hasattr(type(text_config), "mamba2_cache_params")
     if (
         server_args.speculative_eagle_topk is not None
         and server_args.speculative_eagle_topk > 1
-        and server_args.page_size > 1
+        and (server_args.page_size > 1 or is_mamba_state_model)
         and not server_args.disable_overlap_schedule
     ):
-        # Spec v2 tree drafting supports topk > 1 with page_size == 1. The
-        # page_size > 1 + topk > 1 draft KV allocation (partial-page duplication)
-        # is not yet ported to v2, so fall back to v1 only for that case.
+        # Spec v2 tree drafting supports topk > 1 with page_size == 1 on
+        # non-mamba models. The page_size > 1 + topk > 1 draft KV allocation
+        # (partial-page duplication) is not yet ported to v2, and mamba/linear
+        # state models only support topk == 1 on v2, so fall back to v1.
         server_args.disable_overlap_schedule = True
-        spec_v1_reason = "spec v2 topk > 1 currently requires page_size == 1"
+        spec_v1_reason = (
+            "spec v2 topk > 1 is not supported for mamba/linear-attn models"
+            if is_mamba_state_model
+            else "spec v2 topk > 1 currently requires page_size == 1"
+        )
     elif (
         not envs.SGLANG_ENABLE_SPEC_V2.get()
         and not server_args.disable_overlap_schedule
