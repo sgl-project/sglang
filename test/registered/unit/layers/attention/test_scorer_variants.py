@@ -10,8 +10,9 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+    _anchor_positions,
     _compute_logical_token_scores,
-    _force_include_recency_anchor,
+    _force_include_anchor,
     compute_token_scores,
     ds_scorer_is_default,
     select_topk_sequence_order,
@@ -84,30 +85,111 @@ class TestHeadAggregation(unittest.TestCase):
         self.assertNotAlmostEqual(smax[0, 0].item(), smean[0, 0].item())
 
 
-class TestAnchorBudget(unittest.TestCase):
-    def test_forces_recent_positions_into_selection(self):
-        # scores favor early tokens; anchor must force in the most-recent ones.
+class TestAnchorModes(unittest.TestCase):
+    def test_anchor_position_generators(self):
+        self.assertEqual(_anchor_positions(16, 3, "recency"), [13, 14, 15])
+        self.assertEqual(_anchor_positions(16, 3, "global"), [0, 1, 2])
+        self.assertEqual(_anchor_positions(16, 4, "strided"), [0, 5, 10, 15])
+        self.assertEqual(_anchor_positions(16, 3, "off"), [])
+        # budget > seq_len clamps to seq_len; short sequence
+        self.assertEqual(_anchor_positions(2, 5, "recency"), [0, 1])
+        self.assertEqual(_anchor_positions(1, 4, "strided"), [0])
+
+    def _forced_real(self, mode, budget):
+        # scores favor early tokens; anchors must be forced in regardless.
         scores = torch.tensor([[10.0, 9.0, 8.0, 1.0, 2.0, 3.0, 0.0, 0.0]])
         sel, _ = select_topk_sequence_order(scores, max_top_k=3)  # picks {0,1,2}
-        self.assertEqual(sorted(p for p in sel[0].tolist() if p >= 0), [0, 1, 2])
         seq_lens = torch.tensor([8], dtype=torch.int32)
-        forced, vl = _force_include_recency_anchor(sel, scores, seq_lens, anchor_budget=2)
+        forced, vl = _force_include_anchor(sel, scores, seq_lens, budget, mode)
         real = sorted(p for p in forced[0].tolist() if p >= 0)
-        # positions 6 and 7 (the 2 most recent of seq_len 8) now present, count kept
+        return real, int(vl[0])
+
+    def test_recency_forces_recent_positions(self):
+        real, vl = self._forced_real("recency", 2)
         self.assertIn(6, real)
         self.assertIn(7, real)
+        self.assertEqual(len(real), 3)  # count preserved
+        self.assertEqual(real, sorted(real))  # ascending
+        self.assertEqual(vl, 3)
+
+    def test_strided_forces_spread_positions(self):
+        real, _ = self._forced_real("strided", 3)  # [0, ~3-4, 7] over [0,8)
+        self.assertIn(7, real)  # last strided position
         self.assertEqual(len(real), 3)
-        self.assertEqual(int(vl[0]), 3)
+
+    def test_off_is_noop(self):
+        real, _ = self._forced_real("off", 4)
+        self.assertEqual(real, [0, 1, 2])  # unchanged
+
+    def test_no_duplicates_when_anchor_already_selected(self):
+        scores = torch.tensor([[10.0, 9.0, 8.0, 1.0, 2.0, 3.0, 0.0, 0.0]])
+        sel, _ = select_topk_sequence_order(scores, max_top_k=3)  # {0,1,2}
+        seq_lens = torch.tensor([8], dtype=torch.int32)
+        forced, _ = _force_include_anchor(sel, scores, seq_lens, 2, "global")  # {0,1}
+        real = [p for p in forced[0].tolist() if p >= 0]
+        self.assertEqual(len(real), len(set(real)))  # no dupes
+        self.assertEqual(sorted(real), [0, 1, 2])  # already present -> unchanged
+
+
+class TestPhysicalHybridRejected(unittest.TestCase):
+    def test_physical_hybrid_raises(self):
+        q = torch.zeros(1, 1, 4)
+        q[0, 0, 0] = 1.0
+        sig = torch.zeros(1, 1, 1, 4)
+        sig[0, 0, 0, 0] = 3.0
+        w = torch.ones(1, 1, dtype=torch.bool)
+        cs = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int32)
+        cw = torch.ones(1, 1, 4)
+        with self.assertRaises(ValueError):
+            compute_token_scores(q, sig, w, cs, cw, 0, scorer_norm="hybrid")
 
 
 class TestScorerDefaultGuard(unittest.TestCase):
     def test_default_vs_variants(self):
         from types import SimpleNamespace as NS
         self.assertTrue(ds_scorer_is_default(None))
-        self.assertTrue(ds_scorer_is_default(NS(scorer_norm="off", head_agg="max", anchor_budget=0)))
-        self.assertFalse(ds_scorer_is_default(NS(scorer_norm="cosine", head_agg="max", anchor_budget=0)))
-        self.assertFalse(ds_scorer_is_default(NS(scorer_norm="off", head_agg="mean", anchor_budget=0)))
-        self.assertFalse(ds_scorer_is_default(NS(scorer_norm="off", head_agg="max", anchor_budget=64)))
+        self.assertTrue(ds_scorer_is_default(NS(scorer_norm="off", head_agg="max", anchor_mode="off")))
+        self.assertFalse(ds_scorer_is_default(NS(scorer_norm="cosine", head_agg="max", anchor_mode="off")))
+        self.assertFalse(ds_scorer_is_default(NS(scorer_norm="off", head_agg="mean", anchor_mode="off")))
+        self.assertFalse(ds_scorer_is_default(NS(scorer_norm="off", head_agg="max", anchor_mode="recency")))
+
+
+class TestNonDefaultScorerGraphGuard(unittest.TestCase):
+    """Server init rejects a non-default scorer when CUDA graph is enabled (the
+    production-path safety guard), and allows it with --disable-cuda-graph."""
+
+    def _server_args(self, scorer_norm, disable_cuda_graph):
+        from types import SimpleNamespace
+        cfg = f'{{"channel_mask_path": "/tmp/cm.safetensors", "scorer_norm": "{scorer_norm}"}}'
+        return SimpleNamespace(
+            enable_double_sparsity=True,
+            enable_hisparse=False,
+            disaggregation_mode=None,
+            double_sparsity_config=cfg,
+            disable_cuda_graph=disable_cuda_graph,
+            page_size=64,
+        )
+
+    def test_non_default_scorer_with_cuda_graph_rejected(self):
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        with self.assertRaises(ValueError) as cm:
+            validate_double_sparsity(self._server_args("cosine", disable_cuda_graph=False))
+        self.assertIn("CUDA graph", str(cm.exception))
+
+    def test_non_default_scorer_eager_passes_guard(self):
+        # With --disable-cuda-graph the scorer guard must NOT fire (a later
+        # validation check may raise, but not the cuda-graph guard).
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        try:
+            validate_double_sparsity(self._server_args("cosine", disable_cuda_graph=True))
+        except Exception as e:
+            # A later validation check may raise (e.g. missing channel-mask file),
+            # but the scorer/cuda-graph guard must NOT be what fired.
+            self.assertNotIn("CUDA graph", str(e))
 
 
 if __name__ == "__main__":

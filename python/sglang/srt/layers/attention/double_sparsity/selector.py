@@ -269,6 +269,7 @@ class DoubleSparsitySelector:
                 scorer_norm=getattr(self.config, "scorer_norm", "off"),
                 head_agg=getattr(self.config, "head_agg", "max"),
                 hybrid_threshold=getattr(self.config, "scorer_norm_hybrid_threshold", 8192),
+                anchor_mode=getattr(self.config, "anchor_mode", "off"),
                 anchor_budget=getattr(self.config, "anchor_budget", 0),
             )
 

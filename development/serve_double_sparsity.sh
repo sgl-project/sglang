@@ -66,11 +66,15 @@ fi
 LOG_DIR="${LOG_DIR:-$(pwd)/development/logs}"
 mkdir -p "${LOG_DIR}"
 
-# Loop-7 Tier-2.B scorer normalization (config-borne so it reaches the TP
-# workers): "off" (default, production raw channel-dot) or "cosine".
-SCORER_NORM="${SCORER_NORM:-off}"
-DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s", "scorer_norm": "%s"}' \
-  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}")
+# Flag-gated non-learned selector variants (config-borne so they reach the TP
+# workers). Defaults reproduce the production scorer (byte-identical).
+SCORER_NORM="${SCORER_NORM:-off}"                          # off | cosine | hybrid
+SCORER_NORM_HYBRID_THRESHOLD="${SCORER_NORM_HYBRID_THRESHOLD:-8192}"
+HEAD_AGG="${HEAD_AGG:-max}"                                # max | mean
+ANCHOR_MODE="${ANCHOR_MODE:-off}"                          # off | recency | global | strided
+ANCHOR_BUDGET="${ANCHOR_BUDGET:-0}"
+DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s", "scorer_norm": "%s", "scorer_norm_hybrid_threshold": %s, "head_agg": "%s", "anchor_mode": "%s", "anchor_budget": %s}' \
+  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}" "${SCORER_NORM_HYBRID_THRESHOLD}" "${HEAD_AGG}" "${ANCHOR_MODE}" "${ANCHOR_BUDGET}")
 echo ">>> effective double_sparsity_config = ${DS_CONFIG}"
 
 # Radix cache: DS serves radix-off by default. To serve radix-on, set

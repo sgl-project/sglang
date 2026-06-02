@@ -93,6 +93,27 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
+    # Production-path scorer-variant safety. A non-default scorer variant
+    # (scorer_norm/head_agg/anchor_mode) runs the eager logical scorer, which is
+    # NOT graph-safe (it allocates / host-syncs). If CUDA graph capture is
+    # enabled it would run that eager path INSIDE the captured model forward
+    # (illegal), so refuse at startup. Until the variants are ported into the
+    # graph-safe Triton scorer, they require --disable-cuda-graph.
+    from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+        ds_scorer_is_default,
+    )
+
+    if not ds_scorer_is_default(config) and not getattr(
+        server_args, "disable_cuda_graph", False
+    ):
+        raise ValueError(
+            "Double Sparsity non-default scorer variant "
+            f"(scorer_norm={config.scorer_norm!r}, head_agg={config.head_agg!r}, "
+            f"anchor_mode={config.anchor_mode!r}) is not yet supported under CUDA "
+            "graph capture (it runs the non-graph-safe eager logical scorer). "
+            "Re-run with --disable-cuda-graph, or use the default scorer."
+        )
+
     # Page size pairing (config vs server) + supported set.
     server_page_size = getattr(server_args, "page_size", None)
     if config.page_size not in _SUPPORTED_PAGE_SIZES:

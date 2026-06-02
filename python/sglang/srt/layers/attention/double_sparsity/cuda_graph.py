@@ -302,7 +302,7 @@ def capture_decode_step(
                 "Double Sparsity: a non-default scorer variant "
                 f"(scorer_norm={getattr(selector.config, 'scorer_norm', 'off')!r}, "
                 f"head_agg={getattr(selector.config, 'head_agg', 'max')!r}, "
-                f"anchor_budget={getattr(selector.config, 'anchor_budget', 0)!r}) "
+                f"anchor_mode={getattr(selector.config, 'anchor_mode', 'off')!r}) "
                 "is not supported by the graph-safe Triton scorer; serve with "
                 "--disable-cuda-graph until it is ported. Capturing here would "
                 "silently raw-score the selection."

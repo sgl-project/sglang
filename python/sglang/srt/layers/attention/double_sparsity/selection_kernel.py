@@ -372,7 +372,7 @@ def ds_scorer_is_default(config) -> bool:
     return (
         getattr(config, "scorer_norm", "off") == "off"
         and getattr(config, "head_agg", "max") == "max"
-        and getattr(config, "anchor_budget", 0) == 0
+        and getattr(config, "anchor_mode", "off") == "off"
     )
 
 
@@ -415,10 +415,18 @@ def compute_token_scores(
     q_proj = project_query_onto_channels(queries, sel_layer, w_layer)  # [bs, H, D]
 
     norm_mode = scorer_norm if scorer_norm is not None else _scorer_norm_mode()
-    # Physical mode has no per-request seq_len, so "hybrid" degrades to cosine
-    # here (this path is the sanity probe / unit tests; production decode uses
-    # the logical scorer, which thresholds hybrid by seq_len).
-    cosine_like = norm_mode in ("cosine", "hybrid")
+    # The physical scorer has no per-request seq_len, so "hybrid" (which is
+    # length-conditional) cannot be applied correctly here and must NOT silently
+    # degrade to cosine (that is exactly the moderate-context regression hybrid
+    # avoids). Reject it; the logical scorer is the hybrid-capable path.
+    if norm_mode == "hybrid":
+        raise ValueError(
+            "Double Sparsity scorer_norm='hybrid' is length-conditional and "
+            "requires per-request seq_len; it is only valid on the logical "
+            "scoring path (_compute_logical_token_scores), not the physical "
+            "compute_token_scores path."
+        )
+    cosine_like = norm_mode == "cosine"
 
     if (
         not cosine_like
@@ -737,15 +745,39 @@ def _compute_logical_token_scores(
     return scores
 
 
-def _force_include_recency_anchor(
+def _anchor_positions(n: int, budget: int, mode: str) -> list:
+    """Deterministic anchor logical positions in ``[0, n)`` for one request.
+
+    - ``recency``: the ``budget`` most-recent positions ``[n-budget, n)``.
+    - ``global``: the ``budget`` earliest stable positions ``[0, budget)``.
+    - ``strided``: ``budget`` distinct evenly-spaced positions over ``[0, n)``.
+    Clamps ``budget`` to ``n``; returns ``[]`` for ``off`` / empty.
+    """
+    if budget <= 0 or n <= 0 or mode == "off":
+        return []
+    b = min(budget, n)
+    if mode == "recency":
+        return list(range(n - b, n))
+    if mode == "global":
+        return list(range(0, b))
+    if mode == "strided":
+        if b == 1:
+            return [0]
+        step = (n - 1) / (b - 1)
+        return sorted({int(round(i * step)) for i in range(b)})
+    return []
+
+
+def _force_include_anchor(
     indices: torch.Tensor,
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     anchor_budget: int,
+    anchor_mode: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Force each request's ``anchor_budget`` most-recent logical positions into
-    the selection, evicting the lowest-scoring non-anchor selected positions and
-    preserving the per-row selected count. Eager/research path (per-row loop).
+    """Force each request's deterministic anchor positions (per ``anchor_mode``)
+    into the selection, evicting the lowest-scoring non-anchor selected positions
+    and preserving the per-row selected count. Eager/research path (per-row loop).
     """
     bs, budget = indices.shape
     out = indices.to(torch.int32).clone()
@@ -754,7 +786,7 @@ def _force_include_recency_anchor(
         n = int(sl[b])
         if n <= 0:
             continue
-        anchors = list(range(max(0, n - anchor_budget), n))
+        anchors = _anchor_positions(n, anchor_budget, anchor_mode)
         if not anchors:
             continue
         real = [int(p) for p in out[b].tolist() if p >= 0]
@@ -798,6 +830,7 @@ def retrieve_topk_via_labels(
     scorer_norm: Optional[str] = None,
     head_agg: str = "max",
     hybrid_threshold: int = 8192,
+    anchor_mode: str = "off",
     anchor_budget: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """End-to-end selector flow: score → all-reduce → per-request mask → top-K → ascend.
@@ -867,9 +900,9 @@ def retrieve_topk_via_labels(
             )
         scores = scores.masked_fill(~per_request_valid.to(torch.bool), float("-inf"))
     indices, valid_lengths = select_topk_sequence_order(scores, max_top_k)
-    if anchor_budget > 0 and use_logical and seq_lens is not None:
-        indices, valid_lengths = _force_include_recency_anchor(
-            indices, scores, seq_lens, int(anchor_budget)
+    if anchor_mode != "off" and anchor_budget > 0 and use_logical and seq_lens is not None:
+        indices, valid_lengths = _force_include_anchor(
+            indices, scores, seq_lens, int(anchor_budget), anchor_mode
         )
     if not torch.cuda.is_current_stream_capturing():
         from sglang.srt.layers.attention.double_sparsity import metrics as _metrics

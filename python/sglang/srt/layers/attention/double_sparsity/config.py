@@ -36,6 +36,7 @@ _ALLOWED_FIELDS = {
     "scorer_norm",
     "scorer_norm_hybrid_threshold",
     "head_agg",
+    "anchor_mode",
     "anchor_budget",
     "extra",
 }
@@ -47,13 +48,17 @@ _ALLOWED_FIELDS = {
 # scorer_norm: "off" (raw channel-dot), "cosine" (direction-only), "hybrid"
 #   (raw for context <= scorer_norm_hybrid_threshold tokens, cosine above).
 # head_agg: cross-head score reduction, "max" (default) or "mean".
-# anchor_budget: reserve this many recency (most-recent-position) slots that are
-#   always force-included in the selection; 0 disables (default).
+# anchor_mode: which deterministic positions to always force-include in the
+#   selection — "off" (default, none), "recency" (most-recent), "global"
+#   (earliest stable), or "strided" (evenly spaced over [0, seq_len)).
+# anchor_budget: how many anchor positions to force-include; 0 disables.
 _ALLOWED_SCORER_NORM = ("off", "cosine", "hybrid")
 _DEFAULT_SCORER_NORM = "off"
 _DEFAULT_HYBRID_THRESHOLD = 8192
 _ALLOWED_HEAD_AGG = ("max", "mean")
 _DEFAULT_HEAD_AGG = "max"
+_ALLOWED_ANCHOR_MODE = ("off", "recency", "global", "strided")
+_DEFAULT_ANCHOR_MODE = "off"
 _DEFAULT_ANCHOR_BUDGET = 0
 
 
@@ -74,6 +79,7 @@ class DoubleSparsityConfig:
     scorer_norm: str = _DEFAULT_SCORER_NORM
     scorer_norm_hybrid_threshold: int = _DEFAULT_HYBRID_THRESHOLD
     head_agg: str = _DEFAULT_HEAD_AGG
+    anchor_mode: str = _DEFAULT_ANCHOR_MODE
     anchor_budget: int = _DEFAULT_ANCHOR_BUDGET
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -92,6 +98,11 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'head_agg' must be one of "
                 f"{list(_ALLOWED_HEAD_AGG)}, got {self.head_agg!r}."
+            )
+        if self.anchor_mode not in _ALLOWED_ANCHOR_MODE:
+            raise ValueError(
+                f"Double Sparsity 'anchor_mode' must be one of "
+                f"{list(_ALLOWED_ANCHOR_MODE)}, got {self.anchor_mode!r}."
             )
         if not isinstance(self.anchor_budget, int) or self.anchor_budget < 0:
             raise ValueError(
@@ -178,6 +189,7 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
             data.get("scorer_norm_hybrid_threshold", _DEFAULT_HYBRID_THRESHOLD)
         ),
         head_agg=str(data.get("head_agg", _DEFAULT_HEAD_AGG)),
+        anchor_mode=str(data.get("anchor_mode", _DEFAULT_ANCHOR_MODE)),
         anchor_budget=int(data.get("anchor_budget", _DEFAULT_ANCHOR_BUDGET)),
         extra=data.get("extra", {}),
     )
