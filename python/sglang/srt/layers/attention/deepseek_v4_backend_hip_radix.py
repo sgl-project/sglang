@@ -106,6 +106,9 @@ class DSV4AttnMetadata:
     swa_topk_lengths: torch.Tensor
 
     c4_sparse_topk: int
+    # SWA KV-store write target (out_cache_loc translated to SWA space), computed
+    # once per iteration in make_core_attn_metadata and read by the store path.
+    swa_out_cache_loc: Optional[torch.Tensor] = None
     c4_out_loc: Optional[torch.Tensor] = None
     c4_topk_lengths_raw: Optional[torch.Tensor] = None
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
@@ -145,6 +148,7 @@ class DSV4AttnMetadata:
             ],
             copy_fields=[
                 "raw_out_loc",
+                "swa_out_cache_loc",
                 "seq_lens_casual",
                 "positions_casual",
                 "c4_out_loc",
@@ -206,6 +210,7 @@ class DSV4AttnMetadata:
     ]
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
+        "swa_out_cache_loc",
         "c4_out_loc",
         "c128_out_loc",
     ]
@@ -908,18 +913,18 @@ class DeepseekV4HipRadixBackend(
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
-        raw_loc = forward_batch.out_cache_loc
+        swa_loc = self.forward_metadata.core_attn_metadata.swa_out_cache_loc
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
-                raw_loc=raw_loc,
+                swa_loc=swa_loc,
                 cache_k=swa_k,
             )
         else:
             swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
-                raw_loc=raw_loc,
+                swa_loc=swa_loc,
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
             )
 
@@ -1137,6 +1142,14 @@ class DeepseekV4HipRadixBackend(
             swa_topk_lengths=swa_topk_lengths,
             c4_sparse_topk=self.c4_topk,
         )
+        # Translate the KV-store write target once here so the store path reads it
+        # from metadata instead of re-translating per layer. flash_mla kernels
+        # require int32 indices.
+        core_attn_metadata.swa_out_cache_loc = (
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_loc).to(
+                torch.int32
+            )
+        )
 
         if need_compress:
             core_attn_metadata.init_compression_metadata()
@@ -1165,7 +1178,8 @@ class DeepseekV4HipRadixBackend(
         assert raw_indices.shape == (num_qo_tokens, SWA_WINDOW)
         raw_indices.masked_fill_(invalid_offset_mask, -1)
         swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
-        return swa_indices
+        # flash_mla attention requires int32 page indices.
+        return swa_indices.to(torch.int32)
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):

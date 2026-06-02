@@ -471,6 +471,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        attn_backend,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
@@ -485,9 +486,10 @@ class MQALayer(nn.Module):
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        core_meta = attn_backend.forward_metadata.core_attn_metadata
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
-            raw_loc=forward_batch.out_cache_loc,
+            swa_loc=core_meta.swa_out_cache_loc,
             kv=kv,
             kv_weight=self.kv_norm.weight.data,
             eps=self.eps,
@@ -562,7 +564,9 @@ class MQALayer(nn.Module):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
             # Fused norm + rope + cache write -- no bf16 KV intermediate.
-            self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+            self._compute_kv_to_cache(
+                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+            )
 
         del qkv_a
 
@@ -646,9 +650,7 @@ class MQALayer(nn.Module):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = token_to_kv_pool.get_cached_swa_loc(
-                forward_batch.out_cache_loc, self.layer_id
-            )
+            swa_loc = attn_backend.forward_metadata.core_attn_metadata.swa_out_cache_loc
             swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
@@ -672,7 +674,9 @@ class MQALayer(nn.Module):
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
-            self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+            self._compute_kv_to_cache(
+                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+            )
 
         del qkv_a
 
@@ -736,9 +740,7 @@ class MQALayer(nn.Module):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = token_to_kv_pool.get_cached_swa_loc(
-                forward_batch.out_cache_loc, self.layer_id
-            )
+            swa_loc = attn_backend.forward_metadata.core_attn_metadata.swa_out_cache_loc
             swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
@@ -790,7 +792,7 @@ class MQALayer(nn.Module):
                 )
             else:
                 self._compute_kv_to_cache(
-                    x_linear, positions, forward_batch, qkv_a=qkv_a
+                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
                 )
                 kv = None
 
