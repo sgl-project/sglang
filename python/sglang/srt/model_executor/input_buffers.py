@@ -11,27 +11,38 @@ from sglang.srt.utils import is_npu
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 
 
+def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
+    """Coalesce a buffer by ``name`` into the process-wide input-buffer pool.
+
+    If a buffer was previously registered under ``name`` with at least as many
+    elements, reuse its storage; otherwise record ``new_buffer``. Returns a
+    view with the requested size/stride aliased onto the (possibly larger)
+    shared storage, so distinct callers that ask for the same name share one
+    physical allocation and therefore one ``data_ptr``.
+    """
+    buffer_size = new_buffer.size()
+    buffer_stride = new_buffer.stride()
+
+    old_buffer = _forward_input_buffer_pool.get(name, None)
+    if old_buffer is not None:
+        assert (
+            new_buffer.dtype == old_buffer.dtype
+        ), f"Buffer {name} has different dtype than before."
+        assert (
+            new_buffer.device == old_buffer.device
+        ), f"Buffer {name} has different device than before."
+        if old_buffer.numel() > new_buffer.numel():
+            new_buffer = old_buffer
+
+    _forward_input_buffer_pool[name] = new_buffer
+    return new_buffer.as_strided(buffer_size, buffer_stride)
+
+
 @dataclass
 class ForwardInputBuffers:
 
     def _share_one_buffer(self, name: str, new_buffer: torch.Tensor) -> torch.Tensor:
-
-        buffer_size = new_buffer.size()
-        buffer_stride = new_buffer.stride()
-
-        old_buffer = _forward_input_buffer_pool.get(name, None)
-        if old_buffer is not None:
-            assert (
-                new_buffer.dtype == old_buffer.dtype
-            ), f"Buffer {name} has different dtype than before."
-            assert (
-                new_buffer.device == old_buffer.device
-            ), f"Buffer {name} has different device than before."
-            if old_buffer.numel() > new_buffer.numel():
-                new_buffer = old_buffer
-
-        _forward_input_buffer_pool[name] = new_buffer
-        return new_buffer.as_strided(buffer_size, buffer_stride)
+        return share_input_buffer(name, new_buffer)
 
     def share_buffers(self):
         # disable share input buffer on npu due to accuracy issue
