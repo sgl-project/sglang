@@ -68,7 +68,6 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -2067,18 +2066,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_last_track_seqlen.
         """
 
-        def _force_track_h(i):
-            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens:
-            # 1) aligned with FLA_CHUNK_SIZE -> retrieve from last_recurrent_state
-            #    a) is the last position -> retrieve from last_recurrent_state
-            #    b) is NOT the last position -> retrieve from h
-            # 2) unaligned with FLA_CHUNK_SIZE -> retrieve from h
-            # Currently, the math calculation only supports case 1a and 2. So for 1b,
-            # we need to add 1 to force the math calculation to retrieve the correct
-            # mamba state from h.
-            return i + 1
-
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+
+        def _force_track_h(i):
+            # Used by the branching-seqlen path below: when we want to track an
+            # already-aligned, non-last position, +1 so the math retrieves from h
+            # (the aligned-last-position path retrieves from last_recurrent_state
+            # instead). See `_mamba_radix_cache_v2_req_prepare_for_extend` on
+            # upstream main for the canonical description.
+            assert i % mamba_cache_chunk_size == 0
+            return i + 1
 
         extend_lens = torch.tensor(
             [r.extend_input_len for r in reqs], dtype=torch.int64
@@ -2103,26 +2100,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         # 3) track_seqlens: vectorised arithmetic.
-        # total_seqlen is the per-req prefix + extend length.
         # seqlen_aligned / mamba_last_track_seqlen is the actual tracked seqlen,
         # passed to the mamba radix cache to record which seqlen the mamba state
-        # should be stored at.
-        # fla_aligned is the seqlen aligned to FLA_CHUNK_SIZE. When fla_aligned !=
-        # seqlen_aligned (can happen when page_size > FLA_CHUNK_SIZE), we want to
-        # track seqlen_aligned but it is not the last position, so _force_track_h()
-        # adds 1 so the math calculation retrieves from h.
+        # should be stored at. The default tracked seqlen for the non-branching
+        # path is the full prefix + extend length (= total_seqlen).
         total_seqlen = prefix_lens_t + extend_lens
         aligned_extend = (
             extend_lens // mamba_cache_chunk_size
         ) * mamba_cache_chunk_size
         seqlen_aligned = prefix_lens_t + aligned_extend
-        fla_aligned_extend = (extend_lens // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
-        fla_aligned = prefix_lens_t + fla_aligned_extend
-        track_seqlens = torch.where(
-            fla_aligned != seqlen_aligned,
-            _force_track_h(seqlen_aligned),
-            total_seqlen,
-        )
+        track_seqlens = total_seqlen
 
         # Handle branching + per-req mutable state. Use .tolist() once to avoid
         # per-element tensor indexing overhead.
