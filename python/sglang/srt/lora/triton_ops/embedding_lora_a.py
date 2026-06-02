@@ -51,13 +51,13 @@ def _embedding_lora_a_kernel(
     w_index = tl.load(weight_indices + batch_id)
     rank_val = tl.load(lora_ranks + w_index)
 
-    # Compute rank offsets for this block
-    rank_offset = tl.arange(0, BLOCK_RANK) + rank_block_id * BLOCK_RANK
-    rank_mask = rank_offset < rank_val
-
     # Early exit: no work for this rank block
     if rank_block_id * BLOCK_RANK >= rank_val:
         return
+
+    # Compute rank offsets for this block
+    rank_offset = tl.arange(0, BLOCK_RANK) + rank_block_id * BLOCK_RANK
+    rank_mask = rank_offset < rank_val
 
     seg_start = tl.load(seg_indptr + batch_id)
     seg_len = tl.load(seg_lens + batch_id)
