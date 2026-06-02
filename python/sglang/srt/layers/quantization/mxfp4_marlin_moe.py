@@ -132,18 +132,22 @@ class Mxfp4MarlinMoEMethod:
             if w13_s.dtype == torch.float8_e8m0fnu:
                 # E8M0 raw → uint8 view (same bytes, no conversion)
                 layer.w13_weight_scale_inv = Parameter(
-                    w13_s.view(torch.uint8), requires_grad=False,
+                    w13_s.view(torch.uint8),
+                    requires_grad=False,
                 )
                 layer.w2_weight_scale_inv = Parameter(
-                    w2_s.view(torch.uint8), requires_grad=False,
+                    w2_s.view(torch.uint8),
+                    requires_grad=False,
                 )
             elif w13_s.dtype in (torch.uint8, torch.int8):
                 # Already uint8/int8 — ensure uint8 view
                 layer.w13_weight_scale_inv = Parameter(
-                    w13_s.view(torch.uint8), requires_grad=False,
+                    w13_s.view(torch.uint8),
+                    requires_grad=False,
                 )
                 layer.w2_weight_scale_inv = Parameter(
-                    w2_s.view(torch.uint8), requires_grad=False,
+                    w2_s.view(torch.uint8),
+                    requires_grad=False,
                 )
             else:
                 # float32/bfloat16 loaded from checkpoint — convert back to
