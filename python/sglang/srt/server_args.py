@@ -2066,6 +2066,20 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
 
+            if is_sm120_supported():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "marlin"
+                    logger.info(
+                        "Use marlin as MoE runner backend on SM120 for DeepseekV4"
+                    )
+                # SM120 lacks tcgen05/TMEM: disable features that depend on
+                # DeepGEMM or require >99KB SMEM (topk_v2).
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
@@ -3127,17 +3141,14 @@ class ServerArgs:
     def _handle_linear_attn_backend(self):
         import torch
 
-        # SM100+: default to FlashInfer GDN decode when the user hasn't
-        # explicitly chosen a decode backend and mamba-ssm-dtype is bf16
-        # (required by FlashInfer GDN on SM100+).
+        # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
+        # when the user hasn't explicitly chosen a decode backend and
+        # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
-        # Excluded when MTP speculative decoding is enabled because
-        # FlashInfer GDN MTP verify is not yet supported on SM100+.
         if (
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
-            and self.speculative_algorithm is None
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
@@ -6833,9 +6844,12 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
-            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+            help="The InfiniBand devices for disaggregation transfer. Supports a single device "
+            "(e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list "
+            "(e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping "
+            '(e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), '
+            "or a path to a JSON file containing that mapping. Default is None, which triggers "
+            "automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",

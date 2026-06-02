@@ -2628,6 +2628,8 @@ class Scheduler(
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
+            # Account for LoRAs that are already loaded in the adder, such as chunked requests
+            running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
