@@ -121,7 +121,6 @@ def match_prefix_for_req(
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
-
     return match_result
 
 

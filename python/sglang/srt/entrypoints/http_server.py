@@ -1887,17 +1887,13 @@ def _execute_server_warmup(server_args: ServerArgs):
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
     ssl_verify = server_args.ssl_verify()
-    session = requests.Session()
-    # Warmup uses the server loopback URL. Ignore environment proxies so
-    # uppercase HTTP_PROXY/HTTPS_PROXY cannot hijack local readiness checks.
-    session.trust_env = False
 
     # Wait until the server is launched
     success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            res = session.get(
+            res = requests.get(
                 url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
             )
             assert res.status_code == 200, f"{res=}, {res.text=}"
@@ -1923,8 +1919,6 @@ def _execute_server_warmup(server_args: ServerArgs):
             request_name = "/generate"
     else:
         request_name = "/encode"
-    if server_args.disaggregation_mode != "null" and model_info["is_generation"]:
-        request_name = "/generate"
     max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
@@ -1985,7 +1979,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if server_args.disaggregation_mode == "null":
-            res = session.post(
+            res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
@@ -2013,7 +2007,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
-            res = session.post(
+            res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,

@@ -886,11 +886,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(preallocated_reqs),
                     hicache_reserved_tokens=reserved_restore_tokens,
                 )
-                logger.info(
-                    "Decode radix cache before send_metadata: req=%s, prefix_len=%s",
-                    decode_req.req.rid,
-                    prefix_len,
-                )
             else:
                 prefix_indices = None
                 prefix_len = 0

@@ -44,11 +44,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
         for i, req in enumerate(reqs):
             req_pool_indices.append(req.req_pool_idx)
             pre_len = len(req.prefix_indices)
-            logger.info(
-                "Decode radix cache before actual run: req=%s, prefix_len=%s",
-                req.rid,
-                pre_len,
-            )
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
                 pre_len : pre_len + req.extend_input_len
