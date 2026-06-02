@@ -421,6 +421,13 @@ class SWAComponent(TreeComponent):
                 continue
             assert cd.value is not None
 
+            if (
+                not evict_retained_window
+                and len(cd.value) <= self._window_retention_len()
+            ):
+                x = x_next
+                continue
+
             if x in self.cache.evictable_device_leaves:
                 # D-leaf: atomic eviction of all components.
                 self.cache._evict_device_leaf(x, tracker)

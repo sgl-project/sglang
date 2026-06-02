@@ -1862,6 +1862,43 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(match.device_indices), len(base))
         tree.sanity_check()
 
+    def test_swa_evict_defers_retained_suffix_that_became_leaf(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
+        base = self._make_seq(1, retain_len // ps + 2)
+        leaf = base + self._make_seq(5000, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        split_parent = next(iter(tree.root_node.children.values()))
+        suffix = next(iter(split_parent.children.values()))
+        child = next(iter(suffix.children.values()))
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_device_leaf(child, tracker)
+        self.assertEqual(len(suffix.children), 0)
+        self.assertIn(suffix, tree.evictable_device_leaves)
+        self.assertEqual(len(suffix.component_data[ComponentType.SWA].value), retain_len)
+
+        other = self._make_seq(9000, retain_len // ps + 1)
+        self._insert(tree, allocator, req_to_token_pool, other)
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        self.assertEqual(result.swa_num_tokens_evicted, len(other))
+        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
+        self.assertIn(suffix, tree.evictable_device_leaves)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", base))))
+        self.assertEqual(len(match.device_indices), len(base))
+        tree.sanity_check()
+
     def test_swa_evict_second_pass_clears_retained_window(self):
         if not self.cfg.has_swa:
             self.skipTest("requires SWA component")
