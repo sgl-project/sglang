@@ -5,8 +5,8 @@ import shutil
 import time
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import msgspec.msgpack
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,

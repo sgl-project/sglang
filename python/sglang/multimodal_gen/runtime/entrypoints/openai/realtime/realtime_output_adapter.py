@@ -7,8 +7,8 @@ import io
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
-from fastapi import WebSocket
 import msgspec.msgpack
+from fastapi import WebSocket
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timing import (
