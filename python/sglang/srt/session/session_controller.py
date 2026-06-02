@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Dict, Optional
@@ -30,6 +31,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
+
+
+def _radix_native_enabled() -> bool:
+    """Radix-native sessions: hold session KV as ordinary evictable radix entries
+    (tagged + floor-priority + bulk-evicted on close) instead of pinned streaming
+    slots. Opt-in; off preserves the legacy streaming-session behavior."""
+    return os.environ.get("SGLANG_SESSION_RADIX_NATIVE") == "1"
 
 
 class SessionReqNode:
@@ -289,6 +297,27 @@ class SessionController:
         elif session_id is None:
             logger.warning("session id is None, cannot open.")
             return OpenSessionReqOutput(session_id, False)
+        elif _radix_native_enabled():
+            # Radix-native session: no pinned slot. The session is a routing +
+            # cleanup tag over ordinary evictable radix KV. streaming=False makes
+            # create_req treat each turn as full context (no slot, no append
+            # reconstruction, no _inflight guard), so it can never deadlock on
+            # non-evictable KV and never duplicates context. Reuse across turns
+            # comes from radix prefix matching; the KV is floor-priority (see
+            # StreamingSession) so it is evicted first under pressure and
+            # bulk-dropped via RadixCache.release_session at close.
+            self.sessions[session_id] = Session(
+                recv_req.capacity_of_str_len,
+                session_id,
+                streaming=False,
+                timeout=recv_req.timeout,
+            )
+            log_info_on_rank0(
+                logger,
+                f"Session opened (radix-native): {session_id} "
+                f"(active={len(self.sessions)})",
+            )
+            return OpenSessionReqOutput(session_id, True)
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len,
