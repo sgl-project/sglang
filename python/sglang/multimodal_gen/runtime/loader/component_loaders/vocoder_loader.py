@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.precision import resolve_component_precision
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
@@ -47,11 +48,12 @@ class VocoderLoader(ComponentLoader):
         vocoder_config = LTXVocoderConfig()
         vocoder_config.update_model_arch(config)
 
-        try:
-            vocoder_precision = server_args.pipeline_config.audio_vae_precision
-        except AttributeError:
-            vocoder_precision = "fp32"
-        vocoder_dtype = PRECISION_TO_TYPE[vocoder_precision]
+        vocoder_precision = resolve_component_precision(server_args, "vocoder")
+        vocoder_dtype = (
+            vocoder_precision.dtype
+            if vocoder_precision is not None
+            else PRECISION_TO_TYPE["fp32"]
+        )
 
         should_offload = self.should_offload(server_args)
         target_device = self.target_device(should_offload)

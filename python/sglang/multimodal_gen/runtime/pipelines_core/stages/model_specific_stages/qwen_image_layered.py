@@ -15,6 +15,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.precision import (
+    align_tensor_to_module_dtype,
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -210,16 +214,22 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
+        text_encoder_dtype = resolve_precision(
+            server_args, "text_encoder", precision_attr="dit_precision"
+        ).dtype
+        vae_dtype = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        ).dtype
         return [
             ComponentUse(
                 stage_name,
                 "text_encoder",
-                target_dtype=self.text_encoder_dtype,
+                target_dtype=text_encoder_dtype,
             ),
             ComponentUse(
                 stage_name,
                 "vae",
-                target_dtype=self.vae_dtype,
+                target_dtype=vae_dtype,
             ),
         ]
 
@@ -368,6 +378,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             assert vae is not None
             self.vae = vae
+            image = align_tensor_to_module_dtype(image, self.vae)
             if isinstance(generator, list):
                 image_latents = [
                     retrieve_latents(
@@ -422,7 +433,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         image_latents = None
         if image is not None:
-            image = image.to(device=device, dtype=dtype)
+            image = align_tensor_to_module_dtype(image, self.vae, device=device)
             if image.shape[1] != self.latent_channels:
                 image_latents = self._encode_vae_image(image=image, generator=generator)
             else:
@@ -510,7 +521,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             image, calculated_height, calculated_width
         )
         image = image.unsqueeze(2)
-        image = image.to(dtype=self.vae_dtype)
+        image = align_tensor_to_module_dtype(image, self.vae, device=device)
 
         prompt = batch.prompt
         with self.use_declared_component(

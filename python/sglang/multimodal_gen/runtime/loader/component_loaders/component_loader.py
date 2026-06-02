@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.precision import resolve_component_precision
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_hf_config,
@@ -232,7 +233,10 @@ class ComponentLoader(ABC):
                 attn_backend, component_name=component_attn_name
             ):
                 component = self.load_native(
-                    component_model_path, server_args, transformers_or_diffusers
+                    component_model_path,
+                    server_args,
+                    transformers_or_diffusers,
+                    component_name,
                 )
             should_offload = self.should_offload(server_args)
             target_device = self.target_device(should_offload)
@@ -268,10 +272,20 @@ class ComponentLoader(ABC):
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
+        component_name: str | None = None,
     ) -> AutoModel:
         """
         Load the component using the native library (transformers/diffusers).
         """
+        precision = (
+            resolve_component_precision(server_args, component_name)
+            if component_name is not None
+            else None
+        )
+        load_kwargs = {}
+        if precision is not None:
+            load_kwargs["torch_dtype"] = precision.dtype
+
         if transformers_or_diffusers == "transformers":
             from transformers import AutoModel
 
@@ -285,6 +299,7 @@ class ComponentLoader(ABC):
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                **load_kwargs,
             )
         elif transformers_or_diffusers == "diffusers":
             from diffusers import AutoModel
@@ -296,6 +311,7 @@ class ComponentLoader(ABC):
                 component_model_path,
                 revision=server_args.revision,
                 trust_remote_code=server_args.trust_remote_code,
+                **load_kwargs,
             )
         else:
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")

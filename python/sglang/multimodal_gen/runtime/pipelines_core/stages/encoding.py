@@ -21,9 +21,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.precision import (
+    autocast_enabled,
+    resolve_precision,
+    temporary_module_dtype,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -43,7 +47,9 @@ class EncodingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        ).dtype
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
@@ -83,11 +89,13 @@ class EncodingStage(PipelineStage):
         """
         assert batch.latents is not None and isinstance(batch.latents, torch.Tensor)
 
-        # Setup VAE precision
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        # Setup VAE precision from user policy.
+        vae_precision = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        )
+        vae_autocast_enabled = autocast_enabled(
+            vae_precision.dtype, server_args.disable_autocast
+        )
 
         # Normalize input to [-1, 1] range (reverse of decoding normalization)
         latents = (batch.latents * 2.0 - 1.0).clamp(-1, 1)
@@ -102,16 +110,22 @@ class EncodingStage(PipelineStage):
             # Encode image to latents
             with torch.autocast(
                 device_type=current_platform.device_type,
-                dtype=vae_dtype,
+                dtype=vae_precision.dtype,
                 enabled=vae_autocast_enabled,
             ):
                 if server_args.pipeline_config.vae_tiling:
                     self.vae.enable_tiling()
                 # if server_args.vae_sp:
                 #     self.vae.enable_parallel()
+                should_cast_vae = (
+                    vae_precision.is_user_policy and not vae_autocast_enabled
+                )
                 if not vae_autocast_enabled:
-                    latents = latents.to(vae_dtype)
-                latents = self.vae.encode(latents).mean
+                    latents = latents.to(vae_precision.dtype)
+                with temporary_module_dtype(
+                    self.vae, vae_precision.dtype, enabled=should_cast_vae
+                ) as vae:
+                    latents = vae.encode(latents).mean
 
         # Update batch with encoded latents
         batch.latents = latents
