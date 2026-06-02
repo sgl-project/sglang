@@ -185,6 +185,25 @@ def gemm_nt_bf16bf16f32(
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
 
 
+def tf32_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_splits: Optional[int],
+):
+    m, k = x.shape
+    n, _ = fn.shape
+    num_splits_key = num_splits if num_splits is not None else 0
+    kernel_type = compile_utils.DeepGemmKernelType.TF32_HC_PRENORM_GEMM
+
+    if m == 0:
+        return
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_splits_key, kernel_type):
+        deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
+
+
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 

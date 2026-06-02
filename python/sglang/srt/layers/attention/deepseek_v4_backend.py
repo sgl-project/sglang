@@ -56,12 +56,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
+from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+    from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_sm120 = is_sm120_supported()
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +85,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    import flash_mla
+    if _is_sm120:
+        return None
+    import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
 
@@ -366,6 +371,9 @@ class DeepseekV4AttnBackend(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
 
+        self.enable_deepseek_v4_fp4_indexer: bool = (
+            model_runner.server_args.enable_deepseek_v4_fp4_indexer
+        )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -749,48 +757,40 @@ class DeepseekV4AttnBackend(
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ) -> None:
+        from types import SimpleNamespace
+
         assert req_pool_indices.size(0) == bs
         assert seq_lens.size(0) == bs
 
         bucket = _GraphBucket.of(forward_mode)
-        raw_type: Optional[type] = None
         if bucket == _GraphBucket.DECODE_OR_IDLE:
-            metadata = self.init_forward_metadata_decode(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=torch.zeros_like(seq_lens),
-            )
-            raw_type = DSV4RawDecodeMetadata
+            dummy_cache_loc = torch.zeros_like(seq_lens)
         elif bucket == _GraphBucket.TARGET_VERIFY:
-            out_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
-            metadata = self.init_forward_metadata_target_verify(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-                use_prefill_cuda_graph=True,
-            )
-            raw_type = DSV4RawVerifyMetadata
-        elif bucket == _GraphBucket.DRAFT_EXTEND:
-            num_tokens_per_bs = num_tokens // bs
-            metadata = self.init_forward_metadata_draft_extend(
-                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens.tolist(),
-                num_tokens_per_bs=num_tokens_per_bs,
-                use_prefill_cuda_graph=True,
-            )
+            dummy_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
         else:
-            raise NotImplementedError(f"{forward_mode=} not supported yet")
+            dummy_cache_loc = None
 
-        self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = metadata
-        self.forward_metadata = metadata
-        if raw_type is not None:
-            self._current_capture_raw = (
-                metadata if isinstance(metadata, raw_type) else None
-            )
+        self._replay_forward_batch = SimpleNamespace(
+            out_cache_loc=dummy_cache_loc,
+            forward_mode=forward_mode,
+        )
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
+        )
+        # Preserve _current_capture_raw for on_after_cuda_graph_warmup
+        metadata = self.forward_metadata
+        self._current_capture_raw = (
+            metadata
+            if isinstance(metadata, (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata))
+            else None
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -892,6 +892,11 @@ class DeepseekV4AttnBackend(
         ],
         bucket: _GraphBucket,
     ) -> None:
+        if bs not in self.cuda_graph_metadata_of_bucket_and_bs[bucket]:
+            # First call (from capture): store the new metadata directly.
+            self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = temp_metadata
+            self.forward_metadata = temp_metadata
+            return
         chosen_metadata = self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs]
         chosen_metadata.copy_(temp_metadata)
         self.forward_metadata = chosen_metadata
@@ -1045,24 +1050,42 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import flash_mla
+            if _is_sm120:
+                from sglang.srt.layers.attention.flash_mla_sm120 import (
+                    flash_mla_with_kvcache_sm120,
+                )
 
-            o = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+                o = flash_mla_with_kvcache_sm120(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+            else:
+                import sgl_kernel.flash_mla as flash_mla
+
+                o = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
 
             o = o.squeeze(1)
             return o
