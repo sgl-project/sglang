@@ -38,8 +38,7 @@ def _build_cosmos3_param_names_mapping() -> dict:
         # Inherited from Qwen3-VL pretraining; unused at diffusion inference.
         r"^lm_head\.weight$": "",
         r"^norm\.weight$": "",
-        # Audio / action modalities — not yet wired; skip to avoid load warnings.
-        r"^audio_.*$": "",
+        # Action modality not yet wired; skip to avoid load warnings.
         r"^action_.*$": "",
         # Top-level norms / embeddings.
         r"^norm_moe_gen\.(.*)$": r"norm_moe_gen.\1",
@@ -155,6 +154,11 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     base_fps: float = 24.0
     temporal_compression_factor: int = 4
     unified_3d_mrope_temporal_modality_margin: int = 15000
+
+    # Audio (sound) modality
+    sound_dim: int = 64
+    sound_latent_fps: float = 25.0
+    temporal_compression_factor_sound: int = 1
 
     # Timestep embedding
     timestep_scale: float = 0.001
