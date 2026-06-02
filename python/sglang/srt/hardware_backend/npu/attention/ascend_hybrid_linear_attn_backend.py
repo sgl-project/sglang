@@ -131,9 +131,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        # Match the base _replay_metadata's None guard: out_graph passes
-        # seq_lens_cpu=None at capture, and `None == fill_value` would become a
-        # bool and crash torch.count_nonzero.
+        # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
             num_padding = 0
         else:

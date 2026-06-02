@@ -597,10 +597,7 @@ class PiecewiseCudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            # Eager entry covers both legs (ABC default = _out_graph + _in_graph;
-            # DSV4 chains _in_graph) and handles EXTEND, which the full runner's
-            # _out_graph(in_capture=True) bucket-prep path rejects. PCG re-runs
-            # it host-side every replay, so nothing needs recording into the graph.
+            # Eager entry (not _out_graph): handles EXTEND and covers _in_graph.
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
             # Run and capture
@@ -803,9 +800,6 @@ class PiecewiseCudaGraphRunner:
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
             ):
-                # Outer model.forward runs eagerly here (only the layer body is
-                # captured), so the eager entry materializes forward_metadata
-                # host-side every replay — both legs, no recorded _in_graph needed.
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,

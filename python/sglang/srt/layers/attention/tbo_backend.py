@@ -102,9 +102,6 @@ class TboAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
-        # Fan out to primary + children. The full-graph runner calls this
-        # separately inside graph.capture(), so a child's recordable _in_graph
-        # (e.g. DSV4's Raw->Full upgrade) must be forwarded too.
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
@@ -132,7 +129,6 @@ class TboAttnBackend(AttentionBackend):
             item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
 
     def on_after_cuda_graph_warmup(self):
-        # Fan out to primary + children, mirroring init_cuda_graph_state.
         self.primary.on_after_cuda_graph_warmup()
         for child in self.children:
             child.on_after_cuda_graph_warmup()

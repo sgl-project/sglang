@@ -388,10 +388,7 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        # Eager entry covers both legs (ABC default = _out_graph + _in_graph;
-        # DSV4 chains _in_graph) and handles EXTEND, which the full runner's
-        # _out_graph(in_capture=True) bucket-prep path rejects. BCG re-runs it
-        # host-side every replay, so nothing needs recording into the graph.
+        # Eager entry (not _out_graph): handles EXTEND and covers _in_graph.
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
@@ -468,9 +465,6 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                # Outer model.forward runs eagerly here (only layer_model.forward
-                # is captured), so the eager entry materializes forward_metadata
-                # host-side every replay — both legs, no recorded _in_graph needed.
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 with set_forward_context(
                     static_forward_batch,
