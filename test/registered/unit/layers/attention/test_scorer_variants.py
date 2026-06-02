@@ -539,6 +539,22 @@ class TestLiftedBudgetABI(unittest.TestCase):
         finally:
             mc.is_deepseek_dsa, mc.get_dsa_index_topk = o1, o2
 
+    def test_validator_lifted_rejects_speculative(self):
+        # Lifted + speculative decoding must fail closed: the lifted CUDA-graph
+        # scratch is sized by max_bs, but speculative target-verify expands the
+        # decode rows. (hf_config-independent — fires in the lifted block.)
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        sa = self._server_args(
+            ', "enable_lifted_budget_decode": true, "lifted_budget_top_k": 4096',
+            top_k=2048, disable_cuda_graph=True,
+        )
+        sa.speculative_algorithm = "EAGLE"
+        with self.assertRaises(ValueError) as cm:
+            validate_double_sparsity(sa)
+        self.assertIn("speculative", str(cm.exception).lower())
+
     def test_validator_lifted_allows_cuda_graph(self):
         # The lifted path is now CUDA-graph-safe (fixed-shape builder + alloc-free
         # out= dequant + preallocated scratch), so the validator must NOT reject it

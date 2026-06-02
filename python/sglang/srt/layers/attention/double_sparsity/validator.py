@@ -117,6 +117,19 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
                 "rather than booting into a silent no-op or the flashmla_kv "
                 "'indices.shape[-1] == dsa_index_topk' assert."
             )
+        if getattr(server_args, "speculative_algorithm", None) is not None:
+            # The lifted-budget graph scratch (DSGraphState.lifted_compact_kv etc.)
+            # is sized by max_bs, but speculative target-verify expands the decode
+            # rows to bs * num_draft_tokens, which would undersize/overflow the
+            # scratch. The Loop-7 lifted op-point is non-speculative; fail closed
+            # rather than risk a wrong-output / OOB scratch slice.
+            raise ValueError(
+                "Double Sparsity enable_lifted_budget_decode is not supported with "
+                "speculative decoding (--speculative-algorithm="
+                f"{server_args.speculative_algorithm!r}): the lifted-budget CUDA-graph "
+                "scratch is sized by max_bs, but speculative target-verify expands the "
+                "decode rows. Disable one of the two."
+            )
 
     # Production-path selector-variant safety (future-proof guard). As of R9 ALL
     # non-learned variants — scorer_norm (cosine/hybrid) + head_agg (mean) [R6] and

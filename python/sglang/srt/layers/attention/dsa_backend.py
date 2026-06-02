@@ -479,9 +479,9 @@ class DeepseekSparseAttnBackend(
                 "write; NIAH @ 16K is expected to drop > 30 pp."
             )
         self.ds_max_top_k: int = 2048
-        # Opt-in lifted-budget decode (eager research path): the selector emits a
-        # WIDER fixed budget (lifted_budget_top_k > index_topk) and decode attends
-        # the dequantized selected slots via flash_mla_sparse_fwd instead of the
+        # Opt-in lifted-budget decode (graph-safe production path): the selector
+        # emits a WIDER fixed budget (lifted_budget_top_k > index_topk) and decode
+        # attends the dequantized selected slots via flash_mla_sparse_fwd instead of the
         # default flashmla_kv. When off, every lifted code path below is skipped
         # and the default decode is byte-identical.
         self.ds_lifted_budget_decode: bool = False
@@ -2102,7 +2102,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        """Opt-in lifted-budget decode (eager research path).
+        """Opt-in lifted-budget decode (graph-safe production path; eager fallback).
 
         ``page_table_1`` is the wider lifted-width selection of PHYSICAL KV slots
         (``[bs, lifted_budget_top_k]``, ``-1`` pads). Build the request-local

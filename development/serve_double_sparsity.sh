@@ -78,10 +78,11 @@ ANCHOR_BUDGET="${ANCHOR_BUDGET:-0}"
 # (--disable-cuda-graph), which the validator requires.
 RECALL_ORACLE="${RECALL_ORACLE:-0}"                        # 0 | 1
 if [[ "${RECALL_ORACLE}" == "1" ]]; then RECALL_ORACLE_JSON=true; else RECALL_ORACLE_JSON=false; fi
-# Opt-in lifted-budget decode (eager research path). LIFTED_BUDGET=1 emits
+# Opt-in lifted-budget decode (graph-safe production path). LIFTED_BUDGET=1 emits
 # "enable_lifted_budget_decode": true + a wider "lifted_budget_top_k" (must be
-# > top_k and a multiple of 128) and forces eager (--disable-cuda-graph), which
-# the validator requires (dequantize_k_cache_paged is not graph-safe). Off => the
+# > top_k and a multiple of 128). The path runs UNDER CUDA graph (alloc-free
+# dequantize_k_cache_paged_out + fixed-shape compact builder + preallocated
+# DSGraphState scratch), so it no longer forces --disable-cuda-graph. Off => the
 # config emits the default-off pair (lifted_budget_top_k must be 0 when off, else
 # the config fails closed).
 LIFTED_BUDGET="${LIFTED_BUDGET:-0}"                        # 0 | 1

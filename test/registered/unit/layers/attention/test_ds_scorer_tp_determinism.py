@@ -207,6 +207,98 @@ class TestTP8LiftedWidthDeterminism(unittest.TestCase):
         self._run_width(8192, port=29602)
 
 
+class TestLiftedWidthSelectionGraphCaptured(unittest.TestCase):
+    """The lifted-width graph-safe SELECTOR (`retrieve_topk_graph_safe`) captured in
+    a real CUDA graph at 4096 and 8192 replays **zero-alloc** and is **bit-identical**
+    to the eager logical reference. This is the SELECTION-under-capture half of the
+    graph-captured TP=8 lifted-width determinism requirement.
+
+    The cross-rank (all-reduce) half is NOT proven by a standalone 8-rank
+    `torch.cuda.graph` harness: capturing an NCCL collective in a naive test capture
+    deadlocks — NCCL collective capture requires the production `cuda_graph_runner`'s
+    coordination (graph pool + comm registration), not a raw per-rank `torch.cuda.graph`.
+    That cross-rank-under-capture path is instead covered by (a) this single-rank
+    selection-under-capture proof, (b) the eager 8-rank all-reduce equality
+    (`TestTP8LiftedWidthDeterminism`, the SUM all-reduce is rank-symmetric and
+    deterministic), and (c) the LIVE R17 TP=8 server which ran the selection under
+    production CUDA graph and served correct 95% recall (divergent ranks would corrupt
+    the all-reduced selection → degenerate output, which did not occur)."""
+
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+
+    def _run(self, max_top_k):
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state,
+            assert_no_alloc_in_region,
+        )
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_graph_safe,
+            retrieve_topk_via_labels,
+        )
+
+        dev = torch.device("cuda")
+        torch.manual_seed(7)
+        heads, label_dim, max_seq_len, bs = 4, 8, 8192, 2
+        q = torch.randn(bs, heads, label_dim, device=dev)
+        sig = torch.randn(1, max_seq_len, heads, label_dim, device=dev, dtype=torch.float16)
+        written = torch.ones(1, max_seq_len, dtype=torch.bool, device=dev)
+        chsel = (
+            torch.arange(label_dim, device=dev).view(1, 1, -1)
+            .expand(1, heads, -1).to(torch.int32).contiguous()
+        )
+        chw = torch.ones(1, heads, label_dim, device=dev)
+        rpi = torch.arange(bs, device=dev, dtype=torch.int32)
+        rtt = (
+            torch.arange(max_seq_len, device=dev, dtype=torch.int32)
+            .unsqueeze(0).expand(bs, -1).contiguous()
+        )
+        seq_lens = torch.tensor([max_top_k // 2, max_seq_len], dtype=torch.int32, device=dev)
+
+        idx_e, vl_e = retrieve_topk_via_labels(
+            queries=q, token_signatures=sig, written=written, channel_selection=chsel,
+            channel_weights=chw, layer_id=0, max_top_k=max_top_k, req_pool_indices=rpi,
+            req_to_token=rtt, seq_lens=seq_lens, max_seq_len=max_seq_len,
+        )
+        st = allocate_graph_state(max_bs=bs, max_top_k=max_top_k, max_seq_len=max_seq_len, device=dev)
+
+        def _call():
+            retrieve_topk_graph_safe(
+                queries=q, token_signatures=sig, written=written, channel_selection=chsel,
+                channel_weights=chw, layer_id=0, req_pool_indices=rpi, req_to_token=rtt,
+                seq_lens=seq_lens, max_seq_len=max_seq_len, max_top_k=max_top_k,
+                out_indices=st.selected_indices, out_lengths=st.valid_lengths,
+                scratch_scores=st.scratch_scores, scratch_topk_values=st.scratch_topk_values,
+                scratch_topk_indices=st.scratch_topk_indices, scratch_invalid_mask=st.scratch_invalid_mask,
+                scratch_sorted_vals=st.scratch_sorted_vals, scratch_boundary=st.scratch_boundary,
+                scratch_valid_i64=st.scratch_valid_i64, scratch_throwaway_idx=st.scratch_throwaway_idx,
+            )
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            _call()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            _call()
+        st.selected_indices.fill_(-1)
+        st.valid_lengths.fill_(0)
+        with assert_no_alloc_in_region(f"lifted-selection-graph-w{max_top_k}"):
+            g.replay()
+            torch.cuda.synchronize()
+        self.assertTrue(torch.equal(st.selected_indices[:bs], idx_e.to(torch.int32)))
+        self.assertTrue(torch.equal(st.valid_lengths[:bs], vl_e.to(torch.int32)))
+        self.assertEqual(int(vl_e[1].item()), max_top_k)  # full-length request selects the lifted width
+
+    def test_lifted_selection_graph_4096(self):
+        self._run(4096)
+
+    def test_lifted_selection_graph_8192(self):
+        self._run(8192)
+
+
 class TestTPMisconfigGuardPreserved(unittest.TestCase):
     def test_fail_fast_guards(self):
         from sglang.srt.layers.attention.double_sparsity.selector import (

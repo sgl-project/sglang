@@ -459,14 +459,15 @@ def ds_lifted_budget_decode_available() -> bool:
     implemented and wired into selection/decode, so ``enable_lifted_budget_decode``
     can actually be honored.
 
-    Returns ``True`` as of the lifted decode-branch landing: the selector widens
-    its budget to ``lifted_budget_top_k`` and the decode routes the selected slots
-    through ``build_compact_decode_index`` → ``dequantize_k_cache_paged`` →
-    ``flash_mla_sparse_fwd`` (an EAGER research path — the internally-allocating
-    dequant is not CUDA-graph-safe, so the validator additionally requires
-    ``--disable-cuda-graph`` for the opt-in until the alloc-free hardening lands).
-    The validator's lifted-budget shape/eager checks govern enablement now that
-    this seam is open (mirroring :func:`ds_scorer_is_graph_safe`).
+    Returns ``True``: the selector widens its budget to ``lifted_budget_top_k`` and
+    the decode routes the selected slots through the request-local compact remap →
+    ``dequantize_k_cache_paged`` (eager) / the fixed-shape graph-safe
+    ``build_lifted_compact_kv_fixed`` + ``dequantize_k_cache_paged_out`` into a
+    preallocated ``DSGraphState`` scratch (under CUDA-graph capture) →
+    ``flash_mla_sparse_fwd``. The path is **CUDA-graph-safe** (proven zero-alloc
+    replay; the validator no longer requires ``--disable-cuda-graph``). The
+    validator's lifted-budget shape checks govern enablement now that this seam is
+    open (mirroring :func:`ds_scorer_is_graph_safe`).
     """
     return True
 
