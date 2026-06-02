@@ -298,6 +298,7 @@ class PiecewiseCudaGraphRunner:
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+        self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -418,7 +419,6 @@ class PiecewiseCudaGraphRunner:
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
-        # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
@@ -432,6 +432,7 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
             ):
                 _ = self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -536,6 +537,7 @@ class PiecewiseCudaGraphRunner:
         )
 
         global_dp_buffer_len = None
+        global_num_tokens_cpu = None
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -610,6 +612,7 @@ class PiecewiseCudaGraphRunner:
                     global_dp_buffer_len,
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
+                    global_num_tokens_cpu,
                 )
                 # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
                 # It is True in this context but we need to set it to use low latency deepep mode.
@@ -622,6 +625,7 @@ class PiecewiseCudaGraphRunner:
                     self.quant_config,
                     self.moe_layers,
                     self.moe_fusions,
+                    dsa_indexers=self.dsa_indexers,
                 ):
                     self.model_runner.model.forward(
                         forward_batch.input_ids,
@@ -768,9 +772,7 @@ class PiecewiseCudaGraphRunner:
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
-            temp_scaled_logprobs=forward_batch.temp_scaled_logprobs,
             temperature=forward_batch.temperature,
-            top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
             return_pooled_hidden_states=(
@@ -795,8 +797,8 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
             ):
-                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,

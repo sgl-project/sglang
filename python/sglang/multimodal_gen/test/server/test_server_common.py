@@ -23,6 +23,11 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import conftest
+from sglang.multimodal_gen.test.server.realtime_consistency import (
+    pop_realtime_key_frames,
+    pop_realtime_perf_stats,
+    validate_realtime_perf_stats,
+)
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -35,6 +40,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
+    get_model_task_type_for_server_args,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -127,9 +133,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # LoRA support
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
-
-    if server_args.enable_warmup:
-        extra_args += " --warmup"
 
     # Strict ports: fail immediately if port is occupied instead of silently
     # picking another one (which causes the test client to connect to the wrong server).
@@ -626,7 +629,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         thresholds = get_consistency_thresholds(case.id, is_video=is_video)
 
         if is_video:
-            output_frames = extract_key_frames_from_video(content)
+            output_frames = pop_realtime_key_frames(case.id)
+            if output_frames is None:
+                output_frames = extract_key_frames_from_video(content)
         else:
             output_frames = [image_bytes_to_numpy(content)]
 
@@ -729,10 +734,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         is_video = case.server_args.modality == "video"
 
         if is_video:
-            # Extract key frames from video
-            frames = extract_key_frames_from_video(
-                content, num_frames=case.sampling_params.num_frames
-            )
+            # realtime consistency uses websocket raw frames to avoid lossy mp4 drift
+            frames = pop_realtime_key_frames(case.id)
+            if frames is None:
+                frames = extract_key_frames_from_video(
+                    content, num_frames=case.sampling_params.num_frames
+                )
 
             if len(frames) != 3:
                 logger.warning(
@@ -759,6 +766,22 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             output_path = out_dir / filenames[0]
             output_path.write_bytes(content)
             logger.info(f"Saved GT image: {output_path} (format: {detected_format})")
+
+    def _validate_lora_consistency(
+        self, case: DiffusionTestCase, content: bytes, operation: str
+    ) -> None:
+        if not case.run_consistency_check:
+            logger.info(
+                "[LoRA Consistency] Skipping %s consistency for %s: disabled for case",
+                operation,
+                case.id,
+            )
+            return
+
+        logger.info(
+            "[LoRA Consistency] Validating %s output for %s", operation, case.id
+        )
+        self._validate_consistency(case, content)
 
     def _test_lora_api_functionality(
         self,
@@ -795,10 +818,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
 
         logger.info("[LoRA E2E] Verifying generation after re-merge for %s", case.id)
-        rid_after_merge, _ = self._run_generation_with_server_watchdog(
-            ctx, case.id, generate_fn, client
+        rid_after_merge, content_after_merge = (
+            self._run_generation_with_server_watchdog(ctx, case.id, generate_fn, client)
         )
         assert rid_after_merge is not None, "Generation after merge failed"
+        self._validate_lora_consistency(case, content_after_merge, "merge_lora_weights")
         logger.info("[LoRA E2E] Generation after merge succeeded")
 
         # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
@@ -811,10 +835,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert resp.status_code == 200, f"set_lora failed: {resp.text}"
 
         logger.info("[LoRA E2E] Verifying generation after set_lora for %s", case.id)
-        rid_after_set, _ = self._run_generation_with_server_watchdog(
+        rid_after_set, content_after_set = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
         assert rid_after_set is not None, "Generation after set_lora failed"
+        self._validate_lora_consistency(case, content_after_set, "set_lora")
         logger.info("[LoRA E2E] Generation after set_lora succeeded")
 
         # Test 4: list_loras - API should return the expected list of LoRA adapters
@@ -853,10 +878,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         logger.info(
             "[LoRA Switch E2E] Testing generation with initial LoRA for %s", case.id
         )
-        rid_initial, _ = self._run_generation_with_server_watchdog(
+        rid_initial, content_initial = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
         assert rid_initial is not None, "Generation with initial LoRA failed"
+        self._validate_lora_consistency(
+            case, content_initial, "dynamic switch initial LoRA"
+        )
         logger.info("[LoRA Switch E2E] Generation with initial LoRA succeeded")
 
         # Test 2: Switch to second LoRA and generate
@@ -894,10 +922,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             "[LoRA Switch E2E] Verifying generation after switching back for %s",
             case.id,
         )
-        rid_switched_back, _ = self._run_generation_with_server_watchdog(
-            ctx, case.id, generate_fn, client
+        rid_switched_back, content_switched_back = (
+            self._run_generation_with_server_watchdog(ctx, case.id, generate_fn, client)
         )
         assert rid_switched_back is not None, "Generation after switching back failed"
+        self._validate_lora_consistency(
+            case, content_switched_back, "dynamic switch default LoRA"
+        )
         logger.info("[LoRA Switch E2E] Generation after switching back succeeded")
 
         logger.info(
@@ -955,7 +986,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "lora_nickname": ["default", "lora2"],
                 "lora_path": [first_lora_path, second_lora_path],
                 "target": "all",
-                "strength": [1.0, 1.0],
+                "strength": [0.5, 0.5],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
@@ -974,7 +1005,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "lora_nickname": ["default", "lora2"],
                 "lora_path": [first_lora_path, second_lora_path],
                 "target": "all",
-                "strength": [0.8, 0.5],
+                "strength": [0.6, 0.35],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
@@ -998,7 +1029,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 "lora_nickname": ["default", "lora2"],
                 "lora_path": [first_lora_path, second_lora_path],
                 "target": ["transformer", "transformer_2"],
-                "strength": [0.8, 0.5],
+                "strength": [0.6, 0.35],
             },
             timeout=_CONTROL_API_TIMEOUT_SECS,
         )
@@ -1019,10 +1050,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert (
             resp.status_code == 200
         ), f"set_lora back to single adapter failed: {resp.text}"
-        rid, _ = self._run_generation_with_server_watchdog(
+        rid, content = self._run_generation_with_server_watchdog(
             ctx, case.id, generate_fn, client
         )
         assert rid is not None
+        self._validate_lora_consistency(case, content, "multi-LoRA default adapter")
 
         logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
 
@@ -1063,19 +1095,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert (
             model["num_gpus"] == case.server_args.num_gpus
         ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
-        # Verify task_type is consistent with the modality specified in the test config.
-        # We can't access pipeline_config from test config, but we can validate against modality.
-        modality_to_valid_task_types = {
-            "image": {"T2I", "I2I", "TI2I"},
-            "video": {"T2V", "I2V", "TI2V"},
-            "3d": {"I2M"},
-        }
-        valid_task_types = modality_to_valid_task_types.get(
-            case.server_args.modality, set()
-        )
-        assert model["task_type"] in valid_task_types, (
-            f"task_type '{model['task_type']}' not valid for modality "
-            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        expected_task_type = get_model_task_type_for_server_args(case.server_args).name
+        assert model["task_type"] == expected_task_type, (
+            f"task_type mismatch: expected {expected_task_type}, "
+            f"got {model['task_type']}"
         )
         logger.info(
             "[Models API] GET /v1/models returned valid response with extended fields"
@@ -1096,9 +1119,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         # Verify extended fields on single model endpoint too
         assert "num_gpus" in single_model, "Single model missing 'num_gpus' field"
         assert "task_type" in single_model, "Single model missing 'task_type' field"
-        assert single_model["task_type"] in valid_task_types, (
-            f"Single model task_type '{single_model['task_type']}' not valid for modality "
-            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        assert single_model["task_type"] == expected_task_type, (
+            f"Single model task_type mismatch: expected {expected_task_type}, "
+            f"got {single_model['task_type']}"
         )
         logger.info(
             "[Models API] GET /v1/models/{model_path} returned valid response with extended fields"
@@ -1187,11 +1210,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         )
 
         # Single generation - output is reused for both validations
+        is_realtime_case = case.sampling_params.realtime_num_chunks is not None
         perf_record, content = self.run_and_collect(
             diffusion_server,
             case.id,
             generate_fn,
-            collect_perf=not is_gt_gen_mode,
+            collect_perf=not is_gt_gen_mode and not is_realtime_case,
         )
 
         if is_gt_gen_mode:
@@ -1209,10 +1233,23 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     raise
                 failures.append((name, str(exc)))
 
-        run_case_check(
-            "performance",
-            lambda: self._validate_and_record(case, perf_record),
-        )
+        if is_realtime_case:
+            run_case_check(
+                "performance",
+                lambda: validate_realtime_perf_stats(
+                    case.id,
+                    pop_realtime_perf_stats(case.id),
+                    case.sampling_params.realtime_perf_thresholds,
+                    ignore_initial_chunks=(
+                        case.sampling_params.realtime_perf_ignore_initial_chunks
+                    ),
+                ),
+            )
+        else:
+            run_case_check(
+                "performance",
+                lambda: self._validate_and_record(case, perf_record),
+            )
 
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (

@@ -786,6 +786,9 @@ class CPUGraphRunner:
         assert captured_forward_batch is not None
         captured_forward_batch.seq_lens.fill_(self.seq_len_fill_value)
         captured_forward_batch.out_cache_loc.zero_()
+        # Pair with seq_lens fill: padded rows must point at reserved
+        # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
+        captured_forward_batch.req_pool_indices.zero_()
         captured_forward_batch.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         captured_forward_batch.req_pool_indices[:raw_bs].copy_(
             forward_batch.req_pool_indices
