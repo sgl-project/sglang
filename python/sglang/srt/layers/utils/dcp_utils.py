@@ -11,6 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_dcp_group,
+    get_dcp_group_no_assert,
     get_dcp_rank,
     get_dcp_world_size,
 )
@@ -18,6 +19,8 @@ from sglang.srt.server_args import get_global_server_args
 
 
 def dcp_enabled() -> bool:
+    if get_dcp_group_no_assert() is None:
+        return False
     return get_dcp_world_size() > 1
 
 
@@ -26,10 +29,14 @@ def get_attention_dcp_group() -> GroupCoordinator:
 
 
 def get_attention_dcp_world_size() -> int:
+    if not dcp_enabled():
+        return 1
     return get_dcp_world_size()
 
 
 def get_attention_dcp_rank() -> int:
+    if not dcp_enabled():
+        return 0
     return get_dcp_rank()
 
 

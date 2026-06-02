@@ -1556,6 +1556,10 @@ def get_attn_cp_group() -> GroupCoordinator:
     return _ATTN_CP
 
 
+def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
+    return _DCP
+
+
 def get_dcp_group() -> GroupCoordinator:
     assert _DCP is not None, "decode context parallel group is not initialized"
     return _DCP
