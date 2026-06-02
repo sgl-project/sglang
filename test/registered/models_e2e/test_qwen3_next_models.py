@@ -6,14 +6,16 @@ from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=145, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=130, stage="base-c", runner_config="4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
 
 class TestQwen3NextLazyExtraBuffer(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
     model = QWEN3_NEXT_MODEL
+    cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93
     kl_div_thres = 0.001
     other_args = [
@@ -29,6 +31,8 @@ class TestQwen3NextLazyExtraBuffer(
         "--page-size",
         "1",
         "--attention-backend",
+        "triton",
+        "--moe-runner-backend",
         "triton",
     ]
 
