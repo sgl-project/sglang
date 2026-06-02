@@ -351,10 +351,6 @@ class FrozenKVMTPWorker(TpModelWorker):
         capture_for_decode(logits_output, draft_input, self.topk)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch) -> None:
-        # Install an idle FrozenKVMTPDraftInput on `batch.spec_info` so the
-        # next iter's scheduler ops (merge_batch / filter_batch) see well-typed
-        # empty tensors instead of the leftover FrozenKVMTPVerifyInput, which
-        # has no merge_batch / filter_batch.
         batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
             device=self.device,
             hidden_size=self._recurrent_hidden_size,
@@ -459,7 +455,6 @@ class FrozenKVMTPWorker(TpModelWorker):
             speculative_moe_a2a_backend_context(),
         ):
             draft_extend_input = verify_output.draft_extend_input
-
             if (
                 self.server_args.enable_dp_attention
                 or draft_extend_input.input_ids.shape[0] > 0
@@ -475,7 +470,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 # ops (merge_batch / filter_batch) see well-typed empty
                 # tensors instead of None.
                 self._draft_preprocess_idle(batch)
-           
+
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
