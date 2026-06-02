@@ -25,32 +25,12 @@ _SANA_WM_DISABLE_FUSED_RMSNORM = os.getenv(
 ).lower() in {"1", "true", "yes", "on"} or os.getenv(
     "SGLANG_ENABLE_DETERMINISTIC_INFERENCE", ""
 ).lower() in {"1", "true", "yes", "on"}
-_SANA_WM_GDN_EYE_CACHE: dict[
-    Tuple[int, str, Optional[int], torch.dtype], torch.Tensor
-] = {}
-
-
-def _gdn_eye(
-    dim: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    key = (dim, device.type, device.index, dtype)
-    eye = _SANA_WM_GDN_EYE_CACHE.get(key)
-    if eye is None or eye.device != device:
-        eye = torch.eye(dim, device=device, dtype=dtype).view(1, 1, 1, dim, dim)
-        _SANA_WM_GDN_EYE_CACHE[key] = eye
-    return eye
 
 
 def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
     try:
         version = int(tensor._version)
     except RuntimeError:
-        # Inference-mode tensors do not track version counters. The cache users
-        # here only memoize immutable inference inputs/weights, so shape/stride/
-        # device/dtype/data_ptr is sufficient for that path.
         version = 0
     return (
         tuple(tensor.shape),
@@ -61,18 +41,8 @@ def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
         version,
     )
 
-# ---------------------------------------------------------------------------
-# Small primitives (RMSNorm, ShortConvolution) -- shapes match upstream
-# parameter names exactly so the released checkpoint loads cleanly.
-# ---------------------------------------------------------------------------
-
 
 class _RMSNorm(nn.Module):
-    """RMSNorm matching upstream signature ``RMSNorm(dim, scale_factor=1.0, eps=1e-6)``.
-
-    Parameter name: ``weight`` (shape ``(dim,)``).
-    """
-
     def __init__(
         self,
         dim: int,
@@ -84,9 +54,6 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim) * scale_factor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Avoid materializing full-size fp32 intermediates on the large SANA-WM
-        # hidden states. The fallback below is kept for deterministic inference
-        # and for dtype/platform combinations without a fused torch RMSNorm path.
         if (
             not _SANA_WM_DISABLE_FUSED_RMSNORM
             and x.is_cuda
@@ -96,13 +63,10 @@ class _RMSNorm(nn.Module):
         ):
             return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
 
-        # Upstream Sana RMSNorm does both normalization and weight multiply in
-        # fp32 before casting back to the input dtype.
         x_in = x
         x32 = x.float()
         rms = x32.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         return (x32 * rms * self.weight.to(dtype=x32.dtype)).type_as(x_in)
-
 
 class _ShortConvolution(nn.Module):
     def __init__(self, hidden_size: int, kernel_size: int) -> None:
@@ -110,8 +74,6 @@ class _ShortConvolution(nn.Module):
         self.hidden_size = hidden_size
         self.kernel_size = kernel_size
         self.weight = nn.Parameter(torch.zeros(hidden_size, 1, kernel_size))
-        # identity init: last tap = 1. The released SANA-WM checkpoint has no
-        # ShortConvolution bias tensors, so keep this module bias-free.
         with torch.no_grad():
             self.weight[:, 0, -1] = 1.0
 
@@ -135,17 +97,7 @@ def _bidirectional_short_conv(
     return (y_fwd + y_bwd - center).to(x.dtype)
 
 
-# ---------------------------------------------------------------------------
-# 3D RoPE -- ``WanRotaryPosEmbed`` from upstream sana_blocks.py
-# ---------------------------------------------------------------------------
-
-
 class WanRotaryPosEmbed(nn.Module):
-    """3D rotary position embeddings split across (t, h, w) head dims.
-
-    Returns complex ``freqs`` of shape ``(1, 1, T*H*W, D/2)``.
-    """
-
     def __init__(
         self,
         attention_head_dim: int,
@@ -218,12 +170,6 @@ def _apply_rotary_emb_bhnd(
     x_c = torch.view_as_complex(x.unflatten(-1, (-1, 2)))
     y = torch.view_as_real(x_c * freqs).flatten(-2, -1)
     return y.type_as(hidden_states)
-
-
-# ---------------------------------------------------------------------------
-# UCPE block-diagonal apply primitives (mirror upstream
-# diffusion/model/nets/sana_camctrl_blocks.py)
-# ---------------------------------------------------------------------------
 
 
 def _apply_ray_projmat(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
@@ -393,12 +339,6 @@ def _sana_wm_padded_attention_head_size(head_size: int) -> int:
 
 
 class _SanaWMPaddedLocalAttention(nn.Module):
-    """Opt-in SANA-WM attention-head padding for FlashAttention experiments.
-
-    Padding Q/K/V from head_dim=112 to 128 leaves logits unchanged when the
-    original softmax scale is kept, then slices away the padded output channels.
-    """
-
     def __init__(
         self,
         num_heads: int,
@@ -602,13 +542,7 @@ def _unproject_grid(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Compute camera-space unit ray directions for each latent token.
-
-    Returns (B, F, H, W, 3).
-    """
     B, F_dim = x_fov.shape
-    # Upstream `create_grid` uses integer pixel coordinates [0, W-1] /
-    # [0, H-1] rather than half-pixel centers.
     u = torch.arange(W, device=device, dtype=dtype)
     v = torch.arange(H, device=device, dtype=dtype)
     u = u.view(1, 1, 1, W).expand(B, F_dim, H, W)
@@ -617,11 +551,10 @@ def _unproject_grid(
     cy_e = cy.view(B, F_dim, 1, 1)
     tan_x = torch.tan(x_fov / 2.0).view(B, F_dim, 1, 1)
     tan_y = torch.tan(y_fov / 2.0).view(B, F_dim, 1, 1)
-    # Map pixel (u, v) -> (x_dir, y_dir) on the z=1 plane.
     dx = (u - cx_e) / max(W, 1) * 2.0 * tan_x
     dy = (v - cy_e) / max(H, 1) * 2.0 * tan_y
     dz = torch.ones_like(dx)
-    d = torch.stack([dx, dy, dz], dim=-1)  # (B, F, H, W, 3)
+    d = torch.stack([dx, dy, dz], dim=-1) 
     return F.normalize(d, dim=-1)
 
 
@@ -630,11 +563,6 @@ def process_camera_conditions_ucpe(
     HW: Tuple[int, int, int],
     patch_size: Tuple[int, int, int] = (1, 1, 1),
 ) -> torch.Tensor:
-    """Convert ``(B, F, 20)`` flat camera conditions into ``raymats``.
-
-    Layout: first 16 = c2w 4x4 flatten, last 4 = ``(fx, fy, cx, cy)``.
-    Returns ``raymats`` of shape ``(B, F, H, W, 4, 4)`` (ray<-world).
-    """
     B, F_dim, _ = camera_conditions.shape
     _, H, W = HW
     device = camera_conditions.device
@@ -653,18 +581,15 @@ def process_camera_conditions_ucpe(
     x_fov = _compute_fov_from_focal(fx, image_w)
     y_fov = _compute_fov_from_focal(fy, image_h)
 
-    # cx/cy are in pixel units -- scale to latent grid like upstream
-    # (``cx / patch_size[2]``).
     cx_lat = cx / float(patch_size[2])
     cy_lat = cy / float(patch_size[1])
 
     d_cam = _unproject_grid(
         x_fov, y_fov, H, W, cx_lat, cy_lat, device, dtype
-    )  # (B,F,H,W,3)
+    )  
 
-    # Build per-token "ray<-world" 4x4 following upstream `world_to_ray_mats`.
-    R_c2w = C_to_W[..., :3, :3]  # (B, F, 3, 3)
-    t_c2w = C_to_W[..., :3, 3]  # (B, F, 3)
+    R_c2w = C_to_W[..., :3, :3] 
+    t_c2w = C_to_W[..., :3, 3] 
     d_world = torch.einsum("bfij,bfhwj->bfhwi", R_c2w, d_cam)
     z_ray = F.normalize(d_world, dim=-1, eps=1e-6)
     cam_y = R_c2w[..., :, 1].view(B, F_dim, 1, 1, 3).expand(B, F_dim, H, W, 3)
@@ -672,7 +597,6 @@ def process_camera_conditions_ucpe(
     y_ray = F.normalize(torch.cross(z_ray, x_ray, dim=-1), dim=-1, eps=1e-6)
     R_ray_to_world = torch.stack([x_ray, y_ray, z_ray], dim=-1)
 
-    # P = ray<-world = inverse of [R_ray_to_world | t_c2w]
     R_w_to_ray = R_ray_to_world.transpose(-1, -2)
     t_w_to_ray = -torch.einsum(
         "bfhwij,bfj->bfhwi",
@@ -719,14 +643,14 @@ def compute_chunk_plucker(
         cy / float(patch_size[1]),
         device,
         dtype,
-    )  # (B, F_orig, H, W, 3)
+    )  
 
     R = c2w[..., :3, :3]
-    o = c2w[..., :3, 3]  # (B, F_orig, 3)
+    o = c2w[..., :3, 3] 
     d_world = F.normalize(torch.einsum("bfij,bfhwj->bfhwi", R, d_cam), dim=-1)
     o_exp = o.view(B, F_orig, 1, 1, 3).expand_as(d_world)
     moment = torch.cross(o_exp, d_world, dim=-1)
-    plucker = torch.cat([d_world, moment], dim=-1)  # (B, F_orig, H, W, 6)
+    plucker = torch.cat([d_world, moment], dim=-1) 
 
     time_indices = list(range(0, F_orig, vae_temporal_stride))
     if len(time_indices) < T:
@@ -745,27 +669,15 @@ def compute_chunk_plucker(
             chunk = torch.cat([chunk, pad_chunk], dim=1)
         chunks.append(chunk)
 
-    plucker = torch.stack(chunks, dim=1)  # (B, T, stride, H, W, 6)
+    plucker = torch.stack(chunks, dim=1) 
     plucker = plucker.permute(0, 1, 3, 4, 2, 5).reshape(
         B, T, H, W, vae_temporal_stride * 6
     )
-    # (B, 48, T, H, W) for Conv3d
     plucker = plucker.permute(0, 4, 1, 2, 3).contiguous()
     return plucker
 
 
-# ---------------------------------------------------------------------------
-# Patch embedding / caption embedder / final layer -- upstream key names
-# ---------------------------------------------------------------------------
-
-
 class PatchEmbedMS3D(nn.Module):
-    """3D patch embedder used by SANA-WM for ``x_embedder``,
-    ``raymap_embedder``, and ``plucker_embedder``.
-
-    Parameter names: ``proj.weight`` / ``proj.bias``.
-    """
-
     def __init__(
         self,
         patch_size: Tuple[int, int, int],
@@ -788,8 +700,6 @@ class PatchEmbedMS3D(nn.Module):
 
 
 class _UpstreamMlp(nn.Module):
-    """timm-style Mlp used by ``y_embedder.y_proj`` (fc1/fc2 with bias=True)."""
-
     def __init__(
         self, in_features: int, hidden_features: int, out_features: int
     ) -> None:
@@ -803,14 +713,6 @@ class _UpstreamMlp(nn.Module):
 
 
 class CaptionEmbedder(nn.Module):
-    """Upstream ``CaptionEmbedder``: projects text encoder embeddings to
-    model hidden size, plus a learned null-caption table used by CFG.
-
-    Inference-only forward: ``y`` may be ``(B, 1, L, in_channels)`` or
-    ``(B, L, in_channels)``; the null table is not applied (no dropout at
-    inference time).  Returns ``(B, 1, L, hidden_size)``.
-    """
-
     def __init__(
         self, in_channels: int, hidden_size: int, token_num: int = 300
     ) -> None:
@@ -830,10 +732,6 @@ class CaptionEmbedder(nn.Module):
 
 
 class T2IFinalLayer(nn.Module):
-    """Output AdaLN + Linear, with the scale_shift_table living *inside* the
-    module (upstream stores it as ``final_layer.scale_shift_table``).
-    """
-
     def __init__(
         self, hidden_size: int, patch_size: Tuple[int, int, int], out_channels: int
     ) -> None:
@@ -848,8 +746,6 @@ class T2IFinalLayer(nn.Module):
         self.out_channels = out_channels
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        # t can be either (B, D) for scalar timesteps or (B, 1, T, D) for
-        # SANA-WM's first-frame-conditioned flow_euler_ltx sampler.
         if t.dim() == 2:
             shift, scale = (self.scale_shift_table[None] + t[:, None]).chunk(2, dim=1)
             x = self.norm_final(x) * (1 + scale) + shift
@@ -885,9 +781,6 @@ def _sinusoidal_timestep_embedding(
 
 
 class TimestepEmbedder(nn.Module):
-    """Upstream ``TimestepEmbedder``.  Stored as ``mlp.0/2`` (Linear, SiLU,
-    Linear) -- we mirror that exact layout."""
-
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
@@ -907,10 +800,6 @@ _INT32_SAFE_CONV_ELEMENTS = 1 << 30
 
 
 class _ConvLayer(nn.Module):
-    """Thin wrapper -- has a single ``conv`` member to match upstream
-    ``inverted_conv.conv`` / ``depth_conv.conv`` / ``point_conv.conv`` keys.
-    """
-
     def __init__(self, conv: nn.Module, act: Optional[nn.Module] = None) -> None:
         super().__init__()
         self.conv = conv
@@ -924,13 +813,6 @@ class _ConvLayer(nn.Module):
 
 
 class GLUMBConvTemp(nn.Module):
-    """Spatial GLU MBConv + additive temporal Conv2d (zero-init).
-
-    Operates on ``(B, T*H*W, C)``; reshape to ``(B*T, C, H, W)`` for spatial
-    convs, then ``(B, C, T, H*W)`` for ``t_conv`` (a 2D depth-wise temporal
-    conv), residually added.
-    """
-
     def __init__(
         self, in_features: int, hidden_features: int, t_kernel_size: int = 3
     ) -> None:
@@ -1025,12 +907,6 @@ def _compute_frame_gates(
     dt_bias: torch.Tensor,
     A_log: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Frame-level beta/decay gates.
-
-    Returns:
-        beta:  (B, H, T, S)   in (0, 1) via sigmoid
-        decay: (B, H, T)      in (0, 1) via exp(-A * softplus(.))
-    """
     B, N, C = x.shape
     T, H, W = HW
     S = H * W
@@ -1054,9 +930,6 @@ def _gdn_scan_forward(
     eps: float = 1e-6,
     return_components: bool = False,
 ) -> torch.Tensor:
-    """Causal recurrent GDN scan over T (mirrors
-    ``torch_recurrent_sana_gdn``).  Tensors are in (B, H, D, N=T*S) layout.
-    """
     B, H, D, N = q.shape
     T = beta.shape[2]
     S = N // T
@@ -1120,12 +993,6 @@ def _gdn_chunk_scan_forward(
     eps: float = 1e-6,
     return_components: bool = False,
 ) -> torch.Tensor:
-    """Chunk-scan form of SANA GDN.
-
-    This mirrors upstream ``torch_chunk_sana_gdn`` algebraically, but computes
-    W/U per chunk instead of materializing all temporal transitions at once.
-    That keeps peak memory closer to the recurrent path on long videos.
-    """
     B, H, D, N = q.shape
     T = beta.shape[2]
     S = N // T
@@ -1151,7 +1018,7 @@ def _gdn_chunk_scan_forward(
             chunk_split_strategy="uniform",
         )
 
-    eye = _gdn_eye(D, device=q.device, dtype=q.dtype)
+    eye = torch.eye(D, device=q.device, dtype=q.dtype).view(1, 1, 1, D, D)
     state_kv = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
     state_z = torch.zeros(B, H, D, 1, device=q.device, dtype=q.dtype)
     num_chunks, den_chunks = [], []
@@ -1259,7 +1126,6 @@ def _gdn_scan_bidirectional(
 
     num_fwd, den_fwd = run_scan(q, k, v, q_rot, k_rot, beta, decay)
 
-    # Backward pass: flip Q, flip+shift K/V/k_rot/beta and shift decay-by-1.
     B, H, D, N = q.shape
     T, H_sp, W_sp = HW
     S = H_sp * W_sp
@@ -1388,7 +1254,7 @@ def _single_path_delta_chunk_scan_forward(
             chunk_split_strategy="uniform",
         )
 
-    eye = _gdn_eye(D, device=q_rot.device, dtype=q_rot.dtype)
+    eye = torch.eye(D, device=q_rot.device, dtype=q_rot.dtype).view(1, 1, 1, D, D)
     state_kv = torch.zeros(B, H, D, D, device=q_rot.device, dtype=q_rot.dtype)
     out_chunks = []
 
@@ -1493,13 +1359,6 @@ def _downscale_to_reference_rms(
     return transformed * scale
 
 
-# ---------------------------------------------------------------------------
-# SANA-WM attention block: main GDN (or softmax) + UCPE camera branch
-# (single SinglePath module; cam branch shares ``proj`` / ``output_gate``
-# with the main branch).
-# ---------------------------------------------------------------------------
-
-
 class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     def __init__(
         self,
@@ -1602,7 +1461,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
         ] = None
 
-    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _temporal_short_conv(
@@ -1623,7 +1481,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         # back to (B, T*S, C)
         return y.reshape(B, S, T, C).permute(0, 2, 1, 3).reshape(B, N, C)
 
-    # ------------------------------------------------------------------ #
 
     def _get_cam_qkv_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
         weights = (
@@ -1665,9 +1522,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         HW: Tuple[int, int, int],
         rotary_emb: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return ``(out_raw, beta, decay)`` where ``out_raw`` is the GDN
-        scan result before output gate / proj.
-        """
         B, N, C = x.shape
         T, H_sp, W_sp = HW
         S = H_sp * W_sp
@@ -1747,9 +1601,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         chunk_split_strategy: str = "uniform",
         chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        """Softmax variant of the main branch, dispatched through SGLang's
-        pluggable attention backend.
-        """
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.heads, self.dim)
         q, k, v = qkv.unbind(2)
@@ -1787,7 +1638,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             out = self.softmax_attn(q_in, k_in, v_in)
         return out.reshape(B, N, C)
 
-    # ------------------------------------------------------------------ #
 
     def _cam_branch(
         self,
@@ -1942,7 +1792,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         out_bhnd = apply_o(out_bhnd)
         return out_bhnd.transpose(1, 2).reshape(B, N, C)
 
-    # ------------------------------------------------------------------ #
 
     def forward(
         self,
@@ -2217,28 +2066,7 @@ class SanaWMBlock(nn.Module):
         return x
 
 
-# ---------------------------------------------------------------------------
-# Top-level model
-# ---------------------------------------------------------------------------
-
-
 class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    """SANA-WM 2.6B TI2V world model.
-
-    Forward inputs:
-        hidden_states:           (B, C, T, H, W)        128-ch LTX-2 latent
-        encoder_hidden_states:   (B, L, 2304)           Gemma-2 embeddings
-        timestep:                (B,)
-        encoder_attention_mask:  (B, L) optional bool
-        camera_conditions:       (B, T, 20)             latent-frame raymap:
-                                                        16 c2w + (fx,fy,cx,cy)
-        chunk_plucker:           (B, 48, T, H, W)       optional, computed
-                                                        from camera_conditions
-                                                        if absent.
-
-    Returns: ``(B, C, T, H, W)`` predicted velocity / noise.
-    """
-
     _fsdp_shard_conditions = SanaWMConfig()._fsdp_shard_conditions
     _compile_conditions = SanaWMConfig()._compile_conditions
     _supported_attention_backends = SanaWMConfig()._supported_attention_backends
@@ -2264,8 +2092,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             arch, "timestep_norm_scale_factor", 1.0
         )
 
-        # --- Embedders (upstream names: x_embedder, t_embedder, t_block,
-        # y_embedder, attention_y_norm, raymap_embedder, plucker_embedder) ---
         self.x_embedder = PatchEmbedMS3D(
             self.patch_size,
             arch.in_channels,
@@ -2291,17 +2117,13 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             eps=getattr(arch, "y_norm_eps", 1e-5),
         )
 
-        # 3-channel raymap embedder -- kept for state_dict compatibility but
-        # only invoked when ``use_chunk_plucker_post_attn`` is False.
-        # When ``True`` (the case for the released checkpoint) the absmap
-        # path is skipped entirely.
         self.raymap_embedder = PatchEmbedMS3D(
             self.patch_size,
             3,
             self.inner_dim,
             bias=True,
         )
-        # 48-channel plucker embedder (chunk-packed)
+
         if arch.use_chunk_plucker_post_attn or arch.use_chunk_plucker_input:
             self.plucker_embedder = PatchEmbedMS3D(
                 self.patch_size,
@@ -2408,17 +2230,10 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.layer_names = ["blocks"]
 
     def post_load_weights(self) -> None:
-        # FSDP loader initializes the model on meta and only materializes
-        # tensors that appear in the checkpoint. WanRotaryPosEmbed._freqs is a
-        # derived, non-persistent constant, so recompute it deterministically.
         for module in self.modules():
             if isinstance(module, WanRotaryPosEmbed):
                 if module._freqs.is_meta:
                     module._init_freqs_buffer()
-
-    # ------------------------------------------------------------------ #
-    # Forward
-    # ------------------------------------------------------------------ #
 
     def clear_sana_wm_inference_caches(self) -> None:
         self._ucpe_apply_fns_cache = None

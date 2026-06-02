@@ -77,8 +77,6 @@ class OfficialDiffusersLTX2RefinerModule(_OfficialLayerwiseModule):
 
 
 class OfficialGemma3TextEncoderModule(_OfficialLayerwiseModule):
-    """Thin offload wrapper around HF Gemma-3 used by the official refiner."""
-
     layer_names = [
         "module.language_model.layers",
         "module.model.language_model.layers",
@@ -142,13 +140,6 @@ def _pack_text_embeds(
     scale_factor: int = 8,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """SANA-WM-specific text-embed pooling.
-
-    Stacks per-layer Gemma-3 hidden states (`text_hidden_states` shape
-    `(B, L, D, n_layers)`), applies a masked min-max normalization across the
-    (token, layer) axes, scales by `scale_factor`, then flattens layers into
-    the channel dim, padded positions zeroed out. Matches NVlabs upstream.
-    """
     batch_size, seq_len, hidden_dim, _ = text_hidden_states.shape
     device = text_hidden_states.device
     original_dtype = text_hidden_states.dtype
@@ -225,8 +216,6 @@ def _forward_diffusers_video_only(
     fps: float,
     n_context_tokens: int,
 ) -> torch.Tensor:
-    """Official SANA-WM LTX-2 video-only forward adapted to injected modules."""
-
     batch_size = hidden_states.size(0)
     encoder_attention_mask = _as_additive_attention_mask(
         encoder_attention_mask, hidden_states.dtype
@@ -340,9 +329,6 @@ def _streaming_diffusers_self_attention(
         apply_split_rotary_emb,
     )
 
-    # Diffusers 0.38+ always defines `to_gate_logits`, while 0.37 only has it
-    # on gated variants. The public SANA-WM refiner config is ungated, so a
-    # missing attribute means the same thing as `None`.
     to_gate_logits = getattr(attn, "to_gate_logits", None)
     gate_logits = to_gate_logits(hidden_states) if to_gate_logits is not None else None
 
@@ -405,15 +391,6 @@ def _streaming_diffusers_self_attention(
 
 
 class SanaWMLTX2RefinerStage(PipelineStage):
-    """Run the SANA-WM stage-2 LTX-2 refiner before VAE decode.
-
-    Modules are injected by `SanaWMTwoStagePipeline`:
-      * `transformer` (`SanaWMLTX2VideoRefiner`) -- video-only LTX-2 forward
-      * `connectors` (`LTX2TextConnectors`)
-      * `text_encoder` (`Gemma3ForConditionalGeneration`)
-      * `tokenizer` (HF `AutoTokenizer` for the refiner Gemma-3)
-    """
-
     def __init__(
         self,
         *,
@@ -453,11 +430,6 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         ):
             return []
 
-        # Declare every component this stage forwards through so
-        # ComponentResidencyManager moves them onto GPU before the stage runs.
-        # Without this, `dit_cpu_offload=True` keeps the refiner sub-modules on
-        # CPU and the first matmul fails with "mat2 is on cpu" vs cuda inputs.
-        # The tokenizer stays on CPU (no nn.Module weights to ferry).
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
@@ -517,9 +489,6 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         input_ids = text_inputs.input_ids.to(device)
         attention_mask = text_inputs.attention_mask.to(device)
 
-        # Diffusers-backed official path loads HF Gemma3ForConditionalGeneration.
-        # NVlabs encodes through `.model`; the fallback SGLang-native encoder is
-        # still callable directly, so keep both surfaces.
         with self.use_declared_component(
             component_name="text_encoder_2", module=self.text_encoder
         ):
@@ -771,8 +740,6 @@ class SanaWMLTX2RefinerStage(PipelineStage):
 
 
 class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
-    """Decode refined latents and drop the clean sink anchor frame."""
-
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
         self._drop_refiner_sink = bool(
@@ -806,8 +773,6 @@ class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
         if not getattr(self, "_drop_refiner_sink", True):
             log_sana_wm_tensor_stats("refiner.decode.frames_output", frames)
             return frames
-        # Match NVlabs `inference_sana_wm.py`: decode with the clean sink anchor,
-        # then drop the first frame from the returned video.
         frames = frames[:, :, 1:].contiguous()
         log_sana_wm_tensor_stats("refiner.decode.frames_output", frames)
         return frames

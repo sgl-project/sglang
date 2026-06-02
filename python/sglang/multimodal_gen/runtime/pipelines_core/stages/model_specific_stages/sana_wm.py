@@ -117,14 +117,6 @@ def sana_wm_action_to_camera_to_world(
     rotation_speed_deg: float = _SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
     pitch_limit_deg: float = _SANA_WM_DEFAULT_PITCH_LIMIT_DEG,
 ) -> torch.Tensor:
-    """Roll out upstream SANA-WM action DSL to a camera-to-world trajectory.
-
-    The DSL groups segments as ``<keys>-<frames>`` joined by commas. Movement
-    keys ``wasd`` translate on the world XZ plane; rotation keys ``ijkl`` apply
-    pitch/yaw. The coordinate convention is OpenCV: +X right, +Y down, +Z
-    forward. The returned shape is ``(N+1, 4, 4)``.
-    """
-
     per_frame = parse_sana_wm_action_string(action)
     rotate_rad = math.radians(float(rotation_speed_deg))
     pitch_limit_rad = math.radians(float(pitch_limit_deg))
@@ -206,12 +198,6 @@ def sana_wm_diagnostics_enabled() -> bool:
 
 
 def log_sana_wm_tensor_stats(label: str, tensor: torch.Tensor | None) -> None:
-    """Log compact tensor statistics for reference-quality alignment.
-
-    Enable with ``SGLANG_SANA_WM_DIAGNOSTICS=1``. The fingerprint is a strided
-    sum over at most ~4096 values, useful for spotting deterministic drift
-    without dumping full tensors.
-    """
     if not sana_wm_diagnostics_enabled():
         return
     if tensor is None:
@@ -282,14 +268,6 @@ def configure_sana_wm_ltx2_vae_for_long_video(
     *,
     log_info: Any | None = None,
 ) -> None:
-    """Apply SANA-WM's upstream LTX-2 VAE tiling knobs.
-
-    The LTX-2 VAE implements temporal tiled decode, but unlike the generic
-    VAE base it does not enable it from ``enable_tiling()`` alone. Without this
-    321-frame 720p decode can enter one large Conv3d path and hit PyTorch's
-    32-bit index math limit.
-    """
-
     min_frames = _resolve_sana_wm_vae_frame_tile_value(
         pipeline_config,
         "vae_tile_sample_min_num_frames",
@@ -340,8 +318,6 @@ def configure_sana_wm_ltx2_vae_for_long_video(
 
 
 class SanaWMDecodingStage(DecodingStage):
-    """Decode SANA-WM LTX-2 latents with upstream long-video VAE settings."""
-
     @torch.no_grad()
     def decode(
         self,
@@ -453,15 +429,6 @@ def _align_sana_wm_cfg_text_conditions(
 
 
 class SanaWMTextEncodingStage(TextEncodingStage):
-    """Gemma-2 text encoding that mirrors NVlabs SANA-WM inference.
-
-    The official script prepends a long ``chi_prompt`` only to the positive
-    branch, tokenizes that longer string, then keeps token 0 and the last
-    299 tokens. The negative branch remains a normal 300-token padded prompt.
-    Keeping this local avoids bending the shared TextEncodingStage around a
-    model-specific prompt-window contract.
-    """
-
     @staticmethod
     def _text_encoder_max_length(server_args: ServerArgs) -> int:
         encoder_cfg = server_args.pipeline_config.text_encoder_configs[0]
@@ -617,14 +584,6 @@ class SanaWMTextEncodingStage(TextEncodingStage):
 
 
 class SanaWMDenoisingStage(DenoisingStage):
-    """SANA-WM stage-1 sampler matching NVlabs ``flow_euler_ltx``.
-
-    The generic denoising stage uses one scalar timestep for every latent token
-    and updates the whole tensor. Official SANA-WM inference uses per-frame
-    timesteps: the first-frame condition stays at timestep 0 and is not updated,
-    while the remaining latent frames denoise normally.
-    """
-
     @property
     def parallelism_type(self) -> StageParallelismType:
         if self.server_args.enable_cfg_parallel:
@@ -883,11 +842,6 @@ class SanaWMDenoisingStage(DenoisingStage):
 
 
 class SanaWMBeforeDenoisingStage(PipelineStage):
-    """
-    Monolithic pre-processing stage for SANA-WM TI2V inference.
-
-    Must run after SanaWMTextEncodingStage, which populates batch.prompt_embeds.
-    """
 
     def __init__(
         self,
@@ -917,10 +871,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 target_dtype=vae_dtype,
             )
         ]
-
-    # -----------------------------------------------------------------------
-    # Helper: VAE-encode and scale an image tensor
-    # -----------------------------------------------------------------------
 
     @torch.no_grad()
     def _vae_encode_image(
@@ -1033,10 +983,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             return float(scaling_factor.item())
         scaling_factor = float(scaling_factor)
         return 1.0 if scaling_factor == 0.0 else scaling_factor
-
-    # -----------------------------------------------------------------------
-    # Helper: initialize noise latents
-    # -----------------------------------------------------------------------
 
     def _prepare_noise_latents(
         self,
@@ -1270,10 +1216,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         out[..., 1] *= sy
         out[..., 3] = out[..., 3] * sy - top
         return out
-
-    # -----------------------------------------------------------------------
-    # Helper: splice first-frame image latent into noise latents
-    # -----------------------------------------------------------------------
+    
 
     @torch.no_grad()
     def _splice_first_frame(
@@ -1355,9 +1298,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             )
         return [condition_image]
 
-    # -----------------------------------------------------------------------
-    # Helper: camera conditioning
-    # -----------------------------------------------------------------------
 
     @staticmethod
     def _pad_or_trim_frames(tensor: torch.Tensor, num_frames: int) -> torch.Tensor:
@@ -2066,10 +2006,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         return camera_conditions, chunk_plucker, source
 
-    # -----------------------------------------------------------------------
-    # Helper: compute timesteps and sigmas for FlowMatch scheduling
-    # -----------------------------------------------------------------------
-
     def _prepare_timesteps(
         self,
         batch: Req,
@@ -2119,9 +2055,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         batch.scheduler = scheduler
         return batch
 
-    # -----------------------------------------------------------------------
-    # Main forward
-    # -----------------------------------------------------------------------
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
