@@ -90,6 +90,7 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
+    get_global_server_args,
 )
 from sglang.srt.runtime_context import (
     get_exec,
