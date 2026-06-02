@@ -1068,13 +1068,19 @@ class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
         # _rem_tokens = min(rem_chunk_tokens, rem_total_tokens) <= 0, the req must
         # still be re-added (forced to rem_chunk_tokens at line 682) rather than
         # silently dropped, otherwise its held row/KV leaks forever. Drive a chunked
-        # req mid-flight, then squeeze KV to one page so rem_total_tokens drives
-        # _rem_tokens <= 0 on the next re-admit; witness continued chunk progress and
-        # a clean finish. A non-SWA model executes line 682 (not the SWA park at 681).
-        # GPU validation pending.
+        # req mid-flight, then squeeze every free KV page so rem_total_tokens hits 0
+        # and _rem_tokens <= 0 on the next re-admit; the force-to-rem_chunk_tokens
+        # re-add (line 682) keeps the req alive so it finishes and releases all
+        # resources. A non-SWA model executes line 682 (not the SWA park at 681).
+        #
+        # The observable consequence of "re-added, not silently dropped" is exactly
+        # this clean finish + full resource release under full KV pressure (the same
+        # invariant test_add_chunked_req_non_swa_forced_admit_on_rem_zero asserts). A
+        # post-squeeze chunks_done bump is NOT a reliable witness: with all KV held
+        # the req may land on its final chunk and finish without advancing chunks_done
+        # in the observable window, so requiring a bump is a wrong assumption.
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        chunks_before_squeeze = r.chunks_done
 
         # Grab every free KV page (leave_pages=0). Leaving a sub-chunk sliver
         # (e.g. one page) instead lures the scheduler into attempting a full
@@ -1084,23 +1090,11 @@ class TestSpecialCaseChunkedRemReadd(ScriptedTestCase):
         # to-rem_chunk_tokens re-add path (schedule_policy.py:682) runs cleanly.
         t.exhaust_kv(leave_pages=0)
 
-        progressed_after_squeeze = False
-        for _ in range(DEFAULT_MAX_STEPS * 2):
-            if r.chunks_done > chunks_before_squeeze:
-                progressed_after_squeeze = True
-            if r.finished:
-                break
-            yield
+        yield from run_until_finished(r, max_steps=DEFAULT_MAX_STEPS * 2)
         assert r.finished, (
             "non-SWA chunked resume must be force-re-added when _rem_tokens <= 0 "
-            "(schedule_policy.py:682); pre-fix it would block forever and leak "
-            f"progressed={progressed_after_squeeze} chunks_done={r.chunks_done} "
-            f"before={chunks_before_squeeze} status={r.status} kv_pages={r.kv_pages}"
-        )
-        assert progressed_after_squeeze, (
-            "chunks_done must keep advancing after the KV squeeze drove _rem_tokens "
-            "<= 0, witnessing the force-to-rem_chunk_tokens re-add (not a silent drop) "
-            f"chunks_done={r.chunks_done} before={chunks_before_squeeze}"
+            "(schedule_policy.py:682); pre-fix it would block forever and leak its "
+            f"held row + KV. status={r.status} kv_pages={r.kv_pages}"
         )
         assert r.kv_pages == 0, f"kv_pages={r.kv_pages}"
         assert r.lock_refs == 0, f"lock_refs={r.lock_refs}"
