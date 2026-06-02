@@ -881,7 +881,7 @@ class Cosmos3DecodingStage(PipelineStage):
 
     @staticmethod
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
-        return (decoded * 0.5 + 0.5).clamp(0, 1).float()
+        return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
 
     @staticmethod
     def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
