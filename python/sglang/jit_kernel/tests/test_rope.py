@@ -85,8 +85,24 @@ def torch_impl_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    # TODO: implement a pure-PyTorch reference for extra coverage
-    pass
+    half = cos_sin_cache.shape[-1] // 2
+    cos = cos_sin_cache[positions, :half].float().unsqueeze(1)
+    sin = cos_sin_cache[positions, half:].float().unsqueeze(1)
+
+    def _rotate(t: torch.Tensor) -> None:
+        if is_neox:
+            a = t[..., :half].clone()
+            b = t[..., half:].clone()
+            t[..., :half] = (a * cos - b * sin).to(t.dtype)
+            t[..., half:] = (a * sin + b * cos).to(t.dtype)
+        else:
+            a = t[..., 0::2].clone()
+            b = t[..., 1::2].clone()
+            t[..., 0::2] = (a * cos - b * sin).to(t.dtype)
+            t[..., 1::2] = (a * sin + b * cos).to(t.dtype)
+
+    _rotate(q)
+    _rotate(k)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +176,38 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     atol = rtol = 1e-2
     triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("batch_size", BS_LIST)
+@pytest.mark.parametrize("rope_dim", ROPE_DIM_LIST)
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
+def test_rope_torch_reference(
+    batch_size: int,
+    rope_dim: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Cross-check sglang_jit_rope against a pure-PyTorch reference."""
+    num_qo_heads, num_kv_heads = 8, 2
+    q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=dtype)
+    positions = torch.randint(
+        0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=torch.int64
+    )
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
+
+    q_torch, k_torch = q.clone(), k.clone()
+    q_jit, k_jit = q.clone(), k.clone()
+
+    torch_impl_rope(q_torch, k_torch, cos_sin_cache, positions, is_neox)
+    sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
+
+    # torch_impl_rope mirrors the kernel's fp32 internal precision. fp16 is
+    # accurate to ~5e-4; bf16 hits 1 ULP (~8e-3) on fp32->dtype cast edges.
+    atol = rtol = 1e-3 if dtype == torch.float16 else 1e-2
+    triton.testing.assert_close(q_torch, q_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_torch, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
