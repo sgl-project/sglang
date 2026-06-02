@@ -1279,5 +1279,25 @@ module.exports = {
             out_file:   `${ROOT}/logs/fm-revenue-convergence-out.log`,
             time:       true,
         },
+
+        // ── MISTRAL AI BRIDGE (port 7911) ─────────────────────────────
+        {
+            name:              'fm-mistral',
+            script:            'agents/fm_mistral.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'25M',
+            env_production: {
+                FRACTALMESH_HOME:     ROOT,
+                NODE_ENV:             'production',
+                PYTHONUNBUFFERED:     '1',
+                MISTRAL_BRIDGE_PORT:  '7911',
+            },
+            error_file: `${ROOT}/logs/fm-mistral-error.log`,
+            out_file:   `${ROOT}/logs/fm-mistral-out.log`,
+            time:       true,
+        },
     ],
 };

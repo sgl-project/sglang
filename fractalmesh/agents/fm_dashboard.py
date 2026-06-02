@@ -36,7 +36,8 @@ _AGENTS = {
     "unified-gateway": 8000,
     "fm-dashboard": 8080,
     "fm-omni-nexus": 8095,
-    "fm-revenue-convergence": 7867,
+    "fm-revenue-convergence": 7910,
+    "fm-mistral": 7911,
 }
 
 
