@@ -52,7 +52,7 @@ spec:
           value: "https://hf-mirror.com"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
-          - name: TRANSFORMERS_VERSION_FOR_SGLANG
+        - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
         command: ["/bin/bash", "-c"]
         args:
