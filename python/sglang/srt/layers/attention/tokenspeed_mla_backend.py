@@ -36,6 +36,9 @@ import torch
 from sglang.jit_kernel.fp8_quantize import fp8_quantize
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.layers.attention.tokenspeed_workspace import (
+    tokenspeed_workspace_bytes,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -57,23 +60,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Workspace upper bound for tokenspeed_mla_decode:
-#   num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * sizeof(float32)
-# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
-_TOKENSPEED_MAX_Q_LEN = 8
-
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_tokenspeed_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int
+    device: torch.device, num_heads: int, kv_lora_rank: int, q_len: int
 ) -> torch.Tensor:
-    needed = (
-        tokenspeed_mla.get_num_sm(device)
-        * num_heads
-        * _TOKENSPEED_MAX_Q_LEN
-        * (kv_lora_rank + 1)
-        * 4
+    needed = tokenspeed_workspace_bytes(
+        tokenspeed_mla.get_num_sm(device), num_heads, kv_lora_rank, q_len
     )
     existing = _g_tokenspeed_workspace.get(device)
     if existing is None or existing.numel() < needed:
@@ -116,8 +110,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
+            initial_q_len = max(1, self.num_draft_tokens or 1)
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device, self.num_q_heads, self.kv_lora_rank
+                self.device, self.num_q_heads, self.kv_lora_rank, initial_q_len
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
@@ -155,6 +150,23 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                         use_pdl=use_pdl,
                         enable_ex2_emulation=enable_ex2_emulation,
                     )
+
+    def _ensure_workspace(self, device: torch.device, q_len: int) -> torch.Tensor:
+        needed = tokenspeed_workspace_bytes(
+            tokenspeed_mla.get_num_sm(device),
+            self.num_q_heads,
+            self.kv_lora_rank,
+            q_len,
+        )
+        if (
+            self._tokenspeed_workspace is None
+            or self._tokenspeed_workspace.device != device
+            or self._tokenspeed_workspace.numel() < needed
+        ):
+            self._tokenspeed_workspace = _get_tokenspeed_workspace(
+                device, self.num_q_heads, self.kv_lora_rank, q_len
+            )
+        return self._tokenspeed_workspace
 
     def _fused_rope_fp8_quantize(
         self,
@@ -292,7 +304,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
-            workspace_buffer=self._tokenspeed_workspace,
+            workspace_buffer=self._ensure_workspace(query.device, query.shape[1]),
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
