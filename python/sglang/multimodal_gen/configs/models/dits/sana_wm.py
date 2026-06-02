@@ -72,9 +72,9 @@ class SanaWMArchConfig(DiTArchConfig):
     # FlashAttention backends do not accept. Pad to 128 inside SANA-WM attention
     # by default; users can still disable this with the top-level DiT option.
     pad_attention_head_dim_to_flash: bool = True
-    # Experimental SGLang-owned Triton kernels for SANA-WM hot-path tensor
-    # preprocessing. Disabled by default to preserve checkpoint-output parity.
-    use_triton_kernels: bool = False
+    # SGLang-owned Triton kernels for SANA-WM hot-path tensor preprocessing.
+    # Enabled by default; users can explicitly disable them for parity checks.
+    use_triton_kernels: bool = True
 
     # --- Temporal FFN (GLUMBConvTemp) ---
     ffn_type: str = "GLUMBConvTemp"

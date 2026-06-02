@@ -93,5 +93,12 @@ class DiTConfig(ModelConfig):
             default=None,
             help="Enable SANA-WM opt-in head-dim padding for FlashAttention. Ignored by models that do not expose this DiT option.",
         )
+        parser.add_argument(
+            f"--{prefix}.use-triton-kernels",
+            action=StoreBoolean,
+            dest=f"{prefix.replace('-', '_')}.use_triton_kernels",
+            default=None,
+            help="Enable or disable SANA-WM Triton kernels. Ignored by models that do not expose this DiT option.",
+        )
 
         return parser

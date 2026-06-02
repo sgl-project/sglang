@@ -1257,6 +1257,8 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             "true",
             "--dit-config.pad-attention-head-dim-to-flash",
             "true",
+            "--dit-config.use-triton-kernels",
+            "true",
         ]
 
         with patch.object(sys, "argv", ["sglang"] + argv):
@@ -1266,6 +1268,7 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
         arch = server_args.pipeline_config.dit_config.arch_config
         self.assertTrue(arch.use_chunked_softmax_attention)
         self.assertTrue(arch.pad_attention_head_dim_to_flash)
+        self.assertTrue(arch.use_triton_kernels)
 
     def test_resolution_flag_overrides_qwen_image_layered_pipeline_config(self):
         parser = FlexibleArgumentParser()

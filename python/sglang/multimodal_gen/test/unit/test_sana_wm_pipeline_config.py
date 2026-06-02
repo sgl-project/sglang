@@ -172,10 +172,18 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         dit_config = SanaWMConfig(
             use_chunked_softmax_attention=True,
             pad_attention_head_dim_to_flash=True,
+            use_triton_kernels=True,
         )
 
         self.assertTrue(dit_config.arch_config.use_chunked_softmax_attention)
         self.assertTrue(dit_config.arch_config.pad_attention_head_dim_to_flash)
+        self.assertTrue(dit_config.arch_config.use_triton_kernels)
+
+    def test_dit_triton_kernels_default_enabled(self) -> None:
+        self.assertTrue(SanaWMConfig().arch_config.use_triton_kernels)
+        self.assertFalse(
+            SanaWMConfig(use_triton_kernels=False).arch_config.use_triton_kernels
+        )
 
     def test_pipeline_config_dict_can_enable_dit_attention_flags(self) -> None:
         self.config.update_pipeline_config(
@@ -183,6 +191,7 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
                 "dit_config": {
                     "use_chunked_softmax_attention": True,
                     "pad_attention_head_dim_to_flash": True,
+                    "use_triton_kernels": True,
                 }
             }
         )
@@ -190,6 +199,7 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
 
         self.assertTrue(arch.use_chunked_softmax_attention)
         self.assertTrue(arch.pad_attention_head_dim_to_flash)
+        self.assertTrue(arch.use_triton_kernels)
 
     def test_dit_arch_text_norm_defaults_match_upstream(self) -> None:
         arch = SanaWMConfig().arch_config
