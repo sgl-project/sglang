@@ -512,6 +512,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
+    def get_cached_swa_loc(self, raw_loc: torch.Tensor, layer_id: int) -> torch.Tensor:
+        if self._should_cache_swa:
+            if layer_id == self.start_layer or self.cached_loc is None:
+                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
+            return self.cached_loc
+        return self.translate_loc_from_full_to_swa(raw_loc)
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -758,12 +765,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         raw_loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        if self._should_cache_swa:
-            if layer_id == self.start_layer or self.cached_loc is None:
-                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
-            swa_loc = self.cached_loc
-        else:
-            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        swa_loc = self.get_cached_swa_loc(raw_loc, layer_id)
         return self.swa_kv_pool.set_key_buffer_fused(
             self._swa_local_layer_id(layer_id), swa_loc, cache_k
         )
@@ -778,12 +780,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        if self._should_cache_swa:
-            if layer_id == self.start_layer or self.cached_loc is None:
-                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
-            swa_loc = self.cached_loc
-        else:
-            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        swa_loc = self.get_cached_swa_loc(raw_loc, layer_id)
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
