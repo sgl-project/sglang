@@ -191,9 +191,7 @@ async def _save_upload_to_path(
     else:
         read = getattr(upload, "read", None)
         if not callable(read):
-            raise TypeError(
-                f"Unsupported image upload type: {type(upload).__name__}"
-            )
+            raise TypeError(f"Unsupported image upload type: {type(upload).__name__}")
         content = read()
         if inspect.isawaitable(content):
             content = await content

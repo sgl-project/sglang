@@ -21,4 +21,3 @@ def test_save_upload_to_path_accepts_starlette_upload_file(tmp_path):
 
     assert saved_path == str(target_path)
     assert target_path.read_bytes() == b"image-bytes"
-
