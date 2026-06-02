@@ -12,16 +12,16 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+)
+from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.attention.utils import (
     cp_lse_ag_out_rs,
     create_flashinfer_kv_indices_triton,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
-    create_flashinfer_kv_indices_triton,
-)
-from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
