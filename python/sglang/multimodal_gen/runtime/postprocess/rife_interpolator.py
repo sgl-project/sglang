@@ -26,8 +26,8 @@ logger = init_logger(__name__)
 # Default HuggingFace repo for RIFE 4.22.lite weights
 _DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
 
-# Module-level cache: model_path -> Model instance
-_MODEL_CACHE: dict[str, "Model"] = {}
+# Module-level cache: (model_path, device) -> Model instance
+_MODEL_CACHE: dict[tuple[str, str], "Model"] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -368,15 +368,16 @@ class FrameInterpolator:
 
         self._resolved_path = model_path
 
-        if model_path in _MODEL_CACHE:
-            return _MODEL_CACHE[model_path]
-
         device = current_platform.get_local_torch_device()
+        cache_key = (model_path, str(device))
+
+        if cache_key in _MODEL_CACHE:
+            return _MODEL_CACHE[cache_key]
         model = Model()
         model.load_model(model_path, strip_module_prefix=True)
         model.eval()
         model.flownet = model.flownet.to(device)
-        _MODEL_CACHE[model_path] = model
+        _MODEL_CACHE[cache_key] = model
         logger.info("RIFE model loaded on device: %s", device)
         return model
 
