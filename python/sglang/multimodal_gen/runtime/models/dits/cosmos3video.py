@@ -45,6 +45,9 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
@@ -797,7 +800,7 @@ class Cosmos3LanguageModel(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-class Cosmos3OmniTransformer(CachableDiT):
+class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Cosmos3 Omni transformer.
 
     Dual-pathway architecture:
@@ -919,6 +922,8 @@ class Cosmos3OmniTransformer(CachableDiT):
         self.cached_gen_rope_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.__post_init__()
+
+        self.layer_names = ["gen_layers", "language_model.layers"]
 
     def _pad_to_patch_size(self, H: int, W: int) -> tuple[int, int, int, int]:
         """Compute padded spatial dims aligned to patch_size."""
