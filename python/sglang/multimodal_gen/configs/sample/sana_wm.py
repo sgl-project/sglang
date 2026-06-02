@@ -16,25 +16,6 @@ CameraTensorLike = Union[Any, Sequence[Sequence[Sequence[float]]]]
 
 @dataclass
 class SanaWMSamplingParams(SamplingParams):
-    """
-    Default sampling parameters for SANA-WM 720p video generation.
-
-    SANA-WM generates 720p video (704×1280) at 16fps.
-    Supported frame counts: must satisfy (num_frames - 1) % 8 == 0.
-    Common choices: 49 (~3s), 81 (~5s), 121 (~7.5s), 321 (~20s), 961 (~60s).
-
-    Camera conditioning (optional):
-        camera_to_world: (T, 4, 4) extrinsic matrices, one per output frame.
-        intrinsics:      (T, 3, 3) pinhole intrinsics, one per output frame.
-        action:          upstream WASD/IJKL action DSL, e.g.
-                         "w-80,jw-40,w-40,lw-60,w-100". This is rolled out
-                         to camera_to_world before the existing camera branch.
-        If camera_to_world is omitted, SGLang uses a static identity camera.
-        If intrinsics is omitted, SGLang uses centered heuristic intrinsics;
-        pass explicit intrinsics for closest parity with NVlabs inference, where
-        missing intrinsics can be estimated from the input image.
-    """
-
     data_type: DataType = DataType.VIDEO
 
     # Resolution: 720p landscape (LTX-2 VAE requires multiples of 32)

@@ -2,13 +2,6 @@
 
 import os
 
-# Stage-2 refiner sub-modules live under `<model_path>/refiner/...` rather
-# than at the model root. We load them manually in `initialize_pipeline`
-# (mirroring how `LTX2TwoStagePipeline._initialize_premerged_stage2_transformer`
-# loads its stage-2 DiT) instead of registering them in
-# `_required_config_modules`, because the framework verifier resolves every
-# required module key as a literal top-level subdir of the materialized model.
-
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
@@ -212,15 +205,6 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         component_path: str,
         server_args: ServerArgs,
     ):
-        """Load SANA-WM refiner modules through the same libraries as NVlabs.
-
-        The upstream refiner wrapper in
-        ``diffusion/refiner/diffusers_ltx2_refiner.py`` deliberately keeps the
-        LTX-2 transformer/connectors as Diffusers modules and only customizes
-        the video-only forward surface. Use that path here for the quality
-        critical stage-2 refiner instead of the experimental native port.
-        """
-
         dtype = default_sana_wm_refiner_dtype(server_args)
         if module_name == "transformer_2":
             from diffusers.models.transformers.transformer_ltx2 import (
