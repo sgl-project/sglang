@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -183,10 +184,25 @@ async def _save_upload_to_path(
     upload: Union[UploadFile, bytes], target_path: str
 ) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    if isinstance(upload, UploadFile):
-        content = await upload.read()
-    else:
+    if isinstance(upload, bytes):
         content = upload
+    elif isinstance(upload, (bytearray, memoryview)):
+        content = bytes(upload)
+    else:
+        read = getattr(upload, "read", None)
+        if not callable(read):
+            raise TypeError(
+                f"Unsupported image upload type: {type(upload).__name__}"
+            )
+        content = read()
+        if inspect.isawaitable(content):
+            content = await content
+        if isinstance(content, (bytearray, memoryview)):
+            content = bytes(content)
+        if not isinstance(content, bytes):
+            raise TypeError(
+                f"Image upload read() returned {type(content).__name__}, expected bytes"
+            )
     with open(target_path, "wb") as f:
         f.write(content)
     return target_path
