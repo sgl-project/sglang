@@ -80,6 +80,14 @@ from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 
+# Attribute names used to memoize the per-request MambaPool slot indices on the
+# ForwardBatch. The req -> slot mapping is identical for every CCA layer in a
+# step, so caching it here makes the lookup (and its GPU->CPU sync) run once per
+# forward step instead of once per attention layer.
+_MAMBA_INDICES_ATTR = "_zaya_mamba_indices"
+_MAMBA_INDICES_CPU_ATTR = "_zaya_mamba_indices_cpu"
+
+
 # ---------------------------------------------------------------------------
 # Residual scaling
 # ---------------------------------------------------------------------------
@@ -395,15 +403,56 @@ class CCA(nn.Module):
 
     # ----- helpers ---------------------------------------------------------
 
+    @staticmethod
+    def _get_mamba_indices(forward_batch: ForwardBatch) -> torch.Tensor:
+        """Per-request MambaPool slot indices as an int64 device tensor.
+
+        The req -> slot mapping depends only on ``forward_batch.req_pool_indices``,
+        which is constant for every CCA layer within one forward step. Computing
+        it inside each of the ~60 attention layers would issue one redundant
+        gather per layer, so it is computed once and memoized on the ForwardBatch
+        (whose lifetime is exactly one forward step). The lookup is pure on-device
+        work, so this stays compatible with CUDA graph capture on the decode path.
+        """
+        cached = getattr(forward_batch, _MAMBA_INDICES_ATTR, None)
+        if cached is None:
+            cached = (
+                get_req_to_token_pool()
+                .get_mamba_indices(forward_batch.req_pool_indices)
+                .to(torch.long)
+            )
+            setattr(forward_batch, _MAMBA_INDICES_ATTR, cached)
+        return cached
+
+    @staticmethod
+    def _get_mamba_indices_cpu(
+        forward_batch: ForwardBatch, mamba_indices: torch.Tensor
+    ) -> list[int]:
+        """Host mirror of :meth:`_get_mamba_indices`, memoized per forward step.
+
+        Only the extend/prefill path needs the indices on the host to drive its
+        per-request Python loop; the decode path indexes the pool entirely
+        on-device. Memoizing turns the previous one-``.tolist()``-sync-per-layer
+        behavior into a single GPU->CPU sync per forward step. This helper is
+        never reached on the decode path that CUDA graphs capture.
+        """
+        cached = getattr(forward_batch, _MAMBA_INDICES_CPU_ATTR, None)
+        if cached is None:
+            cached = mamba_indices.tolist()
+            setattr(forward_batch, _MAMBA_INDICES_CPU_ATTR, cached)
+        return cached
+
     def _get_pool_state(self, forward_batch: ForwardBatch):
-        """Retrieve per-request CCA state from the centralized MambaPool."""
-        req_to_token_pool = get_req_to_token_pool()
-        layer_cache = req_to_token_pool.mamba2_layer_cache(self.layer_id)
+        """Retrieve per-request CCA state from the centralized MambaPool.
+
+        ``conv_state`` / ``prev_hs_state`` are layer-local pool views, but the
+        ``mamba_indices`` req -> slot mapping is shared across layers and so is
+        memoized on the ForwardBatch (see :meth:`_get_mamba_indices`).
+        """
+        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_id)
         conv_state = layer_cache.conv[0]
         prev_hs_state = layer_cache.conv[1]
-        mamba_indices = req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
-        ).to(torch.long)
+        mamba_indices = self._get_mamba_indices(forward_batch)
         return conv_state, prev_hs_state, mamba_indices
 
     def _normalize_qk(
@@ -552,9 +601,10 @@ class CCA(nn.Module):
         v2_input = torch.empty_like(hidden_states)
 
         conv_state, prev_hs_state, mamba_indices = self._get_pool_state(forward_batch)
-        # Materialize mamba_indices on CPU once instead of once per loop iter
-        # (each ``.item()`` is a GPU->CPU sync; B*60 syncs/step otherwise).
-        mamba_idx_cpu = mamba_indices.tolist()
+        # Host view of the slot indices to drive the per-request loop below.
+        # Memoized on the ForwardBatch, so the GPU->CPU sync runs once per forward
+        # step rather than once per attention layer (~60 syncs/step otherwise).
+        mamba_idx_cpu = self._get_mamba_indices_cpu(forward_batch, mamba_indices)
 
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu

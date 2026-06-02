@@ -170,13 +170,13 @@ def _make_forward_batch(
     return forward_batch
 
 
-def _make_tiny_config():
+def _make_tiny_config(num_hidden_layers: int = 2):
     from sglang.srt.configs.zaya import ZayaConfig
 
     return ZayaConfig(
         hidden_size=16,
         ffn_hidden_size=32,
-        num_hidden_layers=2,
+        num_hidden_layers=num_hidden_layers,
         num_experts=2,
         num_attention_heads=4,
         num_query_groups=2,
@@ -195,10 +195,13 @@ def _make_tiny_cca(
     seed: int = 0,
     tp_rank: Optional[int] = None,
     tp_size: Optional[int] = None,
+    layer_id: int = 0,
+    config=None,
 ):
     from sglang.srt.models.zaya import CCA
 
-    config = _make_tiny_config()
+    if config is None:
+        config = _make_tiny_config()
     torch.manual_seed(seed)
     cca = CCA(
         config=config,
@@ -208,7 +211,7 @@ def _make_tiny_cca(
         head_dim=config.head_dim,
         cca_time0=config.cca_time0,
         cca_time1=config.cca_time1,
-        layer_id=0,
+        layer_id=layer_id,
         tp_rank=tp_rank,
         tp_size=tp_size,
     )
@@ -413,6 +416,94 @@ class TestZayaCCA(CustomTestCase):
         for idx in (0, 1, 3, 4):
             self.assertTrue(torch.all(conv_state[idx] == 0))
             self.assertTrue(torch.all(prev_hs_state[idx] == 0))
+
+    def test_mamba_indices_resolved_once_per_forward_step(self):
+        """The req -> MambaPool-slot mapping is identical for every CCA layer in
+        a step, so it (and its GPU->CPU ``.tolist()`` sync) must be resolved once
+        per forward step and shared across layers, not recomputed per layer.
+
+        Regression guard for the per-layer mamba-sync fix: two CCA layers driven
+        by a single ForwardBatch must trigger exactly one ``get_mamba_indices``
+        lookup and one host materialization for the whole step.
+        """
+
+        class _CountingPool(_MockReqToTokenPool):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.get_mamba_indices_calls = 0
+
+            def get_mamba_indices(self, req_pool_indices):
+                self.get_mamba_indices_calls += 1
+                return super().get_mamba_indices(req_pool_indices)
+
+        # num_hidden_layers=4 -> CCA (even) layers live at ids 0 and 2.
+        config = _make_tiny_config(num_hidden_layers=4)
+        self.assertEqual(config.linear_layer_ids, [0, 2])
+        cca0, _ = _make_tiny_cca(seed=5, layer_id=0, config=config)
+        cca2, _ = _make_tiny_cca(seed=6, layer_id=2, config=config)
+
+        S = 4
+        hs = torch.randn(S, config.hidden_size, dtype=torch.float32) * 0.1
+
+        def _fresh_fb():
+            return _make_forward_batch(
+                is_decode=False,
+                extend_seq_lens_cpu=[S],
+                extend_prefix_lens_cpu=[0],
+                req_pool_indices=[0],
+                input_ids=torch.arange(S, dtype=torch.int64),
+            )
+
+        pool = _CountingPool(pool_size=8, cca_config=config)
+        with _mock_pool_context(pool):
+            fb = _fresh_fb()
+            cca0.forward(hs, fb)
+            cca2.forward(hs, fb)
+
+            # Two CCA layers, one forward step -> one shared lookup, both the
+            # device tensor and its host mirror memoized on the ForwardBatch.
+            self.assertEqual(pool.get_mamba_indices_calls, 1)
+            self.assertTrue(hasattr(fb, "_zaya_mamba_indices"))
+            self.assertTrue(hasattr(fb, "_zaya_mamba_indices_cpu"))
+            self.assertEqual(fb._zaya_mamba_indices_cpu, [0])
+
+            # A new forward step (fresh ForwardBatch) resolves the mapping again.
+            cca0.forward(hs, _fresh_fb())
+            self.assertEqual(pool.get_mamba_indices_calls, 2)
+
+    def test_decode_path_does_not_sync_indices_to_host(self):
+        """The decode path indexes the pool entirely on-device, so it must not
+        populate the host-side index cache (keeping it CUDA-graph friendly)."""
+        cca, config = _make_tiny_cca(seed=7)
+
+        pool = _MockReqToTokenPool(pool_size=8, cca_config=config)
+        with _mock_pool_context(pool):
+            cca.forward(
+                torch.randn(3, config.hidden_size, dtype=torch.float32) * 0.1,
+                _make_forward_batch(
+                    is_decode=False,
+                    extend_seq_lens_cpu=[3],
+                    extend_prefix_lens_cpu=[0],
+                    req_pool_indices=[0],
+                    input_ids=torch.arange(3, dtype=torch.int64),
+                ),
+            )
+            fb_decode = _make_forward_batch(
+                is_decode=True,
+                extend_seq_lens_cpu=[],
+                extend_prefix_lens_cpu=[],
+                req_pool_indices=[0],
+                input_ids=torch.tensor([0], dtype=torch.int64),
+            )
+            cca.forward(
+                torch.randn(1, config.hidden_size, dtype=torch.float32) * 0.1,
+                fb_decode,
+            )
+
+        # Device indices are memoized, but the host ``.tolist()`` mirror is only
+        # built by the extend path.
+        self.assertTrue(hasattr(fb_decode, "_zaya_mamba_indices"))
+        self.assertFalse(hasattr(fb_decode, "_zaya_mamba_indices_cpu"))
 
 
 class TestZayaCCATensorParallel(CustomTestCase):
