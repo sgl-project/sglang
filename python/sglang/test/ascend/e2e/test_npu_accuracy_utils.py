@@ -111,7 +111,9 @@ def run_evalscope(
 
     logger.info(f"Generated evalscope script: {script_path}")
 
-    install_cmd = "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+    install_cmd = (
+        "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+    )
     subprocess.run(install_cmd, shell=True, check=True)
 
     python_bin = "test_env_evalscope/bin/python"
