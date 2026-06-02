@@ -1,7 +1,6 @@
 import logging
 
 from sglang.srt.environ import envs
-from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_device_sm,
     is_blackwell_supported,
@@ -17,11 +16,7 @@ _is_musa = is_musa()
 
 def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
-    if (
-        (_is_cuda and sm_version < 90)
-        or (_is_musa and sm_version < 31)
-        or current_platform.is_out_of_tree()
-    ):
+    if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
     # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
     if sm_version == 120:
