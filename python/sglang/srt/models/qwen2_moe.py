@@ -619,7 +619,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         trace_sync("post_experts")
         if enable_dual_stream:
-            wait_share_stream()
+            final_hidden_states = wait_share_stream(final_hidden_states)
         elif enable_cuda_shared_overlap:
             torch.cuda.current_stream().wait_event(shared_event)
 
