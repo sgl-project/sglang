@@ -90,6 +90,33 @@ class TestServerArgsUDS(unittest.TestCase):
         self.assertIn("--uds", str(cm.exception))
         self.assertIn("--grpc-mode", str(cm.exception))
 
+    def test_uds_with_ssl_certfile_rejected(self):
+        # uvicorn wraps the UDS listener in TLS when ssl_certfile is set,
+        # but the in-process warmup self-call (_uds_request) speaks plain
+        # HTTP and would fail the TLS handshake. Refuse the combination at
+        # config-parse time.
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs(
+                model_path="dummy",
+                uds="/tmp/sglang-test.sock",
+                ssl_certfile="/tmp/cert.pem",
+                ssl_keyfile="/tmp/key.pem",
+            )
+        self.assertIn("--uds", str(cm.exception))
+        self.assertIn("--ssl-certfile", str(cm.exception))
+
+    def test_uds_with_ssl_keyfile_only_rejected(self):
+        # Even ssl_keyfile alone triggers TLS expectation downstream.
+        # (Reject permissively so we don't have to chase every combination
+        # that uvicorn might interpret as TLS.)
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs(
+                model_path="dummy",
+                uds="/tmp/sglang-test.sock",
+                ssl_keyfile="/tmp/key.pem",
+            )
+        self.assertIn("--uds", str(cm.exception))
+
     def test_uds_cli_flag_parsed(self):
         from sglang.srt.server_args import prepare_server_args
         from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN

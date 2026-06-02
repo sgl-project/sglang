@@ -916,6 +916,16 @@ class ServerArgs:
                     "binds via its own listener and does not consult --uds. "
                     "Drop one of --uds or --grpc-mode."
                 )
+            if self.ssl_certfile or self.ssl_keyfile:
+                raise ValueError(
+                    "--uds combined with --ssl-certfile / --ssl-keyfile is "
+                    "not supported: uvicorn wraps the UDS listener in TLS "
+                    "but the in-process warmup self-call goes over plain "
+                    "HTTP and would fail the TLS handshake, killing the "
+                    "server at startup. Drop the SSL flags (UDS is local-only "
+                    "so TLS provides little additional protection) or drop "
+                    "--uds."
+                )
             # Compare against dataclass defaults to detect "user explicitly set
             # --host or --port alongside --uds". Argparse cannot distinguish
             # `--host 127.0.0.1` (user typed the default explicitly) from
