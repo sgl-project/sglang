@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.model_executor.input_buffers import share_input_buffer
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -247,10 +249,15 @@ class CudaGraphBufferRegistry:
         device: torch.device,
         max_bs: int,
         max_num_tokens: int,
+        share_pool: bool = False,
     ) -> None:
         self.device = device
         self.max_bs = max_bs
         self.max_num_tokens = max_num_tokens
+        # When True, slot buffers are coalesced by name through the global
+        # ForwardInputBuffers pool, so a registry can share physical storage
+        # (and data_ptr) with the legacy DecodeInputBuffers during migration.
+        self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
 
     # ---- registration ------------------------------------------------------
@@ -275,6 +282,11 @@ class CudaGraphBufferRegistry:
         shape = slot.shape_fn(self.max_bs, self.max_num_tokens)
         device = slot.device if slot.device is not None else self.device
         buffer = torch.zeros(shape, dtype=slot.dtype, device=device)
+        if self.share_pool:
+            # Coalesce with any same-named buffer (e.g. the legacy
+            # DecodeInputBuffers field) so capture and replay see one
+            # physical allocation with a stable data_ptr.
+            buffer = share_input_buffer(slot.name, buffer)
         if (
             slot.padding_policy == PaddingPolicy.FILL_SENTINEL
             and slot.pad_value is not None

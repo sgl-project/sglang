@@ -509,5 +509,54 @@ class TestSliceFnSlot(unittest.TestCase):
         self.assertEqual(fb_view.mrope_positions.shape, (3, 8))
 
 
+class TestPoolBackedAlloc(unittest.TestCase):
+    """``share_pool=True`` coalesces same-named slot buffers through the
+    global ForwardInputBuffers pool (so a registry can share storage with
+    the legacy DecodeInputBuffers during migration)."""
+
+    def setUp(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+
+    def _reg(self, *, max_num_tokens=16, share_pool):
+        return CudaGraphBufferRegistry(
+            device=torch.device("cpu"),
+            max_bs=8,
+            max_num_tokens=max_num_tokens,
+            share_pool=share_pool,
+        )
+
+    @staticmethod
+    def _ids_slot(name):
+        return GraphSlot(
+            name=name,
+            shape_fn=lambda bs, mt: (mt,),
+            dtype=torch.int64,
+            axis="tokens",
+        )
+
+    def test_share_pool_off_is_independent(self):
+        r1, r2 = self._reg(share_pool=False), self._reg(share_pool=False)
+        r1.register_slot(self._ids_slot("ids"))
+        r2.register_slot(self._ids_slot("ids"))
+        self.assertNotEqual(
+            r1.get_slot("ids").buffer.data_ptr(),
+            r2.get_slot("ids").buffer.data_ptr(),
+        )
+
+    def test_larger_pool_buffer_is_reused(self):
+        big = self._reg(max_num_tokens=32, share_pool=True)
+        small = self._reg(max_num_tokens=16, share_pool=True)
+        big.register_slot(self._ids_slot("ids"))
+        small.register_slot(self._ids_slot("ids"))
+        # small asks for 16 but is aliased onto big's 32-elem storage.
+        self.assertEqual(tuple(small.get_slot("ids").buffer.shape), (16,))
+        self.assertEqual(
+            small.get_slot("ids").buffer.data_ptr(),
+            big.get_slot("ids").buffer.data_ptr(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
