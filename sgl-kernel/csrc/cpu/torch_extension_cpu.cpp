@@ -417,7 +417,7 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
     bool mrope_interleaved,
     bool is_neox);
 
-at::Tensor apply_rotary_emb_interleaved_cpu(
+void apply_rotary_emb_interleaved_cpu(
     at::Tensor& x,
     at::Tensor& freqs,
     bool inverse,
@@ -797,7 +797,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
   m.def(
       "apply_rotary_emb_interleaved_cpu(Tensor(a!) x, Tensor freqs, bool inverse, Tensor? positions=None, Tensor(b!)? "
-      "k=None) -> Tensor(a!)");
+      "k=None) -> ()");
   m.impl("apply_rotary_emb_interleaved_cpu", torch::kCPU, &apply_rotary_emb_interleaved_cpu);
 
   // multimodal rope

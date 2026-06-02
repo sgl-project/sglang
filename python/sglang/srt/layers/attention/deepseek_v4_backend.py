@@ -895,6 +895,101 @@ class DeepseekV4AttnBackend(
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        self.decode_cpu_graph_metadata_of_bs: Dict[
+            int, Union[DSV4Metadata, DSV4RawDecodeMetadata]
+        ] = {}
+
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ) -> None:
+        assert encoder_lens is None, "Not supported"
+        assert (
+            spec_info is None
+        ), "CPU graph only supports decode without speculative inference"
+        assert (
+            forward_mode.is_decode()
+        ), f"CPU graph only supports decode, got {forward_mode=}"
+        assert req_pool_indices.size(0) == bs
+        assert seq_lens.size(0) == bs
+        assert num_tokens == bs
+
+        seq_lens = seq_lens.to(torch.int32)
+        metadata = self.init_forward_metadata_decode(
+            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=torch.zeros_like(seq_lens),
+        )
+        if isinstance(metadata, DSV4RawDecodeMetadata):
+            metadata = self.make_forward_metadata_from_raw_decode(metadata)
+        self.decode_cpu_graph_metadata_of_bs[bs] = metadata
+        self.forward_metadata = metadata
+
+    def init_forward_metadata_replay_cpu_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
+        actual_forward_mode: Optional[ForwardMode] = None,
+    ) -> None:
+        assert encoder_lens is None, "Not supported"
+        assert (
+            spec_info is None
+        ), "CPU graph only supports decode without speculative inference"
+        assert (
+            forward_mode.is_decode()
+        ), f"CPU graph only supports decode, got {forward_mode=}"
+        assert (
+            actual_forward_mode is None or actual_forward_mode.is_decode()
+        ), f"CPU graph only supports decode, got {actual_forward_mode=}"
+        assert out_cache_loc is not None
+        assert seq_lens_cpu is not None
+
+        seq_lens = seq_lens[:bs].to(torch.int32)
+        seq_lens_cpu = seq_lens_cpu[:bs]
+        req_pool_indices = req_pool_indices[:bs]
+        assert seq_lens.size(0) == bs
+        assert req_pool_indices.size(0) == bs
+
+        actual_max_seq_len = seq_lens_cpu.max().item()
+        assert actual_max_seq_len <= self.MAX_SEQ_LEN_FOR_CAPTURE
+        assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
+        out_cache_loc_padded = F.pad(
+            out_cache_loc,
+            pad=(0, bs - len(out_cache_loc)),
+            mode="constant",
+            value=0,
+        )
+
+        temp_metadata = self.init_forward_metadata_decode(
+            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc_padded,
+        )
+        if isinstance(temp_metadata, DSV4RawDecodeMetadata):
+            temp_metadata = self.make_forward_metadata_from_raw_decode(temp_metadata)
+        chosen_metadata = self.decode_cpu_graph_metadata_of_bs[bs]
+        chosen_metadata.copy_(temp_metadata)
+        self.forward_metadata = chosen_metadata
+
+    def get_cpu_graph_seq_len_fill_value(self):
+        return 1
+
     def on_after_cuda_graph_warmup(self):
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata) and isinstance(

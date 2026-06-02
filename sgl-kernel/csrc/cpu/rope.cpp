@@ -1171,7 +1171,7 @@ static void apply_rotary_emb_impl(
 
 }  // namespace
 
-at::Tensor apply_rotary_emb_interleaved_cpu(
+void apply_rotary_emb_interleaved_cpu(
     at::Tensor& x,
     at::Tensor& freqs,
     bool inverse,
@@ -1285,5 +1285,4 @@ at::Tensor apply_rotary_emb_interleaved_cpu(
       run_with_positions(positions.value().data_ptr<int32_t>());
     }
   });
-  return x;
 }

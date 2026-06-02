@@ -90,9 +90,10 @@ def apply_rotary_emb_cpu(
     positions: Optional[torch.Tensor] = None,
     inverse: bool = False,
 ) -> torch.Tensor:
-    return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
-        x, freqs_cis, inverse, positions
+    torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+        x, freqs_cis, inverse, positions, None
     )
+    return x
 
 
 if _is_cpu and _cpu_amx:
@@ -262,6 +263,9 @@ class MQALayer(nn.Module):
             beta_fast=rope_scaling["beta_fast"],
             beta_slow=rope_scaling["beta_slow"],
         )
+        # This is for cpu graph to avoid "auto_functionalized_v2 was not removed"
+        if _is_cpu and _cpu_amx:
+            freqs_cis = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
@@ -714,12 +718,12 @@ class MQALayer(nn.Module):
 
 @triton.jit
 def _hc_split_sinkhorn_triton_kernel(
-    mixes_ptr,        # [N, (2 + HC) * HC] float32
-    hc_scale_ptr,     # [3]                float32
-    hc_base_ptr,      # [(2 + HC) * HC]    float32
-    pre_ptr,          # [N, HC]            float32
-    post_ptr,         # [N, HC]            float32
-    comb_ptr,         # [N, HC, HC]        float32
+    mixes_ptr,  # [N, (2 + HC) * HC] float32
+    hc_scale_ptr,  # [3]                float32
+    hc_base_ptr,  # [(2 + HC) * HC]    float32
+    pre_ptr,  # [N, HC]            float32
+    post_ptr,  # [N, HC]            float32
+    comb_ptr,  # [N, HC, HC]        float32
     N,
     HC: tl.constexpr,
     SINKHORN_ITERS: tl.constexpr,

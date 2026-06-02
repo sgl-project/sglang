@@ -52,6 +52,68 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+_CPU_COMPILE_FALLBACK_OPS = (
+    "act_quant_cpu",
+    "apply_rotary_emb_interleaved_cpu",
+    "biased_grouped_topk_cpu",
+    "biased_topk_cpu",
+    "bmm_cpu",
+    "causal_conv1d_fwd_cpu",
+    "causal_conv1d_update_cpu",
+    "chunk_gated_delta_rule_cpu",
+    "compress_decode_cpu",
+    "decode_attention_cpu",
+    "extend_attention_cpu",
+    "fast_hadamard_transform_cpu",
+    "flash_mla_with_kvcache_cpu",
+    "fp8_paged_mqa_logits_cpu",
+    "fp8_scaled_mm_cpu",
+    "fused_add_layernorm_cpu",
+    "fused_add_rmsnorm_cpu",
+    "fused_experts_cpu",
+    "fused_gdn_gating_cpu",
+    "fused_linear_sigmoid_mul",
+    "fused_qkvzba_split_reshape_cat_contiguous_cpu",
+    "fused_qkvzba_split_reshape_cat_cpu",
+    "fused_rmsnorm_gated_cpu",
+    "fused_scale_cpu",
+    "fused_sigmoid_gating_delta_rule_update_cpu",
+    "gemma3_rmsnorm_cpu",
+    "gemma4_rmsnorm_cpu",
+    "gemma_fused_add_rmsnorm_cpu",
+    "gemma_rmsnorm_cpu",
+    "grouped_topk_cpu",
+    "hash_topk_cpu",
+    "hc_head_fused_cpu",
+    "hc_post_fused_cpu",
+    "hc_pre_fused_cpu",
+    "int8_scaled_mm_cpu",
+    "int8_scaled_mm_with_quant",
+    "l2norm_cpu",
+    "layernorm_cpu",
+    "multimodal_rotary_embedding_cpu",
+    "per_token_quant_int8_cpu",
+    "qkv_proj_with_rope",
+    "qkv_proj_with_rope_fused_weight",
+    "quant_to_nope_fp8_rope_bf16_pack_cpu",
+    "rmsnorm_cpu",
+    "rotary_embedding_cpu",
+    "set_k_and_s_cpu",
+    "set_k_cpu",
+    "set_s_cpu",
+    "shared_expert_cpu",
+    "shm_allgather",
+    "shm_allreduce",
+    "silu_and_mul_cpu",
+    "gelu_tanh_and_mul_cpu",
+    "gelu_and_mul_cpu",
+    "topk_sigmoid_cpu",
+    "topk_softmax_cpu",
+    "topk_transform_512_cpu",
+    "weight_packed_linear",
+)
+
+
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
@@ -89,7 +151,21 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
+    register_inductor_fallback_ops()
     monkey_patch_torch_compile()
+
+
+def register_inductor_fallback_ops():
+    from torch._inductor.lowering import lowerings, make_fallback
+
+    sgl_kernel_ops = torch.ops.sgl_kernel
+    for op_name in _CPU_COMPILE_FALLBACK_OPS:
+        try:
+            op = getattr(getattr(sgl_kernel_ops, op_name), "default")
+        except AttributeError:
+            continue
+        if op not in lowerings:
+            make_fallback(op, warn=False)
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
@@ -115,6 +191,7 @@ def register_fake_ops():
     """
 
     none_return_ops = [
+        "apply_rotary_emb_interleaved_cpu",
         "shm_allreduce",
         "bmm_cpu",
         "fused_add_rmsnorm_cpu",
@@ -123,6 +200,10 @@ def register_fake_ops():
         "gemma_fused_add_rmsnorm_cpu",
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
+        "set_k_and_s_cpu",
+        "set_k_cpu",
+        "set_s_cpu",
+        "topk_transform_512_cpu",
     ]
     for op in none_return_ops:
 
@@ -194,6 +275,10 @@ def register_fake_ops():
             return query, key
         else:
             return torch.empty_like(query), torch.empty_like(key)
+
+    @torch.library.register_fake("sgl_kernel::fast_hadamard_transform_cpu")
+    def _(x, scale):
+        return torch.empty_like(x)
 
     @torch.library.register_fake("sgl_kernel::multimodal_rotary_embedding_cpu")
     def _(
@@ -454,6 +539,157 @@ def register_fake_ops():
         out = a.new_empty(1, batch, num_heads, dtype=torch.float)
         beta = b.new_empty(1, batch, num_heads)
         return out, beta
+
+    @torch.library.register_fake("sgl_kernel::flash_mla_with_kvcache_cpu")
+    def _(
+        q,
+        k_cache,
+        head_dim_v,
+        softmax_scale,
+        indices,
+        topk_length,
+        attn_sink,
+        extra_k_cache,
+        extra_indices,
+        extra_topk_length,
+        is_fp8_kvcache,
+        fp8_layout,
+    ):
+        batch = q.shape[0]
+        seq_len = q.shape[1]
+        num_heads = q.shape[2]
+        out = q.new_empty((batch, seq_len, num_heads, head_dim_v))
+        lse = q.new_empty((batch, num_heads, seq_len), dtype=torch.float32)
+        return out, lse
+
+    @torch.library.register_fake("sgl_kernel::quant_to_nope_fp8_rope_bf16_pack_cpu")
+    def _(k_bf16):
+        num_tokens = k_bf16.shape[0]
+        quant_dim_nope = 448
+        quant_dim_rope = 64
+        quant_tile_size = 64
+        quant_num_tiles = quant_dim_nope // quant_tile_size
+        return (
+            torch.empty(
+                num_tokens,
+                quant_dim_nope,
+                dtype=torch.float8_e4m3fn,
+                device=k_bf16.device,
+            ),
+            torch.empty(
+                num_tokens,
+                quant_dim_rope,
+                dtype=torch.bfloat16,
+                device=k_bf16.device,
+            ),
+            torch.empty(
+                num_tokens,
+                quant_num_tiles,
+                dtype=torch.uint8,
+                device=k_bf16.device,
+            ),
+        )
+
+    @torch.library.register_fake("sgl_kernel::hash_topk_cpu")
+    def _(
+        gating_output,
+        tid2eid,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        num_experts,
+        routed_scaling_factor,
+    ):
+        num_tokens = gating_output.shape[0]
+        shape = (num_tokens, topk)
+        topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
+        topk_ids = torch.empty(shape, device=gating_output.device, dtype=torch.int)
+        return topk_weights, topk_ids
+
+    @torch.library.register_fake("sgl_kernel::biased_topk_cpu")
+    def _(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk,
+        renormalize,
+        scoring_func,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    ):
+        num_tokens = hidden_states.shape[0]
+        shape = (num_tokens, topk)
+        topk_weights = hidden_states.new_empty(shape, dtype=torch.float32)
+        topk_ids = torch.empty(shape, device=hidden_states.device, dtype=torch.int)
+        return topk_weights, topk_ids
+
+    @torch.library.register_fake("sgl_kernel::fp8_paged_mqa_logits_cpu")
+    def _(
+        q_fp8,
+        kvcache_fp8,
+        weight,
+        seq_lens,
+        page_table,
+        max_seq_len,
+        clean_logits,
+    ):
+        return q_fp8.new_empty((q_fp8.shape[0], max_seq_len), dtype=torch.float32)
+
+    @torch.library.register_fake("sgl_kernel::hc_pre_fused_cpu")
+    def _(x, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, rms_eps, hc_eps):
+        num_tokens = x.shape[0]
+        hidden_dim = x.shape[2]
+        y = x.new_empty((num_tokens, hidden_dim))
+        post = x.new_empty((num_tokens, hc_mult), dtype=torch.float32)
+        comb = x.new_empty((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
+        return y, post, comb
+
+    @torch.library.register_fake("sgl_kernel::hc_post_fused_cpu")
+    def _(x, residual, post, comb):
+        num_tokens = x.shape[0]
+        hc = residual.shape[1]
+        hidden_dim = x.shape[1]
+        return x.new_empty((num_tokens, hc, hidden_dim))
+
+    @torch.library.register_fake("sgl_kernel::hc_head_fused_cpu")
+    def _(x, hc_fn, hc_scale, hc_base, hc_eps, norm_eps):
+        num_tokens = x.shape[0]
+        hidden_dim = x.shape[2]
+        return x.new_empty((num_tokens, hidden_dim))
+
+    @torch.library.register_fake("sgl_kernel::compress_decode_cpu")
+    def _(
+        pool_kv,
+        pool_score,
+        kv,
+        score,
+        seq_lens,
+        req_pool_indices,
+        ape,
+        norm_weight,
+        freqs_cis,
+        ratio,
+        head_dim,
+        rope_head_dim,
+        overlap,
+        rotate,
+        norm_eps,
+    ):
+        return pool_kv.new_empty((seq_lens.shape[0], head_dim))
+
+    @torch.library.register_fake("sgl_kernel::act_quant_cpu")
+    def _(x, block_size=128, scale_fmt=None):
+        scale_shape = list(x.shape)
+        scale_shape[-1] = (scale_shape[-1] + block_size - 1) // block_size
+        return (
+            torch.empty_like(x, dtype=torch.float8_e4m3fn),
+            torch.empty(scale_shape, dtype=torch.float32, device=x.device),
+        )
+
+    @torch.library.register_fake("sgl_kernel::fused_scale_cpu")
+    def _(weight, out_scale, q_scale):
+        return weight.new_empty((*weight.shape, 1), dtype=torch.float32)
 
     @torch.library.register_fake("sgl_kernel::chunk_gated_delta_rule_cpu")
     def _(
@@ -764,6 +1000,39 @@ class CPUGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def _init_forward_metadata_replay(
+        self,
+        prepared_forward_batch: ForwardBatch,
+        actual_forward_batch: ForwardBatch,
+    ) -> None:
+        if hasattr(
+            self.model_runner.attn_backend,
+            "init_forward_metadata_replay_cpu_graph",
+        ):
+            assert actual_forward_batch.forward_mode.is_decode(), (
+                "CPUGraphRunner only supports decode graph replay for this "
+                f"CPU graph metadata path, got {actual_forward_batch.forward_mode=}"
+            )
+            seq_lens_cpu = (
+                prepared_forward_batch.seq_lens_cpu
+                if prepared_forward_batch.seq_lens_cpu is not None
+                else prepared_forward_batch.seq_lens
+            )
+            self.model_runner.attn_backend.init_forward_metadata_replay_cpu_graph(
+                bs=prepared_forward_batch.batch_size,
+                req_pool_indices=prepared_forward_batch.req_pool_indices,
+                seq_lens=prepared_forward_batch.seq_lens,
+                seq_lens_sum=prepared_forward_batch.seq_lens_sum,
+                encoder_lens=None,
+                forward_mode=self.capture_forward_mode,
+                spec_info=actual_forward_batch.spec_info,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=prepared_forward_batch.out_cache_loc,
+                actual_forward_mode=actual_forward_batch.forward_mode,
+            )
+        else:
+            self.model_runner.attn_backend.init_forward_metadata(prepared_forward_batch)
+
     def prepare_replay(
         self,
         forward_batch: ForwardBatch,
@@ -772,7 +1041,7 @@ class CPUGraphRunner:
 
         raw_bs = forward_batch.batch_size
         if raw_bs in self.graphs:
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self._init_forward_metadata_replay(forward_batch, forward_batch)
             return forward_batch
 
         raw_num_token = raw_bs * self.num_tokens_per_bs
@@ -808,7 +1077,7 @@ class CPUGraphRunner:
                 forward_batch.num_token_non_padded
             )
 
-        self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
+        self._init_forward_metadata_replay(captured_forward_batch, forward_batch)
         return captured_forward_batch
 
     def replay(
