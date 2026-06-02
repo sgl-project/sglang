@@ -36,12 +36,18 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip
 
 _is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_hip:
     from sgl_kernel import apply_token_bitmask_inplace_cuda
+elif _is_cpu and _is_cpu_amx_available:
+    apply_token_bitmask_inplace_cpu = (
+        torch.ops.sgl_kernel.apply_token_bitmask_inplace_cpu
+    )
 else:
     from sglang.srt.constrained.triton_ops.bitmask_ops import (
         apply_token_bitmask_inplace_triton,
@@ -55,24 +61,6 @@ from sglang.srt.constrained.triton_ops.token_filter_ops import set_token_filter_
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
 
-
-def apply_token_bitmask_inplace_torch(
-    logits: torch.Tensor,
-    bitmask: torch.Tensor,
-) -> None:
-    """Backend-agnostic torch fallback for packed-bitmask application.
-
-    This path is currently used as a fallback on NPU in xgrammar backend.
-    """
-    vocab_size = logits.shape[-1]
-    bitmask_cpu = bitmask.detach().cpu()
-    token_ids = torch.arange(vocab_size, device="cpu", dtype=torch.int32)
-    word_idx = token_ids // 32
-    bit_idx = token_ids % 32
-    words = bitmask_cpu[:, word_idx].to(torch.int32)
-    allowed = ((words >> bit_idx) & 1).to(torch.bool)
-    allowed = allowed.to(logits.device, non_blocking=True)
-    logits.masked_fill_(~allowed, float("-inf"))
 
 class XGrammarGrammar(BaseGrammarObject):
 
@@ -138,7 +126,7 @@ class XGrammarGrammar(BaseGrammarObject):
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
         elif logits.device.type == "cpu":
-            apply_token_bitmask_inplace_torch(logits, vocab_mask)
+            apply_token_bitmask_inplace_cpu(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 

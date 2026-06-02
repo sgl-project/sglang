@@ -447,6 +447,9 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
+// grammar
+void apply_token_bitmask_inplace_cpu(at::Tensor& logits, at::Tensor& bitmask);
+
 // kvcache
 void store_cache_cpu(
     const at::Tensor& k,
@@ -719,6 +722,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
       "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // grammar
+  m.def("apply_token_bitmask_inplace_cpu(Tensor(a!) logits, Tensor bitmask) -> ()");
+  m.impl("apply_token_bitmask_inplace_cpu", torch::kCPU, &apply_token_bitmask_inplace_cpu);
 
   // kvcache
   m.def(
