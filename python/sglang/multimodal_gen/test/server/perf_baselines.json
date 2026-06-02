@@ -2605,6 +2605,14 @@
             "expected_median_denoise_ms": 246.85,
             "estimated_full_test_time_s": 170.0
         },
+        "lingbot_world_realtime_plastic_beach": {
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 0.0,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 126.0
+        },
         "ltx_2_3_hq_pipeline": {
             "stages_ms": {
                 "InputValidationStage": 0.08,

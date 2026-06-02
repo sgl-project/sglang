@@ -400,9 +400,9 @@ class HiCacheController:
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
 
-        self.prefetch_revoke_queue = Queue()
-        self.ack_backup_queue = Queue()
-        self.host_mem_release_queue = Queue()
+        self.prefetch_revoke_queue: Queue[str] = Queue()
+        self.ack_backup_queue: Queue[StorageOperation] = Queue()
+        self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
         self.prefetch_thread.start()
         self.backup_thread.start()

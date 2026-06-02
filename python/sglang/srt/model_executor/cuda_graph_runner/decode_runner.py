@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
@@ -119,6 +120,51 @@ def _make_graph_key(bs, stream_idx=None, variant_label=None):
     if variant_label is not None:
         key = f"{variant_label}_{key}"
     return key
+
+
+def build_replay_fb_view(
+    forward_batch: "ForwardBatch",
+    buffers: "DecodeInputBuffers",
+    bs: int,
+    raw_bs: int,
+    num_tokens: int,
+    seq_len_fill_value: int,
+    capture_forward_mode: "ForwardMode",
+    is_encoder_decoder: bool,
+) -> SimpleNamespace:
+    """Construct a ForwardBatch-like view for backend replay-side init.
+
+    Combines the original ``forward_batch`` (for unpadded / per-iter
+    fields like ``spec_info``, ``out_cache_loc``, and the runtime
+    ``actual_forward_mode``) with the padded capture-time buffers from
+    ``buffers`` (for ``req_pool_indices``, ``seq_lens``, ``seq_lens_cpu``,
+    ``encoder_lens``).
+
+    ``forward_mode`` is the capture-time mode (used by backends for
+    bucket / dispatch decisions); ``actual_forward_mode`` is the
+    runtime mode (may be IDLE while the captured graph targets DECODE
+    — DSV4's replay metadata prep uses this for IDLE substitution).
+
+    Subsumes the ``_replay_forward_batch`` side channel that DSV4 used to
+    read out-of-band before the init_forward_metadata 3-method ABC.
+    """
+    return SimpleNamespace(
+        batch_size=bs,
+        forward_mode=capture_forward_mode,
+        actual_forward_mode=forward_batch.forward_mode,
+        input_ids=buffers.input_ids[:num_tokens],
+        req_pool_indices=buffers.req_pool_indices[:bs],
+        seq_lens=buffers.seq_lens[:bs],
+        seq_lens_sum=(
+            None
+            if forward_batch.seq_lens_sum is None
+            else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
+        ),
+        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
+        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        spec_info=forward_batch.spec_info,
+    )
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -511,19 +557,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.encoder_lens,
-                forward_batch.forward_mode,
-                forward_batch.spec_info,
+            attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=True
             )
 
             def run_once():
                 if self.model_runner.is_hybrid_swa:
                     self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+
+                # Must run inside the capture block: warmup mutations here are
+                # undone by on_after_cuda_graph_warmup so capture starts clean.
+                attn_backend.init_forward_metadata_in_graph(forward_batch)
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -532,6 +576,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.global_dp_buffer_len,
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
+                    forward_batch.global_num_tokens_cpu,
                 )
                 set_is_extend_in_batch(False)
 
@@ -634,37 +679,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device
             )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
         else:
             global_dp_buffer_len = None
 
@@ -717,6 +744,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
+            global_num_tokens_cpu=global_num_tokens_cpu,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -827,25 +855,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
-        # FIXME: implicit channel for backends (dsv4) that need forward_batch
-        # in replay metadata prep. Should become a real param on the interface.
-        attn_backend._replay_forward_batch = forward_batch
-        seq_lens_sum_arg = (
-            None
-            if forward_batch.seq_lens_sum is None
-            else forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        fb_view = build_replay_fb_view(
+            forward_batch=forward_batch,
+            buffers=buffers,
+            bs=bs,
+            raw_bs=raw_bs,
+            num_tokens=bs * self.num_tokens_per_bs,
+            seq_len_fill_value=self.seq_len_fill_value,
+            capture_forward_mode=self.capture_forward_mode,
+            is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            seq_lens_sum_arg,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
-        attn_backend._replay_forward_batch = None
+        attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
