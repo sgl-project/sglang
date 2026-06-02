@@ -1500,7 +1500,7 @@ def apply_fp8_linear(
         if (
             input_scale is not None
             and input_scale.numel() == 1
-            and get_global_server_args().cuda_graph_config[Phase.PREFILL]["tc_compiler"]
+            and get_global_server_args().cuda_graph_config.prefill.tc_compiler
             == "inductor"
         ):
             qinput = (

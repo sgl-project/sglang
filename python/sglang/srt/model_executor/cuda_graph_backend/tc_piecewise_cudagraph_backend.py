@@ -95,7 +95,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         """
         from sglang.srt.model_executor.cuda_graph_config import Phase
 
-        prefill = server_args.cuda_graph_config[Phase.PREFILL]
+        prefill = server_args.cuda_graph_config.prefill
         num_tokens = prefill["bs"]
         compiler = prefill["tc_compiler"]
         assert num_tokens is not None, "cuda_graph_config[prefill].bs is not set"

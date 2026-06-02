@@ -123,8 +123,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         # Defer cuda graph capture; we do it ourselves below.
-        backup_decode_mode = server_args.cuda_graph_config[Phase.DECODE]["backend"]
-        server_args.cuda_graph_config[Phase.DECODE]["backend"] = Backend.DISABLED
+        backup_decode_mode = server_args.cuda_graph_config.decode.backend
+        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         # Draft attention uses target req_to_token + KV allocator (read-only).
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -172,7 +172,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
             self._bind_kv_context()
 
-        self.draft_model_runner.server_args.cuda_graph_config[Phase.DECODE][
+        self.draft_model_runner.server_args.cuda_graph_config.decode[
             "backend"
         ] = backup_decode_mode
 

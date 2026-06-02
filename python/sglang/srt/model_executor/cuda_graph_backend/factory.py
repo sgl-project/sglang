@@ -40,8 +40,8 @@ def resolve_decode_backend(model_runner: "ModelRunner") -> BaseCudaGraphBackend:
     NPU device returns ``NPUCudaGraphBackend`` regardless of mode (only
     the Full-style backend is wired for NPU today).
     """
-    settings = model_runner.server_args.cuda_graph_config or {}
-    backend_name = settings.get(Phase.DECODE, {}).get("backend", Backend.FULL)
+    cfg = model_runner.server_args.cuda_graph_config
+    backend_name = cfg.decode.backend if cfg is not None else Backend.FULL
 
     enable_memory_saver = model_runner.server_args.enable_memory_saver
 
@@ -70,8 +70,8 @@ def resolve_decode_backend(model_runner: "ModelRunner") -> BaseCudaGraphBackend:
 
 def resolve_prefill_backend(model_runner: "ModelRunner") -> BaseCudaGraphBackend:
     """Pick a backend instance from ``cuda_graph_config['prefill']['backend']``."""
-    settings = model_runner.server_args.cuda_graph_config or {}
-    backend_name = settings.get(Phase.PREFILL, {}).get("backend", Backend.TC_PIECEWISE)
+    cfg = model_runner.server_args.cuda_graph_config
+    backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(

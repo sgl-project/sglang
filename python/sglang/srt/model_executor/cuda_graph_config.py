@@ -8,9 +8,10 @@ inside the function body to preserve that invariant.
 """
 
 import argparse
-import copy
+import dataclasses
 import json
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
 class Phase:
@@ -50,33 +51,73 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # For prefill, ``bs`` carries the captured shape size (token count for
 # tc_piecewise, request count for breakable) — one shape knob per phase.
 ALLOWED_KEYS_PER_PHASE = {
-    Phase.DECODE: ("backend", "max_bs", "bs"),
+    Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
     Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler"),
 }
 
-DEFAULT_CUDA_GRAPH_CONFIG: Dict[str, Dict[str, Any]] = {
-    Phase.DECODE: {
-        "backend": Backend.FULL,
-        "max_bs": None,
-        "bs": None,
-    },
-    Phase.PREFILL: {
-        "backend": Backend.TC_PIECEWISE,
-        "max_bs": None,
-        "bs": None,
-        # Only meaningful when ``backend == tc_piecewise``; ignored otherwise.
-        "tc_compiler": "eager",
-    },
-}
+
+@dataclass
+class PhaseConfig:
+    """Per-phase CUDA graph settings."""
+
+    backend: str = Backend.DISABLED
+    max_bs: Optional[int] = None
+    bs: Optional[List[int]] = None
+    # Only meaningful when ``backend == tc_piecewise``; ignored otherwise.
+    tc_compiler: str = "eager"
 
 
-def default_cuda_graph_config() -> Dict[str, Dict[str, Any]]:
-    """Fresh deep copy of the canonical defaults."""
-    return copy.deepcopy(DEFAULT_CUDA_GRAPH_CONFIG)
+@dataclass
+class CudaGraphConfig:
+    """Top-level CUDA graph config: one ``PhaseConfig`` per phase."""
+
+    decode: PhaseConfig = field(
+        default_factory=lambda: PhaseConfig(backend=Backend.FULL)
+    )
+    prefill: PhaseConfig = field(
+        default_factory=lambda: PhaseConfig(backend=Backend.TC_PIECEWISE)
+    )
+
+    def __getitem__(self, phase: str) -> PhaseConfig:
+        """Phase-string lookup; kept for migration ergonomics."""
+        if phase not in Phase.ALL:
+            raise KeyError(phase)
+        return getattr(self, phase)
+
+    def to_dict(self) -> Dict[str, Dict[str, Any]]:
+        """Serialize to the legacy ``{phase: {key: value}}`` shape (used
+        by the parser pipeline that re-applies explicit input)."""
+        return {
+            Phase.DECODE: dataclasses.asdict(self.decode),
+            Phase.PREFILL: dataclasses.asdict(self.prefill),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Optional[Dict[str, Dict[str, Any]]]) -> "CudaGraphConfig":
+        """Build from a (partial) dict of overrides, defaults fill the rest.
+        Unknown phases / keys are silently dropped — the JSON-input
+        validator (``parse_cuda_graph_config_arg``) rejects them upstream."""
+        cfg = cls()
+        if not raw:
+            return cfg
+        for phase, phase_settings in raw.items():
+            if phase not in Phase.ALL or not isinstance(phase_settings, dict):
+                continue
+            phase_cfg = getattr(cfg, phase)
+            allowed = ALLOWED_KEYS_PER_PHASE[phase]
+            for key, value in phase_settings.items():
+                if key in allowed:
+                    setattr(phase_cfg, key, value)
+        return cfg
+
+
+def default_cuda_graph_config() -> CudaGraphConfig:
+    """Fresh ``CudaGraphConfig`` populated with canonical defaults."""
+    return CudaGraphConfig()
 
 
 def check_cuda_graph_backend(phase: str, backend: str) -> bool:
-    """True if ``cuda_graph_config[phase]['backend'] == backend`` on the
+    """True if ``cuda_graph_config[phase].backend == backend`` on the
     global server args. Returns False if the global server args have not
     been initialized yet (e.g. unit tests, early startup)."""
     from sglang.srt.server_args import get_global_server_args
@@ -85,18 +126,18 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
         server_args = get_global_server_args()
     except ValueError:
         return False
-    if server_args.cuda_graph_config is None:
+    cfg = server_args.cuda_graph_config
+    if cfg is None or phase not in Phase.ALL:
         return False
-    phase_settings = server_args.cuda_graph_config.get(phase)
-    if phase_settings is None:
-        return False
-    return phase_settings.get("backend") == backend
+    return getattr(cfg, phase).backend == backend
 
 
 def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
     """argparse type for ``--cuda-graph-config``: parse JSON dict of
     phase → settings dict. Each phase's settings dict is itself validated
-    against ``ALLOWED_KEYS_PER_PHASE``."""
+    against ``ALLOWED_KEYS_PER_PHASE``. Returns a plain dict — the
+    precedence pipeline in ``ServerArgs`` converts to ``CudaGraphConfig``
+    after merging."""
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -132,10 +173,10 @@ def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
 def explicit_keys_in(
     settings: Optional[Dict[str, Dict[str, Any]]],
 ) -> set:
-    """Return the set of ``(phase, key)`` tuples present in ``settings``.
-    Used by ``ServerArgs`` to track keys the user explicitly set so the
-    auto-disable cascade can skip them (the old ``--enforce-piecewise-cuda-graph``
-    contract, generalized to every setting)."""
+    """Return the set of ``(phase, key)`` tuples present in ``settings``
+    (the raw dict form, as it arrives from CLI/SDK). Used by ``ServerArgs``
+    to track keys the user explicitly set so the auto-disable cascade can
+    skip them."""
     out: set = set()
     if not settings:
         return out
