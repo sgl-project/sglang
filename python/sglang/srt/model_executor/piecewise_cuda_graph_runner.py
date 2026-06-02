@@ -419,7 +419,6 @@ class PiecewiseCudaGraphRunner:
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
-        # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
@@ -798,7 +797,6 @@ class PiecewiseCudaGraphRunner:
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
             ):
-                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
