@@ -28,13 +28,13 @@ from transformers import (
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
-from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
+    resolve_runai_obj_uri,
 )
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
@@ -105,7 +105,7 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     if tok_cls is None:
         return None
 
-    logger.info(
+    logger.debug(
         "Loading tokenizer for %s directly as %s (bypassing AutoTokenizer)",
         tokenizer_name,
         tok_class_name,
@@ -146,8 +146,7 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
-    if is_runai_obj_uri(tokenizer_name):
-        tokenizer_name = ObjectStorageModel.get_path(tokenizer_name)
+    tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
 
     if is_remote_url(tokenizer_name):
         # BaseConnector implements __del__() to clean up the local dir.
@@ -209,7 +208,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
     ``tokenizer_config.json``.  May still return a ``TokenizersBackend``
     if all retries fail (with a warning).
     """
-    logger.warning(
+    logger.debug(
         "Tokenizer loaded as generic TokenizersBackend for %s, "
         "retrying with use_fast=False",
         tokenizer_name,
@@ -240,7 +239,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
                 tokenizer_name,
             )
         else:
-            logger.warning(
+            logger.debug(
                 "Tokenizer for %s loaded as generic TokenizersBackend. "
                 "Set --trust-remote-code to load the model-specific tokenizer.",
                 tokenizer_name,

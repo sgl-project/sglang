@@ -349,7 +349,12 @@ class DiffGenerator:
                 global_output_index += len(requests)
 
         total_gen_time = time.perf_counter() - total_start_time
-        log_batch_completion(logger, len(results), total_gen_time)
+        if self.server_args.batching_max_size > 1:
+            log_batch_completion(
+                logger,
+                len(results),
+                total_gen_time,
+            )
         self._log_summary(results)
 
         if not results:
@@ -451,6 +456,7 @@ class DiffGenerator:
         lora_path: Union[str, None, List[Union[str, None]]] = None,
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
+        merge_mode: str | None = None,
     ) -> None:
         """
         Set LoRA adapter(s) for the specified transformer(s).
@@ -466,12 +472,14 @@ class DiffGenerator:
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
+            merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
             lora_path=lora_path,
             target=target,
             strength=strength,
+            merge_mode=merge_mode,
         )
         nickname_str, target_str, strength_str = format_lora_message(
             lora_nickname, target, strength

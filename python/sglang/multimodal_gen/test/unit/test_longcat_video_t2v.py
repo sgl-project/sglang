@@ -179,21 +179,26 @@ def _longcat_reference_apply_rope(x: torch.Tensor, cos_sin_cache: torch.Tensor):
 
 def test_longcat_rope_reuses_shared_nd_embedding_without_changing_math():
     module = _longcat_dit_module()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     head_dim = 128
     grid_size = (2, 3, 4)
     seq_len = grid_size[0] * grid_size[1] * grid_size[2]
     rope = module.RotaryPositionalEmbedding(head_dim)
 
-    q = torch.randn(2, 3, seq_len, head_dim)
-    k = torch.randn(2, 3, seq_len, head_dim)
+    q = torch.randn(2, 3, seq_len, head_dim, device=device)
+    k = torch.randn(2, 3, seq_len, head_dim, device=device)
     q_out, k_out = rope(q, k, grid_size)
 
-    expected_cache = _longcat_reference_rope_cache(head_dim, grid_size)
+    expected_cache = _longcat_reference_rope_cache(head_dim, grid_size).to(device)
     assert q_out.dtype == q.dtype
     assert k_out.dtype == k.dtype
     assert torch.allclose(rope.freqs_dict[grid_size], expected_cache)
-    assert torch.allclose(q_out, _longcat_reference_apply_rope(q, expected_cache))
-    assert torch.allclose(k_out, _longcat_reference_apply_rope(k, expected_cache))
+    assert torch.allclose(
+        q_out, _longcat_reference_apply_rope(q, expected_cache), rtol=1e-5, atol=1e-6
+    )
+    assert torch.allclose(
+        k_out, _longcat_reference_apply_rope(k, expected_cache), rtol=1e-5, atol=1e-6
+    )
 
 
 def test_longcat_synthesizes_diffusers_model_index_for_official_layout(tmp_path: Path):

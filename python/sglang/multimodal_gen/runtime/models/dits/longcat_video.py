@@ -24,6 +24,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb as apply_rotary_emb,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
