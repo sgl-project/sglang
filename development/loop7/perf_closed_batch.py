@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import functools
 import json
 import os
 import subprocess
@@ -224,6 +225,21 @@ def _one_stream(base_url: str, osl: int, prompt: str):
     }
 
 
+def _run_concurrent(call, warmup, conc):
+    """Warm up once (capture/JIT), then fire `conc` concurrent copies of `call()`.
+
+    Returns ``(results, wall_seconds)``. ``call`` and ``warmup`` are zero-arg callables
+    (e.g. ``functools.partial``) so the closed batch and its warmup can use different
+    output lengths through one shared orchestration path.
+    """
+    warmup()
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as ex:
+        futs = [ex.submit(call) for _ in range(conc)]
+        res = [f.result() for f in futs]
+    return res, time.time() - t0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--conc", type=int, required=True)
@@ -255,13 +271,11 @@ def main():
     _gpu_name, _gpu_n = _gpu_info()
 
     if args.stream:
-        _one_stream(base, 16, prompt)  # warmup (capture/JIT)
-        t0 = time.time()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.conc) as ex:
-            futs = [ex.submit(_one_stream, base, args.osl, prompt) for _ in range(args.conc)]
-            res = [f.result() for f in futs]
-        wall = time.time() - t0
-
+        res, wall = _run_concurrent(
+            functools.partial(_one_stream, base, args.osl, prompt),
+            functools.partial(_one_stream, base, 16, prompt),
+            args.conc,
+        )
         ttfts = [r["ttft"] for r in res]
         decode_tps = [r["decode_tps"] for r in res if r["decode_tps"] > 0]
         cts = [r["completion_tokens"] for r in res]
@@ -301,13 +315,11 @@ def main():
             artifact_path=args.out,
         )
     else:
-        _one(base, 16, prompt)  # warmup (capture/JIT)
-        t0 = time.time()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.conc) as ex:
-            futs = [ex.submit(_one, base, args.osl, prompt) for _ in range(args.conc)]
-            res = [f.result() for f in futs]
-        wall = time.time() - t0
-
+        res, wall = _run_concurrent(
+            functools.partial(_one, base, args.osl, prompt),
+            functools.partial(_one, base, 16, prompt),
+            args.conc,
+        )
         e2es = [e for e, _ in res]
         cts = [c for _, c in res]
         per_req_tps = [c / e for c, e in zip(cts, e2es) if e > 0]
