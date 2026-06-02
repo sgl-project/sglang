@@ -1,6 +1,130 @@
 # Hybrid PD 部署指南: 3(P+D) + 1D 架构
 
-## 架构设计图
+## 架构对比: 3P1D 完全分离 vs 3(P+D)+1D 混合模式
+
+### 方案 A: 3P1D 完全 PD 分离
+
+```mermaid
+flowchart TB
+    ClientA([Client Requests]) --> RouterA[Router / Load Balancer]
+
+    subgraph PrefillGroupA["Prefill Group (3 Nodes)"]
+        PA1[Node 1<br/>Prefill Only]
+        PA2[Node 2<br/>Prefill Only]
+        PA3[Node 3<br/>Prefill Only]
+    end
+
+    subgraph DecodeGroupA["Decode Group (1 Node)"]
+        DA1[Node 4<br/>Decode Only]
+    end
+
+    RouterA -->|"所有请求"| PA1
+    RouterA -->|"所有请求"| PA2
+    RouterA -->|"所有请求"| PA3
+
+    PA1 -->|"KV Transfer<br/>(每个请求必传)"| DA1
+    PA2 -->|"KV Transfer<br/>(每个请求必传)"| DA1
+    PA3 -->|"KV Transfer<br/>(每个请求必传)"| DA1
+
+    DA1 -->|"Stream Response"| ClientA
+
+    style PrefillGroupA fill:#e3f2fd,stroke:#1976d2
+    style DecodeGroupA fill:#fce4ec,stroke:#c62828
+```
+
+**特点:**
+- Prefill 节点只做 prefill，**所有**请求完成后必须 KV Transfer 到 Decode 节点
+- Decode 节点承担所有 decode 工作，容易成为瓶颈
+- 每个请求都有 KV Transfer 延迟（影响 TTFT）
+
+---
+
+### 方案 B: 3(P+D)+1D 混合模式 (本方案)
+
+```mermaid
+flowchart TB
+    ClientB([Client Requests]) --> RouterB[Router<br/>--hybrid-mode<br/>port 30000]
+
+    subgraph HybridGroupB["Hybrid P+D Group (3 Nodes)"]
+        direction TB
+        subgraph NodeB1["Node 1 (Hybrid P+D)"]
+            PB1[Prefill] --> DB1[Local Decode]
+            PB1 -.->|"溢出时"| KVB1[KV Sender]
+        end
+        subgraph NodeB2["Node 2 (Hybrid P+D)"]
+            PB2[Prefill] --> DB2[Local Decode]
+            PB2 -.->|"溢出时"| KVB2[KV Sender]
+        end
+        subgraph NodeB3["Node 3 (Hybrid P+D)"]
+            PB3[Prefill] --> DB3[Local Decode]
+            PB3 -.->|"溢出时"| KVB3[KV Sender]
+        end
+    end
+
+    subgraph DecodeNodeB["Node 4 (Overflow Decode)"]
+        KVRB[KV Receiver<br/>Mooncake RDMA] --> DB4[Decode Only]
+    end
+
+    RouterB -->|"Round Robin"| NodeB1
+    RouterB -->|"Round Robin"| NodeB2
+    RouterB -->|"Round Robin"| NodeB3
+
+    KVB1 -.->|"KV Transfer<br/>(仅溢出请求)"| KVRB
+    KVB2 -.->|"KV Transfer<br/>(仅溢出请求)"| KVRB
+    KVB3 -.->|"KV Transfer<br/>(仅溢出请求)"| KVRB
+
+    NodeB1 -->|"Response<br/>(大部分请求)"| ClientB
+    NodeB2 -->|"Response<br/>(大部分请求)"| ClientB
+    NodeB3 -->|"Response<br/>(大部分请求)"| ClientB
+    DB4 -.->|"Response<br/>(溢出请求)"| ClientB
+
+    style HybridGroupB fill:#e8f5e9,stroke:#4caf50
+    style DecodeNodeB fill:#fff3e0,stroke:#ff9800
+```
+
+**特点:**
+- Hybrid 节点本地完成 P+D，**大部分请求零 KV Transfer**
+- 仅在资源紧张时溢出到外部 Decode 节点
+- Decode 节点仅承担溢出流量，不会成为瓶颈
+
+---
+
+### 对比总结
+
+```mermaid
+flowchart LR
+    subgraph Compare["架构对比"]
+        direction TB
+        subgraph A_Flow["3P1D: 每个请求的路径"]
+            A1[Client] --> A2[Prefill Node]
+            A2 -->|"❌ 必须 KV Transfer"| A3[Decode Node]
+            A3 --> A4[Response]
+        end
+        subgraph B_Flow["3(P+D)+1D: 每个请求的路径"]
+            B1[Client] --> B2[Hybrid Node]
+            B2 -->|"✅ 通常本地 Decode"| B3[Response]
+            B2 -.->|"仅溢出时 Transfer"| B4[Decode Node] -.-> B5[Response]
+        end
+    end
+
+    style A_Flow fill:#fce4ec
+    style B_Flow fill:#e8f5e9
+```
+
+| 维度 | 3P1D 完全分离 | 3(P+D)+1D 混合模式 |
+|------|--------------|-------------------|
+| **KV Transfer 频率** | 100% 请求都要传 | 仅溢出请求 (~10-30%) |
+| **TTFT 影响** | 每个请求增加 transfer 延迟 | 大部分请求无额外延迟 |
+| **Decode 瓶颈** | 单点 Decode 容易满载 | Decode 节点仅处理溢出 |
+| **资源利用率** | Prefill 节点 decode 空闲 | 所有节点充分利用 |
+| **网络依赖** | 强依赖 RDMA 带宽 | 仅溢出时依赖 |
+| **容错性** | Decode 挂 = 全部中断 | Decode 挂 = 仅溢出失败，本地仍可用 |
+| **适用场景** | Prefill 远重于 Decode 时 | 通用场景，混合负载 |
+| **配置复杂度** | 简单（角色固定） | 需要调优 watermark/limit |
+
+---
+
+## 架构设计图（详细版）
 
 ```mermaid
 flowchart TB
