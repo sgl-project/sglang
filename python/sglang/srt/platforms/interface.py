@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Type
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig, MoeRunnerCore
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
@@ -77,10 +76,6 @@ class SRTPlatform(DeviceMixin):
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
 
-    def get_moe_runner(self, config: MoeRunnerConfig) -> MoeRunnerCore:
-        """Return the MOE runner for this platform."""
-        raise NotImplementedError
-
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
 
@@ -92,7 +87,7 @@ class SRTPlatform(DeviceMixin):
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
 
-    def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
+    def get_quantization_config(self, quantization: str) -> Type[QuantizationConfig]:
         """Return the quantization config class for this platform."""
         raise NotImplementedError
 
