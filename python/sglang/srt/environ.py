@@ -446,6 +446,10 @@ class Envs:
     # (their env gates were removed — proven useful). The down-proj overlap is DISABLED (load-triggered
     # cuda-graph/NCCL race → decode garbage; see moe_overlap.py `_overlap_down`).
     SGLANG_TWO_STREAM_MAX_TOKENS = EnvInt(256)
+    # WIP (unstaged, test-only): tuned triton a_stage_config for the MoE LoRA shrink GEMM. Default off.
+    # Correctness-neutral (acc at the atomic-add noise floor, coherent). On GB200 this hand-tune currently
+    # beats PR #26899's B200-tuned auto-configs; for the auto-tuned path, re-run that PR's tuner on GB200.
+    SGLANG_OPT_LORA_SHRINK_TUNE = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
+from sglang.srt.environ import envs
 
 
 @triton.jit
@@ -731,6 +732,16 @@ def _merged_experts_fused_moe_lora_add_impl(
     num_experts_b = lora_b.shape[1]
 
     a_stage_config = _get_stage_config(lora_a_virtual, input_top_k)
+    if envs.SGLANG_OPT_LORA_SHRINK_TUNE.get():
+        # Tuned decode shrink config: skinny GEMM (M=tokens small, N=rank, K=in large).
+        a_stage_config = {
+            **a_stage_config,
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": max_lora_rank,
+            "BLOCK_SIZE_K": 256,
+            "num_warps": 4,
+            "num_stages": 4,
+        }
     (
         sorted_token_ids,
         expert_ids,
