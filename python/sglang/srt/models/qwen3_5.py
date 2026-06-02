@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -90,7 +91,6 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
-    get_global_server_args,
 )
 from sglang.srt.runtime_context import (
     get_forward,
@@ -1315,9 +1315,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
+            ctx = (
+                nullcontext()
+                if get_server_args().cuda_graph_config is not None
+                and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    layer_idx
+                )
+            )
+            with ctx:
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
