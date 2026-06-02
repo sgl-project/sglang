@@ -241,12 +241,22 @@ class Mamba2Metadata(ForwardMetadata):
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
+        # seq_idx must have one entry per *real* prefill token. The repeats below
+        # (query_start_loc.diff()) sum to the real prefill-token count. With
+        # dp-attention, num_prefill_tokens falls back to extend_num_tokens, which
+        # INCLUDES DP padding rows, so passing it as output_size triggers a CUDA
+        # assert (output_size != sum(repeats)). Only pass output_size when it comes
+        # from the CPU-side extend_seq_lens (then it equals the real count and keeps
+        # the no-sync fast path); otherwise let repeat_interleave infer it.
+        _seq_idx_output_size = (
+            num_prefill_tokens if extend_seq_lens_cpu is not None else None
+        )
         seq_idx = torch.repeat_interleave(
             torch.arange(
                 num_prefills, dtype=torch.int32, device=query_start_loc.device
             ),
             query_start_loc.diff(),
-            output_size=num_prefill_tokens,
+            output_size=_seq_idx_output_size,
         )
         seq_idx.unsqueeze_(0)
 
