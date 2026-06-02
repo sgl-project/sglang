@@ -393,6 +393,11 @@ class SessionController:
                 streaming=False,
                 timeout=recv_req.timeout,
             )
+            # Track the session's leaves from open, so a request that finishes
+            # after the session closes cannot re-create a dangling registry entry.
+            register = getattr(self.tree_cache, "register_session", None)
+            if register is not None:
+                register(session_id)
             log_info_on_rank0(
                 logger,
                 f"Session opened (radix-native): {session_id} "
