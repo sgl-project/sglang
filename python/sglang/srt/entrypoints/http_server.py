@@ -20,6 +20,8 @@ This file implements HTTP APIs for the inference engine via fastapi.
 import asyncio
 import dataclasses
 import errno
+import http.client
+import json
 import logging
 import os
 import socket
@@ -1913,9 +1915,118 @@ def _admin_api_key_missing_response(
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
+class _UDSResponseShim:
+    """Minimal ``requests.Response``-compatible shim for UDS warmup calls.
+
+    The warmup code uses ``.status_code``, ``.text``, and ``.json()`` only --
+    those are what this shim covers, so we don't pull in
+    ``requests-unixsocket`` just to do a few self-loopback requests.
+    """
+
+    def __init__(self, status_code: int, raw: bytes):
+        self.status_code = status_code
+        self._raw = raw
+
+    def __repr__(self) -> str:
+        return f"<_UDSResponseShim [{self.status_code}]>"
+
+    @property
+    def text(self) -> str:
+        return self._raw.decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self._raw.decode("utf-8"))
+
+
+def _uds_request(
+    method: str,
+    uds_path: str,
+    path: str,
+    headers: dict,
+    timeout: float,
+    json_data: Optional[dict] = None,
+) -> "_UDSResponseShim":
+    """Make an HTTP request over an AF_UNIX socket using stdlib ``http.client``.
+
+    ``OSError`` (transport) and ``http.client.HTTPException`` (protocol) may
+    propagate; callers should treat these as equivalent to
+    ``requests.exceptions.RequestException``.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(uds_path)
+    except BaseException:
+        # Failure before HTTPConnection takes ownership of the fd.
+        sock.close()
+        raise
+    conn = http.client.HTTPConnection("localhost", timeout=timeout)
+    conn.sock = sock
+    try:
+        merged_headers = dict(headers)
+        body = None
+        if json_data is not None:
+            body = json.dumps(json_data).encode("utf-8")
+            merged_headers.setdefault(
+                "Content-Type", "application/json; charset=utf-8"
+            )
+        conn.request(method, path, body=body, headers=merged_headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        return _UDSResponseShim(resp.status, raw)
+    finally:
+        conn.close()
+
+
+def _server_http_get(
+    server_args: ServerArgs,
+    path: str,
+    *,
+    headers: dict,
+    timeout: float,
+    ssl_verify,
+):
+    """GET ``path`` on the running server, transparently handling UDS vs TCP."""
+    if server_args.uds:
+        return _uds_request("GET", server_args.uds, path, headers, timeout)
+    return requests.get(
+        server_args.url() + path,
+        timeout=timeout,
+        headers=headers,
+        verify=ssl_verify,
+    )
+
+
+def _server_http_post(
+    server_args: ServerArgs,
+    path: str,
+    *,
+    json_data: dict,
+    headers: dict,
+    timeout: float,
+    ssl_verify,
+):
+    """POST ``json_data`` to ``path`` on the server, handling UDS vs TCP."""
+    if server_args.uds:
+        return _uds_request(
+            "POST",
+            server_args.uds,
+            path,
+            headers,
+            timeout,
+            json_data=json_data,
+        )
+    return requests.post(
+        server_args.url() + path,
+        json=json_data,
+        headers=headers,
+        timeout=timeout,
+        verify=ssl_verify,
+    )
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
-    url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
@@ -1926,13 +2037,22 @@ def _execute_server_warmup(server_args: ServerArgs):
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
+            res = _server_http_get(
+                server_args,
+                "/model_info",
+                headers=headers,
+                timeout=5,
+                ssl_verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
-        except (AssertionError, requests.exceptions.RequestException):
+        except (
+            AssertionError,
+            OSError,
+            http.client.HTTPException,
+            requests.exceptions.RequestException,
+        ):
             last_traceback = get_exception_traceback()
             pass
 
@@ -2012,12 +2132,13 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
+            res = _server_http_post(
+                server_args,
+                request_name,
+                json_data=json_data,
                 headers=headers,
                 timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
+                ssl_verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -2040,14 +2161,15 @@ def _execute_server_warmup(server_args: ServerArgs):
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
-            res = requests.post(
-                url + request_name,
-                json=json_data,
+            res = _server_http_post(
+                server_args,
+                request_name,
+                json_data=json_data,
                 headers=headers,
                 timeout=(
                     warmup_timeout if warmup_timeout > 0 else 1800
                 ),  # because of deep gemm precache is very long if not precache.
-                verify=ssl_verify,
+                ssl_verify=ssl_verify,
             )
             if res.status_code == 200:
                 logger.info(
