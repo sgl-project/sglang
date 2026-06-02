@@ -1151,9 +1151,6 @@ class CudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            # forward_batch was constructed above from `buffers` and already
-            # carries the padded capture-time tensors, so it can be passed
-            # straight to the new init API.
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
@@ -1163,13 +1160,8 @@ class CudaGraphRunner:
                 if self.model_runner.is_hybrid_swa:
                     self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
-                # In-graph metadata step. Out-of-graph init ran above with
-                # in_capture=True; this is the recordable companion that
-                # backends like DSV4 use for the Raw→Full upgrade. Default
-                # ABC impl is a no-op. Lives inside run_once so it executes
-                # inside the capture block (and inside warmup, which is the
-                # rehearsal — on_after_cuda_graph_warmup undoes any state
-                # mutated here so capture starts from the same Raw view).
+                # Must run inside the capture block: warmup mutations here are
+                # undone by on_after_cuda_graph_warmup so capture starts clean.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (

@@ -670,11 +670,9 @@ class DeepseekV4AttnBackend(
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # In-graph step: with SGLANG_PREP_IN_CUDA_GRAPH=1, init_forward_metadata_*
-        # returned Raw metadata so the Raw→Full upgrade is recorded inside the
-        # cuda graph (per-replay materialization of c4/c128 compress + core_attn
-        # + indexer fields). With PREP_IN_CUDA_GRAPH=0 forward_metadata is
-        # already Full and the isinstance checks below short-circuit.
+        # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
+        # materialization is recorded inside the cuda graph; a no-op (Full
+        # already) when PREP_IN_CUDA_GRAPH=0.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
@@ -695,10 +693,8 @@ class DeepseekV4AttnBackend(
         seq_lens = forward_batch.seq_lens
 
         if in_capture:
-            # Capture-time synthesizes a dummy out_cache_loc per bucket
-            # (the captured graph doesn't run real cache writes; replay
-            # supplies the real value) and uses capture-time mode as the
-            # actual mode (no IDLE at capture).
+            # Captured graph does no real cache writes, so synthesize a dummy
+            # out_cache_loc per bucket (replay supplies the real value).
             assert req_pool_indices.size(0) == bs
             assert seq_lens.size(0) == bs
             num_tokens = forward_batch.positions.numel()
@@ -712,9 +708,6 @@ class DeepseekV4AttnBackend(
             seq_lens_sum = int(seq_lens.sum().item())
             seq_lens_cpu = seq_lens.cpu()
         else:
-            # Replay reads the real out_cache_loc and runtime actual_forward_mode
-            # from the fb_view (which the graph runner constructed from the
-            # padded buffers + the original forward_batch).
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
@@ -821,8 +814,7 @@ class DeepseekV4AttnBackend(
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # DSv4 bakes this step's KV write target (c4/c128) into metadata,
-            # so slice the shared multi-step out_cache_loc now rather than at
-            # forward time.
+            # so slice the shared multi-step out_cache_loc now, not at forward time.
             out_cache_loc = forward_batch.out_cache_loc
             if self.topk > 0 and self.speculative_num_steps > 1:
                 out_cache_loc = per_step_draft_out_cache_loc(
@@ -869,9 +861,6 @@ class DeepseekV4AttnBackend(
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
         self.forward_metadata = metadata
-        # Chain the recordable in-graph step so PREP_IN_CUDA_GRAPH=1 upgrades
-        # Raw→Full (no-op when init_forward_metadata_decode/verify already
-        # produced a Full DSV4Metadata).
         self.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -1222,10 +1211,8 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # MultiStep dispatcher: fan out the in-graph step to every inner
-        # backend so each per-step Raw metadata gets upgraded to Full
-        # inside graph capture (the parent ABC override operates on
-        # self.forward_metadata, which the inner backends don't share).
+        # Fan out to every inner backend; they each own their own
+        # forward_metadata rather than sharing self.forward_metadata.
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 
@@ -1234,20 +1221,14 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # MultiStep dispatcher. Inner backends now read out_cache_loc /
-        # actual_forward_mode straight off the passed fb, so no
-        # _replay_forward_batch side channel is needed. We hard-pin
-        # forward_mode=DECODE for inner dispatch (matching the legacy
-        # capture/replay variants that hardcoded it).
+        # forward_mode is hard-pinned to DECODE for inner dispatch.
         from types import SimpleNamespace
 
         inner_fb = SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
-            # Propagate the runtime mode from the replay fb_view so inner
-            # DSV4 backends can detect IDLE and apply their idle substitution
-            # (build_replay_fb_view puts the captured mode in `forward_mode`
-            # and the real runtime mode in `actual_forward_mode`).
+            # Propagate the real runtime mode so inner backends can detect IDLE
+            # and apply their idle substitution.
             actual_forward_mode=getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             ),

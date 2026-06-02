@@ -88,7 +88,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         spec_info = forward_batch.spec_info
 
         if forward_mode.is_decode_or_idle() and spec_info is None:
-            # Own decode/idle path: write into cuda_graph_kv_indices buffer.
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 forward_batch.req_pool_indices[:bs],
@@ -106,7 +105,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
                 )
         else:
-            # Prefill / spec / draft-extend: fall back to FlashInferMLA parent.
             super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )

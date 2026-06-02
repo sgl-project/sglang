@@ -564,7 +564,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         forward_mode = forward_batch.forward_mode
 
-        # Delegate to FlashInferMLA parent for non-decode / non-spec modes.
         if (
             not forward_mode.is_decode_or_idle()
             and not forward_mode.is_target_verify()
@@ -1272,9 +1271,6 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     ):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
-        # Only the replay path was overridden by this wrapper historically.
-        # Capture inherits from FlashInferMLAMultiStepDraftBackend's
-        # init_forward_metadata_out_graph; we intercept only in_capture=False.
         if in_capture:
             return super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture

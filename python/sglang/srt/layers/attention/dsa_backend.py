@@ -413,11 +413,6 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # DSA's legacy capture was a thin pass-through to replay, so the
-        # branches collapse. seq_lens_cpu is computed at capture time;
-        # out_cache_loc / actual_forward_mode come off the fb (build_replay_fb_view
-        # supplies them at replay-from-graph-runner; spec runners pass them
-        # explicitly via a SimpleNamespace fb_view).
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -2394,7 +2389,6 @@ class DeepseekSparseAttnMultiStepBackend:
                 )
             return
 
-        # Replay path — preserves the fast-path precompute + fallback.
         bs = forward_batch.batch_size
         if envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
             # Precompute metadata once (shared across all backends)
@@ -2566,10 +2560,6 @@ class DeepseekSparseAttnMultiStepBackend:
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # MultiStep dispatcher: fan out to inner backends. Default ABC
-        # impl on inner backends is no-op; this exists so callers (e.g.
-        # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
-        # type-checking the wrapper type.
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
 

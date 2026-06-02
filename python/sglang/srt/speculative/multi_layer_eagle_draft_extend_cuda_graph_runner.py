@@ -485,9 +485,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             return ret
 
         with forward_context(ForwardContext(attn_backend=attn_backend)):
-            # forward_batch already carries the padded capture-time tensors
-            # plus forward_mode + spec_info; pass it straight through the
-            # new init API.
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
             self.deepep_adapter.capture(is_extend_in_batch=True)
             self._capture_init(run_once)

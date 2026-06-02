@@ -291,21 +291,11 @@ def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
         max_bs=capture_batch_size,
         max_num_tokens=batch.input_ids.numel(),
     )
-    # Mirror the production capture path: the new init_forward_metadata API
-    # reads all required fields off the ForwardBatch (or fb_view); the
-    # caller signals capture via in_capture=True. Then the recordable
-    # in-graph step (no-op for most backends; DSV4 upgrades Raw→Full).
     backend.init_forward_metadata_out_graph(batch, in_capture=True)
     backend.init_forward_metadata_in_graph(batch)
 
 
 def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
-    # Production replay path: the graph runner builds an fb_view with
-    # actual_forward_mode + out_cache_loc (see build_replay_fb_view) and
-    # dispatches via init_forward_metadata_out_graph(fb_view). For the unit
-    # test we just hand the batch object directly — it already carries
-    # the runtime forward_mode (mapped to actual_forward_mode below) plus
-    # out_cache_loc.
     from types import SimpleNamespace
 
     fb_view = SimpleNamespace(
@@ -323,10 +313,8 @@ def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
         spec_info=batch.spec_info,
     )
     backend.init_forward_metadata_out_graph(fb_view)
-    # Production replays re-run the captured _in_graph ops as part of
-    # graph.replay(); the unit harness calls forward() directly without a
-    # real cuda graph, so explicitly run _in_graph here to produce the
-    # Full metadata the forward path expects (no-op for non-DSV4).
+    # No real cuda graph here, so run the in-graph step explicitly to produce
+    # the Full metadata the forward path expects (no-op for non-DSV4).
     backend.init_forward_metadata_in_graph(fb_view)
     # Best-effort metadata-shape sanity check — catches negative kv_lens and
     # non-monotonic indptr that would otherwise leave real-row output correct

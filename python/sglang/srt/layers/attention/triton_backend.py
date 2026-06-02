@@ -499,8 +499,6 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
-            # Freeze the result into a ForwardMetadata whose tensor fields
-            # point into the cuda-graph buffers (capture-only post-step).
             self.forward_metadata = self._build_cuda_graph_forward_metadata(
                 bs, forward_mode, spec_info
             )
@@ -1461,10 +1459,6 @@ class TritonMultiStepDraftBackend:
             )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # MultiStep dispatcher: fan out to inner backends. Default ABC
-        # impl on inner backends is no-op; this exists so callers (e.g.
-        # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
-        # type-checking the wrapper type.
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 

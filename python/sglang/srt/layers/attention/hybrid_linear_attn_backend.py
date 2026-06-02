@@ -263,9 +263,8 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # Mamba base capture/replay shared body — just runs _replay_metadata.
-        # seq_lens_cpu is unused by _replay_metadata's actual logic for the
-        # non-target-verify case but kept in the contract for compatibility.
+        # seq_lens_cpu is unused by _replay_metadata for the non-target-verify
+        # case but kept in the contract for compatibility.
         self.forward_metadata = self._replay_metadata(
             forward_batch.batch_size,
             forward_batch.req_pool_indices,
@@ -683,7 +682,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # Mamba2 extends MambaBase's body with a prepare_decode wrapping.
         metadata = self._replay_metadata(
             forward_batch.batch_size,
             forward_batch.req_pool_indices,

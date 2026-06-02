@@ -76,9 +76,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # Legacy capture was a thin pass-through to replay, so the branches
-        # collapse. seq_lens_cpu is unused by the underlying _replay_metadata
-        # for non-target-verify modes; pass it through for compatibility.
+        # seq_lens_cpu is unused by the underlying _replay_metadata for
+        # non-target-verify modes; pass it through for compatibility.
         bs = forward_batch.batch_size
         metadata = self._replay_metadata(
             bs,

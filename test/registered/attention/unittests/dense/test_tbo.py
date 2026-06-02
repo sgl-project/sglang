@@ -127,9 +127,6 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         capture_bs = case.batch_size
         num_tokens = sum(case.extend_lens)
         wrapper.init_cuda_graph_state(max_bs=capture_bs, max_num_tokens=num_tokens)
-        # This is the failing call before the fix: TBO dispatching to
-        # primary's replay path (instead of capture) reads an unpopulated
-        # ``target_verify_metadata[bs]`` dict and raises KeyError.
         wrapper.init_forward_metadata_out_graph(batch, in_capture=True)
 
     @unittest.skipIf(
@@ -185,9 +182,8 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         self.assertGreater(split_seq_index, 0)
         self.assertLess(split_seq_index, capture_bs)
 
-        # Build the same shape of fb_view that cuda_graph_runner.replay_prepare
-        # passes — `SimpleNamespace` from build_replay_fb_view (no tbo_children
-        # attribute).
+        # fb_view shaped like build_replay_fb_view's output: a SimpleNamespace
+        # with no tbo_children attribute.
         fb_view = SimpleNamespace(
             batch_size=capture_bs,
             forward_mode=batch.forward_mode,
@@ -202,10 +198,8 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
             spec_info=batch.spec_info,
         )
 
-        # Replace primary + children with pure mocks (no `wraps=...`) so the
-        # dispatcher's slicing/contract is observed without invoking real
-        # backend bodies (which would need a full init_cuda_graph_state
-        # warmup pass to populate per-bs metadata dicts).
+        # Pure mocks (no `wraps=...`) so the dispatcher's slicing/contract is
+        # observed without invoking real backend bodies.
         primary_mock = MagicMock()
         child_mocks = [MagicMock(), MagicMock()]
         wrapper.primary = primary_mock

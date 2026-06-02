@@ -476,7 +476,6 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if in_capture:
-            # Pre-step: create per-bs wrappers (capture-only).
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
@@ -520,9 +519,8 @@ class FlashInferAttnBackend(AttentionBackend):
             raise ValueError("Invalid forward mode")
 
         if in_capture and forward_mode.is_decode_or_idle():
-            # Post-step (capture-only): fast_decode_plan requires _cached_module
-            # set by the initial full begin_forward call above; install it only
-            # after that first plan runs.
+            # fast_decode_plan needs _cached_module from the initial begin_forward
+            # above, so install it only after that first plan has run.
             for w in self.decode_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
@@ -1672,10 +1670,6 @@ class FlashInferMultiStepDraftBackend:
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # MultiStep dispatcher: fan out to inner backends. Default ABC
-        # impl on inner backends is no-op; this exists so callers (e.g.
-        # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
-        # type-checking the wrapper type.
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 

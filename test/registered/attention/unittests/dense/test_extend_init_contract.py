@@ -43,8 +43,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 
 register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
 
-# Single shared EXTEND case: small, no prefix, single request. Same shape
-# piecewise/breakable capture sees on the prefill leg of bench_serving.
+# Single shared EXTEND case: small, no prefix, single request.
 _EXTEND_CASE = DenseAttentionCase(
     name="extend_no_prefix_smoke",
     backend="fa3",  # overridden per backend below
@@ -79,8 +78,6 @@ class TestExtendInitContract(CustomTestCase):
         except (AssertionError, ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"backend {backend} unavailable: {exc}")
 
-    # ----- positive: the API piecewise/breakable capture *does* use -----
-
     def _assert_extend_eager_init_well_formed(
         self, backend: str, *, head_dim: int = 16
     ):
@@ -92,9 +89,7 @@ class TestExtendInitContract(CustomTestCase):
             f"{backend}: init_forward_metadata(EXTEND) left forward_metadata as None — "
             "piecewise/breakable capture would crash on the first forward_extend call.",
         )
-        # FA3 / FlashInfer (paged) both produce a page_table on EXTEND. Asserting
-        # it's non-None catches the specific bug pattern where
-        # _apply_cuda_graph_metadata leaves metadata=None for unsupported modes.
+        # FA3 / FlashInfer (paged) both produce a page_table on EXTEND.
         page_table = getattr(meta, "page_table", None)
         if page_table is not None:
             self.assertIsInstance(page_table, torch.Tensor)
@@ -112,8 +107,6 @@ class TestExtendInitContract(CustomTestCase):
 
     def test_triton_extend_eager_init(self):
         self._assert_extend_eager_init_well_formed("triton")
-
-    # ----- negative: the API that capture must *not* use for EXTEND -----
 
     def _assert_out_graph_in_capture_rejects_extend(
         self, backend: str, *, head_dim: int = 16
@@ -133,10 +126,7 @@ class TestExtendInitContract(CustomTestCase):
         except (ValueError, AttributeError, KeyError, AssertionError):
             return
         # Backend accepted EXTEND on the bucket-prep path — verify the result
-        # is at least well-formed (forward_metadata non-None). If a future
-        # refactor makes _out_graph(in_capture=True) a superset of the
-        # eager init, this branch passes silently and the piecewise/breakable
-        # wiring can be revisited.
+        # is at least well-formed (forward_metadata non-None).
         meta = fixture.backend.forward_metadata
         self.assertIsNotNone(
             meta,

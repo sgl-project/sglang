@@ -423,9 +423,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend)
         ):
-            # forward_batch above already carries bs, num_tokens, the
-            # padded buffers, forward_mode and spec_info; pass it straight
-            # through the new init API.
             self.draft_extend_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
@@ -539,9 +536,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
-        # Build a ForwardBatch-like view from the padded capture-time
-        # buffers + original forward_batch fields, then dispatch through
-        # the new init API.
         from types import SimpleNamespace
 
         seq_lens_sum = forward_batch.seq_lens_sum

@@ -92,8 +92,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     ):
         forward_mode = forward_batch.forward_mode
         if forward_mode.is_decode_or_idle() or forward_mode.is_target_verify():
-            # Decode + target-verify share the same body between capture and
-            # replay (legacy capture was a thin pass-through to replay).
             self._apply_decode_target_verify_metadata(
                 bs=forward_batch.batch_size,
                 req_pool_indices=forward_batch.req_pool_indices,
@@ -102,7 +100,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 forward_mode=forward_mode,
             )
         else:
-            # Prefill / draft-extend: fall back to FlashInferMLA parent.
             super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
@@ -521,9 +518,5 @@ class FlashMLAMultiStepDraftBackend:
         self.common_template(forward_batch, call_fn)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # MultiStep dispatcher: fan out to inner backends. Default ABC
-        # impl on inner backends is no-op; this exists so callers (e.g.
-        # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
-        # type-checking the wrapper type.
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)

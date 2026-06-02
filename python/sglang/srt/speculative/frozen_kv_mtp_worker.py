@@ -288,7 +288,6 @@ class FrozenKVMTPWorker(TpModelWorker):
         self, forward_batch: ForwardBatch
     ) -> None:
         with self._frozen_kv_target_view(forward_batch):
-            # forward_batch already carries the capture-time tensors.
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
@@ -296,8 +295,7 @@ class FrozenKVMTPWorker(TpModelWorker):
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
     ) -> None:
-        # Legacy replay sliced req_pool_indices / seq_lens to bs and used a
-        # caller-derived seq_lens_sum; preserve that by building a view.
+        # Slice req_pool_indices / seq_lens to bs and use the caller-derived seq_lens_sum.
         from types import SimpleNamespace
 
         fb_view = SimpleNamespace(

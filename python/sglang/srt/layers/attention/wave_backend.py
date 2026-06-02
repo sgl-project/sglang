@@ -160,8 +160,7 @@ class WaveAttnBackend(AttentionBackend):
 
         if in_capture:
             assert forward_batch.encoder_lens is None, "Not supported"
-            # Multi-step speculative decode: kv buffers come from spec_info
-            # rather than the cuda-graph pool, so replay is not involved.
+            # kv buffers come from spec_info rather than the cuda-graph pool.
             if forward_mode.is_decode_or_idle() and spec_info is not None:
                 self.forward_metadata = ForwardMetadata(
                     attn_logits=self.cuda_graph_attn_logits,

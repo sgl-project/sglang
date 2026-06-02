@@ -30,7 +30,6 @@ class TboAttnBackend(AttentionBackend):
         forward_batch: "ForwardBatch",
         in_capture: bool = False,
     ):
-        # TBO dispatcher: forward in_capture flag to primary + children.
         self.primary.init_forward_metadata_out_graph(
             forward_batch=forward_batch, in_capture=in_capture
         )

@@ -306,8 +306,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             seq_lens_cpu = seq_lens.cpu()
 
             if forward_mode.is_decode_or_idle():
-                # Decode: create wrapper, run the initial full begin_forward
-                # (init_metadata_replay=False), then install the fast plan.
                 decode_wrapper = BatchMLAPagedAttentionWrapper(
                     self.workspace_buffer,
                     use_cuda_graph=True,
@@ -327,11 +325,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 )
                 self.decode_cuda_graph_metadata[bs] = decode_wrapper
                 self.forward_metadata = DecodeMetadata(decode_wrapper)
-                # fast_mla_decode_plan requires _cached_module set by the initial
-                # begin_forward above; install it only after that call completes.
+                # fast_mla_decode_plan needs _cached_module from the initial
+                # begin_forward above, so install it only after that call completes.
                 decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
             elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
-                # Prefill: create wrapper and store — _apply handles the update call.
                 prefill_wrapper = BatchMLAPagedAttentionWrapper(
                     self.workspace_buffer,
                     use_cuda_graph=True,
@@ -1028,10 +1025,6 @@ class FlashInferMLAMultiStepDraftBackend:
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        # MultiStep dispatcher: fan out to inner backends. Default ABC
-        # impl on inner backends is no-op; this exists so callers (e.g.
-        # EAGLEDraftCudaGraphRunner) can invoke it uniformly without
-        # type-checking the wrapper type.
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 
