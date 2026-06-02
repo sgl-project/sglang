@@ -394,6 +394,10 @@ class TestRegressionPp(ScriptedTestCase):
             f"waiting_queue; got {occurrences} occurrences of rid="
             f"{r.rid} (pre-fix bug would yield 3)"
         )
+        # The dedup assertion above must read running_batch exactly one yield after
+        # the abort. The actual finish/release then lands a few forward steps later
+        # under PP, so drain before asserting the req is gone.
+        yield from _drain_until_released(t, r)
         assert r.finished
 
     def test_pp_other_mb_chunked_exclude(self):
@@ -401,11 +405,19 @@ class TestRegressionPp(ScriptedTestCase):
 
     @staticmethod
     def _script_pp_other_mb_chunked_exclude(t: ScriptedContext):
-        r_long = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
-        r_ctrl = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1)
+        # Distinct prompt_token per req: identical prompts share radix prefix nodes,
+        # so r_ctrl would resume from r_long's cached chunks and report chunks_done==0
+        # instead of chunking cold. Distinct tokens force both to chunk independently.
+        r_long = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=5
+        )
+        r_ctrl = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=1, prompt_token=6
+        )
 
         long_exclude_engaged = False
         ctrl_exclude_engaged = False
+        ctrl_seen_in_flight = False
         for _ in range(2000):
             in_flight_other_mb = _in_flight_other_mb_rids(t)
             running = [req.rid for req in t.scheduler.running_batch.reqs]
@@ -416,8 +428,10 @@ class TestRegressionPp(ScriptedTestCase):
                     f"must be excluded from local running while held in "
                     f"another mb's in-flight set; rid={r_long.rid}"
                 )
-            if r_ctrl.rid in in_flight_other_mb and r_ctrl.rid in running:
-                ctrl_exclude_engaged = True
+            if r_ctrl.rid in in_flight_other_mb:
+                ctrl_seen_in_flight = True
+                if r_ctrl.rid in running:
+                    ctrl_exclude_engaged = True
             in_flight = 1 if t.scheduler.chunked_req is not None else 0
             assert (
                 in_flight <= 1
@@ -429,14 +443,23 @@ class TestRegressionPp(ScriptedTestCase):
             raise AssertionError("reqs did not finish")
 
         assert r_long.finished and r_ctrl.finished
-        assert r_long.chunks_done >= 2 and r_ctrl.chunks_done >= 2
+        assert r_long.chunks_done >= 2 and r_ctrl.chunks_done >= 2, (
+            f"both reqs must chunk cold; got long={r_long.chunks_done} "
+            f"ctrl={r_ctrl.chunks_done}"
+        )
         assert long_exclude_engaged, (
             "69ef71edc4: never observed r_long in another mb's in-flight "
             "set — cross-mb exclude path was not exercised"
         )
-        assert ctrl_exclude_engaged or not long_exclude_engaged, (
-            "69ef71edc4: max_new_tokens == 1 control must NOT trigger "
-            "the cross-mb exclude (no output-stash dedupe needed)"
+        # The max_new_tokens == 1 control must NOT be excluded from local running
+        # while in another mb's in-flight set: the wrong decode is filtered by the
+        # req.finished() check before being appended, so excluding it would only add
+        # a needless 1-mb stall. The non-exclusion is observable only when the control
+        # is actually caught in the in-flight set, so assert it conditionally on that
+        # observation rather than coupling it to r_long's unrelated exclusion.
+        assert ctrl_exclude_engaged or not ctrl_seen_in_flight, (
+            "69ef71edc4: max_new_tokens == 1 control was seen in another mb's "
+            "in-flight set but never in local running — it must NOT be excluded"
         )
 
 
