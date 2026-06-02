@@ -48,3 +48,11 @@ class XpuCommunicator:
         else:
             output_tensor = None
         return output_tensor
+
+    def all_to_all_single(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        dist.all_to_all_single(output_tensor, input_tensor, group=self.group)
+        return output_tensor

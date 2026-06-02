@@ -49,3 +49,12 @@ class HpuCommunicator:
             input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
         return output_tensor
+
+    def all_to_all_single(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        htorch.core.mark_step()
+        dist.all_to_all_single(output_tensor, input_tensor, group=self.group)
+        return output_tensor

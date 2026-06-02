@@ -600,6 +600,18 @@ class TransformersBase(nn.Module):
                     orig_to_new_suffix=fp8_suffix_map
                 )
 
+        # For MiniMaxM2 models, HF Transformers expects rope_parameters in the config.
+        # Must be set *before* AutoModel.from_config because the HF model constructor
+        # reads it (MiniMaxM2RotaryEmbedding.__init__).
+        if getattr(self.config, "model_type", None) == "minimax_m2" and not hasattr(
+            self.config, "rope_parameters"
+        ):
+            rope_theta = getattr(self.config, "rope_theta", 10000.0)
+            rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
+            if hasattr(self.config, "rotary_dim"):
+                rope_parameters["rotary_dim"] = self.config.rotary_dim
+            self.config.rope_parameters = rope_parameters
+
         # Resolve model class for _supports_attention_backend check
         model_cls = _resolve_attention_backend_model_cls(config)
 
