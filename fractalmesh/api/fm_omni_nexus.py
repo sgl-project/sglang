@@ -7,6 +7,7 @@ Endpoints: /api/health /api/stats /api/agents /api/affiliates
 Auto-refreshes every 30s in browser.
 Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
+
 import json
 import os
 import sqlite3
@@ -27,19 +28,20 @@ from flags import ggh
 from flags import router as flags_router
 
 ROOT = os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas"))
-DB   = os.path.join(ROOT, "database", "sovereign.db")
+DB = os.path.join(ROOT, "database", "sovereign.db")
 PORT = int(os.getenv("NEXUS_PORT", "8095"))
 
-PHI      = 1.6180339887
+PHI = 1.6180339887
 OPERATOR = "Samuel James Hiotis"
-ABN      = "56 628 117 363"
-SITE     = "https://fractalmesh.net"
+ABN = "56 628 117 363"
+SITE = "https://fractalmesh.net"
 
 app = FastAPI(title="FractalMesh Omni Nexus", version="2.1.0")
 app.include_router(flags_router)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _db(sql: str, params=(), default=None):
     try:
@@ -55,7 +57,7 @@ def _db(sql: str, params=(), default=None):
 def _scalar(sql: str, params=(), default=0):
     try:
         conn = sqlite3.connect(DB, timeout=5)
-        row  = conn.execute(sql, params).fetchone()
+        row = conn.execute(sql, params).fetchone()
         conn.close()
         return row[0] if row and row[0] is not None else default
     except Exception:
@@ -65,7 +67,8 @@ def _scalar(sql: str, params=(), default=0):
 def _pm2_list() -> list:
     try:
         out = subprocess.check_output(
-            ["pm2", "jlist"], timeout=10, stderr=subprocess.DEVNULL)
+            ["pm2", "jlist"], timeout=10, stderr=subprocess.DEVNULL
+        )
         return json.loads(out)
     except Exception:
         return []
@@ -73,62 +76,62 @@ def _pm2_list() -> list:
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
 
+
 @app.get("/api/health")
 def health(request: Request):
     return {
-        "status":    "ok",
-        "operator":  OPERATOR,
-        "abn":       ABN,
-        "ts":        datetime.now(tz=timezone.utc).isoformat(),
+        "status": "ok",
+        "operator": OPERATOR,
+        "abn": ABN,
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
         "db_exists": os.path.exists(DB),
-        "flags":     {"ggh": ggh(request)},
+        "flags": {"ggh": ggh(request)},
     }
 
 
 @app.get("/api/stats")
 def stats():
-    total_rev    = _scalar("SELECT COALESCE(SUM(amount_aud),0) FROM revenue")
+    total_rev = _scalar("SELECT COALESCE(SUM(amount_aud),0) FROM revenue")
     total_orders = _scalar("SELECT COUNT(*) FROM orders WHERE status='paid'")
     active_prods = _scalar("SELECT COUNT(*) FROM products WHERE active=1")
-    leads        = _scalar("SELECT COUNT(*) FROM leads")
+    leads = _scalar("SELECT COUNT(*) FROM leads")
     aff_programs = _scalar("SELECT COUNT(*) FROM affiliates WHERE status='active'")
-    aff_clicks   = _scalar(
-        "SELECT COUNT(*) FROM affiliate_clicks WHERE ts>datetime('now','-1 day')")
-    aff_earned   = _scalar(
+    aff_clicks = _scalar(
+        "SELECT COUNT(*) FROM affiliate_clicks WHERE ts>datetime('now','-1 day')"
+    )
+    aff_earned = _scalar(
         "SELECT COALESCE(SUM(amount),0) FROM affiliate_conversions "
-        "WHERE status!='rejected'")
-    aff_pending  = _scalar(
+        "WHERE status!='rejected'"
+    )
+    aff_pending = _scalar(
         "SELECT COALESCE(SUM(amount),0) FROM affiliate_conversions "
-        "WHERE status='pending'")
-    methane_anom = _scalar(
-        "SELECT COUNT(*) FROM methane_readings WHERE is_anomaly=1")
-    ais_alerts   = _scalar(
-        "SELECT COUNT(*) FROM ais_alerts WHERE resolved=0")
-    ip_value     = _scalar(
-        "SELECT COALESCE(SUM(value_estimate_aud),0) FROM ip_registry")
-    content      = _scalar("SELECT COUNT(*) FROM content_pieces")
-    drip_active  = _scalar(
-        "SELECT COUNT(*) FROM drip_sequences WHERE status='active'")
-    conv_rate    = round((total_orders / max(leads, 1)) * 100, 2)
-    phi          = round(float(total_rev) * PHI / max(float(total_rev), 1), 4)
+        "WHERE status='pending'"
+    )
+    methane_anom = _scalar("SELECT COUNT(*) FROM methane_readings WHERE is_anomaly=1")
+    ais_alerts = _scalar("SELECT COUNT(*) FROM ais_alerts WHERE resolved=0")
+    ip_value = _scalar("SELECT COALESCE(SUM(value_estimate_aud),0) FROM ip_registry")
+    content = _scalar("SELECT COUNT(*) FROM content_pieces")
+    drip_active = _scalar("SELECT COUNT(*) FROM drip_sequences WHERE status='active'")
+    conv_rate = round((total_orders / max(leads, 1)) * 100, 2)
+    phi = round(float(total_rev) * PHI / max(float(total_rev), 1), 4)
 
     return {
-        "revenue_aud":         round(float(total_rev), 2),
-        "orders":              total_orders,
-        "products_active":     active_prods,
-        "leads":               leads,
-        "conversion_pct":      conv_rate,
-        "affiliate_programs":  aff_programs,
+        "revenue_aud": round(float(total_rev), 2),
+        "orders": total_orders,
+        "products_active": active_prods,
+        "leads": leads,
+        "conversion_pct": conv_rate,
+        "affiliate_programs": aff_programs,
         "affiliate_clicks_24h": aff_clicks,
         "affiliate_earned_aud": round(float(aff_earned), 2),
         "affiliate_pending_aud": round(float(aff_pending), 2),
-        "methane_anomalies":   methane_anom,
-        "ais_open_alerts":     ais_alerts,
-        "ip_portfolio_aud":    round(float(ip_value), 2),
-        "content_pieces":      content,
-        "drip_active":         drip_active,
-        "phi_score":           phi,
-        "ts":                  datetime.now(tz=timezone.utc).isoformat(),
+        "methane_anomalies": methane_anom,
+        "ais_open_alerts": ais_alerts,
+        "ip_portfolio_aud": round(float(ip_value), 2),
+        "content_pieces": content,
+        "drip_active": drip_active,
+        "phi_score": phi,
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
     }
 
 
@@ -136,14 +139,14 @@ def stats():
 def agents():
     procs = _pm2_list()
     return {
-        "count":    len(procs),
-        "agents":   [
+        "count": len(procs),
+        "agents": [
             {
-                "name":   p.get("name"),
+                "name": p.get("name"),
                 "status": p.get("pm2_env", {}).get("status"),
                 "uptime": p.get("pm2_env", {}).get("pm_uptime"),
                 "restarts": p.get("pm2_env", {}).get("restart_time", 0),
-                "cpu":    p.get("monit", {}).get("cpu", 0),
+                "cpu": p.get("monit", {}).get("cpu", 0),
                 "mem_mb": round(p.get("monit", {}).get("memory", 0) / 1048576, 1),
             }
             for p in procs
@@ -157,15 +160,20 @@ def affiliates():
     rows = _db(
         "SELECT program, network, commission_type, commission_value, "
         "cookie_days, payout_threshold, status, notes "
-        "FROM affiliates ORDER BY program")
+        "FROM affiliates ORDER BY program"
+    )
     clicks = _db(
         "SELECT program, COUNT(*) as clicks FROM affiliate_clicks "
-        "WHERE ts>datetime('now','-7 days') GROUP BY program")
+        "WHERE ts>datetime('now','-7 days') GROUP BY program"
+    )
     click_map = {r["program"]: r["clicks"] for r in clicks}
     for r in rows:
         r["clicks_7d"] = click_map.get(r["program"], 0)
-    return {"programs": rows, "count": len(rows),
-            "ts": datetime.now(tz=timezone.utc).isoformat()}
+    return {
+        "programs": rows,
+        "count": len(rows),
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+    }
 
 
 @app.get("/api/fdi")
@@ -175,19 +183,22 @@ def fdi():
         "SELECT id, source, lat, lon, ch4_ppb, ch4_enhancement, "
         "estimated_flux_kt, sensing_date, phi_score "
         "FROM methane_readings WHERE is_anomaly=1 "
-        "ORDER BY phi_score DESC LIMIT 20")
+        "ORDER BY phi_score DESC LIMIT 20"
+    )
     ais = _db(
         "SELECT id, mmsi, vessel_name, alert_type, lat, lon, "
         "dark_hours, ts FROM ais_alerts WHERE resolved=0 "
-        "ORDER BY ts DESC LIMIT 20")
+        "ORDER BY ts DESC LIMIT 20"
+    )
     reports = _db(
         "SELECT report_ref, tier, status, amount_aud, phi_score, ts "
-        "FROM methane_report_log ORDER BY ts DESC LIMIT 10")
+        "FROM methane_report_log ORDER BY ts DESC LIMIT 10"
+    )
     return {
         "methane_anomalies": methane,
-        "ais_alerts":        ais,
-        "recent_reports":    reports,
-        "ts":                datetime.now(tz=timezone.utc).isoformat(),
+        "ais_alerts": ais,
+        "recent_reports": reports,
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
     }
 
 
@@ -195,22 +206,36 @@ def fdi():
 def guardrails():
     """Vault key presence check — never exposes values."""
     keys = [
-        "GMAIL_USER", "GMAIL_APP_PASS", "OPENAI_API_KEY",
-        "STRIPE_SECRET_KEY", "DEVTO_API_KEY",
-        "CDSE_USER", "AISHUB_USER", "ADMOB_PUBLISHER_ID",
-        "ENABLE_CONTENT", "ENABLE_DRIP", "ENABLE_NEGOTIATOR",
-        "ENABLE_METHANE_REPORTS", "ENABLE_ADMOB", "ENABLE_CAMPAIGNS",
-        "ENABLE_SMART_CONTRACTS", "ENABLE_WATERMARK", "ENABLE_GEO_VALIDATOR",
-        "ENABLE_CARBON_CREDITS", "ENABLE_LICENSING",
+        "GMAIL_USER",
+        "GMAIL_APP_PASS",
+        "OPENAI_API_KEY",
+        "STRIPE_SECRET_KEY",
+        "DEVTO_API_KEY",
+        "CDSE_USER",
+        "AISHUB_USER",
+        "ADMOB_PUBLISHER_ID",
+        "ENABLE_CONTENT",
+        "ENABLE_DRIP",
+        "ENABLE_NEGOTIATOR",
+        "ENABLE_METHANE_REPORTS",
+        "ENABLE_ADMOB",
+        "ENABLE_CAMPAIGNS",
+        "ENABLE_SMART_CONTRACTS",
+        "ENABLE_WATERMARK",
+        "ENABLE_GEO_VALIDATOR",
+        "ENABLE_CARBON_CREDITS",
+        "ENABLE_LICENSING",
     ]
     presence = {k: bool(os.getenv(k, "")) for k in keys}
-    enabled  = [k for k, v in presence.items()
-                if k.startswith("ENABLE_") and v and
-                os.getenv(k, "false").lower() == "true"]
+    enabled = [
+        k
+        for k, v in presence.items()
+        if k.startswith("ENABLE_") and v and os.getenv(k, "false").lower() == "true"
+    ]
     return {
-        "vault_keys":    presence,
+        "vault_keys": presence,
         "live_features": enabled,
-        "ts":            datetime.now(tz=timezone.utc).isoformat(),
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
     }
 
 
@@ -218,21 +243,27 @@ def guardrails():
 def ip_registry():
     rows = _db(
         "SELECT title, category, value_estimate_aud, license_type, status, ts "
-        "FROM ip_registry ORDER BY value_estimate_aud DESC LIMIT 50")
-    total = _scalar(
-        "SELECT COALESCE(SUM(value_estimate_aud),0) FROM ip_registry")
-    return {"portfolio": rows, "total_aud": round(float(total), 2),
-            "count": len(rows), "ts": datetime.now(tz=timezone.utc).isoformat()}
+        "FROM ip_registry ORDER BY value_estimate_aud DESC LIMIT 50"
+    )
+    total = _scalar("SELECT COALESCE(SUM(value_estimate_aud),0) FROM ip_registry")
+    return {
+        "portfolio": rows,
+        "total_aud": round(float(total), 2),
+        "count": len(rows),
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+    }
 
 
 @app.get("/api/compliance")
 def compliance():
     proposals = _db(
         "SELECT prospect, tier, ask_aud, status, ts "
-        "FROM negotiation_log ORDER BY ts DESC LIMIT 20")
-    pipeline  = _db(
+        "FROM negotiation_log ORDER BY ts DESC LIMIT 20"
+    )
+    pipeline = _db(
         "SELECT prospect, tier, ask_aud, sent, ts "
-        "FROM proposals ORDER BY ts DESC LIMIT 10")
+        "FROM proposals ORDER BY ts DESC LIMIT 10"
+    )
     return {
         "negotiation_log": proposals,
         "proposal_pipeline": pipeline,
@@ -244,9 +275,13 @@ def compliance():
 def log_recent():
     rows = _db(
         "SELECT source, event, priority, ts "
-        "FROM pulse_log ORDER BY ts DESC LIMIT 100")
-    return {"logs": rows, "count": len(rows),
-            "ts": datetime.now(tz=timezone.utc).isoformat()}
+        "FROM pulse_log ORDER BY ts DESC LIMIT 100"
+    )
+    return {
+        "logs": rows,
+        "count": len(rows),
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+    }
 
 
 # ── HTML dashboard ─────────────────────────────────────────────────────────────

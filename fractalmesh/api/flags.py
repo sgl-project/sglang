@@ -6,6 +6,7 @@ vercel-flag-overrides JWE cookie.
 Credentials from ~/.secrets/fractal.env via os.environ.setdefault.
 Samuel James Hiotis | ABN 56 628 117 363
 """
+
 import base64
 import hashlib
 import hmac as _hmac
@@ -37,13 +38,14 @@ FLAGS_DEFINITIONS: dict[str, dict[str, Any]] = {
         ),
         "options": [
             {"value": False, "label": "Disabled"},
-            {"value": True,  "label": "Enabled"},
+            {"value": True, "label": "Enabled"},
         ],
         "defaultValue": False,
     },
 }
 
 # ── Access verification ───────────────────────────────────────────────────────
+
 
 def _verify_access(authorization: str) -> bool:
     """
@@ -64,7 +66,9 @@ def _verify_access(authorization: str) -> bool:
     expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
     return _hmac.compare_digest(expected, token)
 
+
 # ── Override cookie decoding ──────────────────────────────────────────────────
+
 
 def _decode_overrides(cookie: str) -> dict[str, Any]:
     """
@@ -87,7 +91,9 @@ def _decode_overrides(cookie: str) -> dict[str, Any]:
         logger.debug("Could not decode flag overrides cookie", exc_info=True)
         return {}
 
+
 # ── Flag evaluation ───────────────────────────────────────────────────────────
+
 
 def evaluate(name: str, request: Request) -> Any:
     """
@@ -105,6 +111,7 @@ def evaluate(name: str, request: Request) -> Any:
 def ggh(request: Request) -> bool:
     """Evaluate the ggh feature flag. Returns True when the flag is enabled."""
     return bool(evaluate("ggh", request))
+
 
 # ── Well-known router ─────────────────────────────────────────────────────────
 
