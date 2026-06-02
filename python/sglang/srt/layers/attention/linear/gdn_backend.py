@@ -60,6 +60,7 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
 
+        cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
@@ -69,7 +70,8 @@ class GDNKernelDispatcher:
                 CuteDSLGDNKernel,
             )
 
-            self.decode_kernel = CuteDSLGDNKernel()
+            cutedsl_kernel = CuteDSLGDNKernel()
+            self.decode_kernel = cutedsl_kernel
         elif decode_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -85,10 +87,26 @@ class GDNKernelDispatcher:
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_cutedsl():
-            raise ValueError(
-                "CuTe DSL backend only supports decode, not prefill. "
-                "Use --linear-attn-prefill-backend triton instead."
-            )
+            if not is_cuda():
+                raise ValueError("GDN CuTe DSL backend requires CUDA")
+            # Reuse the CuteDSL kernel if already created for decode
+            if cutedsl_kernel is None:
+                from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
+                    CuteDSLGDNKernel,
+                )
+
+                cutedsl_kernel = CuteDSLGDNKernel()
+            # The CuteDSL prefill kernel only exists on SM100+ (Blackwell).
+            # On SM90 (Hopper) fall back to Triton so users can pick
+            # `cutedsl` uniformly across hardware.
+            if cutedsl_kernel.supports_prefill:
+                self.extend_kernel = cutedsl_kernel
+            else:
+                rank0_log(
+                    "CuTe DSL GDN prefill is not supported on this GPU "
+                    "(requires SM100+). Falling back to Triton for prefill."
+                )
+                self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -105,9 +123,9 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer only when the selected FlashInfer kernel
-        # supports MTP verify. On SM100+ FlashInfer GDN decode is supported, but
-        # its MTP verify path is not, so keep Triton as the verify fallback.
+        # Verify kernel: use FlashInfer when the selected FlashInfer kernel
+        # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
+        # bf16-state adapter in FlashInferGDNKernel.
         if (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
