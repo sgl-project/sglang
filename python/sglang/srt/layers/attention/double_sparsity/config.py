@@ -33,8 +33,14 @@ _ALLOWED_FIELDS = {
     "channel_mask_path",
     "device_buffer_size",
     "signature_dtype",
+    "scorer_norm",
     "extra",
 }
+
+# Allowed values for the Loop-7 Tier-2.B flag-gated scorer normalization. Config-
+# borne (not env) so it reaches the TP worker processes that run the selector.
+_ALLOWED_SCORER_NORM = ("off", "cosine")
+_DEFAULT_SCORER_NORM = "off"
 
 
 _DEFAULT_TOP_K = 2048           # matches DeepSeek-V3.2 index_topk (max tokens per request)
@@ -51,9 +57,15 @@ class DoubleSparsityConfig:
     page_size: int = _DEFAULT_PAGE_SIZE
     device_buffer_size: int = _DEFAULT_DEVICE_BUFFER_SIZE
     signature_dtype: str = _DEFAULT_SIGNATURE_DTYPE
+    scorer_norm: str = _DEFAULT_SCORER_NORM
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.scorer_norm not in _ALLOWED_SCORER_NORM:
+            raise ValueError(
+                f"Double Sparsity 'scorer_norm' must be one of "
+                f"{list(_ALLOWED_SCORER_NORM)}, got {self.scorer_norm!r}."
+            )
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError(
                 f"Double Sparsity 'top_k' must be a positive integer, got {self.top_k!r}."
@@ -129,5 +141,6 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         page_size=int(data.get("page_size", _DEFAULT_PAGE_SIZE)),
         device_buffer_size=int(data.get("device_buffer_size", _DEFAULT_DEVICE_BUFFER_SIZE)),
         signature_dtype=str(data.get("signature_dtype", _DEFAULT_SIGNATURE_DTYPE)),
+        scorer_norm=str(data.get("scorer_norm", _DEFAULT_SCORER_NORM)),
         extra=data.get("extra", {}),
     )

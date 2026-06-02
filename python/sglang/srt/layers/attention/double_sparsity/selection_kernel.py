@@ -368,6 +368,7 @@ def compute_token_scores(
     channel_weights: torch.Tensor,
     layer_id: int,
     token_scales: Optional[torch.Tensor] = None,
+    scorer_norm: Optional[str] = None,
 ) -> torch.Tensor:
     """Compute per-(batch, token) scalar scores.
 
@@ -396,7 +397,7 @@ def compute_token_scores(
 
     q_proj = project_query_onto_channels(queries, sel_layer, w_layer)  # [bs, H, D]
 
-    norm_mode = _scorer_norm_mode()
+    norm_mode = scorer_norm if scorer_norm is not None else _scorer_norm_mode()
 
     if (
         norm_mode == "off"
@@ -622,6 +623,7 @@ def _compute_logical_token_scores(
     seq_lens: torch.Tensor,
     max_seq_len: int = 0,
     token_scales: Optional[torch.Tensor] = None,
+    scorer_norm: str = "off",
 ) -> torch.Tensor:
     """Score tokens in logical-sequence-position space.
 
@@ -670,12 +672,24 @@ def _compute_logical_token_scores(
 
     # scores[b, i] = max_over_heads(q_proj[b] · sig[b, i])
     # q_proj: [bs, H, D] → [bs, 1, H, D]; gathered_sig: [bs, max_seq_len, H, D]
-    dot = (q_proj.unsqueeze(1).to(torch.float32) * gathered_sig.to(torch.float32)).sum(-1)  # [bs, max_seq_len, H]
-    if token_scales is not None:
-        # Dequant the int8 dot per (slot, head) before the cross-head max.
-        scale_layer = token_scales[layer_id]                # [max_tokens, H]
-        scale_gathered = scale_layer[safe_phys].to(torch.float32)  # [bs, max_seq_len, H]
-        dot = dot * scale_gathered
+    qf = q_proj.unsqueeze(1).to(torch.float32)          # [bs, 1, H, D]
+    sf = gathered_sig.to(torch.float32)                  # [bs, max_seq_len, H, D]
+    if scorer_norm == "cosine":
+        # Direction-only score (Loop-7 Tier-2.B): unit-normalize per (head)
+        # channel vector so per-token background magnitude can't dominate. The
+        # int8 dequant scale is a positive magnitude factor and cancels under
+        # normalization, so token_scales is intentionally ignored.
+        eps = 1e-6
+        qf = qf / (qf.norm(dim=-1, keepdim=True) + eps)
+        sf = sf / (sf.norm(dim=-1, keepdim=True) + eps)
+        dot = (qf * sf).sum(-1)  # [bs, max_seq_len, H]
+    else:
+        dot = (qf * sf).sum(-1)  # [bs, max_seq_len, H]
+        if token_scales is not None:
+            # Dequant the int8 dot per (slot, head) before the cross-head max.
+            scale_layer = token_scales[layer_id]                # [max_tokens, H]
+            scale_gathered = scale_layer[safe_phys].to(torch.float32)  # [bs, max_seq_len, H]
+            dot = dot * scale_gathered
     scores = dot.amax(dim=-1)  # [bs, max_seq_len]
 
     # Mask: unwritten physical slots and positions >= seq_len
@@ -705,6 +719,7 @@ def retrieve_topk_via_labels(
     seq_lens: Optional[torch.Tensor] = None,
     max_seq_len: int = 0,
     token_scales: Optional[torch.Tensor] = None,
+    scorer_norm: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """End-to-end selector flow: score → all-reduce → per-request mask → top-K → ascend.
 
@@ -732,6 +747,7 @@ def retrieve_topk_via_labels(
         and seq_lens is not None
     )
 
+    _norm = scorer_norm if scorer_norm is not None else _scorer_norm_mode()
     if use_logical:
         scores = _compute_logical_token_scores(
             queries=queries,
@@ -745,6 +761,7 @@ def retrieve_topk_via_labels(
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             token_scales=token_scales,
+            scorer_norm=_norm,
         )
         scores = all_reduce_token_scores(scores, process_group=process_group)
     else:
@@ -756,6 +773,7 @@ def retrieve_topk_via_labels(
             channel_weights=channel_weights,
             layer_id=layer_id,
             token_scales=token_scales,
+            scorer_norm=_norm,
         )
         scores = all_reduce_token_scores(scores, process_group=process_group)
 
@@ -808,9 +826,18 @@ def _maybe_record_recall_oracle(
     contention on the sink. Best-effort: a diagnostic failure must never break
     selection.
     """
+    import os as _os
+
     from sglang.srt.layers.attention.double_sparsity import oracle_artifact_sink as _sink
 
+    _dbg = _os.environ.get("SGLANG_DS_RECALL_ORACLE_DEBUG") == "1"
+
+    def _log(reason):
+        if _dbg and layer_id == 0:
+            print(f"[recall-oracle] layer0 skip: {reason}", flush=True)
+
     if not _sink.oracle_enabled():
+        _log("oracle disabled")
         return
     # Primary-rank guard (scores are all-reduce-identical across TP ranks).
     try:
@@ -820,11 +847,12 @@ def _maybe_record_recall_oracle(
             and torch.distributed.is_initialized()
             and torch.distributed.get_rank(group=process_group) != 0
         ):
-            return
+            return  # non-primary rank (silent — every rank but 0)
     except Exception:
         pass
     trial = _sink.get_active_trial()
     if trial is None:
+        _log("no active trial")
         return
     try:
         from sglang.srt.layers.attention.double_sparsity.selection_recall_oracle import (
@@ -834,7 +862,8 @@ def _maybe_record_recall_oracle(
         max_tokens = int(scores.shape[-1])
         span = [p for p in trial.needle_positions if 0 <= p < max_tokens]
         if not span:
-            return  # needle outside this request's token domain; nothing to record
+            _log(f"empty span (needle {trial.needle_positions} vs max_tokens {max_tokens})")
+            return
         needle = torch.as_tensor(span, dtype=torch.int64, device=scores.device)
         sample_idx = _sink.next_sample_index()
         payload = oracle_payload_for_row(
@@ -844,15 +873,17 @@ def _maybe_record_recall_oracle(
             stride=1,
             index_topk=int(max_top_k),
         )
-        _sink.record_oracle_sample(
+        wrote = _sink.record_oracle_sample(
             request_id=trial.request_id,
             trial_id=trial.trial_id,
             layer_id=int(layer_id),
             decode_step=int(sample_idx),
             payload=payload,
         )
-    except Exception:
-        # Diagnostic must not perturb serving; swallow and continue.
+        if _dbg and layer_id == 0:
+            print(f"[recall-oracle] layer0 RECORDED wrote={wrote} span={span[:3]} rank={payload.get('needle_worst_rank')}", flush=True)
+    except Exception as _e:
+        _log(f"exception {type(_e).__name__}: {_e}")
         return
 
 

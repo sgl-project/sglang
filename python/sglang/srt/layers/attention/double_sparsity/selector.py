@@ -266,6 +266,7 @@ class DoubleSparsitySelector:
                 seq_lens=seq_lens,
                 max_seq_len=max_seq_len,
                 token_scales=self.token_label_table.scales,
+                scorer_norm=getattr(self.config, "scorer_norm", "off"),
             )
 
         batch_size = req_pool_indices.shape[0]

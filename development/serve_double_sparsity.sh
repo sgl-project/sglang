@@ -55,8 +55,11 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.6}"
 LOG_DIR="${LOG_DIR:-$(pwd)/development/logs}"
 mkdir -p "${LOG_DIR}"
 
-DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s"}' \
-  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}")
+# Loop-7 Tier-2.B scorer normalization (config-borne so it reaches the TP
+# workers): "off" (default, production raw channel-dot) or "cosine".
+SCORER_NORM="${SCORER_NORM:-off}"
+DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "device_buffer_size": %s, "signature_dtype": "%s", "scorer_norm": "%s"}' \
+  "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}")
 
 # Radix cache: DS serves radix-off by default. To serve radix-on, set
 # RADIX_FIXTURE_ARTIFACT to a fixtures-passed state file (written by

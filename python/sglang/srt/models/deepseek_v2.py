@@ -2232,8 +2232,21 @@ class DeepseekV2AttentionMLA(
                     _ds_graph_state = getattr(
                         _dsa_metadata, "ds_graph_state", None
                     )
+                # Route decode through the eager selector.retrieve_topk path
+                # (which honors flag-gated scorer variants like scorer_norm) when
+                # a non-default scorer norm is configured, OR via the env escape
+                # hatch. Config-borne scorer_norm reaches the TP workers (env does
+                # not). Off by default; production keeps the graph-safe path.
+                _scorer_norm_cfg = getattr(
+                    getattr(_selector, "config", None), "scorer_norm", "off"
+                )
+                _force_eager_select = (
+                    os.environ.get("SGLANG_DS_FORCE_EAGER_SELECT", "0") == "1"
+                    or _scorer_norm_cfg != "off"
+                )
                 _use_graph_safe = (
-                    _ds_graph_state is not None
+                    not _force_eager_select
+                    and _ds_graph_state is not None
                     and _ds_graph_state.scratch_scores is not None
                     and _selector.token_label_table is not None
                     and _selector.channel_mask is not None
