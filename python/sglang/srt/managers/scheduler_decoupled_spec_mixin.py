@@ -351,17 +351,31 @@ class SchedulerDecoupledSpecMixin:
         VerifierCommitSegment: apply the verifier-committed segment and
         truncate suffix if needed
         """
+        def broadcast_ready_controls(rank, group, src) -> ReadyDraftControls | None:
+            payload = (
+                [ready_controls]
+                if ready_controls is not None and rank == src
+                else []
+            )
+            payload = broadcast_pyobj(payload, rank, group, src=src)
+            if not payload:
+                return None
+            if len(payload) != 1:
+                raise RuntimeError(
+                    "Expected a single ReadyDraftControls payload, "
+                    f"got {len(payload)}"
+                )
+            return payload[0]
+
         if getattr(self.server_args, "enable_dp_attention", False):
             if self.attn_tp_size != 1:
-                ready_controls = broadcast_pyobj(
-                    ready_controls,
+                ready_controls = broadcast_ready_controls(
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
             if self.attn_cp_size != 1:
-                ready_controls = broadcast_pyobj(
-                    ready_controls,
+                ready_controls = broadcast_ready_controls(
                     self.attn_cp_group.rank,
                     self.attn_cp_cpu_group,
                     src=self.attn_cp_group.ranks[0],
@@ -373,8 +387,7 @@ class SchedulerDecoupledSpecMixin:
             )
 
         if self.tp_size != 1:
-            ready_controls = broadcast_pyobj(
-                ready_controls,
+            ready_controls = broadcast_ready_controls(
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
