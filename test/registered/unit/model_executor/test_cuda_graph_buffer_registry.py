@@ -662,17 +662,55 @@ class TestPoolBackedAlloc(unittest.TestCase):
             r2.get_slot("ids").buffer.data_ptr(),
         )
 
-    def test_larger_pool_buffer_is_reused(self):
+    def test_same_size_shares_one_allocation(self):
+        a = self._reg(max_num_tokens=16, share_pool=True)
+        b = self._reg(max_num_tokens=16, share_pool=True)
+        a.register_slot(self._ids_slot("ids"))
+        b.register_slot(self._ids_slot("ids"))
+        # Identical (name, size, dtype, device) -> one shared allocation.
+        self.assertEqual(
+            a.get_slot("ids").buffer.data_ptr(),
+            b.get_slot("ids").buffer.data_ptr(),
+        )
+
+    def test_different_sizes_do_not_share(self):
         big = self._reg(max_num_tokens=32, share_pool=True)
         small = self._reg(max_num_tokens=16, share_pool=True)
         big.register_slot(self._ids_slot("ids"))
         small.register_slot(self._ids_slot("ids"))
-        # small asks for 16 but is aliased onto big's 32-elem storage.
+        # Different sizes -> different pool keys -> independent storage (no
+        # aliasing a smaller request onto a larger buffer).
         self.assertEqual(tuple(small.get_slot("ids").buffer.shape), (16,))
-        self.assertEqual(
+        self.assertEqual(tuple(big.get_slot("ids").buffer.shape), (32,))
+        self.assertNotEqual(
             small.get_slot("ids").buffer.data_ptr(),
             big.get_slot("ids").buffer.data_ptr(),
         )
+
+    def test_sharing_is_independent_of_registration_order(self):
+        from sglang.srt.model_executor import input_buffers
+
+        def _ptrs(first_tokens, second_tokens):
+            input_buffers._forward_input_buffer_pool.clear()
+            r1 = self._reg(max_num_tokens=first_tokens, share_pool=True)
+            r1.register_slot(self._ids_slot("ids"))
+            r2 = self._reg(max_num_tokens=second_tokens, share_pool=True)
+            r2.register_slot(self._ids_slot("ids"))
+            return r1.get_slot("ids").buffer, r2.get_slot("ids").buffer
+
+        # Same size: shares in either order.
+        a, b = _ptrs(16, 16)
+        self.assertEqual(a.data_ptr(), b.data_ptr())
+        b2, a2 = _ptrs(16, 16)
+        self.assertEqual(a2.data_ptr(), b2.data_ptr())
+
+        # Different sizes: never shares, regardless of which registers first
+        # (the old strictly-larger rule shared big-then-small but not
+        # small-then-big — that asymmetry is what this fix removes).
+        big_first, small_after = _ptrs(32, 16)
+        self.assertNotEqual(big_first.data_ptr(), small_after.data_ptr())
+        small_first, big_after = _ptrs(16, 32)
+        self.assertNotEqual(small_first.data_ptr(), big_after.data_ptr())
 
 
 class TestBuildDecodeRegistry(unittest.TestCase):

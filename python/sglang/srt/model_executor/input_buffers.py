@@ -2,40 +2,45 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
 
 from sglang.srt.utils import is_npu
 
-_forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
+# Keyed by ``(name, numel, dtype, device)``: buffers that mirror the same
+# ForwardBatch field *and* have an identical size/dtype/device share one
+# physical allocation. Keying on size — not name alone — makes the sharing
+# outcome independent of registration order. The previous "reuse iff the
+# existing buffer is strictly larger" rule was order-dependent two ways: a
+# larger buffer arriving after a smaller one orphaned the smaller (no share),
+# and equal sizes never shared at all. It could also have required repointing
+# an already-registered buffer onto larger storage — unsafe, because cuda graph
+# capture (which runs right after registration, per runner) burns the buffer's
+# ``data_ptr`` into the graph. Size-keying guarantees an entry is never grown
+# or replaced once created, so no captured buffer is ever repointed.
+_PoolKey = Tuple[str, int, torch.dtype, torch.device]
+_forward_input_buffer_pool: Dict[_PoolKey, torch.Tensor] = {}
 
 
 def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
-    """Coalesce a buffer by ``name`` into the process-wide input-buffer pool.
+    """Coalesce a buffer by ``(name, size, dtype, device)`` into the
+    process-wide input-buffer pool.
 
-    If a buffer was previously registered under ``name`` with at least as many
-    elements, reuse its storage; otherwise record ``new_buffer``. Returns a
-    view with the requested size/stride aliased onto the (possibly larger)
-    shared storage, so distinct callers that ask for the same name share one
-    physical allocation and therefore one ``data_ptr``.
+    Distinct callers that request the same field ``name`` with the same
+    size/dtype/device share one physical allocation (and therefore one
+    ``data_ptr``): the first registrant's buffer becomes canonical and every
+    later identical request is returned as a view aliased onto it. Requests
+    that differ in size get their own allocation — they never reuse or displace
+    an existing entry — so the sharing *structure* is independent of
+    registration order and no already-captured buffer is ever repointed.
     """
-    buffer_size = new_buffer.size()
-    buffer_stride = new_buffer.stride()
-
-    old_buffer = _forward_input_buffer_pool.get(name, None)
-    if old_buffer is not None:
-        assert (
-            new_buffer.dtype == old_buffer.dtype
-        ), f"Buffer {name} has different dtype than before."
-        assert (
-            new_buffer.device == old_buffer.device
-        ), f"Buffer {name} has different device than before."
-        if old_buffer.numel() > new_buffer.numel():
-            new_buffer = old_buffer
-
-    _forward_input_buffer_pool[name] = new_buffer
-    return new_buffer.as_strided(buffer_size, buffer_stride)
+    key: _PoolKey = (name, new_buffer.numel(), new_buffer.dtype, new_buffer.device)
+    canonical = _forward_input_buffer_pool.get(key, None)
+    if canonical is None:
+        _forward_input_buffer_pool[key] = new_buffer
+        canonical = new_buffer
+    return canonical.as_strided(new_buffer.size(), new_buffer.stride())
 
 
 @dataclass
