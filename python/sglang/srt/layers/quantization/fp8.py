@@ -309,6 +309,17 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+def _dequant_mxfp8_weight_for_fallback(layer: torch.nn.Module) -> torch.Tensor:
+    """MXFP8 weight -> BF16 on-the-fly."""
+    weight_fp8 = layer.weight          # FP8 E4M3, (N, K)
+    scale_u8 = layer.weight_scale_inv
+    N, K = weight_fp8.shape
+    w_view = weight_fp8.view(N, K // 32, 32)
+    scale_f32 = (scale_u8.to(torch.int32) << 23).view(torch.float32)
+    w_deq = (w_view.float() * scale_f32.unsqueeze(-1)).to(torch.bfloat16)
+    return w_deq.reshape(N, K)
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -351,6 +362,9 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+        self._skip_small_batch_fallback = (
+            self.use_mxfp8 and get_fp8_gemm_runner_backend().is_flashinfer_trtllm()
+        )
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -762,6 +776,17 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
+            # Small batch → on-the-fly dequant to BF16 + F.linear.
+            # isinstance(x, tuple): activation is (fp8_tensor, scale) tuple
+            if isinstance(x, tuple):
+                batch_size = x[0].numel() // x[0].shape[-1]
+            else:
+                batch_size = x.numel() // x.shape[-1]
+            if batch_size < 32 and not self._skip_small_batch_fallback:
+                weight_bf16 = _dequant_mxfp8_weight_for_fallback(layer)
+                input_tensor = x[0] if isinstance(x, tuple) else x
+                return F.linear(input_tensor, weight_bf16, bias)
+
             if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
             else:
