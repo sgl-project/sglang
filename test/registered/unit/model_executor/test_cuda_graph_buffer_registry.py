@@ -841,6 +841,53 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(torch.equal(col[:3], torch.tensor([7, 8, 9], dtype=torch.int32)))
         self.assertTrue(torch.equal(req[:3], torch.tensor([1, 1, 2], dtype=torch.int32)))
 
+    def test_source_with_pp_registers_proxy_slots(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        hs = torch.zeros((8, 2), dtype=torch.int32)
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+            pp_proxy_tensors={"hidden_states": hs},
+        )
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        self.assertTrue(reg.has_slot("pp_proxy_tensors.hidden_states"))
+        self.assertEqual(
+            reg.get_slot("pp_proxy_tensors.hidden_states").buffer.data_ptr(),
+            hs.data_ptr(),
+        )
+        # The pp input is not on the FB — it rides on the fill_from kwarg.
+        fb = _MiniForwardBatch(batch_size=3)
+        pp = SimpleNamespace(
+            tensors={"hidden_states": torch.ones((3, 2), dtype=torch.int32)}
+        )
+        reg.fill_from(
+            fb,
+            raw_bs=3,
+            padded_bs=4,
+            raw_num_tokens=3,
+            padded_num_tokens=8,
+            pp_proxy_tensors=pp,
+        )
+        self.assertTrue(torch.all(hs[:3] == 1))
+        self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
+
 
 class TestFillOncePolicy(unittest.TestCase):
     """FILL_ONCE initializes the whole buffer at alloc and never resets the

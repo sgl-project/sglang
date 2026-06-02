@@ -342,6 +342,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             padded_bs=bs,
             raw_num_tokens=raw_num_token,
             padded_num_tokens=bs * num_tokens_per_bs,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         # Residual fields the registry does not own yet.
@@ -357,14 +358,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ):
             dsts.append(self.bootstrap_room_ids_int[:raw_bs])
             srcs.append(forward_batch.bootstrap_room_ids_int)
-
-        # Pipeline-parallel proxy tensors.
-        if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
-            for key, buf in self.pp_proxy_tensors.items():
-                src = pp_proxy_tensors.tensors[key]
-                dim = src.shape[0]
-                dsts.append(buf[:dim])
-                srcs.append(src)
 
         # Batch the residual GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
