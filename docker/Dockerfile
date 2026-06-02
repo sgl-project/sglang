@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.11.post1
+ARG FLASHINFER_VERSION=0.6.12
 ARG MOONCAKE_VERSION=0.3.11.post1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -249,6 +249,45 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
+
+# Optional source override for DeepGEMM changes that are not available in a
+# released sgl-deep-gemm wheel yet. Keep the default empty so official builds
+# continue to use the pinned package version from python/pyproject.toml.
+ARG DEEPGEMM_SOURCE_REPO
+ARG DEEPGEMM_SOURCE_REF
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "${DEEPGEMM_SOURCE_REPO}" ]; then \
+        rm -rf /tmp/deepgemm_src && \
+        git clone --recursive "${DEEPGEMM_SOURCE_REPO}" /tmp/deepgemm_src && \
+        cd /tmp/deepgemm_src && \
+        if [ -n "${DEEPGEMM_SOURCE_REF}" ]; then \
+            git checkout "${DEEPGEMM_SOURCE_REF}"; \
+        fi && \
+        git submodule update --init --recursive && \
+        DG_FORCE_BUILD=1 python3 -m pip install --no-build-isolation --no-deps --force-reinstall -v . && \
+        cd /sgl-workspace && \
+        rm -rf /tmp/deepgemm_src; \
+    fi
+
+# Optional source override for FlashInfer changes that are not available in a
+# released flashinfer-python wheel yet. Keep the default empty so official
+# builds continue to use the pinned package versions from python/pyproject.toml.
+ARG FLASHINFER_SOURCE_REPO
+ARG FLASHINFER_SOURCE_REF
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "${FLASHINFER_SOURCE_REPO}" ]; then \
+        rm -rf /tmp/flashinfer_src && \
+        git clone --recursive "${FLASHINFER_SOURCE_REPO}" /tmp/flashinfer_src && \
+        cd /tmp/flashinfer_src && \
+        if [ -n "${FLASHINFER_SOURCE_REF}" ]; then \
+            git checkout "${FLASHINFER_SOURCE_REF}"; \
+        fi && \
+        git submodule update --init --recursive && \
+        python3 -m pip install --upgrade "setuptools>=77,<82" build && \
+        python3 -m pip install --no-build-isolation --no-deps --force-reinstall -v ".[cu13]" && \
+        cd /sgl-workspace && \
+        rm -rf /tmp/flashinfer_src; \
+    fi
 
 ########################################################
 # PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
@@ -781,6 +820,17 @@ COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/l
 
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace
+
+# Some Python dependencies can be satisfied by Ubuntu system packages in the
+# framework stage, but runtime starts from a fresh CUDA image and only copies
+# /usr/local site-packages. Reinstall those packages into /usr/local so imports
+# and pip dependency checks do not depend on framework-only system packages.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    distro \
+    pyparsing \
+    cryptography \
+    PyJWT
 
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway

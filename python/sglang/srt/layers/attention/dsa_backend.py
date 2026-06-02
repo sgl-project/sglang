@@ -273,7 +273,14 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashmla_auto",
+    "flashinfer_sparse_mla",
+    "fa3",
+    "tilelang",
+    "aiter",
+    "trtllm",
 ]
 
 
@@ -333,6 +340,10 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
+        self.flashinfer_sparse_mla_wrapper = None
+        self.flashinfer_sparse_mla_wrapper_max_tokens = 0
+        self.flashinfer_sparse_mla_wrapper_max_heads = 0
+        self.flashinfer_sparse_mla_wrapper_d_v = 0
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -637,10 +648,14 @@ class DeepseekSparseAttnBackend(
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        if (
+            is_cuda()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            )
         ):
             try:
                 import deep_gemm
@@ -928,10 +943,14 @@ class DeepseekSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend(include_v2=True)
+        if (
+            is_cuda()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend(include_v2=True)
+            )
         ):
             try:
                 import deep_gemm
@@ -1115,10 +1134,14 @@ class DeepseekSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend(include_v2=True)
+        if (
+            is_cuda()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend(include_v2=True)
+            )
         ):
             try:
                 import deep_gemm
@@ -1333,7 +1356,7 @@ class DeepseekSparseAttnBackend(
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
-        if is_cuda():
+        if is_cuda() and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             try:
                 import deep_gemm
 
@@ -1537,6 +1560,16 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
+        elif dsa_impl == "flashinfer_sparse_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
@@ -1679,6 +1712,16 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+            )
+        elif self.dsa_decode_impl == "flashinfer_sparse_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -1871,6 +1914,109 @@ class DeepseekSparseAttnBackend(
             o = o[:, :, :num_q_heads, :]
 
         return o
+
+    def _get_flashinfer_sparse_mla_wrapper(
+        self,
+        num_tokens: int,
+        num_heads: int,
+        v_head_dim: int,
+        device: torch.device,
+    ):
+        import flashinfer
+
+        if not hasattr(flashinfer, "BatchSparseMLAPagedAttentionWrapper"):
+            raise RuntimeError(
+                "flashinfer_sparse_mla DSA backend requires FlashInfer with "
+                "BatchSparseMLAPagedAttentionWrapper. Install a FlashInfer build "
+                "that includes the SM120 sparse MLA API and a matching "
+                "flashinfer-cubin package."
+            )
+
+        if (
+            self.flashinfer_sparse_mla_wrapper is None
+            or num_tokens > self.flashinfer_sparse_mla_wrapper_max_tokens
+            or num_heads > self.flashinfer_sparse_mla_wrapper_max_heads
+            or v_head_dim != self.flashinfer_sparse_mla_wrapper_d_v
+        ):
+            wrapper_cls = flashinfer.BatchSparseMLAPagedAttentionWrapper
+            self.flashinfer_sparse_mla_wrapper = wrapper_cls(
+                max_num_tokens=max(num_tokens, 1),
+                max_num_heads=max(num_heads, 1),
+                d_v=v_head_dim,
+                device=device,
+            )
+            self.flashinfer_sparse_mla_wrapper_max_tokens = max(num_tokens, 1)
+            self.flashinfer_sparse_mla_wrapper_max_heads = max(num_heads, 1)
+            self.flashinfer_sparse_mla_wrapper_d_v = v_head_dim
+
+        return self.flashinfer_sparse_mla_wrapper
+
+    def _forward_flashinfer_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        if self.real_page_size != 64:
+            raise RuntimeError(
+                f"flashinfer_sparse_mla DSA backend requires page size 64, got {self.real_page_size}."
+            )
+        if v_head_dim != 512:
+            raise RuntimeError(
+                f"flashinfer_sparse_mla DSA backend requires v_head_dim=512, got {v_head_dim}."
+            )
+
+        num_tokens, num_heads, _ = q_all.shape
+        if num_tokens == 0:
+            return q_all.new_empty((0, num_heads, v_head_dim))
+        if q_all.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"flashinfer_sparse_mla DSA backend requires BF16 queries, got {q_all.dtype}."
+            )
+
+        q_input = q_all.contiguous()
+        indices = page_table_1
+        if indices.dtype != torch.int32:
+            indices = indices.to(torch.int32).contiguous()
+        else:
+            indices = indices.contiguous()
+
+        # FlashInfer's SM120 sparse MLA kernel consumes the packed FP8 DSA KV
+        # byte layout: [num_blocks, page_size=64, h_kv=1, bytes_per_token].
+        kv_cache = kv_cache.view(torch.uint8).view(
+            -1, self.real_page_size, 1, self.kv_cache_dim
+        )
+        output = q_input.new_empty((num_tokens, num_heads, v_head_dim))
+
+        mid_out = None
+        mid_lse = None
+        if num_tokens <= 64:
+            num_splits = (indices.shape[-1] + 63) // 64
+            mid_out = q_input.new_empty((num_tokens, num_heads, num_splits, v_head_dim))
+            mid_lse = torch.empty(
+                (num_tokens, num_heads, num_splits),
+                dtype=torch.float32,
+                device=q_input.device,
+            )
+
+        wrapper = self._get_flashinfer_sparse_mla_wrapper(
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            v_head_dim=v_head_dim,
+            device=q_input.device,
+        )
+        wrapper.run(
+            q=q_input,
+            kv_cache=kv_cache,
+            indices=indices,
+            output=output,
+            sm_scale=sm_scale,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )
+        return output
 
     def _forward_standard_mha(
         self,

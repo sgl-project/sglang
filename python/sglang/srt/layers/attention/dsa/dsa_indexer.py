@@ -610,7 +610,7 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
+        if _is_cuda and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
@@ -650,6 +650,21 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
+            )
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+            from sglang.srt.layers.attention.dsv4.indexer import (
+                fp8_paged_mqa_logits_torch,
+            )
+
+            logits = fp8_paged_mqa_logits_torch(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d[:q_offset].reshape(-1),
+                block_tables[:q_offset],
+                None,
+                max_seq_len,
+                clean_logits=False,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
