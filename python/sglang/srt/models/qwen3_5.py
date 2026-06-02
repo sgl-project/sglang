@@ -1062,8 +1062,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             and not server_args.disable_shared_experts_fusion
             and not can_fuse_shared_expert(config, quant_config)
         ):
-        server_args.disable_shared_experts_fusion = True
-        logger.info("Qwen3.5: shared-expert fusion is not possible ... ")
+            server_args.disable_shared_experts_fusion = True
+            logger.info("Qwen3.5: shared-expert fusion is not possible ... ")
 
     def __init__(
         self,
