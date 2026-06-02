@@ -289,7 +289,10 @@ def _is_encoded_preview_transport(
     content_type: str,
     output_format: str | None,
 ) -> bool:
-    return output_format in ENCODED_PREVIEW_FORMATS and content_type == RAW_RGB_CONTENT_TYPE
+    return (
+        output_format in ENCODED_PREVIEW_FORMATS
+        and content_type == RAW_RGB_CONTENT_TYPE
+    )
 
 
 async def _build_encoded_preview_payloads(
