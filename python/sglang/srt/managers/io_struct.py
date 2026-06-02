@@ -891,6 +891,9 @@ class EmbeddingReqInput(BaseReq):
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
 
+    # Whether to return prompt token IDs without computing logprobs
+    return_prompt_token_ids: bool = False
+
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
@@ -997,6 +1000,7 @@ class EmbeddingReqInput(BaseReq):
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
+                return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1026,6 +1030,7 @@ class EmbeddingReqInput(BaseReq):
                 http_worker_ipc=self.http_worker_ipc,
                 received_time=self.received_time,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
+                return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None

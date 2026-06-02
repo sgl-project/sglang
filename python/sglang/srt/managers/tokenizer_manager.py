@@ -584,7 +584,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self.rid_to_state[obj.rid]
-                if getattr(obj, "return_prompt_token_ids", False):
+                if obj.return_prompt_token_ids:
                     state.prompt_token_ids = list(tokenized_obj.input_ids)
                 self._send_one_request(tokenized_obj)
                 async for response in self._wait_one_response(obj, request):
@@ -1448,7 +1448,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(batch_size):
                     tmp_obj = obj[i]
                     state = self.rid_to_state[tmp_obj.rid]
-                    if getattr(tmp_obj, "return_prompt_token_ids", False):
+                    if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
@@ -1463,7 +1463,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
                         state = self.rid_to_state[tmp_obj.rid]
-                        if getattr(tmp_obj, "return_prompt_token_ids", False):
+                        if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
                         generators.append(self._wait_one_response(tmp_obj, request))
@@ -1516,7 +1516,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
-                    if getattr(tmp_obj, "return_prompt_token_ids", False):
+                    if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
                     generators.append(self._wait_one_response(tmp_obj, request))
