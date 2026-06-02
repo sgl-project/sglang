@@ -69,6 +69,11 @@ class NPUPlatformBase(Platform):
         return True
 
     @classmethod
+    def inference_mode(cls):
+        # npu kernels in diffusion paths may need tensor version counters
+        return torch.no_grad()
+
+    @classmethod
     def is_full_nvlink(cls, physical_device_ids: list[int]) -> bool:
         logger.exception(
             "NVLink detection not possible, as context support was"
@@ -119,6 +124,57 @@ class NPUPlatformBase(Platform):
         if selected_backend == AttentionBackendEnum.FA:
             logger.info("Using Ascend Flash Attention backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
+
+        elif selected_backend == AttentionBackendEnum.LASER_ATTN:
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (  # noqa: F401
+                    LaserAttentionBackend,
+                )
+
+                logger.info("Using Laser Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn.LaserAttentionBackend"
+            except ImportError as e:
+                logger.error(f"Failed to import Laser Attention backend: {e}")
+                raise ImportError(
+                    "Laser Attention backend is not installed. "
+                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
+                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                ) from e
+
+        elif selected_backend == AttentionBackendEnum.BLOCK_SPARSE_ATTN:
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attn import (  # noqa: F401
+                    BlockSparseAttentionBackend,
+                )
+
+                logger.info("Using Block Sparse Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attn.BlockSparseAttentionBackend"
+            except ImportError as e:
+                logger.error(f"Failed to import Block Sparse Attention backend: {e}")
+                raise ImportError(
+                    "Block Sparse Attention backend is not installed. "
+                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
+                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                ) from e
+
+        elif selected_backend == AttentionBackendEnum.RAIN_FUSION_ATTN:
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn import (  # noqa: F401
+                    RainFusionAttentionBackend,
+                )
+
+                logger.info("Using Rain Fusion Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn.RainFusionAttentionBackend"
+            except ImportError as e:
+                logger.error(f"Failed to import Rain Fusion Attention backend: {e}")
+                raise ImportError(
+                    "Rain Fusion Attention backend is not installed. "
+                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
+                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                ) from e
 
         logger.info("Using Torch SDPA backend.")
         return (

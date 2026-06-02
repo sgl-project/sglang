@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.6
+# Build sgl-router binary for k8s integration E2E.
+# Context root: repo root (one level above experimental/sgl-router/).
+
+# Matches rust-toolchain.toml's pinned channel, avoiding an in-build rustup channel-sync.
+FROM rust:1.90-bookworm AS builder
+
+# Pin to the exact toolchain pre-installed in the base image so rustup
+# doesn't try to sync the channel manifest when it sees rust-toolchain.toml's
+# `channel = "1.90"`.
+ENV RUSTUP_TOOLCHAIN=1.90.0
+
+# libssl-dev + pkg-config ship with rust:1.90-bookworm already; no apt-get needed.
+
+WORKDIR /build
+
+# Copy just the sgl-router crate (context is the repo root)
+COPY experimental/sgl-router /build/experimental/sgl-router
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/experimental/sgl-router/target \
+    cd /build/experimental/sgl-router \
+    && cargo build --release --bin sgl-router \
+    && cp target/release/sgl-router /usr/local/bin/sgl-router
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/sgl-router /usr/local/bin/sgl-router
+
+# Tiny tokenizer fixture used by the E2E config
+COPY experimental/sgl-router/tests/fixtures/tiny_tokenizer.json /etc/tokenizer/tiny.json
+
+EXPOSE 8090
+
+ENTRYPOINT ["sgl-router"]

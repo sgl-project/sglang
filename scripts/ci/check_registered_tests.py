@@ -22,11 +22,11 @@ def main() -> int:
     ci_register = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ci_register)
 
-    # Same filter as run_suite.py: skip conftest.py and __init__.py
+    # Same filter as run_suite.py: skip conftest.py, __init__.py, and utils.py
     files = sorted(
         f
         for f in glob.glob("test/registered/**/*.py", recursive=True)
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        if os.path.basename(f) not in ("conftest.py", "__init__.py", "utils.py")
     )
     if not files:
         return 0
@@ -34,7 +34,7 @@ def main() -> int:
     errors = []
     for f in files:
         try:
-            registries = ci_register.ut_parse_one_file(f)
+            registries, _has_main_entry = ci_register.ut_parse_one_file(f)
             if len(registries) == 0:
                 errors.append(f)
         except Exception:
