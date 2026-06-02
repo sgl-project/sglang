@@ -269,7 +269,12 @@ def process_anyres_image(image, processor, grid_pinpoints):
 
 
 def load_image_from_base64(image):
-    return Image.open(BytesIO(pybase64.b64decode(image, validate=True)))
+    # Force the pixel decode here (worker thread) instead of lazily on first
+    # access back on the event-loop/scheduler thread (mirrors vLLM). Same intent
+    # as common.py:_load_image; kept consistent in case this path is used.
+    img = Image.open(BytesIO(pybase64.b64decode(image, validate=True)))
+    img.load()
+    return img
 
 
 def expand2square(pil_img, background_color):
