@@ -43,13 +43,11 @@ class CpuDeviceMixin(DeviceMixin):
         return float(psutil.Process().memory_info().rss)
 
     def get_device(self, local_rank: int) -> "torch.device":
-        # ``local_rank`` is intentionally ignored. PyTorch's CPU device is
-        # unindexed — ``torch.device("cpu", n)`` parses but the index is a
-        # semantic no-op, unlike CUDA where it selects a physical GPU. CPU
-        # tensor parallelism does have per-rank meaning (one rank per
-        # sub-NUMA cluster), but that isolation is applied out-of-band via
-        # OpenMP thread binding + numactl pinning (see
-        # ModelRunner.init_threads_binding), not through the device object.
+        # local_rank is ignored: all CPU ranks share the one CPU device, so
+        # there is nothing rank-specific to return. PyTorch enforces this —
+        # Device::validate() asserts a CPU index must be -1 or 0 (c10/core/
+        # Device.h). Per-rank isolation is done via OpenMP/numactl binding
+        # (ModelRunner.init_threads_binding), not the device object.
         return torch.device("cpu")
 
     def set_device(self, device: "torch.device") -> None:
