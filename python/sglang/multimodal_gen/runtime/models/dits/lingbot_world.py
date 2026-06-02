@@ -80,6 +80,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.realtime.causal_state import RealtimeCausalDiTState
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -1120,6 +1121,10 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
     def _get_request_cache(forward_batch, name: str) -> dict | None:
         if forward_batch is None:
             return None
+        session = getattr(forward_batch, "session", None)
+        if session is not None:
+            state = session.get_or_create_state(RealtimeCausalDiTState)
+            return state.runtime_cache.setdefault(name, {})
         extra = getattr(forward_batch, "extra", None)
         if extra is None:
             return None
@@ -1237,14 +1242,48 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         encoder_hidden_states_image: torch.Tensor | None,
         crossattn_cache: list[CrossAttentionKVCache] | None,
     ):
+        forward_batch = get_forward_context().forward_batch
+        temb, timestep_proj = self._prepare_cached_time_embeddings(
+            timestep=timestep,
+            forward_batch=forward_batch,
+        )
         if self._all_crossattn_caches_initialized(crossattn_cache):
-            temb = self.condition_embedder.time_embedder(timestep.flatten())
-            timestep_proj = self.condition_embedder.time_modulation(temb)
             return temb, timestep_proj, encoder_hidden_states, None
 
-        return self.condition_embedder(
-            timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
+        encoder_hidden_states = self.condition_embedder.text_embedder(
+            encoder_hidden_states
         )
+        if encoder_hidden_states_image is not None:
+            assert self.condition_embedder.image_embedder is not None
+            encoder_hidden_states_image = self.condition_embedder.image_embedder(
+                encoder_hidden_states_image
+            )
+
+        return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
+
+    def _prepare_cached_time_embeddings(
+        self,
+        *,
+        timestep: torch.LongTensor,
+        forward_batch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = self._get_request_cache(forward_batch, "lingbot_time_embeddings")
+        current_timestep = get_forward_context().current_timestep
+        cache_key = (
+            current_timestep,
+            tuple(timestep.shape),
+            timestep.dtype,
+            timestep.device.type,
+            timestep.device.index,
+        )
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
+        temb = self.condition_embedder.time_embedder(timestep.flatten())
+        timestep_proj = self.condition_embedder.time_modulation(temb)
+        if cache is not None:
+            cache[cache_key] = (temb, timestep_proj)
+        return temb, timestep_proj
 
     def forward(
         self,
