@@ -1232,13 +1232,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            # stride = accept_tokens per-req width = accept_index.shape[1]
-            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
             fill_bonus_tokens[(bs,)](
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
-                accept_index.shape[1],
+                self.speculative_num_draft_tokens,
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
@@ -1246,13 +1244,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
-            )
-
-        if not batch.forward_mode.is_idle() and self.topk > 1:
-            # topk == 1 needs nothing here: the accepted path is already the front
-            # chain, so the whole compaction is an identity transform.
-            predict = self._finalize_accepted_tree_path(
-                batch, accept_index, accept_lens, predict, logits_output, bs
             )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
@@ -1336,30 +1327,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 model=self.target_worker.model_runner.model,
             )
 
-    def _finalize_accepted_tree_path(
-        self,
-        batch: ScheduleBatch,
-        accept_index: torch.Tensor,
-        accept_lens: torch.Tensor,
-        predict: torch.Tensor,
-        logits_output,
-        bs: int,
-    ) -> torch.Tensor:
-        """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
-        hidden_states -- to the contiguous front of each per-req block, which the
-        downstream chain-layout code (draft-extend select_index, committed-KV reads)
-        assumes. Returns compacted predict; mutates logits_output.hidden_states
-        (moved only when present)."""
-        self.move_accepted_tokens_to_target_kvcache(
-            batch, accept_index, accept_lens - 1
-        )
-        predict = self._compact_accepted_to_front(predict, accept_index, bs)
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = self._compact_accepted_to_front(
-                logits_output.hidden_states, accept_index, bs
-            )
-        return predict
-
     def move_accepted_tokens_to_target_kvcache(
         self,
         batch: ScheduleBatch,
@@ -1376,9 +1343,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
         """
         bs = len(batch.seq_lens)
-        # accept_index element count, NOT bs * num_draft_tokens: for topk > 1 the
-        # tree exceeds the accepted chain, over-reading accept_index (illegal memory).
-        size = bs * accept_index.shape[1]
+        size = bs * self.speculative_num_draft_tokens
 
         # fill_accepted_out_cache_loc reads out_cache_loc[accept_index]; -1 sentinel ok.
         maybe_detect_oob(
@@ -1414,24 +1379,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
-
-    def _compact_accepted_to_front(
-        self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
-    ) -> torch.Tensor:
-        """Gather the accepted tree path to the front of each per-req block.
-
-        ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
-        ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
-        Padded entries clamp to node 0 but land past accept_lens (never read);
-        trailing unaccepted slots stay and are freed as overshoot.
-        """
-        nd = self.speculative_num_draft_tokens
-        s1 = accept_index.shape[1]  # spec_steps + 1
-        safe = accept_index.to(torch.int64).clamp(min=0).reshape(-1)
-        gathered = x[safe]
-        out = x.clone()
-        out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
-        return out
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self._draft_worker.draft_runner.update_weights_from_disk(

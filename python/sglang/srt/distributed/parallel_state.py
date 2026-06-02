@@ -689,6 +689,21 @@ class GroupCoordinator:
             total_bytes = input_.numel() * input_.element_size()
             use_1stage_ar = total_bytes <= 128 * 1024
 
+        if (
+            getattr(ca_comm, "_IS_CAPTURING", False)
+            and not torch.cuda.is_current_stream_capturing()
+            and is_in_piecewise_cuda_graph()
+        ):
+            if not hasattr(ca_comm, "fused_ar_rms"):
+                return None
+            return ca_comm.fused_ar_rms(
+                input_,
+                residual_inp_,
+                w=weight_,
+                eps=eps,
+                registered=False,
+                use_1stage=use_1stage_ar,
+            )
         fused_outputs = ca_comm.custom_fused_ar_rms(
             input_,
             residual_inp_,
@@ -804,6 +819,35 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
+        # Aiter's should_custom_ag still owns shape/layout validation:
+        # 16B alignment, weak-contiguous, supported topology, and per-rank
+        # size <= max_size/(world*2).
+        # On a hit, writes directly into the caller's pre-allocated `output` via
+        # all_gather_reg during CUDA-graph capture and all_gather_unreg otherwise.
+        ca_comm = self.ca_comm
+        if (
+            is_hip()
+            and envs.SGLANG_USE_AITER_AG.get()
+            and self._has_aiter_custom_all_gather()
+            and input.is_contiguous()
+            and output.is_contiguous()
+            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and ca_comm.should_custom_ag(input)
+        ):
+            if getattr(ca_comm, "_IS_CAPTURING", False):
+                if torch.cuda.is_current_stream_capturing():
+                    ca_comm.all_gather_reg(input, out=output, dim=0)
+                elif is_in_piecewise_cuda_graph():
+                    ca_comm.all_gather_unreg(input, out=output, dim=0)
+                else:
+                    # True CUDA graph warmup: avoid a different host collective.
+                    output.zero_()
+                return
+            else:
+                ca_comm.all_gather_unreg(input, out=output, dim=0)
+                return
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -817,6 +861,24 @@ class GroupCoordinator:
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
             )
+
+    def _has_aiter_custom_all_gather(self) -> bool:
+        if self._deterministic_collectives_enabled():
+            return False
+        ca_comm = self.ca_comm
+        return (
+            ca_comm is not None
+            and not getattr(ca_comm, "disabled", True)
+            and hasattr(ca_comm, "should_custom_ag")
+            and hasattr(ca_comm, "all_gather_reg")
+            and hasattr(ca_comm, "all_gather_unreg")
+        )
+
+    @staticmethod
+    def _deterministic_collectives_enabled() -> bool:
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            return envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu or _is_xpu:
