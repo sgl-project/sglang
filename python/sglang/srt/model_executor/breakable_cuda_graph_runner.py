@@ -169,6 +169,9 @@ class BreakableCudaGraphRunner:
 
     def _init_buffers(self, model_runner):
         """Initialize input buffers."""
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
         from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
             PrefillInputBuffers,
         )
@@ -214,6 +217,21 @@ class BreakableCudaGraphRunner:
             mrope_positions=mrope_positions,
         )
         self.buffers.share_buffers()
+
+        # Token-axis FB-shared slot registry adopting the PrefillInputBuffers
+        # storage. Breakable has no mamba track and bs is not padded here, so
+        # there are no bs-axis slots (max_bs is unused).
+        self.buffer_registry = build_prefill_registry(
+            device=self.device,
+            max_bs=1,
+            max_num_token=self.max_num_tokens,
+            cache_loc_dtype=torch.int64 if not is_npu() else torch.int32,
+            is_multimodal=self.is_multimodal,
+            hidden_size=model_runner.model_config.hidden_size,
+            embed_dtype=model_runner.dtype,
+            enable_mamba_track=False,
+            source=self.buffers,
+        )
 
     @torch.no_grad()
     def _run_forward(self, forward_batch, num_tokens):
