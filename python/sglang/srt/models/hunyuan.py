@@ -14,7 +14,7 @@
 """Inference-only HunYuan model compatible with HuggingFace weights."""
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -528,7 +528,7 @@ class HunYuanModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is not None:
             hidden_states = input_embeds
         else:
