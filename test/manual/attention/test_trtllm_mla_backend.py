@@ -268,6 +268,7 @@ class MockModelRunner:
             device=self.device,
             enable_memory_saver=False,
         )
+        self.hisparse_coordinator = None
 
 
 def compare_outputs(trtllm_out, reference_out, tolerance=1e-2):
