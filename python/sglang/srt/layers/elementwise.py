@@ -528,3 +528,111 @@ def silu_and_mul_triton(
         return out_hidden_states, out_scales
     else:
         return out_hidden_states, None
+
+
+@triton.jit
+def _fused_sigmoid_mul_kernel(
+    output_ptr,
+    attn_output_ptr,
+    gate_ptr,
+    n_ele,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fuse sigmoid(gate) * attn_output into a single kernel."""
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_ele
+
+    attn = tl.load(attn_output_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    result = attn * tl.sigmoid(g)
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+
+def fused_sigmoid_mul(
+    attn_output: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Fused sigmoid-mul for attention output gating.
+
+    Equivalent to: attn_output * sigmoid(gate)
+    """
+    out = torch.empty_like(attn_output)
+    n_elements = out.numel()
+    grid = (triton.cdiv(n_elements, 1024),)
+    _fused_sigmoid_mul_kernel[grid](
+        out, attn_output, gate, n_elements, BLOCK_SIZE=1024, num_warps=8
+    )
+    return out
+
+
+@triton.jit
+def _fused_gate_sigmoid_mul_add_kernel(
+    hidden_states_ptr,  # [num_tokens, hidden_dim]
+    gate_weight_ptr,  # [hidden_dim]
+    shared_output_ptr,  # [num_tokens, hidden_dim]
+    final_hidden_states_ptr,  # [num_tokens, hidden_dim]
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0).to(tl.int64)
+    row_offset = pid * hidden_dim
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden_dim
+
+    # Phase 1: dot product in fp32
+    h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.sum(h * w, axis=0)
+
+    # Sigmoid in fp32
+    gate_val = tl.sigmoid(gate)
+
+    # Phase 2: final_hidden_states += gate_val * shared_output
+    s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    f = tl.load(
+        final_hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    result = f + gate_val * s
+
+    tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
+
+
+def fused_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+) -> None:
+    """
+    Fused gate-sigmoid-mul-add for MoE shared expert gating.
+
+    Equivalent to:
+        gate = hidden_states @ gate_weight
+        final_hidden_states += sigmoid(gate).unsqueeze(1) * shared_output
+    """
+    num_tokens, hidden_dim = hidden_states.shape
+
+    max_warps = 16 if _is_hip else 32
+    config = {
+        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+        "num_warps": max(
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+        ),
+    }
+
+    _fused_gate_sigmoid_mul_add_kernel[(num_tokens,)](
+        hidden_states,
+        gate_weight,
+        shared_output,
+        final_hidden_states,
+        hidden_dim=hidden_dim,
+        **config,
+    )
