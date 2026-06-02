@@ -1086,12 +1086,12 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 k_cache = (
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                     .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
                     .contiguous()
                 )
                 v_cache = (
-                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                    self.token_to_kv_pool.get_value_buffer(layer.layer_id)
                     .view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
                     .contiguous()
                 )
@@ -1869,21 +1869,18 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if sinks is not None:
-            # k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            # v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-
-            # # Use SWA block tables if hybrid SWA is enabled for this layer
+            # Use SWA block tables if hybrid SWA is enabled for this layer
             if self.is_hybrid_swa and layer.sliding_window_size != -1:
                 block_tables = self.forward_metadata.block_tables_swa
             else:
                 block_tables = self.forward_metadata.block_tables
             k_cache = (
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
                 .contiguous()
             )
             v_cache = (
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id)
                 .view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
                 .contiguous()
             )
