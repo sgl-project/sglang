@@ -180,6 +180,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         kv_cache: CausalSelfAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        update_cache_only: bool = False,
     ):
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
@@ -243,6 +244,8 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             current_chunk_start=current_start,
             debug_name="LingBot KV cache",
         )
+        if update_cache_only:
+            return v
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         x = attn_impl(
             roped_query,
@@ -926,6 +929,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         current_start: int = 0,
         cache_start: int | None = None,
         c2ws_plucker_emb: torch.Tensor | None = None,
+        update_cache_only: bool = False,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -963,7 +967,10 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             kv_cache,
             current_start,
             cache_start,
+            update_cache_only=update_cache_only,
         )
+        if update_cache_only:
+            return hidden_states
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -1359,6 +1366,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 current_start=current_start,
                 cache_start=cache_start,
                 c2ws_plucker_emb=c2ws_plucker_emb,
+                update_cache_only=skip_final_projection
+                and block_index == len(self.blocks) - 1,
             )
 
         if skip_final_projection:
