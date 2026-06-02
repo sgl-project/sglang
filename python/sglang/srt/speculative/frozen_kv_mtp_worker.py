@@ -68,10 +68,10 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
-    fast_topk,
     generate_token_bitmask,
     select_top_k_tokens,
 )
+from sglang.srt.speculative.triton_ops.fused_softmax_topk import fused_softmax_topk
 from sglang.srt.utils import empty_context
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -392,7 +392,9 @@ class FrozenKVMTPWorker(TpModelWorker):
     def _capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: FrozenKVMTPDraftInput
     ) -> None:
-        capture_for_decode(logits_output, draft_input, self.topk)
+        capture_for_decode(
+            logits_output, draft_input, self.topk, self.model_config.dtype
+        )
 
     def _run_assistant_seed_step(
         self,
@@ -716,8 +718,10 @@ class FrozenKVMTPWorker(TpModelWorker):
             seed_next_logits = seed_output.next_token_logits
             seed_hidden_per_req = seed_output.hidden_states
 
-        probs = torch.softmax(seed_next_logits, dim=-1)
-        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        # Fused softmax→topk: avoids materializing the full [bs, vocab_size]
+        # probability tensor.  Falls back to torch.softmax + fast_topk when
+        # topk is not in {1, 2, 4} or input is not on CUDA.
+        topk_p, topk_index = fused_softmax_topk(seed_next_logits, self.topk)
         maybe_detect_oob(
             topk_index,
             0,
@@ -756,8 +760,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
             )
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            topk_p, topk_index = fused_softmax_topk(
+                logits_output.next_token_logits, self.topk
+            )
             maybe_detect_oob(
                 topk_index,
                 0,

@@ -26,7 +26,7 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPDraftExtendInput,
     FrozenKVMTPDraftInput,
 )
-from sglang.srt.speculative.spec_utils import fast_topk
+from sglang.srt.speculative.triton_ops.fused_softmax_topk import fused_softmax_topk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -173,8 +173,14 @@ def select_last_verified_seed(
 
 
 def capture_for_decode(
-    logits_output: LogitsProcessorOutput, draft_input: FrozenKVMTPDraftInput, topk: int
+    logits_output: LogitsProcessorOutput,
+    draft_input: FrozenKVMTPDraftInput,
+    topk: int,
+    draft_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
-    probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-    draft_input.topk_p, draft_input.topk_index = fast_topk(probs, topk, dim=-1)
+    # Fused softmax→topk avoids materializing the full [bs, vocab] prob tensor.
+    del draft_dtype  # kept in signature for API compat; fused kernel handles dtype
+    draft_input.topk_p, draft_input.topk_index = fused_softmax_topk(
+        logits_output.next_token_logits, topk
+    )
     draft_input.hidden_states = logits_output.hidden_states

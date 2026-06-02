@@ -84,6 +84,7 @@ class FrozenKVMTPCudaGraphRunner:
         )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.model_is_mrope = getattr(model_runner, "model_is_mrope", False)
 
         self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
         self.seq_len_fill_value = (
@@ -99,7 +100,15 @@ class FrozenKVMTPCudaGraphRunner:
         with torch.device(model_runner.device):
             req_pool_indices = torch.zeros((self.max_num_token,), dtype=torch.int64)
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
+            # Only allocate full mrope buffer for models that use it (e.g.
+            # Qwen2-VL); for standard RoPE models this saves
+            # 3 * max_num_token * 8 bytes of persistent VRAM.
+            if self.model_is_mrope:
+                mrope_positions = torch.zeros(
+                    (3, self.max_num_token), dtype=torch.int64
+                )
+            else:
+                mrope_positions = torch.zeros((3, 1), dtype=torch.int64)
             seq_lens = torch.full(
                 (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int32
             )
@@ -206,7 +215,9 @@ class FrozenKVMTPCudaGraphRunner:
 
         req_pool_indices = buffers.req_pool_indices[:expanded_bs]
         positions = buffers.positions[:expanded_bs]
-        mrope_positions = buffers.mrope_positions[:, :expanded_bs]
+        mrope_positions = (
+            buffers.mrope_positions[:, :expanded_bs] if self.model_is_mrope else None
+        )
         seq_lens = buffers.seq_lens[:expanded_bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:expanded_bs]
         topk_p = buffers.topk_p[:request_bs]

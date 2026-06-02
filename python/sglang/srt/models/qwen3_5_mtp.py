@@ -98,16 +98,29 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             is_nextn=True,
         )
 
+        # embed_tokens and lm_head are always replaced by
+        # set_embed_and_head() from the target model (EAGLE worker).
+        # Allocate them on meta device to avoid consuming scarce VRAM
+        # during draft model construction.
+        if self.pp_group.is_first_rank and hasattr(self.model, "embed_tokens"):
+            self.model.embed_tokens.weight = nn.Parameter(
+                torch.empty(
+                    self.model.embed_tokens.weight.shape, device="meta"
+                ),
+                requires_grad=False,
+            )
+
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+                with torch.device("meta"):
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
 
         self.logits_processor = LogitsProcessor(config)
 

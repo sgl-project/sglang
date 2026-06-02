@@ -78,13 +78,26 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             prefix=add_prefix("model", prefix),
             is_nextn=True,
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+
+        # embed_tokens and lm_head are always replaced by
+        # set_embed_and_head() from the target model (EAGLE worker).
+        # Allocate on meta device to avoid consuming scarce VRAM
+        # during draft model construction.
+        if self.pp_group.is_first_rank and hasattr(self.model, "embed_tokens"):
+            self.model.embed_tokens.weight = nn.Parameter(
+                torch.empty(
+                    self.model.embed_tokens.weight.shape, device="meta"
+                ),
+                requires_grad=False,
+            )
+        with torch.device("meta"):
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
