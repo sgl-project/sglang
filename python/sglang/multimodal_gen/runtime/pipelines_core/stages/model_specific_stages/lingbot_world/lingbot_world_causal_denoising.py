@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDCachePolicy,
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -156,6 +158,55 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         target_dtype: torch.dtype,
     ):
         return server_args.pipeline_config.get_pos_prompt_embeds(batch)
+
+    def _update_causal_context_cache(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        context_input: torch.Tensor,
+        prompt_embeds,
+        kv_cache,
+        crossattn_cache,
+        current_start_tokens: int,
+        start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        attn_metadata,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+    ) -> None:
+        context_noise = getattr(server_args.pipeline_config, "context_noise", 0)
+        timestep = torch.full(
+            (context_input.shape[0], 1),
+            int(context_noise),
+            device=context_input.device,
+            dtype=torch.long,
+        )
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ),
+            set_forward_context(
+                current_timestep=0,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ),
+        ):
+            self.transformer(
+                context_input.to(target_dtype),
+                prompt_embeds,
+                timestep,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start_tokens,
+                start_frame=start_frame,
+                skip_final_projection=True,
+                **image_kwargs,
+                **pos_cond_kwargs,
+            )
 
     @staticmethod
     def _select_i2v_condition_chunk(
