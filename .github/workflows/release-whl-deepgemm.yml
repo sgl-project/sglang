@@ -76,10 +76,7 @@ jobs:
 
   test-cu129:
     needs: build-cu129-matrix
-    # Run the DeepGEMM test suite against the freshly-built wheel on both
-    # supported architectures before releasing: SM90 (Hopper) and SM100
-    # (Blackwell). Only the x86_64 wheel is GPU-validated (no aarch64 GPU
-    # runners besides GB200); the aarch64 wheel ships unvalidated.
+    # Only the x86_64 wheel is GPU-validated; the aarch64 wheel ships unvalidated.
     strategy:
       fail-fast: false
       matrix:

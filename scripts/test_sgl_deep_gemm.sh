@@ -1,27 +1,13 @@
 #!/usr/bin/env bash
-# Run the sgl-project/DeepGEMM test suite against an *installed* sgl-deep-gemm
+# Run the sgl-project/DeepGEMM test suite against an installed sgl-deep-gemm
 # wheel, as a pre-release gate for release-whl-deepgemm.yml.
 #
-# Why "installed": the released artifact is the `sgl-deep-gemm` distribution,
-# which imports as `deep_gemm` and ships a *pre-compiled* tvm-ffi `_C.so`
-# (from csrc/tvm_ffi_api.cpp) plus the fork's Python wrapper layer
-# (fp8_fp4_gemm_nt, bf16_gemm_nt, fp8_paged_mqa_logits, the mega_moe APIs, ...).
-# The tests `import deep_gemm` and call exactly those top-level functions, so
-# running them against the installed wheel validates both the compiled binding
-# and the wrapper — i.e. the fork's added surface, not just upstream.
+# Tests must run from <DEEPGEMM_SRC>/tests so `import deep_gemm` resolves to the
+# installed wheel (which ships the pre-compiled tvm-ffi _C.so) rather than the
+# source tree's deep_gemm/ package, which differs and JIT-rebuilds _C. The guard
+# below aborts if that resolution is wrong, to avoid a false-positive gate.
 #
-# CRITICAL: tests must run from <DEEPGEMM_SRC>/tests so that `import deep_gemm`
-# resolves to the installed wheel in site-packages, NOT the source tree's
-# deep_gemm/ directory (whose __init__.py differs and JIT-rebuilds _C). The
-# tests/ dir has no deep_gemm/ subdir, and `import generators` still resolves
-# to the local tests/generators.py.
-#
-# Usage: test_sgl_deep_gemm.sh <DEEPGEMM_SRC> [options]
-#   DEEPGEMM_SRC        path to a checkout of sgl-project/DeepGEMM
-# Options:
-#   --max-procs N       cap multi-GPU process count (default: detected GPUs)
-#   --skip-sanitizer    skip the (slow) compute-sanitizer pass
-#   --skip-mega-moe     skip the heavy mega_moe family even on SM100
+# Usage: test_sgl_deep_gemm.sh <DEEPGEMM_SRC> [--max-procs N] [--skip-sanitizer] [--skip-mega-moe]
 set -uo pipefail
 
 if [ $# -lt 1 ]; then
@@ -50,13 +36,12 @@ if [ ! -d "${TESTS_DIR}" ]; then
   exit 1
 fi
 
-# --- Detect GPU count and architecture ------------------------------------
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [ "${NUM_GPUS}" -eq 0 ]; then
   echo "No GPUs visible to nvidia-smi — DeepGEMM tests require a GPU." >&2
   exit 1
 fi
-# compute_cap like "9.0" / "10.3"; arch major 9 == Hopper (SM90), 10 == Blackwell (SM100).
+# arch major: 9 == Hopper (SM90), 10 == Blackwell (SM100).
 COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
 ARCH_MAJOR=${COMPUTE_CAP%%.*}
 
@@ -65,7 +50,6 @@ if [ -n "${MAX_PROCS}" ] && [ "${MAX_PROCS}" -lt "${NPROC}" ]; then
   NPROC=${MAX_PROCS}
 fi
 
-# --- Verify we are testing the INSTALLED wheel, not the source tree -------
 DG_FILE=$(cd "${TESTS_DIR}" && "${PYTHON}" -c "import deep_gemm, sys; sys.stdout.write(deep_gemm.__file__)" 2>/dev/null)
 if [ -z "${DG_FILE}" ]; then
   echo "Failed to import deep_gemm — is the wheel installed?" >&2
@@ -74,7 +58,7 @@ fi
 case "${DG_FILE}" in
   "${DEEPGEMM_SRC}"/*)
     echo "ERROR: 'import deep_gemm' resolved to the source tree (${DG_FILE})," >&2
-    echo "       not the installed wheel. Aborting to avoid a false-positive test." >&2
+    echo "       not the installed wheel. Aborting." >&2
     exit 1 ;;
 esac
 
@@ -90,7 +74,6 @@ PASSED=()
 FAILED=()
 SKIPPED=()
 
-# run_test <relative-test-path> [extra args...]
 run_test() {
   local name="$1"; shift
   echo ""
@@ -110,7 +93,6 @@ skip_test() {
   SKIPPED+=("$1 ($2)")
 }
 
-# --- Single-GPU correctness (both SM90 and SM100; arch-gated internally) ---
 SINGLE_GPU_TESTS=(
   test_bf16.py
   test_einsum.py
@@ -128,14 +110,11 @@ for t in "${SINGLE_GPU_TESTS[@]}"; do
   fi
 done
 
-# --- Lazy init: multi-process, trivial, both archs ------------------------
 if [ -f "${TESTS_DIR}/test_lazy_init.py" ]; then
   run_test test_lazy_init.py --num-processes "${NPROC}"
 fi
 
-# --- mega_moe family: SM100 (Blackwell) only ------------------------------
-# These use SM100 fp4 + symmetric-memory kernels and carry an upstream
-# "TODO: skip the test for SM90" note, so they are gated to arch major >= 10.
+# mega_moe family uses SM100 fp4 + symmetric-memory kernels (SM100-only).
 MEGA_MOE_MULTI=(
   test_mega_moe.py
   test_mega_moe_l1_fp4_accuracy.py
@@ -149,7 +128,6 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   for t in "${MEGA_MOE_MULTI[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${NPROC}"
   done
-  # pre_dispatch runs in a single process (no --num-processes flag).
   [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
 else
   for t in "${MEGA_MOE_MULTI[@]}" test_mega_moe_pre_dispatch.py; do
@@ -157,7 +135,6 @@ else
   done
 fi
 
-# --- compute-sanitizer pass (re-runs the others under memcheck/synccheck) -
 if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then
   if [ "${SKIP_SANITIZER}" -eq 1 ]; then
     skip_test test_sanitizer.py "--skip-sanitizer"
@@ -168,7 +145,6 @@ if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then
   fi
 fi
 
-# --- Summary --------------------------------------------------------------
 echo ""
 echo "=============================================================="
 echo " Summary: ${#PASSED[@]} passed, ${#FAILED[@]} failed, ${#SKIPPED[@]} skipped"
