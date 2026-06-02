@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import imageio
+import msgspec.msgpack
 import numpy as np
 import pytest
-from msgpack import packb, unpackb
 from openai import Client
 
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
@@ -353,11 +353,11 @@ async def collect_realtime_output(
                 continue
             if int(event.get("after_chunk", 0)) != completed_chunk:
                 continue
-            await ws.send(packb(build_realtime_event_payload(event), use_bin_type=True))
+            await ws.send(msgspec.msgpack.encode(build_realtime_event_payload(event)))
             sent_event_indices.add(event_idx)
 
     async with websockets.connect(ws_url, max_size=None, ping_interval=None) as ws:
-        await ws.send(packb(init_payload, use_bin_type=True))
+        await ws.send(msgspec.msgpack.encode(init_payload))
         await send_events_for_boundary(ws, -1)
 
         received_chunks: set[int] = set()
@@ -368,7 +368,7 @@ async def collect_realtime_output(
             header_payload = await asyncio.wait_for(
                 ws.recv(), timeout=_REALTIME_WS_TIMEOUT_SECS
             )
-            header = unpackb(header_payload, raw=False)
+            header = msgspec.msgpack.decode(header_payload)
             message_type = header.get("type")
             if message_type == "error":
                 pytest.fail(f"Realtime generation failed: {header.get('content')}")

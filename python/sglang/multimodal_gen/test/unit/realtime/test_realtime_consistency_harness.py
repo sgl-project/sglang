@@ -4,9 +4,9 @@ import asyncio
 import sys
 from types import SimpleNamespace
 
+import msgspec.msgpack
 import numpy as np
 import pytest
-from msgpack import packb, unpackb
 
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
@@ -240,7 +240,7 @@ class _FakeRealtimeWebSocket:
         return False
 
     async def send(self, payload):
-        self.sent.append(unpackb(payload, raw=False))
+        self.sent.append(msgspec.msgpack.decode(payload))
 
     async def recv(self):
         if not self.messages:
@@ -260,15 +260,15 @@ def _packed_realtime_frame_message(chunk_index: int, frame: np.ndarray):
         "channels": frame.shape[2],
         "bytes_per_frame": frame.nbytes,
     }
-    return packb(header, use_bin_type=True), frame.tobytes()
+    return msgspec.msgpack.encode(header), frame.tobytes()
 
 
 def _packed_realtime_combined_frame_message(chunk_index: int, frame: np.ndarray):
     header, payload = _packed_realtime_frame_message(chunk_index, frame)
-    message = unpackb(header, raw=False)
+    message = msgspec.msgpack.decode(header)
     message["type"] = "frame_batch"
     message["payload"] = payload
-    return packb(message, use_bin_type=True)
+    return msgspec.msgpack.encode(message)
 
 
 def _packed_realtime_chunk_stats(chunk_index: int, **overrides):
@@ -291,7 +291,7 @@ def _packed_realtime_chunk_stats(chunk_index: int, **overrides):
     for key, value in list(payload.items()):
         if key.endswith("_ms"):
             payload[key] = max(0, int(value + 0.5))
-    packed = packb(payload, use_bin_type=True)
+    packed = msgspec.msgpack.encode(payload)
     assert bytes([0xCB]) not in packed
     return packed
 
@@ -377,7 +377,7 @@ def test_collect_realtime_output_accepts_combined_frame_batch(monkeypatch):
 def test_realtime_perf_stats_summary_and_thresholds():
     stats = [
         parse_realtime_chunk_stats(
-            unpackb(
+            msgspec.msgpack.decode(
                 _packed_realtime_chunk_stats(
                     0,
                     scheduler_forward_ms=10.0,
@@ -385,12 +385,11 @@ def test_realtime_perf_stats_summary_and_thresholds():
                     ws_write_ms=3.0,
                     ws_payload_bytes=1024 * 1024,
                     chunk_total_ms=20.0,
-                ),
-                raw=False,
+                )
             )
         ),
         parse_realtime_chunk_stats(
-            unpackb(
+            msgspec.msgpack.decode(
                 _packed_realtime_chunk_stats(
                     1,
                     scheduler_forward_ms=30.0,
@@ -398,8 +397,7 @@ def test_realtime_perf_stats_summary_and_thresholds():
                     ws_write_ms=5.0,
                     ws_payload_bytes=2 * 1024 * 1024,
                     chunk_total_ms=40.0,
-                ),
-                raw=False,
+                )
             )
         ),
     ]
@@ -432,33 +430,30 @@ def test_realtime_perf_stats_summary_and_thresholds():
 def test_realtime_perf_stats_can_ignore_startup_chunks():
     stats = [
         parse_realtime_chunk_stats(
-            unpackb(
+            msgspec.msgpack.decode(
                 _packed_realtime_chunk_stats(
                     0,
                     scheduler_forward_ms=20000.0,
                     chunk_total_ms=21000.0,
-                ),
-                raw=False,
+                )
             )
         ),
         parse_realtime_chunk_stats(
-            unpackb(
+            msgspec.msgpack.decode(
                 _packed_realtime_chunk_stats(
                     1,
                     scheduler_forward_ms=7000.0,
                     chunk_total_ms=7200.0,
-                ),
-                raw=False,
+                )
             )
         ),
         parse_realtime_chunk_stats(
-            unpackb(
+            msgspec.msgpack.decode(
                 _packed_realtime_chunk_stats(
                     2,
                     scheduler_forward_ms=2300.0,
                     chunk_total_ms=2800.0,
-                ),
-                raw=False,
+                )
             )
         ),
     ]

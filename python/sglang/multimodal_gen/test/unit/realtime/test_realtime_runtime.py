@@ -4,6 +4,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import msgspec.msgpack
 import numpy as np
 import torch
 
@@ -354,9 +355,7 @@ def test_send_output_emits_chunk_stats_message():
         )
     )
 
-    from msgpack import unpackb
-
-    message = unpackb(sent_messages[-1], raw=False)
+    message = msgspec.msgpack.decode(sent_messages[-1])
     assert stats["raw_write_ms"] == 42.0
     assert message["type"] == "chunk_stats"
     assert message["chunk_index"] == 7

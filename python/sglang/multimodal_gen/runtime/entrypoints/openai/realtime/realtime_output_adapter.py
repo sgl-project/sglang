@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
 from fastapi import WebSocket
-from msgpack import packb
+import msgspec.msgpack
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timing import (
@@ -192,7 +192,7 @@ def _pack_frame_batch_message(
         "type": "frame_batch",
         "payload": payload,
     }
-    return packb(message, use_bin_type=True)
+    return msgspec.msgpack.encode(message)
 
 
 def _build_transport_payload(

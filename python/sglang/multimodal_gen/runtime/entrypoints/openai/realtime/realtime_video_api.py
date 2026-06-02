@@ -6,7 +6,7 @@ import time
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from msgpack import packb, unpackb
+import msgspec.msgpack
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
@@ -110,7 +110,7 @@ async def _send_realtime_chunk_stats(
     send_stats: RealtimeFrameSendStats,
 ) -> None:
     await ws.send_bytes(
-        packb(
+        msgspec.msgpack.encode(
             {
                 "type": "chunk_stats",
                 "session_id": session.id,
@@ -131,8 +131,7 @@ async def _send_realtime_chunk_stats(
                 "raw_bytes": send_stats["raw_bytes"],
                 "ws_payload_bytes": send_stats["ws_payload_bytes"],
                 "content_type": send_stats["content_type"],
-            },
-            use_bin_type=True,
+            }
         )
     )
 
@@ -287,7 +286,7 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
     async for message in ws.iter_bytes():
         data = None
         try:
-            data = unpackb(message, raw=False)
+            data = msgspec.msgpack.decode(message)
             if not isinstance(data, dict):
                 raise ValueError("realtime event must be a map")
             realtime_event = RealtimeEvent.model_validate(data)
@@ -310,7 +309,7 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
 async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
     while True:
         try:
-            data = unpackb(await ws.receive_bytes(), raw=False)
+            data = msgspec.msgpack.decode(await ws.receive_bytes())
             if not isinstance(data, dict):
                 raise ValueError("generate request must be a map")
 
@@ -424,5 +423,5 @@ async def generate(websocket: WebSocket):
 
 async def write_error_msg(error_msg: str, websocket: WebSocket):
     await websocket.send_bytes(
-        packb({"type": "error", "content": error_msg}, use_bin_type=True)
+        msgspec.msgpack.encode({"type": "error", "content": error_msg})
     )

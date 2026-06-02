@@ -34,7 +34,6 @@ dependencies = [
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
-  "msgpack",
   "msgspec",
   "ninja",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports

@@ -3,6 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import msgspec.msgpack
 import numpy as np
 import torch
 
@@ -25,11 +26,9 @@ from sglang.multimodal_gen.runtime.utils.realtime_video import (
 
 
 def _unpack_frame_batch_messages(payloads):
-    from msgpack import unpackb
-
     messages = []
     for payload in payloads:
-        message = unpackb(payload, raw=False)
+        message = msgspec.msgpack.decode(payload)
         assert message.pop("type") == "frame_batch"
         frame_payload = message.pop("payload")
         messages.append((message, frame_payload))
