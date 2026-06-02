@@ -955,6 +955,9 @@ class Req(ReqDllmMixin):
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+        # Used in overlap sequence to signal that an optimistic request should
+        # abort chunking. Set in create_sender, consumed in process_batch_result.
+        self.pending_bootstrap = False
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
