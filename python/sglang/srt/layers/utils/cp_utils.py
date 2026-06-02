@@ -68,6 +68,29 @@ def is_prefill_cp_in_seq_split():
     )
 
 
+def get_cp_padding_align_size() -> int:
+    """Per-rank token-count alignment required by CP when padding global_num_tokens.
+
+    Zigzag (in-seq-split) CP splits each rank's tokens into 2 * cp_size chunks
+    for load balance, so token counts must be divisible by 2 * cp_size.
+    Round-robin CP distributes tokens by token_idx % cp_size, so cp_size
+    alignment suffices. Returns 1 when CP is disabled so callers skip padding
+    entirely: with CP off, the extra even-length padding breaks EAGLE/MTP
+    draft prefill (NaN draft logits, see #23269).
+
+    Keep ForwardBatch.prepare_mlp_sync_batch and cal_padded_tokens
+    (layers/attention/dsa/utils.py) consistent through this helper.
+    """
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+
+    attn_cp_size = get_attention_cp_size()
+    if attn_cp_size <= 1:
+        return 1
+    if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
+        return attn_cp_size * 2
+    return attn_cp_size
+
+
 def is_mla_prefill_cp_enabled() -> bool:
     sa = get_global_server_args()
     return sa.enable_prefill_context_parallel and sa.use_mla_backend

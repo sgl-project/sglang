@@ -47,14 +47,16 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
+from sglang.srt.layers.utils.cp_utils import (
+    ContextParallelMetadata,
+    get_cp_padding_align_size,
+)
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -991,16 +993,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
-        # make sure that each rank has the same number of tokens to do collective communication and
-        # we can divide the tokens into 2 * CP chunks for load balance.
-        # Only pad to 2*CP when CP is enabled; with CP off the extra even-length
-        # padding breaks EAGLE/MTP draft prefill (NaN draft logits, see #23269).
-        attn_cp_size = get_attention_cp_size()
-        if attn_cp_size > 1:
+        # make sure that each rank has the same number of tokens to do collective communication.
+        # Zigzag (in-seq-split) CP additionally needs each rank's tokens divisible into
+        # 2 * CP chunks for load balance, so it pads to 2 * attn_cp_size; other CP modes
+        # (e.g. round-robin) only pad to attn_cp_size. With CP off nothing is padded here:
+        # the extra even-length padding breaks EAGLE/MTP draft prefill (NaN draft logits,
+        # see #23269).
+        # FIXME(kpham-sgl): make the EAGLE/MTP draft prefill-extend path tolerate padded
+        # dummy tokens so this padding does not need CP-mode-specific gating.
+        cp_align_size = get_cp_padding_align_size()
+        if cp_align_size > 1:
             for i in range(sync_group_size):
-                global_num_tokens[i] = ceil_align(
-                    global_num_tokens[i], attn_cp_size * 2
-                )
+                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
