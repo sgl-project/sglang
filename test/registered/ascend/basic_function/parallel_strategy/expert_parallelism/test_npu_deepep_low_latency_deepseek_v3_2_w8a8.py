@@ -53,6 +53,8 @@ class TestDeepEpDeepseekV32(CustomTestCase):
                 128,
                 "--max-total-tokens",
                 40960,
+                "--watchdog-timeout",
+                900,
             ],
             env={
                 "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
