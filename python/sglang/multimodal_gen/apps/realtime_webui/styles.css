@@ -281,6 +281,11 @@ button:focus-visible {
   font-size: 12px;
 }
 
+.topbar > * {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
 .topbar-spacer { flex: 1; }
 .preview-scale-control {
   display: inline-flex;
@@ -290,6 +295,7 @@ button:focus-visible {
   margin: 0;
   color: rgba(232, 234, 223, 0.72);
   font-size: 11px;
+  line-height: 1;
 }
 .preview-scale-control input {
   width: 92px;
@@ -307,17 +313,20 @@ button:focus-visible {
 #statusText {
   display: inline-block;
   min-width: 92px;
+  line-height: 1;
 }
 #chunkText {
   display: inline-block;
   min-width: 70px;
+  line-height: 1;
 }
 .stage-stat {
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 5px;
   min-width: max-content;
   color: rgba(232, 234, 223, 0.72);
+  line-height: 1;
 }
 .stage-stat b {
   color: #fffdf7;
