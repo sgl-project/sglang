@@ -106,7 +106,7 @@ def get_allocator_from_storage(allocator_type):
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
-    elif allocator_type == "umbp":
+    elif allocator_type == "mori":
         try:
             from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
                 UMBPHostTensorAllocator,

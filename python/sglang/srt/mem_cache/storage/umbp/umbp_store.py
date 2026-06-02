@@ -1118,6 +1118,11 @@ class KVEventsSubscriber:
         ``StorageMedium.GPU`` ("GPU") maps to HBM (GPU on-chip memory).
         All other values (CPU pinned, unknown) map to DRAM.
         """
+        # kv_events.py exposes the enum class ``StorageMedium`` (not a
+        # module-level ``MEDIUM_GPU`` constant — that import was removed when
+        # the file was reorganised but this consumer was never updated, so
+        # PD-disagg paths crash here when KVEventsSubscriber receives the
+        # first GPU-tier event). Compare against the enum value's string.
         from sglang.srt.disaggregation.kv_events import StorageMedium
 
         return self._tier_hbm if medium == StorageMedium.GPU.value else self._tier_dram
