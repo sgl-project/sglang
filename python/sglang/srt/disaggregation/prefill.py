@@ -512,6 +512,8 @@ class SchedulerDisaggregationPrefillMixin:
             return 0
 
         min_tokens = max(1, envs.SGLANG_PIPELINE_MIN_TOKENS.get())  # guard div-by-zero
+        if len(batch.reqs) == 0:
+            return 0  # Empty batch — fallback to non-pipelined
         avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
         if avg_tokens < min_tokens:
             return 0
