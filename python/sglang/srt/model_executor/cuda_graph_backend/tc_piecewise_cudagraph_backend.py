@@ -241,7 +241,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         return True
 
     @contextmanager
-    def runtime_session(self):
+    def replay_session(self):
         with enable_tc_piecewise_cuda_graph():
             yield
 
@@ -249,7 +249,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     def capture_session(self, stream: torch.cuda.Stream):
         self._capture_stream = stream
         try:
-            with self.runtime_session():
+            with self.replay_session():
                 with set_pcg_capture_stream(stream):
                     yield
         finally:

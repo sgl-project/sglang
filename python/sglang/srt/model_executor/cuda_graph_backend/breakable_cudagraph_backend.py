@@ -159,7 +159,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         return True
 
     @contextmanager
-    def runtime_session(self):
+    def replay_session(self):
         with enable_breakable_cuda_graph():
             yield
 
@@ -170,7 +170,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:
-            with self.runtime_session():
+            with self.replay_session():
                 yield
         finally:
             self._capture_stream = None

@@ -43,7 +43,7 @@ class BaseCudaGraphBackend(ABC):
            depending on backend (Full/Breakable replay against static
            buffers and ignore it; TcPiecewise dispatches by shape via
            torch.compile and uses it).
-        5. ``runtime_session()`` — context wrapping replay-time model
+        5. ``replay_session()`` — context wrapping replay-time model
            code. Sets per-backend global flags so model code takes the
            static-buffer / fixed-shape path.
         6. ``can_run(forward_batch)`` — backend-level "is this batch
@@ -93,7 +93,7 @@ class BaseCudaGraphBackend(ABC):
     def cleanup(self) -> None: ...
 
     @contextmanager
-    def runtime_session(self):
+    def replay_session(self):
         """Context wrapping replay-time model code. Sets per-backend
         global flags (``is_in_*_cuda_graph``) so model code takes the
         static-buffer / fixed-shape path. Default: no-op (Full doesn't

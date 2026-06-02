@@ -180,10 +180,22 @@ class BaseCudaGraphRunner(ABC):
 
     @abstractmethod
     def capture_one_shape(self, size: int, *args, **kwargs) -> Any:
-        """Per-shape capture: build a dummy ForwardBatch, run model
-        forward once into the backend's captured artifact for ``size``.
-        Decode passes the patched-model forward + stream/variant info;
-        prefill takes ``size`` only. Subclasses define the full signature.
+        """Per-shape capture: build a dummy ForwardBatch via
+        ``capture_prepare``, run model forward once into the backend's
+        captured artifact for ``size``. Decode passes the patched-model
+        forward + stream/variant info; prefill takes ``size`` only.
+        Subclasses define the full signature.
+        """
+
+    @abstractmethod
+    def capture_prepare(self, size: int, *args, **kwargs) -> Any:
+        """Capture-time setup symmetric to ``replay_prepare``: build the
+        dummy ForwardBatch used by ``capture_one_shape`` and do any
+        capture-time-only init that needs locals (attn backend choice,
+        pp_proxy_tensors, …). Decode returns
+        ``(forward_batch, attn_backend, pp_proxy_tensors)``; prefill
+        returns only the ``forward_batch``. Caller (``capture_one_shape``)
+        consumes whatever is returned.
         """
 
     @abstractmethod

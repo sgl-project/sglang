@@ -161,7 +161,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
-    def _build_capture_forward_batch(self, num_tokens: int) -> ForwardBatch:
+    def capture_prepare(self, num_tokens: int) -> ForwardBatch:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
         Default tensor inputs are fresh literals; backends that need
@@ -274,7 +274,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         torch.compile install) and the compile-loop pass (every shape,
         inside ``enable_torch_compile_warmup``).
         """
-        fb = self._build_capture_forward_batch(num_tokens)
+        fb = self.capture_prepare(num_tokens)
         self.model_runner.attn_backend.init_forward_metadata(fb)
         self._run_forward(fb, num_tokens)
 
@@ -340,7 +340,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         delegate to backend. ``size`` is the prefill token count.
         """
         num_tokens = size
-        forward_batch = self._build_capture_forward_batch(num_tokens)
+        forward_batch = self.capture_prepare(num_tokens)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
@@ -482,7 +482,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def replay(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        with self.backend.runtime_session():
+        with self.backend.replay_session():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
