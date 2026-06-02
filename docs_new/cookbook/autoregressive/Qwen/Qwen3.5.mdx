@@ -14,7 +14,7 @@ Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
 
 **Architecture details:**
 - **Hybrid Attention:** Gated Delta Networks (linear, O(n) complexity) combined with full attention every 4th layer — linear layers provide low-cost long-context processing while periodic full attention ensures high associative recall.
-- **MoE routing:** Top-8 active out of 64 routed experts plus a dedicated shared expert for universal features, keeping 17B parameters active from 397B total.
+- **MoE routing:** Top-10 active out of 512 routed experts plus a dedicated shared expert for universal features, keeping 17B parameters active from 397B total.
 - **Native multimodal:** DeepStack Vision Transformer with Conv3d temporal encoding for image and video understanding without separate visual encoders.
 
 **Key Features:**

@@ -795,7 +795,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
 ```
 
 - **Test Results** (model: `deepseek-ai/DeepSeek-V3.2-Exp`, 8×B200):
-  - Default (`temperature=0`): mean **0.797** over 8 runs
+  - Default (`temperature=0`): mean **0.797** over 8 runs — closely matches the official GPQA-Diamond score of **79.9** for DeepSeek-V3.2-Exp reported in its [model card](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp)
   - With `temperature=1.0, top_p=0.95` (as recommended by DeepSeek):
 
 ```shell Command
@@ -806,8 +806,6 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
   Repeat: 8, mean: 0.840
   Scores: ['0.848', '0.808', '0.848', '0.838', '0.879', '0.813', '0.838', '0.848']
   ```
-
-  Matches the official score of 0.824 reported in the [DeepSeek-V3.2 technical report](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/assets/paper.pdf).
 
 #### 5.2.4 AIME 2025 Benchmark
 
