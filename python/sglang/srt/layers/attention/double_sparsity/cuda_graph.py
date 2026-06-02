@@ -286,26 +286,24 @@ def capture_decode_step(
         and state.scratch_scores is not None
     )
 
-    # Fail fast: the graph-safe Triton scorer only implements the production
-    # raw channel-dot / cross-head-max path. A non-default scorer variant
-    # (scorer_norm/head_agg/anchor_budget) would be SILENTLY ignored here and
-    # raw-scored under capture. Refuse rather than capture a wrong selection;
-    # such a configuration must serve eager (--disable-cuda-graph) until the
-    # variant is ported to the graph-safe path.
+    # Fail fast: scorer_norm (cosine/hybrid) + head_agg (mean) are ported into the
+    # graph-safe Triton scorer (R6) and are safe to capture. A non-default
+    # anchor_mode (post-topK force-include) is NOT yet graph-safe and would be
+    # SILENTLY dropped under capture — refuse rather than capture a wrong
+    # selection; such a configuration must serve eager (--disable-cuda-graph)
+    # until the anchor path is ported.
     if use_graph_safe:
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-            ds_scorer_is_default,
+            ds_scorer_is_graph_safe,
         )
 
-        if not ds_scorer_is_default(getattr(selector, "config", None)):
+        if not ds_scorer_is_graph_safe(getattr(selector, "config", None)):
             raise RuntimeError(
-                "Double Sparsity: a non-default scorer variant "
-                f"(scorer_norm={getattr(selector.config, 'scorer_norm', 'off')!r}, "
-                f"head_agg={getattr(selector.config, 'head_agg', 'max')!r}, "
-                f"anchor_mode={getattr(selector.config, 'anchor_mode', 'off')!r}) "
-                "is not supported by the graph-safe Triton scorer; serve with "
+                "Double Sparsity: a non-default anchor_mode "
+                f"(anchor_mode={getattr(selector.config, 'anchor_mode', 'off')!r}) "
+                "is not yet supported by the graph-safe Triton scorer; serve with "
                 "--disable-cuda-graph until it is ported. Capturing here would "
-                "silently raw-score the selection."
+                "silently drop the anchor force-include."
             )
 
     def _call_into_state() -> None:
@@ -340,6 +338,11 @@ def capture_decode_step(
                 scratch_throwaway_idx=state.scratch_throwaway_idx,
                 token_scales=selector.token_label_table.scales,
                 process_group=getattr(selector, "process_group", None),
+                scorer_norm=getattr(selector.config, "scorer_norm", "off"),
+                head_agg=getattr(selector.config, "head_agg", "max"),
+                hybrid_threshold=getattr(
+                    selector.config, "scorer_norm_hybrid_threshold", 8192
+                ),
             )
         else:
             out_idx, out_len = selector.retrieve_topk(

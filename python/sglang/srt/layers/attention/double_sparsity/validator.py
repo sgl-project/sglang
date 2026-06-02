@@ -93,25 +93,23 @@ def validate_double_sparsity(server_args: "ServerArgs") -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
-    # Production-path scorer-variant safety. A non-default scorer variant
-    # (scorer_norm/head_agg/anchor_mode) runs the eager logical scorer, which is
-    # NOT graph-safe (it allocates / host-syncs). If CUDA graph capture is
-    # enabled it would run that eager path INSIDE the captured model forward
-    # (illegal), so refuse at startup. Until the variants are ported into the
-    # graph-safe Triton scorer, they require --disable-cuda-graph.
+    # Production-path scorer-variant safety. As of R6 scorer_norm (cosine/hybrid)
+    # + head_agg (mean) are ported into the graph-safe Triton scorer and run under
+    # CUDA-graph capture. A non-default anchor_mode (post-topK force-include) is
+    # NOT yet graph-safe — it runs the eager selector, so it still requires
+    # --disable-cuda-graph until ported.
     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-        ds_scorer_is_default,
+        ds_scorer_is_graph_safe,
     )
 
-    if not ds_scorer_is_default(config) and not getattr(
+    if not ds_scorer_is_graph_safe(config) and not getattr(
         server_args, "disable_cuda_graph", False
     ):
         raise ValueError(
-            "Double Sparsity non-default scorer variant "
-            f"(scorer_norm={config.scorer_norm!r}, head_agg={config.head_agg!r}, "
-            f"anchor_mode={config.anchor_mode!r}) is not yet supported under CUDA "
-            "graph capture (it runs the non-graph-safe eager logical scorer). "
-            "Re-run with --disable-cuda-graph, or use the default scorer."
+            "Double Sparsity non-default anchor_mode "
+            f"(anchor_mode={config.anchor_mode!r}) is not yet supported under CUDA "
+            "graph capture (the anchor force-include runs the non-graph-safe eager "
+            "selector). Re-run with --disable-cuda-graph, or use anchor_mode=off."
         )
 
     # Recall-oracle diagnostic safety. The oracle hook does host syncs

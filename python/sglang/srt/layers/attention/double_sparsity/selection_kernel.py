@@ -84,6 +84,9 @@ if _TRITON_AVAILABLE:
         out_stride_b: tl.constexpr,
         TOKEN_BLOCK: tl.constexpr,
         LABEL_DIM_POW2: tl.constexpr,
+        SCORER_NORM: tl.constexpr,       # 0=off(raw), 1=cosine, 2=hybrid
+        HEAD_AGG_MEAN: tl.constexpr,     # bool: True=mean over heads, False=max
+        HYBRID_THRESHOLD: tl.constexpr,  # int: hybrid uses cosine when seq_len > this
     ):
         batch_id = tl.program_id(0)
         tok_blk = tl.program_id(1)
@@ -125,8 +128,18 @@ if _TRITON_AVAILABLE:
 
         d_offs = tl.arange(0, LABEL_DIM_POW2)
         d_mask = d_offs < label_dim
+        eps = 1e-6
+        # Per-request cosine decision for hybrid: cosine above the length
+        # threshold, raw channel-dot at/below it (matches the eager
+        # _compute_logical_token_scores length-conditional switch). Scalar.
+        hybrid_cos = seq_len_i > HYBRID_THRESHOLD
 
-        max_score = tl.full((TOKEN_BLOCK,), float("-inf"), dtype=tl.float32)
+        # Cross-head accumulator: 0 for mean (sum then divide), -inf for max.
+        if HEAD_AGG_MEAN:
+            acc = tl.zeros((TOKEN_BLOCK,), dtype=tl.float32)
+        else:
+            acc = tl.full((TOKEN_BLOCK,), float("-inf"), dtype=tl.float32)
+
         for h in range(num_heads):
             sel_h = tl.load(
                 ch_sel_ptr + h * ch_sel_stride_h + d_offs,
@@ -153,21 +166,57 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             ).to(tl.float32)
             dot = tl.sum(q_proj_h[None, :] * sig_block, axis=1)
-            if HAS_SCALE:
-                # Dequant: scale the int8 dot by the per-(slot, head) scale
-                # before the cross-head max (scale >= 0 preserves ordering).
-                scale_h = tl.load(
-                    scale_ptr + safe_phys * scale_stride_t + h * scale_stride_h,
-                    mask=in_range,
-                    other=0.0,
-                ).to(tl.float32)
-                dot = dot * scale_h
-            max_score = tl.where(dot > max_score, dot, max_score)
+
+            if SCORER_NORM == 0:
+                # Raw channel-dot (production), dequant-scaled for the int8 path
+                # (scale >= 0 preserves ordering).
+                if HAS_SCALE:
+                    scale_h = tl.load(
+                        scale_ptr + safe_phys * scale_stride_t + h * scale_stride_h,
+                        mask=in_range,
+                        other=0.0,
+                    ).to(tl.float32)
+                    score_h = dot * scale_h
+                else:
+                    score_h = dot
+            else:
+                # Cosine (direction-only): unit-normalize the weighted query and
+                # the token signature per head. Equal to the eager
+                # ((qf/||qf||)*(sf/||sf||)).sum form (normalize-then-sum); scale
+                # is intentionally ignored (it cancels under normalization).
+                q_norm = tl.sqrt(tl.sum(q_proj_h * q_proj_h)) + eps
+                sig_norm = tl.sqrt(tl.sum(sig_block * sig_block, axis=1)) + eps
+                cos = tl.sum(
+                    (q_proj_h[None, :] / q_norm) * (sig_block / sig_norm[:, None]),
+                    axis=1,
+                )
+                if SCORER_NORM == 1:
+                    score_h = cos
+                else:
+                    # Hybrid: cosine above the threshold, raw (scaled) below.
+                    if HAS_SCALE:
+                        scale_h = tl.load(
+                            scale_ptr + safe_phys * scale_stride_t + h * scale_stride_h,
+                            mask=in_range,
+                            other=0.0,
+                        ).to(tl.float32)
+                        raw_h = dot * scale_h
+                    else:
+                        raw_h = dot
+                    score_h = tl.where(hybrid_cos, cos, raw_h)
+
+            if HEAD_AGG_MEAN:
+                acc += score_h
+            else:
+                acc = tl.where(score_h > acc, score_h, acc)
+
+        if HEAD_AGG_MEAN:
+            acc = acc / num_heads
 
         out_score = tl.where(
             valid,
-            max_score,
-            tl.full(max_score.shape, float("-inf"), dtype=tl.float32),
+            acc,
+            tl.full(acc.shape, float("-inf"), dtype=tl.float32),
         )
         tl.store(out_ptr + batch_id * out_stride_b + tok_offs, out_score, mask=in_range)
 
@@ -374,6 +423,20 @@ def ds_scorer_is_default(config) -> bool:
         and getattr(config, "head_agg", "max") == "max"
         and getattr(config, "anchor_mode", "off") == "off"
     )
+
+
+def ds_scorer_is_graph_safe(config) -> bool:
+    """``True`` iff the configured scorer variants are all implemented on the
+    graph-safe Triton path, so the selector can run under CUDA-graph capture.
+
+    As of R6 ``scorer_norm`` (cosine/hybrid) and ``head_agg`` (mean) are ported
+    into ``_logical_score_kernel`` and ARE graph-safe. ``anchor_mode`` is a
+    post-topK per-row force-include that is NOT yet graph-safe — a non-default
+    ``anchor_mode`` still requires the eager selector (and ``--disable-cuda-graph``).
+    """
+    if config is None:
+        return True
+    return getattr(config, "anchor_mode", "off") == "off"
 
 
 def ds_recall_oracle_enabled(config) -> bool:
@@ -1084,6 +1147,9 @@ def _logical_score_triton(
     *,
     scale_layer: Optional[torch.Tensor] = None,  # [T, H] per-(slot, head) int8 dequant scale, else None
     token_block: int = 64,
+    scorer_norm: str = "off",
+    head_agg: str = "max",
+    hybrid_threshold: int = 8192,
 ) -> None:
     """Fill ``out[:bs, :max_seq_len]`` with per-(batch, logical-position) scores.
 
@@ -1104,6 +1170,9 @@ def _logical_score_triton(
     label_dim_pow2 = _next_pow2(max(label_dim, 1))
     num_token_blocks = (max_seq_len + token_block_pow2 - 1) // token_block_pow2
     grid = (bs, num_token_blocks)
+
+    scorer_norm_code = {"off": 0, "cosine": 1, "hybrid": 2}.get(scorer_norm or "off", 0)
+    head_agg_mean = head_agg == "mean"
 
     _logical_score_kernel[grid](
         q_proj_input,
@@ -1134,6 +1203,9 @@ def _logical_score_triton(
         out_stride_b=out.stride(0),
         TOKEN_BLOCK=token_block_pow2,
         LABEL_DIM_POW2=label_dim_pow2,
+        SCORER_NORM=scorer_norm_code,
+        HEAD_AGG_MEAN=head_agg_mean,
+        HYBRID_THRESHOLD=int(hybrid_threshold),
     )
 
 
@@ -1166,6 +1238,9 @@ def retrieve_topk_graph_safe(
     token_scales: Optional[torch.Tensor] = None,           # fp16 [L, T, H] int8 dequant scale, else None
     process_group=None,
     recall_oracle: bool = False,
+    scorer_norm: str = "off",
+    head_agg: str = "max",
+    hybrid_threshold: int = 8192,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Capture-safe retrieve_topk that writes results into caller-owned buffers.
 
@@ -1217,6 +1292,9 @@ def retrieve_topk_graph_safe(
             max_seq_len=max_seq_len,
             token_scales=token_scales,
             recall_oracle=recall_oracle,
+            scorer_norm=scorer_norm,
+            head_agg=head_agg,
+            hybrid_threshold=hybrid_threshold,
         )
         mtk = indices.shape[1]
         out_indices[:bs, :mtk].copy_(indices)
@@ -1262,6 +1340,9 @@ def retrieve_topk_graph_safe(
         out=scores_view,
         max_seq_len=max_seq_len,
         scale_layer=scale_layer,
+        scorer_norm=scorer_norm,
+        head_agg=head_agg,
+        hybrid_threshold=hybrid_threshold,
     )
 
     if process_group is not None and torch.distributed.is_available() and torch.distributed.is_initialized():

@@ -171,13 +171,14 @@ class TestScorerDefaultGuard(unittest.TestCase):
         self.assertFalse(ds_scorer_is_default(NS(scorer_norm="off", head_agg="max", anchor_mode="recency")))
 
 
-class TestNonDefaultScorerGraphGuard(unittest.TestCase):
-    """Server init rejects a non-default scorer when CUDA graph is enabled (the
-    production-path safety guard), and allows it with --disable-cuda-graph."""
+class TestScorerGraphSafeGuard(unittest.TestCase):
+    """As of R6, scorer_norm (cosine/hybrid) + head_agg (mean) are graph-safe and
+    pass the startup guard under CUDA graph; only a non-default anchor_mode is
+    rejected (still eager-only)."""
 
-    def _server_args(self, scorer_norm, disable_cuda_graph):
+    def _server_args(self, extra_cfg, disable_cuda_graph):
         from types import SimpleNamespace
-        cfg = f'{{"channel_mask_path": "/tmp/cm.safetensors", "scorer_norm": "{scorer_norm}"}}'
+        cfg = '{"channel_mask_path": "/tmp/cm.safetensors"' + extra_cfg + "}"
         return SimpleNamespace(
             enable_double_sparsity=True,
             enable_hisparse=False,
@@ -187,26 +188,116 @@ class TestNonDefaultScorerGraphGuard(unittest.TestCase):
             page_size=64,
         )
 
-    def test_non_default_scorer_with_cuda_graph_rejected(self):
+    def test_graph_safe_scorer_passes_under_cuda_graph(self):
+        # cosine/hybrid/mean are graph-safe -> the cuda-graph guard must NOT fire
+        # under CUDA graph (a later check, e.g. missing mask file, may raise).
+        from sglang.srt.layers.attention.double_sparsity.validator import (
+            validate_double_sparsity,
+        )
+        for extra in (
+            ', "scorer_norm": "cosine"',
+            ', "scorer_norm": "hybrid"',
+            ', "head_agg": "mean"',
+        ):
+            try:
+                validate_double_sparsity(self._server_args(extra, disable_cuda_graph=False))
+            except Exception as e:
+                self.assertNotIn("CUDA graph", str(e), f"cfg {extra} wrongly graph-rejected")
+
+    def test_non_default_anchor_with_cuda_graph_rejected(self):
         from sglang.srt.layers.attention.double_sparsity.validator import (
             validate_double_sparsity,
         )
         with self.assertRaises(ValueError) as cm:
-            validate_double_sparsity(self._server_args("cosine", disable_cuda_graph=False))
+            validate_double_sparsity(
+                self._server_args(', "anchor_mode": "recency", "anchor_budget": 4', disable_cuda_graph=False)
+            )
         self.assertIn("CUDA graph", str(cm.exception))
 
-    def test_non_default_scorer_eager_passes_guard(self):
-        # With --disable-cuda-graph the scorer guard must NOT fire (a later
-        # validation check may raise, but not the cuda-graph guard).
+    def test_non_default_anchor_eager_passes_guard(self):
         from sglang.srt.layers.attention.double_sparsity.validator import (
             validate_double_sparsity,
         )
         try:
-            validate_double_sparsity(self._server_args("cosine", disable_cuda_graph=True))
+            validate_double_sparsity(
+                self._server_args(', "anchor_mode": "recency", "anchor_budget": 4', disable_cuda_graph=True)
+            )
         except Exception as e:
-            # A later validation check may raise (e.g. missing channel-mask file),
-            # but the scorer/cuda-graph guard must NOT be what fired.
             self.assertNotIn("CUDA graph", str(e))
+
+
+class TestGraphSafeScorerEqualsEager(unittest.TestCase):
+    """R6: the graph-safe Triton scorer produces selection IDENTICAL to the eager
+    scorer for raw/cosine/hybrid x max/mean, on fp16 and int8 signatures (GPU)."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_graph_safe_matches_eager_all_variants(self):
+        import itertools
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_via_labels, retrieve_topk_graph_safe,
+        )
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            allocate_graph_state,
+        )
+        dev = torch.device("cuda")
+        torch.manual_seed(0)
+        BS, H, LD, MAXT, MSL, K, HYB = 3, 8, 8, 512, 320, 64, 128
+        for int8 in (False, True):
+            q = torch.randn(BS, H, LD, device=dev)
+            if int8:
+                sig = torch.randint(-127, 127, (1, MAXT, H, LD), device=dev, dtype=torch.int8)
+                scales = torch.rand(1, MAXT, H, device=dev, dtype=torch.float16) * 0.1 + 0.01
+            else:
+                sig = torch.randn(1, MAXT, H, LD, device=dev, dtype=torch.float16)
+                scales = None
+            written = torch.ones(1, MAXT, dtype=torch.bool, device=dev)
+            chsel = torch.arange(LD, device=dev).view(1, 1, -1).expand(1, H, -1).to(torch.int32).contiguous()
+            chw = torch.ones(1, H, LD, device=dev)
+            rpi = torch.arange(BS, device=dev, dtype=torch.int32)
+            rtt = torch.arange(MSL, device=dev, dtype=torch.int32).unsqueeze(0).expand(BS, -1).contiguous()
+            sl = torch.tensor([60, 200, MSL], device=dev, dtype=torch.int32)  # below/above HYB
+            st = allocate_graph_state(max_bs=BS, max_top_k=K, max_seq_len=MSL, device=dev)
+            for sn, ha in itertools.product(("off", "cosine", "hybrid"), ("max", "mean")):
+                idx_e, vl_e = retrieve_topk_via_labels(
+                    queries=q, token_signatures=sig, written=written, channel_selection=chsel,
+                    channel_weights=chw, layer_id=0, max_top_k=K, req_pool_indices=rpi,
+                    req_to_token=rtt, seq_lens=sl, max_seq_len=MSL, token_scales=scales,
+                    scorer_norm=sn, head_agg=ha, hybrid_threshold=HYB,
+                )
+                st.selected_indices.fill_(-1); st.valid_lengths.fill_(0)
+                retrieve_topk_graph_safe(
+                    queries=q, token_signatures=sig, written=written, channel_selection=chsel,
+                    channel_weights=chw, layer_id=0, req_pool_indices=rpi, req_to_token=rtt,
+                    seq_lens=sl, max_seq_len=MSL, max_top_k=K,
+                    out_indices=st.selected_indices, out_lengths=st.valid_lengths,
+                    scratch_scores=st.scratch_scores, scratch_topk_values=st.scratch_topk_values,
+                    scratch_topk_indices=st.scratch_topk_indices, scratch_invalid_mask=st.scratch_invalid_mask,
+                    scratch_sorted_vals=st.scratch_sorted_vals, scratch_boundary=st.scratch_boundary,
+                    scratch_valid_i64=st.scratch_valid_i64, scratch_throwaway_idx=st.scratch_throwaway_idx,
+                    token_scales=scales, scorer_norm=sn, head_agg=ha, hybrid_threshold=HYB,
+                )
+                tag = "int8" if int8 else "fp16"
+                self.assertTrue(
+                    torch.equal(st.selected_indices[:BS, :K], idx_e.to(torch.int32)),
+                    f"[{tag}] sn={sn} ha={ha}: graph-safe indices != eager",
+                )
+                self.assertTrue(
+                    torch.equal(st.valid_lengths[:BS], vl_e.to(torch.int32)),
+                    f"[{tag}] sn={sn} ha={ha}: graph-safe lengths != eager",
+                )
+
+
+class TestScorerGraphSafePredicate(unittest.TestCase):
+    def test_graph_safe_vs_default(self):
+        from types import SimpleNamespace as NS
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            ds_scorer_is_graph_safe,
+        )
+        # scorer_norm + head_agg are graph-safe; anchor_mode is not.
+        self.assertTrue(ds_scorer_is_graph_safe(None))
+        self.assertTrue(ds_scorer_is_graph_safe(NS(scorer_norm="cosine", head_agg="mean", anchor_mode="off")))
+        self.assertTrue(ds_scorer_is_graph_safe(NS(scorer_norm="hybrid", head_agg="max", anchor_mode="off")))
+        self.assertFalse(ds_scorer_is_graph_safe(NS(scorer_norm="off", head_agg="max", anchor_mode="recency")))
 
 
 class TestRecallOracleGraphGuard(unittest.TestCase):

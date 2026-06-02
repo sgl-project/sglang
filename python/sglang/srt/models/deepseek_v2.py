@@ -2232,14 +2232,14 @@ class DeepseekV2AttentionMLA(
                     _ds_graph_state = getattr(
                         _dsa_metadata, "ds_graph_state", None
                     )
-                # Route decode through the eager selector.retrieve_topk path
-                # (which honors flag-gated scorer variants) when ANY non-default
-                # scorer variant is configured, OR via the env escape hatch. The
-                # graph-safe Triton scorer only implements the production raw/max
-                # path, so a non-default scorer must NOT enter it. Config-borne so
-                # it reaches the TP workers (env does not). Off by default.
+                # Route decode through the eager selector.retrieve_topk path only
+                # for scorer variants NOT yet on the graph-safe Triton path. As of
+                # R6 scorer_norm (cosine/hybrid) + head_agg (mean) are ported into
+                # _logical_score_kernel and ride the graph-safe path; only a
+                # non-default anchor_mode (post-topK force-include) still requires
+                # the eager selector. Config-borne so it reaches the TP workers.
                 from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-                    ds_scorer_is_default as _ds_scorer_is_default,
+                    ds_scorer_is_graph_safe as _ds_scorer_is_graph_safe,
                 )
 
                 # NOTE: the recall-oracle diagnostic does NOT force eager. The
@@ -2250,7 +2250,7 @@ class DeepseekV2AttentionMLA(
                 # into retrieve_topk_graph_safe below instead.
                 _force_eager_select = (
                     os.environ.get("SGLANG_DS_FORCE_EAGER_SELECT", "0") == "1"
-                    or not _ds_scorer_is_default(getattr(_selector, "config", None))
+                    or not _ds_scorer_is_graph_safe(getattr(_selector, "config", None))
                 )
                 _use_graph_safe = (
                     not _force_eager_select
@@ -2321,6 +2321,11 @@ class DeepseekV2AttentionMLA(
                         process_group=getattr(_selector, "process_group", None),
                         recall_oracle=bool(
                             getattr(_selector.config, "recall_oracle", False)
+                        ),
+                        scorer_norm=getattr(_selector.config, "scorer_norm", "off"),
+                        head_agg=getattr(_selector.config, "head_agg", "max"),
+                        hybrid_threshold=getattr(
+                            _selector.config, "scorer_norm_hybrid_threshold", 8192
                         ),
                     )
                     selected_indices = _ds_graph_state.selected_indices[:_bs]

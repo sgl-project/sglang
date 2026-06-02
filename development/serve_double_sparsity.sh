@@ -82,13 +82,14 @@ DS_CONFIG=$(printf '{"top_k": %s, "page_size": %s, "channel_mask_path": "%s", "d
   "${TOP_K}" "${PAGE_SIZE}" "${CHANNEL_MASK_PATH}" "${DEVICE_BUFFER_SIZE}" "${SIGNATURE_DTYPE}" "${SCORER_NORM}" "${SCORER_NORM_HYBRID_THRESHOLD}" "${HEAD_AGG}" "${ANCHOR_MODE}" "${ANCHOR_BUDGET}" "${RECALL_ORACLE_JSON}")
 echo ">>> effective double_sparsity_config = ${DS_CONFIG}"
 
-# The recall oracle and any non-default scorer variant run the eager (non-graph-
-# safe) selector path; the validator rejects them under CUDA graph. Auto-add
-# --disable-cuda-graph so the operator does not have to remember it.
+# The recall oracle and a non-default anchor_mode run the eager (non-graph-safe)
+# selector path; the validator rejects them under CUDA graph. scorer_norm
+# (cosine/hybrid) + head_agg (mean) are graph-safe (R6) and do NOT require eager.
+# Auto-add --disable-cuda-graph so the operator does not have to remember it.
 CUDA_GRAPH_ARGS=()
-if [[ "${RECALL_ORACLE}" == "1" || "${SCORER_NORM}" != "off" || "${HEAD_AGG}" != "max" || "${ANCHOR_MODE}" != "off" ]]; then
+if [[ "${RECALL_ORACLE}" == "1" || "${ANCHOR_MODE}" != "off" ]]; then
   CUDA_GRAPH_ARGS=(--disable-cuda-graph)
-  echo ">>> eager selector path required (recall_oracle/non-default scorer): adding --disable-cuda-graph"
+  echo ">>> eager selector path required (recall_oracle/anchor_mode): adding --disable-cuda-graph"
 fi
 
 # Radix cache: DS serves radix-off by default. To serve radix-on, set
