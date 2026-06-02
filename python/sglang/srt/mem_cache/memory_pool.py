@@ -702,6 +702,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_value_donated = (
             req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
+        assert mamba_value_donated.item() != -1, (
+            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
+            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+            f"next_track_idx={req.mamba_next_track_idx}, "
+            f"rid={req.rid}"
+        )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
