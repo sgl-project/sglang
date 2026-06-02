@@ -1,0 +1,12 @@
+{
+  "label": "DS-default graph conc1",
+  "conc": 1,
+  "osl": 256,
+  "completed": 1,
+  "per_req_decode_tps_mean": 39.81,
+  "per_req_decode_tps_min": 39.81,
+  "system_throughput_tok_s": 39.8,
+  "mean_e2e_s": 6.43,
+  "total_out_tokens": 256,
+  "wall_s": 6.4
+}

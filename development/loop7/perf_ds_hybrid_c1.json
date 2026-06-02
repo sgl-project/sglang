@@ -1,0 +1,12 @@
+{
+  "label": "DS-hybrid graph conc1",
+  "conc": 1,
+  "osl": 256,
+  "completed": 1,
+  "per_req_decode_tps_mean": 40.1,
+  "per_req_decode_tps_min": 40.1,
+  "system_throughput_tok_s": 40.1,
+  "mean_e2e_s": 6.38,
+  "total_out_tokens": 256,
+  "wall_s": 6.4
+}

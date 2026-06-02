@@ -1,0 +1,12 @@
+{
+  "label": "DSA native-NSA graph conc16",
+  "conc": 16,
+  "osl": 256,
+  "completed": 16,
+  "per_req_decode_tps_mean": 55.37,
+  "per_req_decode_tps_min": 55.35,
+  "system_throughput_tok_s": 885.0,
+  "mean_e2e_s": 4.62,
+  "total_out_tokens": 4096,
+  "wall_s": 4.6
+}
