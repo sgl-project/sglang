@@ -931,6 +931,16 @@ class ModelRunnerKVCacheMixin:
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
+            if max_num_reqs < 1:
+                logger.warning(
+                    "max_mamba_cache_size=%d is smaller than the required "
+                    "ratio=%d for overlap/radix scheduling. Clamping "
+                    "max_num_reqs to 1; consider increasing GPU memory or "
+                    "lowering --mem-fraction-static.",
+                    self.server_args.max_mamba_cache_size,
+                    ratio,
+                )
+                max_num_reqs = 1
 
             if max_num_reqs <= 0:
                 raise RuntimeError(
