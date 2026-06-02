@@ -124,7 +124,10 @@ Pick a weight format by hardware: **NVFP4** on NVIDIA Blackwell (B200, GB200), *
   </tbody>
 </table>
 
-For general GLM-4.x family launch guidance (EAGLE speculative decoding, thinking-budget control, AMD ROCm notes), see [Launch GLM-4.5 / GLM-4.6 / GLM-4.7 with SGLang](../../../docs/basic_usage/glm45). Per-hardware bench commands and flags are inline in §5.1 below.
+- **EAGLE Speculative Decoding:** Supported for GLM-4.7. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default (`SGLANG_ENABLE_SPEC_V2=True`); set `SGLANG_ENABLE_SPEC_V2=0` to disable. Enable via the interactive command generator above.
+- **Thinking Budget:** Use `--enable-custom-logit-processor` flag and pass `Glm4MoeThinkingBudgetLogitProcessor` in requests to cap the model's thinking token count (see section 4.2.3).
+
+For general GLM-4.x family launch guidance (AMD ROCm notes and more), see [Launch GLM-4.5 / GLM-4.6 / GLM-4.7 with SGLang](../../../docs/basic_usage/glm45). Per-hardware bench commands and flags are inline in §5.1 below.
 
 ## 4. Model Invocation
 
@@ -214,6 +217,10 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 **Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
 
 #### 4.2.2 Tool Calling
+
+<Note>
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
+</Note>
 
 GLM-4.7 supports tool calling capabilities. Enable the tool call parser:
 
@@ -365,6 +372,27 @@ final_response = client.chat.completions.create(
 
 print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+#### 4.2.3 Thinking Budget
+
+Limit the number of thinking tokens using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor`:
+
+```python Example
+import openai
+from sglang.srt.sampling.custom_logit_processor import Glm4MoeThinkingBudgetLogitProcessor
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.7",
+    messages=[{"role": "user", "content": "Is Paris the Capital of France?"}],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": Glm4MoeThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {"thinking_budget": 512},
+    },
+)
+print(response)
 ```
 
 ## 5. Benchmark
