@@ -773,6 +773,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
     enable_return_indexer_topk: bool = False
+    enable_deepseek_v4_fp4_indexer: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -4078,6 +4079,11 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
+        if self.enable_deepseek_v4_fp4_indexer and not is_sm100_supported():
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
+                "DeepGEMM FP4 indexer support."
+            )
         # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
         if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
             if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
@@ -6669,6 +6675,11 @@ class ServerArgs:
             "--enable-return-indexer-topk",
             action="store_true",
             help="Enable returning indexer topk indices of layers with indexer with responses.",
+        )
+        parser.add_argument(
+            "--enable-deepseek-v4-fp4-indexer",
+            action="store_true",
+            help="Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",
