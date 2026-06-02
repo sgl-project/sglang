@@ -59,7 +59,8 @@ def _build_app():
                 if msg.get("action") == "reset":
                     async with _lock:
                         await loop.run_in_executor(
-                            None, _engine.reset, _engine._prompt, _engine._image)
+                            None, _engine.reset, _engine._prompt, _engine._image,
+                            _engine._intrinsics)
                     await sock.send_text(json.dumps({"type": "reset_done"}))
                     continue
                 keys = msg.get("keys", "w")
@@ -86,6 +87,9 @@ def main():
                     help="first-frame conditioning image (default: bundled demo)")
     ap.add_argument("--prompt", default=str(_assets / "demo_prompt.txt"),
                     help="prompt text or path to a .txt (default: bundled demo)")
+    ap.add_argument("--intrinsics", default=str(_assets / "demo_intrinsics.npy"),
+                    help="camera intrinsics .npy (3x3 or 4-vec) for the source image; "
+                         "default: bundled demo. Pass '' to use heuristic centered intrinsics.")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8008)
     ap.add_argument("--height", type=int, default=704)
@@ -104,7 +108,7 @@ def main():
     _engine = SanaWMRealtimeEngine(
         model_path=args.model, height=args.height, width=args.width,
         use_refiner=not args.no_refiner)
-    _engine.reset(prompt, args.image)
+    _engine.reset(prompt, args.image, intrinsics=(args.intrinsics or None))
     print(f"Engine ready. Open http://{args.host}:{args.port}/", flush=True)
     uvicorn.run(_build_app(), host=args.host, port=args.port, ws_max_size=64 * 1024 * 1024)
 

@@ -72,15 +72,20 @@ class SanaWMRealtimeEngine:
         self._T_lat = 1
         self._dtype = None
 
-    def reset(self, prompt, image_path, init_keys="w"):
+    def reset(self, prompt, image_path, intrinsics=None, init_keys="w"):
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import _first_tensor
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+            _first_tensor, _SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY,
+        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_realtime import (
             SanaWMRealtimeSession,
         )
+        self._intrinsics = intrinsics  # path / array / None (-> heuristic centered)
         req = Req(prompt=prompt, image_path=image_path, num_frames=49, num_inference_steps=4,
                   height=self.height, width=self.width, seed=self.seed, save_output=False)
         req.extra = {"action": f"{init_keys}-8"}
+        if intrinsics is not None:
+            req.extra["intrinsics"] = intrinsics
         full = list(self.pipeline.stages)
         self.pipeline._stages = self._prefix
         try:
@@ -88,6 +93,9 @@ class SanaWMRealtimeEngine:
         finally:
             self.pipeline._stages = full
         self._dtype = batch.latents.dtype
+        # condition-image resize/crop metadata — needed to map source intrinsics
+        # into the cropped pixel grid for the per-step camera rebuild.
+        self._preprocess = (batch.extra or {}).get(_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY)
         first_latent = batch.latents[:, :, :1].clone()
         pos = _first_tensor(self.pcfg.get_pos_prompt_embeds(batch)).clone()
         pmask = _first_tensor(batch.prompt_attention_mask)
@@ -134,10 +142,17 @@ class SanaWMRealtimeEngine:
 
     def _build_camera(self, total_T_lat):
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+            _SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY,
+        )
         num_pixel = (total_T_lat - 1) * STRIDE + 1
         req = Req(prompt=self._prompt, num_frames=num_pixel, num_inference_steps=4,
                   height=self.height, width=self.width, seed=self.seed)
         req.extra = {"action": ",".join(self._segments)}
+        if self._intrinsics is not None:
+            req.extra["intrinsics"] = self._intrinsics
+            if self._preprocess is not None:
+                req.extra[_SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY] = self._preprocess
         cc, cp, _ = self._before._build_camera_conditioning(
             req, batch_size=1, num_frames=num_pixel,
             latent_shape=(1, 128, total_T_lat, self._H, self._W),
@@ -188,9 +203,9 @@ def main():
     import imageio.v3 as iio
     eng = SanaWMRealtimeEngine()
     prompt = open(f"{ASSET}/demo_0.txt").read().strip()
-    eng.reset(prompt, f"{ASSET}/demo_0.png")
+    eng.reset(prompt, f"{ASSET}/demo_0.png", intrinsics=f"{ASSET}/demo_0_intrinsics.npy")
     frames = []
-    print("RESET ok (refiner=%s)" % bool(eng._runner), flush=True)
+    print("RESET ok (refiner=%s, intrinsics=yes)" % bool(eng._runner), flush=True)
     for keys in ["w", "wl", "l"]:
         f = eng.step(keys)
         frames.append(f)
