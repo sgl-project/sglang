@@ -11,10 +11,6 @@ Registry: nightly-amd-8-gpu-mi35x-kimi-k25-mxfp4-aiter-mla suite
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from dataclasses import dataclass
 from typing import List, Optional
@@ -40,7 +36,7 @@ KIMI_K25_MXFP4_HF_MODEL_ID = "moonshotai/Kimi-K2.5-MXFP4"
 
 
 def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
+    """Get effective model path: env var > HF model ID."""
     env_path = os.environ.get("KIMI_K25_MXFP4_MODEL_PATH")
     if env_path:
         return env_path

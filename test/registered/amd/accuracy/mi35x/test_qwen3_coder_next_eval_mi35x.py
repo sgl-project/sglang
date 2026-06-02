@@ -8,11 +8,6 @@ Registry: nightly-amd-8-gpu-mi35x-qwen3-coder-next suite
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -44,7 +39,7 @@ QWEN3_CODER_NEXT_HF_MODEL_ID = "Qwen/Qwen3-Coder-Next"
 
 
 def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
+    """Get effective model path: env var > HF model ID."""
     env_path = os.environ.get("QWEN3_CODER_NEXT_MODEL_PATH")
     if env_path:
         return env_path
