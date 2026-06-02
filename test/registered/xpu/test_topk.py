@@ -8,7 +8,10 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
 
 
 # Nemotron-3 uses biased_grouped_topk
