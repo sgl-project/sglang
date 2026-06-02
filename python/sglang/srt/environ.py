@@ -250,6 +250,7 @@ class Envs:
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
+    SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -323,6 +324,7 @@ class Envs:
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
+    SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)

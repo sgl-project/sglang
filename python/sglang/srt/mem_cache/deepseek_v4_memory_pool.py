@@ -271,13 +271,17 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
+        self.use_fp4_indexer = get_global_server_args().enable_deepseek_v4_fp4_indexer
 
         self._create_buffer()
 
+    def get_bytes_per_token(self) -> int:
+        if self.use_fp4_indexer:
+            return self.index_head_dim // 2 + 4
+        return self.index_head_dim + 4
+
     def _create_buffer(self):
-        num_scales_per_token = self.index_head_dim // self.quant_block_size
-        page_bytes = self.page_size * self.index_head_dim
-        page_bytes += self.page_size * num_scales_per_token * 4
+        page_bytes = self.page_size * self.get_bytes_per_token()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -344,6 +348,23 @@ class DeepSeekV4IndexerPool(KVCache):
             indices=loc,
             page_size=self.page_size,
             type="indexer",
+        )
+
+    def set_index_fp4(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        from sglang.srt.layers.attention.dsv4.fp4_indexer import (
+            store_fp4_index_k_cache,
+        )
+
+        return store_fp4_index_k_cache(
+            input=cache_k,
+            cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
+            loc=loc,
+            page_size=self.page_size,
         )
 
 
@@ -811,3 +832,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
+
+    def set_index_k_fp4(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        return self.c4_indexer_kv_pool.set_index_fp4(compress_layer_id, loc, cache_k)

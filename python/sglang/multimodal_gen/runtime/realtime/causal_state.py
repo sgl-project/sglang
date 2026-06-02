@@ -10,11 +10,13 @@ class RealtimeCausalDiTState(BaseRealtimeState):
         super().__init__()
         self.kv_cache = None
         self.crossattn_cache = None
+        self.runtime_cache: dict = {}
         self.current_chunk_start_frame: int = 0
         self.chunk_idx: int = 0
 
     def dispose(self) -> None:
         self.kv_cache = None
         self.crossattn_cache = None
+        self.runtime_cache.clear()
         self.current_chunk_start_frame = 0
         self.chunk_idx = 0
