@@ -765,12 +765,23 @@ class DeepseekV4HipRadixBackend(
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
+            if out_cache_loc is not None:
+                # Pad the real write locations to the captured token count so the
+                # metadata's swa_out_cache_loc (the KV-store write target read by
+                # store_cache) reflects the actual replay out_cache_loc.
+                out_cache_loc = torch.nn.functional.pad(
+                    out_cache_loc,
+                    pad=(0, num_tokens_per_bs * bs - len(out_cache_loc)),
+                    mode="constant",
+                    value=0,
+                )
             temp_metadata = self.init_forward_metadata_draft_extend(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
                 num_tokens_per_bs=num_tokens_per_bs,
+                out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=True,
             )
         else:
