@@ -25,22 +25,18 @@ logger = logging.getLogger(__name__)
 FLAGS_SECRET: str = os.environ.get("FLAGS_SECRET", "")
 
 # ── Flag definitions ──────────────────────────────────────────────────────────
-# Description, defaultValue, and options sourced from:
-#   vercel flags inspect ggh --scope samuel-hiotis-projects
-#
-# ggh kind: boolean   variants: false (off) | true (on)
+# Sourced from: vercel flags inspect ggh --scope samuel-hiotis-projects
+# ID: flg_4L5mLv2jfWgX5rnHwNBHMfvwMGYw  kind: boolean  state: active
+# Environments: production=On  preview=On  development=On
 FLAGS_DEFINITIONS: dict[str, dict[str, Any]] = {
     "ggh": {
         "description": "GGH feature rollout for FractalMesh sovereign deployment",
-        "origin": (
-            "https://vercel.com/samuel-hiotis-projects"
-            "/fractalmeshsovereigndeployment/settings/flags"
-        ),
+        "origin": "https://vercel.com/samuel-hiotis-projects/fractalmeshsovereigndeployment/flag/ggh",
         "options": [
-            {"value": False, "label": "Disabled"},
-            {"value": True, "label": "Enabled"},
+            {"value": False, "label": "Off"},
+            {"value": True, "label": "On"},
         ],
-        "defaultValue": False,
+        "defaultValue": True,
     },
 }
 
