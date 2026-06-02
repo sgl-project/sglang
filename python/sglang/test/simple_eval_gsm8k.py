@@ -56,33 +56,20 @@ class GSM8KEval(Eval):
         else:
             filename = download_and_cache_file(GSM8K_URL)
 
-        all_lines = list(read_jsonl(filename))
-        pool_size = self._setup_prefix_pool(all_lines, num_shots)
+        self._lines = list(read_jsonl(filename))
+        self._few_shot_prompt = get_few_shot_examples(self._lines, num_shots)
+
         # The evaluation data should not include the few-shot examples to prevent data leakage.
-        self._lines = all_lines[pool_size:]
+        self._lines = self._lines[num_shots:]
         if num_examples is not None:
-            assert num_examples <= len(self._lines), (
-                f"num_examples={num_examples} exceeds available test lines "
-                f"({len(self._lines)})"
-            )
             self._lines = self._lines[:num_examples]
-
-    def _setup_prefix_pool(self, all_lines: list, num_shots: int) -> int:
-        self._few_shot_prompt = get_few_shot_examples(all_lines, num_shots)
-        return num_shots
-
-    def _build_prefix(self, idx: int) -> str:
-        return self._few_shot_prompt
-
-    def _extra_sample_metrics(self, idx: int, score: float) -> dict:
-        return {}
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(idx: int) -> SingleEvalResult:
             question = get_one_example(self._lines, idx, include_answer=False)
             correct_answer = get_answer_value(self._lines[idx]["answer"])
 
-            prompt_content = self._build_prefix(idx) + question
+            prompt_content = self._few_shot_prompt + question
             prompt_messages = [
                 sampler._pack_message(content=prompt_content, role="user")
             ]
@@ -104,12 +91,7 @@ class GSM8KEval(Eval):
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
 
-            return SingleEvalResult(
-                html=html,
-                score=score,
-                convo=convo,
-                metrics=self._extra_sample_metrics(idx, score),
-            )
+            return SingleEvalResult(html=html, score=score, convo=convo)
 
         results = common.map_with_progress(
             fn, list(range(len(self._lines))), num_threads=self._num_threads
