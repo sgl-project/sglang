@@ -991,11 +991,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                     feat_idx.set(0)
                     first_chunk.set(i == 0)
                     out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
-                out = (
-                    torch.cat(out_chunks, 2)
-                    if len(out_chunks) > 1
-                    else out_chunks[0]
-                )
+                out = torch.cat(out_chunks, 2) if len(out_chunks) > 1 else out_chunks[0]
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)
