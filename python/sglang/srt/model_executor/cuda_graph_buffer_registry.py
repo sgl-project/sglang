@@ -742,4 +742,20 @@ def build_decode_registry(
                     bind=_backing,
                 )
 
+        # KV-canary id buffers (off by default): plain bs-axis FB copies,
+        # adopt-only when the source carries them. Head [:raw_bs] is copied;
+        # the tail keeps its init (rids_int 0, bootstrap_room_ids_int -1).
+        for _cname in ("rids_int", "bootstrap_room_ids_int"):
+            canary = getattr(source, _cname, None)
+            if canary is not None:
+                reg.register_slot(
+                    GraphSlot(
+                        name=_cname,
+                        shape_fn=lambda _bs, _mt, _s=tuple(canary.shape): _s,
+                        dtype=canary.dtype,
+                        axis="bs",
+                    ),
+                    bind=canary,
+                )
+
     return reg

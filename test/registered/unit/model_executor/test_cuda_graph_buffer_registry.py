@@ -48,6 +48,8 @@ class _MiniForwardBatch:
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     ngram_embedding_info: Optional[object] = None
+    rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
     forward_mode: Optional[str] = None
     spec_info: Optional[object] = None
 
@@ -887,6 +889,47 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
         self.assertTrue(torch.all(hs[:3] == 1))
         self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
+
+    def test_source_with_canary_registers_bs_slots(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        rids = torch.zeros(4, dtype=torch.int64)
+        boot = torch.full((4,), -1, dtype=torch.int64)
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+            rids_int=rids,
+            bootstrap_room_ids_int=boot,
+        )
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        self.assertTrue(reg.has_slot("rids_int"))
+        self.assertTrue(reg.has_slot("bootstrap_room_ids_int"))
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            rids_int=torch.tensor([10, 11], dtype=torch.int64),
+            bootstrap_room_ids_int=torch.tensor([20, 21], dtype=torch.int64),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=8)
+        # Head copied; bootstrap tail keeps its -1 init (no per-iter reset).
+        self.assertTrue(torch.equal(rids[:2], torch.tensor([10, 11], dtype=torch.int64)))
+        self.assertTrue(torch.equal(boot[:2], torch.tensor([20, 21], dtype=torch.int64)))
+        self.assertTrue(torch.all(boot[2:] == -1))
 
 
 class TestFillOncePolicy(unittest.TestCase):

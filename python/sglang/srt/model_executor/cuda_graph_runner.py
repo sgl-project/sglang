@@ -58,10 +58,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-    _grouped_foreach_copy_,
-    build_decode_registry,
-)
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_decode_registry
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -328,14 +325,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
         registry,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        # Registry-owned FB-shared slots — input_ids / positions /
-        # out_cache_loc / req_pool_indices / seq_lens / seq_lens_cpu /
-        # mrope_positions (and mamba_track_* when enabled) — including their
-        # padding reset and the dtype-grouped copy. The registry adopted these
-        # buffers, so it writes the same storage the old per-field code did
-        # (seq_lens -> FILL_SENTINEL, out_cache_loc/req_pool_indices/mamba ->
-        # ZERO; the old full-buffer fill_/zero_ is equivalent to the policies'
-        # tail-only reset because the head is overwritten by the copy).
+        # Every FB-shared decode slot is now owned by the registry: the core
+        # axis slots (input_ids / positions / out_cache_loc / req_pool_indices /
+        # seq_lens / seq_lens_cpu / mrope_positions, + mamba_track_* / encoder),
+        # the computed ones (num_token_non_padded, global_num_tokens_*), and the
+        # structured / side-sourced ones (ngram_embedding_info.*,
+        # pp_proxy_tensors.*, canary ids). fill_from does the padding reset and
+        # the dtype-grouped copy into the adopted buffers, writing the same
+        # storage the old per-field populate did.
         registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,
@@ -344,23 +341,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             padded_num_tokens=bs * num_tokens_per_bs,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-
-        # Residual fields the registry does not own yet.
-        dsts = []
-        srcs = []
-
-        if self.rids_int is not None and forward_batch.rids_int is not None:
-            dsts.append(self.rids_int[:raw_bs])
-            srcs.append(forward_batch.rids_int)
-        if (
-            self.bootstrap_room_ids_int is not None
-            and forward_batch.bootstrap_room_ids_int is not None
-        ):
-            dsts.append(self.bootstrap_room_ids_int[:raw_bs])
-            srcs.append(forward_batch.bootstrap_room_ids_int)
-
-        # Batch the residual GPU copies, grouped by dtype pair.
-        _grouped_foreach_copy_(dsts, srcs)
 
 
 # Detect whether the current forward pass is in capture mode
