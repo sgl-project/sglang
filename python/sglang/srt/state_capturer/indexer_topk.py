@@ -77,7 +77,9 @@ class IndexerTopkCapturer(BaseTopkCapturer):
             forward_batch, can_run_graph, cuda_graph_batch
         )
         local_end_pos = local_start_pos + local_num_tokens
-        return forward_batch.out_cache_loc[local_start_pos:local_end_pos]
+        if forward_batch.out_cache_loc.shape[0] >= local_end_pos:
+            return forward_batch.out_cache_loc[local_start_pos:local_end_pos]
+        return forward_batch.out_cache_loc[:local_num_tokens]
 
 
 _global_indexer_capturer: Optional[IndexerTopkCapturer] = None
