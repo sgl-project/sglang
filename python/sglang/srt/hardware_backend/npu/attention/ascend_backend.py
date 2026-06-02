@@ -1261,104 +1261,28 @@ class AscendAttnBackend(AttentionBackend):
                     q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-                    if layer.qk_head_dim != layer.v_head_dim:
-                        k_cache_v2 = k_cache.view(
-                            -1,
-                            self.page_size,
-                            layer.tp_k_head_num * layer.qk_head_dim,
-                        ).contiguous()
-                        v_cache_v2 = v_cache.view(
-                            -1,
-                            self.page_size,
-                            layer.tp_v_head_num * layer.v_head_dim,
-                        ).contiguous()
-                        query = q.reshape(
-                            -1, layer.tp_q_head_num, layer.qk_head_dim
-                        ).contiguous()
-
-                        num_token_padding = query.shape[0]
-                        if num_token_padding > forward_batch.num_token_non_padded_cpu:
-                            query = query[: forward_batch.num_token_non_padded_cpu]
-
-                        if self.forward_metadata.seq_lens_cpu_int is None:
-                            actual_seq_lengths_kv = (
-                                self.forward_metadata.seq_lens_cpu_list
-                            )
-                        else:
-                            actual_seq_lengths_kv = (
-                                self.forward_metadata.seq_lens_cpu_int.cpu()
-                                .int()
-                                .tolist()
-                            )
-
-                        if self.forward_metadata.extend_seq_lens_cpu_int is None:
-                            actual_seq_lengths = (
-                                self.forward_metadata.seq_lens_list_cumsum
-                            )
-                        else:
-                            actual_seq_lengths = (
-                                torch.cumsum(
-                                    self.forward_metadata.extend_seq_lens_cpu_int,
-                                    dim=0,
-                                )
-                                .int()
-                                .tolist()
-                            )
-
-                        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                            query,
-                            k_cache_v2,
-                            v_cache_v2,
-                            num_query_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="TND",
-                            pre_tokens=FULL_ATTENTION_WINDOW,
-                            next_tokens=0,
-                            atten_mask=self.fia_mask.to(torch.int8),
-                            sparse_mode=3,
-                            softmax_scale=layer.scaling,
-                            block_table=self.forward_metadata.block_tables,
-                            block_size=self.page_size,
-                            actual_seq_qlen=actual_seq_lengths,
-                            actual_seq_kvlen=actual_seq_lengths_kv,
-                        )
-                        attn_output = attn_output.view(
-                            -1, layer.tp_q_head_num * layer.v_head_dim
-                        )
-                        if num_token_padding != forward_batch.num_token_non_padded_cpu:
-                            attn_output = torch.cat(
-                                [
-                                    attn_output,
-                                    attn_output.new_zeros(
-                                        num_token_padding - attn_output.shape[0],
-                                        *attn_output.shape[1:],
-                                    ),
-                                ],
-                                dim=0,
-                            )
-                    else:
-                        # add forward_batch.encoder_lens and is_cross_attention arguments for cross attention scene
-                        attn_output = self.native_attn.run_sdpa_forward_extend(
-                            q_,
-                            o_,
-                            k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                            v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                            forward_batch.req_to_token_pool.req_to_token,
-                            forward_batch.req_pool_indices,
-                            forward_batch.seq_lens,
-                            forward_batch.extend_prefix_lens,
-                            forward_batch.extend_seq_lens,
-                            forward_batch.encoder_lens,
-                            is_cross_attention=layer.is_cross_attention,
-                            scaling=layer.scaling,
-                            enable_gqa=use_gqa,
-                            causal=causal,
-                            logit_cap=layer.logit_cap,
-                            logit_capping_method=layer.logit_capping_method,
-                        )
-                        attn_output = attn_output.view(
-                            -1, layer.tp_q_head_num * layer.v_head_dim
-                        )
+                    # add forward_batch.encoder_lens and is_cross_attention arguments for cross attention scene
+                    attn_output = self.native_attn.run_sdpa_forward_extend(
+                        q_,
+                        o_,
+                        k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        forward_batch.req_to_token_pool.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_seq_lens,
+                        forward_batch.encoder_lens,
+                        is_cross_attention=layer.is_cross_attention,
+                        scaling=layer.scaling,
+                        enable_gqa=use_gqa,
+                        causal=causal,
+                        logit_cap=layer.logit_cap,
+                        logit_capping_method=layer.logit_capping_method,
+                    )
+                    attn_output = attn_output.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
