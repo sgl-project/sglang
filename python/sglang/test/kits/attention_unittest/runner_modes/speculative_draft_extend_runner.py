@@ -1023,11 +1023,11 @@ class EagleDraftExtendCudaGraphRunnerAdapter:
         [Any, Any, Any, EagleDraftRunnerSettings], ForwardBatch
     ]
     # Optional hook invoked with `(draft_extend_attn_backend, batch)` right
-    # before `graph_runner.replay(batch)`. DSV4 needs this to set the
-    # out-of-band `_replay_forward_batch` attribute that
-    # `DeepseekV4AttnBackend.init_forward_metadata_replay_cuda_graph` reads
-    # (the multi-step DECODE wrapper sets it internally, but the single-
-    # backend DRAFT_EXTEND path does not).
+    # before `graph_runner.replay(batch)`, then again with `(backend, None)`
+    # afterwards for cleanup. Currently unused — kept as an extension point
+    # for backends that need to stage out-of-band replay state. (The DSV4
+    # `_replay_forward_batch` side channel that previously used this hook was
+    # removed; replay now reads everything off the reconstructed fb_view.)
     pre_replay: Callable[[Any, ForwardBatch], None] = None
     check_case: Callable[[Any, EagleDraftRunnerSettings], None] = (
         lambda _case, _settings: None
@@ -1934,21 +1934,6 @@ def _dsv4_assert_draft_extend_outputs_close(actual, expected, settings) -> None:
         )
 
 
-def _dsv4_draft_extend_pre_replay(
-    draft_extend_attn_backend,
-    batch: ForwardBatch | None,
-) -> None:
-    """Set/clear the out-of-band `_replay_forward_batch` attribute that
-    `DeepseekV4AttnBackend.init_forward_metadata_replay_cuda_graph` reads.
-
-    The DSV4 multi-step DECODE wrapper sets this internally
-    (`deepseek_v4_backend.py:1231,1242`), but the single-backend DRAFT_EXTEND
-    path used by `_create_dsv4_prefill_backend` does not. Set before
-    `replay()` and clear afterwards to mimic the multi-step pattern.
-    """
-    draft_extend_attn_backend._replay_forward_batch = batch
-
-
 def run_dsv4_eagle_draft_extend_cuda_graph_runner_case(
     testcase,
     case: DSV4AttentionCase,
@@ -2001,7 +1986,6 @@ def run_dsv4_eagle_draft_extend_cuda_graph_runner_case(
         make_draft_inputs=_make_dsv4_draft_extend_inputs,
         prepare_replay_state=_prepare_dsv4_draft_extend_replay_state,
         make_forward_batch=_make_dsv4_eagle_draft_extend_forward_batch,
-        pre_replay=_dsv4_draft_extend_pre_replay,
         assert_outputs_close=_dsv4_assert_draft_extend_outputs_close,
     )
     run_eagle_draft_extend_cuda_graph_runner_case(

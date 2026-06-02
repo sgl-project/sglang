@@ -342,7 +342,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             out_cache_loc=None,
         )
 
-    def test_hybrid_dispatch_replay_init_forward_data_fan_out(self):
+    def test_hybrid_dispatch_replay_init_forward_metadata_fan_out(self):
         backend, full_attn_backend, linear_attn_backend = (
             self._make_dispatch_spy_backend()
         )
@@ -355,7 +355,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
                 sub_backend.init_forward_metadata_out_graph, fb
             )
 
-    def test_hybrid_dispatch_capture_init_forward_data_fan_out(self):
+    def test_hybrid_dispatch_capture_init_forward_metadata_fan_out(self):
         backend, full_attn_backend, linear_attn_backend = (
             self._make_dispatch_spy_backend()
         )
