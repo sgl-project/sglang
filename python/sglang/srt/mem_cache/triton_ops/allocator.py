@@ -2,7 +2,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["free_page_ptr"])
 def alloc_extend_kernel(
     pre_lens_ptr,
     seq_lens_ptr,
@@ -88,7 +88,7 @@ def alloc_extend_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["free_page_ptr"])
 def alloc_decode_kernel(
     seq_lens_ptr,
     last_loc_ptr,
