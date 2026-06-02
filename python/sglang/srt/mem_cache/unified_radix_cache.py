@@ -6,7 +6,7 @@ import threading
 import time
 from array import array
 from collections import defaultdict
-from functools import lru_cache, partial
+from functools import partial
 from queue import Empty
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -114,7 +114,6 @@ class UnifiedTreeNode:
             return None
         return self.hash_value[-1]
 
-    @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
         if node is None or node.hash_value is None:
             return []
