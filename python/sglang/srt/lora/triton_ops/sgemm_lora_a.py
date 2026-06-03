@@ -164,16 +164,6 @@ def sgemm_lora_a_fwd(
     K = weights.shape[-1]
     assert x.shape[-1] == K
 
-    # Dense cuBLAS fast path for the single-adapter case: when every request
-    # uses the same adapter, the shrink is a plain GEMM out = x @ A.T, which
-    # cuBLAS does ~1.2-1.7x faster than the segmented split-K kernel on skinny
-    # rank decode shapes. Guards:
-    #  * eager only -- a captured CUDA graph cannot branch on per-replay adapter
-    #    membership, so under graph we stay on the data-driven Triton path.
-    #  * rank == max_r (= R // stack_num) only -- then F.linear's max_r-packed
-    #    output is bit-layout-identical to the kernel's rank-packed output for
-    #    every stack_num (see validate_cublas_stack.py). When rank < max_r the
-    #    layouts differ, so we fall through to the kernel.
     single_adapter = getattr(batch_info, "single_adapter", None)
     if single_adapter is not None and not batch_info.use_cuda_graph:
         idx, rank = single_adapter
@@ -193,9 +183,6 @@ def sgemm_lora_a_fwd(
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         base_grid = batch_info.bs * num_s_tiles
         num_sms = _num_sms(x.device.index)
-        # Require K >= 4096 (>= 16 K-tiles): split-K has a ~5us floor (buffer
-        # zeroing + atomics + launch), so at K=2048 the non-split path is
-        # already below that floor and split-K regresses at higher batch.
         if base_grid < num_sms and num_k_tiles >= 16:
             split_k = max(1, min(2 * num_sms // base_grid, num_k_tiles, 16))
 

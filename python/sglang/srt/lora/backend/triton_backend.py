@@ -224,8 +224,6 @@ class TritonLoRABackend(BaseLoRABackend):
                 permutation=perm,
             )
 
-        # Carry the single-adapter flag onto the merged sgemm info so the dense
-        # cuBLAS fast path in sgemm_lora_a_fwd sees it for decode (eager).
         sgemm.single_adapter = bi.single_adapter
         self.sgemm_batch_info = sgemm
 
@@ -237,10 +235,6 @@ class TritonLoRABackend(BaseLoRABackend):
         scalings: list[float],
         use_cuda_graph: bool,
     ):
-        # Detect the single-adapter case from the host-side lists (no GPU sync):
-        # every request maps to the same buffer id with rank > 0. Stored on
-        # batch_info.single_adapter to enable the dense cuBLAS LoRA-A fast path
-        # in sgemm_lora_a_fwd (eager only).
         single_adapter = None
         if weight_indices and len(set(weight_indices)) == 1:
             idx = weight_indices[0]

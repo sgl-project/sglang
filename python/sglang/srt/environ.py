@@ -402,14 +402,7 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
-    # Split-K for the dense LoRA-A (shrink) GEMM. At decode the shrink grid is
-    # bs programs (one per sequence), far below the SM count, so the large-K
-    # reduction under-fills the GPU. Splitting K across SPLIT_K programs that
-    # accumulate via fp32 atomics recovers the idle SMs. fp32 (not bf16) atomics
-    # are mandatory here: bf16 atomic_add is an emulated CAS loop that contends
-    # and caps the win, while native fp32 atomics scale and are more accurate.
-    # Only helps at large K (>=~2-4K input dim) and low batch; the heuristic
-    # returns SPLIT_K=1 (original path) otherwise. Opt-in; default off is a no-op.
+    # Split-K for the dense LoRA-A (shrink) GEMM.
     SGLANG_ENABLE_LORA_SHRINK_SPLIT_K = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
