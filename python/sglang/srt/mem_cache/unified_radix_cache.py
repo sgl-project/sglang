@@ -1507,7 +1507,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
         if self.enable_storage:
-            self.write_backup_storage(lock_node)
+            # Back up each fragment: after a split, lock_node only holds the
+            # suffix; the prefix fragment must be persisted as well.
+            for node in publish_nodes:
+                self.write_backup_storage(node)
 
     def load_back(
         self,

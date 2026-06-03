@@ -476,7 +476,18 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._insert(tree, allocator, [1, 2, 5, 6])
         self.assertEqual(self._stored_events(tree, StorageMedium.CPU), [])
 
-        tree.writing_check(write_back=True)
+        # Each fragment must also be persisted to L3 on ack: lock_node only
+        # holds the suffix after the split.
+        tree.enable_storage = True
+        with mock.patch.object(tree, "write_backup_storage") as backup_storage:
+            tree.writing_check(write_back=True)
+        self.assertEqual(
+            [
+                list(call.args[0].key.token_ids)
+                for call in backup_storage.call_args_list
+            ],
+            [[1, 2], [3, 4]],
+        )
 
         # Both split fragments must be published, with intact parentage.
         stored_cpu = self._stored_events(tree, StorageMedium.CPU)
