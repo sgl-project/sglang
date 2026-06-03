@@ -66,6 +66,9 @@ class MoeRunnerConfig:
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
 
+    # MoE Layer
+    layer: Optional[torch.nn.Module] = None
+
 
 @dataclass
 class RunnerInput(ABC):

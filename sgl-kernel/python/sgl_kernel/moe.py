@@ -12,6 +12,7 @@ def moe_align_block_size(
     num_tokens_post_pad,
     cumsum_buffer,
     pad_sorted_token_ids=False,
+    ignore_invalid_expert=False,
 ):
     torch.ops.sgl_kernel.moe_align_block_size.default(
         topk_ids,
@@ -22,6 +23,21 @@ def moe_align_block_size(
         num_tokens_post_pad,
         cumsum_buffer,
         pad_sorted_token_ids,
+        ignore_invalid_expert,
+    )
+
+
+def moe_permute_prepare(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool = False,
+    is_ep: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.sgl_kernel.moe_permute_prepare.default(
+        topk_ids,
+        num_experts,
+        use_int64_offset,
+        is_ep,
     )
 
 

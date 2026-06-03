@@ -156,6 +156,7 @@ QUANTIZATION_CHOICES = [
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
     "unquant",
+    "humming",
 ]
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
@@ -224,6 +225,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "humming",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [

@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQMarlinConfig,
 )
 from sglang.srt.layers.quantization.gptq_cpu import CPUGPTQConfig
+from sglang.srt.layers.quantization.humming import HummingConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -93,6 +94,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
+    "humming": HummingConfig,
 }
 
 

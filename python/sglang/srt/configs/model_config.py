@@ -1167,6 +1167,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "modelslim",
+            "humming",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
