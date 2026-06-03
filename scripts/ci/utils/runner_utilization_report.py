@@ -763,13 +763,20 @@ def build_queue_timeline(label_jobs, window_start, window_end, max_series=8):
     return sample_labels, [(lbl, vals) for lbl, vals, _ in series[:max_series]]
 
 
-def build_load_buckets(label_jobs, window_start, window_end, max_pools=6):
+def build_load_buckets(label_jobs, window_start, window_end, max_pools=8):
     """Per runner pool, count jobs running and queued during each hourly bucket.
 
     A job is *running* in a bucket if its [start, end] interval overlaps it, and
     *queued* if its waiting interval [created_at, queue_end] overlaps it.
     Returns (bucket_labels, [(pool, running[], queued[]), ...]) for the busiest
     pools (by peak running+queued), capped at max_pools.
+
+    `max_pools` defaults to 8 to match `build_queue_timeline`'s
+    `max_series=8` so both charts cover the same pool set -- otherwise a
+    pool with sustained-but-flat demand (e.g. 8-gpu-h200 at 85% util, 5
+    peak concurrent, 49 peak queue) appears in the Queue Wait Over Time
+    chart legend but is silently absent from the per-pool Running vs
+    Queued sub-charts, which is confusing.
     """
     total = (window_end - window_start).total_seconds()
     if total <= 0 or not label_jobs:
