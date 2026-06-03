@@ -103,19 +103,24 @@ logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
 
 
-def flatten_arrays_to_int64_tensor(
-    parts: List[array[int]], device, pin: bool
-) -> torch.Tensor:
-    """Flatten a list of array.array('q') buffers into one int64 tensor.
+def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
+    """Flatten array.array('q') buffers into one int64 CPU tensor.
 
-    Uses NumPy here to speed up the conversion by using memcpy
-    instead of a per-element PyLong-to-int64 walk.
+    NumPy memcpy instead of a per-element PyLong-to-int64 walk. Stays on
+    (optionally pinned) CPU; H2D is the caller's job.
     """
     combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
     cpu_t = torch.from_numpy(combined)
     if pin:
         cpu_t = cpu_t.pin_memory()
-    return cpu_t.to(device, non_blocking=True)
+    return cpu_t
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor on `device`."""
+    return flatten_arrays_to_pinned_cpu(parts, pin).to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -276,6 +281,11 @@ is_sm120_supported = lru_cache(maxsize=1)(
 is_sm100_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
+    )
+)
+is_sm80_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
     )
 )
 is_sm90_supported = lru_cache(maxsize=1)(
@@ -1161,33 +1171,59 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
+def _still_holding_resources(procs):
+    """Procs still holding GPU context, pinned memory or fds.
+
+    A zombie has already had its resources freed by the kernel (only the exit
+    status lingers), so it counts as gone; NoSuchProcess / OSError (see
+    _wait_for_reap_or_raise) mean the same.
+    """
+    alive = []
+    for p in procs:
+        try:
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                alive.append(p)
+        except (psutil.NoSuchProcess, OSError):
+            pass
+    return alive
+
+
 def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
     """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
 
     SIGKILL is asynchronous -- children hold GPU context, pinned memory and
     fds until the kernel reaps them. Raise on timeout so a stuck process
     surfaces instead of leaving a latent race.
+
+    Polls /proc via is_running()/status() rather than psutil.wait_procs, whose
+    os.pidfd_open path (used for non-child procs) raises OSError(EINVAL) against
+    a just-killed process on some kernels and aborts the whole wait.
     """
     warn_at = min(10.0, wait_timeout / 2)
-    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
-    if not alive:
-        return
-    logger.warning(
-        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
-        "continuing to wait up to %.1fs total. pids=%s",
-        len(alive),
-        warn_at,
-        wait_timeout,
-        [p.pid for p in alive],
-    )
-    remaining = wait_timeout - warn_at
-    if remaining > 0:
-        _, alive = psutil.wait_procs(alive, timeout=remaining)
-    if alive:
-        raise RuntimeError(
-            f"kill_process_tree: {len(alive)} process(es) not reaped within "
-            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
-        )
+    deadline = time.monotonic() + wait_timeout
+    warn_deadline = time.monotonic() + warn_at
+    warned = False
+    while True:
+        alive = _still_holding_resources(procs)
+        if not alive:
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"kill_process_tree: {len(alive)} process(es) not reaped within "
+                f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+            )
+        if not warned and now >= warn_deadline:
+            logger.warning(
+                "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+                "continuing to wait up to %.1fs total. pids=%s",
+                len(alive),
+                warn_at,
+                wait_timeout,
+                [p.pid for p in alive],
+            )
+            warned = True
+        time.sleep(0.1)
 
 
 def kill_process_tree(
@@ -1203,6 +1239,11 @@ def kill_process_tree(
     `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
     for itself -- use `include_parent=False` if child reap must finish first.
     """
+    logger.info(
+        f"kill_process_tree called: parent_pid={parent_pid}, "
+        f"include_parent={include_parent}, pid={os.getpid()}"
+    )
+
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -3119,8 +3160,7 @@ def require_attn_tp_gather(server_args: ServerArgs):
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    assert server_args.moe_dense_tp_size in [1, None]
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -3612,6 +3652,18 @@ def is_gfx95_supported():
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
     else:
         return False
 

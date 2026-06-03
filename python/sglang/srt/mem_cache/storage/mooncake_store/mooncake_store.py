@@ -20,7 +20,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostKVCache,
+    HostTensorAllocator,
+    MLATokenToKVPoolHost,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -618,6 +622,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        if host_pool_name == PoolName.DRAFT:
+            self.registered_pools[host_pool_name] = host_pool
+            super().register_buffer(host_pool.kv_buffer)
+            return
+
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
@@ -652,6 +661,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name == PoolName.DRAFT:
+            # Draft pool's MLA/MHA layout is independent from the target
+            # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the
+            # suffix scheme from the draft pool's own class. The `_draft`
+            # tag is what keeps these keys from colliding with target's
+            # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
+            draft_pool = self.registered_pools.get(PoolName.DRAFT)
+            if isinstance(draft_pool, MLATokenToKVPoolHost):
+                suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
+            else:
+                suffixes = [
+                    f"_{self.mha_suffix}_{PoolName.DRAFT}_k",
+                    f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
+                ]
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
@@ -664,8 +687,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(qkeys, extra_info)
+        kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -674,8 +696,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if final_pages == 0:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                qkeys, transfer
+                keys, transfer
             )
+            component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
             if key_multiplier > 0:
                 page_exists = [
