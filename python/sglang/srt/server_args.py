@@ -125,38 +125,43 @@ LOAD_FORMAT_CHOICES = [
     "runai_streamer",
 ]
 
+# TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
+# Some of the choices here do NOT support online quantization.
 QUANTIZATION_CHOICES = [
     "awq",
-    "fp8",
-    "mxfp8",
+    "fp8",  # MOE + linear online quantization.
+    "mxfp8",  # MOE + linear online quantization.
     "gptq",
     "marlin",
     "gptq_marlin",
     "awq_marlin",
     "bitsandbytes",
     "gguf",
+    # Modelopt has some online quantization support through ModelOptModelLoader.
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
     "modelopt_mixed",
     "petit_nvfp4",
-    "w8a8_int8",
-    "w8a8_fp8",
-    "moe_wna16",
+    "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
+    "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
+    "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
     "qoq",
     "w4afp8",
-    "mxfp4",
+    "mxfp4",  # MOE-only.
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
+    "quark_mxfp4",  # Online MOE + linear quantization.
     # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
     "unquant",
 ]
+
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 
