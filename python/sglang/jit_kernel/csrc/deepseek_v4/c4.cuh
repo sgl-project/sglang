@@ -86,41 +86,45 @@ struct Compress4PrefillParams {
   uint32_t num_write;
 };
 
-template <typename T>
+template <typename BufferFloat, typename InputFloat>
 SGL_DEVICE void c4_write(
-    T* kv_score_buf,  //
-    const T* kv_score_src,
+    BufferFloat* kv_score_buf,  //
+    const InputFloat* kv_score_src,
     const int64_t head_dim,
     const int32_t write_pos) {
   using namespace device;
 
-  using Storage = AlignedVector<T, kTileElements>;
+  using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
+  using StorageInput = AlignedVector<InputFloat, kTileElements>;
   const auto element_size = head_dim * 4;
-  const auto gmem = tile::Memory<Storage>::warp();
+  const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
+  const auto gmem_input = tile::Memory<StorageInput>::warp();
   kv_score_buf += write_pos * element_size;
 
   /// NOTE: Layout | [0] = kv overlap | [1] = kv | [2] = score overlap | [3] = score |
-  Storage kv_score[4];
+  StorageInput kv_score[4];
+  StorageBuffer kv_score_cast[4];
 #pragma unroll
   for (int32_t i = 0; i < 4; ++i) {
-    kv_score[i] = gmem.load(kv_score_src + head_dim * i);
-  }
+    kv_score[i] = gmem_input.load(kv_score_src + head_dim * i);
 #pragma unroll
-  for (int32_t i = 0; i < 4; ++i) {
-    gmem.store(kv_score_buf + head_dim * i, kv_score[i]);
+    for (int32_t j = 0; j < kTileElements; ++j) {
+      kv_score_cast[i][j] = cast<BufferFloat>(kv_score[i][j]);
+    }
+    gmem_buffer.store(kv_score_buf + head_dim * i, kv_score_cast[i]);
   }
 }
 
-template <bool kPaged, typename InFloat, typename OutFloat>
+template <bool kPaged, typename BufferFloat, typename InputFloat, typename OutFloat>
 SGL_DEVICE void c4_forward(
-    const InFloat* kv_score_buf,
-    const InFloat* kv_score_src,
+    const BufferFloat* kv_score_buf,
+    const InputFloat* kv_score_src,
     OutFloat* kv_out,
-    const InFloat* score_bias,
+    const InputFloat* score_bias,
     const int64_t head_dim,
     const int32_t seq_len,
     const int32_t window_len,
-    [[maybe_unused]] const InFloat* kv_score_overlap_buf = nullptr) {
+    [[maybe_unused]] const BufferFloat* kv_score_overlap_buf = nullptr) {
   using namespace device;
 
   const auto element_size = head_dim * 4;
@@ -128,39 +132,45 @@ SGL_DEVICE void c4_forward(
   const auto overlap_stride = head_dim;
 
   /// NOTE: part 1: load kv + score
-  using StorageIn = AlignedVector<InFloat, kTileElements>;
-  const auto gmem_in = tile::Memory<StorageIn>::warp();
-  StorageIn kv[8];
-  StorageIn score[8];
-  StorageIn bias[8];
+  using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
+  using StorageInput = AlignedVector<InputFloat, kTileElements>;
+  const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
+  const auto gmem_input = tile::Memory<StorageInput>::warp();
+  StorageBuffer kv_hist[8];
+  StorageBuffer score_hist[8];
+  StorageInput kv_live[8];
+  StorageInput score_live[8];
+  StorageInput bias[8];
 
 #pragma unroll
   for (int32_t i = 0; i < 8; ++i) {
-    bias[i] = gmem_in.load(score_bias + i * head_dim);
+    bias[i] = gmem_input.load(score_bias + i * head_dim);
   }
 
 #pragma unroll
   for (int32_t i = 0; i < 8; ++i) {
     const bool is_overlap = i < 4;
-    const InFloat* src;
     if (i < window_len) {
       /// NOTE: `seq_len` must be a multiple of 4 here
       if constexpr (kPaged) {
         const auto kv_score_ptr = is_overlap ? kv_score_overlap_buf : kv_score_buf;
         const int32_t k = i % 4;
-        src = kv_score_ptr + k * element_size;
+        const auto src = kv_score_ptr + k * element_size + (is_overlap ? 0 : overlap_stride);
+        kv_hist[i] = gmem_buffer.load(src);
+        score_hist[i] = gmem_buffer.load(src + score_offset);
       } else {
         const int32_t k = (seq_len + i) % 8;
-        src = kv_score_buf + k * element_size;
+        const auto src = kv_score_buf + k * element_size + (is_overlap ? 0 : overlap_stride);
+        kv_hist[i] = gmem_buffer.load(src);
+        score_hist[i] = gmem_buffer.load(src + score_offset);
       }
     } else {
       /// NOTE: k in [-7, 0]. We'll load from the ragged `kv_score_src`
       const int32_t k = i - 7;
-      src = kv_score_src + k * element_size;
+      const auto src = kv_score_src + k * element_size + (is_overlap ? 0 : overlap_stride);
+      kv_live[i] = gmem_input.load(src);
+      score_live[i] = gmem_input.load(src + score_offset);
     }
-    src += (is_overlap ? 0 : overlap_stride);
-    kv[i] = gmem_in.load(src);
-    score[i] = gmem_in.load(src + score_offset);
   }
 
   if (seq_len == 4) {
@@ -168,8 +178,8 @@ SGL_DEVICE void c4_forward(
     constexpr float kFloatNegInf = -1e9f;
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i) {
-      kv[i].fill(cast<InFloat>(0.0f));
-      score[i].fill(cast<InFloat>(kFloatNegInf));
+      kv_hist[i].fill(cast<BufferFloat>(0.0f));
+      score_hist[i].fill(cast<BufferFloat>(kFloatNegInf));
     }
   }
 
@@ -182,26 +192,25 @@ SGL_DEVICE void c4_forward(
   for (int32_t i = 0; i < kTileElements; ++i) {
     float score_fp32[8];
 
+    float max_value = -INFINITY;
 #pragma unroll
     for (int32_t j = 0; j < 8; ++j) {
-      score_fp32[j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);
+      const float score_value =
+          j < window_len ? cast<float>(score_hist[j][i]) : cast<float>(score_live[j][i]);
+      const float score = score_value + cast<float>(bias[j][i]);
+      score_fp32[j] = score;
+      max_value = fmaxf(max_value, score);
     }
 
-    float max_value = score_fp32[0];
     float sum_exp_value = 0.0f;
-
-#pragma unroll
-    for (int32_t j = 1; j < 8; ++j) {
-      const auto fp32_score = score_fp32[j];
-      max_value = fmaxf(max_value, fp32_score);
-    }
-
     float sum_product = 0.0f;
 #pragma unroll
     for (int32_t j = 0; j < 8; ++j) {
       const auto fp32_score = score_fp32[j];
       const auto exp_score = expf(fp32_score - max_value);
-      sum_product += cast<float>(kv[j][i]) * exp_score;
+      const float kv_value =
+          j < window_len ? cast<float>(kv_hist[j][i]) : cast<float>(kv_live[j][i]);
+      sum_product += kv_value * exp_score;
       sum_exp_value += exp_score;
     }
 
@@ -211,7 +220,7 @@ SGL_DEVICE void c4_forward(
   gmem_out.store(kv_out, result);
 }
 
-template <int64_t kHeadDim, typename InFloat, typename OutFloat, PageMode kMode, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, PageMode kMode, bool kUsePDL>
 C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams params) {
   using namespace device;
 
@@ -236,10 +245,10 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   const int64_t split_offset = global_sid * kTileDim;
 
   // kv score
-  const auto kv_score_buffer = static_cast<InFloat*>(_kv_score_buffer);
+  const auto kv_score_buffer = static_cast<BufferFloat*>(_kv_score_buffer);
 
   // kv input
-  const auto kv_score_input = static_cast<const InFloat*>(_kv_score_input);
+  const auto kv_score_input = static_cast<const InputFloat*>(_kv_score_input);
   const auto kv_src = kv_score_input + global_bid * kElementSize + split_offset;
 
   // kv output
@@ -247,7 +256,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   const auto kv_out = kv_compressed_output + global_bid * kHeadDim + split_offset;
 
   // score bias (ape)
-  const auto score_bias = static_cast<const InFloat*>(_score_bias) + split_offset;
+  const auto score_bias = static_cast<const InputFloat*>(_score_bias) + split_offset;
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -272,7 +281,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int64_t kHeadDim, typename InFloat, typename OutFloat, PageMode kMode, bool kWrite, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, PageMode kMode, bool kWrite, bool kUsePDL>
 C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
   using namespace device;
 
@@ -300,10 +309,10 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const int64_t split_offset = global_sid * kTileDim;
 
   // kv score
-  const auto kv_score_buffer = static_cast<InFloat*>(_kv_score_buffer);
+  const auto kv_score_buffer = static_cast<BufferFloat*>(_kv_score_buffer);
 
   // kv input
-  const auto kv_score_input = static_cast<const InFloat*>(_kv_score_input);
+  const auto kv_score_input = static_cast<const InputFloat*>(_kv_score_input);
   const auto kv_src = kv_score_input + ragged_id * kElementSize + split_offset;
 
   // kv output
@@ -314,7 +323,7 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
     return;
 
   // score bias (ape)
-  const auto score_bias = static_cast<const InFloat*>(_score_bias) + split_offset;
+  const auto score_bias = static_cast<const InputFloat*>(_score_bias) + split_offset;
   const auto seq_len = position + 1;
   const int32_t index = indices[global_bid];
 
@@ -358,12 +367,14 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress4Kernel {
   template <PageMode kMode>
-  static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, InFloat, OutFloat, kMode, kUsePDL>;
+  static constexpr auto decode_kernel =
+      flash_c4_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kMode, kUsePDL>;
   template <PageMode kMode, bool kWrite>
-  static constexpr auto prefill_kernel = flash_c4_prefill<kHeadDim, InFloat, OutFloat, kMode, kWrite, kUsePDL>;
+  static constexpr auto prefill_kernel =
+      flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kMode, kWrite, kUsePDL>;
   template <PageMode kMode>
   static constexpr auto prefill_c_kernel = prefill_kernel<kMode, /*kWrite=*/false>;
   template <PageMode kMode>
@@ -393,11 +404,11 @@ struct FlashCompress4Kernel {
     const auto page_size = extra_ptr != nullptr ? 4 : 8;
 
     TensorMatcher({-1, page_size, kHeadDim * 4})  // kv score
-        .with_dtype<InFloat>()
+        .with_dtype<BufferFloat>()
         .with_device(device_)
         .verify(kv_score_buffer);
     TensorMatcher({B, kHeadDim * 4})  // kv score input
-        .with_dtype<InFloat>()
+        .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(kv_score_input);
     TensorMatcher({B, kHeadDim})  // kv compressed output
@@ -405,7 +416,7 @@ struct FlashCompress4Kernel {
         .with_device(device_)
         .verify(kv_compressed_output);
     TensorMatcher({8, kHeadDim})  // ape
-        .with_dtype<InFloat>()
+        .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(ape);
     TensorMatcher({B})  // indices
@@ -457,11 +468,11 @@ struct FlashCompress4Kernel {
     const auto page_size = extra_ptr != nullptr ? 4 : 8;
 
     TensorMatcher({-1, page_size, kHeadDim * 4})  // kv score
-        .with_dtype<InFloat>()
+        .with_dtype<BufferFloat>()
         .with_device(device_)
         .verify(kv_score_buffer);
     TensorMatcher({N, kHeadDim * 4})  // kv score input
-        .with_dtype<InFloat>()
+        .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(kv_score_input);
     TensorMatcher({N, kHeadDim})  // kv compressed output
@@ -469,7 +480,7 @@ struct FlashCompress4Kernel {
         .with_device(device_)
         .verify(kv_compressed_output);
     TensorMatcher({8, kHeadDim})  // ape
-        .with_dtype<InFloat>()
+        .with_dtype<InputFloat>()
         .with_device(device_)
         .verify(ape);
     TensorMatcher({B})  // indices
