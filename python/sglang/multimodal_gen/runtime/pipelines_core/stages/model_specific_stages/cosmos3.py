@@ -14,7 +14,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -322,11 +321,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         if is_i2v:
             vae_dtype = next(self.vae.parameters()).dtype
-            pixel_video = (
-                batch.preprocessed_image.unsqueeze(2)
-                .expand(-1, -1, batch.num_frames, -1, -1)
-                .contiguous()
-                .to(device=device, dtype=vae_dtype)
+            pixel_video = batch.preprocessed_image.unsqueeze(2).to(
+                device=device, dtype=vae_dtype
             )
             with torch.no_grad():
                 cond_latent = self._vae_encode(pixel_video).to(dtype)
@@ -499,6 +495,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run transformer forward pass.
 
@@ -513,10 +510,9 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and "uncond" for unconditional to enable cache reuse across steps.
             noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V conditioning mask.
         """
-        with set_forward_context(
-            current_timestep=int(timestep.flatten()[0].item()),
-            attn_metadata=None,
-        ):
+        if current_timestep is None:
+            current_timestep = int(timestep.flatten()[0].item())
+        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
@@ -610,7 +606,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             f"CFG_parallel={enable_cfg_parallel}, cfg_rank={cfg_rank}"
         )
 
-        progress_bar = tqdm(
+        progress_bar = self.progress_bar(
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
@@ -641,6 +637,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         noisy_frame_mask=velocity_mask,
                         cond_text_seq_len=batch.extra["cond_text_seq_len"],
                         uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
+                        current_timestep=i,
                     )
                 elif effective_scale == 1.0:
                     noise_pred = self._run_transformer(
@@ -653,6 +650,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         cache_key="cond",
                         noisy_frame_mask=velocity_mask,
                         max_text_seq_len=batch.extra["cond_text_seq_len"],
+                        current_timestep=i,
                     )
                 else:
                     noise_pred = self._predict_noise_cfg_batched(
@@ -670,6 +668,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                             batch.extra["cond_text_seq_len"],
                             batch.extra["uncond_text_seq_len"],
                         ),
+                        current_timestep=i,
                     )
             else:
                 noise_pred = self._run_transformer(
@@ -682,6 +681,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                     cache_key="cond",
                     noisy_frame_mask=velocity_mask,
                     max_text_seq_len=batch.extra["cond_text_seq_len"],
+                    current_timestep=i,
                 )
 
             # I2V: zero-velocity at conditioned frames so the scheduler keeps
@@ -717,6 +717,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         guidance_scale: float,
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run CFG by stacking both branches into a batch_size=2 forward.
 
@@ -744,6 +745,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             cache_key="cfg_batched",
             noisy_frame_mask=mask_batched,
             max_text_seq_len=max_text_seq_len,
+            current_timestep=current_timestep,
         )
 
         noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
@@ -767,6 +769,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         noisy_frame_mask: torch.Tensor | None = None,
         cond_text_seq_len: int | None = None,
         uncond_text_seq_len: int | None = None,
+        current_timestep: int | None = None,
     ) -> torch.Tensor:
         """Run CFG with one branch per CFG rank, combined by all-reduce.
 
@@ -787,6 +790,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 cache_key="cond",
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=cond_text_seq_len,
+                current_timestep=current_timestep,
             )
             partial = guidance_scale * noise_pred
         else:
@@ -800,6 +804,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 cache_key="uncond",
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=uncond_text_seq_len,
+                current_timestep=current_timestep,
             )
             partial = (1.0 - guidance_scale) * noise_pred
 
@@ -822,11 +827,6 @@ class Cosmos3DecodingStage(PipelineStage):
         self._latents_mean = None
         self._latents_std = None
         self._guardrails = guardrails
-        # Use VideoProcessor for postprocessing (same as other video pipelines)
-        from diffusers.video_processor import VideoProcessor
-
-        vae_scale_factor = getattr(vae.config, "scale_factor_spatial", 16)
-        self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)
         if guardrails:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 _init_guardrails,
@@ -876,6 +876,16 @@ class Cosmos3DecodingStage(PipelineStage):
 
         return video
 
+    @staticmethod
+    def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
+        return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
+
+    @staticmethod
+    def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
+        if is_image_gen:
+            return video.squeeze(2).permute(0, 2, 3, 1).cpu().numpy()
+        return video.permute(0, 2, 3, 4, 1).cpu().numpy()
+
     def forward(self, batch: Req, server_args: ServerArgs):
         """Decode latents to video, or to a single image for T2I."""
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -900,25 +910,21 @@ class Cosmos3DecodingStage(PipelineStage):
             self.vae.to("cpu", non_blocking=True)
 
         self.log_info(f"Decoded tensor shape: {decoded.shape}")
-
-        if is_image_gen:
-            output = self.video_processor.postprocess(
-                decoded.squeeze(2), output_type="np"
-            )
-        else:
-            output = self.video_processor.postprocess_video(decoded, output_type="np")
-            self.log_info(f"Postprocessed video shape: {output.shape}")
+        output = self._postprocess_tensor(decoded)
 
         if self._guardrails and batch.use_guardrails is not False:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 check_video_safety,
             )
 
+            output = self._postprocess_video_np(output, is_image_gen)
             if is_image_gen:
                 # check_video_safety expects [B, T, H, W, C]; wrap then unwrap.
                 output = check_video_safety(output[:, np.newaxis, ...])[:, 0, ...]
             else:
                 output = check_video_safety(output)
+        elif not is_image_gen:
+            self.log_info(f"Postprocessed video tensor shape: {output.shape}")
 
         return OutputBatch(
             output=output,
