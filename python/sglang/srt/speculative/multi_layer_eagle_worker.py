@@ -766,9 +766,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     )
                     forward_batch.mark_forward_metadata_ready()
                 logits_output = (
-                    self.mtp_model_runner(step)
-                    .forward(forward_batch, skip_attn_backend_init=True)
-                    .logits_output
+                    self.mtp_model_runner(step).forward(forward_batch).logits_output
                 )
 
             maybe_detect_nan(
