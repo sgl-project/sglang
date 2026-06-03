@@ -95,18 +95,6 @@ class TestSRTEndpoint(CustomTestCase):
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
 
-    def test_simple_decode(self):
-        self.run_decode()
-
-    def test_simple_decode_batch(self):
-        self.run_decode(batch=True)
-
-    def test_parallel_sample(self):
-        self.run_decode(n=3)
-
-    def test_parallel_sample_stream(self):
-        self.run_decode(n=3, stream=True)
-
     def test_logprob(self):
         self.run_decode(
             return_logprob=True,

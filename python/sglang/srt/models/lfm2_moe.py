@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -195,7 +196,7 @@ class Lfm2MoeAttention(nn.Module):
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=getattr(config, "max_position_embeddings", 128000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_scaling=rope_parameters or getattr(config, "rope_scaling", None),
             base=rope_theta,
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
@@ -326,12 +327,10 @@ class Lfm2MoeShortConv(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
+        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
-        mamba_indices = forward_batch.req_to_token_pool.get_mamba_indices(
-            req_pool_indices
-        )
+        mamba_indices = get_req_to_token_pool().get_mamba_indices(req_pool_indices)
 
         proj, _ = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)

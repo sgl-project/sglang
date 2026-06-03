@@ -56,13 +56,16 @@ configure_environment() {
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
         if [ -n "${GITHUB_ENV:-}" ]; then
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
+            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
             touch "$UV_VENV/env.sh"
         fi
         if [ -n "${GITHUB_PATH:-}" ]; then
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
         fi
     else
         echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
@@ -335,18 +338,30 @@ download_flashinfer_cache() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-purge_cutlass_libs_base() {
-    # nvidia-cutlass-dsl[cu13] extras are additive on PyPI: requires_dist always
-    # pulls -libs-base AND -libs-cu13 when [cu13] is requested. Both wheels write
-    # to the same site-packages paths with different content, leaving the wrapper
-    # (cutlass.py, cu13 style) mismatched with the binding (_gpu_ops_gen.py, base
-    # style) -> GPUModuleOp signature TypeError. See vllm-project/vllm#40082.
-    # Uninstall -libs-base, then force-reinstall -libs-cu13 so its files win.
-    $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
-    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
-    if [ -n "$CUTLASS_DSL_VERSION" ]; then
-        $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
+force_reinstall_cutlass_dsl_libs_cu13() {
+    # nvidia-cutlass-dsl[cu13] has additive PyPI extras: installing it pulls in
+    # both -libs-base and -libs-cu13. The two wheels ship intentionally-different
+    # content for the same paths (cutlass/_mlir/dialects/_gpu_ops_gen.py and
+    # cutlass/_mlir/_mlir_libs/_cutlass_ir.cpython-*.so) -- each Python wrapper
+    # is paired with a matching pybind11 .so. If install order leaves the .py
+    # from one wheel and the .so from the other, GPUModuleOp.__init__ raises
+    # TypeError: incompatible function arguments at kernel-compile time.
+    #
+    # Force-reinstall -libs-cu13 LAST so both files come from the same wheel
+    # (BOTH-cu13 state), eliminating the mismatch. The version is parsed from
+    # pyproject.toml so this stays in sync with whatever nvidia-cutlass-dsl
+    # version the project pins.
+    if [ "$CU_MAJOR" != "13" ]; then
+        return
     fi
+
+    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' "${REPO_ROOT}/python/pyproject.toml" || echo "")
+    if [ -z "$CUTLASS_DSL_VERSION" ]; then
+        echo "WARNING: could not detect nvidia-cutlass-dsl version from pyproject.toml; skipping libs-cu13 force-reinstall"
+        return
+    fi
+
+    $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -404,11 +419,11 @@ stabilize_flashinfer_jit_paths() {
 
 install_extra_deps() {
     if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.11.post1"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
+        MOONCAKE_PKG="mooncake-transfer-engine==0.3.11.post1"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
@@ -504,7 +519,7 @@ main() {
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
-    purge_cutlass_libs_base
+    force_reinstall_cutlass_dsl_libs_cu13
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
