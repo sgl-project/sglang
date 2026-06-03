@@ -181,8 +181,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
         delta = float(getattr(batch, "progressive_delta", 0.01))
         seed = self._get_seed(batch)
 
-        vae_scale_factor = (
-            server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
+        arch = server_args.pipeline_config.vae_config.arch_config
+        vae_scale_factor = getattr(arch, "vae_scale_factor", None) or getattr(
+            arch, "spatial_compression_ratio", 8
         )
         H_lat = batch.height // vae_scale_factor
         W_lat = batch.width // vae_scale_factor

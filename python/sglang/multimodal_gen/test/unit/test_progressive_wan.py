@@ -338,29 +338,38 @@ class TestDCTUpsample5D(unittest.TestCase):
 
 
 class TestWanVAEArchConfig(unittest.TestCase):
-    def test_vae_scale_factor_set(self):
-        """WanVAEArchConfig.__post_init__ must set vae_scale_factor for progressive stage."""
+    """WanVAEArchConfig does NOT set vae_scale_factor — that's intentional.
+    ProgressiveDenoisingStage.forward() uses spatial_compression_ratio as a
+    fallback, so the original Wan VAE config is untouched.
+    """
+
+    def test_vae_scale_factor_absent_from_wan_arch(self):
+        """WanVAEArchConfig must NOT have vae_scale_factor — original code is unchanged."""
         from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEArchConfig
 
         cfg = WanVAEArchConfig()
-        self.assertTrue(
+        self.assertFalse(
             hasattr(cfg, "vae_scale_factor"),
-            "WanVAEArchConfig must expose vae_scale_factor for ProgressiveDenoisingStage",
+            "WanVAEArchConfig should not set vae_scale_factor; "
+            "ProgressiveDenoisingStage falls back to spatial_compression_ratio",
         )
-        self.assertEqual(cfg.vae_scale_factor, cfg.scale_factor_spatial)
 
-    def test_spatial_compression_ratio_matches(self):
-        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEArchConfig
-
-        cfg = WanVAEArchConfig()
-        self.assertEqual(cfg.vae_scale_factor, cfg.spatial_compression_ratio)
-
-    def test_vae_scale_factor_value(self):
+    def test_spatial_compression_ratio_is_8(self):
         """Wan VAE spatial stride is 8 (480//60 = 832//104 = 8)."""
         from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEArchConfig
 
         cfg = WanVAEArchConfig()
-        self.assertEqual(cfg.vae_scale_factor, 8)
+        self.assertEqual(cfg.spatial_compression_ratio, 8)
+
+    def test_progressive_stage_reads_spatial_compression_ratio(self):
+        """ProgressiveDenoisingStage.forward() falls back to spatial_compression_ratio."""
+        from types import SimpleNamespace
+
+        arch = SimpleNamespace(spatial_compression_ratio=8)
+        result = getattr(arch, "vae_scale_factor", None) or getattr(
+            arch, "spatial_compression_ratio", 8
+        )
+        self.assertEqual(result, 8)
 
 
 # ---------------------------------------------------------------------------

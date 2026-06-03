@@ -71,7 +71,6 @@ class WanVAEArchConfig(VAEArchConfig):
         )
         self.temporal_compression_ratio = self.scale_factor_temporal
         self.spatial_compression_ratio = self.scale_factor_spatial
-        self.vae_scale_factor = self.scale_factor_spatial
 
 
 @dataclass
