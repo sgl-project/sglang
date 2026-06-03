@@ -61,6 +61,8 @@ class CpuDeviceMixin(DeviceMixin):
         # Device::validate() asserts a CPU index must be -1 or 0 (c10/core/
         # Device.h). Per-rank isolation is done via OpenMP/numactl binding
         # (ModelRunner.init_threads_binding), not the device object.
+        # TODO(zijiexia): make per-rank placement NUMA-affinity aware
+        # (rank -> NUMA node) when the platform layer takes this over.
         return torch.device("cpu")
 
     def set_device(self, device: "torch.device") -> None:
@@ -91,17 +93,18 @@ class CpuDeviceMixin(DeviceMixin):
         return None
 
     def empty_cache(self) -> None:
-        # CPU has no device-side allocator cache to drop, and PyTorch exposes
-        # no ``torch.cpu.empty_cache()`` (nor any arch-specific equivalent on
-        # the x86/ARM CPUs we support). The honest portable action is a GC
-        # pass to reclaim Python-level cycles at the teardown points where this
-        # is called (Scheduler.flush_cache, periodic idle sleep, weight reload).
+        # No torch.cpu.empty_cache() exists; do a GC pass at the teardown
+        # points where this is called (flush_cache, idle sleep, weight reload).
         #
-        # This intentionally does NOT force freed arenas back to the OS. glibc
-        # ``malloc_trim`` could, but it is (a) a no-op under the tcmalloc / TBB
-        # malloc allocators the CPU deployment guide preloads via LD_PRELOAD,
-        # and (b) on a periodic path. Real RSS reclaim, if needed, belongs in a
-        # separate benchmarked change gated on the active allocator.
+        # gc.collect() caveats:
+        # - the pause grows with heap size (full walk of tracked objects);
+        # - it only reclaims reference cycles — refcounting already frees
+        #   everything else, so it may do little;
+        # - freed memory returns to the allocator, not the OS, so RSS may not
+        #   drop. glibc malloc_trim would not help: it is a no-op under the
+        #   tcmalloc / TBB malloc the CPU guide preloads via LD_PRELOAD. Real
+        #   RSS reclaim belongs in a separate allocator-aware, benchmarked
+        #   change.
         gc.collect()
 
     def synchronize(self) -> None:
