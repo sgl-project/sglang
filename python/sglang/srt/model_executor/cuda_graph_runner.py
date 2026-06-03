@@ -325,14 +325,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         registry,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        # Every FB-shared decode slot is now owned by the registry: the core
-        # axis slots (input_ids / positions / out_cache_loc / req_pool_indices /
-        # seq_lens / seq_lens_cpu / mrope_positions, + mamba_track_* / encoder),
-        # the computed ones (num_token_non_padded, global_num_tokens_*), and the
-        # structured / side-sourced ones (ngram_embedding_info.*,
-        # pp_proxy_tensors.*, canary ids). fill_from does the padding reset and
-        # the dtype-grouped copy into the adopted buffers, writing the same
-        # storage the old per-field populate did.
+        # Reset padded tails + copy FB into the registry-adopted graph buffers
+        # (same storage the old per-field populate wrote).
         registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,

@@ -8,17 +8,7 @@ import torch
 
 from sglang.srt.utils import is_npu
 
-# Keyed by ``(name, numel, dtype, device)``: buffers that mirror the same
-# ForwardBatch field *and* have an identical size/dtype/device share one
-# physical allocation. Keying on size — not name alone — makes the sharing
-# outcome independent of registration order. The previous "reuse iff the
-# existing buffer is strictly larger" rule was order-dependent two ways: a
-# larger buffer arriving after a smaller one orphaned the smaller (no share),
-# and equal sizes never shared at all. It could also have required repointing
-# an already-registered buffer onto larger storage — unsafe, because cuda graph
-# capture (which runs right after registration, per runner) burns the buffer's
-# ``data_ptr`` into the graph. Size-keying guarantees an entry is never grown
-# or replaced once created, so no captured buffer is ever repointed.
+# Process-wide pool keyed by (name, numel, dtype, device); see share_input_buffer.
 _PoolKey = Tuple[str, int, torch.dtype, torch.device]
 _forward_input_buffer_pool: Dict[_PoolKey, torch.Tensor] = {}
 
