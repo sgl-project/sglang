@@ -1373,7 +1373,9 @@ class DeepseekSparseAttnBackend(
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+                metadata.paged_mqa_ctx_lens_2d[: seqlens_32_2d.shape[0]].copy_(
+                    seqlens_32_2d
+                )
 
         self.forward_metadata = metadata
 
