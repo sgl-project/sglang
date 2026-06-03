@@ -14,11 +14,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
@@ -146,8 +142,7 @@ def prepare_mlp_sync_batch_raw(
     attn_cp_size: int,
     tp_group: GroupCoordinator,
     get_idle_batch: Callable[[], ScheduleBatch],
-    disable_decode_cuda_graph: bool,
-    disable_prefill_cuda_graph: bool,
+    disable_cuda_graph: bool,
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
@@ -183,7 +178,7 @@ def prepare_mlp_sync_batch_raw(
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
-    ) and not disable_decode_cuda_graph
+    ) and not disable_cuda_graph
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -271,12 +266,7 @@ class SchedulerDPAttnAdapter:
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
-            disable_decode_cuda_graph=check_cuda_graph_backend(
-                Phase.DECODE, Backend.DISABLED
-            ),
-            disable_prefill_cuda_graph=check_cuda_graph_backend(
-                Phase.PREFILL, Backend.DISABLED
-            ),
+            disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
