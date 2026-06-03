@@ -458,7 +458,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         logger.info(log_message)
 
     # -----------------------------------------------------------------
-    # capture_prepare — build the dummy ForwardBatch + capture-time locals
+    # capture_prepare
     # -----------------------------------------------------------------
     def capture_prepare(
         self,
@@ -668,7 +668,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._post_process_after_profile(prof)
 
     # -----------------------------------------------------------------
-    # capture_one_shape — per-shape capture (size = batch size for decode)
+    # capture_one_shape
     # -----------------------------------------------------------------
     def capture_one_shape(
         self,
@@ -796,7 +796,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        *,
+        skip_attn_backend_init: bool = False,
     ):
+        self.deepep_adapter.replay()
+
+        if skip_attn_backend_init:
+            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and forward_batch.input_embeds is not None
+            ):
+                self.buffers.input_embeds[: self.raw_num_token].copy_(
+                    forward_batch.input_embeds
+                )
+            variant_label = self._resolve_lora_variant(forward_batch)
+            stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+            self._replay_graph_key = self._make_graph_key(
+                self.bs, stream_idx, variant_label
+            )
+            return
+
         buffers = self.buffers
         self.recapture_if_needed(forward_batch)
 
@@ -870,6 +892,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
+        variant_label = self._resolve_lora_variant(forward_batch)
+        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        self._replay_graph_key = self._make_graph_key(
+            self.bs, stream_idx, variant_label
+        )
+
     # -----------------------------------------------------------------
     # replay
     # -----------------------------------------------------------------
@@ -879,42 +907,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        self.deepep_adapter.replay()
+        self.replay_prepare(
+            forward_batch,
+            pp_proxy_tensors,
+            skip_attn_backend_init=skip_attn_backend_init,
+        )
 
-        if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
-        else:
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-            if (
-                self.model_runner.spec_algorithm.is_dflash()
-                and self.model_runner.is_draft_worker
-                and forward_batch.input_embeds is not None
-            ):
-                self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
-                )
-
-        variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
-
-        # Backend dispatches by shape — ``static_forward_batch`` is the
-        # forward_batch the model code reads from during replay; for
-        # Full/Breakable backends it's unused (replay against static
-        # buffers in place); for tc_piecewise-decode (not yet implemented) it
-        # would feed args to the compiled callable.
         timer_ctx = (
             self.model_runner.device_timer.wrap(
-                metadata={
-                    "category": forward_batch.forward_mode.name.lower(),
-                }
+                metadata={"category": forward_batch.forward_mode.name.lower()}
             )
             if self.model_runner.device_timer
             else contextlib.nullcontext()
         )
         with timer_ctx, self.backend.replay_session():
-            output = self.backend.replay(graph_key, forward_batch)
+            output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
