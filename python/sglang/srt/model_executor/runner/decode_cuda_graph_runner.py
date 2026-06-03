@@ -123,13 +123,13 @@ def _make_graph_key(bs, stream_idx=None, variant_label=None):
 
 
 def build_replay_fb_view(
-    forward_batch: "ForwardBatch",
-    buffers: "DecodeInputBuffers",
+    forward_batch: ForwardBatch,
+    buffers: DecodeInputBuffers,
     bs: int,
     raw_bs: int,
     num_tokens: int,
     seq_len_fill_value: int,
-    capture_forward_mode: "ForwardMode",
+    capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
 ) -> SimpleNamespace:
     """Construct a ForwardBatch-like view for backend replay-side init.
@@ -177,7 +177,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def __init__(
         self,
-        model_runner: "ModelRunner",
+        model_runner: ModelRunner,
         *,
         attn_backend=None,
         speculative_num_steps: Optional[int] = None,

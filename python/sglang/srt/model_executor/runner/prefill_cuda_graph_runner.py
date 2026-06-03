@@ -97,7 +97,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
-    def __init__(self, model_runner: "ModelRunner"):
+    def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # --- core state ------------------------------------------------
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
