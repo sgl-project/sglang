@@ -279,6 +279,8 @@ button:focus-visible {
   color: #e8eadf;
   background: rgba(17, 20, 15, 0.88);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .topbar > * {
@@ -291,6 +293,7 @@ button:focus-visible {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  flex: 0 0 190px;
   min-width: 190px;
   margin: 0;
   color: rgba(232, 234, 223, 0.72);
@@ -324,14 +327,22 @@ button:focus-visible {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  flex: 0 0 auto;
   min-width: max-content;
   color: rgba(232, 234, 223, 0.72);
   line-height: 1;
 }
 .stage-stat b {
+  display: inline-block;
   color: #fffdf7;
   font-weight: 650;
+  font-variant-numeric: tabular-nums;
 }
+
+#outputSizeText { min-width: 206px; }
+#renderFps { min-width: 2ch; text-align: right; }
+#theoreticalFpsText { min-width: 116px; }
+#stageLatencyText { min-width: 120px; }
 
 .timeline { justify-content: flex-end; border-top: 1px solid rgba(232, 234, 223, 0.12); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }

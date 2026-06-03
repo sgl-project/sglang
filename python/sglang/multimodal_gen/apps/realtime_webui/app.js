@@ -21,6 +21,7 @@ const DEFAULT_PREVIEW_SCALE = 120;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const DECODE_QUEUE_SECONDS = 0.9;
 const STARTUP_DECODE_QUEUE_SECONDS = 1.2;
+const RECENT_DROP_DISPLAY_MS = 1800;
 const CONTROL_BUFFERED_AMOUNT_LIMIT = 1 << 20;
 const CONTROL_KEY_ACTIONS = new Map([
   ["w", "w"],
@@ -208,6 +209,8 @@ let queuedDecodeFrames = 0;
 let decodeInProgress = false;
 let pendingDecodeBatches = 0;
 let droppedDecodeFrames = 0;
+let lastDecodeDropAt = 0;
+let lastDecodeDropCount = 0;
 let nextEventId = 1;
 let lastRawRgbFrame = null;
 let decoderWorker = null;
@@ -278,6 +281,8 @@ function resetStreamStats() {
   decodeInProgress = false;
   pendingDecodeBatches = 0;
   droppedDecodeFrames = 0;
+  lastDecodeDropAt = 0;
+  lastDecodeDropCount = 0;
   encodedDecodeErrors = 0;
   renderedPreviewFrames = 0;
   controlStateController?.reset({ sendRelease: false });
@@ -433,10 +438,13 @@ function updateStats() {
   queueParts.push(`q ${playback.queueFrames}`);
   if (playback.buffering && playback.queueFrames) queueParts.push("hold");
   if (pendingDecodeBatches) queueParts.push(`decode ${pendingDecodeBatches}`);
-  const totalDroppedFrames = playback.droppedFrames + droppedDecodeFrames;
-  if (totalDroppedFrames) {
+  const now = performance.now();
+  if (playback.lastDropAt && now - playback.lastDropAt < RECENT_DROP_DISPLAY_MS) {
     const reason = playback.lastDropReason ? ` ${playback.lastDropReason}` : "";
-    queueParts.push(`drop ${totalDroppedFrames}${reason}`);
+    queueParts.push(`drop +${playback.lastDropCount}${reason}`);
+  }
+  if (lastDecodeDropAt && now - lastDecodeDropAt < RECENT_DROP_DISPLAY_MS) {
+    queueParts.push(`decode drop +${lastDecodeDropCount}`);
   }
   $("queueText").textContent = queueParts.join(" · ");
   $("frameText").textContent = `frames ${frames}`;
@@ -506,6 +514,8 @@ function trimDecodeQueue() {
     queuedDecodeFrames = Math.max(0, queuedDecodeFrames - item.frameCount);
     pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
     droppedDecodeFrames += item.frameCount;
+    lastDecodeDropAt = performance.now();
+    lastDecodeDropCount = item.frameCount;
   }
 }
 

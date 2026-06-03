@@ -68,7 +68,7 @@ function slowServerCapsRenderFps() {
 function backlogDropsContiguousOldFrames() {
   const controller = new RealtimePlaybackController({ targetFps: 25 });
   let now = 100;
-  for (let chunk = 0; chunk < 6; chunk += 1) {
+  for (let chunk = 0; chunk < 10; chunk += 1) {
     enqueueChunk(controller, { chunk, now, durationMs: 480 });
     now += 20;
   }
@@ -89,7 +89,7 @@ function eventCutoverKeepsShortGrace() {
     now: 1150,
   });
   assert.ok(result.cutover);
-  assert.ok(result.droppedFrames.length >= 18);
+  assert.ok(result.droppedFrames.length >= 14);
 }
 
 function settleEventCutoverKeepsWiderGrace() {

@@ -4,35 +4,35 @@
     minSourceFps: 1,
     serverFpsAlphaUp: 0.28,
     serverFpsAlphaDown: 0.2,
-    deliveryFpsAlphaUp: 0.16,
+    deliveryFpsAlphaUp: 0.08,
     deliveryFpsAlphaDown: 0.55,
-    targetLeadChunkRatio: 1.25,
-    minTargetLeadMs: 450,
-    maxTargetLeadMs: 1000,
-    maxLeadExtraChunkRatio: 2.0,
-    startLeadChunkRatio: 1.5,
-    minStartLeadMs: 520,
-    resumeLeadChunkRatio: 0.35,
-    minResumeLeadMs: 120,
-    maxResumeLeadMs: 320,
-    rebufferLeadBoostMs: 150,
+    targetLeadChunkRatio: 1.5,
+    minTargetLeadMs: 700,
+    maxTargetLeadMs: 1500,
+    maxLeadExtraChunkRatio: 5.0,
+    startLeadChunkRatio: 1.85,
+    minStartLeadMs: 900,
+    resumeLeadChunkRatio: 0.8,
+    minResumeLeadMs: 300,
+    maxResumeLeadMs: 800,
+    rebufferLeadBoostMs: 250,
     rebufferLeadBoostDecayMsPerSecond: 120,
-    deliveryLeadBoostDecayMsPerSecond: 180,
-    maxDeliveryLeadBoostMs: 600,
-    deliveryStallExpectedMultiplier: 1.35,
+    deliveryLeadBoostDecayMsPerSecond: 80,
+    maxDeliveryLeadBoostMs: 1200,
+    deliveryStallExpectedMultiplier: 1.25,
     receiveStallPlaybackRateMin: 0.65,
     receiveStallPlaybackRateSlewPerSecond: 0.5,
-    lowWaterRatio: 0.2,
-    playbackRateGain: 0.14,
-    playbackRateMin: 0.95,
-    playbackRateMax: 1.07,
+    lowWaterRatio: 0.4,
+    playbackRateGain: 0.1,
+    playbackRateMin: 0.92,
+    playbackRateMax: 1.04,
     emergencyPlaybackRateMin: 0.9,
-    emergencyPlaybackRateMax: 1.12,
+    emergencyPlaybackRateMax: 1.08,
     playbackRateSlewPerSecond: 0.05,
-    eventCutoverMaxMs: 250,
-    eventCutoverMaxFrames: 6,
-    settleEventCutoverMaxMs: 500,
-    settleEventCutoverMaxFrames: 12,
+    eventCutoverMaxMs: 420,
+    eventCutoverMaxFrames: 10,
+    settleEventCutoverMaxMs: 720,
+    settleEventCutoverMaxFrames: 18,
     startupWarmupMinMs: 1500,
     startupWarmupExpectedMultiplier: 3,
   };
@@ -72,6 +72,8 @@
       this.pendingEventSentAt = 0;
       this.pendingEventCutoverMode = "motion";
       this.lastDropReason = "";
+      this.lastDropAt = 0;
+      this.lastDropCount = 0;
       this.rebufferLeadBoostMs = 0;
       this.deliveryLeadBoostMs = 0;
       this.chunkReceives = new Map();
@@ -154,7 +156,7 @@
         const dropCount = Math.max(0, this.#oldEventFrameCount(eventId) - this.#eventGraceFrames());
         if (dropCount > 0) {
           droppedFrames.push(...this.queue.splice(0, dropCount));
-          this.#recordDrop(dropCount, "event cutover");
+          this.#recordDrop(dropCount, "event cutover", now);
         }
         cutover = {
           eventId,
@@ -167,14 +169,14 @@
 
       this.queue.push(...preparedFrames);
       this.#observeChunkArrival(header, preparedFrames.length, receivedAt, now);
-      droppedFrames.push(...this.#trimBacklog());
+      droppedFrames.push(...this.#trimBacklog(now));
       return { droppedFrames, cutover, snapshot: this.snapshot() };
     }
 
     render(now, { hasPendingInput = true } = {}) {
       this.#decayRebufferBoost(now);
       this.#updateReceiveStallGuard(now);
-      const droppedFrames = this.#trimBacklog();
+      const droppedFrames = this.#trimBacklog(now);
       if (!this.queue.length) {
         if (this.renderedFrames && hasPendingInput && !this.buffering) {
           this.buffering = true;
@@ -257,6 +259,8 @@
         renderFps: this.renderFps,
         playbackRate: this.playbackRate,
         droppedFrames: this.droppedFrames,
+        lastDropAt: this.lastDropAt,
+        lastDropCount: this.lastDropCount,
         buffering: this.buffering,
         lastDropReason: this.lastDropReason,
       };
@@ -286,7 +290,7 @@
         this.hasServerSample = true;
       }
       const effectiveFps = this.hasServerSample
-        ? this.serverFps
+        ? (this.hasDeliverySample ? Math.min(this.serverFps, this.deliveryFps) : this.serverFps)
         : (this.hasDeliverySample ? this.deliveryFps : this.targetFps);
       this.sourceFps = clamp(effectiveFps, this.config.minSourceFps, this.targetFps);
       if (!isDelivery || !this.hasServerSample) {
@@ -408,7 +412,7 @@
       );
     }
 
-    #trimBacklog() {
+    #trimBacklog(now) {
       const droppedFrames = [];
       while (this.queue.length && this.bufferDurationMs > this.maxLeadMs) {
         const firstChunk = this.queue[0].chunkIndex;
@@ -421,7 +425,7 @@
         }
         if (!dropCount || dropCount >= this.queue.length) break;
         droppedFrames.push(...this.queue.splice(0, dropCount));
-        this.#recordDrop(dropCount, "backlog");
+        this.#recordDrop(dropCount, "backlog", now);
       }
       return droppedFrames;
     }
@@ -439,7 +443,8 @@
         1,
         Math.round(this.sourceFps * this.#eventCutoverMaxMs() / 1000),
       );
-      const byChunk = Math.max(1, Math.round(this.latestChunkFrames * 0.5));
+      const byChunkRatio = this.pendingEventCutoverMode === "settle" ? 1.5 : 0.85;
+      const byChunk = Math.max(1, Math.round(this.latestChunkFrames * byChunkRatio));
       return Math.min(this.#eventCutoverMaxFrames(), byTime, byChunk);
     }
 
@@ -484,8 +489,10 @@
       );
     }
 
-    #recordDrop(count, reason) {
+    #recordDrop(count, reason, now) {
       this.droppedFrames += count;
+      this.lastDropAt = Number(now || 0);
+      this.lastDropCount = count;
       this.lastDropReason = reason;
     }
   }

@@ -318,8 +318,12 @@ async def _wait_for_realtime_output_slot(
     next_send_at = session.output_pace_next_send_at
     if next_send_at is None:
         next_send_at = now
-    if batch.realtime_event_id is not None:
+    if (
+        batch.realtime_event_id is not None
+        and batch.realtime_event_id != session.output_pace_last_event_id
+    ):
         next_send_at = min(next_send_at, now)
+        session.output_pace_last_event_id = batch.realtime_event_id
 
     wait_s = max(0.0, next_send_at - now)
     if wait_s > 0:
