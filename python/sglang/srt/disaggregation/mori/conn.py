@@ -41,8 +41,8 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import get_int_env_var
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -298,21 +298,15 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
-        # Send CPU-resident AUX data via RDMA instead of ZMQ TCP.
-        # Default: TCP.  Set SGLANG_MORI_SEND_AUX_RDMA=1 to use RDMA.
-        self._send_aux_rdma = os.environ.get(
-            "SGLANG_MORI_SEND_AUX_RDMA", ""
-        ).lower() in ("1", "true")
+        self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._num_shards = max(1, get_int_env_var("SGLANG_MORI_TRANSFER_SHARDS", 8))
+            self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
             self._transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(self._num_shards)
             ]
-            self._wait_poll_ms = get_int_env_var("SGLANG_MORI_WAIT_POLL_MS", 1000)
-            self._transfer_timeout_ms = get_int_env_var(
-                "SGLANG_MORI_TRANSFER_TIMEOUT_MS", 0
-            )
+            self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
+            self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
             for shard, queue in enumerate(self._transfer_queues):
                 threading.Thread(
                     target=self._transfer_worker,
@@ -345,24 +339,9 @@ class MoriKVManager(CommonKVManager):
         engine = IOEngine(engine_key, config)
         poll_mode = PollCqMode.POLLING
 
-        # Number of RDMA Queue Pairs (QPs) used per transfer operation.
-        # Higher values can increase parallelism and bandwidth utilization.
-        # Default: 4
-        qp_per_transfer = get_int_env_var("SGLANG_MORI_QP_PER_TRANSFER", 4)
-
-        # Number of RDMA work requests posted in a single batch to each QP.
-        # Larger batch sizes reduce per-operation overhead and improve throughput
-        # at the cost of higher latency. Use -1 for automatic sizing based on
-        # the number of merged work requests and available endpoints.
-        # Default: -1 (automatic)
-        post_batch_size = get_int_env_var("SGLANG_MORI_POST_BATCH_SIZE", -1)
-
-        # Number of worker threads in the RDMA executor thread pool.
-        # Each worker handles RDMA operations on a separate CPU core (with affinity).
-        # More workers can improve parallelism for large batch transfers across
-        # multiple QPs, but excessive threads may cause contention.
-        # Default: 4
-        num_worker_threads = get_int_env_var("SGLANG_MORI_NUM_WORKERS", 4)
+        qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
+        post_batch_size = envs.SGLANG_MORI_POST_BATCH_SIZE.get()
+        num_worker_threads = envs.SGLANG_MORI_NUM_WORKERS.get()
 
         rdma_cfg = RdmaBackendConfig(
             qp_per_transfer,
