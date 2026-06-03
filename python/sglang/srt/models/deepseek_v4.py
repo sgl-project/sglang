@@ -646,8 +646,8 @@ class MQALayer(nn.Module):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
+            swa_loc = token_to_kv_pool.get_cached_swa_loc(
+                forward_batch.out_cache_loc, self.layer_id
             )
             swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
@@ -736,8 +736,8 @@ class MQALayer(nn.Module):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
-            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
+            swa_loc = token_to_kv_pool.get_cached_swa_loc(
+                forward_batch.out_cache_loc, self.layer_id
             )
             swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
@@ -1582,9 +1582,6 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-        # Upgrade lazy raw metadata on the main stream once before any layer
-        # forks alt-streams; later per-layer calls become no-ops.
-        get_attn_backend()._maybe_upgrade_forward_metadata()
 
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
@@ -1743,7 +1740,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
+                    core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)

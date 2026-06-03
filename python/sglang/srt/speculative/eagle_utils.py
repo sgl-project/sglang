@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -98,13 +99,21 @@ def organize_draft_results(
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values
+    maybe_detect_oob(
+        top_scores_index,
+        0,
+        ss_token_list.shape[1],
+        "organize_draft_results: top_scores_index OOB for gather on ss_token_list",
+    )
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
     if len(parents_list) > 1:
         parent_list = torch.cat(parents_list[:-1], dim=1)
     else:
         batch_size = parents_list[0].shape[0]
-        parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+        parent_list = torch.empty(
+            batch_size, 0, dtype=torch.long, device=parents_list[0].device
+        )
 
     return parent_list, top_scores_index, draft_tokens
 
