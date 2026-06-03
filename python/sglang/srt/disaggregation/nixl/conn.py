@@ -1944,12 +1944,36 @@ class NixlKVSender(CommonKVSender):
             )
         return status
 
+    def clear(self) -> None:
+        super().clear()
+        if (
+            getattr(self.kv_mgr, "enable_staging", False)
+            and getattr(self.kv_mgr, "_staging_ctx", None) is not None
+        ):
+            self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
+            self.kv_mgr._staging_ctx.prefetch_requested = {
+                key
+                for key in self.kv_mgr._staging_ctx.prefetch_requested
+                if key[0] != self.bootstrap_room
+            }
+
     def failure_exception(self):
+        exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+        self._send_failed = True
+
+        self.clear()
+
         if self._send_error is not None:
             raise self._send_error
-        exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
         if exc is not None:
             raise exc
+        if failure_reason is not None:
+            raise RuntimeError(failure_reason)
         raise RuntimeError("NIXL KVSender Exception")
 
 
