@@ -572,6 +572,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if node is not None and node is not self.root_node:
             node.session_id = sid
             self._session_leaves[sid].add(node)
+            logger.debug(
+                "tag session %s: node=%d len=%d (registered=%d)",
+                sid, node.id, len(node.key), len(self._session_leaves[sid]),
+            )
 
     def release_session(self, session_id: str) -> int:
         """Queue a session's tagged leaves for deferred free (drained by
@@ -579,10 +583,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         chain; shared prefixes are branch points and are preserved."""
         registered = self._session_leaves.pop(session_id, None)
         if not registered:
+            logger.info("release_session %s: no tagged leaves", session_id)
             return 0
         seeds = [
             n for n in registered if n in self.evictable_leaves and n.lock_ref == 0
         ]
+        logger.info(
+            "release_session %s: %d leaves registered, %d seeds queued",
+            session_id, len(registered), len(seeds),
+        )
         self._pending_release.extend(seeds)
         return len(seeds)
 
@@ -608,6 +617,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             freed_nodes += 1
             # Walk up: the parent may now be a freeable leaf of this chain.
             self._pending_release[-1] = parent
+        if freed_nodes:
+            logger.debug("drain_pending_release: freed %d nodes", freed_nodes)
         return freed_nodes
 
     def pretty_print(self):
