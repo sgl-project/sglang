@@ -6,6 +6,7 @@ import logging
 import multiprocessing as mp
 import os
 import pickle
+import threading
 import time
 import traceback
 from collections import defaultdict
@@ -2406,47 +2407,71 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 
 
 def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
-    """Register this encoder server's URL with one or more prefill servers.
+    """Asynchronously register this encoder with each bootstrap URL.
 
-    Called after the encoder is initialized.  Iterates over all URLs in
-    ``server_args.encoder_register_urls`` and registers with each.
-    Retries on failure to handle the case where a prefill server may not
-    be ready immediately.
+    Spawns a daemon thread that retries each URL independently with bounded
+    backoff.  The encoder's own startup is not blocked: if some bootstrap
+    server is slow or unreachable, only the background worker waits.
+
+    Inspired by ``_ensure_prefill_info`` in disaggregation/decode.py: each
+    target keeps its own retry count and is retried at a fixed interval
+    instead of serialising sleeps in a single thread.
     """
+
     encoder_url = server_args.url()
     payload = {"url": encoder_url}
-    max_retries = 5
-    retry_delay = 2.0
+    bootstrap_urls = list(server_args.encoder_register_urls)
+    if not bootstrap_urls:
+        return
 
-    for bootstrap_url in server_args.encoder_register_urls:
-        register_endpoint = f"{bootstrap_url}/register_encoder_url"
-        registered = False
-        for attempt in range(max_retries):
-            try:
-                resp = http_requests.post(register_endpoint, json=payload, timeout=5)
-                if resp.status_code == 200:
-                    logger.info(
-                        f"Registered encoder URL '{encoder_url}' with prefill server at {bootstrap_url}"
-                    )
-                    registered = True
-                    break
-                else:
-                    logger.warning(
-                        f"Failed to register with {bootstrap_url} (attempt {attempt + 1}/{max_retries}): "
-                        f"{resp.status_code}, {resp.text}"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to register with {bootstrap_url} (attempt {attempt + 1}/{max_retries}): {e}"
-                )
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
+    max_retries = 30
+    retry_interval = 5.0
+    request_timeout = 5.0
 
-        if not registered:
-            logger.error(
-                f"Could not register encoder URL '{encoder_url}' with {bootstrap_url} "
-                f"after {max_retries} attempts. Encoder discovery may be incomplete."
+    def _try_register_once(bootstrap_url: str) -> bool:
+        try:
+            resp = http_requests.post(
+                f"{bootstrap_url}/register_encoder_url",
+                json=payload,
+                timeout=request_timeout,
             )
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered encoder URL '{encoder_url}' with bootstrap "
+                    f"at {bootstrap_url}"
+                )
+                return True
+            logger.warning(
+                f"Bootstrap {bootstrap_url} returned {resp.status_code}: {resp.text}"
+            )
+        except Exception as e:
+            logger.debug(f"Register attempt to {bootstrap_url} failed: {e}")
+        return False
+
+    def _worker():
+        pending = list(bootstrap_urls)
+        retry_count = {url: 0 for url in pending}
+        while pending:
+            still_pending = []
+            for bootstrap_url in pending:
+                if _try_register_once(bootstrap_url):
+                    continue
+                retry_count[bootstrap_url] += 1
+                if retry_count[bootstrap_url] >= max_retries:
+                    logger.error(
+                        f"Giving up on bootstrap {bootstrap_url} after "
+                        f"{max_retries} attempts. Encoder discovery via this "
+                        f"bootstrap will be incomplete."
+                    )
+                    continue
+                still_pending.append(bootstrap_url)
+            pending = still_pending
+            if pending:
+                time.sleep(retry_interval)
+
+    threading.Thread(
+        target=_worker, daemon=True, name="encoder-bootstrap-register"
+    ).start()
 
 
 def launch_server(server_args: ServerArgs):
