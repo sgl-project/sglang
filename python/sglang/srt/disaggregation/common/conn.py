@@ -487,15 +487,6 @@ class CommonKVManager(BaseKVManager):
             )
             return sock
 
-    def _disconnect(self, endpoint: str):
-        with self._socket_lock:
-            sock = self._socket_cache.pop(endpoint, None)
-            monitor = self._monitor_cache.pop(endpoint, None)
-            if sock is not None:
-                sock.close(linger=0)
-            if monitor is not None:
-                monitor.close()
-
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
