@@ -96,6 +96,43 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
         self.assertTrue(torch.equal(processed_ids, torch.tensor([[0, 34, 270, 271]])))
         self.assertTrue(torch.equal(recorder_ids, torch.tensor([[0, 33, 263]])))
 
+    def test_topk_recorder_ids_match_dispatch_ids_for_non_deepep_fusion(self):
+        topk_ids = torch.tensor([[0, 33, 263, 256]], dtype=torch.int32)
+        topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+        topk_config = TopKConfig(
+            top_k=4,
+            num_fused_shared_experts=1,
+            routed_scaling_factor=1.0,
+        )
+        dispatch_info = SimpleNamespace(num_physical_experts=264)
+
+        def fake_eplb_postprocess(
+            ids, expert_location_dispatch_info, num_token_non_padded
+        ):
+            return ids + 1
+
+        with (
+            patch.object(topk_module, "_is_cuda", True),
+            patch.object(topk_module, "_use_aiter", False),
+            patch.object(topk_module, "is_deepep_class_backend", return_value=False),
+            patch.object(
+                topk_module,
+                "_biased_grouped_topk_postprocess",
+                side_effect=fake_eplb_postprocess,
+            ),
+        ):
+            processed_ids, _, recorder_ids = topk_module._post_process_topk_ids(
+                topk_ids=topk_ids.clone(),
+                topk_weights=topk_weights.clone(),
+                topk_config=topk_config,
+                router_logits=torch.empty((1, 256)),
+                layer_id=0,
+                expert_location_dispatch_info=dispatch_info,
+            )
+
+        self.assertTrue(torch.equal(processed_ids, torch.tensor([[1, 34, 264, 257]])))
+        self.assertTrue(torch.equal(recorder_ids, processed_ids))
+
 
 if __name__ == "__main__":
     unittest.main()
