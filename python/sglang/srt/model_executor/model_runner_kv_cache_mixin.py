@@ -499,6 +499,9 @@ class ModelRunnerKVCacheMixin:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     token_to_kv_pool_class=NPUMHATokenToKVPool,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                     **kwargs,
                 )
             elif self.use_mla_backend:
@@ -621,6 +624,9 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                     **kwargs,
                 )
             elif config := self.mambaish_config:

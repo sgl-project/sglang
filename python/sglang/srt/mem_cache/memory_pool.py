@@ -854,6 +854,11 @@ class MHATokenToKVPool(KVCache):
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
+        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
+        if self.layer_num == 0:
+            self._kv_copy_config = None
+            return
+
         # Heuristics for KV copy tiling
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
         _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
@@ -1090,6 +1095,10 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
+        if self.layer_num == 0:
+            return
+
         # Catch stale indices here instead of as illegal-addr or silent KV corruption.
         size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
@@ -1828,6 +1837,20 @@ class MLATokenToKVPool(KVCache):
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_cache in self.kv_buffer:
+            kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         current_platform.synchronize()
         kv_cache_cpu = []
@@ -2072,6 +2095,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _clear_buffers(self):
         del self.kv_buffer
         del self.index_k_with_scale_buffer
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
+        super().move_kv_cache(tgt_loc, src_loc)
+
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for index_k in self.index_k_with_scale_buffer:
+            index_k[tgt_loc_flat] = index_k[src_loc_flat]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
