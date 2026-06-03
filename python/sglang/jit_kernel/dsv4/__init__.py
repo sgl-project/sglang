@@ -15,6 +15,7 @@ from .elementwise import (
     fused_k_norm_rope_flashmla,
     fused_k_norm_rope_flashmla_bf16,
     fused_q_indexer_rope_hadamard_fp4_quant,
+    fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
     fused_rope_inplace,
 )
