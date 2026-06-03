@@ -167,24 +167,37 @@ class TestChannelPairs(unittest.TestCase):
 
 
 class TestQueueDealer(unittest.TestCase):
-    def test_send_and_recv_use_separate_queues(self):
-        """A DEALER socket can both send and recv. Our QueueDealer must
-        wire send and recv to distinct queues so the sender does not see
-        its own writes on the receive side.
+    def test_send_is_a_sink(self):
+        """The dealer's send side must drop payloads, not enqueue them.
+
+        In threaded mode no peer drives the dealer; if send_pyobj queued
+        responses, the queue would grow without bound (slow memory leak).
         """
         recv_q: "queue.SimpleQueue[object]" = queue.SimpleQueue()
-        send_q: "queue.SimpleQueue[object]" = queue.SimpleQueue()
-        dealer = QueueDealer(recv_q, send_q)
+        dealer = QueueDealer(recv_q)
 
-        # Send goes out the send queue, not the recv queue.
-        dealer.send_pyobj({"resp": 1})
-        self.assertEqual(send_q.get_nowait(), {"resp": 1})
+        # Send 10k payloads — none of them should be observable anywhere.
+        for i in range(10_000):
+            dealer.send_pyobj({"resp": i})
+
+        # Recv side stays empty — sends did not bleed in either.
         with self.assertRaises(zmq.Again):
             dealer.recv_pyobj(flags=zmq.NOBLOCK)
 
-        # Recv reads from the recv queue.
+    def test_recv_reads_recv_queue(self):
+        recv_q: "queue.SimpleQueue[object]" = queue.SimpleQueue()
+        dealer = QueueDealer(recv_q)
         recv_q.put({"req": 2})
         self.assertEqual(dealer.recv_pyobj(), {"req": 2})
+
+    def test_send_pyobj_return_is_awaitable(self):
+        """``await sender.send_pyobj(...)`` must keep working on the sink."""
+        dealer = QueueDealer(queue.SimpleQueue())
+
+        async def go():
+            await dealer.send_pyobj("dropped")
+
+        asyncio.run(go())  # must not raise
 
 
 class TestChannelHub(unittest.TestCase):
@@ -246,8 +259,12 @@ class TestChannelHub(unittest.TestCase):
 class TestEnableThreadedEngineIdempotent(unittest.TestCase):
     """``enable_threaded_engine`` must be safe to call multiple times.
 
-    Imported lazily to keep this test module importable on systems where
-    the full sglang dependency surface is not installed.
+    The function has irreversible side effects on the running process
+    (``mp.set_start_method("spawn", force=True)``, mutating
+    ``sglang.srt.managers.mm_utils._is_default_tensor_transport``, etc.),
+    so calling it for real here would pollute every test that runs
+    after this one in the same pytest worker. We patch the side-effect
+    targets so the body executes but no global state actually changes.
     """
 
     def test_idempotent(self):
@@ -257,17 +274,33 @@ class TestEnableThreadedEngineIdempotent(unittest.TestCase):
         except ImportError as e:
             self.skipTest(f"sglang not importable in this env: {e}")
 
-        # Force-reset the module-level flag so the test is hermetic.
-        engine_threaded._patches_applied = False
+        from unittest import mock
+
+        # Snapshot anything we are going to touch so we can also assert
+        # it was not mutated by the patched calls.
         sa = ServerArgs(model_path="dummy")
+        sa.disable_piecewise_cuda_graph = True  # already what we'd force
+        engine_threaded._patches_applied = False
 
-        engine_threaded.enable_threaded_engine(sa)
-        first = engine_threaded._patches_applied
-        engine_threaded.enable_threaded_engine(sa)  # must not raise
-        second = engine_threaded._patches_applied
+        with mock.patch.object(
+            engine_threaded.mp, "set_start_method"
+        ) as set_method, mock.patch(
+            "sglang.srt.managers.mm_utils._is_default_tensor_transport",
+            create=True,
+            new=False,
+        ):
+            engine_threaded.enable_threaded_engine(sa)
+            self.assertTrue(engine_threaded._patches_applied)
+            first_calls = set_method.call_count
 
-        self.assertTrue(first)
-        self.assertTrue(second)
+            # Second call must be a no-op — no extra mp.set_start_method,
+            # no exception, flag still True.
+            engine_threaded.enable_threaded_engine(sa)
+            self.assertTrue(engine_threaded._patches_applied)
+            self.assertEqual(set_method.call_count, first_calls)
+
+        # Reset so this test does not leak state to subsequent tests.
+        engine_threaded._patches_applied = False
 
 
 if __name__ == "__main__":

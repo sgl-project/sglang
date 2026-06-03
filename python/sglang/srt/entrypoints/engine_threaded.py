@@ -45,6 +45,7 @@ from sglang.srt.entrypoints.engine import (
     _compute_parallelism_ranks,
     init_tokenizer_manager,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.channel import ChannelHub
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.scheduler import (
@@ -75,10 +76,19 @@ _pending_hub: threading.local = threading.local()
 
 
 def enable_threaded_engine(server_args: ServerArgs) -> None:
-    """Apply global runtime patches required by ThreadedEngine.
+    """Apply runtime adjustments required by ThreadedEngine.
 
-    Idempotent — safe to call multiple times. Logs a warning when it has
-    to override a non-default ``multiprocessing`` start method.
+    Idempotent — safe to call multiple times. The first call:
+      - forces ``multiprocessing`` start method to ``spawn`` (fork from a
+        multi-threaded process can deadlock);
+      - flips the multimodal tensor-transport default to in-process refs;
+      - forces ``disable_piecewise_cuda_graph=True`` (warns if the user
+        had explicitly disabled it).
+
+    sglang's own ``mp.get_context("fork")`` call sites consult
+    ``is_threaded_engine_enabled()`` directly and switch to spawn there;
+    we do *not* monkey-patch ``mp.get_context`` globally, so third-party
+    libraries are unaffected.
     """
     global _patches_applied
     with _patches_lock:
@@ -96,17 +106,6 @@ def enable_threaded_engine(server_args: ServerArgs) -> None:
             )
         mp.set_start_method("spawn", force=True)
 
-        # Some call sites explicitly request mp.get_context("fork"); rewrite
-        # so they also use spawn for the same reason.
-        _orig_get_context = mp.get_context
-
-        def _safe_get_context(method=None):
-            if method == "fork":
-                method = "spawn"
-            return _orig_get_context(method)
-
-        mp.get_context = _safe_get_context
-
         # In single-process threaded mode the tokenizer and rank-0 scheduler
         # share an address space, so multimodal tensors can be passed by
         # reference rather than wrapped in SHM.
@@ -117,7 +116,24 @@ def enable_threaded_engine(server_args: ServerArgs) -> None:
         # Piecewise CUDA graph spawns inductor compile workers that can
         # deadlock when the scheduler itself is a thread in a free-threaded
         # process. Non-piecewise CUDA graphs still work.
-        server_args.disable_piecewise_cuda_graph = True
+        if not server_args.disable_piecewise_cuda_graph:
+            logger.warning(
+                "ThreadedEngine forces disable_piecewise_cuda_graph=True; "
+                "piecewise CUDA graph compile workers can deadlock when the "
+                "scheduler is a thread of the parent process. Non-piecewise "
+                "CUDA graphs still work."
+            )
+            server_args.disable_piecewise_cuda_graph = True
+
+
+def is_threaded_engine_enabled() -> bool:
+    """True iff ``enable_threaded_engine`` has been applied in this process.
+
+    Used by sglang's own subprocess entry points (e.g. multimodal
+    processor's ProcessPoolExecutor) so they can opt out of fork without
+    a global ``mp.get_context`` monkey-patch.
+    """
+    return _patches_applied
 
 
 # ---------------------------------------------------------------------------
@@ -209,16 +225,16 @@ class _ThreadedTokenizerManager(TokenizerManager):
 # ---------------------------------------------------------------------------
 
 
-def _pin_thread_cores(env_var: str, role: str) -> None:
+def _pin_thread_cores(env_field, role: str) -> None:
     """Honor SGLANG_*_CORES on Linux; warn on platforms without sched_setaffinity."""
-    cores_raw = os.environ.get(env_var)
+    cores_raw = env_field.get()
     if not cores_raw:
         return
     if not hasattr(os, "sched_setaffinity"):
         logger.warning(
             "%s is set but os.sched_setaffinity is unavailable on this "
             "platform; ignoring.",
-            env_var,
+            env_field.name,
         )
         return
     cores = [int(c) for c in cores_raw.split(",")]
@@ -279,15 +295,12 @@ class ThreadedEngine(Engine):
 
         def _scheduler_main():
             try:
-                _pin_thread_cores("SGLANG_SCHEDULER_CORES", "Scheduler")
+                _pin_thread_cores(envs.SGLANG_SCHEDULER_CORES, "Scheduler")
 
-                # PR_SET_PDEATHSIG is per-thread on Linux; in a threaded
-                # engine the scheduler thread inheriting it would kill the
-                # whole process when the shell parent exits.
-                import sglang.srt.utils.common as _common_utils
-
-                _common_utils.kill_itself_when_parent_died = lambda: None
-
+                # PR_SET_PDEATHSIG is per-thread on Linux; if the
+                # scheduler thread set it, the whole engine would die when
+                # the shell parent exits. Skip just that one step here
+                # rather than monkey-patching the module-level helper.
                 configure_scheduler_process(
                     server_args,
                     gpu_id=gpu_id_0,
@@ -297,6 +310,7 @@ class ThreadedEngine(Engine):
                     moe_ep_rank=moe_ep_rank_0,
                     pp_rank=0,
                     dp_rank=None,
+                    skip_parent_death_signal=True,
                 )
                 _pending_hub.hub = hub
                 try:
@@ -343,7 +357,7 @@ class ThreadedEngine(Engine):
         # ---- detokenizer thread ----
         def _detoken_main():
             try:
-                _pin_thread_cores("SGLANG_DETOKENIZER_CORES", "Detokenizer")
+                _pin_thread_cores(envs.SGLANG_DETOKENIZER_CORES, "Detokenizer")
                 detoken = _ThreadedDetokenizer(server_args, port_args)
                 detoken.recv_from_scheduler = hub.scheduler_to_detokenizer.receiver
                 detoken.send_to_tokenizer = hub.detokenizer_to_tokenizer.sender

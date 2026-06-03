@@ -183,29 +183,36 @@ class AsyncChannelPair:
         self.receiver = AsyncQueueReceiver(self._q)
 
 
+class _NullSender:
+    """Sender that discards every payload.
+
+    Used by ``QueueDealer`` in threaded mode where the dealer's send
+    side has no consumer; queueing every response would leak memory
+    unboundedly. Discarding matches the practical "nobody is listening"
+    semantics without changing call-site contracts.
+    """
+
+    __slots__ = ()
+
+    def send_pyobj(self, obj: Any, flags: int = 0, **kwargs) -> _Sent:
+        return _SENT
+
+
 class QueueDealer:
     """Drop-in for a ``zmq.DEALER`` socket — both ``send_pyobj`` and ``recv_pyobj``.
 
-    Backed by two independent queues so the sender does not see its own
-    writes on the receive side. Used for the RPC channel, where the
-    scheduler both reads requests and writes responses on the same socket.
-
-    In single-process threaded mode no caller drives this channel, so the
-    receive queue stays empty (``recv_pyobj(NOBLOCK)`` always raises
-    ``zmq.Again``) and the send queue acts as a sink.
+    The receive side is queue-backed (``request_receiver`` polls it with
+    ``NOBLOCK`` and expects ``zmq.Again`` on empty). The send side is a
+    sink: in threaded mode no peer drives the dealer, so anything the
+    scheduler writes would accumulate forever.
     """
 
-    __slots__ = ("_recv_q", "_send_q", "_recv", "_send")
+    __slots__ = ("_recv_q", "_recv", "_send")
 
-    def __init__(
-        self,
-        recv_q: "queue.SimpleQueue[Any]",
-        send_q: "queue.SimpleQueue[Any]",
-    ):
+    def __init__(self, recv_q: "queue.SimpleQueue[Any]"):
         self._recv_q = recv_q
-        self._send_q = send_q
         self._recv = QueueReceiver(recv_q)
-        self._send = QueueSender(send_q)
+        self._send = _NullSender()
 
     def recv_pyobj(self, flags: int = 0) -> Any:
         return self._recv.recv_pyobj(flags)
@@ -236,7 +243,6 @@ class ChannelHub:
         "scheduler_to_detokenizer",
         "detokenizer_to_tokenizer",
         "_rpc_in",
-        "_rpc_out",
         "rpc_dealer",
     )
 
@@ -245,8 +251,7 @@ class ChannelHub:
         self.scheduler_to_detokenizer = SyncChannelPair()
         self.detokenizer_to_tokenizer = AsyncChannelPair()
         self._rpc_in: "queue.SimpleQueue[Any]" = queue.SimpleQueue()
-        self._rpc_out: "queue.SimpleQueue[Any]" = queue.SimpleQueue()
-        self.rpc_dealer = QueueDealer(self._rpc_in, self._rpc_out)
+        self.rpc_dealer = QueueDealer(self._rpc_in)
 
     def close(self) -> None:
         """Best-effort shutdown for any background bridge threads."""

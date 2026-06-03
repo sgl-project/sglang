@@ -2362,9 +2362,9 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    if os.environ.get("SGLANG_THREADED_ENGINE") == "1":
+    if envs.SGLANG_THREADED_ENGINE.get():
         if server_args.tp_size > 1:
-            if os.environ.get("SGLANG_THREADED_ENGINE_ALLOW_FALLBACK") != "1":
+            if not envs.SGLANG_THREADED_ENGINE_ALLOW_FALLBACK.get():
                 raise RuntimeError(
                     "SGLANG_THREADED_ENGINE=1 is not supported for tp_size > 1 "
                     f"(got tp_size={server_args.tp_size}); CPU contention "
