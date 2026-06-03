@@ -390,6 +390,9 @@ def _run_eagle_draft_eager(
         init_eager_metadata(worker, batch, settings)
     else:
         worker.draft_attn_backend.init_forward_metadata(batch)
+    # Mirror the production workers: the pre-plan marks the batch so the
+    # per-step forwards inside draft_forward don't re-plan.
+    batch.mark_forward_metadata_ready()
     return worker.draft_forward(batch)
 
 
@@ -589,6 +592,13 @@ class _DenseEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
+        # Draft-loop forwards must arrive pre-planned: the production
+        # ModelRunner.forward would otherwise re-plan via the single-backend
+        # entry and clobber the per-step metadata. Mocks stand in for the
+        # runner forward, so assert the contract the real judgment enforces.
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -625,6 +635,13 @@ class _FrozenKVMTPDenseDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
+        # Draft-loop forwards must arrive pre-planned: the production
+        # ModelRunner.forward would otherwise re-plan via the single-backend
+        # entry and clobber the per-step metadata. Mocks stand in for the
+        # runner forward, so assert the contract the real judgment enforces.
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1011,6 +1028,13 @@ class _MLAEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
+        # Draft-loop forwards must arrive pre-planned: the production
+        # ModelRunner.forward would otherwise re-plan via the single-backend
+        # entry and clobber the per-step metadata. Mocks stand in for the
+        # runner forward, so assert the contract the real judgment enforces.
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1266,6 +1290,13 @@ class _DSV4EagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
+        # Draft-loop forwards must arrive pre-planned: the production
+        # ModelRunner.forward would otherwise re-plan via the single-backend
+        # entry and clobber the per-step metadata. Mocks stand in for the
+        # runner forward, so assert the contract the real judgment enforces.
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1565,6 +1596,13 @@ class _DSAEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
+        # Draft-loop forwards must arrive pre-planned: the production
+        # ModelRunner.forward would otherwise re-plan via the single-backend
+        # entry and clobber the per-step metadata. Mocks stand in for the
+        # runner forward, so assert the contract the real judgment enforces.
+        assert (
+            forward_batch.forward_metadata_ready
+        ), "draft-loop forward reached the runner without a pre-planned batch"
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
