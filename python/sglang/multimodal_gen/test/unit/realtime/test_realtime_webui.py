@@ -48,8 +48,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "Info" not in index_html
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
-    assert "styles.css?v=realtime-sr-v35" in index_html
-    assert "app.js?v=realtime-sr-v35" in index_html
+    assert "styles.css?v=realtime-sr-v38" in index_html
+    assert "app.js?v=realtime-sr-v38" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";' in app_js
     assert "const DEFAULT_TARGET_FPS = 25;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
@@ -58,6 +58,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "const DEFAULT_PREVIEW_SCALE = 120;" in app_js
     assert 'setPreviewState("waiting")' in app_js
     assert "stage.dataset.previewState = state" in app_js
+    assert "previewProgressSpin" in styles_css
+    assert "previewDotPulse" not in styles_css
     assert 'document.querySelector(".preview-frame")' in app_js
     assert 'previewFrame.style.setProperty("--preview-scale"' in app_js
     assert "cancelAnimationFrame(previewScaleFrame)" in app_js
