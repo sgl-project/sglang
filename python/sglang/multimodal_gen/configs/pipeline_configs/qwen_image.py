@@ -148,6 +148,8 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
     vae_sp: bool = False
 
+    vae_precision: str = "bf16"
+
     dit_config: DiTConfig = field(default_factory=QwenImageDitConfig)
     # VAE
     vae_config: VAEConfig = field(default_factory=QwenImageVAEConfig)
@@ -168,6 +170,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (qwen_image_postprocess_text,)
     )
+
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             dict(
@@ -177,6 +180,16 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             None,
         ]
     )
+
+    def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
+        tok_kwargs.setdefault("truncation", True)
+
+        if tok_kwargs.get("max_length") is not None:
+            tok_kwargs["padding"] = "max_length"
+        else:
+            tok_kwargs.setdefault("max_length", 1024)
+            tok_kwargs["padding"] = True
+        return tokenizer(prompts, **tok_kwargs)
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)

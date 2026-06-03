@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -14,9 +14,16 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
     )
 
 logger = logging.getLogger(__name__)
@@ -244,11 +251,18 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     )
 
     server_args = get_global_server_args()
-    use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
-    max_num_tokens = max(
-        getattr(server_args, "cuda_graph_max_bs", None) or 512,
-        getattr(server_args, "chunked_prefill_size", None) or 8192,
-    )
+    use_cuda_graph = not server_args.disable_cuda_graph
+
+    # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
+    # single forward can route through this layer.
+    dispatcher = getattr(layer, "dispatcher", None)
+    if hasattr(dispatcher, "max_num_tokens"):
+        # A2A path: bounded by the dispatcher's own workspace limit.
+        max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
+    else:
+        # Standard allgather path: the MoE sees up to dp_size local forwards
+        # gathered together, so scale the per-rank forward bound by dp_size.
+        max_num_tokens = server_args.dp_size * server_args.cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
@@ -283,28 +297,49 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
 
 @dataclass
 class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
-    """Quantization payload consumed by FlashInfer CuteDSL FP4 MoE kernels."""
+    """Quantization payload for FlashInfer CuteDSL FP4 MoE kernels.
 
-    # Lazily-created CuteDslMoEWrapper (stashed on layer)
-    wrapper: Any
+    Shared by the two CuteDSL runner entries:
 
-    # Weights (uint8 FP4 packed)
+    * "v2" standard path (a2a=``none``/``flashinfer``): consumed by the
+      ``@register_fused_func("none", "flashinfer_cutedsl")`` entry, which
+      drives ``CuteDslMoEWrapper.run``. Weights are ``[Up, Gate]``
+      interleaved with MMA-layout blockscales. ``wrapper`` is set;
+      ``w*_scale`` are scalarized.
+
+    * "v1" DeepEP low-latency path (a2a=``deepep``): consumed by the
+      ``@register_fused_func("deepep", "flashinfer_cutedsl")`` entry,
+      which drives ``flashinfer_cutedsl_moe_masked``. Weights are
+      ``[Gate, Up]`` non-interleaved with swizzled blockscales.
+      ``wrapper`` is ``None``; ``w*_scale`` are per-expert.
+    """
+
+    # FP4 packed weights (uint8)
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
 
-    # Block-scale factors
+    # Block-scale factors (MMA layout for v2, swizzled for v1)
     w13_weight_sf: torch.Tensor
     w2_weight_sf: torch.Tensor
 
-    # Per-expert GEMM scales
+    # Per-expert GEMM dequant alphas (scalarized for v2, per-expert for v1)
     w1_alpha: torch.Tensor
     w2_alpha: torch.Tensor
 
-    # Intermediate quantization scale (fc2 input)
-    fc2_input_scale: torch.Tensor
+    # Activation quant scales (1 / raw_input_scale).
+    #   - a1_scale: quantizes hidden_states before GEMM1
+    #   - a2_scale: quantizes GEMM1 output before GEMM2 (a.k.a. fc2 input)
+    a1_scale: torch.Tensor
+    a2_scale: torch.Tensor
 
-    # Activation quantization scale (scalarized)
-    input_scale: torch.Tensor
+    # v2 only: lazily-created CuteDslMoEWrapper (``None`` on the v1 path).
+    wrapper: Optional[Any] = None
+
+    # v1 only: ``True`` when DeepEP pre-quantizes activations to NVFP4.
+    use_nvfp4_dispatch: bool = False
+
+    # v1 only: SBO down-GEMM overlap args.
+    down_gemm_overlap_args: Optional["DownGemmOverlapArgs"] = None
 
 
 @register_fused_func("none", "flashinfer_cutedsl")
@@ -318,6 +353,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -330,7 +366,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
     x_fp4, x_sf = fp4_quantize(
         hidden_states,
-        quant_info.input_scale,
+        quant_info.a1_scale,
         sf_vec_size=_FP4_SF_VEC_SIZE,
         is_sf_swizzled_layout=False,
     )
@@ -343,10 +379,141 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=quant_info.fc2_input_scale,
+        fc2_input_scale=quant_info.a2_scale,
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
     )
 
     return StandardCombineInput(hidden_states=output)
+
+
+@register_fused_func("flashinfer", "flashinfer_cutedsl")
+def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: CuteDslFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> FlashinferCombineInput:
+    """CuteDSL fused func for flashinfer alltoall dispatcher.
+
+    Two cases depending on whether the dispatcher did FP4 quantization:
+    - bf16 input (SGLANG_MOE_NVFP4_DISPATCH=0): quantize with cutedsl's scale
+    - FP4 input (SGLANG_MOE_NVFP4_DISPATCH=1): pass through (same fp4_quantize params)
+    """
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+    )
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
+
+    hidden_states = dispatch_output.hidden_states
+    x_sf = dispatch_output.hidden_states_scale
+    topk_output = dispatch_output.topk_output
+    assert TopKOutputChecker.format_is_standard(topk_output)
+
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    if x_sf is not None:
+        # NVFP4 dispatch, inputs are already quantized.
+        x_fp4 = hidden_states
+    else:
+        x_fp4, x_sf = fp4_quantize(
+            hidden_states,
+            quant_info.a1_scale,
+            sf_vec_size=_FP4_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+        )
+
+    output = quant_info.wrapper.run(
+        x=x_fp4,
+        x_sf=x_sf,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_weights,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=quant_info.w13_weight_sf,
+        w1_alpha=quant_info.w1_alpha,
+        fc2_input_scale=quant_info.a2_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=quant_info.w2_weight_sf,
+        w2_alpha=quant_info.w2_alpha,
+    )
+
+    # Note: output contains routed expert results; shared_expert is handled separately
+
+    # Write into pre-allocated workspace buffer if available
+    if dispatch_output.moe_output is not None:
+        dispatch_output.moe_output.copy_(output)
+        output = dispatch_output.moe_output
+
+    return FlashinferCombineInput(hidden_states=output)
+
+
+@register_fused_func("deepep", "flashinfer_cutedsl")
+def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
+    dispatch_output: DeepEPLLDispatchOutput,
+    quant_info: CuteDslFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> DeepEPLLCombineInput:
+    from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+        flashinfer_cutedsl_moe_masked,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert (
+        not runner_config.apply_router_weight_on_input
+    ), "apply_router_weight_on_input is not supported for Flashinfer"
+
+    hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+
+    # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
+    # Same-dtype .view is a no-op; only wider dtypes (e.g. int32-packed
+    # UE8M0) need stride(-1)==1.
+    if (
+        quant_info.use_nvfp4_dispatch
+        and hidden_states_scale is not None
+        and hidden_states_scale.element_size() != 1
+        and hidden_states_scale.stride(-1) != 1
+    ):
+        raise AssertionError(
+            f"NVFP4 dispatch scale has stride(-1)={hidden_states_scale.stride(-1)}, "
+            f"dtype={hidden_states_scale.dtype}; .view(float8_e4m3fn) requires stride(-1)==1. "
+            "Try SGLANG_MOE_NVFP4_DISPATCH=0 or check DeepEP version."
+        )
+
+    overlap = quant_info.down_gemm_overlap_args
+    output = flashinfer_cutedsl_moe_masked(
+        hidden_states=(hidden_states, hidden_states_scale),
+        input_global_scale=(
+            None if quant_info.use_nvfp4_dispatch else quant_info.a1_scale
+        ),
+        w1=quant_info.w13_weight,
+        w1_blockscale=quant_info.w13_weight_sf,
+        w1_alpha=quant_info.w1_alpha,
+        w2=quant_info.w2_weight,
+        a2_global_scale=quant_info.a2_scale,
+        w2_blockscale=quant_info.w2_weight_sf,
+        w2_alpha=quant_info.w2_alpha,
+        masked_m=masked_m,
+        **(
+            dict(
+                down_sm_count=overlap.num_sms,
+                down_signals=overlap.signal,
+                down_start_event=overlap.start_event,
+            )
+            if overlap is not None
+            else {}
+        ),
+    )
+
+    return DeepEPLLCombineInput(
+        hidden_states=output,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )

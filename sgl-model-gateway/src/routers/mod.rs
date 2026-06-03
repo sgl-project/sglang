@@ -32,6 +32,7 @@ pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
 pub mod router_manager;
+pub mod streaming_utils;
 pub mod tokenize;
 
 pub use factory::RouterFactory;

@@ -94,6 +94,24 @@ if _is_hip:
             # Fallback: vllm not available, will use native PyTorch implementation
             _has_vllm = False
 
+if _is_musa:
+
+    @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit_v2")
+    def _(
+        input,
+        output_q,
+        output_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        fuse_silu_and_mul,
+        masked_m,
+    ):
+        return
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1919,6 +1937,17 @@ def is_weak_contiguous(x: torch.Tensor):
     return is_transpose or is_not_transpose
 
 
+def _as_column_scale(scale: torch.Tensor, expected_len: int) -> torch.Tensor:
+    if scale.dim() <= 1:
+        return scale.reshape(-1, 1)
+    if scale.dim() == 2:
+        if scale.shape[1] == 1:
+            return scale
+        if scale.shape[0] == 1 and scale.shape[1] == expected_len:
+            return scale.t()
+    return scale
+
+
 @triton.jit
 def scaled_mm_kernel(
     a_ptr,
@@ -2062,9 +2091,10 @@ def triton_scaled_mm(
     assert weight.shape[0] == K
     assert input.dtype == weight.dtype
 
-    scale_a = scale_a.reshape(-1, 1) if scale_a.dim() <= 1 else scale_a
-    scale_b = scale_b.reshape(-1, 1) if scale_b.dim() <= 1 else scale_b
+    scale_a = _as_column_scale(scale_a, M)
+    scale_b = _as_column_scale(scale_b, N)
 
+    assert scale_a.dim() == 2 and scale_b.dim() == 2
     assert scale_a.dtype == scale_b.dtype and scale_a.is_floating_point()
     assert scale_a.shape[1] == 1 and (scale_a.shape[0] == 1 or scale_a.shape[0] == M)
     assert scale_b.shape[1] == 1 and (scale_b.shape[0] == 1 or scale_b.shape[0] == N)

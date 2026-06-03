@@ -5,13 +5,14 @@ metatags:
 tag: NEW
 ---
 
-<Note>
-The public MiniCPM-V 4.6 release weights are not yet on HuggingFace; benchmark numbers below were captured during SGLang port verification on an internal test checkpoint and will be re-run once the public weights drop. The License field is also pending verification against the public model card.
-</Note>
-
 ## 1. Model Introduction
 
 MiniCPM-V 4.6 is the next-generation multimodal model from [OpenBMB](https://huggingface.co/openbmb), the team behind the MiniCPM-V series. The model combines a **Qwen3.5-style hybrid LLM backbone** (Gated Delta Net + full attention) with a **NaViT-packed vision encoder** that handles arbitrary aspect ratios and high-resolution slicing natively, plus end-to-end video support.
+
+OpenBMB ships two variants on HuggingFace:
+
+- [`openbmb/MiniCPM-V-4.6`](https://huggingface.co/openbmb/MiniCPM-V-4.6) — base instruct model. Use this for general multimodal serving; thinking mode is still available per-request via `chat_template_kwargs.enable_thinking=true`.
+- [`openbmb/MiniCPM-V-4.6-Thinking`](https://huggingface.co/openbmb/MiniCPM-V-4.6-Thinking) — thinking-tuned variant with stronger chain-of-thought behavior. Pair with the same `--reasoning-parser qwen3` flag.
 
 **Key Features:**
 
@@ -20,9 +21,9 @@ MiniCPM-V 4.6 is the next-generation multimodal model from [OpenBMB](https://hug
 - **High-resolution slicing**: Source image plus a configurable grid of slice tiles (up to 9 tiles in the open test variant) lets the model reason over fine detail in 1280×720+ images.
 - **Video**: Frame-by-frame multi-modal data items routed through the same vision encoder; any number of frames per request.
 - **Reasoning Parser**: switchable thinking mode (Qwen3.5 lineage), exposed via `chat_template_kwargs.enable_thinking` per request and SGLang's `--reasoning-parser qwen3` on the server side.
-- **Tool Calling**: Qwen 2.5–style `<tool_call>` JSON format, surfaced as OpenAI-compatible `message.tool_calls` via SGLang's `--tool-call-parser qwen`. Composes with thinking mode and with image / video inputs.
+- **Tool Calling**: Qwen3.5-style `<tool_call><function=…><parameter=…>…</parameter></function></tool_call>` XML format, surfaced as OpenAI-compatible `message.tool_calls` via SGLang's `--tool-call-parser qwen3_coder`. Composes with thinking mode and with image / video inputs.
 
-**License:** TODO — verify on HuggingFace model card.
+**License:** [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
 
 ## 2. SGLang Installation
 
@@ -31,11 +32,9 @@ Pull the nightly Docker image (rolling tag, tracks `main`):
 ```bash
 # CUDA 13 (Hopper / Blackwell, default)
 docker pull lmsysorg/sglang:dev
-docker pull lmsysorg/sglang:dev-minicpm-v-4-6
 
 # CUDA 12 (Ampere or older drivers)
 docker pull lmsysorg/sglang:dev-cu12
-docker pull lmsysorg/sglang:dev-cu12-minicpm-v-4-6
 ```
 
 For the general SGLang installation guide (PyPI, source, Docker) see the [official SGLang installation guide](../../../docs/get-started/install).
@@ -44,7 +43,7 @@ For the general SGLang installation guide (PyPI, source, Docker) see the [offici
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to generate the appropriate deployment command. The `Reasoning Parser` and `Tool Call Parser` toggles add `--reasoning-parser qwen3` and `--tool-call-parser qwen` respectively; see §4.4 for usage details.
+**Interactive Command Generator**: Use the configuration selector below to generate the appropriate deployment command. The `Variant` toggle switches between `openbmb/MiniCPM-V-4.6` (base) and `openbmb/MiniCPM-V-4.6-Thinking`. The `Reasoning Parser` and `Tool Call Parser` toggles add `--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder` respectively; see §4.4 for usage details.
 
 import { MiniCPMV46Deployment } from '/src/snippets/autoregressive/minicpm-v-4_6-deployment.jsx'
 
@@ -70,10 +69,12 @@ import { MiniCPMV46Deployment } from '/src/snippets/autoregressive/minicpm-v-4_6
 Deploy the model on an H200:
 
 ```bash Command
-sglang serve --model-path openbmb/MiniCPM-V-4_6 \
+sglang serve --model-path openbmb/MiniCPM-V-4.6 \
   --trust-remote-code \
   --dtype bfloat16 \
   --mem-fraction-static 0.15 \
+  --mamba-scheduler-strategy extra_buffer \
+  --page-size 64 \
   --host 0.0.0.0 --port 30000
 ```
 
@@ -88,7 +89,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[
         {
             "role": "user",
@@ -127,7 +128,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[
         {
             "role": "user",
@@ -163,7 +164,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[
         {
             "role": "user",
@@ -204,7 +205,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[{"role": "user", "content": "Reply with the single word 'hi'. No explanation."}],
     max_tokens=200,
 )
@@ -221,7 +222,7 @@ content          : hi
 
 ```python Example (instruct mode)
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[{"role": "user", "content": "Reply with the single word 'hi'. No explanation."}],
     max_tokens=200,
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
@@ -239,10 +240,10 @@ content          : hi
 
 #### 4.4.2 Tool Calling
 
-Pass `--tool-call-parser qwen` to the server (toggle "Tool Call Parser" on in §3.1) so SGLang extracts `<tool_call>` blocks from the model output into the OpenAI-style `message.tool_calls` field (with `finish_reason="tool_calls"`). The model speaks the Qwen 2.5 tool-call format (`<tool_call>\n{...}\n</tool_call>`); the `qwen` parser is the right one. Tool calls compose with both reasoning modes and with image / video inputs.
+Pass `--tool-call-parser qwen3_coder` to the server (toggle "Tool Call Parser" on in §3.1) so SGLang extracts `<tool_call>` blocks from the model output into the OpenAI-style `message.tool_calls` field (with `finish_reason="tool_calls"`). The model speaks the Qwen3.5 XML tool-call format (`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`); the `qwen3_coder` parser is the right one. Tool calls compose with both reasoning modes and with image / video inputs.
 
 <Warning>
-Do **not** use `--tool-call-parser qwen3_coder` for MiniCPM-V 4.6 — even though the Qwen3.5 cookbooks use it. `qwen3_coder` expects an XML-style inner format (`<function=name><parameter=k>v</parameter></function>`), but 4.6 emits Qwen2.5-style JSON (`{"name":..., "arguments":...}`) inside the same `<tool_call>` wrapper. The result is `finish_reason="tool_calls"` but an empty `tool_calls` array, with the raw markup left in `content` — broken in both directions.
+Do **not** use `--tool-call-parser qwen` for MiniCPM-V 4.6 — that parser expects the older Qwen2.5 JSON format `<tool_call>{"name":..., "arguments":...}</tool_call>`, but both public 4.6 variants emit the Qwen3.5-style XML format with nested `<function=…>` and `<parameter=…>` tags. With `qwen` the outer `<tool_call>` markers match but the inner JSON parse fails, so `tool_calls` returns empty and the raw markup is left in `content`.
 </Warning>
 
 
@@ -270,7 +271,7 @@ tools = [
 ]
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[{"role": "user", "content": "What is the weather in San Francisco? Use the tool."}],
     tools=tools,
     max_tokens=200,
@@ -292,10 +293,6 @@ To get the final natural-language answer, feed the tool's result back as a `tool
 
 ## 5. Benchmark
 
-<Note>
-**TODO — re-run all benchmarks once the official MiniCPM-V 4.6 release weights are public.** Numbers in this section were captured during SGLang port verification and should not be interpreted as representative of the public release.
-</Note>
-
 **Common Test Environment (all benchmarks below):**
 
 - Hardware: 1× NVIDIA H200 (141 GB), single GPU (no TP / DP)
@@ -306,7 +303,7 @@ To get the final natural-language answer, feed the tool's result back as a `tool
 
 ```bash Command
 CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
-  --model-path openbmb/MiniCPM-V-4_6 \
+  --model-path openbmb/MiniCPM-V-4.6 \
   --trust-remote-code \
   --dtype bfloat16 \
   --mem-fraction-static 0.5 \
@@ -322,13 +319,54 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
 #### 5.1.1 MMMU Benchmark
 
 - Benchmark Command
+
 ```bash Command
 python3 benchmark/mmmu/bench_sglang.py --port 30000 --concurrency 48 --max-new-tokens 2048
 ```
 
 - Test Result
 
-Numbers will be filled in once the official MiniCPM-V 4.6 release weights are public.
+```
+{'Accounting': {'acc': 0.767, 'num': 30},
+ 'Agriculture': {'acc': 0.533, 'num': 30},
+ 'Architecture_and_Engineering': {'acc': 0.4, 'num': 30},
+ 'Art': {'acc': 0.6, 'num': 30},
+ 'Art_Theory': {'acc': 0.667, 'num': 30},
+ 'Basic_Medical_Science': {'acc': 0.533, 'num': 30},
+ 'Biology': {'acc': 0.333, 'num': 30},
+ 'Chemistry': {'acc': 0.333, 'num': 30},
+ 'Clinical_Medicine': {'acc': 0.467, 'num': 30},
+ 'Computer_Science': {'acc': 0.333, 'num': 30},
+ 'Design': {'acc': 0.533, 'num': 30},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 0.333, 'num': 30},
+ 'Economics': {'acc': 0.633, 'num': 30},
+ 'Electronics': {'acc': 0.5, 'num': 30},
+ 'Energy_and_Power': {'acc': 0.633, 'num': 30},
+ 'Finance': {'acc': 0.533, 'num': 30},
+ 'Geography': {'acc': 0.367, 'num': 30},
+ 'History': {'acc': 0.533, 'num': 30},
+ 'Literature': {'acc': 0.7, 'num': 30},
+ 'Manage': {'acc': 0.367, 'num': 30},
+ 'Marketing': {'acc': 0.733, 'num': 30},
+ 'Materials': {'acc': 0.367, 'num': 30},
+ 'Math': {'acc': 0.567, 'num': 30},
+ 'Mechanical_Engineering': {'acc': 0.333, 'num': 30},
+ 'Music': {'acc': 0.267, 'num': 30},
+ 'Overall': {'acc': 0.527, 'num': 900},
+ 'Overall-Art and Design': {'acc': 0.517, 'num': 120},
+ 'Overall-Business': {'acc': 0.607, 'num': 150},
+ 'Overall-Health and Medicine': {'acc': 0.553, 'num': 150},
+ 'Overall-Humanities and Social Science': {'acc': 0.617, 'num': 120},
+ 'Overall-Science': {'acc': 0.473, 'num': 150},
+ 'Overall-Tech and Engineering': {'acc': 0.443, 'num': 210},
+ 'Pharmacy': {'acc': 0.667, 'num': 30},
+ 'Physics': {'acc': 0.767, 'num': 30},
+ 'Psychology': {'acc': 0.567, 'num': 30},
+ 'Public_Health': {'acc': 0.767, 'num': 30},
+ 'Sociology': {'acc': 0.667, 'num': 30}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.527
+```
 
 ### 5.2 Speed Benchmark
 
@@ -339,7 +377,7 @@ We use SGLang's built-in `bench_serving` tool with random text prompts (1000 inp
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
-  --model openbmb/MiniCPM-V-4_6 \
+  --model openbmb/MiniCPM-V-4.6 \
   --dataset-name random \
   --random-input-len 1000 \
   --random-output-len 1000 \
@@ -393,7 +431,7 @@ Max ITL (ms):                            5.79
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
-  --model openbmb/MiniCPM-V-4_6 \
+  --model openbmb/MiniCPM-V-4.6 \
   --dataset-name random \
   --random-input-len 1000 \
   --random-output-len 1000 \
@@ -453,7 +491,7 @@ python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \
-  --model openbmb/MiniCPM-V-4_6 \
+  --model openbmb/MiniCPM-V-4.6 \
   --dataset-name image \
   --image-count 1 \
   --image-resolution 720p \
@@ -512,7 +550,7 @@ python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \
-  --model openbmb/MiniCPM-V-4_6 \
+  --model openbmb/MiniCPM-V-4.6 \
   --dataset-name image \
   --image-count 1 \
   --image-resolution 720p \
