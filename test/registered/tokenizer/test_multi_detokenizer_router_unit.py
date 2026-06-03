@@ -9,9 +9,9 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import (
     DETOKENIZER_ROUTER_TCP_PORT_DELTA,
+    ZMQ_TCP_PORT_DELTA,
     PortArgs,
     ServerArgs,
-    ZMQ_TCP_PORT_DELTA,
     _build_detokenizer_router_ipc_names,
     use_dp_rank_detokenizer_router,
 )
@@ -252,9 +252,7 @@ class TestBuildDetokenizerRouterIpcNames(unittest.TestCase):
         )
         names = _build_detokenizer_router_ipc_names(server_args)
         base = 20000 + 1 + DETOKENIZER_ROUTER_TCP_PORT_DELTA
-        expected = [
-            NetworkAddress("127.0.0.1", base + i).to_tcp() for i in range(2)
-        ]
+        expected = [NetworkAddress("127.0.0.1", base + i).to_tcp() for i in range(2)]
         self.assertEqual(names, expected)
 
     def test_single_node_dp_attention_without_dist_init_addr(self):
@@ -267,9 +265,7 @@ class TestBuildDetokenizerRouterIpcNames(unittest.TestCase):
         )
         names = _build_detokenizer_router_ipc_names(server_args)
         base = 10000 + ZMQ_TCP_PORT_DELTA + 1 + DETOKENIZER_ROUTER_TCP_PORT_DELTA
-        expected = [
-            NetworkAddress("127.0.0.1", base + i).to_tcp() for i in range(2)
-        ]
+        expected = [NetworkAddress("127.0.0.1", base + i).to_tcp() for i in range(2)]
         self.assertEqual(names, expected)
 
     def test_ipc_mode_allocates_one_socket_per_dp_rank_when_dp_size_four(self):
