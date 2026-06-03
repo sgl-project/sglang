@@ -258,11 +258,11 @@ class GenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
-    # Per-request encoder bootstrap address for nEmP (multiple encoders,
-    # multiple prefill servers).  When set, this overrides the server-level
-    # encoder_bootstrap_url so each request can target a different bootstrap
-    # server to discover its own set of encoders.
-    epd_bootstrap_addr: Optional[str] = None
+    # Snapshot of encoder URLs at the time tokenizer-side computed
+    # ``num_items_assigned``.  Forwarded to the scheduler so the
+    # encoder_idx values produced here index into the same list there.
+    # Internal IPC only -- not exposed via OpenAI protocol.
+    encoder_urls: Optional[List[str]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -807,8 +807,10 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
-    # Per-request encoder bootstrap address for nEmP dynamic discovery.
-    epd_bootstrap_addr: Optional[str] = None
+    # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
+    # encoder_idx assignments stay consistent in the scheduler subprocess.
+    # Internal IPC only.
+    encoder_urls: Optional[List[str]] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None

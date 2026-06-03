@@ -823,8 +823,9 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
-    # Auto-populated to self.url() when --language-only is set.  Not a CLI arg.
-    encoder_bootstrap_url: Optional[str] = None
+    # Port of the standalone EncoderBootstrapServer started by the language-only
+    # tokenizer manager.  Encoder workers register here.
+    encoder_bootstrap_port: int = 8997
     encoder_register_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
 
@@ -3889,17 +3890,10 @@ class ServerArgs:
             import logging as _logging
 
             _logging.getLogger(__name__).info(
-                "--language-only is set without --encoder-urls. Encoders will "
-                "register dynamically via the embedded bootstrap endpoints, or "
-                "per-request epd_bootstrap_addr (nEmP mode)."
+                "--language-only is set without --encoder-urls. Encoders are "
+                "expected to register dynamically via the "
+                "EncoderBootstrapServer."
             )
-
-        # When --language-only is set the main HTTP server embeds the bootstrap
-        # endpoints (register / unregister / list).  Auto-set encoder_bootstrap_url
-        # to point at ourselves so that encode_receiver discovers encoders via
-        # the same server without requiring a separate bootstrap process.
-        if self.language_only:
-            self.encoder_bootstrap_url = self.url()
 
         # Validate IB devices when mooncake backend is used
         if (
@@ -6900,13 +6894,21 @@ class ServerArgs:
             help="List of encoder server urls.",
         )
         parser.add_argument(
+            "--encoder-bootstrap-port",
+            type=int,
+            default=ServerArgs.encoder_bootstrap_port,
+            help="Port for the EncoderBootstrapServer that runs in the "
+            "language-only tokenizer manager process. Encoders register here, "
+            "and language-only receivers fetch the current URL list from here.",
+        )
+        parser.add_argument(
             "--encoder-register-urls",
             nargs="+",
             type=str,
             default=[],
-            help="One or more prefill server URLs to register this encoder with "
-            "on startup, for dynamic encoder discovery. "
-            "Example: --encoder-register-urls http://prefill0:30002 http://prefill1:30003. "
+            help="One or more EncoderBootstrapServer URLs to register this encoder "
+            "with on startup, for dynamic encoder discovery. "
+            "Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. "
             "Used with --encoder-only servers.",
         )
         parser.add_argument(
@@ -7103,12 +7105,6 @@ class ServerArgs:
         args.moe_dp_size = args.moe_data_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-
-        # encoder_bootstrap_url is auto-derived (not a CLI arg), so it won't
-        # be in the argparse namespace.  Set it to its default so the generic
-        # getattr below doesn't raise AttributeError.
-        if not hasattr(args, "encoder_bootstrap_url"):
-            args.encoder_bootstrap_url = None
 
         # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
         # surface and won't appear on the argparse Namespace. Skip them so the

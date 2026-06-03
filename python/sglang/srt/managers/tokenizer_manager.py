@@ -471,18 +471,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.fake_bootstrap_room_counter = 0
 
         # Encoder Disaggregation
-        self.encoder_url_registry = None
+        self.encoder_bootstrap_server = None
         if self.server_args.language_only:
-            from sglang.srt.disaggregation.encode_server import (
-                EncoderURLRegistry,
+            from sglang.srt.disaggregation.encode_receiver import (
+                EncoderBootstrapServer,
             )
 
-            self.encoder_url_registry = EncoderURLRegistry()
+            # Shared mutable URL list: the bootstrap server appends / removes
+            # entries as encoders register, the receiver reads from the same
+            # list.  Pre-populated with static --encoder-urls so the legacy
+            # CLI flag still works (alongside dynamic registrations).
+            self.encoder_urls: List[str] = list(self.server_args.encoder_urls)
+            self.encoder_bootstrap_server = EncoderBootstrapServer(
+                host=self.server_args.host,
+                port=self.server_args.encoder_bootstrap_port,
+                urls=self.encoder_urls,
+            )
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
-                encoder_url_registry=self.encoder_url_registry,
+                encode_urls=self.encoder_urls,
             )
 
     def init_metric_collector_watchdog(self):
@@ -1079,7 +1088,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
-                epd_bootstrap_addr=getattr(obj, "epd_bootstrap_addr", None),
+                encoder_urls=obj.encoder_urls,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available

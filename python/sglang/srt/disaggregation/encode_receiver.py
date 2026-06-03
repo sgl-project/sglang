@@ -44,6 +44,215 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+class EncoderBootstrapServer:
+    """Lightweight bootstrap server for dynamic encoder discovery.
+
+    Mirrors the design of :class:`CommonKVBootstrapServer`: an ``aiohttp`` web
+    application running in a daemon thread with its own asyncio event loop.
+    Encoder workers POST/DELETE their URLs as they come online or shut down.
+
+    The set of registered URLs is exposed as the ``urls`` list passed in at
+    construction time.  Callers that want to observe registrations without
+    going through HTTP -- typically a co-located :class:`MMReceiver` -- share
+    that list by reference: register/unregister mutate it in place under an
+    internal lock, and the receiver simply reads ``self.encode_urls`` (the
+    same list).  When ``urls`` is ``None`` the server allocates its own list,
+    accessible through :meth:`list_urls`.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        urls: Optional[List[str]] = None,
+        health_check_interval: float = 10.0,
+        health_check_timeout: float = 2.0,
+    ):
+        from aiohttp import web
+
+        self.host = host
+        self.port = port
+        self.app = web.Application()
+        self._urls: List[str] = urls if urls is not None else []
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner: Optional[web.AppRunner] = None
+        self._health_check_task: Optional[asyncio.Task] = None
+        self._health_check_interval = health_check_interval
+        self._health_check_timeout = health_check_timeout
+        self._setup_routes()
+
+        self.thread = threading.Thread(
+            target=self._run_server, daemon=True, name="EncoderBootstrap"
+        )
+        self.thread.start()
+
+    # ------------------------------------------------------------------ #
+    # In-process API (thread-safe; safe to call from any thread)         #
+    # ------------------------------------------------------------------ #
+    def register(self, url: str) -> bool:
+        """Add *url* if not already present.  Returns True if added."""
+        with self._lock:
+            if url not in self._urls:
+                self._urls.append(url)
+                logger.info(f"Registered encoder URL: {url}")
+                return True
+            logger.debug(f"Encoder URL already registered: {url}")
+            return False
+
+    def unregister(self, url: str) -> bool:
+        """Remove *url* if present.  Returns True if removed."""
+        with self._lock:
+            if url in self._urls:
+                self._urls.remove(url)
+                logger.info(f"Unregistered encoder URL: {url}")
+                return True
+            return False
+
+    def list_urls(self) -> List[str]:
+        """Return a snapshot of all registered encoder URLs."""
+        with self._lock:
+            return list(self._urls)
+
+    # ------------------------------------------------------------------ #
+    # HTTP layer                                                         #
+    # ------------------------------------------------------------------ #
+    def _setup_routes(self):
+        self.app.router.add_post("/register_encoder_url", self._handle_register)
+        self.app.router.add_delete("/unregister_encoder_url", self._handle_unregister)
+        self.app.router.add_get("/list_encoder_urls", self._handle_list)
+        self.app.router.add_get("/health", self._handle_health)
+
+    async def _handle_health(self, request):
+        from aiohttp import web
+
+        return web.Response(text="OK", status=200)
+
+    async def _handle_register(self, request):
+        from aiohttp import web
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        url = data.get("url")
+        if not url:
+            return web.json_response(
+                {"error": "Missing or empty 'url' field"}, status=400
+            )
+        self.register(url)
+        return web.Response(text="OK", status=200)
+
+    async def _handle_unregister(self, request):
+        from aiohttp import web
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        url = data.get("url")
+        if not url:
+            return web.json_response(
+                {"error": "Missing or empty 'url' field"}, status=400
+            )
+        self.unregister(url)
+        return web.Response(text="OK", status=200)
+
+    async def _handle_list(self, request):
+        from aiohttp import web
+
+        return web.json_response({"encoder_urls": self.list_urls()}, status=200)
+
+    # ------------------------------------------------------------------ #
+    # Health check                                                       #
+    # ------------------------------------------------------------------ #
+    async def _probe(self, session, url: str) -> bool:
+        try:
+            async with session.get(f"{url}/health") as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    async def _health_check_loop(self):
+        """Probe each registered encoder periodically and evict dead ones."""
+        from aiohttp import ClientSession, ClientTimeout
+
+        timeout = ClientTimeout(total=self._health_check_timeout)
+        while True:
+            try:
+                await asyncio.sleep(self._health_check_interval)
+                snapshot = self.list_urls()
+                if not snapshot:
+                    continue
+                async with ClientSession(timeout=timeout) as session:
+                    results = await asyncio.gather(
+                        *(self._probe(session, url) for url in snapshot),
+                        return_exceptions=True,
+                    )
+                dead = [url for url, ok in zip(snapshot, results) if ok is not True]
+                if dead:
+                    with self._lock:
+                        for url in dead:
+                            if url in self._urls:
+                                self._urls.remove(url)
+                    logger.warning(
+                        f"Health check evicted {len(dead)} encoder(s): {dead}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Health check loop error: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle                                                          #
+    # ------------------------------------------------------------------ #
+    def _run_server(self):
+        from aiohttp import web
+
+        try:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+
+            access_log = None
+            if logger.getEffectiveLevel() <= logging.DEBUG:
+                access_log = self.app.logger
+
+            self._runner = web.AppRunner(self.app, access_log=access_log)
+            self._loop.run_until_complete(self._runner.setup())
+
+            site = web.TCPSite(self._runner, host=self.host, port=self.port)
+            self._loop.run_until_complete(site.start())
+            if self._health_check_interval > 0:
+                self._health_check_task = self._loop.create_task(
+                    self._health_check_loop()
+                )
+            logger.info(
+                f"EncoderBootstrapServer started on {self.host}:{self.port} "
+                f"(health_check every {self._health_check_interval}s)"
+            )
+            self._loop.run_forever()
+        except Exception as e:
+            logger.error(f"EncoderBootstrapServer error: {e}", exc_info=True)
+        finally:
+            if self._runner is not None:
+                try:
+                    self._loop.run_until_complete(self._runner.cleanup())
+                except Exception:
+                    pass
+            if self._loop is not None:
+                self._loop.close()
+
+    def close(self):
+        if self._loop is not None and self._loop.is_running():
+            if self._health_check_task is not None:
+                self._loop.call_soon_threadsafe(self._health_check_task.cancel)
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            logger.info("Stopping EncoderBootstrapServer loop...")
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
+            logger.info("EncoderBootstrapServer thread stopped")
+
+
 def _grpc_target(url: str) -> str:
     if url.startswith("grpc://"):
         return url[len("grpc://") :]
@@ -1198,20 +1407,18 @@ class MMReceiverBase(ABC):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
-        encoder_url_registry=None,
+        encode_urls: Optional[List[str]] = None,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
-        self.encode_urls = list(server_args.encoder_urls)
-        self.encoder_bootstrap_url = server_args.encoder_bootstrap_url
-        # Local registry for short-circuiting self-referential bootstrap calls.
-        # When the bootstrap URL points to the same server, using a synchronous
-        # HTTP call would deadlock the event loop.  The registry allows us to
-        # query encoder URLs directly in-process.
-        self._encoder_url_registry = encoder_url_registry
-        # Timestamp of last bootstrap refresh; used to rate-limit requests.
-        self._last_bootstrap_refresh: float = 0.0
-        self._bootstrap_refresh_interval: float = 5.0
+        # When ``encode_urls`` is shared with an :class:`EncoderBootstrapServer`
+        # (tokenizer manager process), it grows / shrinks in place as encoders
+        # register or unregister; the receiver always sees the current set.
+        # When None (e.g. in a scheduler subprocess that has no in-process
+        # bootstrap), fall back to a snapshot of the static --encoder-urls.
+        self.encode_urls: List[str] = (
+            encode_urls if encode_urls is not None else list(server_args.encoder_urls)
+        )
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(server_args.host)
         self.pp_rank = pp_rank
@@ -1333,140 +1540,16 @@ class MMReceiverBase(ABC):
     def process_waiting_requests(self, recv_reqs):
         pass
 
-    def _refresh_encoder_urls_from_bootstrap(self, bootstrap_url=None):
-        """Fetch encoder URLs from a bootstrap server and update the local list.
-
-        Called on every request when a bootstrap URL is configured, so that
-        dynamically registered or deregistered encoders are reflected immediately.
-        Rate-limited to at most one HTTP call per ``_bootstrap_refresh_interval``
-        seconds to avoid hammering the bootstrap server.
-
-        Args:
-            bootstrap_url: Optional override for the bootstrap server URL.
-                When provided (e.g. per-request ``epd_bootstrap_addr`` for nEmP),
-                this URL is used instead of the server-level
-                ``self.encoder_bootstrap_url``.  Rate-limiting still applies
-                to the server-level URL; per-request URLs bypass rate-limiting
-                and return the fetched URLs directly without caching on ``self``.
-
-        Returns:
-            When *bootstrap_url* is provided (per-request): a ``list[str]`` of
-            encoder URLs, or ``None`` on failure.
-            When *bootstrap_url* is ``None`` (server-level): always ``None``
-            (results are stored on ``self.encode_urls``).
-        """
-        import time
-
-        import requests as http_requests
-
-        url = bootstrap_url or self.encoder_bootstrap_url
-        if not url:
-            return None
-
-        # Short-circuit: when the bootstrap URL points to this server and we
-        # have a local registry, query it directly to avoid a synchronous HTTP
-        # call that would deadlock the event loop.
-        if self._encoder_url_registry is not None and url.rstrip("/") == (
-            self.encoder_bootstrap_url or ""
-        ).rstrip("/"):
-            urls = self._encoder_url_registry.list_urls()
-            if bootstrap_url is not None:
-                # Per-request path: return directly.
-                if urls:
-                    logger.info(
-                        f"Fetched {len(urls)} encoder URLs from local registry "
-                        f"(bootstrap {bootstrap_url} is self): {urls}"
-                    )
-                return urls
-            else:
-                # Server-level path: cache on self.
-                self.encode_urls = urls
-                if urls:
-                    logger.info(
-                        f"Fetched {len(urls)} encoder URLs from local registry: {urls}"
-                    )
-                else:
-                    logger.info(
-                        "Local registry has no encoder URLs yet; "
-                        "will retry on next request"
-                    )
-                return None
-
-        # Per-request bootstrap: always fetch, return directly.
-        if bootstrap_url is not None:
-            try:
-                resp = http_requests.get(
-                    f"{bootstrap_url}/list_encoder_urls", timeout=5
-                )
-                if resp.status_code == 200:
-                    urls = resp.json().get("encoder_urls", [])
-                    if urls:
-                        logger.info(
-                            f"Fetched {len(urls)} encoder URLs from per-request bootstrap "
-                            f"{bootstrap_url}: {urls}"
-                        )
-                    return urls
-                else:
-                    logger.warning(
-                        f"Failed to fetch encoder URLs from per-request bootstrap "
-                        f"{bootstrap_url}: {resp.status_code}"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to fetch encoder URLs from per-request bootstrap "
-                    f"{bootstrap_url}: {e}"
-                )
-            return None
-
-        # Server-level bootstrap: rate-limited, results cached on self.
-        now = time.monotonic()
-        if now - self._last_bootstrap_refresh < self._bootstrap_refresh_interval:
-            return None
-        self._last_bootstrap_refresh = now
-
-        try:
-            resp = http_requests.get(
-                f"{self.encoder_bootstrap_url}/list_encoder_urls", timeout=5
-            )
-            if resp.status_code == 200:
-                urls = resp.json().get("encoder_urls", [])
-                # Always overwrite the cached list so that newly registered
-                # encoders are picked up and departed encoders are evicted.
-                self.encode_urls = urls
-                if urls:
-                    logger.info(
-                        f"Fetched {len(urls)} encoder URLs from bootstrap: {urls}"
-                    )
-                else:
-                    logger.info(
-                        "Bootstrap server returned no encoder URLs yet; "
-                        "will retry on next request"
-                    )
-            else:
-                logger.warning(
-                    f"Failed to fetch encoder URLs from bootstrap: {resp.status_code}"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to fetch encoder URLs from bootstrap: {e}")
-        return None
-
     async def recv_mm_data(
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
         try:
-            # Determine the effective encoder URL list.  A per-request
-            # ``epd_bootstrap_addr`` (nEmP) takes priority over the
-            # server-level ``encoder_bootstrap_url`` (nE1P).
-            per_req_bootstrap = getattr(request_obj, "epd_bootstrap_addr", None)
-            if per_req_bootstrap:
-                encode_urls = (
-                    self._refresh_encoder_urls_from_bootstrap(per_req_bootstrap) or []
-                )
-            else:
-                if self.encoder_bootstrap_url:
-                    self._refresh_encoder_urls_from_bootstrap()
-                encode_urls = self.encode_urls
+            # ``self.encode_urls`` is shared by reference with the bootstrap
+            # server (when running) so it always reflects the current set.
+            # Snapshot once for the duration of this request to avoid races
+            # against concurrent register / unregister.
+            encode_urls = list(self.encode_urls)
 
             if len(encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
@@ -1599,26 +1682,10 @@ class MMReceiverBase(ABC):
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
 
-        # Determine effective encoder URLs.  A per-request epd_bootstrap_addr
-        # (nEmP) takes priority over the server-level encoder_bootstrap_url.
-        per_req_bootstrap = getattr(obj, "epd_bootstrap_addr", None)
-        if per_req_bootstrap:
-            encode_urls = (
-                self._refresh_encoder_urls_from_bootstrap(per_req_bootstrap) or []
-            )
-        else:
-            # Refresh encoder URLs from bootstrap on every request when dynamic
-            # discovery is configured, so newly registered or departed encoders
-            # are reflected without a server restart.
-            bootstrap_url = self.encoder_bootstrap_url
-            if mm_data and bootstrap_url:
-                if not self.encode_urls:
-                    logger.info(
-                        f"No encoder URLs available; querying bootstrap at "
-                        f"{bootstrap_url} for request {obj.rid}"
-                    )
-                self._refresh_encoder_urls_from_bootstrap()
-            encode_urls = self.encode_urls
+        # ``self.encode_urls`` is the shared list maintained by the bootstrap
+        # server (and pre-populated with --encoder-urls); take a snapshot for
+        # the duration of this dispatch.
+        encode_urls = list(self.encode_urls)
 
         if mm_data and encode_urls:
             logger.info(
@@ -1631,6 +1698,9 @@ class MMReceiverBase(ABC):
                 mm_data, len(encode_urls)
             )
             obj.num_items_assigned = num_items_assigned
+            # Freeze the encoder URL snapshot onto obj so the scheduler
+            # subprocess uses the same list when indexing encoder_idx.
+            obj.encoder_urls = encode_urls
 
             # For mooncake, No tokenizer-side thread.
             # Save mm_data (extracted URL list) onto obj so the scheduler-side
@@ -1660,10 +1730,8 @@ class MMReceiverBase(ABC):
             # never arrive.  A warning is emitted so the user can diagnose why
             # disaggregation is not happening for this request.
             if mm_data:
-                effective_bootstrap = per_req_bootstrap or self.encoder_bootstrap_url
                 logger.warning(
-                    f"No encoder URLs available for request {obj.rid} "
-                    f"(bootstrap_url={effective_bootstrap}); "
+                    f"No encoder URLs available for request {obj.rid}; "
                     "processing without encoder disaggregation."
                 )
             obj.need_wait_for_mm_inputs = False
@@ -1676,22 +1744,12 @@ class MMReceiverBase(ABC):
                 isinstance(recv_req, TokenizedGenerateReqInput)
                 and recv_req.need_wait_for_mm_inputs is True
             ):
-                # Determine effective encoder URLs.  Per-request
-                # epd_bootstrap_addr (nEmP) takes priority.
-                per_req_bootstrap = getattr(recv_req, "epd_bootstrap_addr", None)
-                if per_req_bootstrap:
-                    encode_urls = (
-                        self._refresh_encoder_urls_from_bootstrap(per_req_bootstrap)
-                        or []
-                    )
-                else:
-                    # The scheduler subprocess has its own MMReceiverHTTP instance.
-                    # Always refresh from the bootstrap server (subject to rate
-                    # limiting) so that newly registered or departed encoders are
-                    # reflected without a server restart.
-                    if self.encoder_bootstrap_url:
-                        self._refresh_encoder_urls_from_bootstrap()
-                    encode_urls = self.encode_urls
+                # Use the URL snapshot frozen by the tokenizer when it
+                # computed num_items_assigned -- the encoder_idx values in
+                # that assignment must index into this exact list.  Falling
+                # back to ``self.encode_urls`` would only matter if the
+                # tokenizer never set encoder_urls (legacy / static path).
+                encode_urls = recv_req.encoder_urls or list(self.encode_urls)
 
                 waiting_req = waiting_cls(
                     rid=recv_req.rid,
@@ -1934,7 +1992,7 @@ class MMReceiverHTTP(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
-        encoder_url_registry=None,
+        encode_urls: Optional[List[str]] = None,
     ):
         super().__init__(
             server_args,
@@ -1944,7 +2002,7 @@ class MMReceiverHTTP(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
-            encoder_url_registry=encoder_url_registry,
+            encode_urls=encode_urls,
         )
 
     # For zmq_to_scheduler and mooncake
@@ -2124,7 +2182,7 @@ class MMReceiverGrpc(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
-        encoder_url_registry=None,
+        encode_urls: Optional[List[str]] = None,
     ):
         super().__init__(
             server_args,
@@ -2134,7 +2192,7 @@ class MMReceiverGrpc(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
-            encoder_url_registry=encoder_url_registry,
+            encode_urls=encode_urls,
         )
 
     def build_and_send_encode_request(self, image_urls, rid):
@@ -2304,7 +2362,7 @@ def create_mm_receiver(
     tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
     transport_mode: Optional[str] = None,
-    encoder_url_registry=None,
+    encode_urls: Optional[List[str]] = None,
 ):
     if transport_mode is None:
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
@@ -2324,5 +2382,5 @@ def create_mm_receiver(
         tp_rank=tp_rank,
         tp_group=tp_group,
         scheduler=scheduler,
-        encoder_url_registry=encoder_url_registry,
+        encode_urls=encode_urls,
     )
