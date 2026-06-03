@@ -288,9 +288,12 @@ class CudaGraphBufferRegistry:
         self.device = device
         self.max_bs = max_bs
         self.max_num_tokens = max_num_tokens
-        # When True, slot buffers are coalesced by name through the global
-        # ForwardInputBuffers pool, so a registry can share physical storage
-        # (and data_ptr) with the legacy DecodeInputBuffers during migration.
+        # When True, *allocated* slot buffers are coalesced through the global
+        # ForwardInputBuffers pool so a registry can share storage (and
+        # data_ptr) with a legacy buffer dataclass. Applies to allocation only:
+        # production always adopts an existing tensor via register_slot(bind=)
+        # (source=), which bypasses the pool — so this path is currently
+        # exercised only by tests.
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
 
@@ -470,6 +473,13 @@ class CudaGraphBufferRegistry:
         ``capture_hidden_mode`` / ``dp_*`` / ``lora_ids`` / ...). Slot
         fields are replaced with views into the registry buffers via
         ``dataclasses.replace`` — the template itself is not mutated.
+
+        NOTE: currently parked / unused. It is NOT a drop-in for the decode
+        replay path's ``build_replay_fb_view``: it returns the *padded*
+        out_cache_loc slot slice (vs the raw ``fb.out_cache_loc`` that path
+        keeps), does not recompute ``seq_lens_sum`` for the padded tail, and
+        does not split ``forward_mode`` vs ``actual_forward_mode``. Reconcile
+        those before wiring it into any replay path.
         """
         import dataclasses
 

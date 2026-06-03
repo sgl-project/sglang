@@ -842,6 +842,53 @@ class TestBuildDecodeRegistry(unittest.TestCase):
                 name,
             )
 
+    def test_num_token_non_padded_gathered_dp_branch(self):
+        import unittest.mock as mock
+
+        from sglang.srt.model_executor import forward_batch_info as fbi
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        ntnp = torch.zeros(1, dtype=torch.int32)
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int32),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int32),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            num_token_non_padded=ntnp,
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+        )
+        # Gathered (DP) path: post_fill overwrites the plain FB copy with this
+        # rank's local count. Pin attn-TP (size=2, rank=0) so the result is
+        # deterministic and differs from the raw FB value.
+        with mock.patch.object(
+            fbi, "get_attention_tp_size", return_value=2
+        ), mock.patch.object(fbi, "get_attention_tp_rank", return_value=0):
+            reg = build_decode_registry(
+                device=torch.device("cpu"),
+                max_bs=4,
+                max_num_token=8,
+                seq_len_fill_value=5,
+                cache_loc_dtype=torch.int64,
+                enable_num_token_non_padded=True,
+                require_gathered_buffer=True,
+                source=src,
+            )
+            fb = _MiniForwardBatch(
+                num_token_non_padded=torch.tensor([100], dtype=torch.int32),
+            )
+            reg.fill_from(
+                fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
+            )
+        # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
+        # local = clamp(100 - rank*4, 0, 4) = 4  (NOT the raw FB copy of 100).
+        self.assertEqual(int(src.num_token_non_padded.item()), 4)
+
     def test_source_with_ngram_registers_structured_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,

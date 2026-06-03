@@ -177,12 +177,10 @@ class BreakableCudaGraphRunner:
         )
         from sglang.srt.utils import is_npu
 
+        cache_loc_dtype = torch.int64 if not is_npu() else torch.int32
         with torch.device(self.device):
             input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            out_cache_loc = torch.zeros(
-                (self.max_num_tokens,),
-                dtype=torch.int64 if not is_npu() else torch.int32,
-            )
+            out_cache_loc = torch.zeros((self.max_num_tokens,), dtype=cache_loc_dtype)
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             if self.is_multimodal:
                 input_embeds = torch.zeros(
@@ -225,7 +223,7 @@ class BreakableCudaGraphRunner:
             device=self.device,
             max_bs=1,
             max_num_token=self.max_num_tokens,
-            cache_loc_dtype=torch.int64 if not is_npu() else torch.int32,
+            cache_loc_dtype=cache_loc_dtype,
             is_multimodal=self.is_multimodal,
             hidden_size=model_runner.model_config.hidden_size,
             embed_dtype=model_runner.dtype,
