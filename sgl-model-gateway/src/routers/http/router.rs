@@ -101,15 +101,12 @@ impl Router {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
 
                 if let Some(key) = api_key {
-                    let mut auth_header = String::with_capacity(7 + key.len());
-                    auth_header.push_str("Bearer ");
-                    auth_header.push_str(&key);
-                    request_builder = request_builder.header("Authorization", auth_header);
+                    request_builder = request_builder.bearer_auth(&key);
                 }
 
                 for (name, value) in headers {
                     if header_utils::should_forward_request_header(&name) {
-                        if has_worker_api_key && name == AUTHORIZATION {
+                        if has_worker_api_key && name == AUTHORIZATION.as_str() {
                             continue;
                         }
                         request_builder = request_builder.header(name, value);
@@ -410,10 +407,7 @@ impl Router {
                     };
 
                     if let Some(key) = api_key {
-                        let mut auth_header = String::with_capacity(7 + key.len());
-                        auth_header.push_str("Bearer ");
-                        auth_header.push_str(&key);
-                        request_builder = request_builder.header("Authorization", auth_header);
+                        request_builder = request_builder.bearer_auth(&key);
                     }
 
                     for (name, value) in headers {
@@ -568,11 +562,7 @@ impl Router {
         };
 
         if let Some(key) = api_key {
-            // Pre-allocate string with capacity to avoid reallocation
-            let mut auth_header = String::with_capacity(7 + key.len());
-            auth_header.push_str("Bearer ");
-            auth_header.push_str(&key);
-            request_builder = request_builder.header("Authorization", auth_header);
+            request_builder = request_builder.bearer_auth(&key);
         }
 
         if let Some(headers) = headers {
@@ -930,7 +920,8 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        let url = result.unwrap();
+        let worker = result.unwrap();
+        let url = worker.url();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
     }
@@ -941,9 +932,7 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        let url = result.unwrap();
-
-        let worker = router.worker_registry.get_by_url(&url).unwrap();
+        let worker = result.unwrap();
         assert!(worker.is_healthy());
     }
 }
