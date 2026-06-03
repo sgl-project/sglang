@@ -881,8 +881,6 @@ class SchedulerBatchResultProcessor:
         )
 
         if not at_boundary:
-            if lazy and req.finished():
-                self._mamba_lazy_undo_stale_prealloc(req, batch)
             return
 
         req.mamba_last_track_seqlen = track_seqlen
@@ -898,17 +896,26 @@ class SchedulerBatchResultProcessor:
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen). Both lazy and non-lazy use the
-        same boundary condition (seq_len % interval == 0). For spec decode,
-        the boundary is detected by comparing the accepted seq_len range
-        against interval boundaries.
+        Returns (at_boundary, track_seqlen).  The boundary condition uses
+        the same seq_len that ``prepare_for_decode`` used for the tracking
+        mask (``seq_lens_cpu % interval == 0``).  Since
+        ``prepare_for_decode`` increments ``seq_lens_cpu`` by 1 before
+        computing the mask, the matching value here is
+        ``len(origin_input_ids) + len(output_ids)`` (output_ids already
+        includes the token appended in this step).  ``track_seqlen`` is
+        capped at ``kv_committed_len`` so it never exceeds the KV that
+        was actually allocated.
+
+        For spec decode, the boundary is detected by comparing the
+        accepted seq_len range against interval boundaries.
         """
         interval = get_global_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
-            seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            seq_len = len(req.origin_input_ids) + len(req.output_ids)
             if seq_len % interval == 0:
-                return True, seq_len
+                track_seqlen = min(seq_len, req.kv_committed_len)
+                return True, track_seqlen
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
             prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
@@ -920,39 +927,22 @@ class SchedulerBatchResultProcessor:
     def mamba_lazy_post_decode_at_boundary(self, req: Req, batch: ScheduleBatch):
         """Post-decode cleanup at a lazy-mode track boundary.
 
-        Finished reqs return early — ``free_mamba_cache`` handles their
-        slots.  If prealloc failed (other slot is -1), the forward
+        Finished reqs: if prealloc failed (other slot is -1), the forward
         overwrote the only slot with corrupted state, so mark
-        is_insert=False to skip the cache insert.
+        is_insert=False to skip the cache insert.  If the other slot is
+        occupied (stale prealloc from an overlap extra forward), free it
+        so the prealloc assert in the next prepare_for_decode holds.
 
         Running reqs: free the old ping-pong slot so we go back to
         holding only 1 slot until the next boundary.
         """
-        if req.finished():
-            other_idx = 1 - req.mamba_next_track_idx
-            if req.mamba_ping_pong_track_buffer[other_idx].item() == -1:
-                req.mamba_lazy_is_insert = False
-            return
         other_idx = 1 - req.mamba_next_track_idx
-        old_val = req.mamba_ping_pong_track_buffer[other_idx]
-        if old_val.item() != -1:
+        other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
+        if other_val != -1:
             pool = batch.req_to_token_pool
-            pool.mamba_pool.free(old_val.unsqueeze(0))
+            pool.mamba_pool.free(
+                req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
+            )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
-
-    def _mamba_lazy_undo_stale_prealloc(self, req: Req, batch: ScheduleBatch):
-        """Undo a prealloc that was performed by a stale overlap forward.
-
-        With overlap scheduling a finished request gets one extra
-        ``prepare_for_decode`` before its EOS token is processed.
-        If that extra step hit a track boundary, prealloc allocated a
-        second slot and swapped ``next_track_idx``.  The post-decode
-        cleanup never ran for that step (overlap skips finished reqs).
-
-        Swap ``next_track_idx`` back to the old slot whose state matches
-        ``mamba_last_track_seqlen``.  The stale slot is freed later by
-        ``free_mamba_cache``.
-        """
-        other_idx = 1 - req.mamba_next_track_idx
-        if req.mamba_ping_pong_track_buffer[other_idx].item() != -1:
-            req.mamba_next_track_idx = other_idx
+        elif req.finished():
+            req.mamba_lazy_is_insert = False
