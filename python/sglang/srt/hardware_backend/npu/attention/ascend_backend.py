@@ -2238,13 +2238,15 @@ class AscendAttnBackend(AttentionBackend):
                         input_layout="BSND",
                         block_size=block_size,
                         atten_mask=(
-                            swa_mask if layer.sliding_window_size != -1 else None
+                            self.fia_mask if layer.sliding_window_size != -1 else None
                         ),
                         sparse_mode=4 if layer.sliding_window_size != -1 else 0,
                         softmax_scale=layer.scaling,
                         block_table=block_tables,
                         actual_seq_qlen=[1] * len(self.forward_metadata.seq_lens),
                         actual_seq_kvlen=actual_seq_len_kv,
+                        pre_tokens=layer.sliding_window_size,
+                        next_tokens=0,
                         learnable_sink=sinks,
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -2284,7 +2286,7 @@ class AscendAttnBackend(AttentionBackend):
                         -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
                     ),
                     v_cache.view(
-                        -1, self.page_size, layer.tp_v_head_num * layer.qk_head_dim
+                        -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
                     ),
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
