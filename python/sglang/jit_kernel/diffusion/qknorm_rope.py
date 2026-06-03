@@ -26,14 +26,33 @@ def _jit_qknorm_rope_module(
     rope_dim: int,
     is_neox: bool,
     dtype: torch.dtype,
+    arch_variant: str,
 ) -> Module:
     args = make_cpp_args(head_dim, rope_dim, is_neox, is_arch_support_pdl(), dtype)
+    cuda_file = {
+        "b200": "diffusion/qknorm_rope_b200.cuh",
+        "h200": "diffusion/qknorm_rope_h200.cuh",
+    }.get(arch_variant, "diffusion/qknorm_rope.cuh")
     return load_jit(
-        "qknorm_rope",
+        f"qknorm_rope_{arch_variant}",
         *args,
-        cuda_files=["diffusion/qknorm_rope.cuh"],
+        cuda_files=[cuda_file],
         cuda_wrappers=[("qknorm_rope", f"QKNormRopeKernel<{args}>::run")],
     )
+
+
+def _arch_variant(device: torch.device | int | None = None) -> str:
+    if not torch.cuda.is_available():
+        return "base"
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+    except Exception:
+        return "base"
+    if major >= 10:
+        return "b200"
+    if (major, minor) == (9, 0):
+        return "h200"
+    return "base"
 
 
 @torch.compiler.assume_constant_result
@@ -70,7 +89,9 @@ def can_use_fused_inplace_qknorm_rope(
             )
             return False
     try:
-        _jit_qknorm_rope_module(head_dim, rope_dim, is_neox, dtype)
+        _jit_qknorm_rope_module(
+            head_dim, rope_dim, is_neox, dtype, _arch_variant()
+        )
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT fused QKNorm+RoPE kernel: {e}")
@@ -93,5 +114,7 @@ def fused_inplace_qknorm_rope(
 ) -> None:
     head_dim = head_dim or q.size(-1)
     rope_dim = rope_dim or cos_sin_cache.size(-1)
-    module = _jit_qknorm_rope_module(head_dim, rope_dim, is_neox, q.dtype)
+    module = _jit_qknorm_rope_module(
+        head_dim, rope_dim, is_neox, q.dtype, _arch_variant(q.device)
+    )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)

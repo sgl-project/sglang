@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.diffusion.native_rotary import try_native_ltx2_split_rotary_emb
+
 
 @triton.jit
 def _ltx2_split_rotary_kernel(
@@ -61,6 +63,10 @@ def _ltx2_split_rotary_kernel(
 def apply_ltx2_split_rotary_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
+    native_out = try_native_ltx2_split_rotary_emb(x, cos, sin)
+    if native_out is not None:
+        return native_out
+
     batch, seq_len, inner_dim = x.shape
     cos_batch, num_heads, cos_seq_len, half_dim = cos.shape
     head_dim = half_dim * 2

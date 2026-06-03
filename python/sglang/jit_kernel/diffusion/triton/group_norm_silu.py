@@ -5,6 +5,9 @@ import torch.nn.functional as F
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.jit_kernel.diffusion.native_group_norm_silu import (
+    try_native_group_norm_silu,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
@@ -406,6 +409,9 @@ def triton_group_norm_silu(
     num_groups: int,
     eps: float = 1e-5,
 ) -> torch.Tensor:
+    native_out = try_native_group_norm_silu(x, weight, bias, num_groups, eps)
+    if native_out is not None:
+        return native_out
     return _triton_group_norm_silu_cuda(x, weight, bias, num_groups, eps)
 
 

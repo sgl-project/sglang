@@ -2,6 +2,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.jit_kernel.diffusion.native_rotary import try_native_rotary_embedding
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -84,6 +85,10 @@ def _rotary_embedding_kernel(
 def apply_rotary_embedding(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
+    native_out = try_native_rotary_embedding(x, cos, sin, interleaved)
+    if native_out is not None:
+        return native_out
+
     output = torch.empty_like(x)
 
     if x.dim() > 3:

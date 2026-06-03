@@ -3,6 +3,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.jit_kernel.diffusion.native_norm import try_native_one_pass_rms_norm
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -66,6 +67,9 @@ def _triton_one_pass_rms_norm_cuda(
 
 
 def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
+    native_out = try_native_one_pass_rms_norm(x, w, eps)
+    if native_out is not None:
+        return native_out
     return _triton_one_pass_rms_norm_cuda(x, w, eps)
 
 

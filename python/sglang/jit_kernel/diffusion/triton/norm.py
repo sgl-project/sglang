@@ -5,6 +5,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
 
+from sglang.jit_kernel.diffusion.native_norm import try_native_norm_infer
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -622,6 +623,11 @@ def norm_infer(
     if bias is not None:
         assert bias.shape == (N,)
         assert bias.stride(-1) == 1
+    native_out = try_native_norm_infer(
+        x, weight, bias, eps, is_rms_norm=is_rms_norm, out=out
+    )
+    if native_out is not None:
+        return native_out
     if out is None:
         out = torch.empty_like(x)
     MAX_FUSED_SIZE = 65536 // x.element_size()
