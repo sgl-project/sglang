@@ -51,10 +51,10 @@ class SchedulerInputBlocker:
 
     def _handle_recv_req(self, recv_req):
         if isinstance(recv_req, BlockReqInput):
-            if recv_req.type == BlockReqType.BLOCK:
+            if recv_req.req_type == BlockReqType.BLOCK:
                 self._execute_block_req()
                 return []
-            elif recv_req.type == BlockReqType.UNBLOCK:
+            elif recv_req.req_type == BlockReqType.UNBLOCK:
                 self._execute_unblock_req()
                 return []
             else:
@@ -99,8 +99,8 @@ class _State(Enum):
 
 @contextmanager
 def input_blocker_guard_region(send_to_scheduler):
-    send_to_scheduler.send_pyobj(BlockReqInput(BlockReqType.BLOCK))
+    send_to_scheduler.send_obj(BlockReqInput(BlockReqType.BLOCK))
     try:
         yield
     finally:
-        send_to_scheduler.send_pyobj(BlockReqInput(BlockReqType.UNBLOCK))
+        send_to_scheduler.send_obj(BlockReqInput(BlockReqType.UNBLOCK))

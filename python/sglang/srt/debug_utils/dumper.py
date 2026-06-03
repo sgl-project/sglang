@@ -1391,6 +1391,7 @@ def _create_zmq_rpc_broadcast(
 ) -> Optional["_ZmqRpcBroadcast"]:
     """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
+    from sglang.srt.managers.io_struct import (sock_send, sock_recv)
 
     rank = _get_rank()
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -1404,13 +1405,13 @@ def _create_zmq_rpc_broadcast(
     def serve_loop():
         while True:
             try:
-                req = sock.recv_pyobj()
+                req = sock_recv(sock)
                 result = getattr(handler, req["method"])(*req["args"], **req["kwargs"])
                 resp = {"result": result, "error": None}
             except Exception as e:
                 _log(f"[ZmqRpc] error inside handler: {e}")
                 resp = {"result": None, "error": str(e)}
-            sock.send_pyobj(resp)
+            sock_send(sock, resp)
 
     thread = threading.Thread(target=serve_loop, daemon=True)
     thread.start()
@@ -1447,14 +1448,13 @@ class _ZmqRpcHandle:
 
     def __getattr__(self, method_name: str):
         def call(*args, **kwargs):
-            self._socket.send_pyobj(
-                {
-                    "method": method_name,
-                    "args": args,
-                    "kwargs": kwargs,
-                }
-            )
-            response = self._socket.recv_pyobj()
+            from sglang.srt.managers.io_struct import (sock_send, sock_recv)
+            sock_send(self._socket, {
+                "method": method_name,
+                "args": args,
+                "kwargs": kwargs,
+            })
+            response = sock_recv(self._socket)
             if response["error"]:
                 raise RuntimeError(
                     f"RPC error on {self._debug_name}: {response['error']}"

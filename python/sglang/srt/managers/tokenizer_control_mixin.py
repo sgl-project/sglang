@@ -336,7 +336,7 @@ class TokenizerControlMixin:
         )
         record_shapes = (record_shapes is not False) and env_record_shapes
         req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
+            req_type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
             start_step=start_step,
             num_steps=num_steps,
@@ -353,7 +353,7 @@ class TokenizerControlMixin:
 
     async def stop_profile(self: TokenizerManager):
         self.auto_create_handle_loop()
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        req = ProfileReq(ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
@@ -857,7 +857,7 @@ class TokenizerControlMixin:
 
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
-        self.send_to_scheduler.send_pyobj(obj)
+        await self.send_to_scheduler.async_send_obj(obj)
 
         try:
             return await future
@@ -869,7 +869,7 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        await self.send_to_scheduler.send_pyobj(obj)
+        await self.send_to_scheduler.async_send_obj(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

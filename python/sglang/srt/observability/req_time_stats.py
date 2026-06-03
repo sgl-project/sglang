@@ -220,10 +220,12 @@ class RequestStage:
 @dataclass
 class ReqTimeStatsBase:
     enable_metrics: bool = False
-    metrics_collector: Optional[
-        Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
-    ] = None
-    trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
+    # use object to avoid msgpack decode build issue, not use Any due to the
+    # custom object serialized by pickle.
+    # Optional[Union[SchedulerMetricsCollector, TokenizerMetricsCollector]]
+    metrics_collector: Optional[object] = None
+    # Union[TraceReqContext, TraceNullContext]
+    trace_ctx: object = field(
         default_factory=TraceNullContext
     )
     disagg_mode: DisaggregationMode = DisaggregationMode.NULL

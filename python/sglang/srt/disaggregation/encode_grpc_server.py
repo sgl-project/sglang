@@ -87,6 +87,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
     async def Encode(
         self, request: sglang_encoder_pb2.EncodeRequest, context
     ) -> sglang_encoder_pb2.EncodeResponse:
+        from sglang.srt.managers.io_struct import async_sock_send
         try:
             request_dict = {
                 "mm_items": list(request.mm_items),
@@ -95,7 +96,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 "part_idx": request.part_idx,
             }
             for socket in self.send_sockets:
-                await socket.send_pyobj(request_dict)
+                await async_sock_send(socket, request_dict)
 
             # gRPC encode is image-only; encoder.encode() requires modality
             (

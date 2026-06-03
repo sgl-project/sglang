@@ -35,6 +35,7 @@ from typing import (
     List,
     Optional,
     Union,
+    Literal,
 )
 
 # Fix a bug of Python threading
@@ -109,36 +110,34 @@ from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
-    AbortReq,
-    AttachHiCacheStorageReqInput,
-    CheckWeightsReqInput,
-    CloseSessionReqInput,
-    ConfigureLoggingReq,
-    ContinueGenerationReqInput,
-    DestroyWeightsUpdateGroupReqInput,
+    CheckWeightsReqInput as CheckWeightsReqInputIpc,
+    CloseSessionReqInput as CloseSessionReqInputIpc,
+    ConfigureLoggingReq as ConfigureLoggingReqIpc,
+    ContinueGenerationReqInput as ContinueGenerationReqInputIpc,
+    DestroyWeightsUpdateGroupReqInput as DestroyWeightsUpdateGroupReqInputIpc,
     DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
-    GetWeightsByNameReqInput,
-    InitWeightsSendGroupForRemoteInstanceReqInput,
-    InitWeightsUpdateGroupReqInput,
-    LoadLoRAAdapterFromTensorsReqInput,
-    LoadLoRAAdapterReqInput,
-    OpenSessionReqInput,
+    GetWeightsByNameReqInput as GetWeightsByNameReqInputIpc,
+    InitWeightsSendGroupForRemoteInstanceReqInput as InitWeightsSendGroupForRemoteInstanceReqInputIpc,
+    InitWeightsUpdateGroupReqInput as InitWeightsUpdateGroupReqInputIpc,
+    LoadLoRAAdapterFromTensorsReqInput as LoadLoRAAdapterFromTensorsReqInputIpc,
+    LoadLoRAAdapterReqInput as LoadLoRAAdapterReqInputIpc,
+    OpenSessionReqInput as OpenSessionReqInputIpc,
     ParseFunctionCallReq,
-    PauseGenerationReqInput,
+    PauseGenerationReqInput as PauseGenerationReqInputIpc,
     ProfileReqInput,
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-    SendWeightsToRemoteInstanceReqInput,
+    ReleaseMemoryOccupationReqInput as ReleaseMemoryOccupationReqInputIpc,
+    ResumeMemoryOccupationReqInput as ResumeMemoryOccupationReqInputIpc,
+    SendWeightsToRemoteInstanceReqInput as SendWeightsToRemoteInstanceReqInputIpc,
     SeparateReasoningReqInput,
-    SetInternalStateReq,
-    SlowDownReqInput,
-    UnloadLoRAAdapterReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
+    SetInternalStateReq as SetInternalStateReqIpc,
+    SlowDownReqInput as SlowDownReqInputIpc,
+    UnloadLoRAAdapterReqInput as UnloadLoRAAdapterReqInputIpc,
+    UpdateWeightFromDiskReqInput as UpdateWeightFromDiskReqInputIpc,
+    UpdateWeightsFromDistributedReqInput as UpdateWeightsFromDistributedReqInputIpc,
+    UpdateWeightsFromIPCReqInput as UpdateWeightsFromIPCReqInputIpc,
+    UpdateWeightsFromTensorReqInput as UpdateWeightsFromTensorReqInputIpc,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
@@ -680,12 +679,19 @@ async def get_load():
     ]
 
 
+@dataclasses.dataclass
+class SetInternalStateReq:
+    server_args: Dict[str, Any]
+
+
 # example usage:
 # curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
-    res = await _global_state.tokenizer_manager.set_internal_state(obj)
+    res = await _global_state.tokenizer_manager.set_internal_state(
+        SetInternalStateReqIpc(**obj.__dict__)
+    )
     return res
 
 
@@ -870,6 +876,41 @@ async def clear_hicache_storage_backend():
     )
 
 
+@dataclasses.dataclass
+class AttachHiCacheStorageReqInput:
+    """Dynamically attach (enable) HiCache storage backend at runtime.
+
+    Note: `hicache_storage_backend_extra_config_json` is a JSON string. It may contain both:
+    - backend-specific configs (e.g., mooncake master address)
+    - prefetch-related knobs (prefetch_threshold, prefetch_timeout_*, hicache_storage_pass_prefix_keys)
+    """
+
+    hicache_storage_backend: str
+    hicache_storage_backend_extra_config_json: Optional[str] = None
+    hicache_storage_prefetch_policy: Optional[str] = None
+    hicache_write_policy: Optional[str] = None
+
+    def __post_init__(self):
+        if self.hicache_storage_prefetch_policy is None:
+            pass
+        else:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if self.hicache_storage_prefetch_policy not in allowed:
+                raise ValueError(
+                    f"Invalid hicache_storage_prefetch_policy: {self.hicache_storage_prefetch_policy!r}. "
+                    f"Expected one of {allowed}."
+                )
+
+        if self.hicache_write_policy is None:
+            return
+        allowed = ["write_back", "write_through", "write_through_selective"]
+        if self.hicache_write_policy not in allowed:
+            raise ValueError(
+                f"Invalid hicache_write_policy: {self.hicache_write_policy!r}. "
+                f"Expected one of {allowed}."
+            )
+
+
 # example usage:
 # curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
 #  -H 'Content-Type: application/json' \
@@ -1045,12 +1086,41 @@ async def dump_expert_distribution_record_async():
     )
 
 
+@dataclasses.dataclass
+class UpdateWeightFromDiskReqInput:
+    # The model path with the new weights
+    model_path: str
+    # The format to load the weights
+    load_format: Optional[str] = None
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Whether to update weights asynchronously
+    is_async: bool = False
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+    # Whether to keep the scheduler paused after weight update
+    keep_pause: bool = False
+    # Whether to recapture cuda graph after weight update
+    recapture_cuda_graph: bool = False
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_step: int = 0
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Tensor metadata
+    manifest: Optional[Dict[str, Any]] = None
+
+
 @app.post("/update_weights_from_disk")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
     success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
+        await _global_state.tokenizer_manager.update_weights_from_disk(
+            UpdateWeightFromDiskReqInputIpc(**obj.__dict__),
+            request,
+        )
     )
 
     content = {
@@ -1070,6 +1140,22 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         )
 
 
+@dataclasses.dataclass
+class InitWeightsSendGroupForRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The rank in the communication group
+    group_rank: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_send_group"
+    # The backend
+    backend: str = "nccl"
+
+
 @app.post("/init_weights_send_group_for_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_send_group_for_remote_instance(
@@ -1077,7 +1163,8 @@ async def init_weights_send_group_for_remote_instance(
 ):
     success, message = (
         await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
-            obj, request
+            InitWeightsSendGroupForRemoteInstanceReqInputIpc(**obj.__dict__),
+            request,
         )
     )
     content = {"success": success, "message": message}
@@ -1087,6 +1174,16 @@ async def init_weights_send_group_for_remote_instance(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@dataclasses.dataclass
+class SendWeightsToRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The group name
+    group_name: str = "weight_send_group"
+
+
 @app.post("/send_weights_to_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def send_weights_to_remote_instance(
@@ -1094,7 +1191,8 @@ async def send_weights_to_remote_instance(
 ):
     success, message = (
         await _global_state.tokenizer_manager.send_weights_to_remote_instance(
-            obj, request
+            SendWeightsToRemoteInstanceReqInputIpc(**obj.__dict__),
+            request,
         )
     )
     content = {"success": success, "message": message}
@@ -1142,6 +1240,22 @@ async def remote_instance_transfer_engine_info(rank: int = None):
     )
 
 
+@dataclasses.dataclass
+class InitWeightsUpdateGroupReqInput:
+    # The master address
+    master_address: str
+    # The master port
+    master_port: int
+    # The rank offset
+    rank_offset: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_update_group"
+    # The backend
+    backend: str = "nccl"
+
+
 @app.post("/init_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
@@ -1149,13 +1263,19 @@ async def init_weights_update_group(
 ):
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
-        obj, request
+        InitWeightsUpdateGroupReqInputIpc(**obj.__dict__),
+        request,
     )
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@dataclasses.dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str = "weight_update_group"
 
 
 @app.post("/destroy_weights_update_group")
@@ -1165,12 +1285,33 @@ async def destroy_weights_update_group(
 ):
     """Destroy the parameter update group."""
     success, message = (
-        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+        await _global_state.tokenizer_manager.destroy_weights_update_group(
+            DestroyWeightsUpdateGroupReqInputIpc(**obj.__dict__),
+            request,
+        )
     )
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
     )
+
+
+@dataclasses.dataclass
+class UpdateWeightsFromTensorReqInput:
+    # List[Union[str, bytes]]
+    serialized_named_tensors: List[bytes]
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Optional: Determine whether to disable updating the draft model
+    disable_draft_model: Optional[bool] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
 
 
 @app.post("/update_weights_from_tensor")
@@ -1186,13 +1327,33 @@ async def update_weights_from_tensor(
     """
 
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
-        obj, request
+        UpdateWeightsFromTensorReqInputIpc(**obj.__dict__),
+        request
     )
 
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
     )
+
+
+@dataclasses.dataclass
+class UpdateWeightsFromDistributedReqInput:
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    # The group name
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
 
 
 @app.post("/update_weights_from_distributed")
@@ -1203,7 +1364,8 @@ async def update_weights_from_distributed(
     """Update model parameter from distributed online."""
     success, message = (
         await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
+            UpdateWeightsFromDistributedReqInputIpc(**obj.__dict__),
+            request,
         )
     )
 
@@ -1214,12 +1376,25 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@dataclasses.dataclass
+class UpdateWeightsFromIPCReqInput:
+    # ZMQ socket paths for each device UUID
+    zmq_handles: Dict[str, str]
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
 @app.post("/update_weights_from_ipc")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
     """Update the weights from IPC (Inter-Process Communication) for checkpoint-engine integration."""
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
-        obj, request
+        UpdateWeightsFromIPCReqInputIpc(**obj.__dict__),
+        request,
     )
 
     content = {"success": success, "message": message}
@@ -1262,18 +1437,32 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
         )
 
 
+@dataclasses.dataclass
+class GetWeightsByNameReqInput:
+    name: str
+    truncate_size: int = 100
+
+
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
     """Get model parameter by name."""
     try:
-        ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
+        ret = await _global_state.tokenizer_manager.get_weights_by_name(
+            GetWeightsByNameReqInputIpc(**obj.__dict__),
+            request,
+        )
         if ret is None:
             return _create_error_response("Get parameter by name failed")
         else:
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
         return _create_error_response(e)
+
+
+@dataclasses.dataclass
+class ReleaseMemoryOccupationReqInput:
+    tags: Optional[List[str]] = None
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
@@ -1283,9 +1472,17 @@ async def release_memory_occupation(
 ):
     """Release GPU memory occupation temporarily."""
     try:
-        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+        await _global_state.tokenizer_manager.release_memory_occupation(
+            ReleaseMemoryOccupationReqInputIpc(**obj.__dict__),
+            request,
+        )
     except Exception as e:
         return _create_error_response(e)
+
+
+@dataclasses.dataclass
+class ResumeMemoryOccupationReqInput:
+    tags: Optional[List[str]] = None
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
@@ -1295,10 +1492,17 @@ async def resume_memory_occupation(
 ):
     """Resume GPU memory occupation."""
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        await _global_state.tokenizer_manager.resume_memory_occupation(
+            ResumeMemoryOccupationReqInputIpc(**obj.__dict__),
+            request,
+        )
     except Exception as e:
         return _create_error_response(e)
 
+
+@dataclasses.dataclass
+class CheckWeightsReqInput:
+    action: str = "checksum"
 
 @app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
@@ -1308,7 +1512,10 @@ async def check_weights(
     if obj is None:
         obj = CheckWeightsReqInput()
     success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
+        await _global_state.tokenizer_manager.check_weights(
+            CheckWeightsReqInputIpc(**obj.__dict__),
+            request,
+        )
     )
     body = {"success": success, "message": message}
     if ranks is not None:
@@ -1316,6 +1523,11 @@ async def check_weights(
     if per_engine_checksum is not None:
         body["per_engine_checksum"] = per_engine_checksum
     return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
+
+
+@dataclasses.dataclass
+class SlowDownReqInput:
+    forward_sleep_time: Optional[float]
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
@@ -1327,16 +1539,34 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
     to let it run in full batch size.
     """
     try:
-        await _global_state.tokenizer_manager.slow_down(obj, request)
+        await _global_state.tokenizer_manager.slow_down(
+            SlowDownReqInputIpc(**obj.__dict__),
+            request,
+        )
     except Exception as e:
         return _create_error_response(e)
+
+
+@dataclasses.dataclass
+class LoadLoRAAdapterReqInput:
+    # The name of the lora module to newly loaded.
+    lora_name: str
+    # The path of loading.
+    lora_path: str
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
 
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
-    result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
+    result = await _global_state.tokenizer_manager.load_lora_adapter(
+        LoadLoRAAdapterReqInputIpc(**obj.__dict__),
+        request,
+    )
 
     if result.success:
         return ORJSONResponse(
@@ -1348,6 +1578,17 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
             result,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@dataclasses.dataclass
+class LoadLoRAAdapterFromTensorsReqInput:
+    lora_name: str
+    config_dict: Dict[str, Any]
+    serialized_tensors: str
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    lora_id: Optional[str] = None
+    load_format: Optional[str] = None
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
@@ -1356,7 +1597,8 @@ async def load_lora_adapter_from_tensors(
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
-        obj, request
+        LoadLoRAAdapterFromTensorsReqInputIpc(**obj.__dict__),
+        request,
     )
 
     if result.success:
@@ -1365,11 +1607,22 @@ async def load_lora_adapter_from_tensors(
         return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@dataclasses.dataclass
+class UnloadLoRAAdapterReqInput:
+    # The name of lora module to unload.
+    lora_name: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+
 @app.api_route("/unload_lora_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
-    result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+    result = await _global_state.tokenizer_manager.unload_lora_adapter(
+        UnloadLoRAAdapterReqInputIpc(**obj.__dict__),
+        request,
+    )
 
     if result.success:
         return ORJSONResponse(
@@ -1383,11 +1636,21 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
         )
 
 
+@dataclasses.dataclass
+class OpenSessionReqInput:
+    capacity_of_str_len: int
+    session_id: Optional[str] = None
+    streaming: Optional[bool] = None
+    timeout: Optional[float] = None
+
 @app.api_route("/open_session", methods=["GET", "POST"])
 async def open_session(obj: OpenSessionReqInput, request: Request):
     """Open a session, and return its unique session id."""
     try:
-        session_id = await _global_state.tokenizer_manager.open_session(obj, request)
+        session_id = await _global_state.tokenizer_manager.open_session(
+            OpenSessionReqInputIpc(**obj.__dict__),
+            request,
+        )
         if session_id is None:
             raise Exception(
                 "Failed to open the session. Check if a session with the same id is still open."
@@ -1397,23 +1660,49 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
         return _create_error_response(e)
 
 
+@dataclasses.dataclass
+class CloseSessionReqInput:
+    session_id: str
+
 @app.api_route("/close_session", methods=["GET", "POST"])
 async def close_session(obj: CloseSessionReqInput, request: Request):
     """Close the session."""
     try:
-        await _global_state.tokenizer_manager.close_session(obj, request)
+        await _global_state.tokenizer_manager.close_session(
+            CloseSessionReqInputIpc(**obj.__dict__),
+            request,
+        )
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
+
+
+@dataclasses.dataclass
+class ConfigureLoggingReq:
+    log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
+    log_requests_format: Optional[str] = None
+    log_level: Optional[str] = None
+    dump_requests_folder: Optional[str] = None
+    dump_requests_threshold: Optional[int] = None
+    crash_dump_folder: Optional[str] = None
+    dump_requests_exclude_meta_keys: Optional[List[str]] = None
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     """Configure the request logging options."""
-    _global_state.tokenizer_manager.configure_logging(obj)
+    _global_state.tokenizer_manager.configure_logging(
+        ConfigureLoggingReqIpc(**obj.__dict__)
+    )
     return Response(status_code=200)
 
+@dataclasses.dataclass
+class AbortReq:
+    rid: Optional[str] = None
+    # Whether to abort all requests
+    abort_all: bool = False
 
 @app.post("/abort_request")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
@@ -1470,22 +1759,45 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     return ORJSONResponse(content=response_data, status_code=200)
 
 
+@dataclasses.dataclass
+class PauseGenerationReqInput:
+    mode: Literal["abort", "retract", "in_place"] = "abort"
+
+    def __post_init__(self):
+        allowed = ["abort", "retract", "in_place"]
+        if self.mode not in allowed:
+            raise ValueError(
+                f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}."
+            )
+
+
+
+
 @app.post("/pause_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pause_generation(obj: PauseGenerationReqInput, request: Request):
     """Pause generation."""
-    await _global_state.tokenizer_manager.pause_generation(obj)
+    await _global_state.tokenizer_manager.pause_generation(
+        PauseGenerationReqInputIpc(**obj.__dict__)
+    )
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
         status_code=200,
     )
 
 
+@dataclasses.dataclass
+class ContinueGenerationReqInput:
+    torch_empty_cache: bool = True
+
+
 @app.post("/continue_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
     """Continue generation."""
-    await _global_state.tokenizer_manager.continue_generation(obj)
+    await _global_state.tokenizer_manager.continue_generation(
+        ContinueGenerationReqInputIpc(**obj.__dict__)
+    )
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,

@@ -40,7 +40,13 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
+from sglang.srt.managers.io_struct import (
+    ProfileReq,
+    ProfileReqInput,
+    ProfileReqType,
+    sock_send,
+    async_sock_recv,
+)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
@@ -2303,7 +2309,8 @@ class EncoderScheduler:
         requests = [p.request for p in group]
         start = time.time()
         for sock in self.send_sockets:
-            sock.send_pyobj(
+            sock_send(
+                sock,
                 {
                     "type": "batch_encode",
                     "modality": modality.name,
@@ -2355,7 +2362,7 @@ class EncoderScheduler:
             req = p.request
             try:
                 for sock in self.send_sockets:
-                    sock.send_pyobj(req)
+                    sock_send(sock, req)
                 result = await self.encoder.encode_request(req, modality)
                 if not p.future.done():
                     p.future.set_result(result)
@@ -2395,9 +2402,9 @@ async def run_encoder(
 ):
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
-        request = await encoder.schedule_socket.recv_pyobj()
+        request = await async_sock_recv(encoder.schedule_socket)
         if isinstance(request, ProfileReq):
-            if request.type == ProfileReqType.START_PROFILE:
+            if request.req_type == ProfileReqType.START_PROFILE:
                 if encoder.profiler is None:
                     encoder.profiler = EncoderProfiler(encoder.rank)
                 encoder.profiler.start(request)
@@ -2527,7 +2534,7 @@ async def handle_encode_request(request: dict):
                     )
             else:
                 for socket in send_sockets:
-                    socket.send_pyobj(request)
+                    sock_send(socket, request)
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                     await encoder.encode_request(request, modality)
                 )
@@ -2701,7 +2708,7 @@ async def health_generate():
 
         # Broadcast to other TP ranks so distributed ops stay in sync
         for socket in send_sockets:
-            socket.send_pyobj(dummy_request)
+            sock_send(socket, dummy_request)
 
         # Run encode on rank 0 with timeout
         _, _, _, error_msg, _ = await asyncio.wait_for(
@@ -2741,7 +2748,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         req = ProfileReq(ProfileReqType.START_PROFILE)
     else:
         req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
+            req_type=ProfileReqType.START_PROFILE,
             output_dir=obj.output_dir,
             start_step=obj.start_step,
             num_steps=obj.num_steps,
@@ -2755,7 +2762,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
             profile_stages=obj.profile_stages,
         )
     for socket in send_sockets:
-        socket.send_pyobj(req)
+        sock_send(socket, req)
     if encoder.profiler is None:
         encoder.profiler = EncoderProfiler(encoder.rank)
     ok, msg = encoder.profiler.start(req)
@@ -2780,7 +2787,7 @@ async def stop_profile_async():
         )
     req = ProfileReq(ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
-        socket.send_pyobj(req)
+        sock_send(socket, req)
     ok, msg = encoder.profiler.stop()
     if ok:
         return Response(content="Stop profiling.\n", status_code=200)

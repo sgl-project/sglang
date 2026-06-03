@@ -41,14 +41,20 @@ from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     BaseReq,
+    BaseReqIpc,
+    BaseBatchReqIpc,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     ContinueGenerationReqInput,
     FreezeGCReq,
-    PauseContinueBroadcast,
+    PauseContinueBroadcastReq,
     PauseGenerationReqInput,
-    TokenizerWorkerRegistration,
+    TokenizerWorkerRegistrationReq,
+    sock_recv,
+    sock_send,
+    async_sock_recv,
+    async_sock_send,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -93,7 +99,7 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
-        self._mapping[ipc_name].send_pyobj(output)
+        sock_send(self._mapping[ipc_name], output)
 
 
 def _extract_field_by_index(
@@ -324,7 +330,7 @@ class MultiHttpWorkerDetokenizerMixin:
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is None:
                 continue
@@ -332,13 +338,13 @@ class MultiHttpWorkerDetokenizerMixin:
             # Fan out the output back to the originating tokenizer worker(s).
             # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
             # forward either batched or single requests, so handle both shapes.
-            if isinstance(recv_obj, BaseBatchReq):
+            if isinstance(recv_obj, BaseBatchReqIpc):
                 for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
                     new_output = _handle_output_by_index(output, i)
                     self.socket_mapping.send_output(
                         ipc_name, new_output, is_tokenizer=True
                     )
-            elif isinstance(recv_obj, BaseReq):
+            elif isinstance(recv_obj, BaseReqIpc):
                 self.socket_mapping.send_output(
                     recv_obj.http_worker_ipc, output, is_tokenizer=True
                 )
@@ -394,9 +400,9 @@ class MultiTokenizerRouter:
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
+            recv_obj = await async_sock_recv(self.receive_from_worker)
 
-            if isinstance(recv_obj, TokenizerWorkerRegistration):
+            if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
                     self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
                     logger.info(
@@ -410,7 +416,7 @@ class MultiTokenizerRouter:
             ):
                 # Broadcast to ALL workers so every worker's is_pause is set
                 is_pause = isinstance(recv_obj, PauseGenerationReqInput)
-                broadcast = PauseContinueBroadcast(is_pause=is_pause)
+                broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
                 for ipc_name in self.all_worker_ipcs:
                     self.socket_mapping.send_output(ipc_name, broadcast)
                 # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
@@ -419,21 +425,21 @@ class MultiTokenizerRouter:
                     isinstance(recv_obj, PauseGenerationReqInput)
                     and recv_obj.mode == "abort"
                 ):
-                    await self.send_to_scheduler.send_pyobj(recv_obj)
+                    await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            await async_sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
-        if isinstance(recv_obj, BaseReq):
+        if isinstance(recv_obj, BaseReqIpc):
             ipc_names = [recv_obj.http_worker_ipc]
-        elif isinstance(recv_obj, BaseBatchReq):
+        elif isinstance(recv_obj, BaseBatchReqIpc):
             ipc_names = recv_obj.http_worker_ipcs
         else:
             raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")
@@ -468,7 +474,7 @@ class MultiDetokenizerRouter:
 
     def event_loop(self):
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
 
             # FreezeGCReq must freeze every detokenizer process.
             if isinstance(recv_obj, FreezeGCReq):
@@ -477,7 +483,7 @@ class MultiDetokenizerRouter:
                 continue
 
             # Single request: route by its own http_worker_ipc.
-            if isinstance(recv_obj, BaseReq):
+            if isinstance(recv_obj, BaseReqIpc):
                 assert (
                     recv_obj.http_worker_ipc is not None
                 ), f"Single req {recv_obj.rid=} missing http_worker_ipc"
@@ -485,7 +491,7 @@ class MultiDetokenizerRouter:
                 continue
 
             # Batch request.
-            if isinstance(recv_obj, BaseBatchReq):
+            if isinstance(recv_obj, BaseBatchReqIpc):
                 # Idle/no-op batch (rids=[]): broadcast to all detokenizers
                 if not recv_obj.rids:
                     for ipc in self.ipc_name_list:
@@ -562,18 +568,18 @@ class TokenizerWorker(TokenizerManager):
         )
 
         # Register this worker with the router for pause/continue broadcasting
-        reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
-        self.send_to_scheduler.send_pyobj(reg)
+        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
+        self.send_to_scheduler.send_obj(reg)
 
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
 
-        # Register PauseContinueBroadcast in the result dispatcher so
+        # Register PauseContinueBroadcastReq in the result dispatcher so
         # handle_loop routes it to _handle_pause_continue_broadcast
         from sglang.utils import TypeBasedDispatcher
 
         self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcast, self._handle_pause_continue_broadcast)]
+            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
@@ -581,7 +587,8 @@ class TokenizerWorker(TokenizerManager):
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
-        self.send_to_scheduler.send_pyobj(obj)
+        await self.send_to_scheduler.async_send_obj(obj)
+        
         await self._pause_continue_future
 
         if obj.mode == "abort":
@@ -596,15 +603,15 @@ class TokenizerWorker(TokenizerManager):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
-        self.send_to_scheduler.send_pyobj(obj)
+        await self.send_to_scheduler.async_send_obj(obj)
         await self._pause_continue_future
 
-    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
+    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Called from handle_loop when a broadcast arrives from the router."""
         loop = asyncio.get_event_loop()
         loop.create_task(self._apply_pause_continue_broadcast(obj))
 
-    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
+    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Apply pause/continue state under the condition lock."""
         async with self.is_pause_cond:
             if obj.is_pause:
@@ -707,11 +714,22 @@ def write_data_for_multi_tokenizer(
 
 
 class SenderWrapper:
-    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
+    def __init__(
+        self,
+        port_args: PortArgs,
+        send_to_scheduler: zmq.Socket,
+        is_multi_tokenizer: bool = False,
+    ):
         self.port_args = port_args
         self.send_to_scheduler = send_to_scheduler
+        self.is_multi_tokenizer = is_multi_tokenizer
 
-    def send_pyobj(self, obj):
-        if isinstance(obj, BaseReq):
+    def send_obj(self, obj):
+        if not self.is_multi_tokenizer and hasattr(obj, "http_worker_ipc"):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
-        self.send_to_scheduler.send_pyobj(obj)
+        sock_send(self.send_to_scheduler, obj)
+
+    async def async_send_obj(self, obj):
+        if not self.is_multi_tokenizer and hasattr(obj, "http_worker_ipc"):
+            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+        await async_sock_send(self.send_to_scheduler, obj)

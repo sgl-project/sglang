@@ -684,11 +684,20 @@ class TraceReqContext:
         self.abort(abort_info={"reason": "have unclosed span, auto closed"})
 
 
-@dataclass
+# Temperary remove the @dataclass decorator to make msgpack treat
+# TraceReqContext as a custom class and serialize with pickle like TraceReqContext.
+# When the TraceReqContext fixed with msgpack, we can consider to add @dataclass back.
 class TraceNullContext:
     tracing_enable: bool = False
 
+    def __init__(self, tracing_enable=False):
+        self.tracing_enable = tracing_enable
+
     def __getattr__(self, name):
+        # fix the .__dataclass_fields__ is not a dict error
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+
         return self
 
     def __call__(self, *args, **kwargs):
