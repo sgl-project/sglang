@@ -32,32 +32,17 @@ def init_diffusion_tracing(server_args, thread_label: str):
     if not server_args.enable_trace:
         return
 
-    from types import SimpleNamespace
-
-    from sglang.srt import server_args as srt_server_args_module
     from sglang.srt.observability.trace import (
         process_tracing_init,
         trace_set_thread_info,
     )
-    from sglang.srt.server_args import set_global_server_args_for_scheduler
 
-    # srt owns TraceReqContext and filters spans through its global trace_modules
-    try:
-        srt_server_args = srt_server_args_module.get_global_server_args()
-    except ValueError:
-        srt_server_args = SimpleNamespace(trace_modules=DIFFUSION_TRACE_MODULE)
-        set_global_server_args_for_scheduler(srt_server_args)
-
-    trace_modules = [
-        module.strip()
-        for module in getattr(srt_server_args, "trace_modules", "").split(",")
-        if module.strip()
-    ]
-    if DIFFUSION_TRACE_MODULE not in trace_modules:
-        trace_modules.append(DIFFUSION_TRACE_MODULE)
-        srt_server_args.trace_modules = ",".join(trace_modules)
-
-    process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
+    # srt owns TraceReqContext and filters spans through its trace_modules list
+    process_tracing_init(
+        server_args.otlp_traces_endpoint,
+        "sglang-diffusion",
+        trace_modules=DIFFUSION_TRACE_MODULE,
+    )
     trace_set_thread_info(thread_label)
 
 
