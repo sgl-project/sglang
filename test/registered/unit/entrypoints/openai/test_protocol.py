@@ -475,5 +475,20 @@ class TestValidationEdgeCases(unittest.TestCase):
         self.assertEqual(len(restored_request.messages), len(original_request.messages))
 
 
+class TestParsedResponseFieldsProtocol(unittest.TestCase):
+    """Test ParsedResponseFields protocol."""
+
+    def test_parsed_response_fields_protocol(self):
+        """ParsedResponseFields protocol works with isinstance."""
+        from sglang.srt.entrypoints.openai.protocol import ParsedResponseFields
+
+        class MockFields:
+            content = "hello"
+            tool_calls = None
+            reasoning_content = None
+
+        self.assertIsInstance(MockFields(), ParsedResponseFields)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
