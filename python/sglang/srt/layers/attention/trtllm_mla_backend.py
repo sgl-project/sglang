@@ -956,12 +956,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or self.forward_decode_metadata
         )
 
-        # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-        # FIXME(@rainj-me): metadata went stale because the batch was padded
-        # (prepare_mlp_sync_batch) after a pre-planner marked it
-        # forward_metadata_ready. Replace this defensive re-plan with central
-        # staleness validation on the marker (record planned_bs at mark time,
-        # invalidate when padding changes shapes).
+        # Backstop for stale metadata (batch padded by prepare_mlp_sync_batch
+        # after planning). Equivalent-replan pre-plan sites now opt into
+        # replan_on_reshape and get re-planned centrally post-pad; this local
+        # re-plan only still fires for regimes that cannot opt in — wrapper
+        # (multi-step) plans and multi_layer_eagle_worker_v2's
+        # skip-without-pre-plan paths. Remove once those are fixed.
         batch_size = getattr(metadata, "batch_size", None)
         if batch_size is not None and batch_size < forward_batch.batch_size:
             self.init_forward_metadata(forward_batch)
@@ -1061,12 +1061,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or self.forward_decode_metadata
             )
 
-            # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-            # FIXME(@rainj-me): metadata went stale because the batch was
-            # padded (prepare_mlp_sync_batch) after a pre-planner marked it
-            # forward_metadata_ready. Replace this defensive re-plan with
-            # central staleness validation on the marker (record planned_bs
-            # at mark time, invalidate when padding changes shapes).
+            # Backstop for stale metadata (batch padded by
+            # prepare_mlp_sync_batch after planning). Equivalent-replan
+            # pre-plan sites now opt into replan_on_reshape and get
+            # re-planned centrally post-pad; this local re-plan only still
+            # fires for regimes that cannot opt in — wrapper (multi-step)
+            # plans and multi_layer_eagle_worker_v2's skip-without-pre-plan
+            # paths. Remove once those are fixed.
             batch_size = getattr(metadata, "batch_size", None)
             if batch_size is not None and batch_size < forward_batch.batch_size:
                 self.init_forward_metadata(forward_batch)
