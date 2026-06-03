@@ -42,6 +42,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        BaseCudaGraphRunner,
+    )
     from sglang.srt.server_args import ServerArgs
 
 
@@ -72,14 +75,20 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     recomputed at replay (outside the compiled callable's sub-graphs).
     """
 
-    def __init__(self) -> None:
-        self._compile_config: Optional[CompilationConfig] = None
-        self._language_model: Optional[torch.nn.Module] = None
-        self._compiled_fn: Optional[Callable] = None
-        self._device_module = None
-        self._tp_group = None
-        self._capture_stream: Optional[torch.cuda.Stream] = None
-        self._pool = None
+    def __init__(self, runner: "BaseCudaGraphRunner") -> None:
+        super().__init__(runner)
+        self._compile_config: CompilationConfig = self.build_compilation_config(
+            runner.model_runner.server_args
+        )
+        self._language_model: torch.nn.Module = getattr(
+            runner.model_runner.model, "language_model", runner.model_runner.model
+        )
+        self._run_compile_pass(runner)
+        # Replay invokes the outer ``model_runner.model.forward`` — the
+        # wrapper that builds LogitsProcessorOutput. The torch.compile we
+        # installed on ``language_model.model`` is dispatched internally
+        # by that wrapper.
+        self._compiled_fn: Callable = runner.model_runner.model.forward
 
     # -----------------------------------------------------------------
     # Static helper retained from the previous version (used by the
@@ -137,48 +146,29 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     # -----------------------------------------------------------------
     # BaseCudaGraphBackend interface
     # -----------------------------------------------------------------
-    def prepare(self, runner) -> None:
-        """One-time setup: build CompilationConfig, JIT-activate kernels,
-        install torch.compile wrapping on the language model, then run
-        the compile-loop pass so torch.compile finishes FX/inductor
-        compilation for every shape. Per-shape *cuda graph capture* is
-        not done here — that lives in ``capture_one`` (matches Full /
-        Breakable: prepare = setup, capture_one = warmup + record).
+    def _run_compile_pass(self, runner: "BaseCudaGraphRunner") -> None:
+        """JIT-activate kernels at the smallest shape, install
+        ``torch.compile`` on ``language_model.model``, then run a
+        compile-loop pass so torch.compile finishes FX / inductor
+        compilation for every shape. Per-shape cuda-graph *capture*
+        happens later in ``capture_one`` (matches the Full / Breakable
+        warmup-then-record pattern).
 
-        Phase breakdown for tc_piecewise, paired with what Full / Breakable do:
+        Steps (tc_piecewise-only items vs. Full / Breakable):
 
-          1. JIT-kernel-activate forward (1 call at smallest shape):
-             warms shared CUDA kernels before torch.compile sees the
-             model. tc_piecewise-only.
-          2. install_compile: wraps ``language_model.model.forward``
-             with ``torch.compile``. tc_piecewise-only.
+          1. JIT-kernel activation: warms shared CUDA kernels before
+             torch.compile sees the model.
+          2. ``install_compile``: wraps ``language_model.model.forward``
+             with ``torch.compile``.
           3. Compile-loop pass: 1 forward per shape inside
-             ``enable_torch_compile_warmup`` — the FX backend short-
-             circuits the cuda-graph branch (see
-             ``cuda_piecewise_backend:143``) so this only triggers
-             FX/inductor compilation. tc_piecewise-only.
-          4. Per-shape warmup + record: handled by ``capture_one``;
-             matches Full / Breakable's 2x warmup + 1x capture pattern.
+             ``enable_torch_compile_warmup`` so the FX backend short-
+             circuits cuda-graph capture and only fires
+             FX / inductor compilation.
 
-        Requires the runner to expose:
-          - ``runner.model_runner.server_args``
-          - ``runner.model_runner.model`` (.language_model.model in
-            multimodal case, or .model otherwise)
-          - ``runner.device_module``
-          - ``runner.capture_num_tokens``
-          - ``runner._run_dummy_forward(num_tokens)`` callable
+        Requires the runner to expose ``capture_num_tokens`` and a
+        ``_run_dummy_forward(num_tokens)`` callable.
         """
-        self._compile_config = self.build_compilation_config(
-            runner.model_runner.server_args
-        )
-        self._device_module = runner.device_module
-        self._tp_group = runner.model_runner.tp_group
-
-        language_model = getattr(
-            runner.model_runner.model, "language_model", runner.model_runner.model
-        )
-        self._language_model = language_model
-
+        language_model = self._language_model
         compiler = self._compile_config.compiler
         with enable_tc_piecewise_cuda_graph():
             try:
@@ -221,21 +211,12 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     language_model.model, reverse=True, num_tokens=16
                 )
 
-        # Replay invokes the outer model_runner.model.forward — the
-        # wrapper that builds LogitsProcessorOutput. The torch.compile
-        # we installed on language_model.model is dispatched internally
-        # by that wrapper.
-        self._compiled_fn = runner.model_runner.model.forward
-
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
-        return True
-
-    def has_shape(self, shape_key: Any) -> bool:
+    def can_run(self, forward_batch: "ForwardBatch", shape_key: Any) -> bool:
         # torch.compile manages its per-shape cache internally; the
-        # runner's capture loop ensures every shape in capture_num_tokens
-        # has been warmed up. From the runner's perspective, every
-        # shape ≤ max_num_tokens is supported (after replay_prepare's
-        # bisect-bucket pad).
+        # compile-loop pass during ``__init__`` ensures every shape in
+        # ``capture_num_tokens`` has been warmed up. From the runner's
+        # perspective every shape ≤ ``max_num_tokens`` is supported
+        # (after replay_prepare's bisect-bucket pad).
         return True
 
     @contextmanager

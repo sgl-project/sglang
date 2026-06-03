@@ -228,9 +228,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Backend (Full CUDA graph capture)
         self.backend = FullCudaGraphBackend(
+            self,
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
         )
-        self.backend.prepare(self)
 
         # Capture
         try:
@@ -266,7 +266,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.batch_size
 
         is_bs_supported = (
-            self.backend.has_shape(cuda_graph_bs)
+            self.backend.can_run(forward_batch, cuda_graph_bs)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )

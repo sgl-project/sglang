@@ -14,7 +14,7 @@ Uses ``BreakableCUDAGraph`` / ``BreakableCUDAGraphCapture`` from
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
@@ -35,6 +35,9 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        BaseCudaGraphRunner,
+    )
 
 
 class BreakableCudaGraphBackend(BaseCudaGraphBackend):
@@ -44,27 +47,17 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
 
     def __init__(
         self,
+        runner: "BaseCudaGraphRunner",
         *,
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
         if is_hip():
             raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
-        self._graphs: Dict[Any, BreakableCUDAGraph] = {}
-        self._outputs: Dict[Any, Any] = {}
-        self._pool = None
-        self._device_module = None
-        self._tp_group = None
-        self._memory_saver_adapter: Optional[Any] = None
-        self._capture_stream: Optional[torch.cuda.Stream] = None
-        self._enable_memory_saver = enable_memory_saver
+        super().__init__(runner)
         self._debug_eager = debug_eager
-
-    def prepare(self, runner) -> None:
-        self._device_module = runner.device_module
-        self._tp_group = runner.model_runner.tp_group
-        self._memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self._enable_memory_saver
+        self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
         if (
@@ -74,9 +67,6 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             raise NotImplementedError(
                 "Breakable CUDA graph is not compatible with memory saver mode"
             )
-
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
-        return True
 
     @contextmanager
     def replay_session(self):
@@ -124,9 +114,6 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             out = captured_fn()
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
-
-    def has_shape(self, shape_key: Any) -> bool:
-        return shape_key in self._graphs
 
     def replay(
         self,

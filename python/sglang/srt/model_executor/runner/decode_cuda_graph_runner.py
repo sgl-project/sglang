@@ -325,8 +325,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffers.share_buffers()
 
         # --- backend ---------------------------------------------------
-        self.backend = resolve_decode_backend(model_runner)
-        self.backend.prepare(self)
+        self.backend = resolve_decode_backend(self)
 
         # --- capture --------------------------------------------------
         try:
@@ -383,7 +382,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
         is_bs_supported = (
-            self.backend.has_shape(graph_key)
+            self.backend.can_run(forward_batch, graph_key)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -429,7 +428,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
-            and self.backend.can_run(forward_batch)
         )
 
     # -----------------------------------------------------------------

@@ -152,7 +152,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # tensor addresses, so we own a set of static int64 buffers here
         # and rebind them into capture-time dummy inputs / replay-time
         # serving inputs below. Other backends don't need this.
-        self.backend = resolve_prefill_backend(model_runner)
+        self.backend = resolve_prefill_backend(self)
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
         if isinstance(self.backend, BreakableCudaGraphBackend):
             with torch.device(self.device):
@@ -160,7 +160,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
                     for name in _PREFILL_STATIC_FIELDS
                 }
-        self.backend.prepare(self)
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
@@ -335,7 +334,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # return wrong-shaped logits, corrupting downstream output_ids.
         if self._prefill_static_buffers is not None and forward_batch.batch_size > 1:
             return False
-        return self.backend.can_run(forward_batch)
+        # No backend-level shape check here: replay_prepare bucket-pads
+        # num_tokens up to the nearest captured shape, so eligibility is
+        # bounded by ``num_tokens <= self.max_num_tokens`` (already
+        # checked above), not by exact shape membership.
+        return True
 
     # -----------------------------------------------------------------
     # capture loop
