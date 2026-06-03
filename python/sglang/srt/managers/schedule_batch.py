@@ -812,9 +812,10 @@ class Req(ReqDllmMixin):
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         self.host_hit_length = 0
-        # Number of input tokens already covered by cache (device prefix_indices
-        # + host hit), capped at the max matchable prefix length. Used to compute
-        # uncached waiting tokens; not a raw len() of any list.
+        # Total cached prefix length (on-device prefix_indices + host_hit_length),
+        # capped at the max allowed prefix. Set during prefix matching at schedule
+        # time and used to estimate uncached tokens / sort by longest prefix for
+        # load reporting.
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
