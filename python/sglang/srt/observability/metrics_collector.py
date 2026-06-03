@@ -1839,12 +1839,6 @@ class HiCacheL1L2TransferMetricsCollector:
         self.labels = labels or {}
         labelnames = list(self.labels.keys()) + ["direction", "src", "dst"]
 
-        self.transfer_events_total = Counter(
-            "sglang:hicache_l1_l2_transfer_events_total",
-            "Total number of completed HiCache L1<->L2 KV block transfer events.",
-            labelnames=labelnames,
-        )
-
         self.transfer_blocks_total = Counter(
             "sglang:hicache_l1_l2_transfer_blocks_total",
             "Total number of KV cache blocks transferred between HiCache L1 and L2.",
@@ -1854,12 +1848,6 @@ class HiCacheL1L2TransferMetricsCollector:
         self.transfer_bytes_total = Counter(
             "sglang:hicache_l1_l2_transfer_bytes_total",
             "Total number of KV cache bytes transferred between HiCache L1 and L2.",
-            labelnames=labelnames,
-        )
-
-        self.transfer_time_us_total = Counter(
-            "sglang:hicache_l1_l2_transfer_time_us_total",
-            "Total measured transfer time in microseconds for HiCache L1<->L2 KV block transfers.",
             labelnames=labelnames,
         )
 
@@ -1903,10 +1891,8 @@ class HiCacheL1L2TransferMetricsCollector:
             "dst": dst,
         }
 
-        self.transfer_events_total.labels(**metric_labels).inc()
         self.transfer_blocks_total.labels(**metric_labels).inc(blocks)
         self.transfer_bytes_total.labels(**metric_labels).inc(bytes_)
-        self.transfer_time_us_total.labels(**metric_labels).inc(xfer_us)
         self.transfer_duration_us.labels(**metric_labels).observe(xfer_us)
 
 
