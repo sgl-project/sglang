@@ -7,10 +7,6 @@ Registry: nightly-amd-4-gpu-mi35x-minimax-m25-tp4 suite
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
