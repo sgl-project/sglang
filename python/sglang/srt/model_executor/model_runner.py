@@ -215,7 +215,11 @@ from sglang.srt.utils import (
     slow_rank_detector,
 )
 from sglang.srt.utils.common import ceil_align, require_mlp_sync
-from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_local_ip_auto,
+    get_mooncake_transfer_engine_hostname,
+)
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
@@ -1244,7 +1248,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
             init_mooncake_transfer_engine(
-                hostname=get_local_ip_auto(),
+                hostname=get_mooncake_transfer_engine_hostname(
+                    self.server_args.host,
+                ),
                 gpu_id=self.gpu_id,
                 ib_device=(
                     self.server_args.disaggregation_ib_device
