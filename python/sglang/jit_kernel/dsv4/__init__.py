@@ -8,10 +8,12 @@ from .compress import (
     CompressorPrefillPlan,
     compress_forward,
     compress_norm_rope_store,
+    compress_norm_rope_store_bf16,
 )
 from .compress_old import fused_norm_rope_inplace
 from .elementwise import (
     fused_k_norm_rope_flashmla,
+    fused_k_norm_rope_flashmla_bf16,
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
@@ -35,6 +37,7 @@ __all__ = [
     "CompressorPrefillPlan",
     "compress_forward",
     "compress_norm_rope_store",
+    "compress_norm_rope_store_bf16",
     "fused_norm_rope_inplace",
     "fused_store_cache",
     "fused_rope_inplace",
@@ -42,6 +45,7 @@ __all__ = [
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
+    "fused_k_norm_rope_flashmla_bf16",
     "make_name",
     "linear_bf16_fp32",
     "hisparse_offload_to_host",

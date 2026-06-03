@@ -222,16 +222,69 @@ def triton_fused_store_indexer(
     )
 
 
+@triton.jit
+def _triton_fused_store_flashmla_bf16_kernel(
+    input_ptr,
+    cache_bf16_ptr,
+    indices_ptr,
+    N,
+    PAGE_SIZE: tl.constexpr,
+    BF16_ELEMS_PER_PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    if token_id >= N:
+        return
+
+    loc = tl.load(indices_ptr + token_id).to(tl.int32)
+    page = loc // PAGE_SIZE
+    slot = loc % PAGE_SIZE
+
+    lane = tl.arange(0, HEAD_DIM)
+    vals = tl.load(input_ptr + token_id * HEAD_DIM + lane)
+
+    out_offset = page * BF16_ELEMS_PER_PAGE + slot * HEAD_DIM + lane
+    tl.store(cache_bf16_ptr + out_offset, vals)
+
+
+def triton_fused_store_flashmla_bf16(
+    input: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Fused paged scatter for the SWA (flashmla) BF16 KV cache. No quantization."""
+    N = input.shape[0]
+    if N == 0:
+        return
+
+    cache_bf16 = cache.view(torch.bfloat16)
+    bf16_elems_per_page = cache.shape[1] // 2  # bytes -> bf16 elements
+    indices_i32 = indices.to(torch.int32) if indices.dtype != torch.int32 else indices
+
+    _triton_fused_store_flashmla_bf16_kernel[(N,)](
+        input,
+        cache_bf16,
+        indices_i32,
+        N,
+        PAGE_SIZE=page_size,
+        BF16_ELEMS_PER_PAGE=bf16_elems_per_page,
+        HEAD_DIM=512,
+    )
+
+
 def triton_fused_store_cache(
     input: torch.Tensor,
     cache: torch.Tensor,
     indices: torch.Tensor,
     *,
     page_size: int,
-    type: Literal["flashmla", "indexer"],
+    type: Literal["flashmla", "flashmla_bf16", "indexer"],
 ) -> None:
     """ROCm dispatch for fused_store_cache()."""
     if type == "flashmla":
         triton_fused_store_flashmla(input, cache, indices, page_size)
+    elif type == "flashmla_bf16":
+        triton_fused_store_flashmla_bf16(input, cache, indices, page_size)
     else:
         triton_fused_store_indexer(input, cache, indices, page_size)
