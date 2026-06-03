@@ -2343,7 +2343,9 @@ class ServerArgs:
             "Gemma4UnifiedForConditionalGeneration",
         ):
             default_attention_backend = (
-                "trtllm_mha" if is_sm100_supported() else "triton"
+                "triton"
+                if model_arch == "Gemma4UnifiedForConditionalGeneration"
+                else "trtllm_mha" if is_sm100_supported() else "triton"
             )
             if self.is_attention_backend_not_set():
                 self.attention_backend = default_attention_backend
