@@ -2425,14 +2425,35 @@ class ServerArgs:
                 )
 
             if self.enable_hierarchical_cache:
-                self.swa_full_tokens_ratio = 1.0
-                logger.warning(
-                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2 model with hierarchical cache"
-                )
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
-                )
+                if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                    raise ValueError(
+                        "Hierarchical cache for MiMoV2 requires the unified "
+                        "radix tree. Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
+                        "to enable --enable-hierarchical-cache for this model."
+                    )
+
+                # MiMoV2 has head_dim != v_head_dim, so the host KV pool must
+                # use the asymmetric K/V allocation path which is only wired
+                # for `page_first_direct` (and `page_first`); and the AOT
+                # `kernel` transfer path passes a single `item_size` that
+                # silently mis-strides V transfers when v_head_dim differs.
+                # Force the only safe combination here.
+                if self.hicache_io_backend != "direct":
+                    logger.warning(
+                        f"Force hicache_io_backend to 'direct' for MiMoV2 model "
+                        f"(was {self.hicache_io_backend!r}); the 'kernel' "
+                        f"transfer path assumes head_dim == v_head_dim and "
+                        f"would corrupt V copies."
+                    )
+                    self.hicache_io_backend = "direct"
+                if self.hicache_mem_layout != "page_first_direct":
+                    logger.warning(
+                        f"Force hicache_mem_layout to 'page_first_direct' for "
+                        f"MiMoV2 model (was {self.hicache_mem_layout!r}); only "
+                        f"page_first / page_first_direct support asymmetric "
+                        f"K/V allocation."
+                    )
+                    self.hicache_mem_layout = "page_first_direct"
         elif (
             "Step3p5ForCausalLM" in model_arch
             or "Step3p7ForConditionalGeneration" in model_arch
