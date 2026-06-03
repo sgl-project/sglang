@@ -183,7 +183,7 @@ class NPUGraphRunner(CudaGraphRunner):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not skip_attn_backend_init:
+        if not skip_attn_backend_init and forward_batch.needs_forward_metadata_init():
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
