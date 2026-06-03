@@ -458,7 +458,151 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         logger.info(log_message)
 
     # -----------------------------------------------------------------
-    # capture loop
+    # capture_prepare — build the dummy ForwardBatch + capture-time locals
+    # -----------------------------------------------------------------
+    def capture_prepare(
+        self,
+        size: int,
+        stream_idx: Optional[int] = None,
+    ):
+        """Build the dummy decode ForwardBatch for capture at ``size`` (=bs),
+        populate static input buffers, choose the active attn backend, and
+        optionally build pp_proxy_tensors.
+
+        Returns ``(forward_batch, attn_backend, pp_proxy_tensors)``;
+        ``pp_proxy_tensors`` is None unless ``pp_size > 1``.
+        """
+        bs = size
+        buffers: DecodeInputBuffers = self.buffers
+        num_tokens = bs * self.num_tokens_per_bs
+
+        # Graph inputs
+        input_ids = buffers.input_ids[:num_tokens]
+        req_pool_indices = buffers.req_pool_indices[:bs]
+        seq_lens = buffers.seq_lens[:bs]
+        seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+        out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        positions = buffers.positions[:num_tokens]
+        if self.is_encoder_decoder:
+            encoder_lens = buffers.encoder_lens[:bs]
+        else:
+            encoder_lens = None
+        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:bs]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
+
+        buffers.num_token_non_padded[...] = num_tokens
+        if (
+            enable_num_token_non_padded()
+            and self.require_gathered_buffer
+            and not self.enable_prefill_cp
+        ):
+            local = compute_local_num_token_non_padded(
+                global_num_token_non_padded=buffers.num_token_non_padded,
+                num_tokens_per_dp=num_tokens,
+            )
+            buffers.num_token_non_padded.copy_(local)
+
+        pp_proxy_tensors = None
+        if self.pp_size > 1:
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+            )
+
+        if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
+        elif self.require_attn_tp_gather:
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device
+            )
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
+        else:
+            global_dp_buffer_len = None
+
+        spec_info = self.get_spec_info(num_tokens)
+        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+            self.capture_hidden_mode = (
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            )
+
+        if self.model_runner.server_args.enable_lora:
+            lora_ids = [None] * bs
+        else:
+            lora_ids = None
+
+        mamba_track_indices = (
+            buffers.mamba_track_indices[:bs]
+            if buffers.mamba_track_indices is not None
+            else None
+        )
+        mamba_track_mask = (
+            buffers.mamba_track_mask[:bs]
+            if buffers.mamba_track_mask is not None
+            else None
+        )
+
+        if stream_idx is None:
+            attn_backend = self.attn_backend
+        else:
+            assert self.enable_pdmux
+            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+
+        forward_batch = ForwardBatch(
+            forward_mode=self.capture_forward_mode,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens.sum().item(),
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=None,
+            encoder_lens=encoder_lens,
+            return_logprob=False,
+            positions=positions,
+            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            mrope_positions=mrope_positions,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=self.capture_hidden_mode,
+            num_token_non_padded=buffers.num_token_non_padded,
+            global_forward_mode=self.capture_forward_mode,
+            lora_ids=lora_ids,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
+        )
+
+        forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
+        if forward_batch.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+
+        if buffers.ngram_embedding_info is not None:
+            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
+
+        return forward_batch, attn_backend, pp_proxy_tensors
+
+    # -----------------------------------------------------------------
+    # capture
     # -----------------------------------------------------------------
     def capture(self) -> None:
         profile_context = empty_context()
@@ -616,150 +760,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         None,
                     ),
                 )
-
-    # -----------------------------------------------------------------
-    # capture_prepare — build the dummy ForwardBatch + capture-time locals
-    # -----------------------------------------------------------------
-    def capture_prepare(
-        self,
-        size: int,
-        stream_idx: Optional[int] = None,
-    ):
-        """Build the dummy decode ForwardBatch for capture at ``size`` (=bs),
-        populate static input buffers, choose the active attn backend, and
-        optionally build pp_proxy_tensors.
-
-        Returns ``(forward_batch, attn_backend, pp_proxy_tensors)``;
-        ``pp_proxy_tensors`` is None unless ``pp_size > 1``.
-        """
-        bs = size
-        buffers: DecodeInputBuffers = self.buffers
-        num_tokens = bs * self.num_tokens_per_bs
-
-        # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
-        req_pool_indices = buffers.req_pool_indices[:bs]
-        seq_lens = buffers.seq_lens[:bs]
-        seq_lens_cpu = buffers.seq_lens_cpu[:bs]
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
-        positions = buffers.positions[:num_tokens]
-        if self.is_encoder_decoder:
-            encoder_lens = buffers.encoder_lens[:bs]
-        else:
-            encoder_lens = None
-        mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
-        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
-        bootstrap_room_ids_int = (
-            buffers.bootstrap_room_ids_int[:bs]
-            if buffers.bootstrap_room_ids_int is not None
-            else None
-        )
-
-        buffers.num_token_non_padded[...] = num_tokens
-        if (
-            enable_num_token_non_padded()
-            and self.require_gathered_buffer
-            and not self.enable_prefill_cp
-        ):
-            local = compute_local_num_token_non_padded(
-                global_num_token_non_padded=buffers.num_token_non_padded,
-                num_tokens_per_dp=num_tokens,
-            )
-            buffers.num_token_non_padded.copy_(local)
-
-        pp_proxy_tensors = None
-        if self.pp_size > 1:
-            pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
-            )
-
-        if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
-        elif self.require_attn_tp_gather:
-            global_num_tokens_cpu = [num_tokens]
-        else:
-            global_num_tokens_cpu = None
-
-        if global_num_tokens_cpu is not None:
-            global_dp_buffer_len = sum(global_num_tokens_cpu)
-            num_tokens_tensor = torch.tensor(
-                global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device
-            )
-            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
-            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
-        else:
-            global_dp_buffer_len = None
-
-        spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            )
-
-        if self.model_runner.server_args.enable_lora:
-            lora_ids = [None] * bs
-        else:
-            lora_ids = None
-
-        mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
-            else None
-        )
-        mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
-        )
-
-        if stream_idx is None:
-            attn_backend = self.attn_backend
-        else:
-            assert self.enable_pdmux
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-
-        forward_batch = ForwardBatch(
-            forward_mode=self.capture_forward_mode,
-            batch_size=bs,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            next_token_logits_buffer=next_token_logits_buffer,
-            orig_seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=None,
-            encoder_lens=encoder_lens,
-            return_logprob=False,
-            positions=positions,
-            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            global_dp_buffer_len=global_dp_buffer_len,
-            global_num_tokens_cpu=global_num_tokens_cpu,
-            mrope_positions=mrope_positions,
-            spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=spec_info,
-            capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
-            global_forward_mode=self.capture_forward_mode,
-            lora_ids=lora_ids,
-            rids_int=rids_int,
-            bootstrap_room_ids_int=bootstrap_room_ids_int,
-        )
-
-        forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
-        if forward_batch.hisparse_coordinator is not None:
-            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
-
-        if buffers.ngram_embedding_info is not None:
-            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
-
-        return forward_batch, attn_backend, pp_proxy_tensors
 
     # -----------------------------------------------------------------
     # recapture

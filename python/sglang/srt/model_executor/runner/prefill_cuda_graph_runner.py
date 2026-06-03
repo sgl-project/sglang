@@ -181,6 +181,75 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
+    def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
+        """Run model.forward inside the prefill set_tc_piecewise_forward_context."""
+        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
+        set_is_extend_in_batch(False)
+
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ), set_tc_piecewise_forward_context(
+            forward_batch,
+            self.attention_layers,
+            self.quant_config,
+            self.moe_layers,
+            self.moe_fusions,
+            dsa_indexers=self.dsa_indexers,
+        ):
+            return self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
+
+    def _run_dummy_forward(self, num_tokens: int) -> None:
+        """Build a dummy ForwardBatch at this shape, init attn metadata,
+        run forward once. Used by ``TcPiecewiseCudaGraphBackend.prepare``
+        for both the JIT-activate forward (single shape, before
+        torch.compile install) and the compile-loop pass (every shape,
+        inside ``enable_torch_compile_warmup``).
+        """
+        fb = self.capture_prepare(num_tokens)
+        self.model_runner.attn_backend.init_forward_metadata(fb)
+        self._run_forward(fb, num_tokens)
+
+    # -----------------------------------------------------------------
+    # can_run
+    # -----------------------------------------------------------------
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
+        if forward_batch.input_embeds is not None:
+            return False
+        if forward_batch.replace_embeds is not None:
+            return False
+        # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
+        if forward_batch.forward_mode.is_target_verify():
+            return False
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
+        num_tokens = len(forward_batch.input_ids)
+        if forward_batch.return_logprob:
+            for start_len, seq_len in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            ):
+                if start_len is not None and start_len < seq_len:
+                    return False
+        if num_tokens > self.max_num_tokens:
+            return False
+        # Breakable-prefill captures bs=1 only; multi-req would silently
+        # return wrong-shaped logits, corrupting downstream output_ids.
+        if self._prefill_static_buffers is not None and forward_batch.batch_size > 1:
+            return False
+        # No backend-level shape check here: replay_prepare bucket-pads
+        # num_tokens up to the nearest captured shape, so eligibility is
+        # bounded by ``num_tokens <= self.max_num_tokens`` (already
+        # checked above), not by exact shape membership.
+        return True
+
+    # -----------------------------------------------------------------
+    # capture_prepare
+    # -----------------------------------------------------------------
     def capture_prepare(self, num_tokens: int) -> ForwardBatch:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
@@ -274,74 +343,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch
 
-    def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
-        """Run model.forward inside the prefill set_tc_piecewise_forward_context."""
-        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
-        set_is_extend_in_batch(False)
-
-        with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
-        ), set_tc_piecewise_forward_context(
-            forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-            dsa_indexers=self.dsa_indexers,
-        ):
-            return self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
-
-    def _run_dummy_forward(self, num_tokens: int) -> None:
-        """Build a dummy ForwardBatch at this shape, init attn metadata,
-        run forward once. Used by ``TcPiecewiseCudaGraphBackend.prepare``
-        for both the JIT-activate forward (single shape, before
-        torch.compile install) and the compile-loop pass (every shape,
-        inside ``enable_torch_compile_warmup``).
-        """
-        fb = self.capture_prepare(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(fb)
-        self._run_forward(fb, num_tokens)
-
     # -----------------------------------------------------------------
-    # can_run
-    # -----------------------------------------------------------------
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
-        if forward_batch.input_embeds is not None:
-            return False
-        if forward_batch.replace_embeds is not None:
-            return False
-        # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
-        if forward_batch.forward_mode.is_target_verify():
-            return False
-        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
-            return False
-        num_tokens = len(forward_batch.input_ids)
-        if forward_batch.return_logprob:
-            for start_len, seq_len in zip(
-                forward_batch.extend_logprob_start_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
-            ):
-                if start_len is not None and start_len < seq_len:
-                    return False
-        if num_tokens > self.max_num_tokens:
-            return False
-        # Breakable-prefill captures bs=1 only; multi-req would silently
-        # return wrong-shaped logits, corrupting downstream output_ids.
-        if self._prefill_static_buffers is not None and forward_batch.batch_size > 1:
-            return False
-        # No backend-level shape check here: replay_prepare bucket-pads
-        # num_tokens up to the nearest captured shape, so eligibility is
-        # bounded by ``num_tokens <= self.max_num_tokens`` (already
-        # checked above), not by exact shape membership.
-        return True
-
-    # -----------------------------------------------------------------
-    # capture loop
+    # capture
     # -----------------------------------------------------------------
     def capture(self) -> None:
         with freeze_gc(
@@ -371,6 +374,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         )
                     self.capture_one_shape(num_tokens)
 
+    # -----------------------------------------------------------------
+    # capture_one_shape
+    # -----------------------------------------------------------------
     def capture_one_shape(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. ``size`` is the prefill token count.
