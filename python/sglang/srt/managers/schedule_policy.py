@@ -464,6 +464,9 @@ class PrefillAdder:
         self.new_chunked_req = None
 
         self.log_hit_tokens = 0
+        self.log_hit_tokens_device = 0
+        self.log_hit_tokens_host = 0
+        self.log_hit_tokens_storage = 0
 
         self.reprocessed_log_hit_tokens = 0
 
@@ -609,6 +612,21 @@ class PrefillAdder:
 
         return AddReqResult.CONTINUE
 
+    def _accumulate_hit_token_split(self, req, prefix_len: int) -> None:
+        """Accumulate per-source cache-hit split alongside log_hit_tokens.
+
+        Must be called only for non-retracted requests and only once per
+        scheduling decision (not for chunk 2+ of chunked prefill, where
+        prefix_len passed to _update_prefill_budget is 0).
+        """
+        if prefix_len <= 0:
+            return
+        host_total = req.host_hit_length
+        storage_portion = min(host_total, req.storage_hit_length)
+        self.log_hit_tokens_storage += storage_portion
+        self.log_hit_tokens_host += host_total - storage_portion
+        self.log_hit_tokens_device += max(0, prefix_len - host_total)
+
     def _update_prefill_budget(
         self,
         prefix_len: int,
@@ -666,6 +684,8 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
+        if not req.retracted_stain:
+            self._accumulate_hit_token_split(req, prefix_len)
         self._update_prefill_budget(
             prefix_len,
             trunc_len,
@@ -991,6 +1011,8 @@ class PrefillAdder:
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
+                if not req.retracted_stain:
+                    self._accumulate_hit_token_split(req, prefix_len)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -1034,6 +1056,8 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
+                if not req.retracted_stain:
+                    self._accumulate_hit_token_split(req, prefix_len)
                 self._update_prefill_budget(
                     prefix_len,
                     trunc_len,

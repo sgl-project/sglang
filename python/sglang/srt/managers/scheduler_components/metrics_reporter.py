@@ -81,15 +81,9 @@ class PrefillStats:
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
     ):
-        log_hit_tokens_device = sum(
-            getattr(req, "cached_tokens_device", 0) for req in adder.can_run_list
-        )
-        log_hit_tokens_host = sum(
-            getattr(req, "cached_tokens_host", 0) for req in adder.can_run_list
-        )
-        log_hit_tokens_storage = sum(
-            getattr(req, "cached_tokens_storage", 0) for req in adder.can_run_list
-        )
+        log_hit_tokens_device = adder.log_hit_tokens_device
+        log_hit_tokens_host = adder.log_hit_tokens_host
+        log_hit_tokens_storage = adder.log_hit_tokens_storage
 
         return cls(
             log_input_tokens=adder.log_input_tokens,
