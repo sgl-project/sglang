@@ -77,6 +77,12 @@ class LoRABatchInfo:
     # MoE LoRA batch info
     moe_lora_info: Optional[MoELoRABatchInfo] = None
 
+    # CPU-side (buffer_id, rank) when every request in the batch uses the same
+    # active adapter (rank > 0); None otherwise. Computed from Python lists in
+    # prepare_lora_batch (no GPU sync). Enables the dense cuBLAS LoRA-A fast path
+    # in sgemm_lora_a_fwd (eager only). See sgemm_lora_a.py.
+    single_adapter: Optional[Tuple[int, int]] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0
