@@ -192,9 +192,9 @@ class SchedulerWeightUpdaterManager:
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert self.is_fully_idle(), (
-            "release_memory_occupation should be called only when server is idle."
-        )
+        assert (
+            self.is_fully_idle()
+        ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
 
@@ -285,9 +285,9 @@ class SchedulerWeightUpdaterManager:
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
-            assert draft_url is not None, (
-                "draft_url must be provided when draft model is enabled"
-            )
+            assert (
+                draft_url is not None
+            ), "draft_url must be provided when draft model is enabled"
             self.draft_worker.model_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
