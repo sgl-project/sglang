@@ -159,8 +159,6 @@ class TestSelectLatestRun(CustomTestCase):
 
 
 class TestReadManifest(CustomTestCase):
-    """All HF imports are now at module level, so standard patch paths work."""
-
     @patch("sglang.test.precision_baseline_store.hf_hub_download")
     def test_parses_valid_manifest(self, mock_download):
         content = (
@@ -209,7 +207,11 @@ class TestFetchLatestBaseline(CustomTestCase):
     @patch.object(hfs, "_read_manifest")
     def test_downloads_and_copies_tensors(self, mock_manifest, mock_snapshot):
         rows = [
-            {"model": "org/m", "run_path": "org__m/2025/01/01/run-abc", "push_index": 1}
+            {
+                "model": "org/m",
+                "run_path": "org__m/2025/01/01/run-abc",
+                "push_index": 1,
+            }
         ]
         mock_manifest.return_value = (rows, "")
 
@@ -274,13 +276,26 @@ class TestFetchLatestBaseline(CustomTestCase):
 
 
 class TestPushRun(CustomTestCase):
-    @patch("sglang.test.precision_baseline_store.HfApi")
-    @patch.object(hfs, "_read_manifest")
-    @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
-    def test_uploads_tensors_and_manifest(self, mock_ns, mock_manifest, mock_api_cls):
+    """push_run deletes its temp manifest file in a finally block, so tests
+    that inspect the manifest content must capture it via a side_effect on
+    the mock upload_file *before* push_run cleans up."""
+
+    @staticmethod
+    def _make_push_mocks(mock_manifest, mock_api_cls):
         mock_manifest.return_value = ([], "")
         mock_api = MagicMock()
         mock_api_cls.return_value = mock_api
+        # Capture manifest text before push_run's finally block deletes it.
+        captured = []
+        mock_api.upload_file.side_effect = lambda *a, **kw: captured.append(
+            Path(kw["path_or_fileobj"]).read_text()
+        )
+        return mock_api, captured
+
+    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch.object(hfs, "_read_manifest")
+    def test_uploads_tensors_and_manifest(self, mock_manifest, mock_api_cls):
+        mock_api, captured = self._make_push_mocks(mock_manifest, mock_api_cls)
 
         with tempfile.TemporaryDirectory() as tensor_dir:
             (Path(tensor_dir) / "layer0.pt").write_bytes(b"\x01")
@@ -296,11 +311,7 @@ class TestPushRun(CustomTestCase):
 
         mock_api.upload_folder.assert_called_once()
         mock_api.upload_file.assert_called_once()
-        upload_call = mock_api.upload_file.call_args
-        manifest_path = upload_call[1]["path_or_fileobj"]
-        with open(manifest_path) as f:
-            last_line = f.readlines()[-1].strip()
-        row = json.loads(last_line)
+        row = json.loads(captured[0].strip().splitlines()[-1])
         self.assertEqual(row["model"], "org/m")
         self.assertEqual(row["capture_signature"], "abc")
         self.assertEqual(row["tp_size"], 8)
@@ -308,10 +319,7 @@ class TestPushRun(CustomTestCase):
 
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
-    @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
-    def test_skips_existing_tensors_unless_force(
-        self, mock_ns, mock_manifest, mock_api_cls
-    ):
+    def test_skips_existing_tensors_unless_force(self, mock_manifest, mock_api_cls):
         existing_row = {
             "model": "org/m",
             "run_path": "org__m/2025/01/01/run-abc1234",
@@ -339,8 +347,7 @@ class TestPushRun(CustomTestCase):
 
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
-    @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
-    def test_force_re_uploads(self, mock_ns, mock_manifest, mock_api_cls):
+    def test_force_re_uploads(self, mock_manifest, mock_api_cls):
         existing_row = {
             "model": "org/m",
             "run_path": "org__m/2025/01/01/run-abc1234",
@@ -369,10 +376,8 @@ class TestPushRun(CustomTestCase):
 
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
-    @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
-    def test_manifest_row_promotes_keys(self, mock_ns, mock_manifest, mock_api_cls):
-        mock_manifest.return_value = ([], "")
-        mock_api_cls.return_value = MagicMock()
+    def test_manifest_row_promotes_keys(self, mock_manifest, mock_api_cls):
+        _mock_api, captured = self._make_push_mocks(mock_manifest, mock_api_cls)
 
         with tempfile.TemporaryDirectory() as tensor_dir:
             (Path(tensor_dir) / "layer0.pt").write_bytes(b"\x01")
@@ -395,22 +400,19 @@ class TestPushRun(CustomTestCase):
                 meta=meta,
             )
 
-        upload_call = mock_api_cls.return_value.upload_file.call_args
-        manifest_path = upload_call[1]["path_or_fileobj"]
-        with open(manifest_path) as f:
-            row = json.loads(f.readlines()[-1].strip())
-
+        row = json.loads(captured[0].strip().splitlines()[-1])
         for key in hfs._MANIFEST_PROMOTE_KEYS:
             if key in meta:
                 self.assertEqual(
-                    row.get(key), meta[key], f"manifest missing promoted key: {key}"
+                    row.get(key),
+                    meta[key],
+                    f"manifest missing promoted key: {key}",
                 )
         self.assertNotIn("extra_key_not_promoted", row)
 
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
-    @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
-    def test_includes_comparator_report(self, mock_ns, mock_manifest, mock_api_cls):
+    def test_includes_comparator_report(self, mock_manifest, mock_api_cls):
         mock_manifest.return_value = ([], "")
         mock_api_cls.return_value = MagicMock()
 
@@ -537,8 +539,8 @@ class TestWithRetries(CustomTestCase):
         resp_429.status_code = 429
         exc_429 = HfHubHTTPError("rate limited", response=resp_429)
 
-        calls = iter([exc_429, "ok"])
-        result = hfs._with_retries(lambda: next(calls), what="test", base_delay=0.01)
+        mock_op = MagicMock(side_effect=[exc_429, "ok"])
+        result = hfs._with_retries(mock_op, what="test", base_delay=0.01)
         self.assertEqual(result, "ok")
         mock_time.sleep.assert_called_once()
 
@@ -550,8 +552,8 @@ class TestWithRetries(CustomTestCase):
         resp_500.status_code = 500
         exc_500 = HfHubHTTPError("server error", response=resp_500)
 
-        calls = iter([exc_500, "ok"])
-        result = hfs._with_retries(lambda: next(calls), what="test", base_delay=0.01)
+        mock_op = MagicMock(side_effect=[exc_500, "ok"])
+        result = hfs._with_retries(mock_op, what="test", base_delay=0.01)
         self.assertEqual(result, "ok")
         mock_time.sleep.assert_called_once()
 
@@ -563,8 +565,9 @@ class TestWithRetries(CustomTestCase):
         resp_401.status_code = 401
         exc_401 = HfHubHTTPError("unauthorized", response=resp_401)
 
+        mock_op = MagicMock(side_effect=exc_401)
         with self.assertRaises(HfHubHTTPError):
-            hfs._with_retries(lambda: (_ for _ in ()).throw(exc_401), what="test")
+            hfs._with_retries(mock_op, what="test")
         mock_time.sleep.assert_not_called()
 
     @patch("sglang.test.precision_baseline_store.time")
@@ -575,13 +578,9 @@ class TestWithRetries(CustomTestCase):
         resp_500.status_code = 500
         exc = HfHubHTTPError("server error", response=resp_500)
 
+        mock_op = MagicMock(side_effect=exc)
         with self.assertRaises(HfHubHTTPError):
-            hfs._with_retries(
-                lambda: (_ for _ in ()).throw(exc),
-                what="test",
-                attempts=2,
-                base_delay=0.001,
-            )
+            hfs._with_retries(mock_op, what="test", attempts=2, base_delay=0.001)
         self.assertEqual(mock_time.sleep.call_count, 1)
 
 
