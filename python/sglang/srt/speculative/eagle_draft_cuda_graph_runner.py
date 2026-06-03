@@ -289,44 +289,26 @@ class EAGLEDraftCudaGraphRunner:
         topk_index = buffers.topk_index[:num_seqs]
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            global_num_tokens = buffers.global_num_tokens_gpu
-            global_dp_buffer_len = num_tokens * self.dp_size
-            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu,
+                dtype=torch.int32,
+                device=buffers.input_ids.device,
             )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
             global_num_tokens = buffers.global_num_tokens_gpu
-            global_dp_buffer_len = num_tokens
             global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
         else:
-            global_num_tokens = None
             global_dp_buffer_len = None
+            global_num_tokens = None
             global_num_tokens_for_logprob = None
 
         capture_mode = (
@@ -380,6 +362,7 @@ class EAGLEDraftCudaGraphRunner:
                 global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
 

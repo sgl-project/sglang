@@ -321,11 +321,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         if is_i2v:
             vae_dtype = next(self.vae.parameters()).dtype
-            pixel_video = (
-                batch.preprocessed_image.unsqueeze(2)
-                .expand(-1, -1, batch.num_frames, -1, -1)
-                .contiguous()
-                .to(device=device, dtype=vae_dtype)
+            pixel_video = batch.preprocessed_image.unsqueeze(2).to(
+                device=device, dtype=vae_dtype
             )
             with torch.no_grad():
                 cond_latent = self._vae_encode(pixel_video).to(dtype)
