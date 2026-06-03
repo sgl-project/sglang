@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     is_blackwell,
+    is_flashinfer_available,
     is_hip,
     is_npu,
     load_json_config,
@@ -238,20 +239,18 @@ class DeepEPBuffer:
             # TODO can be false when unneeded
             allow_mnnvl=True,
         )
-        if envs.SGLANG_DEEPEP_USE_FABRIC.get():
-            buffer_kwargs["use_fabric"] = True
+        # Use CU_MEM_HANDLE_TYPE_FABRIC for the NVLink arena on hardware that
+        # advertises MNNVL fabric handle support, so cross-pod EP groups
+        # (GB200/GB300) take the cuMemImportFromShareableHandle path instead of
+        # the intra-node-only cudaIpcOpenMemHandle path. See:
+        # https://github.com/deepseek-ai/DeepEP/blob/e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8/csrc/deep_ep.cpp#L101-L114
+        if is_flashinfer_available():
+            from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
-        try:
-            cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
-        except TypeError:
-            if "use_fabric" in buffer_kwargs:
-                logger.error(
-                    "SGLANG_DEEPEP_USE_FABRIC=1 but the installed deep_ep "
-                    "wheel does not accept the `use_fabric` kwarg. Rebuild "
-                    "DeepEP from a commit that ships use_fabric, or unset "
-                    "SGLANG_DEEPEP_USE_FABRIC."
-                )
-            raise
+            if is_mnnvl_fabric_supported(torch.cuda.current_device()):
+                buffer_kwargs["use_fabric"] = True
+
+        cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return cls._buffer
 
     @classmethod
