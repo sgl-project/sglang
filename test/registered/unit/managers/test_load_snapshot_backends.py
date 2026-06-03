@@ -16,6 +16,7 @@ from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     create_load_snapshot_writer,
     should_use_zmq,
+    zmq_reader_owner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -268,6 +269,71 @@ class TestFactoryFunctions(CustomTestCase):
     def test_should_use_zmq_dp_attention_single_node(self):
         args = SimpleNamespace(enable_dp_attention=True, nnodes=1)
         self.assertFalse(should_use_zmq(args))
+
+
+class TestZmqReaderOwner(CustomTestCase):
+    """At most one process binds the zmq PULL socket across all callers."""
+
+    CALLERS = ("tokenizer", "router", "dp_controller")
+
+    @staticmethod
+    def _args(**overrides):
+        base = dict(
+            enable_dp_attention=True,
+            nnodes=2,
+            node_rank=0,
+            dp_size=1,
+            load_balance_method="round_robin",
+            tokenizer_worker_num=1,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _owners(self, args):
+        return {c for c in self.CALLERS if zmq_reader_owner(args, c)}
+
+    def test_zmq_disabled_no_owner(self):
+        args = self._args(enable_dp_attention=False, nnodes=1)
+        self.assertEqual(self._owners(args), set())
+
+    def test_non_zero_node_rank_no_owner(self):
+        args = self._args(node_rank=1, dp_size=4, tokenizer_worker_num=8)
+        self.assertEqual(self._owners(args), set())
+
+    def test_single_tokenizer_owns_when_dp1(self):
+        self.assertEqual(self._owners(self._args(dp_size=1)), {"tokenizer"})
+
+    def test_router_owns_in_multi_tokenizer_dp1(self):
+        args = self._args(dp_size=1, tokenizer_worker_num=8)
+        self.assertEqual(self._owners(args), {"router"})
+
+    def test_router_owns_in_multi_tokenizer_round_robin(self):
+        args = self._args(dp_size=4, tokenizer_worker_num=8)
+        self.assertEqual(self._owners(args), {"router"})
+
+    def test_dp_controller_owns_load_aware(self):
+        for method in ("total_tokens", "total_requests"):
+            args = self._args(
+                dp_size=4, tokenizer_worker_num=8, load_balance_method=method
+            )
+            self.assertEqual(self._owners(args), {"dp_controller"})
+
+    def test_single_tokenizer_owns_dp4_round_robin(self):
+        args = self._args(dp_size=4, tokenizer_worker_num=1)
+        self.assertEqual(self._owners(args), {"tokenizer"})
+
+    def test_at_most_one_owner_across_configs(self):
+        for dp_size in (1, 4):
+            for tw in (1, 8):
+                for method in ("round_robin", "total_tokens", "total_requests"):
+                    for node_rank in (0, 1):
+                        args = self._args(
+                            dp_size=dp_size,
+                            tokenizer_worker_num=tw,
+                            load_balance_method=method,
+                            node_rank=node_rank,
+                        )
+                        self.assertLessEqual(len(self._owners(args)), 1, args)
 
 
 class TestZmqAddr(CustomTestCase):
