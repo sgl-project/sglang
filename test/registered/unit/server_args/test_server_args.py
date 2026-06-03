@@ -643,7 +643,7 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 
     @patch(
         "sglang.srt.model_executor.runner_backend."
-        "tc_piecewise_cudagraph_backend.get_moe_a2a_backend"
+        "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
     )
     def test_tc_piecewise_build_config_reads_phase_config_dataclass(
         self, mock_get_moe_a2a_backend
