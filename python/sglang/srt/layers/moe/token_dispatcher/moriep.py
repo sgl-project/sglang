@@ -44,14 +44,6 @@ from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 FP8_BLOCK_SIZE = 128
 MXFP4_BLOCK_SIZE = 32
 
-# Smallest get_padded_M tier that survives CUDA-graph capture in the mori decode
-# path. Capture shrinks the decode batch toward bs=1, so the raw expected_m
-# collapses and would otherwise pick a tier (<=64) whose fused-MoE kernel indexes
-# the padded mori recv buffer out of bounds (GPU memory access fault). Empirically
-# validated on DSR1 EP8 (num_max_dispatch_tokens_per_rank=64): tier 64 faults,
-# tier 128 captures cleanly. Used only as a floor on the decode expected_m hint.
-_EXPECTED_M_CAPTURE_SAFE_FLOOR = 128
-
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -501,21 +493,12 @@ class _MoriEPDispatcherImplBase:
         if get_is_extend_in_batch():
             # prefill: match MORI_MOE_MAX_INPUT_TOKENS_PREFILL exactly.
             return (self.num_max_dispatch_tokens_per_rank * world_size) // 2
-        # decode: match the legacy decode-side truncation sizing.
-        raw = (topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10
-        # Floor to a capture-safe minimum tier. During CUDA-graph capture the
-        # decode batch shrinks toward bs=1, so raw collapses to single digits
-        # and get_padded_M(raw) would select a tiny tier whose fused-MoE kernel
-        # indexes the (padded) mori recv buffer out of bounds -> GPU memory
-        # access fault during capture. Empirically (DSR1 EP8, num_max=64):
-        # get_padded_M tier 64 still faults, tier 128 is the smallest that
-        # captures cleanly, so floor to 128. At the steady-state operating point
-        # raw (>=358 at conc=128) dominates this floor and lands on tier 512
-        # exactly as before -- the floor only right-sizes the small capture
-        # graphs and low-concurrency steps (where a tighter tier is also no
-        # slower per the tuned fused-MoE configs).
-        floor = _EXPECTED_M_CAPTURE_SAFE_FLOOR
-        return max(raw, floor)
+        # decode: match the legacy decode-side truncation sizing. No capture-time
+        # floor is needed -- the aiter fused_moe 2-stage path now derives its
+        # kernel tier from this same hint (sched_M), so a small tier picked while
+        # the CUDA-graph capture batch shrinks toward bs=1 is self-consistent and
+        # bounded by masked_m. expected_m stays a pure performance hint.
+        return (topk_ids.shape[0] * topk_ids.shape[1] * 7) // 10
 
     def dispatch_a(
         self,
