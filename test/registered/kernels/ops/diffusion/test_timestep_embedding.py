@@ -95,11 +95,8 @@ def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
     cuda_output = timestep_embedding_cuda(
         t, dim, flip_sin_to_cos=True, downscale_freq_shift=0
     )
-    # XPU has slightly lower precision due to SYCL math functions
-    if DEVICE == "xpu":
-        torch.testing.assert_close(torch_output, cuda_output, atol=1e-2, rtol=1e-2)
-    else:
-        torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3) 
+        
 
 
 @pytest.mark.parametrize("batch_size", DIFFUSERS_BATCH_SIZES)
@@ -131,10 +128,7 @@ def test_timestep_embedding_correctness_with_diffusers(
         scale=scale,
         max_period=10000,
     )
-    if DEVICE == "xpu":
-        torch.testing.assert_close(torch_output, cuda_output, atol=1e-2, rtol=1e-2)
-    else:
-        torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
 
 
 def test_timestep_embedding_perf():
