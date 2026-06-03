@@ -1,0 +1,290 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import get_moe_weight_sizes
+from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
+from sglang.srt.layers.quantization.utils import all_close_1d
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
+    set_weight_attrs,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
+
+logger = logging.getLogger(__name__)
+
+_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+
+__all__ = ["QuarkW4A8MXFp4MoE"]
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility.fp4_utils import e8m0_shuffle
+
+OCP_MX_BLOCK_SIZE = 32
+
+
+class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
+    """Quark MoE scheme for MXFP4 weights with static FP8 activations."""
+
+    def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
+        self.weight_quant = weight_config
+        self.input_quant = input_config
+
+        weight_qscheme = self.weight_quant.get("qscheme")
+        input_qscheme = self.input_quant.get("qscheme")
+        weight_dtype = self.weight_quant.get("dtype")
+        input_dtype = self.input_quant.get("dtype")
+
+        if not (
+            weight_dtype == "fp4"
+            and weight_qscheme == "per_group"
+            and self.weight_quant.get("group_size") == OCP_MX_BLOCK_SIZE
+            and not self.weight_quant.get("is_dynamic")
+            and self.weight_quant.get("scale_format") == "e8m0"
+        ):
+            raise ValueError(
+                "For W4A8 MXFP4-FP8 Fused MoE layers, weights must be "
+                "static per-group FP4 with group_size=32 and e8m0 scales. "
+                f"Found {self.weight_quant}."
+            )
+
+        if not (
+            input_dtype in ("fp8_e4m3", "fp8_e4m3fn")
+            and input_qscheme == "per_tensor"
+            and not self.input_quant.get("is_dynamic")
+        ):
+            raise ValueError(
+                "For W4A8 MXFP4-FP8 Fused MoE layers, activations must be "
+                "static per-tensor fp8_e4m3/fp8_e4m3fn. "
+                f"Found {self.input_quant}."
+            )
+
+        self.with_bias = False
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 70
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
+            intermediate_size_per_partition,
+            is_aiter_moe=_use_aiter,
+            is_concat=True,
+            is_packed=True,
+        )
+
+        # Add the quantization method used (per tensor/grouped/channel)
+        # to ensure the weight scales are loaded in properly.
+        extra_weight_attrs.update(
+            {
+                "quant_method": FusedMoeWeightScaleSupported.BLOCK.value,
+                "weight_padded": weight_padded,
+            },
+        )
+
+        weight_dtype = torch.uint8
+
+        # WEIGHTS
+        # MXFP4 weights are stored as uint8, with two FP4 values packed per
+        # byte. The AITER path later views these buffers as float4_e2m1fn_x2.
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                w13_up_dim,
+                hidden_size // 2,
+                dtype=weight_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                w2_down_dim,
+                dtype=weight_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # WEIGHT_SCALES
+        # MXFP4 uses one e8m0 scale per 32-value block. These scales are
+        # loaded as uint8 and shuffled after loading for the kernel layout.
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                w13_up_dim,
+                hidden_size // OCP_MX_BLOCK_SIZE,
+                dtype=weight_dtype,
+            ),
+            requires_grad=False,
+        )
+        # 1. w2 scale is floor division of inter_dim by blockscale.
+        # 2. w2 scale needs to scale up just as w2.
+        # We combine 1. and 2. to keep the integer precision.
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                hidden_size,
+                (w2_down_dim * 2) // OCP_MX_BLOCK_SIZE,
+                dtype=weight_dtype,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        # Add the quantization method used (per tensor/grouped/channel)
+        # to ensure the activation scales are loaded in properly.
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        )
+
+        # INPUT_SCALES
+        # W4A8 checkpoints carry static per-tensor FP8 activation scales for
+        # gate_up_proj and down_proj. These are separate from the MXFP4 weight
+        # block scales above.
+        w13_input_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        w2_input_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_input_scale", w13_input_scale)
+        layer.register_parameter("w2_input_scale", w2_input_scale)
+        set_weight_attrs(w13_input_scale, extra_weight_attrs)
+        set_weight_attrs(w2_input_scale, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Pre-shuffle weight scales
+        s0, s1, _ = layer.w13_weight_scale.shape
+        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+        # layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale, requires_grad=False)
+        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+
+        s0, s1, _ = layer.w2_weight_scale.shape
+        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+        # layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
+        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+
+        # Pre-shuffle weight
+        if _is_shuffle_moe_mxfp4:
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight.contiguous(), (16, 16)
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.contiguous(), (16, 16)
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
+        # Static FP8 MoE kernels consume a single activation scale. Use the
+        # maximum if expert-local checkpoint scales differ.
+        if layer.w13_input_scale is None or layer.w2_input_scale is None:
+            raise ValueError("W4A8 MXFP4-FP8 MoE requires static input scales.")
+        if not all_close_1d(layer.w13_input_scale) or not all_close_1d(
+            layer.w2_input_scale
+        ):
+            logger.warning(
+                "Found input_scales that are not equal for W4A8 MXFP4-FP8 "
+                "MoE layer. Using the maximum across experts for each layer."
+            )
+        layer.w13_input_scale = torch.nn.Parameter(
+            layer.w13_input_scale.max().to(torch.float32), requires_grad=False
+        )
+        layer.w2_input_scale = torch.nn.Parameter(
+            layer.w2_input_scale.max().to(torch.float32), requires_grad=False
+        )
+
+        if hasattr(layer, "dispatcher"):
+            # Weights are stored as torch.uint8 but semantically MXFP4
+            layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
+        self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
+            moe_runner_backend = MoeRunnerBackend.AITER
+
+        if moe_runner_backend.is_aiter():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO: add non-AITER W4A8 MXFP4-FP8 MoE kernels.
+            pass
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            AiterMoeQuantInfo,
+            AiterQuantType,
+        )
+
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+            w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+        else:
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
+        if hasattr(layer.w13_weight, "is_shuffled"):
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
+
+        quant_info = AiterMoeQuantInfo(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            quant_type=AiterQuantType.PER_1X32,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            expert_mask=layer.dispatcher.expert_mask_gpu,
+        )
+        return self.runner.run(dispatch_output, quant_info)
