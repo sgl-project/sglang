@@ -135,38 +135,43 @@ LOAD_FORMAT_CHOICES = [
     "runai_streamer",
 ]
 
+# TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
+# Some of the choices here do NOT support online quantization.
 QUANTIZATION_CHOICES = [
     "awq",
-    "fp8",
-    "mxfp8",
+    "fp8",  # MOE + linear online quantization.
+    "mxfp8",  # MOE + linear online quantization.
     "gptq",
     "marlin",
     "gptq_marlin",
     "awq_marlin",
     "bitsandbytes",
     "gguf",
+    # Modelopt has some online quantization support through ModelOptModelLoader.
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
     "modelopt_mixed",
     "petit_nvfp4",
-    "w8a8_int8",
-    "w8a8_fp8",
-    "moe_wna16",
+    "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
+    "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
+    "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
     "qoq",
     "w4afp8",
-    "mxfp4",
+    "mxfp4",  # MOE-only.
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
+    "quark_mxfp4",  # Online MOE + linear quantization.
     # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
     "unquant",
 ]
+
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 
@@ -296,7 +301,12 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
+MAMBA_SCHEDULER_STRATEGY_CHOICES = [
+    "auto",
+    "no_buffer",
+    "extra_buffer",
+    "extra_buffer_lazy",
+]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
@@ -2806,6 +2816,10 @@ class ServerArgs:
                 is_cuda() or is_musa() or is_npu()
             ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
+                assert not self.enable_mamba_extra_buffer_lazy(), (
+                    "extra_buffer_lazy is not yet supported with speculative decoding. "
+                    "Use --mamba-scheduler-strategy extra_buffer instead."
+                )
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
                 ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
@@ -7519,7 +7533,10 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return self.mamba_scheduler_strategy == "extra_buffer"
+        return self.mamba_scheduler_strategy in ("extra_buffer", "extra_buffer_lazy")
+
+    def enable_mamba_extra_buffer_lazy(self) -> bool:
+        return self.mamba_scheduler_strategy == "extra_buffer_lazy"
 
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:

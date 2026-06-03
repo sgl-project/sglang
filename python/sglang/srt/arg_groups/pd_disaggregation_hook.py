@@ -3,6 +3,7 @@ import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -66,7 +67,10 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
             server_args.disaggregation_transfer_backend != "fake"
         ), "Prefill server does not support 'fake' as the transfer backend"
 
-        server_args.disable_cuda_graph = True
+        # Writes after ServerArgs.__post_init__ don't propagate via the legacy
+        # disable_cuda_graph field, so flip both phases on the config directly.
+        server_args.cuda_graph_config[Phase.DECODE].backend = Backend.DISABLED
+        server_args.cuda_graph_config[Phase.PREFILL].backend = Backend.DISABLED
 
     if server_args.disaggregation_mode in ("prefill", "decode"):
         if (
