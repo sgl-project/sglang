@@ -6284,7 +6284,7 @@ do
         --mem-fraction-static 0.87 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
         --served-model-name glm-5 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
         --cuda-graph-bs 1 2 3 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
-        --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
         NODE_RANK=$i
@@ -6425,7 +6425,7 @@ do
         --mem-fraction-static 0.85 --max-running-requests 320 --attention-backend ascend --device npu --quantization modelslim \
         --served-model-name glm-5 --moe-a2a-backend deepep --deepep-mode low_latency \
         --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
-        --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --disaggregation-enable-decode-radix-cache
@@ -6609,7 +6609,7 @@ do
         --mem-fraction-static 0.865 --max-running-requests 96 --attention-backend ascend --device npu --quantization modelslim \
         --served-model-name glm-5 --moe-a2a-backend deepep --deepep-mode low_latency \
         --cuda-graph-bs 1 2 3 4 5 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000  \
-        --tokenizer-worker-num 32 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
+        --tokenizer-worker-num 32 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --disaggregation-decode-enable-radix-cache
