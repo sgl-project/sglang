@@ -3,7 +3,10 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{header::{AUTHORIZATION, CONTENT_TYPE}, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -411,7 +414,7 @@ impl Router {
                     }
 
                     for (name, value) in headers {
-                        if has_worker_api_key && name == AUTHORIZATION {
+                        if has_worker_api_key && name == AUTHORIZATION.as_str() {
                             continue;
                         }
                         request_builder = request_builder.header(name.clone(), value.clone());
