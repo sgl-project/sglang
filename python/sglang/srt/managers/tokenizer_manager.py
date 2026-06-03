@@ -73,16 +73,14 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
-    WatchLoadUpdateReq,
 )
+from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
-)
+from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -378,6 +376,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
 
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            self.server_args,
+            port_args,
+            caller="tokenizer",
+        )
+
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -558,11 +562,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
+        if self.server_args.tokenizer_worker_num > 1:
+            self._attach_multi_http_worker_info(obj)
         self._init_req_state(obj, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
-        if self.server_args.tokenizer_worker_num > 1:
-            self._attach_multi_http_worker_info(obj)
 
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
@@ -836,6 +840,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
+            # Caller-supplied per-image hashes (external KV routers, e.g.
+            # routing-aware orchestrators that compute a content-addressed
+            # hash before dispatch). Setting MultimodalDataItem.hash here
+            # short-circuits the internal hash_feature() recompute inside
+            # set_pad_value(), making the derived pad_value deterministic
+            # from the caller's hash. That alignment lets the router's
+            # routing decision agree with sglang's prefix-cache key for
+            # the same image. On any per-item parse error or list-length
+            # mismatch we fall back to the internal recompute so a
+            # malformed mm_hashes never blocks a request.
+            caller_mm_hashes = getattr(obj, "mm_hashes", None)
+            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
+                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
+                    logger.warning(
+                        "mm_hashes length (%d) != mm_items length (%d); "
+                        "ignoring caller hashes for this request.",
+                        len(caller_mm_hashes),
+                        len(mm_inputs.mm_items),
+                    )
+                else:
+                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
+                        if not isinstance(item, MultimodalDataItem):
+                            continue
+                        try:
+                            item.hash = int(hex_hash, 16)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Ignoring malformed mm_hashes entry %r; "
+                                "this item will fall back to hash_feature().",
+                                hex_hash,
+                            )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -1647,6 +1682,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
+        if obj.log_level is not None:
+            # setLevel() may raise exception if obj.log_level is illegal string.
+            # Let the exception propagate to the caller.
+            # Only legal requests will be sent to scheduler.
+            logging.getLogger().setLevel(obj.log_level.upper())
+            self.send_to_scheduler.send_pyobj(obj)
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
@@ -1739,6 +1780,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
+            # Surface scheduler load info on each response so clients can do
+            # response-based flow control without polling /v1/loads. The
+            # scheduler already piggy-backs the per-DP-rank load on
+            # BatchStrOutput / BatchTokenIDOutput via the ``load`` field.
+            load = getattr(recv_obj, "load", None)
+            if load is not None:
+                num_running_reqs = getattr(load, "num_running_reqs", None)
+                num_waiting_reqs = getattr(load, "num_waiting_reqs", None)
+                if num_running_reqs is not None:
+                    meta_info["num_running_reqs"] = num_running_reqs
+                if num_waiting_reqs is not None:
+                    meta_info["num_waiting_reqs"] = num_waiting_reqs
+
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
@@ -1774,7 +1828,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ]
 
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                hidden_states = recv_obj.output_hidden_states[i]
+                if hidden_states is not None:
+                    meta_info["hidden_states"] = hidden_states
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
@@ -1946,16 +2002,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
-
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
-        if (
-            self.server_args.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
-            and recv_obj.load is not None
-        ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,

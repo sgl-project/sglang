@@ -60,7 +60,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "flash-attn-4>=4.0.0b9",
-  "sgl-deep-gemm==0.1.0",
+  "sgl-deep-gemm==0.1.2",
   "sglang-kernel==0.4.3",
   "soundfile==0.13.1",
   "tiktoken",
@@ -82,7 +82,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.2.1",
   "smg-grpc-servicer>=0.5.0",
-  "kernels",
+  "kernels>=0.14.1,<0.15",
 ]
 
 [[tool.uv.index]]
@@ -111,6 +111,7 @@ diffusion = [
   "av==16.1.0",
   "scikit-image==0.25.2",
   "trimesh>=4.0.0",
+  "websockets",
   "xatlas",
 ]
 
@@ -177,7 +178,8 @@ killall_sglang = "sglang.cli.killall:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "jit_kernel/**/*",
+  "multimodal_gen/apps/realtime_webui/**/*"
 ]
 
 [tool.setuptools.packages.find]
