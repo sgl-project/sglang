@@ -524,6 +524,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.orig_seq_lens is not None:
                 s["orig_seq_lens"][:bs].copy_(forward_batch.orig_seq_lens)
 
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
@@ -536,7 +538,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with self.backend.replay_session():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             with forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ), set_tc_piecewise_forward_context(
