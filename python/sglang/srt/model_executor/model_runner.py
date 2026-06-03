@@ -2408,14 +2408,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             get_fp4_gemm_runner_backend,
         )
 
-        fp4_gemm_needs_autotune = (
+        model_uses_fp4 = self.model_config.quantization in (
+            "modelopt_fp4",
+            "modelopt_mixed",
+        )
+        fp4_gemm_needs_autotune = model_uses_fp4 and (
             get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
             or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
         )
 
-        from sglang.srt.utils.common import is_sm120_supported
-
-        if not (moe_needs_autotune or fp4_gemm_needs_autotune or is_sm120_supported()):
+        if not (moe_needs_autotune or fp4_gemm_needs_autotune):
             return False
 
         major, _ = torch.cuda.get_device_capability()
