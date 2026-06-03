@@ -52,12 +52,8 @@ def make_mock_server_args(**overrides) -> ServerArgs:
             setattr(sa, f.name, f.default)
         elif f.default_factory is not dataclasses.MISSING:
             setattr(sa, f.name, f.default_factory())
-    # TODO: drop ``cuda_graph_bs`` from the attention unittest kit.
-    # Tests should configure the cuda_graph_config dataclass directly
-    # (and most tests don't actually care about ``bs`` / ``max_bs`` —
-    # only ``.backend`` is read by attention backends). The magic
-    # ``[4]`` default below is also load-bearing for the spec-decode
-    # cuda_graph_runner cases via get_batch_sizes_to_capture.
+    # TODO: drop cuda_graph_bs from the attention unittest kit;
+    # tests should configure cuda_graph_config directly instead.
     legacy_cuda_graph_bs = overrides.pop("cuda_graph_bs", None)
     for k, v in overrides.items():
         cls_attr = getattr(type(sa), k, None)
