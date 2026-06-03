@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_NUM_TILES = 12
 NUM_VIDEO_TILES = 1
-DESIRED_FPS = 2  # TODO: allow desired fps/num frames to be configurable
+DESIRED_FPS = 2
 MAX_FRAMES = 128
 
 
@@ -142,6 +142,8 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         self.video_maintain_aspect_ratio = getattr(
             hf_config, "video_maintain_aspect_ratio", True
         )
+        self.desired_fps = getattr(hf_config, "desired_fps", DESIRED_FPS)
+        self.max_frames = getattr(hf_config, "max_frames", MAX_FRAMES)
 
         self.max_model_len = getattr(server_args, "context_length", None) or 8192
 
@@ -189,10 +191,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
     def render_frame(self, frame_index: int, *, timestamp: float, num_tokens: int):
         return f"Frame {frame_index + 1} sampled at {timestamp:.2f} seconds: {self.PLACEHOLDER}{self.IMG_CONTEXT_TOKEN * num_tokens}{self.IMG_END_TOKEN}"
 
-    @staticmethod
-    def parse_video(video) -> tuple[np.ndarray, list[float]]:
+    def parse_video(self, video) -> tuple[np.ndarray, list[float]]:
         frames = sample_video_frames(
-            video, desired_fps=DESIRED_FPS, max_frames=MAX_FRAMES
+            video, desired_fps=self.desired_fps, max_frames=self.max_frames
         )
         video_array = video.get_frames_at(frames)
         avg_fps = video.avg_fps
