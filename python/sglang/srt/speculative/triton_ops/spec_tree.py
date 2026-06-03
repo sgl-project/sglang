@@ -57,23 +57,26 @@ def sgl_build_tree_kernel_efficient_triton(
             // topk
         )
         parent_position = 0
+        found = 0
 
-        if parent_tb_idx > 0:
+        if parent_tb_idx == 0:
+            found = 1
+        else:
             parent_token_idx = tl.load(
                 parent_list_ptr + batch_idx * parent_list_stride + parent_tb_idx
             )
 
             # Find parent position
-            found = 0
             for pp in range(draft_token_num - 1):
-                sel_idx = tl.load(
-                    selected_index_ptr + batch_idx * selected_index_stride + pp
-                )
-                if sel_idx == parent_token_idx and found == 0:
-                    parent_position = pp + 1
-                    found = 1
+                if found == 0:
+                    sel_idx = tl.load(
+                        selected_index_ptr + batch_idx * selected_index_stride + pp
+                    )
+                    if sel_idx == parent_token_idx:
+                        parent_position = pp + 1
+                        found = 1
 
-        if parent_position < draft_token_num:
+        if found == 1:
             # Update next token links
             next_tok_addr = (
                 retrive_next_token_ptr + batch_idx * draft_token_num + parent_position
@@ -142,17 +145,17 @@ def sgl_build_tree_kernel_efficient_triton(
                         # Find cur_position for next iteration
                         found = 0
                         for cp in range(draft_token_num - 1):
-                            if (
-                                tl.load(
-                                    selected_index_ptr
-                                    + batch_idx * selected_index_stride
-                                    + cp
-                                )
-                                == parent_token_idx
-                                and found == 0
-                            ):
-                                cur_position = cp
-                                found = 1
+                            if found == 0:
+                                if (
+                                    tl.load(
+                                        selected_index_ptr
+                                        + batch_idx * selected_index_stride
+                                        + cp
+                                    )
+                                    == parent_token_idx
+                                ):
+                                    cur_position = cp
+                                    found = 1
 
             tl.store(
                 positions_ptr + batch_idx * draft_token_num + draft_token_idx,
