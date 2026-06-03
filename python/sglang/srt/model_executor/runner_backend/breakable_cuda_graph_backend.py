@@ -54,9 +54,12 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         if is_hip():
             raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
-        super().__init__(cuda_graph_runner)
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._pool = None
+        self._device_module = cuda_graph_runner.device_module
+        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver

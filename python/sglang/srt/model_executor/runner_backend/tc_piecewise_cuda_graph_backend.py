@@ -76,8 +76,11 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     """
 
     def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
-        super().__init__(cuda_graph_runner)
         model_runner = cuda_graph_runner.model_runner
+        self._pool = None
+        self._device_module = cuda_graph_runner.device_module
+        self._tp_group = model_runner.tp_group
+        self._capture_stream: Optional[torch.cuda.Stream] = None
         self._compile_config: CompilationConfig = self.build_compilation_config(
             model_runner.server_args
         )

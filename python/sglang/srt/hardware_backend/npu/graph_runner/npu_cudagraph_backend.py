@@ -53,9 +53,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
     ) -> None:
-        super().__init__(cuda_graph_runner)
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._pool = None
+        self._device_module = cuda_graph_runner.device_module
+        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -66,6 +69,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
         return shape_key in self._graphs
+
+    @contextmanager
+    def replay_session(self):
+        # NPU's full-graph capture doesn't need a "we're inside a
+        # captured graph" global flag — model code already takes the
+        # static-buffer path via the captured graph itself.
+        yield
 
     @contextmanager
     def capture_session(self, stream):
