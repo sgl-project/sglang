@@ -53,6 +53,8 @@ This section provides a progressive guide from quick deployment to performance t
 
 **Interactive Command Generator**: select model precision, hardware, tensor parallelism, and common knobs to generate a launch command.
 
+The generator only emits a runnable command for combinations that NVIDIA / SGLang have validated. Selecting an unverified tuple (e.g. NVFP4 on H100/H200, BF16 with TP=4 on H100, …) is **blocked** — the command pane shows an explicit error and the verified support matrix instead of a launch line, so unvalidated commands can't be copied by accident.
+
 <Nemotron3UltraDeployment />
 
 ### 3.2 Configuration Tips

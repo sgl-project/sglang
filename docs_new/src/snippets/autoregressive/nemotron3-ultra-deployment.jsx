@@ -4,8 +4,29 @@ export const Nemotron3UltraDeployment = () => {
     nvfp4: 'nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4',
   };
 
-  const isNvfp4HardwareSupported = (hardware) => hardware === 'b200' || hardware === 'gb200' || hardware === 'gb300';
-  const isBlackwell = (hardware) => hardware === 'b200' || hardware === 'gb200' || hardware === 'b300' || hardware === 'gb300';
+  // Verified {model, hardware, tp} combinations. Any tuple not in this list is
+  // blocked by `generateCommand` so the UI cannot emit an unvalidated launch.
+  // Keep in sync with the "Supported GPUs" section of Nemotron3-Ultra.mdx.
+  const VERIFIED_CONFIGS = [
+    { model: 'bf16',  hardware: 'h100',  tp: '16', multinode: true },
+    { model: 'bf16',  hardware: 'h200',  tp: '16', multinode: true },
+    { model: 'bf16',  hardware: 'b200',  tp: '8'  },
+    { model: 'bf16',  hardware: 'gb200', tp: '8'  },
+    { model: 'bf16',  hardware: 'b300',  tp: '8'  },
+    { model: 'bf16',  hardware: 'gb300', tp: '8'  },
+    { model: 'nvfp4', hardware: 'b200',  tp: '4'  },
+    { model: 'nvfp4', hardware: 'gb200', tp: '4'  },
+    { model: 'nvfp4', hardware: 'gb300', tp: '4'  },
+  ];
+
+  const findVerified = (model, hardware, tp) =>
+    VERIFIED_CONFIGS.find((c) => c.model === model && c.hardware === hardware && c.tp === tp);
+
+  const verifiedHardwareForModel = (model) =>
+    [...new Set(VERIFIED_CONFIGS.filter((c) => c.model === model).map((c) => c.hardware))];
+
+  const verifiedTpForModelHardware = (model, hardware) =>
+    [...new Set(VERIFIED_CONFIGS.filter((c) => c.model === model && c.hardware === hardware).map((c) => c.tp))];
 
   const options = {
     model: {
@@ -19,24 +40,46 @@ export const Nemotron3UltraDeployment = () => {
     hardware: {
       name: 'hardware',
       title: 'Hardware Platform',
-      items: [
-        { id: 'h100',  label: 'H100',         default: false },
-        { id: 'h200',  label: 'H200',         default: false },
-        { id: 'b200',  label: 'B200',         default: true  },
-        { id: 'gb200', label: 'GB200',        default: false },
-        { id: 'b300',  label: 'B300',         default: false },
-        { id: 'gb300', label: 'GB300',        default: false }
-      ]
+      getDynamicItems: (values) => {
+        const supported = new Set(verifiedHardwareForModel(values.model));
+        const base = [
+          { id: 'h100',  label: 'H100',  default: false },
+          { id: 'h200',  label: 'H200',  default: false },
+          { id: 'b200',  label: 'B200',  default: true  },
+          { id: 'gb200', label: 'GB200', default: false },
+          { id: 'b300',  label: 'B300',  default: false },
+          { id: 'gb300', label: 'GB300', default: false }
+        ];
+        return base.map((it) => {
+          const ok = supported.has(it.id);
+          return {
+            ...it,
+            disabled: !ok,
+            disabledReason: ok ? '' : `${values.model.toUpperCase()} is not verified on ${it.label}`
+          };
+        });
+      }
     },
     tp: {
       name: 'tp',
       title: 'Tensor Parallel (TP)',
-      items: [
-        { id: '2',  label: 'TP=2',  default: false },
-        { id: '4',  label: 'TP=4',  default: false },
-        { id: '8',  label: 'TP=8',  default: true  },
-        { id: '16', label: 'TP=16', default: false, subtitle: '2-node H100' }
-      ]
+      getDynamicItems: (values) => {
+        const supported = new Set(verifiedTpForModelHardware(values.model, values.hardware));
+        const base = [
+          { id: '4',  label: 'TP=4'  },
+          { id: '8',  label: 'TP=8'  },
+          { id: '16', label: 'TP=16', subtitle: '2-node' }
+        ];
+        return base.map((it) => {
+          const ok = supported.has(it.id);
+          return {
+            ...it,
+            default: ok && supported.size === 1,
+            disabled: !ok,
+            disabledReason: ok ? '' : `TP=${it.id} is not verified for ${values.model.toUpperCase()} on ${values.hardware.toUpperCase()}`
+          };
+        });
+      }
     },
     mtp: {
       name: 'mtp',
@@ -76,8 +119,36 @@ export const Nemotron3UltraDeployment = () => {
     }
   };
 
+  const renderVerifiedMatrix = () => {
+    const byModel = {};
+    for (const c of VERIFIED_CONFIGS) {
+      (byModel[c.model] ||= []).push(c);
+    }
+    return Object.entries(byModel)
+      .map(([m, cs]) => {
+        const lines = cs.map((c) => {
+          const node = c.multinode ? ', 2-node' : '';
+          return `#     - ${c.hardware.toUpperCase()} @ TP=${c.tp}${node}`;
+        });
+        return `#   ${m.toUpperCase()}:\n${lines.join('\n')}`;
+      })
+      .join('\n');
+  };
+
   const generateCommand = (values) => {
     const { tp, kvcache, model, hardware } = values;
+    const cfg = findVerified(model, hardware, tp);
+
+    // Block any combination that is not in the verified support matrix.
+    if (!cfg) {
+      return [
+        `# ERROR: ${model.toUpperCase()} on ${hardware.toUpperCase()} with TP=${tp} is not a verified configuration.`,
+        `# The launch command has been suppressed to avoid running an unvalidated setup.`,
+        `#`,
+        `# Verified configurations:`,
+        renderVerifiedMatrix(),
+      ].join('\n');
+    }
 
     const modelPath = MODEL_PATHS[model] || MODEL_PATHS['bf16'];
 
@@ -90,7 +161,7 @@ export const Nemotron3UltraDeployment = () => {
       cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
     }
 
-    if (tp === '16') {
+    if (cfg.multinode) {
       cmd += `  --dist-init-addr <head-node-ip>:5000 \\\n`;
       cmd += `  --nnodes 2 \\\n`;
       cmd += `  --node-rank <0|1> \\\n`;
@@ -108,11 +179,6 @@ export const Nemotron3UltraDeployment = () => {
     cmd = cmd.trimEnd();
     if (cmd.endsWith('\\')) {
       cmd = cmd.slice(0, -1).trimEnd();
-    }
-
-    // Surface NVFP4 hardware constraint as a comment so users see it inline.
-    if (model === 'nvfp4' && !isNvfp4HardwareSupported(hardware)) {
-      cmd = `# NVFP4 requires Blackwell hardware (B200 or GB200). Selected hardware: ${hardware.toUpperCase()}.\n` + cmd;
     }
 
     return cmd;
