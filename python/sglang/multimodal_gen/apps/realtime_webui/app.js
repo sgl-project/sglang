@@ -23,6 +23,7 @@ const DECODE_QUEUE_SECONDS = 2.0;
 const STARTUP_DECODE_QUEUE_SECONDS = 2.5;
 const RECENT_DROP_DISPLAY_MS = 1800;
 const CONTROL_BUFFERED_AMOUNT_LIMIT = 1 << 20;
+const CONTROL_TRANSITION_FLUSH_DELAY_MS = 140;
 const CONTROL_KEY_ACTIONS = new Map([
   ["w", "w"],
   ["a", "a"],
@@ -1623,14 +1624,14 @@ class ControlStateController {
   constructor() {
     this.activeActions = new Set();
     this.pendingTransitions = [];
-    this.flushScheduled = false;
+    this.flushTimer = 0;
   }
 
   reset({ sendRelease = false } = {}) {
     const hadActions = this.activeActions.size > 0;
     this.activeActions.clear();
     this.pendingTransitions = [];
-    this.flushScheduled = false;
+    this.clearFlushTimer();
     this.updateButtons();
     if (sendRelease && hadActions) {
       this.enqueueTransition();
@@ -1666,15 +1667,15 @@ class ControlStateController {
   }
 
   scheduleFlush() {
-    if (this.flushScheduled) return;
-    this.flushScheduled = true;
-    queueMicrotask(() => {
-      this.flushScheduled = false;
+    if (this.flushTimer) return;
+    this.flushTimer = window.setTimeout(() => {
+      this.flushTimer = 0;
       this.flush();
-    });
+    }, CONTROL_TRANSITION_FLUSH_DELAY_MS);
   }
 
   flush() {
+    this.clearFlushTimer();
     if (!this.pendingTransitions.length) return;
     if (ws && ws.bufferedAmount > CONTROL_BUFFERED_AMOUNT_LIMIT) {
       this.compactPendingToLatestPulse();
@@ -1709,6 +1710,12 @@ class ControlStateController {
 
   sameActions(left, right) {
     return left.length === right.length && left.every((item, idx) => item === right[idx]);
+  }
+
+  clearFlushTimer() {
+    if (!this.flushTimer) return;
+    window.clearTimeout(this.flushTimer);
+    this.flushTimer = 0;
   }
 }
 
