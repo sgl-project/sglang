@@ -8,17 +8,24 @@ This module contains an implementation of the Wan video diffusion pipeline
 using the modular pipeline architecture.
 """
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
+)
+from sglang.multimodal_gen.runtime.pipelines.wan_progressive import (
+    WanProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
 
 
 class WanPipeline(LoRAPipeline, ComposedPipelineBase):
@@ -43,7 +50,28 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        self.add_standard_t2i_stages()
+        self.add_stage(InputValidationStage())
+        self.add_standard_text_encoding_stage()
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage()
+        self._add_wan_denoising_stage(server_args)
+        self.add_standard_decoding_stage()
+
+    def _add_wan_denoising_stage(
+        self, server_args: ServerArgs, stage_name: str = "denoising_stage"
+    ) -> None:
+        if server_args.progressive_mode in _PROGRESSIVE_MODES:
+            self.add_stage_factory(
+                RoleType.DENOISER,
+                lambda: WanProgressiveDenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                    pipeline=self,
+                ),
+                stage_name,
+            )
+        else:
+            self.add_standard_denoising_stage(stage_name=stage_name)
 
 
 EntryClass = WanPipeline
