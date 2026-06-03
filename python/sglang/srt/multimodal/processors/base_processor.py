@@ -1211,6 +1211,15 @@ class BaseMultimodalProcessor(ABC):
         )
         if isinstance(available_slice, torch.Tensor):
             available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
+            # CRITICAL ordering fix: ensure the device-local write into the shared
+            # pool has actually landed before this proxy (which carries the pool
+            # offset) can be sent to and read by the consumer PROCESS. Producer and
+            # consumer use independent CUDA contexts/streams, so the shm flag is the
+            # only cross-process signal and it cannot order GPU work -- without this
+            # sync the consumer may read a not-yet-written slice. Cheap: the
+            # tokenizer-worker process has little other GPU work and the copy is
+            # usually already complete by the time we reach here.
+            torch.cuda.current_stream(available_slice.device).synchronize()
             return CudaIpcTensorTransportProxy(
                 data=available_slice,
                 info_data=tensor,
