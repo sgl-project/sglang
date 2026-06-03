@@ -4593,8 +4593,8 @@ class ServerArgs:
             model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
         assert (
-            is_cuda() or is_musa() or is_npu()
-        ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+            is_cuda() or is_musa() or is_npu() or is_hip()
+        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
         if self.speculative_num_draft_tokens is not None:
             assert (
                 not self.enable_mamba_extra_buffer_lazy()
