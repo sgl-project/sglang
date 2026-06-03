@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.evict_policy import (
+    EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
     LFUStrategy,
@@ -17,6 +18,8 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
     SLRUStrategy,
 )
+from sglang.srt.mem_cache.utils import _EVICTION_POLICY_FACTORIES, get_eviction_strategy
+from sglang.srt.server_args import RADIX_EVICTION_POLICY_CHOICES
 
 
 def _make_node(**kwargs):
@@ -213,6 +216,25 @@ class TestEvictionOrdering(unittest.TestCase):
         ]
         actual = [strategy.get_priority(n) for n in eviction_order]
         self.assertEqual(actual, expected)
+
+
+class TestEvictionPolicyWiring(unittest.TestCase):
+    """CLI choices must stay in sync with the eviction-policy registry (both directions)."""
+
+    def test_choices_match_registry(self):
+        # Reverse drift: every implemented policy must be exposed on the CLI and
+        # vice versa. Catches a policy living in the registry but missing from the
+        # CLI choices (the fifo/mru/filo bug this test was added with).
+        self.assertEqual(
+            set(RADIX_EVICTION_POLICY_CHOICES),
+            set(_EVICTION_POLICY_FACTORIES),
+            msg="server_args choices and the eviction-policy registry have drifted apart",
+        )
+
+    def test_every_cli_choice_constructs(self):
+        # Forward drift: every exposed policy must build a strategy without raising.
+        for policy in RADIX_EVICTION_POLICY_CHOICES:
+            self.assertIsInstance(get_eviction_strategy(policy), EvictionStrategy)
 
 
 if __name__ == "__main__":
