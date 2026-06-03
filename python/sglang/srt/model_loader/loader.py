@@ -494,8 +494,22 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
-        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+        # Sort and optionally stagger weight files (see SGLANG_SORT_WEIGHT_FILES).
+        # k=-1: no sort; k=0: sort only; k>0: sort + stagger by (tp_rank*k).
+        k = envs.SGLANG_SORT_WEIGHT_FILES.get()
+        if k >= 0:
             hf_weights_files.sort()
+            if k > 0:
+                tp_size = get_tensor_model_parallel_world_size()
+                if tp_size > 1:
+                    tp_rank = get_tensor_model_parallel_rank()
+                    group_size = tp_size * k
+                    staggered: List[str] = []
+                    for i in range(0, len(hf_weights_files), group_size):
+                        group = hf_weights_files[i : i + group_size]
+                        n = len(group)
+                        staggered.extend(group[(j + tp_rank * k) % n] for j in range(n))
+                    hf_weights_files = staggered
 
         return hf_folder, hf_weights_files, use_safetensors
 
