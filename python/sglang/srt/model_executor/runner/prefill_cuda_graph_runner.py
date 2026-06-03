@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -54,6 +54,9 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.factory import (
     resolve_prefill_backend,
 )
@@ -68,6 +71,18 @@ from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions.
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
+
+# Names of the static prefill input tensors a Breakable-backed prefill
+# runner owns. Each is a 1-D int64 tensor of length max_bs; captured
+# Breakable segments read from these stable addresses.
+_PREFILL_STATIC_FIELDS = (
+    "seq_lens",
+    "extend_seq_lens",
+    "extend_prefix_lens",
+    "extend_start_loc",
+    "req_pool_indices",
+    "orig_seq_lens",
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -133,11 +148,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
         # --- backend ---------------------------------------------------
-        # Backends needing stable addresses for captured prefill segments
-        # (today: only Breakable) allocate their own static buffers in
-        # ``setup_prefill_state``. Other backends no-op.
+        # When the backend is Breakable, captured segments need stable
+        # tensor addresses, so we own a set of static int64 buffers here
+        # and rebind them into capture-time dummy inputs / replay-time
+        # serving inputs below. Other backends don't need this.
         self.backend = resolve_prefill_backend(model_runner)
-        self.backend.setup_prefill_state(self)
+        self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
+        if isinstance(self.backend, BreakableCudaGraphBackend):
+            with torch.device(self.device):
+                self._prefill_static_buffers = {
+                    name: torch.zeros((self.max_bs,), dtype=torch.int64)
+                    for name in _PREFILL_STATIC_FIELDS
+                }
         self.backend.prepare(self)
 
         # --- capture --------------------------------------------------
@@ -163,9 +185,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def capture_prepare(self, num_tokens: int) -> ForwardBatch:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
 
-        Default tensor inputs are fresh literals; backends that need
-        stable addresses for captured segments (Breakable) override via
-        ``populate_prefill_dummy_inputs`` to swap in static buffers.
+        Default tensor inputs are fresh literals; under a Breakable
+        backend, we swap in slices of our static buffers so captured
+        segments read from stable addresses.
         """
         buffers = self.buffers
         bs = 1
@@ -179,9 +201,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "extend_prefix_lens": torch.tensor([0], device=self.device),
                 "extend_start_loc": torch.tensor([0], device=self.device),
             }
-        self.backend.populate_prefill_dummy_inputs(
-            shape_inputs, bs=bs, num_tokens=num_tokens
-        )
+        if self._prefill_static_buffers is not None:
+            s = self._prefill_static_buffers
+            s["seq_lens"][:bs].fill_(num_tokens)
+            s["extend_seq_lens"][:bs].fill_(num_tokens)
+            s["extend_prefix_lens"][:bs].zero_()
+            s["extend_start_loc"][:bs].zero_()
+            s["req_pool_indices"][:bs].copy_(
+                torch.arange(bs, device=s["req_pool_indices"].device)
+            )
+            s["orig_seq_lens"][:bs].fill_(num_tokens)
+            for name in _PREFILL_STATIC_FIELDS:
+                shape_inputs[name] = s[name][:bs]
 
         with torch.device(self.device):
             forward_batch = ForwardBatch(
@@ -300,7 +331,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
-        # Backend-level checks (e.g. Breakable rejects bs>1 prefill).
+        # Breakable-prefill captures bs=1 only; multi-req would silently
+        # return wrong-shaped logits, corrupting downstream output_ids.
+        if self._prefill_static_buffers is not None and forward_batch.batch_size > 1:
+            return False
         return self.backend.can_run(forward_batch)
 
     # -----------------------------------------------------------------
@@ -467,10 +501,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
         )
 
-        # Backends that need stable addresses for captured segments
-        # (Breakable) commit serving-time values into their static buffers.
-        # Other backends no-op.
-        self.backend.commit_prefill_serving_inputs(forward_batch)
+        # Under Breakable, copy serving-time values into the static
+        # buffers so the addresses captured segments hold stay live with
+        # current data.
+        if self._prefill_static_buffers is not None:
+            bs = forward_batch.batch_size
+            s = self._prefill_static_buffers
+            s["seq_lens"][:bs].copy_(forward_batch.seq_lens)
+            s["extend_seq_lens"][:bs].copy_(forward_batch.extend_seq_lens)
+            s["extend_prefix_lens"][:bs].copy_(forward_batch.extend_prefix_lens)
+            s["extend_start_loc"][:bs].copy_(forward_batch.extend_start_loc)
+            s["req_pool_indices"][:bs].copy_(forward_batch.req_pool_indices)
+            if forward_batch.orig_seq_lens is not None:
+                s["orig_seq_lens"][:bs].copy_(forward_batch.orig_seq_lens)
 
         self._static_num_tokens = static_num_tokens
         return static_forward_batch

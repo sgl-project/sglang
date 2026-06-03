@@ -100,36 +100,3 @@ class BaseCudaGraphBackend(ABC):
         set any flag).
         """
         yield
-
-    # -----------------------------------------------------------------
-    # Optional prefill hooks. Backends that need stable addresses for
-    # captured prefill segments (today: only Breakable) override these.
-    # The default implementations are no-ops / pass-through so the
-    # PrefillCudaGraphRunner code path stays uniform.
-    # -----------------------------------------------------------------
-    def setup_prefill_state(self, runner) -> None:
-        """One-time hook called by ``PrefillCudaGraphRunner.__init__``
-        before ``prepare()``. Breakable allocates its static prefill buffers
-        here; other backends no-op.
-        """
-        pass
-
-    def populate_prefill_dummy_inputs(
-        self,
-        kwargs: dict,
-        *,
-        bs: int,
-        num_tokens: int,
-    ) -> None:
-        """Mutate ``kwargs`` in place during capture-time dummy
-        ``ForwardBatch`` construction. Breakable swaps in stable-address
-        static tensors so captured segments read from fixed pointers;
-        other backends no-op (runner falls back to fresh literals).
-        """
-        pass
-
-    def commit_prefill_serving_inputs(self, forward_batch: ForwardBatch) -> None:
-        """Replay-time hook: copy serving-batch values into backend
-        static buffers (Breakable); other backends no-op.
-        """
-        pass
