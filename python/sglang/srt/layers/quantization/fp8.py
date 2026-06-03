@@ -311,7 +311,7 @@ class Fp8Config(QuantizationConfig):
 
 def _dequant_mxfp8_weight_for_fallback(layer: torch.nn.Module) -> torch.Tensor:
     """MXFP8 weight -> BF16 on-the-fly."""
-    weight_fp8 = layer.weight          # FP8 E4M3, (N, K)
+    weight_fp8 = layer.weight  # FP8 E4M3, (N, K)
     scale_u8 = layer.weight_scale_inv
     N, K = weight_fp8.shape
     w_view = weight_fp8.view(N, K // 32, 32)
