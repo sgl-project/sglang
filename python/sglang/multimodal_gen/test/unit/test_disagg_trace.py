@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import pack_tensors
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.srt import server_args as srt_server_args
 from sglang.srt.observability import trace as srt_trace
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
@@ -51,6 +52,12 @@ def _enable_minimal_otel() -> None:
     if not _OTEL_BOOTSTRAPPED:
         otel_trace.set_tracer_provider(TracerProvider())
         _OTEL_BOOTSTRAPPED = True
+    try:
+        srt_server_args.get_global_server_args()
+    except ValueError:
+        srt_server_args.set_global_server_args_for_scheduler(
+            srt_server_args.ServerArgs(model_path="test-model")
+        )
     srt_trace.opentelemetry_initialized = True
     srt_trace.tracer = otel_trace.get_tracer("test-diffusion-disagg")
     srt_trace.trace_set_thread_info("TestThread")
