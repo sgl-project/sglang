@@ -465,15 +465,17 @@ class C4IndexerBackendMixin:
             positions = positions[:num_queries]
 
         if enable_multi_stream:
-            q_indexer, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
-                x=x,
-                q_lora=q_lora,
-                c4_indexer=c4_indexer,
-                positions=positions,
-                forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
-                alt_streams=alt_streams,
-                q_lora_ready=q_lora_ready,
+            q_indexer, weights, c4_indexer_kv_cache = (
+                self._forward_prepare_multi_stream(
+                    x=x,
+                    q_lora=q_lora,
+                    c4_indexer=c4_indexer,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    token_to_kv_pool=token_to_kv_pool,
+                    alt_streams=alt_streams,
+                    q_lora_ready=q_lora_ready,
+                )
             )
         else:
             assert q_lora_ready is None
