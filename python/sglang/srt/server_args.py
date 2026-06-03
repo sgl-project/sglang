@@ -255,6 +255,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
+    "marlin",
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
@@ -493,6 +494,7 @@ class ServerArgs:
     forward_pass_metrics_worker_id: str = ""
     forward_pass_metrics_ipc_name: Optional[str] = None
     enable_trace: bool = False
+    trace_modules: str = "request"
     otlp_traces_endpoint: str = "localhost:4317"
 
     # RequestMetricsExporter configuration
@@ -2330,6 +2332,7 @@ class ServerArgs:
         elif model_arch in (
             "Gemma4ForConditionalGeneration",
             "Gemma4ForCausalLM",
+            "Gemma4UnifiedForConditionalGeneration",
         ):
             default_attention_backend = (
                 "trtllm_mha" if is_sm100_supported() else "triton"
@@ -5258,6 +5261,13 @@ class ServerArgs:
             help="Enable opentelemetry trace",
         )
         parser.add_argument(
+            "--trace-modules",
+            type=str,
+            default="request",
+            help="Select the components to trace. Available options are 'request' and 'mooncake'. Format: <module1 name>,<module2 name>,...",
+        )
+
+        parser.add_argument(
             "--otlp-traces-endpoint",
             type=str,
             default="localhost:4317",
@@ -5688,12 +5698,13 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, flashinfer_cutlass otherwise), "
+            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise), "
             "'cutlass' (SGLang CUTLASS kernel), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
             "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
-            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), "
+            "'marlin' (weight-only W4A16 fallback for SM80+). ",
         )
         parser.add_argument(
             "--disable-flashinfer-autotune",
