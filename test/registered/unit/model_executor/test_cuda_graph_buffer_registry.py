@@ -1152,6 +1152,44 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=3, padded_num_tokens=8)
         self.assertTrue(torch.equal(idx, torch.tensor([3, 4], dtype=torch.int64)))
 
+    def test_source_none_owns_allocated_buffers(self):
+        # With source=None the registry OWNS (allocates) every slot — the path
+        # PCG/breakable use now that PrefillInputBuffers is gone.
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=True,
+            hidden_size=4,
+            embed_dtype=torch.float32,
+            enable_mamba_track=True,
+            share_pool=False,
+            source=None,
+        )
+        self.assertEqual(tuple(reg.get_slot("input_ids").buffer.shape), (16,))
+        self.assertEqual(tuple(reg.get_slot("positions").buffer.shape), (16,))
+        self.assertEqual(tuple(reg.get_slot("out_cache_loc").buffer.shape), (16,))
+        self.assertEqual(tuple(reg.get_slot("mrope_positions").buffer.shape), (3, 16))
+        self.assertEqual(tuple(reg.get_slot("input_embeds").buffer.shape), (16, 4))
+        self.assertEqual(tuple(reg.get_slot("mamba_track_indices").buffer.shape), (2,))
+        # Fills with no backing source (owns its storage); ZERO-tails the pad.
+        fb = _MiniForwardBatch(
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
+            positions=torch.tensor([4, 5, 6], dtype=torch.int64),
+            out_cache_loc=torch.tensor([7, 8, 9], dtype=torch.int64),
+        )
+        reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
+        ids = reg.get_slot("input_ids").buffer
+        self.assertTrue(
+            torch.equal(ids[:3], torch.tensor([1, 2, 3], dtype=torch.int64))
+        )
+        self.assertTrue(torch.all(ids[3:8] == 0))
+
 
 class TestFillOncePolicy(unittest.TestCase):
     """FILL_ONCE initializes the whole buffer at alloc and never resets the
