@@ -170,8 +170,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # tensor addresses, so we own a set of static int64 buffers here
         # and rebind them into capture-time dummy inputs / replay-time
         # serving inputs below. Other backends don't need this.
-        self.backend = resolve_prefill_backend(self)
+        # Initialize the slot to None BEFORE constructing the backend:
+        # TcPiecewise runs its compile pass during __init__ which calls
+        # _run_dummy_forward -> capture_prepare, and capture_prepare reads
+        # self._prefill_static_buffers.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
+        self.backend = resolve_prefill_backend(self)
         if isinstance(self.backend, BreakableCudaGraphBackend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
