@@ -31,8 +31,8 @@ class BaseCudaGraphBackend(ABC):
     """Capture/replay protocol for one cuda-graph backend.
 
     Lifecycle:
-        1. ``__init__(runner, ...)`` — backend allocates its captured
-           artifact tables and binds runner-derived handles
+        1. ``__init__(cuda_graph_runner, ...)`` — backend allocates its
+           captured artifact tables and binds runner-derived handles
            (``device_module``, ``tp_group``). Subclasses do additional
            per-backend setup (memory saver, torch.compile, …) here.
         2. ``capture_session(stream)`` — context wrapping the runner's
@@ -58,15 +58,15 @@ class BaseCudaGraphBackend(ABC):
         7. ``cleanup()`` — release pool, drop captured artifacts.
     """
 
-    def __init__(self, runner: "BaseCudaGraphRunner") -> None:
+    def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
-        self._device_module = runner.device_module
-        self._tp_group = runner.model_runner.tp_group
+        self._device_module = cuda_graph_runner.device_module
+        self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
 
-    def can_run(self, forward_batch: "ForwardBatch", shape_key: Any) -> bool:
+    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
         """Can this backend replay for the given shape? Default: yes iff
         ``capture_one`` has produced a graph for ``shape_key``."""
         return shape_key in self._graphs
@@ -93,7 +93,7 @@ class BaseCudaGraphBackend(ABC):
     def replay(
         self,
         shape_key: Any,
-        static_forward_batch: "ForwardBatch",
+        static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any: ...
 

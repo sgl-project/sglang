@@ -36,13 +36,15 @@ logger = logging.getLogger(__name__)
 _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
 
 
-def resolve_decode_backend(runner: "BaseCudaGraphRunner") -> BaseCudaGraphBackend:
+def resolve_decode_backend(
+    cuda_graph_runner: BaseCudaGraphRunner,
+) -> BaseCudaGraphBackend:
     """Pick a backend instance from ``cuda_graph_config['decode']['backend']``.
 
     NPU device returns ``NPUCudaGraphBackend`` regardless of mode (only
     the Full-style backend is wired for NPU today).
     """
-    model_runner = runner.model_runner
+    model_runner = cuda_graph_runner.model_runner
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.decode.backend if cfg is not None else Backend.FULL
 
@@ -53,11 +55,13 @@ def resolve_decode_backend(runner: "BaseCudaGraphRunner") -> BaseCudaGraphBacken
             NPUCudaGraphBackend,
         )
 
-        return NPUCudaGraphBackend(runner, enable_memory_saver=enable_memory_saver)
+        return NPUCudaGraphBackend(
+            cuda_graph_runner, enable_memory_saver=enable_memory_saver
+        )
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
-            runner,
+            cuda_graph_runner,
             enable_memory_saver=enable_memory_saver,
             debug_eager=model_runner.server_args.debug_cuda_graph,
         )
@@ -69,20 +73,24 @@ def resolve_decode_backend(runner: "BaseCudaGraphRunner") -> BaseCudaGraphBacken
                 "falling back to 'full'."
             )
             _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = True
-    return FullCudaGraphBackend(runner, enable_memory_saver=enable_memory_saver)
+    return FullCudaGraphBackend(
+        cuda_graph_runner, enable_memory_saver=enable_memory_saver
+    )
 
 
-def resolve_prefill_backend(runner: "BaseCudaGraphRunner") -> BaseCudaGraphBackend:
+def resolve_prefill_backend(
+    cuda_graph_runner: BaseCudaGraphRunner,
+) -> BaseCudaGraphBackend:
     """Pick a backend instance from ``cuda_graph_config['prefill']['backend']``."""
-    model_runner = runner.model_runner
+    model_runner = cuda_graph_runner.model_runner
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
-            runner,
+            cuda_graph_runner,
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
             debug_eager=model_runner.server_args.debug_cuda_graph,
         )
     # Default: tc_piecewise. ``(prefill, full)`` is rejected at config validation.
-    return TcPiecewiseCudaGraphBackend(runner)
+    return TcPiecewiseCudaGraphBackend(cuda_graph_runner)

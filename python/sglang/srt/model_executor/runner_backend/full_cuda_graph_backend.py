@@ -42,11 +42,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
     def __init__(
         self,
-        runner: "BaseCudaGraphRunner",
+        cuda_graph_runner: BaseCudaGraphRunner,
         *,
         enable_memory_saver: bool = False,
     ) -> None:
-        super().__init__(runner)
+        super().__init__(cuda_graph_runner)
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")

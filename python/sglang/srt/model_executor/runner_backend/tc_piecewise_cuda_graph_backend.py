@@ -75,20 +75,21 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     recomputed at replay (outside the compiled callable's sub-graphs).
     """
 
-    def __init__(self, runner: "BaseCudaGraphRunner") -> None:
-        super().__init__(runner)
+    def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
+        super().__init__(cuda_graph_runner)
+        model_runner = cuda_graph_runner.model_runner
         self._compile_config: CompilationConfig = self.build_compilation_config(
-            runner.model_runner.server_args
+            model_runner.server_args
         )
         self._language_model: torch.nn.Module = getattr(
-            runner.model_runner.model, "language_model", runner.model_runner.model
+            model_runner.model, "language_model", model_runner.model
         )
-        self._run_compile_pass(runner)
+        self._run_compile_pass(cuda_graph_runner)
         # Replay invokes the outer ``model_runner.model.forward`` — the
         # wrapper that builds LogitsProcessorOutput. The torch.compile we
         # installed on ``language_model.model`` is dispatched internally
         # by that wrapper.
-        self._compiled_fn: Callable = runner.model_runner.model.forward
+        self._compiled_fn: Callable = model_runner.model.forward
 
     # -----------------------------------------------------------------
     # Static helper retained from the previous version (used by the
@@ -146,7 +147,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     # -----------------------------------------------------------------
     # BaseCudaGraphBackend interface
     # -----------------------------------------------------------------
-    def _run_compile_pass(self, runner: "BaseCudaGraphRunner") -> None:
+    def _run_compile_pass(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         """JIT-activate kernels at the smallest shape, install
         ``torch.compile`` on ``language_model.model``, then run a
         compile-loop pass so torch.compile finishes FX / inductor
@@ -178,7 +179,9 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                     )
 
                 # Step 1: JIT-activate kernels at the smallest shape.
-                runner._run_dummy_forward(num_tokens=runner.capture_num_tokens[0])
+                cuda_graph_runner._run_dummy_forward(
+                    num_tokens=cuda_graph_runner.capture_num_tokens[0]
+                )
 
                 if self._pool is None:
                     self._pool = self._device_module.graph_pool_handle()
@@ -196,16 +199,16 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                 # warmup flag is set.
                 with enable_torch_compile_warmup():
                     compile_range = (
-                        tqdm.tqdm(list(reversed(runner.capture_num_tokens)))
+                        tqdm.tqdm(list(reversed(cuda_graph_runner.capture_num_tokens)))
                         if get_tensor_model_parallel_rank() == 0
-                        else reversed(runner.capture_num_tokens)
+                        else reversed(cuda_graph_runner.capture_num_tokens)
                     )
                     for num_tokens in compile_range:
                         if get_tensor_model_parallel_rank() == 0:
                             compile_range.set_description(
                                 f"Compiling num tokens ({num_tokens=})"
                             )
-                        runner._run_dummy_forward(num_tokens=num_tokens)
+                        cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
             finally:
                 _toggle_multi_platform_ops(
                     language_model.model, reverse=True, num_tokens=16
