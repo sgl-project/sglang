@@ -5,6 +5,7 @@ import torch
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -114,25 +115,37 @@ def hash_topk(
     scoring_func: str = "sqrtsoftplus",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert scoring_func == "sqrtsoftplus"
-    num_tokens = router_logits.size(0)
-    topk_routed = tid2eid.size(1)
-    topk_fused = topk_routed + num_fused_shared_experts
-    topk_ids = torch.empty(
-        (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
-    )
-    topk_weights = torch.empty(
-        (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
-    )
-    module = _jit_hash_topk_module()
-    module.hash_topk(
-        router_logits,
-        input_ids,
-        tid2eid,
-        topk_weights,
-        topk_ids,
-        routed_scaling_factor,
-    )
-    return topk_weights, topk_ids
+    if is_hip_runtime():
+        from sglang.jit_kernel.triton.hash_topk import hash_topk_triton
+
+        return hash_topk_triton(
+            router_logits,
+            input_ids,
+            tid2eid,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            scoring_func,
+        )
+    else:
+        num_tokens = router_logits.size(0)
+        topk_routed = tid2eid.size(1)
+        topk_fused = topk_routed + num_fused_shared_experts
+        topk_ids = torch.empty(
+            (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
+        )
+        topk_weights = torch.empty(
+            (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
+        )
+        module = _jit_hash_topk_module()
+        module.hash_topk(
+            router_logits,
+            input_ids,
+            tid2eid,
+            topk_weights,
+            topk_ids,
+            routed_scaling_factor,
+        )
+        return topk_weights, topk_ids
 
 
 def mega_moe_pre_dispatch(
