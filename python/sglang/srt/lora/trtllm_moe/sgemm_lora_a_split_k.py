@@ -248,4 +248,6 @@ def sgemm_lora_a_fwd_split_k(
         BLOCK_K,
         split_k,
     )
-    return output.to(x.dtype) if split_k > 1 else output
+    # split_k>1 returns the fp32 accumulator directly; the LoRA-B expand casts x to the weight dtype
+    # on-load (fused), dropping the standalone fp32->bf16 copy kernel. split_k==1 already returns x.dtype.
+    return output
