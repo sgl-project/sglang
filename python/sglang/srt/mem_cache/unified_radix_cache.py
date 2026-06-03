@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from array import array
 from collections import defaultdict
-from functools import lru_cache, partial
-from queue import Empty
-from typing import TYPE_CHECKING, Any, Optional
+from functools import partial
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -24,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -41,25 +44,36 @@ from sglang.srt.mem_cache.unified_cache_components import (
     ComponentType,
     EvictLayer,
     FullComponent,
+    LRURefreshPhase,
     MambaComponent,
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
+from sglang.srt.mem_cache.utils import (
+    compute_node_hash_values,
+    get_eviction_strategy,
+    split_node_hash_value,
+)
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        PrefetchOperation,
+    )
     from sglang.srt.server_args import ServerArgs
+
+
+T = TypeVar("T")
 
 
 class UnifiedTreeNode:
     counter = 0
 
-    def __init__(self, tree_components: tuple[ComponentType, ...]):
+    def __init__(self, tree_components: tuple[ComponentType, ...], priority: int = 0):
         self.children = defaultdict(partial(UnifiedTreeNode, tree_components))
         self.parent: UnifiedTreeNode | None = None
         self.key: Optional[RadixKey] = None
@@ -69,8 +83,10 @@ class UnifiedTreeNode:
             ComponentData() for _ in range(_NUM_COMPONENT_TYPES)
         ]
         self.last_access_time = get_and_increase_time_counter()
+        self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
         self.hit_count = 0
+        self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
         )
@@ -104,7 +120,6 @@ class UnifiedTreeNode:
             return None
         return self.hash_value[-1]
 
-    @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
         if node is None or node.hash_value is None:
             return []
@@ -177,6 +192,24 @@ class UnifiedLRUList:
                 prev_node = node
             node = node.parent
 
+    def reset_node_and_window_ancestors_mru(
+        self,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+        window_size: int,
+        should_include,
+    ):
+        prev_node = self.head
+        accumulated = 0
+        while node != root_node and accumulated < window_size:
+            if should_include(node):
+                assert node.id in self.cache
+                self._remove_node(node)
+                self._add_node_after(prev_node, node)
+                prev_node = node
+            accumulated += len(node.key)
+            node = node.parent
+
     def in_list(self, node: Optional[UnifiedTreeNode]):
         return node is not None and node.id in self.cache
 
@@ -220,7 +253,7 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
-class UnifiedRadixCache(BasePrefixCache):
+class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
@@ -230,6 +263,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.is_eagle = params.is_eagle
+        self.enable_kv_cache_events = params.enable_kv_cache_events
+        self.kv_event_queue = []
+        self.eviction_policy = params.eviction_policy.lower()
+        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -245,8 +282,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        component_registry = COMPONENT_REGISTRY
+        if params.component_registry_override:
+            component_registry = {
+                **COMPONENT_REGISTRY,
+                **params.component_registry_override,
+            }
         self.components: dict[ComponentType, TreeComponent] = {
-            ct: COMPONENT_REGISTRY[ct](self, params) for ct in self.tree_components
+            ct: component_registry[ct](self, params) for ct in self.tree_components
         }
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
@@ -261,6 +304,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.session = StreamingSession(inner=self)
 
         self.tp_group = params.tp_cache_group
+        self.attn_cp_group = params.attn_cp_cache_group
+        self.attn_tp_group = params.attn_tp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
@@ -268,7 +313,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # HiCache D↔H defaults (overridden by init_hicache)
-        self.cache_controller = None
+        self.cache_controller: Optional[HybridCacheController] = None
         self.write_through_threshold = 256
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
@@ -279,12 +324,31 @@ class UnifiedRadixCache(BasePrefixCache):
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+        reduced = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(tensor, op=op, group=group)
+                reduced = True
+        if not reduced and self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _barrier_attn_groups(self):
+        waited = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.barrier(group=group)
+                waited = True
+        if not waited and self.tp_world_size > 1:
+            torch.distributed.barrier(group=self.tp_group)
+
     def reset(self) -> None:
         self._reset_full()
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.root_node = UnifiedTreeNode(self.tree_components)
+        self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         self.root_node.hash_value = []
@@ -310,8 +374,18 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
-        self.ongoing_prefetch: dict = {}
-        self.ongoing_backup: dict = {}
+        self.ongoing_prefetch: dict[
+            str,
+            tuple[
+                UnifiedTreeNode,
+                RadixKey,
+                torch.Tensor,
+                PrefetchOperation,
+                DecLockRefParams,
+                dict[ComponentType, list[PoolTransfer]],
+            ],
+        ] = {}
+        self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -328,6 +402,7 @@ class UnifiedRadixCache(BasePrefixCache):
             last_host_node=self.root_node,
             best_match_node=self.root_node,
         )
+        self._record_all_cleared_event()
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -540,7 +615,10 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = None
 
         if is_insert:
-            insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
+            insert_params = InsertParams(
+                prev_prefix_len=req.cache_protected_len,
+                priority=getattr(req, "priority", 0) or 0,
+            )
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
@@ -587,7 +665,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
-    def cache_unfinished_req(self, req: Req, chunked=False, **kwargs) -> None:
+    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
@@ -606,7 +684,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len, chunked=chunked
+            prev_prefix_len=req.cache_protected_len,
+            chunked=chunked,
+            priority=getattr(req, "priority", 0) or 0,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -774,9 +854,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
-            self.lru_lists[comp.component_type].reset_node_and_parents_mru(
-                node_update, self.root_node, comp.node_has_component_data
-            )
+            comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
         while node_update:
@@ -818,10 +896,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> UnifiedTreeNode:
-        new_node = UnifiedTreeNode(self.tree_components)
+        new_node = UnifiedTreeNode(self.tree_components, priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
+        new_node.hit_count = child.hit_count
+        new_node.creation_time = child.creation_time
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -850,15 +930,19 @@ class UnifiedRadixCache(BasePrefixCache):
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:
-            self._for_each_component_lru(node, UnifiedLRUList.reset_node_mru)
+            for comp in self._components_tuple:
+                if comp.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
     def _add_new_node(
         self,
         parent: UnifiedTreeNode,
         key: RadixKey,
         value: torch.Tensor,
+        priority: int = 0,
     ) -> UnifiedTreeNode:
-        new_node = UnifiedTreeNode(self.tree_components)
+        new_node = UnifiedTreeNode(self.tree_components, priority=priority)
         new_node.parent = parent
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
@@ -869,6 +953,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
+        self._record_store_event(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -885,6 +970,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
+        self._record_store_event(node, medium=StorageMedium.GPU)
 
     def _insert_helper(
         self,
@@ -893,7 +979,11 @@ class UnifiedRadixCache(BasePrefixCache):
         value: torch.Tensor,
         params: InsertParams,
     ) -> InsertResult:
+        priority = params.priority
+        if priority is None:
+            priority = 0
         self._touch_node(node)
+        node.priority = max(node.priority, priority)
         if len(key) == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
@@ -905,6 +995,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prefix_len = node.key.match(key, page_size=self.page_size)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
+            node.priority = max(node.priority, priority)
 
             if node.evicted:
                 self._unevict_node_on_insert(node, value[:prefix_len])
@@ -963,7 +1054,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 # cleanup_after_caching_req can free them properly.
                 self.token_to_kv_pool_allocator.free(value)
                 return InsertResult(prefix_len=total_prefix_length)
-            target_node = self._add_new_node(node, key, value)
+            target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
         else:
             target_node = node
@@ -978,6 +1069,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 params=params,
                 result=result,
             )
+
+        if target_node is not self.root_node:
+            for component in self._components_tuple:
+                if component.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                component.refresh_lru(
+                    LRURefreshPhase.INSERT_END, target_node, self.root_node
+                )
+
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
         return result
@@ -1023,7 +1123,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 result.inserted_host_node = node
             return result
 
-        new_node = UnifiedTreeNode(self.tree_components)
+        new_node = UnifiedTreeNode(self.tree_components, priority=node.priority)
         new_node.parent = node
         new_node.key = key
         new_node.hash_value = hash_value
@@ -1086,7 +1186,7 @@ class UnifiedRadixCache(BasePrefixCache):
         node: UnifiedTreeNode,
         comp: TreeComponent,
         target: EvictLayer = EvictLayer.DEVICE,
-        tracker: dict[ComponentType, int] = None,
+        tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
         device_freed, host_freed = comp.evict_component(node, target=target)
         if tracker is not None:
@@ -1232,7 +1332,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.evictable_host_leaves.discard(node)
 
     def _evict_to_host(
-        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int] = None
+        self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
     ) -> None:
         """GPU→CPU demotion: release all device resources, node stays in tree."""
         assert not node.evicted and node.backuped
@@ -1241,6 +1341,7 @@ class UnifiedRadixCache(BasePrefixCache):
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
         )
         self._cascade_evict(node, trigger, tracker)
+        self._record_remove_event(node, medium=StorageMedium.GPU)
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
@@ -1271,6 +1372,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
+                self._record_remove_event(node, medium=StorageMedium.GPU)
                 for comp in self._components_tuple:
                     self._evict_component_and_detach_lru(
                         node, comp, target=EvictLayer.ALL, tracker=tracker
@@ -1291,6 +1393,7 @@ class UnifiedRadixCache(BasePrefixCache):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
+        self._record_remove_event(node, medium=StorageMedium.CPU)
         for comp in self._components_tuple:
             _, hf = self._evict_component_and_detach_lru(
                 node, comp, target=EvictLayer.ALL, tracker=None
@@ -1409,7 +1512,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return False
 
-        avail = self.token_to_kv_pool_allocator.available_size()
+        if self.supports_swa():
+            avail = self.token_to_kv_pool_allocator.full_available_size()
+        else:
+            avail = self.token_to_kv_pool_allocator.available_size()
         if avail < kv_tokens:
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
@@ -1437,6 +1543,8 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.LOAD_BACK,
             [kv_xfer],
         )
+        for node in kv_xfer.nodes_to_load or ():
+            self._record_store_event(node, medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 best_match_node,
@@ -1499,14 +1607,19 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
-        if self.cache_controller is None:
-            return
         if node.evicted or chunked:
             return
-        if self.cache_controller.write_policy == "write_back":
+        if (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        ):
             return
         node.hit_count += 1
-        if not node.backuped and node.hit_count >= self.write_through_threshold:
+        if (
+            self.cache_controller is not None
+            and not node.backuped
+            and node.hit_count >= self.write_through_threshold
+        ):
             self.write_backup(node)
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
@@ -1648,14 +1761,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
-    def _prefetch_timeout_check_linear_func(self, operation) -> bool:
+    def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
             time.monotonic() - operation.start_time
             > self.prefetch_timeout_base
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
 
-    def can_terminate_prefetch(self, operation) -> bool:
+    def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
             return True
 
@@ -1811,7 +1924,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         cc = self.cache_controller
 
-        def _drain_queue(q, limit: Optional[int]):
+        def _drain_queue(q: Queue[T], limit: Optional[int]) -> Iterator[T]:
             drained = 0
             while limit is None or drained < limit:
                 try:
@@ -2031,6 +2144,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         entry = self.ongoing_write_through.pop(ack_id, None)
                         if entry is not None:
                             node, params = entry
+                            self._record_store_event(node, medium=StorageMedium.CPU)
                             if params is not None:
                                 self.dec_lock_ref(node, params)
                             if self.enable_storage:
@@ -2048,12 +2162,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 break
             finish_count += 1
 
-        # TP sync: MIN across all ranks for consistent tree updates
+        # Keep cache state transitions identical across CPxTP participants.
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                queue_size, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
         finish_count = int(queue_size.item())
 
         # Process completed acks
@@ -2062,6 +2173,7 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_event.synchronize()
             for ack_id in ack_list:
                 node, params = self.ongoing_write_through.pop(ack_id)
+                self._record_store_event(node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(node, params)
                 if self.enable_storage:
                     self.write_backup_storage(node)

@@ -14,6 +14,7 @@ def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
+    kwargs: Optional[dict] = {},
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
@@ -22,7 +23,7 @@ def _resolve_speculative_algorithm_alias(
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code
+            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
         )
         is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
             getattr(cfg, "architectures", None) or []
@@ -60,10 +61,17 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
 
+    kwargs = {}
+
+    override_config_file = server_args.decrypted_draft_config_file
+    if override_config_file and override_config_file.strip():
+        kwargs["_configuration_file"] = override_config_file.strip()
+
     server_args.speculative_algorithm = _resolve_speculative_algorithm_alias(
         server_args.speculative_algorithm,
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
+        kwargs=kwargs,
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.

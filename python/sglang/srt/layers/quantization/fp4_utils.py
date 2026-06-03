@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
+from sglang.srt.utils.common import (
+    get_device_capability,
+    is_cuda,
+    is_sm100_supported,
+    is_sm120_supported,
+)
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
 if TYPE_CHECKING:
@@ -95,6 +100,7 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    MARLIN = "marlin"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
@@ -113,6 +119,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutedsl(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL
+
+    def is_marlin(self) -> bool:
+        return self == Fp4GemmRunnerBackend.MARLIN
 
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")
@@ -151,6 +160,8 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
             backend = "flashinfer_cudnn"
         elif is_sm100_supported():
             backend = "flashinfer_cutedsl"
+        elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
+            backend = "marlin"
         else:
             backend = "flashinfer_cutlass"
 

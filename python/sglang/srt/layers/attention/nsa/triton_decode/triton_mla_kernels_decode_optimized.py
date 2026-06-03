@@ -28,6 +28,7 @@ from .triton_mla_kernels_decode_dsv4 import (
 )
 from .triton_mla_kernels_decode_fused import (
     fused_gather_attn_decode_dsv4,
+    fused_gather_attn_decode_dsv4_dual_scope,
     fused_gather_attn_decode_dsv4_dual_scope_low_overhead,
 )
 
@@ -56,14 +57,8 @@ def triton_sparse_attn_decode(
 def _should_use_fused_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> bool:
     """Determine whether to use fused kernel for dual-scope cases.
 
-    The fused kernel avoids allocating a large intermediate gathered_kv
-    buffer and eliminates a separate gather kernel launch.  However, for
-    h_q > 64 with medium-to-large batch sizes and larger topk, the
-    non-splitk fused kernel suffers from low GPU utilization (the grid
-    has only cdiv(h_q, BLOCK_H) blocks in the H dimension).  In those
-    cases the fallback (separate gather + attention) can be faster on
-    the GPU, though it incurs extra torch.empty() overhead in CUDA
-    graphs.
+    Returns True if the fused kernel (with splitk for small bs) should be used.
+    For large batch sizes (>= 256), use _should_use_fused_nosplitk instead.
 
     The thresholds below were determined empirically on MI355X (256 CUs).
     """
@@ -74,15 +69,50 @@ def _should_use_fused_dual_scope(total_tokens: int, h_q: int, total_topk: int) -
     if h_q <= 64 and total_topk >= 1024:
         return total_tokens <= 128
     # h_q > 64 (e.g. h_q=128 when q is padded to full n_heads).
-    # For small topk (c128 layers, topk~192), fused always wins.
-    # For larger topk (c4 layers, topk~640), fused wins at small bs
-    # but the fallback catches up at bs>=16 due to better GPU utilization.
-    # However, the fallback has 4 extra torch.empty() calls that add
-    # ~30us CUDA-graph replay overhead, roughly cancelling the GPU gain.
-    # So we route to fused for all practical batch sizes.
     if h_q > 64:
-        return total_tokens <= 256
+        if total_topk >= 400:
+            return total_tokens <= 32
+        else:
+            return total_tokens <= 128
     return True
+
+
+def _should_use_fused_nosplitk(total_tokens: int, h_q: int, total_topk: int) -> bool:
+    """Determine whether to use the fused no-splitk kernel for large batches.
+
+    Kernel-level benchmarking on MI355X shows that for large batch sizes
+    (total_tokens >= 256), the fused dual-scope kernel WITHOUT split-K
+    is ~10% faster than the separate gather+attention path:
+
+      total_tokens=256:  fused-noSK=169us vs separate=194us (14% faster)
+      total_tokens=512:  fused-noSK=350us vs separate=408us (14% faster)
+      total_tokens=1024: fused-noSK=700us vs separate=777us (10% faster)
+      total_tokens=4096: fused-noSK=2761us vs separate=3063us (10% faster)
+
+    The fused no-splitk kernel avoids:
+    1. Materializing the large intermediate gathered_kv buffer
+    2. The separate gather kernel launch
+    3. The split-K combine overhead
+
+    For total_tokens < 256, the separate path is faster because the
+    fused kernel has insufficient parallelism.
+
+    For extend (total_tokens >= 1024), the fused kernel always wins
+    regardless of h_q or total_topk because:
+    - The grid already has thousands of blocks (good GPU utilization)
+    - It eliminates 1.5-5 GB gathered_kv buffer allocation
+    - It eliminates 2x gather_dequant kernel launches (~414 us)
+    - It avoids chunking that TP>1 configs require with the separate path
+    """
+    if total_tokens >= 1024:
+        return True
+    if h_q <= 64:
+        return False  # Not benchmarked for h_q <= 64
+    if total_topk < 200:
+        return False  # Small topk doesn't benefit
+    # For h_q > 64 and total_topk >= 200:
+    # Fused no-splitk wins for total_tokens >= 256
+    return total_tokens >= 256
 
 
 def _triton_sparse_attn_decode_dsv4(
@@ -135,7 +165,39 @@ def _triton_sparse_attn_decode_dsv4(
     topk_extra = extra_kv_scope.indices_in_kvcache.shape[-1]
     total_topk = topk_main + topk_extra
 
-    # Check if chunking needed (fall back to original implementation)
+    # For large batch sizes, use fused no-splitk kernel (10% faster than separate).
+    # This check is BEFORE the chunking check because the fused kernel does NOT
+    # allocate the intermediate gathered_kv buffer, so buffer size limits don't apply.
+    if _should_use_fused_nosplitk(total_tokens, h_q, total_topk):
+        q_reshaped = q.reshape(total_tokens, h_q, d_qk).contiguous()
+
+        indices_main = kv_scope.indices_in_kvcache.reshape(
+            total_tokens, topk_main
+        ).contiguous()
+
+        block_size_extra = extra_kv_scope.blocked_k.shape[1]
+        indices_extra = extra_kv_scope.indices_in_kvcache.reshape(
+            total_tokens, topk_extra
+        ).contiguous()
+
+        output, lse = fused_gather_attn_decode_dsv4_dual_scope(
+            q_reshaped,
+            kv_quantized_main,
+            indices_main,
+            block_size_main,
+            extra_kv_scope.blocked_k_quantized,
+            indices_extra,
+            block_size_extra,
+            sm_scale,
+            topk_length_main=kv_scope.topk_length,
+            topk_length_extra=extra_kv_scope.topk_length,
+            attn_sink=attn_sink,
+            s_q=s_q,
+            force_no_splitk=True,
+        )
+        return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
+
+    # Check if chunking needed for separate path (fall back to original implementation)
     token_ranges = compute_token_ranges(total_tokens, total_topk, d_qk)
     if len(token_ranges) > 1:
         from .triton_mla_kernels_decode_dsv4 import triton_sparse_attn_decode_dsv4
@@ -146,20 +208,16 @@ def _triton_sparse_attn_decode_dsv4(
 
     # Use fused dual-scope kernel with low-overhead buffer pool
     if _should_use_fused_dual_scope(total_tokens, h_q, total_topk):
-        q_reshaped = q.reshape(total_tokens, h_q, d_qk)
-        if not q_reshaped.is_contiguous():
-            q_reshaped = q_reshaped.contiguous()
+        q_reshaped = q.reshape(total_tokens, h_q, d_qk).contiguous()
 
-        indices_main = kv_scope.indices_in_kvcache.reshape(total_tokens, topk_main)
-        if not indices_main.is_contiguous():
-            indices_main = indices_main.contiguous()
+        indices_main = kv_scope.indices_in_kvcache.reshape(
+            total_tokens, topk_main
+        ).contiguous()
 
         block_size_extra = extra_kv_scope.blocked_k.shape[1]
         indices_extra = extra_kv_scope.indices_in_kvcache.reshape(
             total_tokens, topk_extra
-        )
-        if not indices_extra.is_contiguous():
-            indices_extra = indices_extra.contiguous()
+        ).contiguous()
 
         output, lse = fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             q_reshaped,
