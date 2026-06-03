@@ -7,7 +7,6 @@ import torch
 
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
 )
@@ -381,7 +380,6 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
         if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
             attn_metadata.max_seqlen_q = query.shape[1]
             attn_metadata.max_seqlen_k = key.shape[1]
