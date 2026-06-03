@@ -529,9 +529,10 @@ def build_decode_registry(
     registered here — they are not per-replay FB copies (allocated and written
     elsewhere), so the runner keeps owning them.
 
-    When ``source`` is given, each slot adopts the same-named tensor off
-    ``source`` (e.g. a ``DecodeInputBuffers``) instead of allocating, so the
-    registry shares one physical allocation with that object.
+    When ``source`` is given (the decode buffer namespace from
+    ``_allocate_decode_buffers``), each slot adopts the same-named tensor off
+    it instead of allocating, so the registry shares one physical allocation
+    with that object. With ``source=None`` the registry allocates its own.
     """
     reg = CudaGraphBufferRegistry(
         device=device,
@@ -779,9 +780,10 @@ def build_prefill_registry(
     reset-only (``copy_from_fb=False``). ``mamba_track_*`` are bs-axis copies
     with no padding reset (bs is not padded on this path).
 
-    When ``source`` is given, each slot adopts the same-named tensor off
-    ``source`` (the ``PrefillInputBuffers``) instead of allocating, so the
-    registry shares one physical allocation (and ``data_ptr``) with it.
+    The piecewise / breakable runners pass ``source=None``, so the registry
+    allocates (and owns) these buffers directly; ``share_pool`` then coalesces
+    them through the process-wide pool. (A ``source`` object, if given, would be
+    adopted instead — one shared allocation with stable ``data_ptr``.)
     """
     reg = CudaGraphBufferRegistry(
         device=device,
