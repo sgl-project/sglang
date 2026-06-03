@@ -4405,9 +4405,7 @@ class ServerArgs:
         for key, value in _CUDA_COREDUMP_DEFAULTS.items():
             if key not in os.environ:
                 os.environ[key] = value
-                logger.info(
-                    "Auto-set %s=%s (from --crash-dump-folder)", key, value
-                )
+                logger.info("Auto-set %s=%s (from --crash-dump-folder)", key, value)
 
                 if key == "CUDA_COREDUMP_FILE":
                     # cuda curedump cannot write to a folder that does not exist,
