@@ -6,6 +6,7 @@ from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
+    validate_adaptive_initial_steps,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -237,23 +238,33 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
                 f,
             )
             f.flush()
-            params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
+            params = AdaptiveSpeculativeParams(initial_steps=5, cfg_path=f.name)
         self.assertEqual(params._bs_list, [1, 32])
-        # initial_steps joins the smallest-BS slot; larger slots stay as-is.
-        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 5])
+        # Slots are built straight from the config; the launch flag never pollutes
+        # them. initial_steps just selects the smallest slot's starting step.
+        self.assertEqual(params._slots[1].candidate_steps, [1, 5])
+        self.assertEqual(params._slots[1].current_steps, 5)
         self.assertEqual(params._slots[1].up_hysteresis, 0.3)
         self.assertEqual(params._slots[32].candidate_steps, [1, 2])
 
-    def test_initial_steps_joins_smallest_slot(self):
-        # initial_steps must stay in the candidate union so init_states reuses
-        # the worker's pre-built state instead of leaking it.
-        params = AdaptiveSpeculativeParams(initial_steps=5)
-        self.assertIn(5, params.candidate_steps)
-        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 5, 7])
+    def test_launch_flag_not_injected_into_slots(self):
+        # initial_steps lives only in a larger slot. It must NOT be merged into
+        # any other slot's candidates: slots come straight from the config.
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 5]},
+                    "8": {"candidate_steps": [1, 3, 7]},
+                },
+                f,
+            )
+            f.flush()
+            params = AdaptiveSpeculativeParams(initial_steps=7, cfg_path=f.name)
+        self.assertEqual(params._slots[1].candidate_steps, [1, 5])
+        self.assertEqual(params._slots[8].candidate_steps, [1, 3, 7])
+        # The slot that does not own initial_steps starts at its own median.
         self.assertEqual(params._slots[1].current_steps, 5)
-        # Larger-BS slots are not polluted by the launch flag.
-        self.assertEqual(params._slots[8].candidate_steps, [1, 3])
-        self.assertEqual(params._slots[32].candidate_steps, [1])
+        self.assertEqual(params._slots[8].current_steps, 7)
 
     def test_invalid_config_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -365,23 +376,50 @@ class TestBatchSizeRouting(unittest.TestCase):
 
 class TestResolveCandidateSteps(unittest.TestCase):
     def test_default_config(self):
-        steps = resolve_candidate_steps_from_config(initial_steps=3)
+        steps = resolve_candidate_steps_from_config()
         self.assertIn(1, steps)
         self.assertIn(3, steps)
         self.assertIn(7, steps)
-
-    def test_initial_steps_always_included(self):
-        steps = resolve_candidate_steps_from_config(initial_steps=99)
-        self.assertIn(99, steps)
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump({"1": {"candidate_steps": [2, 4]}}, f)
             f.flush()
-            steps = resolve_candidate_steps_from_config(
-                initial_steps=3, cfg_path=f.name
+            steps = resolve_candidate_steps_from_config(cfg_path=f.name)
+        self.assertEqual(steps, [2, 4])
+
+    def test_unions_and_dedups_across_slots(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 5]},
+                    "8": {"candidate_steps": [3, 5, 7]},
+                },
+                f,
             )
-        self.assertEqual(steps, [2, 3, 4])
+            f.flush()
+            steps = resolve_candidate_steps_from_config(cfg_path=f.name)
+        self.assertEqual(steps, [1, 3, 5, 7])
+
+
+class TestValidateAdaptiveInitialSteps(unittest.TestCase):
+    def test_accepts_value_from_any_slot(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 5]},
+                    "8": {"candidate_steps": [1, 3, 7]},
+                },
+                f,
+            )
+            f.flush()
+            # Membership in any slot is enough: 5 lives in the smallest slot,
+            # 7 only in a larger slot -- both accepted.
+            validate_adaptive_initial_steps(5, cfg_path=f.name)
+            validate_adaptive_initial_steps(7, cfg_path=f.name)
+            # 9 is in no slot -> rejected.
+            with self.assertRaises(ValueError):
+                validate_adaptive_initial_steps(9, cfg_path=f.name)
 
 
 if __name__ == "__main__":

@@ -116,15 +116,27 @@ def _load_adaptive_config(
 
 
 def resolve_candidate_steps_from_config(
-    initial_steps: int,
     cfg_path: str | None = None,
 ) -> list[int]:
-    """Load adaptive config and resolve candidate steps."""
+    """Union of every BS slot's candidate steps; sizes the runtime buffers."""
     _, bs_entries = _load_adaptive_config(cfg_path)
-    all_steps: set[int] = {initial_steps}
+    all_steps: set[int] = set()
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
     return sorted(all_steps)
+
+
+def validate_adaptive_initial_steps(
+    initial_steps: int,
+    cfg_path: str | None = None,
+) -> None:
+    """Require the initial step to be a candidate of some BS slot."""
+    candidate_steps = resolve_candidate_steps_from_config(cfg_path)
+    if initial_steps not in candidate_steps:
+        raise ValueError(
+            f"--speculative-num-steps={initial_steps} is not in the adaptive "
+            f"config candidate_steps {candidate_steps}. Pass one of those values."
+        )
 
 
 class AdaptiveStepSlot:
@@ -243,18 +255,10 @@ class AdaptiveSpeculativeParams:
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None
 
-        # Keep initial_steps in the smallest-BS slot so its candidate union
-        # covers the worker's pre-built state.
-        smallest_bs = self._bs_list[0]
         for bs, entry in sorted(bs_entries.items()):
-            merged = {**cfg, **entry}
-            if bs == smallest_bs:
-                merged["candidate_steps"] = sorted(
-                    set(merged["candidate_steps"]) | {initial_steps}
-                )
             self._slots[bs] = AdaptiveStepSlot(
                 initial_steps=initial_steps,
-                cfg=merged,
+                cfg={**cfg, **entry},
             )
 
         first_slot = self._slots[self._bs_list[0]]

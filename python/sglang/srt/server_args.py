@@ -7244,7 +7244,6 @@ class ServerArgs:
         )
 
         candidate_steps = resolve_candidate_steps_from_config(
-            initial_steps=self.speculative_num_steps,
             cfg_path=self.speculative_adaptive_config,
         )
         # TODO: adaptive spec currently requires topk=1, so each runtime state
