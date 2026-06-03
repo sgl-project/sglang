@@ -206,7 +206,7 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
-            self._move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
+            self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
 
@@ -356,7 +356,7 @@ class SchedulerBatchResultProcessor:
                 embeddings = [tensor.tolist() for tensor in embeddings]
         return embeddings
 
-    def _move_logprobs_to_cpu(
+    def move_logprobs_to_cpu(
         self,
         *,
         batch: ScheduleBatch,
