@@ -141,9 +141,6 @@ class TransformerLoader(ComponentLoader):
         for post_load_hook in quant_spec.post_load_hooks:
             post_load_hook(model)
 
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
-
         # considering the existent of mixed-precision models (e.g., nunchaku)
         if (
             next(model.parameters()).dtype != quant_spec.param_dtype

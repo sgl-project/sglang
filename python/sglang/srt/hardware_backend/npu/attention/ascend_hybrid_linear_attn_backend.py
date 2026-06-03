@@ -131,9 +131,13 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        num_padding = torch.count_nonzero(
-            seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-        )
+        # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
+        if seq_lens_cpu is None:
+            num_padding = 0
+        else:
+            num_padding = torch.count_nonzero(
+                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+            )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -219,7 +223,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
 
     def update_mamba_state_after_mtp_verify(
         self,
-        accepted_steps: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
@@ -233,7 +237,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        request_number = accepted_steps.shape[0]
+        request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -254,7 +258,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             device=dst_indices_tensor.device,
             dtype=torch.int64,
         )
-        last_steps = accepted_steps.to(torch.int64)  # [N]
+        last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
         move_intermediate_cache(
             ssm_states,

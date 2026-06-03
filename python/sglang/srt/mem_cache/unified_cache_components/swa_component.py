@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LRURefreshPhase,
     TreeComponent,
     next_component_uuid,
 )
@@ -60,6 +61,31 @@ class SWAComponent(TreeComponent):
             full_indices
         )
 
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                # Walk-down would refresh every visited ancestor to MRU,
+                # but most are outside the active sliding window and must
+                # stay evictable. Window-bounded refresh runs at
+                # MATCH_END / INSERT_END instead.
+                return
+            case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
+                self.cache.lru_lists[
+                    self.component_type
+                ].reset_node_and_window_ancestors_mru(
+                    node,
+                    root_node,
+                    self.sliding_window_size + self.cache.page_size,
+                    self.node_has_component_data,
+                )
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
+
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type
         node.component_data[ct].value = value
@@ -69,7 +95,9 @@ class SWAComponent(TreeComponent):
         self.cache.lru_lists[ct].insert_mru(node)
         self.cache.component_evictable_size_[ct] += len(value)
 
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
@@ -78,7 +106,7 @@ class SWAComponent(TreeComponent):
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
-            if cd.value is None and cd.host_value is None:
+            if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
                 return False
             state["len"] += len(node.key)
@@ -95,11 +123,12 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
-        node = result.last_device_node
+        node = result.best_match_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
             if cd.value is None and cd.host_value is not None:
+                # TODO(ispobock): refactor host_hit_length usage
                 return result._replace(host_hit_length=max(result.host_hit_length, 1))
             if cd.value is not None:
                 n_swa += len(cd.value)
@@ -232,6 +261,32 @@ class SWAComponent(TreeComponent):
             node.component_data[self.component_type].value = swa_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+        else:
+            # Entire leaf is outside the SWA window — left as a tombstone.
+            return
+
+        self._maybe_split_leaf_for_swa_lock(node)
+
+    def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
+        """Cap a fresh SWA leaf at one page-aligned window so locking it pins
+        only one window of SWA pool, not the whole (long chunked-prefill) leaf.
+        """
+        ct = self.component_type
+        cd = leaf.component_data[ct]
+        if leaf is self.cache.root_node or cd.value is None or cd.lock_ref > 0:
+            return
+
+        page_size = self.cache.page_size
+        # Smallest page-aligned size that still covers the sliding window.
+        tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
+        leaf_len = len(leaf.key)
+        if leaf_len <= tail_size:
+            return
+        split_at = leaf_len - tail_size
+        if page_size > 1 and (split_at % page_size != 0 or leaf_len % page_size != 0):
+            return
+
+        self.cache._split_node(leaf.key, leaf, split_at)
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -347,7 +402,10 @@ class SWAComponent(TreeComponent):
                 x = x_next
 
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
         root = self.cache.root_node
@@ -362,6 +420,7 @@ class SWAComponent(TreeComponent):
         while cur != root and swa_lock_size < sliding_window_size:
             comp = cur.component_data[ct]
             if comp.value is None:
+                result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
                 cur = cur.parent
                 continue
             if comp.lock_ref == 0:
@@ -380,19 +439,24 @@ class SWAComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
         ct = self.component_type
         root = self.cache.root_node
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
+        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         dec_swa = True
 
-        # lock_ref == 0 means acquire_component_lock skipped this node
-        # (tombstone at acquire time) or load_back revived a tombstone between
-        # acquire and release. Either way, there is nothing for us to undo here.
+        # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         cur = node
         while cur != root and dec_swa:
             comp = cur.component_data[ct]
+            if cur.id in skip_lock_node_ids:
+                cur = cur.parent
+                continue
             if comp.lock_ref == 0:
                 cur = cur.parent
                 continue
@@ -437,11 +501,14 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
+            # `node` is best_match_node; the SWA validator guarantees every
+            # ancestor within `sliding_window_size` has value or host_value.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []
-            while node is not self.cache.root_node and n_swa < self.sliding_window_size:
-                cd = node.component_data[ct]
+            cur = node
+            while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
+                cd = cur.component_data[ct]
                 assert cd.host_value is not None or cd.value is not None
                 if cd.value is not None:
                     # device exists, skip it
@@ -449,9 +516,9 @@ class SWAComponent(TreeComponent):
                 else:
                     # host only, collect it
                     backed_up.append(cd.host_value)
-                    nodes.append(node)
+                    nodes.append(cur)
                     n_swa += len(cd.host_value)
-                node = node.parent
+                cur = cur.parent
 
             if not backed_up:
                 return None
@@ -475,6 +542,7 @@ class SWAComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        **kw,
     ) -> None:
         ct = self.component_type
 

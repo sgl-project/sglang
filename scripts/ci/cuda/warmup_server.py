@@ -11,8 +11,7 @@ invalidated when Python, Triton, or PyTorch versions change.
 
 Usage:
     python3 scripts/ci/cuda/warmup_server.py \
-        deepseek-ai/DeepSeek-V3-0324:8 \
-        inclusionAI/Ring-2.5-1T:8
+        deepseek-ai/DeepSeek-V3-0324:8
 """
 
 import hashlib
@@ -87,23 +86,41 @@ def write_marker(model, tp):
 
 def kill_server(proc):
     """Kill server process tree."""
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, OSError):
-        pass
-    try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
+    if proc.poll() is None:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except (ProcessLookupError, OSError):
             pass
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    # sglang's scheduler_TP* and detokenizer workers spawn through
+    # multiprocessing with their own session/process group, so they escape
+    # killpg on launch_server and stay alive holding GPU memory after a
+    # readiness-timeout or unclean exit. Kill any survivors by name so the
+    # next model (or the next CI step) starts with empty GPUs.
+    for pattern in ("sglang::scheduler", "sglang::detokenizer"):
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                timeout=5,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
+    # Let the driver release device memory before the caller measures it.
+    time.sleep(2)
 
 
 def wait_for_server(base_url, proc, timeout):
@@ -192,15 +209,6 @@ def warmup_one_model(model, tp, port):
         ok, err = wait_for_server(base_url, proc, SERVER_STARTUP_TIMEOUT)
         if not ok:
             print(f"  Warning: server not ready: {err}")
-            # Dump last lines of server log for debugging
-            try:
-                log_file.flush()
-                with open(log_path) as f:
-                    lines = f.readlines()
-                for line in lines[-20:]:
-                    print(f"    | {line.rstrip()}")
-            except Exception:
-                pass
             return False
 
         print("  Server ready, sending generate request...")
@@ -208,6 +216,20 @@ def warmup_one_model(model, tp, port):
         return True
 
     finally:
+        # Surface the tail of the server log so CI captures validation
+        # messages, exceptions, and warmup progress (the launch_server
+        # subprocess writes stdout/stderr to the tempfile, not our stdout).
+        try:
+            log_file.flush()
+            with open(log_path) as f:
+                lines = f.readlines()
+            print(f"  --- server log tail ({len(lines)} lines, last 30) ---")
+            for line in lines[-30:]:
+                print(f"    | {line.rstrip()}")
+            print("  --- end server log ---")
+        except Exception:
+            pass
+
         print("  Killing server...")
         kill_server(proc)
         log_file.close()

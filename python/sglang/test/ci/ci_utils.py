@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -5,7 +6,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
@@ -110,6 +111,19 @@ def write_github_step_summary(content: str):
             f.write(content)
 
 
+def _repo_relative_path(p: str) -> str:
+    """Return path stripped to repo-relative form (e.g. 'test/srt/foo.py').
+
+    Used in the machine-readable TIMINGS block so downstream scrapers
+    get a stable key regardless of CI runner checkout layout.
+    """
+    if not os.path.isabs(p):
+        p = os.path.join(os.getcwd(), p)
+    marker = "/sglang/"
+    idx = p.rfind(marker)
+    return p[idx + len(marker) :] if idx >= 0 else p
+
+
 def run_unittest_files(
     files: Union[List[TestFile], List[CIRegistry]],
     timeout_per_file: float,
@@ -140,6 +154,9 @@ def run_unittest_files(
     passed_tests = []
     failed_tests = []
     retried_tests = []  # Track which tests were retried
+    # Per-file elapsed seconds, latest attempt wins. Consumed by the
+    # TIMINGS block emitted at the end of this function.
+    file_elapsed: Dict[str, float] = {}
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -181,6 +198,7 @@ def run_unittest_files(
                 process.wait()
 
             elapsed = time.perf_counter() - file_tic
+            file_elapsed[filename] = elapsed
 
             logger.info(
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
@@ -247,6 +265,10 @@ def run_unittest_files(
             except TimeoutError:
                 kill_process_tree(process.pid)
                 time.sleep(5)
+                # TimeoutError aborts run_one_file before its elapsed write;
+                # record the timeout cap as an upper bound so the file still
+                # appears in the TIMINGS block below.
+                file_elapsed[filename] = float(timeout_per_file)
                 logger.info(
                     f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n"
                 )
@@ -289,6 +311,26 @@ def run_unittest_files(
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
     logger.info(f"{'='*60}\n")
+
+    # Machine-readable timings block for downstream scrapers/dashboards.
+    # One JSON object per executed file (post-retry: only the latest
+    # attempt's elapsed is recorded). Files skipped via fail-fast
+    # (continue_on_error=False) are omitted. Job wall-clock is read
+    # separately from the GitHub Actions API by consumers, so we don't
+    # emit any aggregate fields here.
+    passed_set = set(passed_tests)
+    logger.info("========== TIMINGS BEGIN ==========")
+    for fname, elapsed in file_elapsed.items():
+        logger.info(
+            json.dumps(
+                {
+                    "file": _repo_relative_path(fname),
+                    "passed": fname in passed_set,
+                    "elapsed": round(elapsed),
+                }
+            )
+        )
+    logger.info("========== TIMINGS END ==========")
 
     # Write GitHub Step Summary only if retries occurred
     if retried_tests:
