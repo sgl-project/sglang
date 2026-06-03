@@ -114,8 +114,6 @@ def apply_flashinfer_rope_qk_inplace(
     )
 
     if not use_flashinfer:
-        # Safe fallback for non-CUDA tensors, GQA layouts, or missing FlashInfer.
-
         if flashinfer_apply_rope_inplace is None:
             _warn_about_missing_flashinfer()
 
