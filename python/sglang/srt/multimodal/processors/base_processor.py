@@ -211,6 +211,16 @@ class BaseMultimodalProcessor(ABC):
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
+        # Dedicated pool to offload the sync HF processor (process_and_combine_mm_data,
+        # which tokenizes text + resize/patchifies images, ~hundreds of ms) off the
+        # TokenizerManager event loop so concurrent image requests don't serialize on
+        # it. Separate from io_executor so it doesn't starve image decode/fetch. Safe
+        # because the shared HF fast tokenizer is wrapped thread-safe at TM init (see
+        # TokenizerManager.maybe_init_thread_safe_tokenizer / thread_safe_tokenizer.py).
+        self.mm_processor_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=envs.SGLANG_MM_PROC_WORKERS.get(),
+            thread_name_prefix="sgl-mmproc",
+        )
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {

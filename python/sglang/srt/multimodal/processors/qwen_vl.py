@@ -1,3 +1,5 @@
+import asyncio
+import functools
 import math
 import os
 import re
@@ -706,16 +708,28 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
         ):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            _proc = functools.partial(
+                self.process_and_combine_mm_data,
                 base_output,
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
             )
         else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+            _proc = functools.partial(
+                self.process_and_combine_mm_data, base_output, self.mm_tokens
             )
+
+        # Offload the heavy sync HF processor (tokenize + resize/patchify) off the
+        # TokenizerManager event loop so concurrent (esp. URL) requests don't
+        # serialize on it. Safe because the shared fast tokenizer is wrapped
+        # thread-safe at TM init. Gated by SGLANG_ENABLE_MM_PROCESSOR_OFFLOAD.
+        if envs.SGLANG_ENABLE_MM_PROCESSOR_OFFLOAD.get():
+            mm_items, input_ids, ret = await asyncio.get_running_loop().run_in_executor(
+                self.mm_processor_executor, _proc
+            )
+        else:
+            mm_items, input_ids, ret = _proc()
 
         audio_feature_lengths = None
 
