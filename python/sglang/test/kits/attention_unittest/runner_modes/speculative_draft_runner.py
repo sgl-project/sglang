@@ -588,10 +588,7 @@ class _DenseEagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(
-        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
-    ):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -627,10 +624,7 @@ class _FrozenKVMTPDenseDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(
-        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
-    ):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1016,10 +1010,7 @@ class _MLAEagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(
-        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
-    ):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1274,10 +1265,7 @@ class _DSV4EagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(
-        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
-    ):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1576,10 +1564,7 @@ class _DSAEagleDraftForward:
             torch.full_like(indices, -1),
         )
 
-    def __call__(
-        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
-    ):
-        del skip_attn_backend_init
+    def __call__(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
