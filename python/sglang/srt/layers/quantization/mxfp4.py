@@ -1288,7 +1288,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
-                swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+                swiglu_limit=self.moe_runner_config.gemm1_clamp_limit
+                or self.moe_runner_config.swiglu_limit
+                or 0.0,
             )
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
