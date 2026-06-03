@@ -105,7 +105,6 @@ class TestSelectLatestRun(CustomTestCase):
     def test_picks_highest_recency(self):
         rows = _make_rows(3)
         result = hfs._select_latest_run(rows, model="org/model")
-        # Last row has highest push_index
         self.assertEqual(result, rows[-1]["run_path"])
 
     def test_filters_by_model(self):
@@ -160,9 +159,10 @@ class TestSelectLatestRun(CustomTestCase):
 
 
 class TestReadManifest(CustomTestCase):
+    """All HF imports are now at module level, so standard patch paths work."""
+
     @patch("sglang.test.precision_baseline_store.hf_hub_download")
-    @patch("sglang.test.precision_baseline_store._with_retries")
-    def test_parses_valid_manifest(self, mock_retries, mock_download):
+    def test_parses_valid_manifest(self, mock_download):
         content = (
             '{"model":"a","run_path":"p1","push_index":1}\n'
             '{"model":"b","run_path":"p2","push_index":2}\n'
@@ -171,7 +171,7 @@ class TestReadManifest(CustomTestCase):
         try:
             tmp.write(content)
             tmp.close()
-            mock_retries.return_value = tmp.name
+            mock_download.return_value = tmp.name
             rows, text = hfs._read_manifest(_make_config())
         finally:
             os.unlink(tmp.name)
@@ -180,8 +180,7 @@ class TestReadManifest(CustomTestCase):
         self.assertEqual(text, content)
 
     @patch("sglang.test.precision_baseline_store.hf_hub_download")
-    @patch("sglang.test.precision_baseline_store._with_retries")
-    def test_skips_blank_and_corrupt_lines(self, mock_retries, mock_download):
+    def test_skips_blank_and_corrupt_lines(self, mock_download):
         content = (
             '{"model":"a","run_path":"p1"}\n\nnot-json\n{"model":"b","run_path":"p2"}\n'
         )
@@ -189,41 +188,36 @@ class TestReadManifest(CustomTestCase):
         try:
             tmp.write(content)
             tmp.close()
-            mock_retries.return_value = tmp.name
+            mock_download.return_value = tmp.name
             rows, _ = hfs._read_manifest(_make_config())
         finally:
             os.unlink(tmp.name)
         self.assertEqual(len(rows), 2)
 
     @patch("sglang.test.precision_baseline_store.hf_hub_download")
-    @patch("sglang.test.precision_baseline_store._with_retries")
-    def test_returns_empty_on_not_found(self, mock_retries, mock_download):
+    def test_returns_empty_on_not_found(self, mock_download):
         from huggingface_hub.errors import EntryNotFoundError
 
-        mock_retries.side_effect = EntryNotFoundError("not found")
+        mock_download.side_effect = EntryNotFoundError("not found")
         rows, text = hfs._read_manifest(_make_config())
         self.assertEqual(rows, [])
         self.assertEqual(text, "")
 
 
 class TestFetchLatestBaseline(CustomTestCase):
-    @patch("sglang.test.precision_baseline_store._read_manifest")
-    @patch("sglang.test.precision_baseline_store._with_retries")
     @patch("sglang.test.precision_baseline_store.snapshot_download")
-    def test_downloads_and_copies_tensors(
-        self, mock_snapshot, mock_retries, mock_manifest
-    ):
+    @patch.object(hfs, "_read_manifest")
+    def test_downloads_and_copies_tensors(self, mock_manifest, mock_snapshot):
         rows = [
             {"model": "org/m", "run_path": "org__m/2025/01/01/run-abc", "push_index": 1}
         ]
         mock_manifest.return_value = (rows, "")
 
-        # snapshot_download returns a dir with fake tensor files
         with tempfile.TemporaryDirectory() as snap_dir:
             tensors = Path(snap_dir) / "org__m/2025/01/01/run-abc/tensors"
             tensors.mkdir(parents=True)
             (tensors / "layer0.pt").write_bytes(b"\x00")
-            mock_retries.return_value = snap_dir
+            mock_snapshot.return_value = snap_dir
 
             with tempfile.TemporaryDirectory() as target:
                 result = hfs.fetch_latest_baseline(
@@ -233,7 +227,7 @@ class TestFetchLatestBaseline(CustomTestCase):
                 )
             self.assertEqual(result, "org__m/2025/01/01/run-abc")
 
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     def test_returns_none_when_no_runs(self, mock_manifest):
         mock_manifest.return_value = ([], "")
         with tempfile.TemporaryDirectory() as target:
@@ -244,10 +238,9 @@ class TestFetchLatestBaseline(CustomTestCase):
             )
         self.assertIsNone(result)
 
-    @patch("sglang.test.precision_baseline_store._read_manifest")
-    @patch("sglang.test.precision_baseline_store._with_retries")
     @patch("sglang.test.precision_baseline_store.snapshot_download")
-    def test_passes_capture_signature(self, mock_snapshot, mock_retries, mock_manifest):
+    @patch.object(hfs, "_read_manifest")
+    def test_passes_capture_signature(self, mock_manifest, mock_snapshot):
         rows = [
             {
                 "model": "org/m",
@@ -268,7 +261,7 @@ class TestFetchLatestBaseline(CustomTestCase):
             tensors = Path(snap_dir) / "run_new/tensors"
             tensors.mkdir(parents=True)
             (tensors / "layer0.pt").write_bytes(b"\x00")
-            mock_retries.return_value = snap_dir
+            mock_snapshot.return_value = snap_dir
 
             with tempfile.TemporaryDirectory() as target:
                 result = hfs.fetch_latest_baseline(
@@ -282,7 +275,7 @@ class TestFetchLatestBaseline(CustomTestCase):
 
 class TestPushRun(CustomTestCase):
     @patch("sglang.test.precision_baseline_store.HfApi")
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
     def test_uploads_tensors_and_manifest(self, mock_ns, mock_manifest, mock_api_cls):
         mock_manifest.return_value = ([], "")
@@ -303,7 +296,6 @@ class TestPushRun(CustomTestCase):
 
         mock_api.upload_folder.assert_called_once()
         mock_api.upload_file.assert_called_once()
-        # Verify manifest row was appended
         upload_call = mock_api.upload_file.call_args
         manifest_path = upload_call[1]["path_or_fileobj"]
         with open(manifest_path) as f:
@@ -315,7 +307,7 @@ class TestPushRun(CustomTestCase):
         self.assertTrue(run_path.startswith("org__m/"))
 
     @patch("sglang.test.precision_baseline_store.HfApi")
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
     def test_skips_existing_tensors_unless_force(
         self, mock_ns, mock_manifest, mock_api_cls
@@ -340,16 +332,13 @@ class TestPushRun(CustomTestCase):
                 meta={"tp_size": 8},
             )
 
-        # upload_folder should still be called (for meta.json) but tensors
-        # dir inside the staged run should not contain .pt files.
-        # Verify by checking the staged folder_path in upload_folder call.
         folder_call = mock_api.upload_folder.call_args
         staged_path = Path(folder_call[1]["folder_path"])
         pt_files = list(staged_path.rglob("*.pt"))
         self.assertEqual(len(pt_files), 0)
 
     @patch("sglang.test.precision_baseline_store.HfApi")
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
     def test_force_re_uploads(self, mock_ns, mock_manifest, mock_api_cls):
         existing_row = {
@@ -379,7 +368,7 @@ class TestPushRun(CustomTestCase):
         self.assertGreater(len(pt_files), 0)
 
     @patch("sglang.test.precision_baseline_store.HfApi")
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
     def test_manifest_row_promotes_keys(self, mock_ns, mock_manifest, mock_api_cls):
         mock_manifest.return_value = ([], "")
@@ -419,12 +408,11 @@ class TestPushRun(CustomTestCase):
         self.assertNotIn("extra_key_not_promoted", row)
 
     @patch("sglang.test.precision_baseline_store.HfApi")
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     @patch("sglang.test.precision_baseline_store.time_ns", return_value=42)
     def test_includes_comparator_report(self, mock_ns, mock_manifest, mock_api_cls):
         mock_manifest.return_value = ([], "")
-        mock_api = MagicMock()
-        mock_api_cls.return_value = mock_api
+        mock_api_cls.return_value = MagicMock()
 
         with tempfile.TemporaryDirectory() as tensor_dir:
             (Path(tensor_dir) / "layer0.pt").write_bytes(b"\x01")
@@ -440,14 +428,13 @@ class TestPushRun(CustomTestCase):
                 comparator_report=report_path,
             )
 
-        # The staged upload folder should contain comparator_report.jsonl
-        folder_call = mock_api.upload_folder.call_args
+        folder_call = mock_api_cls.return_value.upload_folder.call_args
         staged = Path(folder_call[1]["folder_path"])
         self.assertTrue((staged / "comparator_report.jsonl").exists())
 
 
 class TestPruneOldRuns(CustomTestCase):
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     def test_keeps_recent_runs(self, mock_manifest):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         rows = [
@@ -458,7 +445,7 @@ class TestPruneOldRuns(CustomTestCase):
         self.assertIn("recent", result["kept"])
         self.assertEqual(result["pruned"], [])
 
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     def test_archives_one_per_week(self, mock_manifest):
         rows = [
             {"model": "org/m", "run_path": "old1", "date": "2020-01-06"},
@@ -469,12 +456,11 @@ class TestPruneOldRuns(CustomTestCase):
         result = hfs.prune_old_runs(
             config=_make_config(), keep_days=0, weekly_archive=True, dry_run=True
         )
-        # One per week should be kept (the last one)
         self.assertEqual(len(result["kept"]), 1)
         self.assertEqual(result["kept"][0], "old3")
         self.assertEqual(len(result["pruned"]), 2)
 
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     def test_prune_without_archive(self, mock_manifest):
         rows = [
             {"model": "org/m", "run_path": "old1", "date": "2020-01-06"},
@@ -488,7 +474,7 @@ class TestPruneOldRuns(CustomTestCase):
         self.assertEqual(len(result["pruned"]), 2)
 
     @patch("sglang.test.precision_baseline_store.HfApi")
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     def test_dry_run_does_not_delete(self, mock_manifest, mock_api_cls):
         rows = [
             {"model": "org/m", "run_path": "old1", "date": "2020-01-06"},
@@ -500,9 +486,8 @@ class TestPruneOldRuns(CustomTestCase):
         mock_api_cls.return_value.delete_folder.assert_not_called()
 
     @patch("sglang.test.precision_baseline_store.HfApi")
-    @patch("sglang.test.precision_baseline_store._with_retries")
-    @patch("sglang.test.precision_baseline_store._read_manifest")
-    def test_live_mode_deletes(self, mock_manifest, mock_retries, mock_api_cls):
+    @patch.object(hfs, "_read_manifest")
+    def test_live_mode_deletes(self, mock_manifest, mock_api_cls):
         rows = [
             {"model": "org/m", "run_path": "old1", "date": "2020-01-06"},
             {"model": "org/m", "run_path": "old2", "date": "2020-01-07"},
@@ -510,18 +495,16 @@ class TestPruneOldRuns(CustomTestCase):
         mock_manifest.return_value = (rows, "")
         mock_api = MagicMock()
         mock_api_cls.return_value = mock_api
-        mock_retries.side_effect = lambda op, **kw: op()
 
         result = hfs.prune_old_runs(
             config=_make_config(), keep_days=0, weekly_archive=True, dry_run=False
         )
-        # One kept (weekly archive), one pruned
         self.assertEqual(len(result["kept"]), 1)
         self.assertEqual(len(result["pruned"]), 1)
         mock_api.upload_file.assert_called_once()
         mock_api.delete_folder.assert_called_once()
 
-    @patch("sglang.test.precision_baseline_store._read_manifest")
+    @patch.object(hfs, "_read_manifest")
     def test_filters_by_model(self, mock_manifest):
         rows = [
             {"model": "org/m1", "run_path": "m1_old", "date": "2020-01-06"},
@@ -535,7 +518,6 @@ class TestPruneOldRuns(CustomTestCase):
             weekly_archive=False,
             dry_run=True,
         )
-        # m2 should be kept (not targeted), m1 pruned
         self.assertIn("m2_old", result["kept"])
         self.assertIn("m1_old", result["pruned"])
 

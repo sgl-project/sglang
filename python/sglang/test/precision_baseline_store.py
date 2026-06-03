@@ -18,6 +18,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub.errors import (
+    EntryNotFoundError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+)
+
 
 @dataclass
 class HfStoreConfig:
@@ -61,11 +68,6 @@ def _with_retries(
     base_delay: float = 2.0,
 ) -> _T:
     """Exponential backoff on 429/5xx; auth/404 raise immediately."""
-    try:
-        from huggingface_hub.errors import HfHubHTTPError
-    except Exception:
-        HfHubHTTPError = Exception  # type: ignore[misc,assignment]
-
     last_exc: Optional[BaseException] = None
     for attempt in range(1, attempts + 1):
         try:
@@ -127,8 +129,6 @@ def fetch_latest_baseline(
 ) -> Optional[str]:
     # Tensors land flat in target_tensors_dir (no enclosing tensors/) so the
     # caller can treat it like a fresh dump dir.
-    from huggingface_hub import snapshot_download
-
     rows, _ = _read_manifest(config)
     run_path = _select_latest_run(
         rows, model=model, capture_signature=capture_signature
@@ -158,9 +158,6 @@ def fetch_latest_baseline(
 
 def _read_manifest(config: HfStoreConfig) -> tuple[list[dict[str, Any]], str]:
     # Skip corrupt rows rather than bricking the store on a partial write.
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
-
     try:
         manifest_local = _with_retries(
             lambda: hf_hub_download(
@@ -212,8 +209,6 @@ def push_run(
     # Dedup: same model+date+sha → skip tensor upload but still refresh meta
     # + comparator_report + append a new manifest row, so pass-1 baseline and
     # pass-2 stats both land. force=True re-uploads tensors too.
-    from huggingface_hub import HfApi
-
     api = HfApi()
     date_str, date_path = _today_path()
     model_sanitized = _sanitize_model_name(model)
@@ -305,8 +300,6 @@ def prune_old_runs(
     # dry_run defaults True because model=None+keep_days=0 would wipe the
     # store. Live mode rewrites the manifest before deleting folders so a
     # mid-run failure leaves manifest pointing at the kept rows only.
-    from huggingface_hub import HfApi
-
     api = HfApi()
     rows, _ = _read_manifest(config)
     if not rows:
