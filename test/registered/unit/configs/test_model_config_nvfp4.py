@@ -5,22 +5,35 @@ Covers `ModelConfig._load_hf_quant_config_dict` (raw JSON load) and
 extraction) — the two pieces that recognise a hybrid FP8(linear)+NVFP4(MoE)
 checkpoint such as ``nvidia/DeepSeek-V4-Pro-NVFP4``.
 
-Both methods only read ``self.model_path`` and ``self.revision``, so the
-tests call them on a ``SimpleNamespace`` stub and avoid constructing a
-real ``ModelConfig`` (which would require an HF model on disk).
+Both methods only read ``self.model_path`` and ``self.revision``. A
+minimal stub class binds them as methods so we avoid constructing a real
+``ModelConfig`` (which would require an HF model on disk) while still
+letting one helper call the other through ``self``.
 """
 
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class _ModelConfigStub:
+    """Minimal stand-in for `ModelConfig` exposing only the two helpers
+    the NVFP4 hybrid path needs. Binds the real methods at class level so
+    `_extract_nvfp4_moe_meta` can call `self._load_hf_quant_config_dict()`."""
+
+    _load_hf_quant_config_dict = ModelConfig._load_hf_quant_config_dict
+    _extract_nvfp4_moe_meta = ModelConfig._extract_nvfp4_moe_meta
+
+    def __init__(self, model_path: str, revision: str | None = None) -> None:
+        self.model_path = model_path
+        self.revision = revision
 
 
 def _write_hf_quant_config(model_dir: Path, body: dict) -> None:
@@ -67,16 +80,12 @@ def _dsv4_pro_nvfp4_body(num_layers: int = 2, num_experts: int = 2) -> dict:
 class TestLoadHfQuantConfigDict(CustomTestCase):
     """`_load_hf_quant_config_dict` returns the raw JSON dict or None."""
 
-    def _make_stub(self, model_path: str):
-        return SimpleNamespace(model_path=model_path, revision=None)
-
     def test_loads_local_hf_quant_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             body = _dsv4_pro_nvfp4_body()
             _write_hf_quant_config(Path(tmpdir), body)
-            stub = self._make_stub(tmpdir)
 
-            loaded = ModelConfig._load_hf_quant_config_dict(stub)
+            loaded = _ModelConfigStub(tmpdir)._load_hf_quant_config_dict()
 
             self.assertEqual(loaded, body)
             self.assertEqual(loaded["producer"]["version"], "dsv4-nvfp4-experts")
@@ -84,23 +93,17 @@ class TestLoadHfQuantConfigDict(CustomTestCase):
     def test_returns_none_when_file_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             # No hf_quant_config.json written.
-            stub = self._make_stub(tmpdir)
-
-            self.assertIsNone(ModelConfig._load_hf_quant_config_dict(stub))
+            self.assertIsNone(_ModelConfigStub(tmpdir)._load_hf_quant_config_dict())
 
 
 class TestExtractNvfp4MoeMeta(CustomTestCase):
     """`_extract_nvfp4_moe_meta` returns {group_size, exclude_modules} or None."""
 
-    def _make_stub(self, model_path: str):
-        return SimpleNamespace(model_path=model_path, revision=None)
-
     def test_extracts_dsv4_pro_nvfp4_shape(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             _write_hf_quant_config(Path(tmpdir), _dsv4_pro_nvfp4_body())
-            stub = self._make_stub(tmpdir)
 
-            meta = ModelConfig._extract_nvfp4_moe_meta(stub)
+            meta = _ModelConfigStub(tmpdir)._extract_nvfp4_moe_meta()
 
             self.assertIsNotNone(meta)
             self.assertEqual(meta["group_size"], 16)
@@ -108,17 +111,14 @@ class TestExtractNvfp4MoeMeta(CustomTestCase):
 
     def test_returns_none_when_file_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            stub = self._make_stub(tmpdir)
-
-            self.assertIsNone(ModelConfig._extract_nvfp4_moe_meta(stub))
+            self.assertIsNone(_ModelConfigStub(tmpdir)._extract_nvfp4_moe_meta())
 
     def test_returns_none_when_no_quantized_layers(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             body = {"quantization": {"quant_algo": None}}  # no quantized_layers
             _write_hf_quant_config(Path(tmpdir), body)
-            stub = self._make_stub(tmpdir)
 
-            self.assertIsNone(ModelConfig._extract_nvfp4_moe_meta(stub))
+            self.assertIsNone(_ModelConfigStub(tmpdir)._extract_nvfp4_moe_meta())
 
     def test_returns_none_when_no_nvfp4_entries(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -134,9 +134,8 @@ class TestExtractNvfp4MoeMeta(CustomTestCase):
                 },
             }
             _write_hf_quant_config(Path(tmpdir), body)
-            stub = self._make_stub(tmpdir)
 
-            self.assertIsNone(ModelConfig._extract_nvfp4_moe_meta(stub))
+            self.assertIsNone(_ModelConfigStub(tmpdir)._extract_nvfp4_moe_meta())
 
     def test_accepts_group_size_key_instead_of_awq_block_size(self):
         # `_extract_nvfp4_moe_meta` falls back to "group_size" if
@@ -156,9 +155,8 @@ class TestExtractNvfp4MoeMeta(CustomTestCase):
                 },
             }
             _write_hf_quant_config(Path(tmpdir), body)
-            stub = self._make_stub(tmpdir)
 
-            meta = ModelConfig._extract_nvfp4_moe_meta(stub)
+            meta = _ModelConfigStub(tmpdir)._extract_nvfp4_moe_meta()
 
             self.assertIsNotNone(meta)
             self.assertEqual(meta["group_size"], 32)
@@ -178,9 +176,8 @@ class TestExtractNvfp4MoeMeta(CustomTestCase):
                 },
             }
             _write_hf_quant_config(Path(tmpdir), body)
-            stub = self._make_stub(tmpdir)
 
-            meta = ModelConfig._extract_nvfp4_moe_meta(stub)
+            meta = _ModelConfigStub(tmpdir)._extract_nvfp4_moe_meta()
 
             self.assertIsNotNone(meta)
             self.assertEqual(meta["exclude_modules"], [])
