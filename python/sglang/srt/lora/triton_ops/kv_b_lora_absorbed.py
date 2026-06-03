@@ -74,12 +74,12 @@ _BLOCK_S = 16
 # Tuned per kernel (B200; H=16, kv_lora_rank=512, qk_nope=v_head_dim=128, rank 16/32).
 # The a/b pair don't share: step_a contracts a wide K into a tiny N=rank output,
 # step_b is the inverse, so they want opposite tiles.
+# step_a output N == rank, so BLOCK_N = next_power_of_2(rank) (set per call) covers it
+# in one tile and adapts to any rank (16/32/64/...), like sgemm/qkv's BLOCK_R.
 _STEP_A_Q_BLOCK_K = 128  # step_a_q: K=qk_nope (~128) -> single contraction block
-_STEP_A_Q_BLOCK_N = 16  # output is rank
 _STEP_A_V_BLOCK_K = (
     256  # step_a_v: K=kv_lora_rank (~512); 256 -> 2 iters (was 8) ~-25..-40%
 )
-_STEP_A_V_BLOCK_N = 32  # output is rank; 32 covers rank-32 in one tile
 _STEP_B_BLOCK_K = 16  # step_b contraction is rank (q and v agree here)
 _STEP_B_Q_BLOCK_N = 128  # step_b_q output is kv_lora_rank (~512); 128 ~-6..-16%
 _STEP_B_V_BLOCK_N = 64  # step_b_v output is v_head_dim (~128); 64 already optimal
@@ -248,13 +248,14 @@ def step_a_q_fwd(
     """
     S, H, qk_nope_dim = q_nope.shape
     rank = B_buf.shape[-1]
+    block_n = triton.next_power_of_2(rank)  # output N == rank -> one tile
     out = torch.empty((S, H, rank), device=q_nope.device, dtype=q_nope.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
 
     grid = (
-        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_Q_BLOCK_N),
+        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, block_n),
         H,
         segment_grid,
     )
@@ -285,7 +286,7 @@ def step_a_q_fwd(
         FULL_K=full_K_per_head,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_A_Q_BLOCK_N,
+        BLOCK_N=block_n,
         BLOCK_K=_STEP_A_Q_BLOCK_K,
     )
     return out
@@ -621,13 +622,14 @@ def step_a_v_fwd(
     """
     S, H, kv_lora_rank = attn_output.shape
     rank = A_buf.shape[1]
+    block_n = triton.next_power_of_2(rank)  # output N == rank -> one tile
     out = torch.empty((S, H, rank), device=attn_output.device, dtype=attn_output.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
 
     grid = (
-        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_V_BLOCK_N),
+        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, block_n),
         H,
         segment_grid,
     )
@@ -656,7 +658,7 @@ def step_a_v_fwd(
         num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_A_V_BLOCK_N,
+        BLOCK_N=block_n,
         BLOCK_K=_STEP_A_V_BLOCK_K,
     )
     return out
