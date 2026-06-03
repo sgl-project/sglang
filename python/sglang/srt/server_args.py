@@ -2493,8 +2493,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa() or is_npu()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
+                is_cuda() or is_musa() or is_npu() or is_hip()
+            ), "Mamba extra_buffer is only supported on CUDA, MUSA, NPU, and ROCm/HIP devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
