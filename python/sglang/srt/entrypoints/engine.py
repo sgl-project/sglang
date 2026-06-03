@@ -257,7 +257,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Enable tracing
         if server_args.enable_trace:
-            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+            process_tracing_init(
+                server_args.otlp_traces_endpoint,
+                "sglang",
+                trace_modules=server_args.trace_modules,
+            )
             thread_label = "Tokenizer"
             if server_args.disaggregation_mode == "prefill":
                 thread_label = "Prefill Tokenizer"
@@ -1277,7 +1281,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.11.post1",
+                "0.6.12",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
