@@ -1036,37 +1036,19 @@ class CudaGraphRunner:
             )
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device
             )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
         else:
             global_dp_buffer_len = None
 
@@ -1171,6 +1153,7 @@ class CudaGraphRunner:
                     global_dp_buffer_len,
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
+                    global_num_tokens_cpu,
                 )
                 set_is_extend_in_batch(False)
 

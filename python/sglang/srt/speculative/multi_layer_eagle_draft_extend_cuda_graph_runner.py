@@ -318,37 +318,30 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         ]
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_for_logprob_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
+            global_num_tokens_cpu = [num_tokens]
+            global_num_tokens_for_logprob_cpu = [bs]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
-                    [num_tokens],
+                    global_num_tokens_cpu,
                     dtype=torch.int32,
                     device=buffers.input_ids.device,
                 )
             )
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [bs],
+                    global_num_tokens_for_logprob_cpu,
                     dtype=torch.int32,
                     device=buffers.input_ids.device,
                 )
             )
-            global_dp_buffer_len = num_tokens
         else:
             global_dp_buffer_len = None
 
@@ -383,6 +376,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
+            global_num_tokens_cpu=global_num_tokens_cpu,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_mode,
@@ -416,6 +410,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                 forward_batch.global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
+                forward_batch.global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
 
