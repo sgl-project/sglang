@@ -2,6 +2,7 @@ import sys
 
 import pytest
 import torch
+import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -180,16 +181,10 @@ def test_rope(
     atol = rtol = 1e-2
     if DEVICE == "xpu":
         torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
-        torch.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
     else:
         flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
-        if triton is not None:
-            triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-            triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
-        else:
-            torch.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-            torch.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -214,16 +209,10 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     atol = rtol = 1e-2
     if DEVICE == "xpu":
         torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
-        torch.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
     else:
         flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions.long(), is_neox)
-        if triton is not None:
-            triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-            triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
-        else:
-            torch.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-            torch.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -252,16 +241,10 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     atol = rtol = 1e-2
     if DEVICE == "xpu":
         torch_impl_rope(q_ref[rope], k_ref[rope], cos_sin_cache, positions, is_neox)
-        torch.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
     else:
         flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions.long(), is_neox)
-        if triton is not None:
-            triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-            triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
-        else:
-            torch.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
-            torch.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(q_jit, q_ref, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_jit, k_ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -326,17 +309,11 @@ def test_fused_rope_store(
 
     atol = rtol = 1e-2
     # q should match RoPE-only result
-    if triton is not None:
-        triton.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
-        # k_cache should contain the rotated k
-        triton.testing.assert_close(
-            k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
-        )
-    else:
-        torch.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
-        torch.testing.assert_close(
-            k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
-        )
+    triton.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
+    # k_cache should contain the rotated k
+    triton.testing.assert_close(
+        k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
+    )
     # v_cache should be an exact copy
     assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
 
