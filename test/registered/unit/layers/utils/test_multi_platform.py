@@ -32,6 +32,9 @@ class DummyOp(MultiPlatformOp):
     def forward_custom_gpu(self, x: str) -> str:
         return x + "custom"
 
+    def forward_xpu(self, x: str) -> str:
+        return x + "xpu"
+
 
 class TestMultiPlatformOp(CustomTestCase):
 
@@ -53,6 +56,17 @@ class TestMultiPlatformOp(CustomTestCase):
     @patch("sglang.srt.layers.utils.multi_platform._is_cpu", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_cpu_amx_available", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_cuda", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_hip", True)
+    @patch("sglang.srt.layers.utils.multi_platform._is_npu", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_xpu", False)
+    def test_dispatch_hip(self) -> None:
+        # Should dispatch to forward_cuda when _is_hip is True (ROCm)
+        op = DummyOp()
+        self.assertEqual(op("input_"), "input_cuda")
+
+    @patch("sglang.srt.layers.utils.multi_platform._is_cpu", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_cpu_amx_available", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_cuda", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_hip", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_npu", True)
     @patch("sglang.srt.layers.utils.multi_platform._is_xpu", False)
@@ -60,6 +74,17 @@ class TestMultiPlatformOp(CustomTestCase):
         # Should dispatch to forward_npu when _is_npu is True
         op = DummyOp()
         self.assertEqual(op("input_"), "input_npu")
+
+    @patch("sglang.srt.layers.utils.multi_platform._is_cpu", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_cpu_amx_available", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_cuda", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_hip", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_npu", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_xpu", True)
+    def test_dispatch_xpu(self) -> None:
+        # Should dispatch to forward_xpu when _is_xpu is True (Intel GPU)
+        op = DummyOp()
+        self.assertEqual(op("input_"), "input_xpu")
 
     @patch("sglang.srt.layers.utils.multi_platform._is_cuda", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_hip", False)

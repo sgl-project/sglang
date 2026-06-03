@@ -51,15 +51,15 @@ class TestLogprobUtils(CustomTestCase):
         self.assertEqual(idx[1], [3, 2, 0])
 
     def test_get_top_logprobs_raw_prefill(self) -> None:
-        # Flat logprobs for prefill: 3 tokens total (Seq 0 has 2 tokens, Seq 1 has 1 token)
+        # Flat logprobs for prefill: 3 tokens total (Seq 0 has 2 tokens, Seq 1 has 0 tokens, Seq 2 has 1 token)
         logprobs = torch.tensor([
-            [0.9, 0.1, 0.0], # Seq 0, token 0
-            [0.2, 0.8, 0.0], # Seq 0, token 1
-            [0.3, 0.3, 0.4]  # Seq 1, token 0
+            [0.9, 0.1, 0.0, 0.0, 0.0], # Seq 0, token 0
+            [0.2, 0.8, 0.0, 0.0, 0.0], # Seq 0, token 1
+            [0.3, 0.3, 0.4, 0.0, 0.0]  # Seq 2, token 0
         ])
-        # Seq 0 wants top 1, Seq 1 wants top 2
-        top_logprobs_nums = [1, 2]
-        extend_logprob_pruned_lens_cpu = [2, 1]
+        # Seq 0 wants top 1, Seq 1 wants top 5 (but has 0 tokens), Seq 2 wants top 2
+        top_logprobs_nums = [1, 5, 2]
+        extend_logprob_pruned_lens_cpu = [2, 0, 1]
         
         val, idx = get_top_logprobs_raw(
             logprobs,
@@ -68,20 +68,25 @@ class TestLogprobUtils(CustomTestCase):
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu
         )
         
-        self.assertEqual(len(val), 2)
+        self.assertEqual(len(val), 3)
         self.assertEqual(len(val[0]), 2) # Seq 0 has 2 tokens
-        self.assertEqual(len(val[1]), 1) # Seq 1 has 1 token
+        self.assertEqual(len(val[1]), 0) # Seq 1 has 0 tokens (empty list)
+        self.assertEqual(len(val[2]), 1) # Seq 2 has 1 token
         
+        # Seq 0
         self.assertAlmostEqual(val[0][0][0], 0.9)
         self.assertEqual(idx[0][0], [0])
         self.assertAlmostEqual(val[0][1][0], 0.8)
         self.assertEqual(idx[0][1], [1])
         
-        self.assertAlmostEqual(val[1][0][0], 0.4)
-        # 0.3 is at indices 0 and 1, stable topk could return either but usually 0 or 1
-        # We just verify index 2 is first (largest value 0.4)
-        self.assertEqual(idx[1][0][0], 2)
-        self.assertEqual(len(idx[1][0]), 2)
+        # Seq 1
+        self.assertEqual(val[1], [])
+        self.assertEqual(idx[1], [])
+        
+        # Seq 2
+        self.assertAlmostEqual(val[2][0][0], 0.4)
+        self.assertEqual(idx[2][0][0], 2)
+        self.assertEqual(len(idx[2][0]), 2)
 
     def test_get_token_ids_logprobs_raw_decode(self) -> None:
         logprobs = torch.tensor([
@@ -101,20 +106,61 @@ class TestLogprobUtils(CustomTestCase):
         self.assertAlmostEqual(vals[1][0], 0.2)
         self.assertAlmostEqual(vals[1][1], 0.3)
 
-    def test_get_top_logprobs_chunk(self) -> None:
-        # Shape: [3, 5] (3 tokens in this chunk)
+    def test_get_token_ids_logprobs_raw_prefill(self) -> None:
+        # Flat logprobs for prefill: 3 tokens total (Seq 0 has 2 tokens, Seq 1 has 0 tokens, Seq 2 has 1 token)
         logprobs = torch.tensor([
             [0.1, 0.5, 0.2, 0.1, 0.1], # Seq 0, token 0
             [0.2, 0.1, 0.3, 0.4, 0.0], # Seq 0, token 1
-            [0.8, 0.1, 0.0, 0.0, 0.1]  # Seq 1, token 0
+            [0.8, 0.1, 0.0, 0.0, 0.1]  # Seq 2, token 0
+        ])
+        
+        # Seq 0 wants logprobs for [1, 3], Seq 1 wants [5, 6] (but has 0 tokens), Seq 2 wants [0, 4]
+        token_ids_logprobs_list = [[1, 3], [5, 6], [0, 4]]
+        extend_logprob_pruned_lens_cpu = [2, 0, 1]
+        
+        vals, idxs = get_token_ids_logprobs_raw(
+            logprobs,
+            token_ids_logprobs_list,
+            stage=LogprobStage.PREFILL,
+            extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu
+        )
+        
+        self.assertEqual(len(vals), 3)
+        self.assertEqual(len(vals[0]), 2) # 2 tokens for Seq 0
+        self.assertEqual(len(vals[1]), 0) # 0 tokens for Seq 1
+        self.assertEqual(len(vals[2]), 1) # 1 token for Seq 2
+        
+        # Seq 0
+        self.assertAlmostEqual(vals[0][0][0], 0.5)
+        self.assertAlmostEqual(vals[0][0][1], 0.1)
+        self.assertAlmostEqual(vals[0][1][0], 0.1)
+        self.assertAlmostEqual(vals[0][1][1], 0.4)
+        
+        # Seq 1
+        self.assertEqual(vals[1], [])
+        self.assertEqual(idxs[1], [])
+        
+        # Seq 2
+        self.assertAlmostEqual(vals[2][0][0], 0.8)
+        self.assertAlmostEqual(vals[2][0][1], 0.1)
+        
+        self.assertEqual(idxs[0], [[1, 3], [1, 3]])
+        self.assertEqual(idxs[2], [[0, 4]])
+
+    def test_get_top_logprobs_chunk(self) -> None:
+        # Shape: [3, 5] (3 tokens in this chunk: Seq 0 has 2, Seq 1 has 0, Seq 2 has 1)
+        logprobs = torch.tensor([
+            [0.1, 0.5, 0.2, 0.1, 0.1], # Seq 0, token 0
+            [0.2, 0.1, 0.3, 0.4, 0.0], # Seq 0, token 1
+            [0.8, 0.1, 0.0, 0.0, 0.1]  # Seq 2, token 0
         ])
         
         # Mock logits_metadata
         logits_metadata = MagicMock()
-        logits_metadata.top_logprobs_nums = [2, 1]
+        logits_metadata.top_logprobs_nums = [2, 5, 1]
         
-        top_k_nums = [2, 1]
-        pruned_lens = [2, 1]
+        top_k_nums = [2, 5, 1]
+        pruned_lens = [2, 0, 1]
         
         input_top_logprobs_val = []
         input_top_logprobs_idx = []
@@ -130,21 +176,26 @@ class TestLogprobUtils(CustomTestCase):
         )
         
         self.assertEqual(next_split, 0)
-        self.assertEqual(len(input_top_logprobs_val), 2)
-        self.assertEqual(len(input_top_logprobs_val[0]), 2)
+        self.assertEqual(len(input_top_logprobs_val), 3)
+        self.assertEqual(len(input_top_logprobs_val[0]), 2) # Seq 0
+        self.assertEqual(len(input_top_logprobs_val[1]), 0) # Seq 1 (empty list)
+        self.assertEqual(len(input_top_logprobs_val[2]), 1) # Seq 2
+        
         self.assertEqual(input_top_logprobs_idx[0][0], [1, 2])
         self.assertEqual(input_top_logprobs_idx[0][1], [3, 2])
-        self.assertEqual(input_top_logprobs_idx[1][0], [0])
+        self.assertEqual(input_top_logprobs_idx[1], [])
+        self.assertEqual(input_top_logprobs_idx[2][0], [0])
 
     def test_get_token_ids_logprobs_chunk(self) -> None:
+        # Shape: [3, 5] (3 tokens in this chunk: Seq 0 has 2, Seq 1 has 0, Seq 2 has 1)
         logprobs = torch.tensor([
             [0.1, 0.5, 0.2, 0.1, 0.1], # Seq 0, token 0
             [0.2, 0.1, 0.3, 0.4, 0.0], # Seq 0, token 1
-            [0.8, 0.1, 0.0, 0.0, 0.1]  # Seq 1, token 0
+            [0.8, 0.1, 0.0, 0.0, 0.1]  # Seq 2, token 0
         ])
         
-        token_ids_logprobs = [[1, 3], [0, 4]]
-        pruned_lens = [2, 1]
+        token_ids_logprobs = [[1, 3], [5, 6], [0, 4]]
+        pruned_lens = [2, 0, 1]
         
         input_token_ids_logprobs_val = []
         input_token_ids_logprobs_idx = []
@@ -159,11 +210,16 @@ class TestLogprobUtils(CustomTestCase):
         )
         
         self.assertEqual(next_split, 0)
-        self.assertEqual(len(input_token_ids_logprobs_val), 2)
-        self.assertEqual(len(input_token_ids_logprobs_val[0]), 2)
+        self.assertEqual(len(input_token_ids_logprobs_val), 3)
+        self.assertEqual(len(input_token_ids_logprobs_val[0]), 2) # Seq 0
+        self.assertEqual(len(input_token_ids_logprobs_val[1]), 0) # Seq 1 (empty list)
+        self.assertEqual(len(input_token_ids_logprobs_val[2]), 1) # Seq 2
+        
         self.assertAlmostEqual(input_token_ids_logprobs_val[0][0][0], 0.5)
         self.assertAlmostEqual(input_token_ids_logprobs_val[0][0][1], 0.1)
         self.assertEqual(input_token_ids_logprobs_idx[0][0], [1, 3])
+        self.assertEqual(input_token_ids_logprobs_idx[1], [])
+        self.assertEqual(input_token_ids_logprobs_idx[2][0], [0, 4])
 
 
 if __name__ == "__main__":
