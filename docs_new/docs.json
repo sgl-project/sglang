@@ -1102,6 +1102,7 @@
                   "cookbook/diffusion/intro",
                   {
                     "group": "Cosmos",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Cosmos/Cosmos3"
                     ]
@@ -1146,6 +1147,7 @@
                   },
                   {
                     "group": "LingBot World",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World"
                     ]

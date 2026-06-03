@@ -458,6 +458,59 @@ class TritonAttnBackend(AttentionBackend):
         )
         return qo_indptr, kv_indptr, num_tokens_per_bs
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        if in_capture:
+            assert forward_batch.encoder_lens is None, "Not supported"
+            # Multi-step speculative decode: kv buffers come from spec_info
+            # rather than the cuda-graph pool, so replay is not involved.
+            if forward_mode.is_decode_or_idle() and spec_info is not None:
+                self.forward_metadata = ForwardMetadata(
+                    attn_logits=self.cuda_graph_attn_logits,
+                    attn_lse=self.cuda_graph_attn_lse,
+                    max_extend_len=None,
+                    num_kv_splits=self.cuda_graph_num_kv_splits,
+                    kv_indptr=spec_info.kv_indptr,
+                    kv_indices=spec_info.kv_indices,
+                    qo_indptr=None,
+                    custom_mask=None,
+                    mask_indptr=None,
+                    window_kv_indptr=self.window_kv_indptr,
+                    window_kv_indices=None,
+                    window_num_kv_splits=None,
+                    window_kv_offsets=None,
+                    swa_attn_logits=self.cuda_graph_swa_attn_logits,
+                )
+                return
+
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+            )
+            self.forward_metadata = self._build_cuda_graph_forward_metadata(
+                bs, forward_mode, spec_info
+            )
+        else:
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
@@ -835,66 +888,18 @@ class TritonAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        assert encoder_lens is None, "Not supported"
-
-        # Multi-step speculative decode: kv buffers come from spec_info rather
-        # than the cuda-graph pool, so replay is not involved for this path.
-        if forward_mode.is_decode_or_idle() and spec_info is not None:
-            self.forward_metadata = ForwardMetadata(
-                attn_logits=self.cuda_graph_attn_logits,
-                attn_lse=self.cuda_graph_attn_lse,
-                max_extend_len=None,
-                num_kv_splits=self.cuda_graph_num_kv_splits,
-                kv_indptr=spec_info.kv_indptr,
-                kv_indices=spec_info.kv_indices,
-                qo_indptr=None,
-                custom_mask=None,
-                mask_indptr=None,
-                window_kv_indptr=self.window_kv_indptr,
-                window_kv_indices=None,
-                window_num_kv_splits=None,
-                window_kv_offsets=None,
-                swa_attn_logits=self.cuda_graph_swa_attn_logits,
-            )
-            return
-
-        # Run the same buffer update as replay, then freeze the result into
-        # a ForwardMetadata whose tensor fields point into the cuda-graph buffers.
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=None,
-        )
-        self.forward_metadata = self._build_cuda_graph_forward_metadata(
-            bs, forward_mode, spec_info
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
     ):
+        """Shared capture+replay body for the cuda-graph init path.
+
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
+        """
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
             assert spec_info is None, "Multi-step cuda graph init is not done here."
@@ -1417,36 +1422,45 @@ class TritonMultiStepDraftBackend:
                 cuda_graph_num_kv_splits_buf=self.cuda_graph_num_kv_splits,
             )
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        if in_capture:
+            inner_fb = build_inner_fb_view(
+                forward_batch,
+                bs=forward_batch.batch_size,
                 forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
             )
 
-        self.common_template(forward_batch, None, call_fn)
+            def call_fn(i, _forward_batch):
+                self.attn_backends[i].init_forward_metadata_out_graph(
+                    inner_fb, in_capture=True
+                )
 
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        self.common_template(forward_batch, None, None)
+            self.common_template(forward_batch, None, call_fn)
+        else:
+            bs = forward_batch.batch_size
+            self.common_template(forward_batch, None, None)
 
-        # NOTE: Multi-step's attention backends use the slice of
-        # - kv_indptr buffer (cuda graph and non-cuda graph)
-        # - kv_indices buffer (cuda graph only)
-        # So we don't need to assign the KV indices inside the attention backend.
+            # NOTE: Multi-step's attention backends use the slice of
+            # - kv_indptr buffer (cuda graph and non-cuda graph)
+            # - kv_indices buffer (cuda graph only)
+            # So we don't need to assign the KV indices inside the attention backend.
 
-        # Compute num_kv_splits only once
-        num_token = forward_batch.batch_size * self.topk
-        self.attn_backends[-1].get_num_kv_splits(
-            self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
-            forward_batch.seq_lens[:bs],
-        )
+            # Compute num_kv_splits only once
+            num_token = bs * self.topk
+            self.attn_backends[-1].get_num_kv_splits(
+                self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
+                forward_batch.seq_lens[:bs],
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
 
 
 def update_sliding_window_buffer(
