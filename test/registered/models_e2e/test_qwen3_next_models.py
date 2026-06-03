@@ -34,25 +34,34 @@ def _make_args(*, page_size=1, track_interval=2):
     ]
 
 
-class _Qwen3NextBase(
+class TestQwen3NextLazyExtraBuffer(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93
     kl_div_thres = 0.001
-
-
-class TestQwen3NextLazyExtraBuffer(_Qwen3NextBase):
     other_args = _make_args(page_size=1, track_interval=2)
 
 
-class TestQwen3NextLazyExtraBufferLargePage(_Qwen3NextBase):
+class TestQwen3NextLazyExtraBufferLargePage(
+    GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
+    model = QWEN3_NEXT_MODEL
+    cache_chunk_size = 64
+    gsm8k_accuracy_thres = 0.93
+    kl_div_thres = 0.001
     other_args = _make_args(page_size=2, track_interval=2)
 
 
 @unittest.skip("Manual-only: forces all lazy preallocs to fail")
-class TestQwen3NextLazyExtraBufferAllocFail(_Qwen3NextBase):
+class TestQwen3NextLazyExtraBufferAllocFail(
+    GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
+    model = QWEN3_NEXT_MODEL
+    cache_chunk_size = 64
+    gsm8k_accuracy_thres = 0.93
+    kl_div_thres = 0.001
     other_args = _make_args(page_size=1, track_interval=2)
 
     @classmethod
@@ -69,7 +78,13 @@ class TestQwen3NextLazyExtraBufferAllocFail(_Qwen3NextBase):
 
 
 @unittest.skip("Manual-only: forces all lazy preallocs to fail")
-class TestQwen3NextLazyExtraBufferLargePageAllocFail(_Qwen3NextBase):
+class TestQwen3NextLazyExtraBufferLargePageAllocFail(
+    GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
+    model = QWEN3_NEXT_MODEL
+    cache_chunk_size = 64
+    gsm8k_accuracy_thres = 0.93
+    kl_div_thres = 0.001
     other_args = _make_args(page_size=2, track_interval=2)
 
     @classmethod
