@@ -98,8 +98,18 @@ def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
 ) -> Tuple[List[npt.NDArray[np.int32]], List[npt.NDArray[np.int32]]]:
     """Vectorised NumPy implementation."""
-    if src_indices.size == 0:
+    # src/dst indices are transferred pairwise, so an empty side means there is
+    # nothing to transfer. Guarding both sides (not just src) avoids a cryptic
+    # NumPy broadcast error from np.diff() below when only one side is empty, e.g.
+    # a non-empty prefill DSA/SWA state list paired with an empty decode registration.
+    if src_indices.size == 0 or dst_indices.size == 0:
         return [], []
+
+    if src_indices.size != dst_indices.size:
+        raise ValueError(
+            "group_concurrent_contiguous requires equal-length src/dst index arrays, "
+            f"got {src_indices.size} and {dst_indices.size}"
+        )
 
     brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
     src_groups = np.split(src_indices, brk)
