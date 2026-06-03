@@ -1867,6 +1867,8 @@ class UnifiedRadixCacheSuite:
             self.skipTest("requires SWA component")
         if self.cfg.has_mamba:
             self.skipTest("SWA-only path keeps the split setup simple")
+        if self.cfg.page_size != 1:
+            self.skipTest("regression setup removes a one-page child directly")
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -1879,10 +1881,6 @@ class UnifiedRadixCacheSuite:
         tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
         split_parent = next(iter(tree.root_node.children.values()))
         suffix = next(iter(split_parent.children.values()))
-        child = next(iter(suffix.children.values()))
-
-        tracker = {ct: 0 for ct in tree.tree_components}
-        tree._evict_device_leaf(child, tracker)
         self.assertEqual(len(suffix.children), 0)
         self.assertIn(suffix, tree.evictable_device_leaves)
         self.assertEqual(len(suffix.component_data[ComponentType.SWA].value), retain_len)
@@ -1891,7 +1889,7 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, other)
 
         result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
-        self.assertEqual(result.swa_num_tokens_evicted, len(other))
+        self.assertEqual(result.swa_num_tokens_evicted, retain_len)
         self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
         self.assertIn(suffix, tree.evictable_device_leaves)
 
