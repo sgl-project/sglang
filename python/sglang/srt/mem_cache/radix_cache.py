@@ -599,11 +599,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def _tag_session_leaf(self, req: Req, radix_key, node=None) -> None:
         """Tag the leaf node for this request's full key with its session_id, so
         release_session can later free the session's unique chain. No-op for
-        non-session requests, and for sessions no longer registered (closed)."""
+        non-session requests, and for sessions no longer registered (closed).
+        The tag rides req.session_id directly -- no Session object is involved."""
         sid = getattr(req, "session_id", None)
-        if sid is None:
-            session = getattr(req, "session", None)
-            sid = getattr(session, "session_id", None) if session is not None else None
         if sid is None or sid not in self._session_leaves:
             return
         if node is None:
