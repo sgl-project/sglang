@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.mem_cache.memory_pool import NoOpMHATokenToKVPool
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
@@ -989,6 +990,65 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def _forward_extend_no_kv_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_ = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v_ = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+        use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+        causal = not (
+            layer.is_cross_attention
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+        )
+
+        if layer.qk_head_dim != layer.v_head_dim:
+            attn_output = q.new_empty(
+                (q_.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
+        else:
+            attn_output = torch.empty_like(q_).reshape(
+                -1, layer.tp_q_head_num * layer.v_head_dim
+            )
+
+        o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        q_t = q_.movedim(0, q_.dim() - 2)
+        k_t = k_.movedim(0, k_.dim() - 2)
+        v_t = v_.movedim(0, v_.dim() - 2)
+
+        seq_lens = forward_batch.extend_seq_lens_cpu or forward_batch.extend_seq_lens
+        if not hasattr(seq_lens, "shape"):
+            seq_lens = torch.tensor(seq_lens)
+        start = 0
+        for idx in range(seq_lens.shape[0]):
+            seq_len = int(seq_lens[idx].item())
+            end = start + seq_len
+
+            per_q = q_t[:, start:end, :].unsqueeze(0)
+            per_k = k_t[:, start:end, :].unsqueeze(0)
+            per_v = v_t[:, start:end, :].unsqueeze(0)
+
+            per_out = torch.nn.functional.scaled_dot_product_attention(
+                per_q,
+                per_k,
+                per_v,
+                enable_gqa=use_gqa,
+                is_causal=causal,
+                scale=layer.scaling,
+            )
+
+            o_[start:end] = per_out.squeeze(0).movedim(o_.dim() - 2, 0)
+            start = end
+
+        return attn_output
+
     def forward_extend(
         self,
         q,
@@ -1056,7 +1116,9 @@ class AscendAttnBackend(AttentionBackend):
 
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
-                if is_cp_mode:
+                if isinstance(self.token_to_kv_pool, NoOpMHATokenToKVPool):
+                    pass
+                elif is_cp_mode:
                     # All-gather K/V from all CP ranks and write full sequence to KV pool
                     _cp_allgather_and_save_kv_npu(
                         forward_batch,
@@ -1077,6 +1139,11 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if isinstance(self.token_to_kv_pool, NoOpMHATokenToKVPool):
+                return self._forward_extend_no_kv_cache(
+                    q, k, v, layer, forward_batch
+                )
 
             if sinks is not None or (
                 self.is_hybrid_swa and layer.sliding_window_size != -1
@@ -2044,6 +2111,11 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
+            if isinstance(self.token_to_kv_pool, NoOpMHATokenToKVPool):
+                raise RuntimeError(
+                    "forward_decode called with NoOpMHATokenToKVPool. "
+                    "Decode is not expected in prefill-only mode."
+                )
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 # support cross attention

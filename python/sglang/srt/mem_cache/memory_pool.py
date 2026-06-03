@@ -936,7 +936,15 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        if self.device == "npu":
+            self.data_ptrs = torch.cat(
+                [self.k_data_ptrs.to(torch.int64), self.v_data_ptrs.to(torch.int64)],
+                dim=0,
+            ).view(torch.uint64)
+        else:
+            self.data_ptrs = torch.cat(
+                [self.k_data_ptrs, self.v_data_ptrs], dim=0
+            )
         self.data_strides = torch.tensor(
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize
@@ -1199,7 +1207,15 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        if self.device == "npu":
+            self.data_ptrs = torch.cat(
+                [self.k_data_ptrs.to(torch.int64), self.v_data_ptrs.to(torch.int64)],
+                dim=0,
+            ).view(torch.uint64)
+        else:
+            self.data_ptrs = torch.cat(
+                [self.k_data_ptrs, self.v_data_ptrs], dim=0
+            )
         self.data_strides = torch.tensor(
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize

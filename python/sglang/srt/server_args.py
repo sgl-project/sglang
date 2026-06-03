@@ -3676,11 +3676,11 @@ class ServerArgs:
         )
 
         prefill_backend, _ = self.get_attention_backends()
-        if prefill_backend not in ("fa3", "fa4"):
+        if prefill_backend not in ("fa3", "fa4", "ascend"):
             raise ValueError(
                 "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
-                f"(fa3/fa4), but got prefill backend {prefill_backend!r}. Other prefill-only "
-                "workloads and backends may be supported in a future change."
+                f"(fa3/fa4) or the ascend backend, but got prefill backend {prefill_backend!r}. "
+                "Other prefill-only workloads and backends may be supported in a future change."
             )
 
     def _handle_hicache(self):
