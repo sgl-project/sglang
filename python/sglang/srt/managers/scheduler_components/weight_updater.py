@@ -93,7 +93,9 @@ class SchedulerWeightUpdaterManager:
             logger.info("Recapturing TP worker CUDA graphs after weight update")
             tp_model_runner.graph_runner.capture()
         if getattr(tp_model_runner, "piecewise_cuda_graph_runner", None) is not None:
-            logger.info("Recapturing TP worker piecewise CUDA graphs after weight update")
+            logger.info(
+                "Recapturing TP worker piecewise CUDA graphs after weight update"
+            )
             tp_model_runner.init_piecewise_cuda_graphs()
 
         # Recapture draft worker CUDA graphs if present
@@ -101,10 +103,17 @@ class SchedulerWeightUpdaterManager:
             draft_model_runner = _get_draft_model_runner(self.draft_worker)
             if draft_model_runner is not None:
                 if draft_model_runner.graph_runner is not None:
-                    logger.info("Recapturing draft worker CUDA graphs after weight update")
+                    logger.info(
+                        "Recapturing draft worker CUDA graphs after weight update"
+                    )
                     draft_model_runner.graph_runner.capture()
-                if getattr(draft_model_runner, "piecewise_cuda_graph_runner", None) is not None:
-                    logger.info("Recapturing draft worker piecewise CUDA graphs after weight update")
+                if (
+                    getattr(draft_model_runner, "piecewise_cuda_graph_runner", None)
+                    is not None
+                ):
+                    logger.info(
+                        "Recapturing draft worker piecewise CUDA graphs after weight update"
+                    )
                     draft_model_runner.init_piecewise_cuda_graphs()
 
     def mark_cuda_graphs_stale(self) -> None:
@@ -183,9 +192,9 @@ class SchedulerWeightUpdaterManager:
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert (
-            self.is_fully_idle()
-        ), "release_memory_occupation should be called only when server is idle."
+        assert self.is_fully_idle(), (
+            "release_memory_occupation should be called only when server is idle."
+        )
 
         tags = recv_req.tags
 
@@ -276,9 +285,9 @@ class SchedulerWeightUpdaterManager:
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
-            assert (
-                draft_url is not None
-            ), "draft_url must be provided when draft model is enabled"
+            assert draft_url is not None, (
+                "draft_url must be provided when draft model is enabled"
+            )
             self.draft_worker.model_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
