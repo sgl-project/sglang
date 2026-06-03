@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -18,9 +21,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
-)
-from sglang.srt.mem_cache.hisparse_memory_pool import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
