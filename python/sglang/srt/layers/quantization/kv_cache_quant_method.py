@@ -17,11 +17,11 @@ Canonical KV cache quantization methods.
 This module owns the public runtime abstraction for quantized KV cache storage:
 
 * ``KVCacheQuantMethod`` defines the buffer/quantize/dequantize contract.
-* ``NVFP4Method`` and ``MXFP4Method`` implement the two FP4 recipes exposed by
-  ``--kv-cache-dtype nvfp4`` and ``--kv-cache-dtype mxfp4``.
+* ``NVFP4Method`` and ``BlockFP4Method`` implement the two FP4 recipes exposed by
+  ``--kv-cache-dtype nvfp4`` and ``--kv-cache-dtype fp4_e2m1_block16``.
 * ``kvfp4_tensor.py`` contains only low-level tensor/FlashInfer helpers.
 
-Recipe selection is explicit. This file must not infer NVFP4 vs MXFP4 from the
+Recipe selection is explicit. This file must not infer the FP4 recipe from the
 GPU architecture; hardware only affects per-recipe implementation details such
 as NVFP4 scale conversion.
 """
@@ -110,10 +110,10 @@ class KVCacheQuantMethod(ABC):
         pass
 
 
-class NoneMethod(KVCacheQuantMethod):
-    """Identity method for BF16 / FP8 KV cache — no extra quantization."""
+class UnquantizedKVCacheMethod(KVCacheQuantMethod):
+    """Identity method for BF16 / FP8 KV cache: no extra quantization."""
 
-    name = "none"
+    name = "unquantized"
     scale_block_size = 1
 
     def create_buffers(self, size, head_num, head_dim, layer_num, device) -> dict:
@@ -349,10 +349,14 @@ class NVFP4Method(KVCacheQuantMethod):
         return fp4_size + scale_size + dq_size
 
 
-class MXFP4Method(KVCacheQuantMethod):
-    """MXFP4 single-level block-wise scaling."""
+class BlockFP4Method(KVCacheQuantMethod):
+    """Block-16 FP4 E2M1 single-level scaling.
 
-    name = "mxfp4"
+    This is intentionally not called MXFP4: standard MXFP4 uses a block size of
+    32, while this KV cache recipe stores one scale per 16 FP4 values.
+    """
+
+    name = "fp4_e2m1_block16"
     scale_block_size = 16
 
     def __init__(
@@ -381,7 +385,7 @@ class MXFP4Method(KVCacheQuantMethod):
             torch.zeros((m, head_num, head_dim // 2), dtype=store_dtype, device=device)
             for _ in range(layer_num)
         ]
-        # MXFP4 flattens head dimensions for scale storage
+        # Block-16 FP4 flattens head dimensions for scale storage
         k_scale_buffer = [
             torch.zeros(
                 (m, (head_num * head_dim) // self.scale_block_size),
@@ -479,7 +483,7 @@ class MXFP4Method(KVCacheQuantMethod):
 # Registry: explicit --kv-cache-dtype value -> method class.
 KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethod]] = {
     "nvfp4": NVFP4Method,
-    "mxfp4": MXFP4Method,
+    "fp4_e2m1_block16": BlockFP4Method,
 }
 
 
@@ -496,14 +500,20 @@ def resolve_kv_cache_quant(
         ):
             raise ValueError(
                 "FP4 KV cache storage dtype does not identify the recipe. "
-                "Pass the explicit --kv-cache-dtype value: 'nvfp4' or 'mxfp4'."
+                "Pass the explicit --kv-cache-dtype value: 'nvfp4' or 'fp4_e2m1_block16'."
             )
         return None
 
     if kv_cache_dtype == "fp4_e2m1":
         raise ValueError(
             "--kv-cache-dtype=fp4_e2m1 no longer auto-selects an FP4 KV recipe. "
-            "Use --kv-cache-dtype=nvfp4 or --kv-cache-dtype=mxfp4."
+            "Use --kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_e2m1_block16."
+        )
+    if kv_cache_dtype == "mxfp4":
+        raise ValueError(
+            "--kv-cache-dtype=mxfp4 is reserved for true MXFP4 block-size-32 "
+            "semantics. Use --kv-cache-dtype=fp4_e2m1_block16 for the current "
+            "block-size-16 FP4 KV recipe."
         )
     if kv_cache_dtype in KV_CACHE_QUANT_REGISTRY:
         return kv_cache_dtype

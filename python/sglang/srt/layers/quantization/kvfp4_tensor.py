@@ -56,14 +56,14 @@ E2M1_BOUNDS = torch.tensor(
 
 
 class KVFP4QuantizeUtil:
-    """Utility class for MXFP4 quantization and dequantization operations."""
+    """Utility class for block-16 FP4 quantization and dequantization operations."""
 
     @staticmethod
     @torch.compile
     def batched_quantize(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
 
-        Quantize tensor to KVFP4 format
+        Quantize tensor to block-16 FP4 format
         Args:
             tensor: Input tensor of shape [B, M, N]
 
@@ -108,7 +108,7 @@ class KVFP4QuantizeUtil:
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """
-        Dequantize KVFP4 tensor
+        Dequantize block-16 FP4 tensor
         Args:
             quant_tensor: Quantized tensor of shape [B, M, N/2]
             scale_factors: Scale factors of shape [B, M*N/16]
