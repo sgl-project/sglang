@@ -913,13 +913,13 @@ def safetensors_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
-    sorted_files = sorted(hf_weights_files)
-
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
 
     for st_file in tqdm(
-        sorted_files,
+        hf_weights_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=BAR_FORMAT,
@@ -1051,9 +1051,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
-    sorted_files = sorted(hf_weights_files)
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -1071,7 +1072,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     buffer_size = max_workers + 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        file_iter = iter(sorted_files)
+        file_iter = iter(hf_weights_files)
         pending: collections.deque = collections.deque()
 
         # Seed the buffer.
