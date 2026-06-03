@@ -262,7 +262,7 @@ class EagleDraftInputV2Mixin:
             # Planned with the runner's own backend, no special context: a
             # forward-path re-plan is equivalent, so let the judgment
             # re-plan post-pad if DP padding reshapes the batch.
-            forward_batch.mark_forward_metadata_ready(replan_on_reshape=True)
+            forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
         return forward_batch
 
 

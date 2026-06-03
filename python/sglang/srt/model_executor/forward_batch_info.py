@@ -485,15 +485,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # (same backend object, no special context) may opt in; multi-step
     # wrapper plans and view-context plans must keep this False — a
     # forward-path re-plan would clobber their metadata.
-    forward_metadata_replan_on_reshape: bool = False
+    forward_metadata_replan_equivalent: bool = False
 
-    def mark_forward_metadata_ready(self, replan_on_reshape: bool = False):
+    def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         """Record that attention metadata was pre-planned for this batch.
 
         Call right next to the out-of-forward planning action
         (e.g. ``draft_attn_backend.init_forward_metadata(fb)`` or
         ``graph_runner.replay_prepare(fb)``). Records the batch shapes so
-        staleness is detectable; pass ``replan_on_reshape=True`` only when
+        staleness is detectable; pass ``replan_equivalent=True`` only when
         a forward-path re-plan is equivalent to the pre-plan (see field
         docs).
         """
@@ -502,14 +502,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.forward_metadata_planned_num_tokens = (
             self.input_ids.shape[0] if self.input_ids is not None else 0
         )
-        self.forward_metadata_replan_on_reshape = replan_on_reshape
+        self.forward_metadata_replan_equivalent = replan_equivalent
 
     def needs_forward_metadata_init(self) -> bool:
         """Single judgment point for whether the forward path must plan.
 
         A marked batch is treated as stale — and re-planned — when its
         shapes no longer match the plan record AND the mark site declared
-        the re-plan safe (replan_on_reshape). This runs after
+        the re-plan safe (replan_equivalent). This runs after
         prepare_mlp_sync_batch in _forward_raw, so the re-plan sees the
         padded (final) shapes. Sites that cannot opt in (multi-step
         wrapper plans etc.) keep today's behavior: marked stays skipped,
@@ -517,7 +517,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         """
         if not self.forward_metadata_ready:
             return True
-        if not self.forward_metadata_replan_on_reshape:
+        if not self.forward_metadata_replan_equivalent:
             return False
         num_tokens = self.input_ids.shape[0] if self.input_ids is not None else 0
         return (

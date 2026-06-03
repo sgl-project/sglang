@@ -769,7 +769,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     # post-pad re-plan if DP padding reshapes the batch.
                     # The per-step re-mark re-records padded shapes, so
                     # later steps don't re-plan again.
-                    forward_batch.mark_forward_metadata_ready(replan_on_reshape=True)
+                    forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
                 logits_output = (
                     self.mtp_model_runner(step).forward(forward_batch).logits_output
                 )

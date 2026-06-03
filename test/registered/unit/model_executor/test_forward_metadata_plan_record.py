@@ -4,7 +4,7 @@ Covers the contract behind ``skip_attn_backend_init`` deprecation:
   * fresh batches need planning; marked batches don't
   * the plan record (planned bs / num tokens) snapshots mark-time shapes
   * reshape after marking triggers a re-plan only for sites that opted
-    into ``replan_on_reshape``; re-marking re-records the new shapes
+    into ``replan_equivalent``; re-marking re-records the new shapes
   * the deprecated kwarg shim maps explicit values onto the marker
     (mapped, not ignored) and warns once per process
 
@@ -59,7 +59,7 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
 
     def test_reshape_with_opt_in_replans(self):
         fb = _make_batch(bs=2, num_tokens=2)
-        fb.mark_forward_metadata_ready(replan_on_reshape=True)
+        fb.mark_forward_metadata_ready(replan_equivalent=True)
         self.assertFalse(fb.needs_forward_metadata_init())
 
         fb.batch_size = 4  # bs drift (prepare_mlp_sync_batch decode pad)
@@ -73,10 +73,10 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         # Per-step loops re-mark after each plan; the second mark must
         # snapshot the padded shapes so later steps skip again.
         fb = _make_batch(bs=2)
-        fb.mark_forward_metadata_ready(replan_on_reshape=True)
+        fb.mark_forward_metadata_ready(replan_equivalent=True)
         fb.batch_size = 4
         self.assertTrue(fb.needs_forward_metadata_init())
-        fb.mark_forward_metadata_ready(replan_on_reshape=True)
+        fb.mark_forward_metadata_ready(replan_equivalent=True)
         self.assertFalse(fb.needs_forward_metadata_init())
         self.assertEqual(fb.forward_metadata_planned_bs, 4)
 
