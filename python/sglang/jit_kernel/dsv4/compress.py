@@ -7,6 +7,7 @@ import torch
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -23,10 +24,19 @@ def _jit_compress_norm_rope_module(
     head_dim: int,
     rope_dim: int,
     page_size: int,
+    bf16_store: bool = False,
 ) -> Module:
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    # bf16_store=True: write the whole head_dim as plain bf16 into a
+    # [num_slots, head_dim] bf16 cache (page_size==1) instead of the packed
+    # fp8 FlashMLA / indexer layout. Used by the unified_kv unified_kv path.
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+    )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
-    if head_dim == 128:
+    # forward_fp4 is the sm100-only FP4 indexer kernel; it uses warp-32
+    # `__shfl_xor_sync` masks that don't compile on ROCm (gfx950 warp=64), and
+    # the FP4 indexer is gated off on HIP anyway. Don't register/compile it there.
+    if head_dim == 128 and not is_hip_runtime():
         cuda_wrappers.append(
             ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
         )
@@ -339,12 +349,13 @@ def compress_norm_rope_store(
     kvcache: torch.Tensor,
     page_size: int,
     use_fp4: bool = False,
+    bf16_store: bool = False,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
     )
     fn = module.forward_fp4 if use_fp4 else module.forward
     fn(

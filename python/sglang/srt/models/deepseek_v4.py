@@ -588,7 +588,7 @@ class MQALayer(nn.Module):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        """ATOM-style ROCm path: overlap compressors, keep Q/KV on main stream."""
+        """unified_kv-style ROCm path: overlap compressors, keep Q/KV on main stream."""
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 1
 
@@ -711,6 +711,71 @@ class MQALayer(nn.Module):
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
+
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if is_unified_kv_triton():
+            # unified_kv. Decode: one fully-fused kernel does q norm+rope, kv norm+rope
+            # AND writes K straight into the bf16 unified_kv SWA ring (slot =
+            # state_slot*win + pos%win) -> backend skips its SWA store. Prefill: keep
+            # bf16 kv (no store here); backend writes the ring AFTER attention (the
+            # 2-source path needs the current chunk out of the ring during attention).
+            q_lora = self.q_norm(q_lora)
+            pool = get_token_to_kv_pool()
+            is_decode = forward_batch.forward_mode.is_decode_or_idle()
+            if is_decode and _is_hip:
+                from sglang.srt.layers.fused_qk_norm_rope_store import (
+                    fused_qk_norm_rope_swa_store,
+                )
+
+                q_b, _ = self.wq_b(q_lora)
+                kv_raw = (
+                    qkv_a[..., self.q_lora_rank :]
+                    if qkv_a is not None
+                    else self.wkv(x_linear)[0]
+                )
+                cs = pool.unified_cs  # SWA ring stride (win_with_spec; == win w/o spec)
+                ring_loc = (
+                    forward_batch.req_pool_indices.to(torch.int64) * cs
+                    + positions.to(torch.int64) % cs
+                ).to(torch.int32)
+                q = fused_qk_norm_rope_swa_store(
+                    q=q_b,
+                    kv=kv_raw,
+                    q_norm_weight=None,
+                    kv_norm_weight=self.kv_norm.weight,
+                    q_rms_eps=self.eps,
+                    kv_rms_eps=self.eps,
+                    rope_head_dim=self.qk_rope_head_dim,
+                    cos_cache=self.cos_cache,
+                    sin_cache=self.sin_cache,
+                    positions=positions,
+                    swa_cache=pool.get_unified_kv(self.layer_id),
+                    swa_loc=ring_loc,
+                    swa_page_size=1,
+                    q_out=q_out,
+                    dtype=x.dtype,
+                    bf16_store=True,
+                )
+                kv = None  # already written into the unified_kv ring
+            else:
+                q = self._compute_q_b(q_lora, positions, q_out)
+                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+            del qkv_a
+            if self.indexer is not None:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                )
+            if self.compressor is not None:
+                attn_backend.forward_core_compressor(
+                    x, forward_batch, self.layer_id, self.compressor
+                )
+            return q, kv
 
         if self.use_fused_qk_norm_rope:
 
@@ -886,17 +951,40 @@ class MQALayer(nn.Module):
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
-        o = attn_backend.forward(
-            q=q_padded if q_padded is not None else q,
-            k=attn_k,
-            v=attn_k,
-            layer=self.attn_mqa,
-            forward_batch=forward_batch,
-            compress_ratio=self.compress_ratio,
-            attn_sink=self.attn_sink,
-            save_kv_cache=False,
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
         )
-        o = o[:, tp_slice, :]
+
+        if is_unified_kv_triton():
+            # Pass the LOCAL-head q (already [T, n_local, head_dim]); the backend
+            # writes the SWA ring + compressed indices and runs unified_kv paged attn,
+            # returning local-head output (no tp re-slice needed).
+            # Decode already wrote the SWA ring via the fused kernel (kv is None) ->
+            # tell the backend to skip its store. Prefill returns bf16 kv and the
+            # backend writes the ring AFTER attention.
+            unified_save_kv = kv is not None
+            o = attn_backend.forward(
+                q=q_out if q_out is not None else q,
+                k=attn_k,
+                v=attn_k,
+                layer=self.attn_mqa,
+                forward_batch=forward_batch,
+                compress_ratio=self.compress_ratio,
+                attn_sink=self.attn_sink,
+                save_kv_cache=unified_save_kv,
+            )
+        else:
+            o = attn_backend.forward(
+                q=q_padded if q_padded is not None else q,
+                k=attn_k,
+                v=attn_k,
+                layer=self.attn_mqa,
+                forward_batch=forward_batch,
+                compress_ratio=self.compress_ratio,
+                attn_sink=self.attn_sink,
+                save_kv_cache=False,
+            )
+            o = o[:, tp_slice, :]
         fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
