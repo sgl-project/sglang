@@ -2336,6 +2336,76 @@ class UnifiedRadixCacheSuite:
             [conv[:, mamba_indices].float().cpu().clone() for conv in mamba_cache.conv],
         )
 
+    def _make_host_leaf(self, tree, allocator, req_to_token_pool, start):
+        seq = self._make_seq(start, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        self.assertIsNot(node, tree.root_node)
+        self._backup_node(tree, node)
+        tree.evict(EvictParams(num_tokens=len(seq)))
+        self.assertTrue(node.evicted and node.backuped)
+        return node
+
+    def test_hicache_load_back_host_lock_protects_node_from_eviction(self):
+        """A host-locked leaf should survive a host-eviction sweep."""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        ct = ComponentType.FULL
+
+        locked = self._make_host_leaf(tree, allocator, req_to_token_pool, start=1)
+        victim = self._make_host_leaf(tree, allocator, req_to_token_pool, start=5000)
+        self.assertIn(locked, tree.evictable_host_leaves)
+        self.assertIn(victim, tree.evictable_host_leaves)
+
+        tree.inc_host_lock_ref(locked)
+        self.assertGreater(locked.component_data[ct].host_lock_ref, 0)
+        self.assertNotIn(locked, tree.evictable_host_leaves)
+
+        # Sweep enough host tokens to want both leaves; the locked one is skipped.
+        tree.evict_host(len(locked.key) + len(victim.key))
+
+        self.assertIsNotNone(locked.component_data[ct].host_value)
+        self.assertTrue(locked.evicted)
+        self.assertIsNone(victim.component_data[ct].host_value)
+
+        tree.dec_host_lock_ref(locked)
+        self.assertEqual(locked.component_data[ct].host_lock_ref, 0)
+        self.assertIn(locked, tree.evictable_host_leaves)
+        tree.sanity_check()
+
+    def test_hicache_evict_device_leaf_aborts_demote_when_backup_fails(self):
+        """when write_backup cannot allocate host pool,
+        _evict_device_leaf should not evict it to host."""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        ct = ComponentType.FULL
+
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        self.assertIsNot(node, tree.root_node)
+        self.assertFalse(node.backuped)
+        self.assertFalse(node.evicted)
+
+        tracker = {c: 0 for c in tree.tree_components}
+        with mock.patch.object(tree, "write_backup", return_value=0):
+            tree._evict_device_leaf(node, tracker)
+
+        self.assertFalse(node.evicted)
+        self.assertIsNotNone(node.component_data[ct].value)
+        self.assertIsNone(node.component_data[ct].host_value)
+
+        with self.assertRaises(AssertionError):
+            tree._evict_to_host(node, {c: 0 for c in tree.tree_components})
+
+        tree.sanity_check()
+
     def test_hicache_node_states(self):
         """Verify device-only to device+host transition after real backup."""
         if self._skip_unsupported_hicache_test():
