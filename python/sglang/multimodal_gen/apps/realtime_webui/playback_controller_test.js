@@ -90,6 +90,8 @@ function eventCutoverKeepsShortGrace() {
   });
   assert.ok(result.cutover);
   assert.ok(result.droppedFrames.length >= 14);
+  assert.equal(controller.queue[0].chunk, 1);
+  assert.equal(controller.queue[0].index, 0);
 }
 
 function settleEventCutoverKeepsWiderGrace() {

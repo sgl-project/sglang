@@ -153,9 +153,11 @@
       let cutover = null;
 
       if (this.pendingEventId && eventId >= this.pendingEventId) {
-        const dropCount = Math.max(0, this.#oldEventFrameCount(eventId) - this.#eventGraceFrames());
+        const oldEventFrameCount = this.#oldEventFrameCount(eventId);
+        const graceFrames = this.#eventGraceFrames();
+        const dropCount = Math.max(0, oldEventFrameCount - graceFrames);
         if (dropCount > 0) {
-          droppedFrames.push(...this.queue.splice(0, dropCount));
+          droppedFrames.push(...this.queue.splice(graceFrames, dropCount));
           this.#recordDrop(dropCount, "event cutover", now);
         }
         cutover = {
