@@ -58,7 +58,7 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
-from sglang.srt.utils.common import configure_logger
+from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -2844,17 +2844,20 @@ async def _dp_worker_handle_request(
 async def run_dp_worker(
     server_args: ServerArgs,
     dp_rank: int,
+    gpu_id: int,
     dispatch_path: str,
     result_path: str,
 ):
     logger.info(
-        f"DP worker {dp_rank} starting on GPU "
-        f"{os.environ.get('CUDA_VISIBLE_DEVICES', '?')}"
+        f"DP worker {dp_rank} starting on gpu_id={gpu_id} "
+        f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')})"
     )
 
-    # CUDA_VISIBLE_DEVICES pinned to one GPU by the parent → cuda:0 here.
+    # gpu_id is the device chosen by maybe_reindex_device_id in the parent:
+    # 0 when CVD is pinned to one GPU, else the absolute id. rank=0, so
+    # MMEncoder runs set_device(base_gpu_id).
     args = copy.deepcopy(server_args)
-    args.base_gpu_id = 0
+    args.base_gpu_id = gpu_id
     args.tp_size = 1
     enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
     sched = EncoderScheduler(
@@ -2924,12 +2927,15 @@ async def run_dp_worker(
 def launch_dp_worker(
     server_args: ServerArgs,
     dp_rank: int,
+    gpu_id: int,
     dispatch_path: str,
     result_path: str,
 ):
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
-        asyncio.run(run_dp_worker(server_args, dp_rank, dispatch_path, result_path))
+        asyncio.run(
+            run_dp_worker(server_args, dp_rank, gpu_id, dispatch_path, result_path)
+        )
     except KeyboardInterrupt:
         logger.info(f"DP worker {dp_rank} exiting")
     except Exception:
@@ -3065,23 +3071,24 @@ def _launch_server_dp(server_args: ServerArgs):
 
     for dp_rank in range(dp_size):
         gpu_id = server_args.base_gpu_id + dp_rank
-        orig = os.environ.get("CUDA_VISIBLE_DEVICES")
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        proc = ctx.Process(
-            target=launch_dp_worker,
-            args=(
-                server_args,
-                dp_rank,
-                f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
-                result_path,
-            ),
-            daemon=False,
-        )
-        proc.start()
-        if orig is None:
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = orig
+        # Pin the device parent-side around spawn (same convention as the
+        # scheduler launcher and DP controller) so the child inherits
+        # CUDA_VISIBLE_DEVICES from its first instruction, before any import
+        # can enumerate CUDA. No-op unless SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS
+        # is set, in which case gpu_id is reindexed to 0 and CVD is pinned.
+        with maybe_reindex_device_id(gpu_id) as gpu_id:
+            proc = ctx.Process(
+                target=launch_dp_worker,
+                args=(
+                    server_args,
+                    dp_rank,
+                    gpu_id,
+                    f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
+                    result_path,
+                ),
+                daemon=False,
+            )
+            proc.start()
         worker_processes.append(proc)
 
     dp_dispatcher = DPDispatcher(
