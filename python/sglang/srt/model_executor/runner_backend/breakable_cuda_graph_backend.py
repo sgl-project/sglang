@@ -1,20 +1,12 @@
 """BreakableCudaGraphBackend — segment-captured graphs with eager break
 markers (``eager_on_graph`` decorators on attention / mamba layers).
-
-Backend owns its own ``_graphs[shape] -> BreakableCUDAGraph`` and
-``_outputs[shape] -> LogitsProcessorOutput`` tables, plus the memory
-pool handle. When used as the prefill backend, the runner
-(``PrefillCudaGraphRunner``) owns the static input buffers captured
-segments read from; this backend stays phase-agnostic.
-
-Uses ``BreakableCUDAGraph`` / ``BreakableCUDAGraphCapture`` from
-``runner_backend_utils.breakable_cuda_graph``. No torch.compile.
+No torch.compile.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
@@ -41,8 +33,8 @@ if TYPE_CHECKING:
 
 
 class BreakableCudaGraphBackend(BaseCudaGraphBackend):
-    """Segmented capture: graphs break at attention/mamba boundaries;
-    attention metadata is recomputed at replay (outside captured segments).
+    """Segmented capture: graphs break at attention / mamba boundaries;
+    attention metadata is recomputed at replay outside captured segments.
     """
 
     def __init__(
@@ -73,14 +65,6 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
                 "Breakable CUDA graph is not compatible with memory saver mode"
             )
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
-        return shape_key in self._graphs
-
-    @contextmanager
-    def replay_session(self):
-        with enable_breakable_cuda_graph():
-            yield
-
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
@@ -100,9 +84,6 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        # Two jit warmups, then capture under BreakableCUDAGraphCapture.
-        # post_warmup_hook lets the attention backend reset state that
-        # warmup mutated (see FullCudaGraphBackend.capture_one for detail).
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
@@ -123,14 +104,20 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
+    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+        return shape_key in self._graphs
+
+    @contextmanager
+    def replay_session(self):
+        with enable_breakable_cuda_graph():
+            yield
+
     def replay(
         self,
         shape_key: Any,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        # static_forward_batch / kwargs are unused — Breakable replays
-        # against static buffers populated by the runner.
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 

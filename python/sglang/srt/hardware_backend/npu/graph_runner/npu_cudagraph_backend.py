@@ -1,14 +1,13 @@
-"""NPUCudaGraphBackend — Full-style backend for the Ascend NPU.
+"""NPUCudaGraphBackend — Ascend NPU full-graph capture (``torch.npu.NPUGraph``).
 
-Mirror of ``FullCudaGraphBackend`` with two differences:
-  - Captures into ``torch.npu.NPUGraph`` via ``torch.npu.graph(...)``.
-  - Exposes ``replay_with_input_update(shape_key, seq_lens, attr_name)``
-    so ``NPUGraphRunner`` can swap the recorded graph's input bindings
-    on-the-fly for variable seq_lens at replay time (NPU's
-    ``NPUGraph.update(...)`` API).
+Mirrors ``FullCudaGraphBackend`` with two differences:
+  - Captures via ``torch.npu.graph(...)`` into ``torch.npu.NPUGraph``.
+  - ``replay_with_input_update(shape_key, seq_lens, attr_name)`` rebinds
+    the recorded graph's input bindings for variable seq_lens at replay
+    time (NPU's ``NPUGraph.update(...)`` API).
 
-Imports of ``torch.npu`` are deferred so the module loads on non-NPU
-hosts without error (the methods are not callable on those hosts).
+``torch.npu`` is imported lazily inside methods so the module loads on
+non-NPU hosts.
 """
 
 from __future__ import annotations
@@ -39,13 +38,9 @@ if TYPE_CHECKING:
 
 
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
-    """Single-graph capture for Ascend NPU.
-
-    Same lifecycle as ``FullCudaGraphBackend`` (one graph per shape;
-    attention metadata captured inside the graph). Replay path may use
-    ``NPUGraph.update(...)`` to substitute fresh seq_lens without
-    re-recording.
-    """
+    """One ``torch.npu.NPUGraph`` per shape; attention metadata captured
+    inside the graph. ``replay_with_input_update`` substitutes fresh
+    seq_lens without re-recording."""
 
     def __init__(
         self,
@@ -66,16 +61,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
-
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
-        return shape_key in self._graphs
-
-    @contextmanager
-    def replay_session(self):
-        # NPU's full-graph capture doesn't need a "we're inside a
-        # captured graph" global flag — model code already takes the
-        # static-buffer path via the captured graph itself.
-        yield
 
     @contextmanager
     def capture_session(self, stream):
@@ -131,15 +116,19 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
+    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+        return shape_key in self._graphs
+
+    @contextmanager
+    def replay_session(self):
+        yield
+
     def replay(
         self,
         shape_key: Any,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        # Default replay path used when no async input update is needed
-        # (e.g. deepseek-nsa). NPUGraphRunner uses
-        # ``replay_with_input_update`` for the common case.
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
@@ -150,10 +139,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_name: str,
         attr_type: Any,
     ) -> Any:
-        """Spawn an update thread that rebinds seq_lens on the recorded
-        NPU graph, then replay. Used by ``NPUGraphRunner.replay`` when
-        the model is not deepseek-nsa.
-        """
+        """Rebind ``seq_lens`` on the recorded NPU graph in a background
+        thread, then replay. Used when the model is not deepseek-nsa."""
         if isinstance(attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
 

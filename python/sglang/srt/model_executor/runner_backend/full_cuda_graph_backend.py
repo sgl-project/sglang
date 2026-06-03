@@ -1,9 +1,5 @@
 """FullCudaGraphBackend — captures the entire model forward as one
 ``torch.cuda.CUDAGraph`` per shape.
-
-Backend owns its own ``_graphs[shape] -> CUDAGraph`` and
-``_outputs[shape] -> LogitsProcessorOutput`` tables, plus the memory
-pool handle for this backend instance.
 """
 
 from __future__ import annotations
@@ -32,12 +28,8 @@ if TYPE_CHECKING:
 
 
 class FullCudaGraphBackend(BaseCudaGraphBackend):
-    """Single-graph capture: one ``torch.cuda.CUDAGraph`` per shape;
-    attention metadata is captured *inside* the graph.
-
-    Memory-saver-aware: when the ``TorchMemorySaverAdapter`` is enabled,
-    capture goes through its wrapper so the graph allocation is tagged
-    correctly.
+    """One ``torch.cuda.CUDAGraph`` per shape; attention metadata is
+    captured inside the graph. Memory-saver-aware.
     """
 
     def __init__(
@@ -57,22 +49,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
-        return shape_key in self._graphs
-
-    @contextmanager
-    def replay_session(self):
-        # Full backend doesn't need a "we're inside a captured graph"
-        # global flag; model code already takes the static-buffer path
-        # via the captured graph itself.
-        yield
-
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
-        """Bind ``stream`` and the (lazily-allocated) pool handle for the
-        duration of the outer capture loop. Sets ``set_graph_pool_id``
-        for symmetric-memory cooperation.
-        """
         if self._pool is None:
             self._pool = self._device_module.graph_pool_handle()
         set_graph_pool_id(self._pool)
@@ -89,12 +67,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        # Two jit warmups so kernels stay loaded and any one-time setup
-        # cost is paid before the actual capture; then capture under
-        # the cuda-graph context. The post-warmup hook (when provided)
-        # lets the attention backend reset state that warmup mutated
-        # (e.g. FlashMLA metadata, PREP_IN_CUDA_GRAPH raw->full upgrade)
-        # so capture starts from a clean baseline.
+        # Two warmups so kernels are loaded and one-time setup is paid before capture.
+        # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
@@ -122,16 +96,19 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
+    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+        return shape_key in self._graphs
+
+    @contextmanager
+    def replay_session(self):
+        yield
+
     def replay(
         self,
         shape_key: Any,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        # static_forward_batch / kwargs are unused — Full backend replays
-        # against the static buffers populated by the runner; output flows
-        # via the cached ``_outputs[shape]`` whose tensors point into
-        # those buffers.
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
