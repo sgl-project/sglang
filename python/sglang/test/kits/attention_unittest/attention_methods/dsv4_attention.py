@@ -320,6 +320,7 @@ class MockDSV4ModelRunner:
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
         self.tp_size = 1
@@ -1078,7 +1079,6 @@ def _seed_c4_if_needed(fixture: DSV4AttentionFixture) -> None:
     compress_ratios.
     """
     if fixture.case.compress_ratio == 4:
-        fixture.backend._maybe_upgrade_forward_metadata()
         _seed_c4_sparse_indices(fixture, num_entries=_DSV4_EXTRA_ENTRIES)
 
 
@@ -1272,7 +1272,6 @@ def _pure_torch_dsv4_combined_reference(
     # `c4_sparse_page_indices` back to all -1 on the next upgrade) — the
     # reference must observe the same seeded indices the backend forward saw.
     _seed_c4_if_needed(fixture)
-    fixture.backend._maybe_upgrade_forward_metadata()
     md = fixture.backend.forward_metadata.core_metadata
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
@@ -1553,9 +1552,6 @@ def run_dsv4_compress_attention_case(
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
-        # Trigger lazy upgrade so we can patch the metadata that the smoke
-        # case relies on (specifically c4_sparse_page_indices).
-        fixture.backend._maybe_upgrade_forward_metadata()
         if case.compress_ratio == 4:
             _seed_c4_sparse_indices(fixture, num_entries=extra_entries)
         actual = fixture.backend.forward(
