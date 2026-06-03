@@ -41,6 +41,35 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     return canonical.as_strided(new_buffer.size(), new_buffer.stride())
 
 
+def share_input_buffers_in(obj) -> None:
+    """Coalesce every tensor buffer held on ``obj`` through the process-wide
+    pool, in place — the standalone equivalent of
+    ``ForwardInputBuffers.share_buffers`` for a plain object / ``SimpleNamespace``
+    of buffers. No-op on NPU (sharing disabled there for accuracy). Handles
+    nested dict / dataclass buffer fields (e.g. ``pp_proxy_tensors`` /
+    ``ngram_embedding_info``).
+    """
+    if is_npu():
+        return
+
+    for name, buffer in list(vars(obj).items()):
+        if buffer is None:
+            continue
+        if dataclasses.is_dataclass(buffer):
+            buffer = vars(buffer)
+        if isinstance(buffer, dict):
+            for sub_name, sub_buffer in buffer.items():
+                assert isinstance(
+                    sub_buffer, torch.Tensor
+                ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
+                buffer[sub_name] = share_input_buffer(f"{name}.{sub_name}", sub_buffer)
+        else:
+            assert isinstance(
+                buffer, torch.Tensor
+            ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
+            setattr(obj, name, share_input_buffer(name, buffer))
+
+
 @dataclass
 class ForwardInputBuffers:
 
