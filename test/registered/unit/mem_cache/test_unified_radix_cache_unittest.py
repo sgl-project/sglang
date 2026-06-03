@@ -169,6 +169,40 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
+class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
+    def test_get_prefix_hash_values_not_shared_across_calls(self):
+        """Regression guard for cached mutable prefix hash lists (#26177)."""
+
+        def make_node():
+            return UnifiedTreeNode(tree_components=(ComponentType.FULL,))
+
+        root = make_node()
+        n1 = make_node()
+        n1.parent = root
+        n1.hash_value = ["h1"]
+        n2 = make_node()
+        n2.parent = n1
+        n2.hash_value = ["h2"]
+        n3 = make_node()
+        n3.parent = n2
+        n3.hash_value = ["h3"]
+
+        first = n3.get_prefix_hash_values(n2)
+        self.assertEqual(first, ["h1", "h2"])
+
+        # Mimic downstream storage code that extends `prefix_keys` in place.
+        first += ["h3"]
+
+        second = n3.get_prefix_hash_values(n2)
+        self.assertEqual(second, ["h1", "h2"])
+        self.assertIsNot(second, first)
+
+        n4 = make_node()
+        n4.parent = n3
+        n4.hash_value = ["h4"]
+        self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
+
+
 def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
     server_args = ServerArgs(model_path="dummy", page_size=cfg.page_size)

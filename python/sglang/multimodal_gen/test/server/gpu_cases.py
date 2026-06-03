@@ -18,6 +18,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
+    LINGBOT_WORLD_REALTIME_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
     MODELOPT_TI2I_CI_sampling_params,
@@ -53,6 +54,7 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
+
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
@@ -421,6 +423,20 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_world_realtime_plastic_beach",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-world-fast-diffusers",
+            modality="video",
+            num_gpus=1,
+            extras=["--pipeline-class-name LingBotWorldCausalDMDPipeline"],
+            text_encoder_cpu_offload=True,
+        ),
+        LINGBOT_WORLD_REALTIME_sampling_params,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
 ]
 

@@ -174,7 +174,7 @@ class HybridCacheController(BaseHiCacheController):
         enable_storage_metrics: bool = False,
     ):
         startup_storage_backend = storage_backend
-        self.extra_host_mem_release_queues: dict[PoolName, Queue] = {}
+        self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,

@@ -54,7 +54,7 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    release_req_to_metadata_buffer,
+    maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -339,6 +339,10 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_decode_hicache = (
+            server_args.disaggregation_decode_enable_radix_cache
+            and self.enable_hierarchical_cache
+        )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -3582,9 +3586,17 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                release_req_to_metadata_buffer(
+                bootstrap_pending = req.pending_bootstrap
+                maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
+                if (
+                    bootstrap_pending
+                    and hasattr(req, "disagg_kv_sender")
+                    and req.disagg_kv_sender is not None
+                ):
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
 
             # For mamba radix cache
             if (
@@ -3710,6 +3722,19 @@ class Scheduler(
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
+
+        # Surface the paused state to dashboards immediately. The scheduler
+        # event loop short-circuits before reaching ``on_idle`` while paused,
+        # so without this hop ``gen_throughput`` retains its last non-zero
+        # value and KV events are not flushed for the entire pause window
+        # (e.g. across a weight update). Zero the gauge, force a one-shot
+        # idle log by resetting the rate-limit timestamp, and flush pending
+        # KV events.
+        self.metrics_reporter.last_gen_throughput = 0.0
+        if self.metrics_reporter.current_scheduler_metrics_enabled:
+            self.metrics_reporter.metrics_collector.last_log_time = 0.0
+            self.metrics_reporter._maybe_log_idle_metrics()
+        self.kv_events_publisher.publish_kv_events()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
