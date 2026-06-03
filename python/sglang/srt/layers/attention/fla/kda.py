@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
 from sglang.srt.layers.attention.fla.utils import (
     check_shared_mem,
+    is_intel,
     is_tf32_supported,
 )
 
