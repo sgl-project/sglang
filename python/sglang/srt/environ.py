@@ -196,7 +196,14 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
-    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
+    # Controls weight-file ordering for load-time I/O optimization.
+    #   -1 : no sorting, no staggering; preserves original file order.
+    #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
+    #   k>0: sort files and stagger per-rank order with factor k.
+    #        Files are processed in groups of (tp_size * k), and rank r starts each
+    #        group at offset (r * k), improving multi-rank I/O concurrency while
+    #        keeping access relatively ordered.
+    SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
@@ -382,6 +389,7 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_AG = EnvBool(True)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
@@ -687,6 +695,7 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
@@ -735,6 +744,13 @@ class Envs:
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
+    # Replicate the input embedding across TP ranks instead of sharding it
+    # along the vocab dimension (saves an all-reduce/all-gather in the embed
+    # lookup at the cost of replicated embedding weights). Drives both the
+    # target and every draft that shares its embedding (see
+    # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
+    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
+    SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
