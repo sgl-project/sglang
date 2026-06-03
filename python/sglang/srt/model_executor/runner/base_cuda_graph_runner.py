@@ -1,18 +1,4 @@
-"""Shared scaffolding for the prefill and decode CUDA graph runners.
-
-The phase-specific subclasses (``DecodeCudaGraphRunner``,
-``PrefillCudaGraphRunner``) own their own buffer dataclasses, capture
-forward-mode, and ``can_run`` logic. This base contributes:
-
-- Shared ``__init__`` fields (model_runner, device, parallel sizes,
-  attn-tp coordinates, tbo plugin).
-- ``freeze_gc`` — gc-freeze context used during capture.
-- ``get_batch_sizes_to_capture`` — bucket-sizing helper for decode.
-- ``_pad_to_bucket`` — shared bisect-bucket lookup with a clear-fail
-  assertion (the runner's ``can_run`` is responsible for ensuring the
-  raw size fits within the bucket list).
-- abstract methods describing the contract a phase runner must fulfil.
-"""
+"""Shared scaffolding for the prefill and decode CUDA graph runners."""
 
 from __future__ import annotations
 
@@ -64,11 +50,11 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def get_batch_sizes_to_capture(
-    model_runner: "ModelRunner", num_tokens_per_bs: int = 1
+    model_runner: ModelRunner, num_tokens_per_bs: int = 1
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
-    Filters ``cuda_graph_config[decode].bs`` by attention-tp/cp alignment
+    Filters cuda_graph_config[decode].bs by attention-tp/cp alignment
     constraints and clamps to req_to_token_pool.size.
     """
 
@@ -107,30 +93,36 @@ def get_batch_sizes_to_capture(
 class BaseCudaGraphRunner(ABC):
     """Abstract base for phase-specific cuda-graph runners.
 
-    A subclass implements one of the two phases (``DecodeCudaGraphRunner``
-    or ``PrefillCudaGraphRunner``) and plugs in a backend that handles
-    capture/replay mechanics. The runner orchestrates: bucket selection,
-    static buffer population, attention metadata init, replay dispatch,
-    and output slicing. The backend handles only "given a populated
-    forward_batch, run the captured artifact for this shape".
+    A subclass (DecodeCudaGraphRunner / PrefillCudaGraphRunner) owns one
+    phase and plugs in a BaseCudaGraphBackend that handles the
+    capture / replay mechanics. The runner orchestrates bucket
+    selection, static buffer population, attention metadata init,
+    replay dispatch, and output slicing.
 
-    Concrete state populated here (subclasses extend):
-      - ``self.model_runner`` — back-reference to ModelRunner.
-      - ``self.device``, ``self.device_module`` — device handle.
-      - ``self.tp_size``, ``self.dp_size``, ``self.pp_size``,
-        ``self.attn_tp_size``, ``self.attn_tp_rank`` — parallelism.
-      - ``self.tbo_plugin`` — two-batch-overlap plugin.
-      - ``self.buffers`` — phase-specific input buffers (assigned by
-        subclass before ``capture()``).
-      - ``self.backend`` — pluggable ``BaseCudaGraphBackend`` (assigned
-        by subclass).
+    Methods:
+      - can_run(forward_batch) — should forward_batch go through cuda
+        graph replay (vs eager fallback)?
+      - capture_prepare(size, ...) — build the dummy ForwardBatch and
+        per-capture local state needed by capture_one_shape.
+      - capture() — outer capture loop; iterates over shapes and calls
+        capture_one_shape for each.
+      - capture_one_shape(size, ...) — drive one model forward at this
+        shape into the backend's captured artifact.
+      - replay_prepare(forward_batch, ...) — pad to the nearest captured
+        bucket, populate static input buffers, init attention metadata.
+      - replay(forward_batch, ...) — dispatch one batch through cuda
+        graph replay.
+
+    Notes:
+      - buffers and backend are populated by the subclass before
+        capture(); the base only declares them.
     """
 
-    # Subclasses populate before calling ``capture``.
-    buffers: "ForwardInputBuffers"
-    backend: "BaseCudaGraphBackend"
+    # Subclasses populate before calling capture().
+    buffers: ForwardInputBuffers
+    backend: BaseCudaGraphBackend
 
-    def __init__(self, model_runner: "ModelRunner") -> None:
+    def __init__(self, model_runner: ModelRunner) -> None:
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
@@ -141,18 +133,15 @@ class BaseCudaGraphRunner(ABC):
         self.attn_tp_rank = get_attention_tp_rank()
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-    # -----------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------
     @staticmethod
     def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
-        """Return the smallest ``buckets[i] >= raw_size``.
+        """Return the smallest buckets[i] >= raw_size.
 
-        Caller's ``can_run`` must reject ``raw_size > max(buckets)``
-        before reaching ``replay_prepare`` — this assertion makes the
-        contract explicit. ``bisect_left`` returns ``len(buckets)``
-        when the value exceeds all buckets, which would otherwise
-        IndexError below with no diagnostic.
+        Caller's can_run must reject raw_size > max(buckets) before
+        reaching replay_prepare; this assertion makes the contract
+        explicit (bisect_left returns len(buckets) when the value
+        exceeds all buckets, which would otherwise IndexError below
+        with no diagnostic).
         """
         assert raw_size <= buckets[-1], (
             f"size {raw_size} exceeds max captured bucket {buckets[-1]}; "
@@ -161,59 +150,28 @@ class BaseCudaGraphRunner(ABC):
         index = bisect.bisect_left(buckets, raw_size)
         return buckets[index]
 
-    # -----------------------------------------------------------------
-    # Abstract contract
-    # -----------------------------------------------------------------
     @abstractmethod
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
-        """Decide whether ``forward_batch`` should go through cuda graph
-        replay (vs falling back to eager forward). Subclasses should AND
-        their phase-level checks with ``self.backend.can_run(fb)``.
-        """
+    def can_run(self, forward_batch: ForwardBatch) -> bool: ...
 
     @abstractmethod
-    def capture(self) -> None:
-        """Outer capture loop. Iterates over shapes, calls
-        ``self.capture_one_shape`` for each.
-        """
+    def capture_prepare(self, size: int, *args, **kwargs) -> Any: ...
 
     @abstractmethod
-    def capture_one_shape(self, size: int, *args, **kwargs) -> Any:
-        """Per-shape capture: build a dummy ForwardBatch via
-        ``capture_prepare``, run model forward once into the backend's
-        captured artifact for ``size``. Decode passes the patched-model
-        forward + stream/variant info; prefill takes ``size`` only.
-        Subclasses define the full signature.
-        """
+    def capture(self) -> None: ...
 
     @abstractmethod
-    def capture_prepare(self, size: int, *args, **kwargs) -> Any:
-        """Capture-time setup symmetric to ``replay_prepare``: build the
-        dummy ForwardBatch used by ``capture_one_shape`` and do any
-        capture-time-only init that needs locals (attn backend choice,
-        pp_proxy_tensors, …). Decode returns
-        ``(forward_batch, attn_backend, pp_proxy_tensors)``; prefill
-        returns only the ``forward_batch``. Caller (``capture_one_shape``)
-        consumes whatever is returned.
-        """
+    def capture_one_shape(self, size: int, *args, **kwargs) -> Any: ...
 
     @abstractmethod
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
         **kwargs,
-    ) -> Any:
-        """Replay-time setup: pad to nearest captured bucket, populate
-        static input buffers from ``forward_batch``, init attention
-        metadata. Decode mutates state on ``self`` (no return); prefill
-        returns the static ``ForwardBatch`` model code reads during
-        replay. Caller (``replay``) consumes whatever is returned.
-        """
+    ) -> Any: ...
 
     @abstractmethod
     def replay(
         self,
         forward_batch: ForwardBatch,
         **kwargs,
-    ) -> Any:
-        """Dispatch one batch through cuda graph replay."""
+    ) -> Any: ...
