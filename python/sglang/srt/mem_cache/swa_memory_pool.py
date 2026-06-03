@@ -380,6 +380,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        # Direct `free_swa` callers (e.g. `ScheduleBatch._evict_swa`) bypass
+        # `free`'s free_group routing. Track them separately so we can batch
+        # the gather / mask / scatter on `full_to_swa_index_mapping` across
+        # many small per-request calls within a free_group.
+        self._pending_swa_free: list[torch.Tensor] = []
 
         self._kvcache = kvcache
         self.clear()
@@ -628,11 +633,54 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        if self.is_not_in_free_group:
+            # Immediate path: gather → mask → free → scatter. Each of these
+            # is a separate CUDA kernel launch on a small tensor; under heavy
+            # eviction (chunked prefill, many requests per batch) the launch
+            # overhead dominates the actual work. Calling
+            # `free_group_begin/end` around batches of `free_swa` calls lets
+            # us batch the gather / mask / scatter as well; see
+            # `_flush_pending_swa_free`.
+            self._do_free_swa(free_index)
+        else:
+            self._pending_swa_free.append(free_index)
+
+    def _do_free_swa(self, free_index: torch.Tensor) -> None:
         self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
+
+    def _flush_pending_swa_free(self) -> None:
+        """Drain `_pending_swa_free` into a single batched gather / mask / scatter."""
+        if not self._pending_swa_free:
+            return
+        # One torch.cat + one set of gather / mask / scatter kernels replaces
+        # N small per-call sequences. The inner `swa_attn_allocator.free` is
+        # already cheap inside a free_group, but the SWA-mapping ops on the
+        # pool itself are not — they bypass `free_group` and run every call.
+        merged = (
+            self._pending_swa_free[0]
+            if len(self._pending_swa_free) == 1
+            else torch.cat(self._pending_swa_free)
+        )
+        self._pending_swa_free.clear()
+        self._do_free_swa(merged)
+
+    def free_group_begin(self):
+        super().free_group_begin()
+        self._pending_swa_free.clear()
+
+    def free_group_end(self):
+        # Drain SWA-only pending frees first, then let the base class drain
+        # the combined-full+SWA free_group (which routes back through `free`
+        # → `free_swa`, but with `is_not_in_free_group=True` so it bypasses
+        # the pending list).
+        self._flush_pending_swa_free()
+        super().free_group_end()
 
     def backup_state(self):
         return [
@@ -653,6 +701,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
+        self._pending_swa_free.clear()
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
