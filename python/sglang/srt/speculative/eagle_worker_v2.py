@@ -427,6 +427,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
+                    forward_batch.mark_forward_metadata_ready()
                 parent_list, top_scores_index, draft_tokens = self.draft_forward(
                     forward_batch
                 )
