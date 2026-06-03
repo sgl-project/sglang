@@ -288,12 +288,8 @@ class CudaGraphBufferRegistry:
         self.device = device
         self.max_bs = max_bs
         self.max_num_tokens = max_num_tokens
-        # When True, *allocated* slot buffers are coalesced through the global
-        # ForwardInputBuffers pool so a registry can share storage (and
-        # data_ptr) with a legacy buffer dataclass. Applies to allocation only:
-        # production always adopts an existing tensor via register_slot(bind=)
-        # (source=), which bypasses the pool — so this path is currently
-        # exercised only by tests.
+        # Coalesce allocated slot buffers through the global pool; only applies
+        # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
 

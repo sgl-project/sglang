@@ -42,13 +42,9 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
 
 
 def share_input_buffers_in(obj) -> None:
-    """Coalesce every tensor buffer held on ``obj`` through the process-wide
-    pool, in place — the standalone equivalent of
-    ``ForwardInputBuffers.share_buffers`` for a plain object / ``SimpleNamespace``
-    of buffers. No-op on NPU (sharing disabled there for accuracy). Handles
-    nested dict / dataclass buffer fields (e.g. ``pp_proxy_tensors`` /
-    ``ngram_embedding_info``).
-    """
+    """Pool every tensor buffer on ``obj`` (dataclass / ``SimpleNamespace``)
+    through the process-wide pool, in place. No-op on NPU; recurses into dict /
+    dataclass buffer fields (``pp_proxy_tensors`` / ``ngram_embedding_info``)."""
     if is_npu():
         return
 

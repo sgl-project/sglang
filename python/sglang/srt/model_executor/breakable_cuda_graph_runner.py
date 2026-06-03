@@ -185,11 +185,7 @@ class BreakableCudaGraphRunner:
                 device=self.device,
             )
 
-        # Token-axis FB-shared slot registry — owns (allocates) the
-        # graph-resident input buffers (input_ids / positions / out_cache_loc,
-        # + mrope_positions / input_embeds when multimodal). Breakable has no
-        # mamba track and bs is not padded here, so no bs-axis slots. share_pool
-        # mirrors the legacy ForwardInputBuffers.share_buffers() (off on NPU).
+        # Registry owns (allocates + pools) the token-axis input buffers.
         self.buffer_registry = build_prefill_registry(
             device=self.device,
             max_bs=1,

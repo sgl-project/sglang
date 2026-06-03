@@ -231,11 +231,7 @@ class PiecewiseCudaGraphRunner:
         with torch.device(self.device):
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # Token-axis FB-shared slot registry — owns (allocates) the
-        # graph-resident input buffers: input_ids / positions / out_cache_loc
-        # always, mrope_positions + input_embeds when multimodal, mamba_track_*
-        # when enabled. share_pool mirrors the legacy
-        # ForwardInputBuffers.share_buffers() coalescing (skipped on NPU).
+        # Registry owns (allocates + pools) the token-axis input buffers.
         self.buffer_registry = build_prefill_registry(
             device=self.device,
             max_bs=self.max_bs,

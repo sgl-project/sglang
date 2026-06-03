@@ -863,9 +863,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
         )
-        # Gathered (DP) path: post_fill overwrites the plain FB copy with this
-        # rank's local count. Pin attn-TP (size=2, rank=0) so the result is
-        # deterministic and differs from the raw FB value.
+        # Gathered (DP) path: post_fill overwrites the FB copy with the local
+        # count. Pin attn-TP (size=2, rank=0) so the result is deterministic.
         with mock.patch.object(
             fbi, "get_attention_tp_size", return_value=2
         ), mock.patch.object(fbi, "get_attention_tp_rank", return_value=0):
@@ -1153,8 +1152,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertTrue(torch.equal(idx, torch.tensor([3, 4], dtype=torch.int64)))
 
     def test_source_none_owns_allocated_buffers(self):
-        # With source=None the registry OWNS (allocates) every slot — the path
-        # PCG/breakable use now that PrefillInputBuffers is gone.
+        # source=None -> the registry allocates (owns) every slot.
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
         )
@@ -1177,7 +1175,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertEqual(tuple(reg.get_slot("mrope_positions").buffer.shape), (3, 16))
         self.assertEqual(tuple(reg.get_slot("input_embeds").buffer.shape), (16, 4))
         self.assertEqual(tuple(reg.get_slot("mamba_track_indices").buffer.shape), (2,))
-        # Fills with no backing source (owns its storage); ZERO-tails the pad.
+        # Fills + ZERO-tails the pad with no backing source.
         fb = _MiniForwardBatch(
             input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
             positions=torch.tensor([4, 5, 6], dtype=torch.int64),

@@ -177,13 +177,8 @@ def _allocate_decode_buffers(
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
 ) -> SimpleNamespace:
-    """Allocate the FB-shared graph-resident decode buffers as a namespace.
-
-    The namespace is adopted by ``build_decode_registry(source=...)``, which
-    then owns the per-replay fill (``fill_from``). This is a plain allocator —
-    the previous ``DecodeInputBuffers`` god dataclass and its
-    ``populate_from_forward_batch`` are gone.
-    """
+    """Allocate the FB-shared decode buffers as a namespace adopted by
+    ``build_decode_registry(source=...)``."""
     with torch.device(device):
         input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
         input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
@@ -257,7 +252,6 @@ def _allocate_decode_buffers(
             rids_int = None
             bootstrap_room_ids_int = None
 
-    # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
     seq_lens_cpu = torch.full(
         (max_bs,),
         seq_len_fill_value,
@@ -606,10 +600,7 @@ class CudaGraphRunner:
             ),
         )
         share_input_buffers_in(self.buffers)
-        # FB-shared slot registry, adopting the buffer storage so
-        # it mirrors the same physical buffers (stable data_ptr for capture vs
-        # replay). This is the unified fill/extract surface that eager /
-        # capture / replay migrate onto, replacing populate_from_forward_batch.
+        # The registry adopts these buffers (one data_ptr for capture + replay).
         self.buffer_registry = build_decode_registry(
             device=self.device,
             max_bs=self.max_bs,
@@ -854,9 +845,7 @@ class CudaGraphRunner:
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Graph inputs. The registry-owned FB-shared slots come from the
-        # registry (it adopted the allocated buffer storage, so these are the
-        # same physical tensors); the rest still come off `buffers` directly.
+        # Graph inputs: owned slots come from the registry; the rest off `buffers`.
         registry = self.buffer_registry
 
         def _slot(name):
