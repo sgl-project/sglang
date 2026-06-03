@@ -459,6 +459,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     req_all_ids_flat: Optional[torch.Tensor] = None
     req_all_ids_lens: Optional[torch.Tensor] = None
 
+    # Attention planning state. True iff attention metadata for this batch has
+    # already been planned outside ModelRunner.forward (multi-step draft
+    # pre-plan, plan-stream replay_prepare, hand-built spec batches), so the
+    # forward path must not plan again. Only such pre-planners may set this —
+    # ModelRunner / graph runners never mark after their own planning. The
+    # marker is only valid for the planning regime (backend set) it was set
+    # under; a fresh batch from init_new always starts unplanned.
+    forward_metadata_ready: bool = False
+
+    def mark_forward_metadata_ready(self):
+        """Record that attention metadata was pre-planned for this batch.
+
+        Call right next to the out-of-forward planning action
+        (e.g. ``draft_attn_backend.init_forward_metadata(fb)`` or
+        ``graph_runner.replay_prepare(fb)``).
+        """
+        self.forward_metadata_ready = True
+
+    def needs_forward_metadata_init(self) -> bool:
+        """Single judgment point for whether the forward path must plan.
+
+        Kept as a method (not an inlined attribute read) so the predicate can
+        later grow planner-identity / staleness checks without touching the
+        call sites.
+        """
+        return not self.forward_metadata_ready
+
     @classmethod
     def init_new(
         cls,
