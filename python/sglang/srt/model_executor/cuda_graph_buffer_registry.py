@@ -1,23 +1,10 @@
-"""FB-shared slot registry for CUDA Graph (and eager) forward paths.
+"""FB-shared slot registry for the CUDA graph forward paths.
 
-This module provides ``CudaGraphBufferRegistry`` — the unified FB →
-graph-resident buffer mirror used by eager / capture / replay. It replaces
-the scattered ``DecodeInputBuffers`` / ``PrefillInputBuffers`` dataclasses
-and their ad-hoc ``populate_from_forward_batch`` methods with a single
-``GraphSlot``-driven registry.
-
-Scope:
-
-  * ``GraphSlot``   — single FB-field spec (shape / dtype / padding policy /
-                      optional post-fill hook).
-  * ``PaddingPolicy`` — enum capturing the four padding behaviors the old
-                      populate path encoded inline (``KEEP_PAD`` /
-                      ``FILL_SENTINEL`` / ``ZERO`` / ``FOREACH_COPY``).
-  * ``CudaGraphBufferRegistry`` — registers slots, allocates their physical
-                      buffers (sharing via ``ForwardInputBuffers`` pool),
-                      and exposes ``fill_from(fb, padded_bs, ...)`` +
-                      ``extract_buffer(template) -> ForwardBatch`` for the
-                      callers.
+``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
+used by capture / replay. It replaces the per-runner ``DecodeInputBuffers`` /
+``PrefillInputBuffers`` dataclasses and their hand-written
+``populate_from_forward_batch`` methods with a single ``GraphSlot``-driven
+registry.
 
 Backend-private buffers (kernel workspaces, derived page tables, etc.) stay
 on ``AttentionBackend.cuda_graph_*`` — the registry only owns FB-shared
@@ -42,11 +29,8 @@ _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs.
-
-    Preserves the dtype-grouping perf optimization used by the old
-    ``DecodeInputBuffers.populate_from_forward_batch`` path.
-    """
+    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs
+    (a single foreach call requires a uniform dtype pair)."""
 
     def _foreach_copy(
         group_dsts: List[torch.Tensor], group_srcs: List[torch.Tensor]
@@ -267,15 +251,11 @@ class CudaGraphBufferRegistry:
 
     The registry holds a dict of ``GraphSlot`` instances, each mirroring
     one ``ForwardBatch`` attribute. Slots are registered up-front (during
-    runner init), allocated lazily on first ``register_slot`` call, then
-    filled per-iter via ``fill_from(fb, ...)`` and consumed via
-    ``extract_buffer(template) -> ForwardBatch``.
-
-    The registry is also a **cross-stream isolation boundary** — the
-    schedule_stream owns the FB tensors; ``fill_from`` issues D2D copies
-    on the forward_stream so the registry buffer becomes the
-    forward_stream's exclusive view of FB-shared inputs. This removes the
-    need for FB-shared-field clones on stream handoff.
+    runner init), allocated at ``register_slot``, then filled per-iter via
+    ``fill_from(fb, ...)`` and consumed via ``extract_buffer(template) ->
+    ForwardBatch``. ``fill_from`` issues plain D2D copies on the caller's
+    current stream; cross-stream correctness (stream handoff) is handled by
+    the runners, not here.
 
     Backend-private buffers (kernel workspace, derived page tables) are
     NOT managed here — backends keep them on ``self.cuda_graph_*`` and
@@ -535,11 +515,9 @@ def build_decode_registry(
         full-buffer ``zero_()`` / ``fill_()`` on ``bs != raw_bs`` is therefore
         equivalent to the tail-only reset the policies apply here).
 
-    Computed / structured fields (``num_token_non_padded``,
-    ``global_num_tokens_*``, ``pp_proxy_tensors``, ``ngram_embedding_info``,
-    ``custom_mask``, ``next_token_logits_buffer``, ``input_embeds``, canary
-    ids) are *not* registered here; the runner fills them out-of-band until
-    the registry grows the matching hooks.
+    ``custom_mask`` / ``next_token_logits_buffer`` / ``input_embeds`` are not
+    registered here — they are not per-replay FB copies (allocated and written
+    elsewhere), so the runner keeps owning them.
 
     When ``source`` is given, each slot adopts the same-named tensor off
     ``source`` (e.g. a ``DecodeInputBuffers``) instead of allocating, so the
