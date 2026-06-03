@@ -164,8 +164,8 @@ def sgemm_lora_a_fwd(
     K = weights.shape[-1]
     assert x.shape[-1] == K
 
-    single_adapter = getattr(batch_info, "single_adapter", None)
-    if single_adapter is not None and not batch_info.use_cuda_graph:
+    single_adapter = batch_info.single_adapter
+    if single_adapter is not None:
         idx, rank = single_adapter
         if rank == R // stack_num:
             return F.linear(x, weights[idx])

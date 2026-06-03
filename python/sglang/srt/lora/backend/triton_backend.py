@@ -29,6 +29,7 @@ class TritonLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
+        self.max_lora_rank = kwargs.get("max_lora_rank")
 
     def run_lora_a_embedding(
         self,
@@ -183,6 +184,11 @@ class TritonLoRABackend(BaseLoRABackend):
                 permutation=torch.zeros(max_tokens, dtype=torch.int32),
             )
 
+            if mlpb == 1 and self.max_lora_rank:
+                forced = (0, self.max_lora_rank)
+                self.cuda_graph_batch_info.single_adapter = forced
+                self.cuda_graph_sgemm_batch_info.single_adapter = forced
+
     def compute_sgemm_routing(self, use_cuda_graph: bool):
         """Sort tokens by adapter and build merged segments for sgemm LoRA."""
         bi = self.batch_info
@@ -305,7 +311,8 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
-        batch_info.single_adapter = single_adapter
+        if not use_cuda_graph:
+            batch_info.single_adapter = single_adapter
         self.batch_info = batch_info
 
         # Biggest win is in decode.
