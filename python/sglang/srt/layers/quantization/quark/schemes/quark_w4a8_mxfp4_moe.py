@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -15,6 +16,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_hip,
+    round_up,
     set_weight_attrs,
 )
 
@@ -92,12 +94,31 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        self.num_experts = num_experts
+        self.with_bias = extra_weight_attrs.get("with_bias", False)
+        if _use_aiter:
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 256
+            )
+            hidden_size = round_up(hidden_size, 256)
+            self.hidden_pad = hidden_size - layer.hidden_size
+            self.intermediate_pad = (
+                intermediate_size_per_partition_after_pad
+                - layer.intermediate_size_per_partition
+            )
+        else:
+            intermediate_size_per_partition_after_pad = intermediate_size_per_partition
+            self.hidden_pad = 0
+            self.intermediate_pad = 0
+
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
-            intermediate_size_per_partition,
+            intermediate_size_per_partition_after_pad,
             is_aiter_moe=_use_aiter,
             is_concat=True,
             is_packed=True,
         )
+        self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
+        self.hidden_size = hidden_size
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly.
@@ -136,6 +157,24 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_bias = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                w13_up_dim,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_bias", w13_weight_bias)
+        set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+
+        w2_weight_bias = torch.nn.Parameter(
+            torch.zeros(num_experts, hidden_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_bias", w2_weight_bias)
+        set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
         # WEIGHT_SCALES
         # MXFP4 uses one e8m0 scale per 32-value block. These scales are
@@ -251,7 +290,10 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            # MXFP4 hard-codes Swiglu in the AITER kernel path.
+            self.runner = MoeRunner(
+                moe_runner_backend, replace(moe_runner_config, activation="swiglu")
+            )
         else:
             # TODO: add non-AITER W4A8 MXFP4-FP8 MoE kernels.
             pass
@@ -277,6 +319,12 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
 
+        x_padded = torch.nn.functional.pad(
+            dispatch_output.hidden_states,
+            (0, self.hidden_pad),
+            mode="constant",
+            value=0.0,
+        )
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -285,6 +333,12 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             w2_scale=layer.w2_weight_scale,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            b13=layer.w13_weight_bias,
+            b2=layer.w2_weight_bias,
             expert_mask=layer.dispatcher.expert_mask_gpu,
+            doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
+            hidden_pad=self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
+            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
         )
-        return self.runner.run(dispatch_output, quant_info)
+        return self.runner.run(dispatch_output._replace(hidden_states=x_padded), quant_info)
