@@ -156,6 +156,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+        if (
+            hasattr(torch, "float4_e2m1fn_x2")
+            and self.data_type == torch.float4_e2m1fn_x2
+            and not self.is_nvfp4_kvcache
+        ):
+            raise ValueError(
+                "trtllm_mha FP4 KV cache decode supports nvfp4 only. "
+                "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
+                "for mxfp4."
+            )
 
         if (
             hasattr(torch, "float4_e2m1fn_x2")

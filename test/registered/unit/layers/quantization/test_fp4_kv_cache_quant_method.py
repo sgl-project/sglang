@@ -1,4 +1,4 @@
-"""Unit tests for FP4 KV cache quantization strategy pattern — no server, no model loading."""
+"""Unit tests for FP4 KV cache quantization strategy pattern - no server, no model loading."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -24,64 +24,81 @@ class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
 
     def test_registry_contains_nvfp4_and_mxfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            FP4_KV_CACHE_QUANT_REGISTRY,
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            KV_CACHE_QUANT_REGISTRY,
         )
 
-        self.assertIn("nvfp4", FP4_KV_CACHE_QUANT_REGISTRY)
-        self.assertIn("blockfp4", FP4_KV_CACHE_QUANT_REGISTRY)
+        self.assertIn("nvfp4", KV_CACHE_QUANT_REGISTRY)
+        self.assertIn("mxfp4", KV_CACHE_QUANT_REGISTRY)
 
     def test_factory_nvfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            NVFP4KVMethod,
-            get_fp4_kv_cache_quant_method,
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            NVFP4Method,
+            get_kv_cache_quant_method,
         )
 
-        method = get_fp4_kv_cache_quant_method(
+        method = get_kv_cache_quant_method(
             "nvfp4", num_layers=4, device="cpu", sm_version=120
         )
-        self.assertIsInstance(method, NVFP4KVMethod)
+        self.assertIsInstance(method, NVFP4Method)
         self.assertEqual(method.name, "nvfp4")
 
     def test_factory_mxfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            BlockFP4KVMethod,
-            get_fp4_kv_cache_quant_method,
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            MXFP4Method,
+            get_kv_cache_quant_method,
         )
 
-        method = get_fp4_kv_cache_quant_method("blockfp4")
-        self.assertIsInstance(method, BlockFP4KVMethod)
-        self.assertEqual(method.name, "blockfp4")
+        method = get_kv_cache_quant_method("mxfp4")
+        self.assertIsInstance(method, MXFP4Method)
+        self.assertEqual(method.name, "mxfp4")
 
-    def test_factory_unknown_raises(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            get_fp4_kv_cache_quant_method,
+    def test_resolve_explicit_recipes(self):
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            resolve_kv_cache_quant,
+        )
+
+        self.assertEqual(resolve_kv_cache_quant("nvfp4"), "nvfp4")
+        self.assertEqual(resolve_kv_cache_quant("mxfp4"), "mxfp4")
+        self.assertIsNone(resolve_kv_cache_quant("fp8_e4m3"))
+
+    def test_resolve_legacy_fp4_alias_raises(self):
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            resolve_kv_cache_quant,
         )
 
         with self.assertRaises(ValueError):
-            get_fp4_kv_cache_quant_method("unknown_method")
+            resolve_kv_cache_quant("fp4_e2m1")
 
-
-class TestNVFP4KVMethod(CustomTestCase):
-    """Test NVFP4KVMethod buffer creation and properties."""
-
-    def test_properties(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            NVFP4KVMethod,
+    def test_factory_unknown_raises(self):
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            get_kv_cache_quant_method,
         )
 
-        m = NVFP4KVMethod(num_layers=4, device="cpu", sm_version=120)
+        with self.assertRaises(ValueError):
+            get_kv_cache_quant_method("unknown_method")
+
+
+class TestNVFP4Method(CustomTestCase):
+    """Test NVFP4Method buffer creation and properties."""
+
+    def test_properties(self):
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            NVFP4Method,
+        )
+
+        m = NVFP4Method(num_layers=4, device="cpu", sm_version=120)
         self.assertEqual(m.name, "nvfp4")
-        self.assertEqual(m.SCALE_BLOCK_SIZE, 16)
+        self.assertEqual(m.scale_block_size, 16)
         self.assertTrue(m.needs_dequant_workspace())
         self.assertTrue(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            NVFP4KVMethod,
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            NVFP4Method,
         )
 
-        m = NVFP4KVMethod(num_layers=4, device="cpu", sm_version=120)
+        m = NVFP4Method(num_layers=4, device="cpu", sm_version=120)
         size, heads, dim, layers = 64, 8, 128, 4
         bufs = m.create_buffers(size, heads, dim, layers, "cpu")
 
@@ -100,21 +117,21 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertEqual(bufs["store_dtype"], torch.uint8)
 
     def test_compute_cell_size(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            NVFP4KVMethod,
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            NVFP4Method,
         )
 
-        m = NVFP4KVMethod(num_layers=4, device="cpu")
+        m = NVFP4Method(num_layers=4, device="cpu")
         cell = m.compute_cell_size(head_num=8, head_dim=128, num_layers=4, kv_size=1)
         # FP4: 8*64*4*2 = 4096, scales: 8*8*4*2 = 512, dq: 8*128*2 = 2048
         self.assertEqual(cell, 4096 + 512 + 2048)
 
     def test_scales_init(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            NVFP4KVMethod,
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            NVFP4Method,
         )
 
-        m = NVFP4KVMethod(num_layers=4, device="cpu")
+        m = NVFP4Method(num_layers=4, device="cpu")
         # Default scales should be 1.0
         self.assertTrue(torch.all(m.k_scales_gpu == 1.0))
         self.assertTrue(torch.all(m.v_scales_gpu == 1.0))
@@ -122,13 +139,13 @@ class TestNVFP4KVMethod(CustomTestCase):
 
     @skip_if_no_blackwell_nvfp4
     def test_quantize_dequantize_roundtrip(self):
-        """Test NVFP4 quantize→dequantize roundtrip on CUDA."""
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            NVFP4KVMethod,
+        """Test NVFP4 quantize->dequantize roundtrip on CUDA."""
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            NVFP4Method,
         )
 
         major, minor = torch.cuda.get_device_capability()
-        m = NVFP4KVMethod(num_layers=1, device="cuda", sm_version=major * 10 + minor)
+        m = NVFP4Method(num_layers=1, device="cuda", sm_version=major * 10 + minor)
 
         size, heads, dim = 32, 8, 128
         bufs = m.create_buffers(size, heads, dim, 1, "cuda")
@@ -171,25 +188,25 @@ class TestNVFP4KVMethod(CustomTestCase):
         )
 
 
-class TestBlockFP4KVMethod(CustomTestCase):
-    """Test BlockFP4KVMethod buffer creation and roundtrip."""
+class TestMXFP4Method(CustomTestCase):
+    """Test MXFP4Method buffer creation and roundtrip."""
 
     def test_properties(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            BlockFP4KVMethod,
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            MXFP4Method,
         )
 
-        m = BlockFP4KVMethod()
-        self.assertEqual(m.name, "blockfp4")
+        m = MXFP4Method()
+        self.assertEqual(m.name, "mxfp4")
         self.assertTrue(m.needs_dequant_workspace())
         self.assertFalse(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            BlockFP4KVMethod,
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            MXFP4Method,
         )
 
-        m = BlockFP4KVMethod()
+        m = MXFP4Method()
         size, heads, dim, layers = 64, 8, 128, 4
         bufs = m.create_buffers(size, heads, dim, layers, "cpu")
 
@@ -199,12 +216,12 @@ class TestBlockFP4KVMethod(CustomTestCase):
         self.assertEqual(bufs["k_scale_buffer"][0].shape, (size, (heads * dim) // 16))
 
     def test_quantize_dequantize_roundtrip_cpu(self):
-        """Test MXFP4 quantize→dequantize roundtrip on CPU."""
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            BlockFP4KVMethod,
+        """Test MXFP4 quantize->dequantize roundtrip on CPU."""
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            MXFP4Method,
         )
 
-        m = BlockFP4KVMethod()
+        m = MXFP4Method()
         size, heads, dim = 32, 8, 128
         bufs = m.create_buffers(size, heads, dim, 1, "cpu")
 
@@ -234,31 +251,21 @@ class TestBlockFP4KVMethod(CustomTestCase):
         self.assertEqual(k_out.dtype, torch.float8_e4m3fn)
 
 
-class TestBlockFP4KVQuantizeUtil(CustomTestCase):
-    """Test the existing MXFP4 BlockFP4KVQuantizeUtil roundtrip."""
+class TestKVFP4QuantizeUtil(CustomTestCase):
+    """Test the existing MXFP4 KVFP4QuantizeUtil roundtrip."""
 
     def test_roundtrip_cpu(self):
-        from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
         x = torch.randn(4, 8, 128, dtype=torch.bfloat16)
-        packed, scales = BlockFP4KVQuantizeUtil.batched_quantize(x)
-        reconstructed = BlockFP4KVQuantizeUtil.batched_dequantize(packed, scales)
+        packed, scales = KVFP4QuantizeUtil.batched_quantize(x)
+        reconstructed = KVFP4QuantizeUtil.batched_dequantize(packed, scales)
 
         self.assertEqual(reconstructed.shape, x.shape)
         rel_error = (
             x.float() - reconstructed.float()
         ).abs().mean() / x.float().abs().mean()
         self.assertLess(rel_error, 0.5)
-
-
-class TestFP4KVCacheRecipe(CustomTestCase):
-    """Test enum."""
-
-    def test_enum_values(self):
-        from sglang.srt.layers.quantization.kvfp4_tensor import FP4KVCacheRecipe
-
-        self.assertEqual(FP4KVCacheRecipe.MXFP4.value, 1)
-        self.assertEqual(FP4KVCacheRecipe.NVFP4.value, 2)
 
 
 if __name__ == "__main__":

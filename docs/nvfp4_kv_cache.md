@@ -4,7 +4,7 @@ NVFP4 KV cache uses FP4 (E2M1) format with two-level scaling (per-tensor FP32 + 
 
 ## Supported Hardware
 
-NVFP4 KV cache requires SM120 architecture.
+NVFP4 KV cache requires Blackwell SM100 or SM120 architecture. This guide focuses on SM120.
 
 ## Installation
 
@@ -54,7 +54,7 @@ pip install -v .
 python3 -m sglang.launch_server \
     --model-path <model_path> \
     --tp-size <num_gpus> \
-    --kv-cache-dtype fp4_e2m1 \
+    --kv-cache-dtype nvfp4 \
     --prefill-attention-backend flashinfer \
     --decode-attention-backend trtllm_mha \
     --moe-runner-backend triton \
@@ -66,42 +66,17 @@ python3 -m sglang.launch_server \
 ```
 
 Key arguments:
-- `--kv-cache-dtype fp4_e2m1`: Enable NVFP4 KV cache
+- `--kv-cache-dtype nvfp4`: Enable NVFP4 KV cache
 - `--prefill-attention-backend flashinfer`: Use FlashInfer for prefill (dequantizes FP4→FP8 for prefill kernel)
 - `--decode-attention-backend trtllm_mha`: Use TRT-LLM XQA decode kernel (native FP4 support)
 - `--moe-runner-backend triton`: Use Triton MoE runner
 - `--mamba-ssm-dtype bfloat16`: Use BF16 for Mamba SSM (for hybrid models like Qwen3.5)
 
-### With MTP (Multi-Token Prediction)
+### Speculative Decoding / MTP
 
-```bash
-python3 -m sglang.launch_server \
-    --model-path <model_path> \
-    --tp-size <num_gpus> --ep-size 1 \
-    --kv-cache-dtype fp4_e2m1 \
-    --prefill-attention-backend flashinfer \
-    --decode-attention-backend trtllm_mha \
-    --moe-runner-backend triton \
-    --mamba-ssm-dtype bfloat16 \
-    --speculative-algorithm NEXTN \
-    --speculative-num-steps 2 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 3 \
-    --speculative-attention-mode decode \
-    --disable-radix-cache \
-    --cuda-graph-bs 1 2 4 8 16 32 64 128 256 512 \
-    --chunked-prefill-size 512 \
-    --max-prefill-tokens 512 \
-    --max-running-requests 256 \
-    --mem-fraction-static 0.6 \
-    --random-seed 0 \
-    --host 0.0.0.0 --port 30000
-```
-
-Additional MTP arguments:
-- `--speculative-algorithm NEXTN`: Use NEXTN speculative decoding algorithm
-- `--speculative-attention-mode decode`: Forces draft_extend/target_verify to use the XQA decode kernel (required because the context kernel does not support NVFP4 scales)
-- `--mem-fraction-static 0.6`: MTP requires more GPU memory; reduce from default 0.85
+Speculative decoding and MTP-specific FP4 KV paths are intentionally out of scope
+for this version. Keep `--speculative-algorithm` unset when validating the
+functional NVFP4 KV cache path.
 
 ## Testing
 
@@ -128,7 +103,7 @@ Reference results (Qwen3.5-35B-A3B, 4x RTX PRO 6000 Blackwell SM120, TP=4):
 |----------|-----|----------|------------|
 | BF16 | No | 91.3% | - |
 | FP8 (fp8_e4m3) | No | 91.0% | 350.6 tok/s |
-| **FP4 (fp4_e2m1)** | **No** | **91.4%** | **2528 tok/s** |
+| **NVFP4** | **No** | **91.4%** | **2528 tok/s** |
 
 #### GPQA (198 questions, 8 repeats, temperature=0.6, max_tokens=81920)
 
@@ -136,14 +111,14 @@ Reference results (Qwen3.5-35B-A3B, 4x RTX PRO 6000 Blackwell SM120, TP=4):
 |----------|------------|-------------------|
 | BF16 | 83.5% | 84.3, 83.8, 83.8, 84.3, 80.8, 85.4, 82.3, 82.8 |
 | FP8 (fp8_e4m3) | 82.1% | 82.8, 80.3, 85.4, 81.3, 80.8, 82.3, 80.8, 82.8 |
-| **FP4 (fp4_e2m1)** | **80.1%** | 81.8, 80.3, 79.3, 81.3, 80.3, 80.8, 79.3, 77.8 |
+| **NVFP4** | **80.1%** | 81.8, 80.3, 79.3, 81.3, 80.3, 80.8, 79.3, 77.8 |
 
 #### LongBench V2 (503 questions, 128K context, no thinking, max_tokens=16384)
 
 | KV Cache | Score | Easy | Hard | Latency |
 |----------|-------|------|------|---------|
 | BF16 (3-round avg) | 52.4% +/- 0.3% | 56.3% | 50.2% | 1146s |
-| **FP4 (fp4_e2m1)** | **49.7%** | 55.7% | 46.3% | 1059s |
+| **NVFP4** | **49.7%** | 55.7% | 46.3% | 1059s |
 | FP4 (3-round avg, old) | 48.9% +/- 0.5% | 52.8% | 46.7% | 1471s |
 
 #### AIME25 (Majority Vote, n=16 beams, max_tokens=114688)
@@ -197,25 +172,22 @@ These scales are stored in `kv_cache_sf` (scale factor) tensors alongside the FP
 
 - **Prefill**: FlashInfer dequantizes FP4→FP8 on-the-fly, then uses the standard FP8 prefill kernel
 - **Decode**: TRT-LLM XQA kernel reads FP4 data natively with the two-level scales
-- **MTP target_verify / draft_extend**: Uses the XQA decode kernel with causal masking (`--speculative-attention-mode decode`)
 
 ### Changed Files (vs main)
 
 | File | Change |
 |------|--------|
-| `attention_registry.py` | Allow `flashinfer` in Blackwell assertion; support split prefill/decode backend check |
-| `flashinfer_backend.py` | Initialize NVFP4 dequant state; guard `_dequant_nvfp4_kv_for_extend_base`; set `transfer_cur_chunk_kv` for cuda graph |
-| `trtllm_mha_backend.py` | Enable MTP target_verify/draft_extend via XQA decode kernel with causal mask; fix q dtype (XQA needs fp16/bf16, not fp8) |
-| `hybrid_attn_backend.py` | Add `update_mamba_state_after_mtp_verify()` forwarding |
-| `hybrid_linear_attn_backend.py` | Support `req_pool_indices` for mamba state update when `speculative_attention_mode=decode` |
-| `memory_pool.py` | Fix `HybridLinearKVPool.get_key_buffer/get_value_buffer` to conditionally pass `scale` |
-| `eagle_worker.py` | Pass `req_pool_indices` to `update_mamba_state_after_mtp_verify` |
-| `custom_logit_processor.py` | Add `Qwen35ThinkingBudgetLogitProcessor` (token IDs 248068/248069) |
-| `run_eval.py` | Add `--custom-params` and `--custom-logit-processor` CLI arguments |
+| `server_args.py` / `model_runner.py` | Expose explicit `--kv-cache-dtype nvfp4` and map it to FP4 E2M1 storage |
+| `kv_cache_quant_method.py` | Own FP4 KV recipe selection, buffer creation, and quant/dequant strategy |
+| `kvfp4_tensor.py` | Provide low-level MXFP4/NVFP4 tensor helper operations |
+| `memory_pool.py` | Store packed FP4 KV, per-block scales, and shared dequant workspaces |
+| `flashinfer_backend.py` | Use NVFP4 dequant workspace for prefill/cache reuse |
+| `trtllm_mha_backend.py` | Enable NVFP4 decode-only XQA path |
 
 ## Known Limitations
 
-- NVFP4 KV cache is SM120 only (not SM90/SM100)
-- The TRT-LLM context kernel does not support NVFP4 scales, so MTP must use `--speculative-attention-mode decode`
+- NVFP4 KV cache requires Blackwell SM100 or SM120; it is not supported on SM90.
+- TRTLLM MHA with NVFP4 KV cache is decode-only; use `flashinfer` or `triton` for prefill.
+- Speculative decoding / MTP-specific FP4 KV paths are not included in this version.
 - FlashInfer prefill with NVFP4 dequantizes to FP8, not native FP4 prefill
 - Radix cache must be disabled (`--disable-radix-cache`)
