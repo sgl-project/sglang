@@ -2,10 +2,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from sglang.srt.speculative.adaptive_spec_params import (
-    AdaptiveSpeculativeParams,
-    load_adaptive_config,
-)
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -76,10 +73,9 @@ class AdaptiveController:
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
         self.worker = worker
-        cfg = load_adaptive_config(config_path)
         self.params = AdaptiveSpeculativeParams(
             initial_steps=worker.speculative_num_steps,
-            config=cfg,
+            cfg_path=config_path,
         )
         self._states: dict[int, SpecRuntimeState] = {}
 

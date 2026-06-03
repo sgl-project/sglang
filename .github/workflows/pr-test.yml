@@ -9,9 +9,8 @@ run-name: >-
 
 on:
   schedule:
-    - cron: '0 1,9,17 * * *'  # Run 3x daily: 2am / 10am / 6pm Pacific (PDT)
+    - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -462,13 +461,13 @@ jobs:
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
     secrets: inherit
 
-  base-c-test-4-gpu-b200:
+  base-c-test-deepep-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: base-c-test-4-gpu-b200
-      runner_config: 4-gpu-b200
+      self_name: base-c-test-deepep-4-gpu-b200
+      runner_config: deepep-4-gpu-b200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -476,27 +475,27 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  base-c-test-dsv4-4-gpu-b200:
+  base-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: base-c-test-dsv4-4-gpu-b200
-      runner_config: dsv4-4-gpu-b200
+      self_name: base-c-test-deepep-8-gpu-h200
+      runner_config: deepep-8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '45'
+      run_timeout_minutes: '30'
       timeout_per_file: '1800'
     secrets: inherit
 
-  base-c-test-dsv4-8-gpu-h200:
+  base-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: base-c-test-dsv4-8-gpu-h200
-      runner_config: dsv4-8-gpu-h200
+      self_name: base-c-test-4-gpu-b200
+      runner_config: 4-gpu-b200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -531,9 +530,9 @@ jobs:
         base-c-test-8-gpu-h20,
         base-c-test-8-gpu-h200,
         base-c-test-deepep-4-gpu-h100,
+        base-c-test-deepep-4-gpu-b200,
+        base-c-test-deepep-8-gpu-h200,
         base-c-test-4-gpu-b200,
-        base-c-test-dsv4-4-gpu-b200,
-        base-c-test-dsv4-8-gpu-h200,
         # base-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
       ]
     if: always()
@@ -563,3 +562,31 @@ jobs:
           # If the loop completes, all jobs were successful
           echo "All jobs completed successfully"
           exit 0
+
+  # =============================================== notify pr-states ====================================================
+  # Dispatches pr-states.yml after every attempt (initial + every rerun).
+  # workflow_run.completed only fires on the initial completion (one
+  # workflow_run record across attempts), so we explicitly dispatch —
+  # workflow_dispatch is the only event GITHUB_TOKEN can cascade-create.
+  #
+  # Fork PRs are excluded: their pull_request GITHUB_TOKEN is forced
+  # read-only regardless of declared `actions: write`, so dispatch 403s.
+  # Fork PRs get pr-states updates via the workflow_run subscription
+  # there (initial completion) and pull_request_target (push / label).
+  notify-pr-states:
+    needs: [pr-test-finish]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch pr-states refresh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run pr-states.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            -f pr_number="$PR_NUMBER"
