@@ -1,35 +1,15 @@
-import itertools
-from typing import Tuple
-
 import torch
-import triton
-import triton.testing
-from sgl_kernel import set_kv_buffer_kernel
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import (
+    DEFAULT_DEVICE,
+    create_empty,
+    create_random,
+)
 from sglang.jit_kernel.kvcache import store_cache
+from sglang.test.ci.ci_register import register_cuda_ci
 
-IS_CI = is_in_ci()
-
-
-def sglang_aot_store_cache(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    indices: torch.Tensor,
-) -> None:
-    set_kv_buffer_kernel(k_cache, v_cache, indices, k, v)
-
-
-def sglang_jit_store_cache(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    indices: torch.Tensor,
-) -> None:
-    store_cache(k, v, k_cache, v_cache, indices)
+register_cuda_ci(est_time=9, suite="base-b-kernel-benchmark-1-gpu-large")
 
 
 @torch.compile()
@@ -62,72 +42,32 @@ def torch_streams_store_cache(
     current_stream.wait_stream(alt_stream)
 
 
-DTYPE = torch.bfloat16
-DEVICE = "cuda"
-NUM_LAYERS = 8
-CACHE_SIZE = 2 * 1024 * 1024 // NUM_LAYERS
-
-if IS_CI:
-    BS_RANGE = [16]
-    ITEM_SIZE = [1024]
-else:
-    BS_RANGE = [2**n for n in range(0, 15)]
-    ITEM_SIZE = [64, 128, 256, 512, 1024]
-
-LINE_VALS = ["aot", "jit", "torch_compile", "torch_streams"]
-LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch Compile", "PyTorch 2 Stream"]
-STYLES = [("orange", "-"), ("blue", "--"), ("red", ":"), ("green", "-.")]
-X_NAMES = ["item_size", "batch_size"]
-CONFIGS = list(itertools.product(ITEM_SIZE, BS_RANGE))
+CACHE_SIZE = 2 * 1024 * 1024
+FN_MAP = {
+    "jit": store_cache,
+    "torch_compile": torch_compile_store_cache,
+    "torch_streams": torch_streams_store_cache,
+}
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=X_NAMES,
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="store-kvcache-performance",
-        args={},
-    )
-)
-def benchmark(
-    batch_size: int, item_size: int, provider: str
-) -> Tuple[float, float, float]:
-    k = torch.randn((NUM_LAYERS, batch_size, item_size), dtype=DTYPE, device=DEVICE)
-    v = torch.randn((NUM_LAYERS, batch_size, item_size), dtype=DTYPE, device=DEVICE)
-    k_cache = torch.randn(
-        (NUM_LAYERS, CACHE_SIZE, item_size), dtype=DTYPE, device=DEVICE
-    )
-    v_cache = torch.randn(
-        (NUM_LAYERS, CACHE_SIZE, item_size), dtype=DTYPE, device=DEVICE
-    )
-    indices = torch.randperm(CACHE_SIZE, device=DEVICE)[:batch_size]
-    torch.cuda.synchronize()
-
-    FN_MAP = {
-        "aot": sglang_aot_store_cache,
-        "jit": sglang_jit_store_cache,
-        "torch_compile": torch_compile_store_cache,
-        "torch_streams": torch_streams_store_cache,
-    }
-
-    def fn():
-        impl = FN_MAP[provider]
-        for i in range(NUM_LAYERS):
-            impl(k[i], v[i], k_cache[i], v_cache[i], indices)
-
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
-    return (
-        1000 * ms / NUM_LAYERS,
-        1000 * max_ms / NUM_LAYERS,
-        1000 * min_ms / NUM_LAYERS,
+@marker.parametrize("item_size", [64, 128, 256, 512, 1024], [1024])
+@marker.parametrize("batch_size", [2**n for n in range(0, 15)], [16])
+@marker.benchmark("impl", ["jit", "torch_compile", "torch_streams"])
+def benchmark(batch_size: int, item_size: int, impl: str):
+    torch.manual_seed(42)
+    k = create_random(batch_size, item_size)
+    k_cache = create_empty(CACHE_SIZE, item_size)
+    v = create_random(batch_size, item_size)
+    v_cache = create_empty(CACHE_SIZE, item_size)
+    indices = torch.randperm(CACHE_SIZE, device=DEFAULT_DEVICE)[:batch_size]
+    return marker.do_bench(
+        FN_MAP[impl],
+        input_args=(k, v, k_cache, v_cache, indices),
+        graph_clone_args=(0, 1, 4),  # not need to clone cache, which is large
+        memory_args=(k, v, indices),  # k_cache / v_cache excluded
+        memory_output=(k, v),  # inplace write, size = k + v
     )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

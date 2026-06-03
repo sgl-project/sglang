@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +23,11 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
@@ -46,6 +53,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -54,13 +62,21 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
     replace_prefix,
     replace_substrings,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -68,6 +84,7 @@ from sglang.srt.utils import (
     is_cuda,
     make_layers,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
@@ -177,6 +194,7 @@ class NemotronHMoE(nn.Module):
             activation=config.mlp_hidden_act,
             layer_id=layer_idx,
             is_gated=False,
+            routing_method_type=RoutingMethodType.DeepSeekV3,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -213,7 +231,9 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if _is_cuda:
+        # torch.compile cannot trace CUDA streams, so use the non-overlapping
+        # path when inside piecewise CUDA graph compilation.
+        if _is_cuda and not is_in_piecewise_cuda_graph():
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
@@ -338,9 +358,10 @@ class NemotronHMoEDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.mixer = NemotronHMoE(
-            config,
+            layer_config,
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
@@ -390,6 +411,24 @@ class NemotronHMambaDecoderLayer(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+    def _forward_mamba(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Core Mamba forward logic, called directly or via split op."""
+        output = torch.empty_like(hidden_states)
+        attn_backend = get_attn_backend()
+        assert isinstance(attn_backend, HybridLinearAttnBackend)
+        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+        attn_backend.linear_attn_backend.forward(
+            mixer=self.mixer,
+            layer_id=self.layer_id,
+            hidden_states=hidden_states,
+            output=output,
+            forward_batch=forward_batch,
+            use_triton_causal_conv=True,
+        )
+        return output
+
     def forward(
         self,
         *,
@@ -403,18 +442,18 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        output = torch.empty_like(hidden_states)
-        attn_backend = forward_batch.attn_backend
-        assert isinstance(attn_backend, HybridLinearAttnBackend)
-        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
-        attn_backend.linear_attn_backend.forward(
-            mixer=self.mixer,
-            layer_id=self.layer_id,
-            hidden_states=hidden_states,
-            output=output,
-            use_triton_causal_conv=True,  # TODO: investigate need of `use_triton_causal_conv`
-        )
-        return output, residual
+        if is_in_breakable_cuda_graph():
+            output = torch.empty_like(hidden_states)
+            breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            return output, residual
+
+        if is_in_piecewise_cuda_graph():
+            output = torch.empty_like(hidden_states)
+            nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            return output, residual
+        else:
+            output = self._forward_mamba(hidden_states, forward_batch)
+            return output, residual
 
 
 class NemotronHAttention(nn.Module):
@@ -472,6 +511,7 @@ class NemotronHAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
+            sliding_window_size=config.sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -495,9 +535,10 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.mixer = NemotronHAttention(
-            config,
+            layer_config,
             layer_idx,
             quant_config,
             prefix=f"{prefix}.mixer",
@@ -525,12 +566,12 @@ class NemotronHAttentionDecoderLayer(nn.Module):
 
 
 Layers = (
-    NemotronHAttentionDecoderLayer
-    | NemotronHMLPDecoderLayer
-    | NemotronHMambaDecoderLayer
-    | NemotronHMoEDecoderLayer
+    NemotronHAttentionDecoderLayer,
+    NemotronHMLPDecoderLayer,
+    NemotronHMambaDecoderLayer,
+    NemotronHMoEDecoderLayer,
 )
-ALL_DECODER_LAYER_TYPES: dict[str, type[Layers]] = {
+ALL_DECODER_LAYER_TYPES: dict[str, type] = {
     ATTENTION: NemotronHAttentionDecoderLayer,
     MLP: NemotronHMLPDecoderLayer,
     MAMBA: NemotronHMambaDecoderLayer,
@@ -631,9 +672,31 @@ class NemotronHForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     }
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "out_proj",
+        "in_proj",
+        "up_proj",
+        "gate_up_proj",
+        "down_proj",
+        "fc1_latent_proj",
+        "fc2_latent_proj",
+    ]
 
     remap_prefix = {"backbone": "model"}
-    remap_substr = {"A_log": "A", "embeddings": "embed_tokens"}
+    remap_substr = {
+        "A_log": "A",
+        "embeddings": "embed_tokens",
+        "k_proj.k_scale": "attn.k_scale",
+        "v_proj.v_scale": "attn.v_scale",
+    }
+
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "backbone.": "model.",
+        }
+    )
 
     def __init__(
         self,
@@ -645,6 +708,7 @@ class NemotronHForCausalLM(nn.Module):
         super().__init__()
         lora_config = None
         self.config = config
+        self.quant_config = quant_config
         self.model = self._init_model(
             config=config, quant_config=quant_config, prefix=prefix
         )
@@ -702,6 +766,100 @@ class NemotronHForCausalLM(nn.Module):
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.model.embed_tokens
 
+    def get_stacked_multiply(self, module_name):
+        """Non-gated MoE uses stacked_multiply=1 for gate_up_proj_moe."""
+        if module_name == "gate_up_proj_moe":
+            return 1  # Non-gated: only w1, no w3
+        # Fall back to defaults for everything else
+        from sglang.srt.lora.utils import get_stacked_multiply
+
+        return get_stacked_multiply(module_name)
+
+    def get_hidden_dim(self, module_name, layer_idx):
+        """Return (input_dim, output_dim) for LoRA buffers, per layer type."""
+        config = self.config
+        layer_type = config.layers_block_type[layer_idx]
+        hidden_size = config.hidden_size
+        head_dim = getattr(
+            config, "head_dim", hidden_size // config.num_attention_heads
+        )
+
+        if module_name == "qkv_proj":
+            return (
+                hidden_size,
+                head_dim
+                * (config.num_attention_heads + config.num_key_value_heads * 2),
+            )
+        elif module_name == "o_proj":
+            return (
+                head_dim * config.num_attention_heads,
+                hidden_size,
+            )
+        elif module_name == "out_proj":
+            # Mamba out_proj: RowParallelLinear from mamba_intermediate to hidden_size
+            mamba_intermediate = config.mamba_num_heads * config.mamba_head_dim
+            return mamba_intermediate, hidden_size
+        elif module_name == "gate_up_proj":
+            if layer_type == "mamba":
+                # Mamba in_proj gate component: output = mamba_num_heads * mamba_head_dim
+                mamba_intermediate = config.mamba_num_heads * config.mamba_head_dim
+                return hidden_size, mamba_intermediate * 2
+            elif layer_type == "moe":
+                # Shared expert: only has up_proj (no gate), but gets stacked
+                shared_inter = (
+                    config.moe_shared_expert_intermediate_size * config.n_shared_experts
+                )
+                return hidden_size, shared_inter * 2
+            else:
+                # MLP layer
+                return hidden_size, config.intermediate_size * 2
+        elif module_name == "up_proj":
+            if layer_type == "moe":
+                shared_inter = (
+                    config.moe_shared_expert_intermediate_size * config.n_shared_experts
+                )
+                return hidden_size, shared_inter
+            else:
+                return hidden_size, config.intermediate_size
+        elif module_name == "down_proj":
+            if layer_type == "moe":
+                shared_inter = (
+                    config.moe_shared_expert_intermediate_size * config.n_shared_experts
+                )
+                return shared_inter, hidden_size
+            else:
+                return config.intermediate_size, hidden_size
+        elif module_name == "in_proj":
+            # Mamba in_proj: gate_proj + x_proj, each mamba_intermediate wide
+            mamba_intermediate = config.mamba_num_heads * config.mamba_head_dim
+            return hidden_size, mamba_intermediate * 2
+        elif module_name == "x_proj":
+            # Mamba x_proj: projects from hidden_size to mamba_intermediate
+            mamba_intermediate = config.mamba_num_heads * config.mamba_head_dim
+            return hidden_size, mamba_intermediate
+        elif module_name == "gate_up_proj_moe":
+            # Non-gated MoE: only w1, no w3. stacked_multiply=1.
+            # For latent MoE, experts operate in moe_latent_size space.
+            moe_hidden = getattr(config, "moe_latent_size", None) or hidden_size
+            return moe_hidden, config.moe_intermediate_size
+        elif module_name == "down_proj_moe":
+            moe_hidden = getattr(config, "moe_latent_size", None) or hidden_size
+            return config.moe_intermediate_size, moe_hidden
+        elif module_name == "fc1_latent_proj":
+            moe_latent = getattr(config, "moe_latent_size", None) or hidden_size
+            return hidden_size, moe_latent
+        elif module_name == "fc2_latent_proj":
+            moe_latent = getattr(config, "moe_latent_size", None) or hidden_size
+            return moe_latent, hidden_size
+        elif module_name == "embed_tokens":
+            return config.vocab_size, hidden_size
+        elif module_name == "lm_head":
+            return hidden_size, config.vocab_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
     @torch.no_grad()
     def forward(
         self,
@@ -741,12 +899,6 @@ class NemotronHForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> None:
-        updated_weights = []
-        for name, loaded_weight in weights:
-            name = replace_prefix(name, self.remap_prefix)
-            name = replace_substrings(name, self.remap_substr)
-            updated_weights.append((name, loaded_weight))
-
         # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
         #   what the activation is applied to
         # - FusedMoe.w3 (aka up_proj) should be ignored since we're
@@ -755,12 +907,18 @@ class NemotronHForCausalLM(nn.Module):
             ckpt_gate_proj_name="up_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.max_n_routed_experts,
         )
 
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in updated_weights:
+        # Stream weights directly from the generator to avoid buffering
+        # the entire checkpoint (~75 GB) into a Python list. On unified-
+        # memory systems (e.g. DGX Spark, 119 GB) the old buffered path
+        # caused OOM: skeleton 81.6 GB + buffer 75 GB = 157 GB peak.
+        for name, loaded_weight in weights:
+            name = replace_prefix(name, self.remap_prefix)
+            name = replace_substrings(name, self.remap_substr)
             if is_mtp:
                 if "mtp" not in name:
                     continue
@@ -776,9 +934,10 @@ class NemotronHForCausalLM(nn.Module):
                 continue
 
             if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
+                if name not in params_dict:
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
 
             layer_id = get_layer_id(name)
             if (
@@ -820,6 +979,8 @@ class NemotronHForCausalLM(nn.Module):
                         continue
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    if name_mapped not in params_dict:
+                        continue
                     param = params_dict[name_mapped]
                     param.weight_loader(
                         param,
@@ -846,4 +1007,46 @@ class NemotronHForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
 
-EntryClass = [NemotronHForCausalLM]
+class NemotronHPuzzleForCausalLM(NemotronHForCausalLM):
+    pass
+
+
+EntryClass = [NemotronHForCausalLM, NemotronHPuzzleForCausalLM]
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def nemotron_mamba2_with_output(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """Split op for Mamba2 forward in piecewise CUDA graph mode."""
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    mamba_layer = attention_layers[layer_id]
+
+    # In piecewise CUDA graph mode, hidden_states may be padded to the
+    # captured graph size. Slice to actual token count for Mamba forward.
+    attn_backend = get_attn_backend()
+    metadata = attn_backend.linear_attn_backend.forward_metadata
+    num_actual_tokens = metadata.num_prefill_tokens + (
+        metadata.num_decodes * metadata.draft_token_num
+        if metadata.is_target_verify
+        else metadata.num_decodes
+    )
+    if hidden_states.shape[0] != num_actual_tokens:
+        hidden_states = hidden_states[:num_actual_tokens]
+
+    ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
+
+    # Copy result back; output may be larger (padded) so only fill actual tokens
+    output[:num_actual_tokens].view(ret.shape).copy_(ret)
+    if output.shape[0] != num_actual_tokens:
+        output[num_actual_tokens:].zero_()
+
+
+breakable_nemotron_mamba2_with_output = eager_on_graph(True)(
+    nemotron_mamba2_with_output
+)

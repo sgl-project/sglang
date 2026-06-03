@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 from collections.abc import Callable
 from typing import Optional
@@ -13,7 +14,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["CompressedTensorsW4A4Fp4"]
 
 
-class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
+class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
     def __init__(self):
         self.group_size = 16
 
@@ -150,7 +151,10 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
         w = layer.weight_packed
         w_blockscale = layer.weight_scale
-        if enable_flashinfer_fp4_gemm:
+        if (
+            enable_flashinfer_fp4_gemm
+            and not get_fp4_gemm_runner_backend().is_cutlass()
+        ):
             w = layer.weight_packed.T
             w_blockscale = layer.weight_scale.T
 

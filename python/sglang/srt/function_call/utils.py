@@ -8,6 +8,168 @@ from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
+_STANDARD_JSON_SCHEMA_TYPES = {
+    "null",
+    "boolean",
+    "object",
+    "array",
+    "number",
+    "string",
+    "integer",
+}
+
+# Non-standard ``type`` values commonly emitted by DB/ORM-driven tool-schema
+# generators. Mapped to the closest JSON Schema 2020-12 primitive so that
+# ``Draft202012Validator.check_schema`` does not reject an otherwise-usable
+# tool definition.
+_JSON_SCHEMA_TYPE_ALIASES: Dict[str, str] = {
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "uuid": "string",
+    "date": "string",
+    "datetime": "string",
+    "time": "string",
+    "timestamp": "string",
+    "binary": "string",
+    "blob": "string",
+    "bytea": "string",
+    "bytes": "string",
+    "varbinary": "string",
+    "bool": "boolean",
+    "bigint": "integer",
+    "smallint": "integer",
+    "tinyint": "integer",
+    "double": "number",
+    "decimal": "number",
+    "real": "number",
+    "numeric": "number",
+    "arr": "array",
+    "tuple": "array",
+    "set": "array",
+    "map": "object",
+}
+
+# Prefix-based matching so that parameterised names like ``int32`` /
+# ``float64`` / ``list[str]`` / ``dict[str, int]`` resolve. A prefix only
+# matches when it spans the entire token or is followed by a non-identifier
+# char, so "int" does not swallow "internal" and "list" does not swallow
+# "list_price".
+_PREFIX_BOUNDARY_CHARS = frozenset("0123456789[<( \t")
+_PREFIX_RULES: Tuple[Tuple[Tuple[str, ...], str], ...] = (
+    (("int", "uint", "long", "short", "unsigned"), "integer"),
+    (("num", "float"), "number"),
+    (("list",), "array"),
+    (("dict",), "object"),
+)
+
+
+def _matches_type_prefix(base: str, prefixes: Tuple[str, ...]) -> bool:
+    for p in prefixes:
+        if base == p:
+            return True
+        if (
+            len(base) > len(p)
+            and base.startswith(p)
+            and base[len(p)] in _PREFIX_BOUNDARY_CHARS
+        ):
+            return True
+    return False
+
+
+def _normalize_single_type(raw: Any) -> Any:
+    if not isinstance(raw, str):
+        return raw
+    if raw in _STANDARD_JSON_SCHEMA_TYPES:
+        return raw
+    # ``split("(", 1)[0]`` strips parenthesized params like ``varchar(255)``
+    # or ``decimal(10,2)`` without the overhead of a regex per call.
+    base = raw.split("(", 1)[0].strip().lower()
+    if base in _STANDARD_JSON_SCHEMA_TYPES:
+        return base
+    mapped = _JSON_SCHEMA_TYPE_ALIASES.get(base)
+    if mapped is not None:
+        return mapped
+    for prefixes, target in _PREFIX_RULES:
+        if _matches_type_prefix(base, prefixes):
+            return target
+    return raw
+
+
+def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
+    normalized_items: List[Any] = []
+    for item in raw_items:
+        normalized_item = _normalize_single_type(item)
+        if normalized_item not in normalized_items:
+            normalized_items.append(normalized_item)
+    return normalized_items
+
+
+def normalize_json_schema_types(schema: Any) -> None:
+    """
+    Walk a JSON Schema in place and rewrite non-standard ``"type"`` values
+    (e.g. ``"varchar"``, ``"enum"``, ``"int"``) to their standard JSON Schema
+    equivalents.
+
+    Acts as a compatibility layer for tool ``parameters`` schemas exported
+    from database / ORM tooling, which often uses DB type names rather than
+    JSON Schema types. Unknown types are left untouched so that downstream
+    validation can still surface genuine errors.
+
+    Mutates the input dict in place; the rewritten schema is also what gets
+    rendered into the model prompt, so e.g. a user-supplied ``"varchar"``
+    reaches the model as ``"string"``. ``$ref`` values are not resolved;
+    callers pass tree-shaped schemas (HTTP JSON input is always a tree).
+    """
+    if isinstance(schema, list):
+        for item in schema:
+            normalize_json_schema_types(item)
+        return
+    if not isinstance(schema, dict):
+        return
+
+    if "type" in schema:
+        t = schema["type"]
+        if isinstance(t, str):
+            schema["type"] = _normalize_single_type(t)
+        elif isinstance(t, list):
+            schema["type"] = _normalize_type_list(t)
+
+    for key in (
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ):
+        nested = schema.get(key)
+        if isinstance(nested, dict):
+            for v in nested.values():
+                normalize_json_schema_types(v)
+
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        nested = schema.get(key)
+        if isinstance(nested, list):
+            for v in nested:
+                normalize_json_schema_types(v)
+
+    for key in (
+        "items",
+        "additionalProperties",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "propertyNames",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ):
+        if key in schema:
+            normalize_json_schema_types(schema[key])
+
 
 def _find_common_prefix(s1: str, s2: str) -> str:
     prefix = ""
@@ -205,13 +367,16 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
 
 
 def get_json_schema_constraint(
-    tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
+    tools: List[Tool],
+    tool_choice: Union[ToolChoice, Literal["required"]],
+    parallel_tool_calls: bool = True,
 ) -> Optional[dict]:
     """
     Get the JSON schema constraint for the specified tool choice.
 
     Args:
         tool_choice: The tool choice specification
+        parallel_tool_calls: If False, constrain to exactly one tool call (maxItems=1)
 
     Returns:
         JSON schema dict, or None if no valid tools found
@@ -222,12 +387,14 @@ def get_json_schema_constraint(
         fn_name = tool_choice.function.name
         for tool in tools:
             if tool.function.name == fn_name:
-                return {
+                schema = {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 1,
                     "items": _get_tool_schema(tool),
                 }
+                if not parallel_tool_calls:
+                    schema["maxItems"] = 1
+                return schema
         return None
     elif tool_choice == "required":
         json_schema = {
@@ -238,6 +405,8 @@ def get_json_schema_constraint(
                 "anyOf": [_get_tool_schema(tool) for tool in tools],
             },
         }
+        if not parallel_tool_calls:
+            json_schema["maxItems"] = 1
         json_schema_defs = _get_tool_schema_defs(tools)
         if json_schema_defs:
             json_schema["$defs"] = json_schema_defs

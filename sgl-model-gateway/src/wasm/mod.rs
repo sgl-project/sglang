@@ -1,13 +1,9 @@
-//! WebAssembly (WASM) module support for sgl-model-gateway
+//! WebAssembly (WASM) module support for SGL Model Gateway
 //!
-//! This module provides WASM component execution capabilities using the WebAssembly Component Model.
-//! It supports middleware execution at various attach points (OnRequest, OnResponse) with async support.
+//! This module re-exports the smg-wasm crate and provides HTTP API routes.
 
-pub mod config;
-pub mod errors;
-pub mod module;
-pub mod module_manager;
+// Re-export everything from smg-wasm
+pub use smg_wasm::*;
+
+// Local HTTP API routes (depends on app-specific types)
 pub mod route;
-pub mod runtime;
-pub mod spec;
-pub mod types;

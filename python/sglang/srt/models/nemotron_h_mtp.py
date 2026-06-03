@@ -283,6 +283,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         prefix: str = "",
     ):
         nn.Module.__init__(self)
+        config = config.get_mtp_config()
         self.config = config
         self.quant_config = quant_config
         # Required for parent's load_weights
@@ -297,7 +298,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         self.model = NemotronHMultiTokenPredictor(
             config=config,
             quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
+            prefix=add_prefix("mtp", prefix),
         )
 
         self.lm_head = ParallelLMHead(

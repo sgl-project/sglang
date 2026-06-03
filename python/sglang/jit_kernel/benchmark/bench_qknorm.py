@@ -1,33 +1,26 @@
-import itertools
-import os
-from typing import Tuple
-
 import torch
-import triton
-import triton.testing
-from sgl_kernel import rmsnorm
 
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.jit_kernel.norm import fused_inplace_qknorm
 from sglang.srt.utils import get_current_device_stream_fast
+from sglang.test.ci.ci_register import register_cuda_ci
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+register_cuda_ci(est_time=10, suite="base-b-kernel-benchmark-1-gpu-large")
 
 alt_stream = torch.cuda.Stream()
 
+torch._dynamo.config.recompile_limit = 100
 
+
+# NOTE: now aot fallback to flashinfer
 def sglang_aot_qknorm(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-
-    head_dim = q.shape[-1]
-    q = q.view(-1, head_dim)
-    k = k.view(-1, head_dim)
+    from flashinfer import rmsnorm  # lazy import to avoid crash
 
     current_stream = get_current_device_stream_fast()
     alt_stream.wait_stream(current_stream)
@@ -35,28 +28,6 @@ def sglang_aot_qknorm(
     with torch.cuda.stream(alt_stream):
         rmsnorm(k, k_weight, out=k)
     current_stream.wait_stream(alt_stream)
-
-
-def sglang_jit_qknorm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-) -> None:
-
-    fused_inplace_qknorm(q, k, q_weight, k_weight)
-
-
-def flashinfer_qknorm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-) -> None:
-    from flashinfer import rmsnorm
-
-    rmsnorm(q, q_weight, out=q)
-    rmsnorm(k, k_weight, out=k)
 
 
 @torch.compile()
@@ -75,58 +46,30 @@ def torch_impl_qknorm(
     k.copy_(k.float() * k_norm * k_weight.float())
 
 
-HEAD_DIM = 128
-DTYPE = torch.bfloat16
-DEVICE = "cuda"
-
-if IS_CI:
-    BS_RANGE = [16]
-    GQA_RANGE = [4]
-    KV_HEAD_RANGE = [1]
-else:
-    BS_RANGE = [2**n for n in range(0, 14)]
-    GQA_RANGE = [4, 8]
-    KV_HEAD_RANGE = [1, 2, 4, 8]
-
-LINE_VALS = ["aot", "jit", "fi", "torch"]
-LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
-STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
-
-configs = list(itertools.product(GQA_RANGE, KV_HEAD_RANGE, BS_RANGE))
+FN_MAP = {
+    "aot": sglang_aot_qknorm,
+    "jit": fused_inplace_qknorm,
+    "torch": torch_impl_qknorm,
+}
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["GQA", "num_kv_heads", "batch_size"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="qknorm-performance",
-        args={},
-    )
-)
-def benchmark(
-    batch_size: int, GQA: int, num_kv_heads: int, provider: str
-) -> Tuple[float, float, float]:
+@marker.parametrize("head_dim", [128, 256, 512, 1024], [128])
+@marker.parametrize("GQA", [4, 8], [4])
+@marker.parametrize("num_kv_heads", [1, 2, 4, 8], [1])
+@marker.parametrize("batch_size", [2**n for n in range(0, 14)], [16])
+@marker.benchmark("impl", ["aot", "jit", "torch"])
+def benchmark(head_dim: int, GQA: int, num_kv_heads: int, batch_size: int, impl: str):
     num_qo_heads = GQA * num_kv_heads
-    q = torch.randn((batch_size, num_qo_heads, HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    k = torch.randn((batch_size, num_kv_heads, HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    q_weight = torch.randn(HEAD_DIM, dtype=DTYPE, device=DEVICE)
-    k_weight = torch.randn(HEAD_DIM, dtype=DTYPE, device=DEVICE)
-    FN_MAP = {
-        "aot": sglang_aot_qknorm,
-        "jit": sglang_jit_qknorm,
-        "fi": flashinfer_qknorm,
-        "torch": torch_impl_qknorm,
-    }
-    fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    q = create_random(batch_size, num_qo_heads, head_dim)
+    k = create_random(batch_size, num_kv_heads, head_dim)
+    q_weight = create_random(head_dim)
+    k_weight = create_random(head_dim)
+    return marker.do_bench(
+        FN_MAP[impl],
+        input_args=(q, k, q_weight, k_weight),
+        memory_output=(q, k),  # inplace write to q, k
+    )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

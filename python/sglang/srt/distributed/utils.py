@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/utils.py
 
 # Copyright 2023 The vLLM team.
@@ -16,6 +18,42 @@ import torch
 from torch.distributed import TCPStore
 
 logger = logging.getLogger(__name__)
+
+# Global TCPStore that is created during distributed initialization
+# This is the single shared store that all components should use
+_global_tcp_store: Optional[TCPStore] = None
+
+
+def set_global_tcp_store(store: TCPStore) -> None:
+    """Set the global TCPStore instance.
+
+    This should be called during distributed initialization to make
+    the store available to all components that need it.
+    """
+    global _global_tcp_store
+    _global_tcp_store = store
+    logger.info("Global TCPStore has been set")
+
+
+def get_global_tcp_store() -> Optional[TCPStore]:
+    """Get the existing global TCPStore.
+
+    This function provides access to the shared TCPStore instance that was
+    created during distributed initialization. All components (like NIXL buffers)
+    should use this same store for coordination.
+
+    Returns:
+        The global TCPStore instance, or None if not initialized yet.
+    """
+    global _global_tcp_store
+
+    if _global_tcp_store is None:
+        logger.warning(
+            "Global TCPStore not found. Make sure init_distributed_environment "
+            "was called with a tcp:// init method."
+        )
+
+    return _global_tcp_store
 
 
 def ensure_divisibility(numerator, denominator):

@@ -4,13 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
-
-use crate::{
-    core::{steps::workflow_data::WorkerRegistrationData, Worker},
-    workflow::{
-        StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
-    },
+use wfaas::{
+    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
+
+use crate::core::{steps::workflow_data::WorkerRegistrationData, Worker};
 
 /// Unified step to update policy registry for registered workers.
 ///
@@ -141,6 +139,23 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                     .policy_registry
                     .init_pd_bucket_policies(&prefill_workers);
             }
+        }
+
+        // Initialize cache-aware policies for PD mode (prefill_policy / decode_policy
+        // are separate instances from model_policies and are not touched by the
+        // per-model loop above). `init_workers` is idempotent so re-running on each
+        // registration is safe.
+        let decode_workers = app_context.worker_registry.get_decode_workers();
+        let prefill_is_cache_aware =
+            app_context.policy_registry.get_prefill_policy().name() == "cache_aware";
+        let decode_is_cache_aware =
+            app_context.policy_registry.get_decode_policy().name() == "cache_aware";
+        if (prefill_is_cache_aware && !prefill_workers.is_empty())
+            || (decode_is_cache_aware && !decode_workers.is_empty())
+        {
+            app_context
+                .policy_registry
+                .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
         }
 
         debug!(

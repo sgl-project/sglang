@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -172,7 +175,7 @@ class GemmaDecoderLayer(nn.Module):
             head_dim=config.head_dim,
             layer_id=layer_id,
             max_position_embeddings=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=config.rope_parameters["rope_theta"],
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )

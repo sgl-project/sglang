@@ -15,11 +15,12 @@ import torch
 from sglang.bench_one_batch import TreeCacheNamespace
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import get_device
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
@@ -32,7 +33,7 @@ class TestForwardSplitPrefill(CustomTestCase):
         """Set up the test environment once for all tests."""
         cls.model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.tp_size = 1
-        cls.device = "cuda"
+        cls.device = get_device()
 
         # Initialize server args
         cls.server_args = ServerArgs(
@@ -114,14 +115,13 @@ class TestForwardSplitPrefill(CustomTestCase):
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
         )
+        batch.prepare_for_extend()
         if is_split_prefill:
-            batch.prepare_for_split_prefill()
-        else:
-            batch.prepare_for_extend()
+            # For split prefill, we need to set the forward mode to SPLIT_PREFILL
+            batch.forward_mode = ForwardMode.SPLIT_PREFILL
 
         # Create forward batch
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
 
         return forward_batch
 

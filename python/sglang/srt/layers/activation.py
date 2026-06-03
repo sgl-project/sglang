@@ -27,14 +27,17 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
     set_weight_attrs,
@@ -42,16 +45,36 @@ from sglang.srt.utils import (
 from sglang.utils import resolve_obj_by_qualname
 
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda or _is_xpu:
+if _is_cuda:
+    from sglang.jit_kernel.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
+elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+elif _is_musa:
+    from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+    @register_fake_if_exists("aten::_fused_swiglu_forward")
+    def _(x):
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        return torch.empty(output_shape, dtype=x.dtype, device=x.device)
+
+
+if _use_aiter:
+    from aiter import silu_and_mul as _aiter_silu_and_mul
 
 if is_npu():
     import torch_npu
@@ -64,6 +87,8 @@ class SiluAndMul(MultiPlatformOp):
         super().__init__(*args, **kwargs)
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
+        elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
+            self._forward_method = self.forward_aiter
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -74,6 +99,13 @@ class SiluAndMul(MultiPlatformOp):
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
+        return out
+
+    def forward_aiter(self, x: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        _aiter_silu_and_mul(out, x, limit)
         return out
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
@@ -93,6 +125,12 @@ class SiluAndMul(MultiPlatformOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "_musa_swish_glu"):
+            # XXX (MUSA): nn.SwishGLU seems to have better performance than silu_and_mul on MUSA, we can switch to it for now. We can consider implementing a silu_and_mul kernel for MUSA in the future if needed.
+            self._musa_swish_glu = nn.SwishGLU()
+        return self._musa_swish_glu(x)
 
 
 class GeluAndMul(MultiPlatformOp):
@@ -131,6 +169,8 @@ class GeluAndMul(MultiPlatformOp):
         return self._forward_impl(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GELUTANH.get():
+            return self.forward_native(x)
         y_npu, gelu_npu = torch_npu.npu_geglu(
             x,
             dim=-1,

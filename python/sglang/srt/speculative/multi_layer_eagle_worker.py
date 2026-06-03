@@ -14,11 +14,10 @@
 
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
@@ -31,14 +30,18 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    apply_eagle_prefill_input_rotation,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -47,7 +50,6 @@ from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner imp
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    detect_nan,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
@@ -55,6 +57,10 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils.async_probe import maybe_detect_nan
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_npu = is_npu()
 
@@ -73,6 +79,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -81,7 +89,6 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -129,14 +136,26 @@ class MultiLayerEagleWorker(TpModelWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
                 is_multi_layer_eagle=True,
+            )
+
+        self.eagle_use_aux_hidden_state = False
+        if self.speculative_algorithm.is_eagle3():
+            eagle_config = getattr(
+                self.model_runner.model_config.hf_config, "eagle_config", {}
+            )
+            self.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -176,9 +195,10 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.mtp_model_runner(0).tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+            speculative_moe_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -226,7 +246,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
                 )
 
-    def mtp_model_runner(self, layer_id: int):
+    def mtp_model_runner(self, layer_id: int) -> ModelRunner:
         return self.model_runner_list[layer_id]
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
@@ -242,70 +262,93 @@ class MultiLayerEagleWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
-                batch
-            )
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            (
+                logits_output,
+                next_token_ids,
+                seq_lens_cpu,
+                can_run_cuda_graph,
+            ) = self.forward_target_extend(batch)
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
-                can_run_cuda_graph=False,
-            )
-        else:
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
-                spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
-            )
-
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
-                # NOTE: We should use `check_forward_draft_extend_after_decode`
-                # when DP attention is enabled, but it is slow. Skip it for now.
-                if (
-                    self.server_args.enable_dp_attention
-                    or batch.spec_info.verified_id.shape[0] > 0
-                ):
-                    # decode is not finished
-                    self.forward_draft_extend_after_decode(batch)
-
-            return GenerationBatchResult(
-                logits_output=logits_output,
-                next_token_ids=verify_output.verified_id,
-                num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+                num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+        else:
+            set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
-    def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.verified_id.shape[0] > 0
-        if not self.server_args.enable_dp_attention:
-            return local_need_forward
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
+                verify_input = self.draft(batch)
 
-        global_need_forward = torch.tensor(
-            [
-                (local_need_forward),
-            ],
-            dtype=torch.int64,
-        )
-        torch.distributed.all_reduce(
-            global_need_forward, group=get_tp_group().cpu_group
-        )
-        global_need_forward_cnt = global_need_forward[0].item()
-        need_forward = global_need_forward_cnt > 0
-        return need_forward
+            set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+
+            # Install verify_input as `batch.spec_info` for the verify forward.
+            batch.spec_info = verify_input
+            verify_output = self.verify(batch)
+
+            if get_global_tracing_enabled():
+                for idx, req in enumerate(batch.reqs):
+                    num_correct_drafts = verify_output.num_correct_drafts_per_req_cpu[
+                        idx
+                    ]
+                    req.time_stats.set_spec_verify_end_time(
+                        num_correct_drafts=num_correct_drafts
+                    )
+
+            set_time_batch(
+                batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
+            )
+
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
+                # NOTE: We should use `check_forward_draft_extend_after_decode`
+                # when DP attention is enabled, but it is slow. Skip it for now.
+                draft_extend_input = verify_output.draft_extend_input
+                if (
+                    self.server_args.enable_dp_attention
+                    or draft_extend_input.input_ids.shape[0] > 0
+                ):
+                    # decode is not finished; install draft_extend_input for
+                    # the extend forward, then install the next-iter
+                    # EagleDraftInput it returns.
+                    batch.spec_info = draft_extend_input
+                    next_draft_input = self.forward_draft_extend_after_decode(batch)
+                    batch.spec_info = next_draft_input
+                else:
+                    # All reqs finished and dp_attention isn't forcing extend.
+                    # Install an idle EagleDraftInput so next iter's scheduler
+                    # ops (merge_batch / filter_batch) see well-typed empty
+                    # tensors instead of None.
+                    self._draft_preprocess_idle(batch)
+
+            set_time_batch(
+                batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
+            )
+
+            return GenerationBatchResult(
+                logits_output=verify_output.logits_output,
+                next_token_ids=verify_output.accept_tokens,
+                num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+                num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
+                can_run_cuda_graph=verify_output.can_run_cuda_graph,
+            )
 
     def forward_target_extend(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, int, Optional[torch.Tensor]]:
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], bool]:
         """Run the target extend.
 
         Args:
@@ -314,13 +357,19 @@ class MultiLayerEagleWorker(TpModelWorker):
         Returns:
             logits_output: The output of logits. It will contain the full hidden states.
             next_token_ids: Next token ids generated.
+            seq_lens_cpu: CPU copy of sequence lengths for the draft prefill path.
+            can_run_cuda_graph: Whether the target prefill ran with cuda graph.
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
-        model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        model_worker_batch.return_hidden_states_before_norm = True
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch.capture_hidden_mode = capture_mode
+        batch.return_hidden_states_before_norm = True
+        batch_result = self.target_worker.forward_batch_generation(batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -328,7 +377,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         return (
             logits_output,
             next_token_ids,
-            model_worker_batch.seq_lens_cpu,
+            batch.seq_lens_cpu,
+            batch_result.can_run_cuda_graph,
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
@@ -353,17 +403,19 @@ class MultiLayerEagleWorker(TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_batch = self.topk
-        spec_info.num_tokens_for_logprob_per_batch = self.topk
+        draft_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        spec_info.capture_hidden_mode = draft_capture_mode
+        spec_info.num_tokens_per_req = self.topk
+        spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.mtp_model_runner(0)
-        )
+        forward_batch = ForwardBatch.init_new(batch, self.mtp_model_runner(0))
+        assert forward_batch.capture_hidden_mode == draft_capture_mode
         forward_batch.can_run_dp_cuda_graph = False
         forward_batch.return_hidden_states_before_norm = True
 
@@ -374,6 +426,8 @@ class MultiLayerEagleWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+
+        maybe_detect_nan(topk_p, "draft: NaN in initial topk_p from spec_info")
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -420,12 +474,12 @@ class MultiLayerEagleWorker(TpModelWorker):
         (
             tree_mask,
             position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            spec_info.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -436,18 +490,23 @@ class MultiLayerEagleWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
+        target_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.server_args.speculative_num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=target_capture_mode,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
@@ -456,7 +515,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         # allocator and kv cache pool are shared with target worker
         pass
 
-    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+    def verify(self, batch: ScheduleBatch):
+        spec_info: EagleVerifyInput = batch.spec_info
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
         batch.forward_mode = (
@@ -464,24 +524,19 @@ class MultiLayerEagleWorker(TpModelWorker):
             if not batch.forward_mode.is_idle()
             else ForwardMode.IDLE
         )
-        batch.spec_info = spec_info
-
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
-        )
-        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
-        model_worker_batch.return_hidden_states_before_norm = True
 
         if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
             draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrive_next_token.shape
+                spec_info.retrieve_next_token.shape
             ).cpu()
 
         # Forward
+        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
+        batch.return_hidden_states_before_norm = True
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+            batch, is_verify=True
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -503,13 +558,12 @@ class MultiLayerEagleWorker(TpModelWorker):
 
             if vocab_mask is not None:
                 assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
                 # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
@@ -523,49 +577,47 @@ class MultiLayerEagleWorker(TpModelWorker):
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
+            res.accept_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]
 
         if self.target_worker.model_runner.hybrid_gdn_config is not None:
-            accepted_length = (
-                torch.tensor(
-                    res.accept_length_per_req_cpu,
-                    device=logits_output.hidden_states.device,
-                    dtype=torch.int64,
-                )
-                + 1
+            num_correct_drafts = torch.tensor(
+                res.num_correct_drafts_per_req_cpu,
+                device=logits_output.hidden_states.device,
+                dtype=torch.int64,
             )
 
             # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-            # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
-            if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
-                # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
-                # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
-                # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
-                # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
-                cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
-                req_start_positions = torch.cat(
-                    [
-                        torch.zeros(
-                            1,
-                            dtype=cumulative_accepted_lengths.dtype,
-                            device=cumulative_accepted_lengths.device,
-                        ),
-                        cumulative_accepted_lengths[:-1],
-                    ]
+            # res.accept_indices.shape[0] > 0 skips DP attn idle batch
+            if spec_info.topk > 1 and res.accept_indices.shape[0] > 0:
+                # accept_indices=[0,2,3,4,5,7,9,10,11], num_accept_tokens=[4, 3, 2], cumulative_num_accept_tokens=[4, 7, 9]
+                # first_token_indices_per_req=prepend(0, accept_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
+                # last_token_indices_per_req=accept_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
+                # last_correct_step_indices = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+                # equivalent: last_correct_step_indices = last_token_indices_per_req - first_token_indices_per_req;
+                # `accepted_indices_offset` equals `first_token_indices_per_req` because the first accepted slot of each req is its "current token" at logical position i * draft_token_num.
+                cumulative_num_accept_tokens = torch.cumsum(
+                    num_correct_drafts + 1, dim=0
                 )
-                first_token_indices_per_req = res.accepted_indices[req_start_positions]
-                last_token_indices_per_req = res.accepted_indices[
-                    cumulative_accepted_lengths - 1
-                ]
-                max_relative_indices_per_req = (
-                    last_token_indices_per_req - first_token_indices_per_req
+                accepted_indices_offset = torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=num_correct_drafts.dtype,
+                    device=num_correct_drafts.device,
+                )
+                last_correct_step_indices = (
+                    res.accept_indices[cumulative_num_accept_tokens - 1]
+                    - accepted_indices_offset
                 )
             else:
-                max_relative_indices_per_req = accepted_length - 1
+                last_correct_step_indices = num_correct_drafts
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                max_relative_indices_per_req, self.target_worker.model_runner.model
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=self.target_worker.model_runner.model,
             )
 
         if batch.return_logprob:
@@ -575,9 +627,9 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
 
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        res.can_run_cuda_graph = can_run_cuda_graph
+        return res
 
     def forward_draft_extend(
         self,
@@ -595,27 +647,32 @@ class MultiLayerEagleWorker(TpModelWorker):
         """
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            verified_id=next_token_ids,
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=seq_lens_cpu
+        apply_eagle_prefill_input_rotation(batch, next_token_ids)
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
         )
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.mtp_model_runner(0)
-        )
+        batch.spec_info.capture_hidden_mode = capture_mode
+        batch.seq_lens_cpu_cache = seq_lens_cpu
+        forward_batch = ForwardBatch.init_new(batch, self.mtp_model_runner(0))
         forward_batch.return_logprob = False
         forward_batch.return_hidden_states_before_norm = True
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
-            logits_output, _ = self.mtp_model_runner(step).forward(forward_batch)
-            if self.enable_nan_detection:
-                detect_nan(logits_output)
+            logits_output = (
+                self.mtp_model_runner(step).forward(forward_batch).logits_output
+            )
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                f"draft_extend_for_prefill step {step}",
+            )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
@@ -633,54 +690,45 @@ class MultiLayerEagleWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
         forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
-        has_finished, unfinished_req_index = False, []
-        for i, req in enumerate(batch.reqs):
-            if req.finished():
-                has_finished = True
-            else:
-                unfinished_req_index.append(i)
-        if has_finished:
-            unfinished_index_device = torch.tensor(
-                unfinished_req_index,
-                dtype=torch.int64,
-                device=batch.spec_info.topk_p.device,
-            )
-            batch.spec_info.filter_batch(
-                unfinished_index_device, has_been_filtered=False
-            )
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        assert isinstance(batch.spec_info, EagleDraftInput)
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch
+    ) -> EagleDraftInput:
+        draft_extend_input: EagleDraftExtendInput = batch.spec_info
+
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = batch.spec_info.accept_length
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
+        draft_extend_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        if draft_extend_input.input_ids.shape[0] == 0:
+            # Single source for hidden_size via hidden_size_for(self) (incl.
+            # EAGLE-3 aux widening). Two stub origins from verify(): fully-idle
+            # batch and active batch with all reqs finished.
             batch = batch.copy()
             batch.prepare_for_idle()
-            hidden_size = (
-                self.model_config.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
-                else self.model_config.hidden_size
-            )
-            batch.spec_info = EagleDraftInput.create_idle_input(
+            draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=self.device,
-                hidden_size=hidden_size,
-                dtype=self.model_config.dtype,
-                topk=self.topk,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
+                hidden_size=EagleDraftExtendInput.hidden_size_for(self),
+                dtype=EagleDraftExtendInput.dtype_for(self),
+                capture_hidden_mode=draft_extend_capture_mode,
             )
+            batch.spec_info = draft_extend_input
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_batch = 1
-        batch.spec_info.prepare_extend_after_decode(
+        # Phase 1: prepare extend (kernel writes draft_extend_input.{positions, bonus_tokens})
+        draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
+        draft_extend_input.num_tokens_for_logprob_per_req = 1
+        draft_extend_input.prepare_extend_after_decode(
             batch,
-            self.speculative_num_steps,
+            speculative_num_steps=self.speculative_num_steps,
         )
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND
@@ -689,11 +737,9 @@ class MultiLayerEagleWorker(TpModelWorker):
         )
 
         batch.return_hidden_states = False
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.mtp_model_runner(0)
-        )
+        draft_extend_input.capture_hidden_mode = draft_extend_capture_mode
+        forward_batch = ForwardBatch.init_new(batch, self.mtp_model_runner(0))
+        assert forward_batch.capture_hidden_mode == draft_extend_capture_mode
         forward_batch.return_hidden_states_before_norm = True
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
@@ -718,12 +764,16 @@ class MultiLayerEagleWorker(TpModelWorker):
                     self.mtp_model_runner(step).attn_backend.init_forward_metadata(
                         forward_batch
                     )
-                logits_output, _ = self.mtp_model_runner(step).forward(
-                    forward_batch, skip_attn_backend_init=True
+                logits_output = (
+                    self.mtp_model_runner(step)
+                    .forward(forward_batch, skip_attn_backend_init=True)
+                    .logits_output
                 )
 
-            if self.enable_nan_detection:
-                detect_nan(logits_output)
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                f"draft_extend_after_decode step {step} (cuda_graph={can_cuda_graph})",
+            )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
@@ -737,16 +787,28 @@ class MultiLayerEagleWorker(TpModelWorker):
                     )
                     pt += extend_len
 
-        forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
-        forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
+        # Phase 3: assemble next-iter EagleDraftInput from extend output
+        next_decode_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        next_draft_input = EagleDraftInput(
+            bonus_tokens=draft_extend_input.bonus_tokens,
+            hidden_states=logits_output.hidden_states,
+            topk_p=torch.cat(topk_p_list, dim=1),
+            topk_index=torch.cat(topk_index_list, dim=1),
+            capture_hidden_mode=next_decode_capture_mode,
+        )
 
-        # Restore backup.
-        # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
+        # Restore batch fields. `seq_lens` etc. were modified by
+        # `prepare_extend_after_decode`. Caller installs `next_draft_input` as
+        # `batch.spec_info`.
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
+        return next_draft_input

@@ -1,17 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
 import logging
 from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 
-IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip
+IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip or _is_musa
 IS_QUICK_AR_AVAILABLE = _is_hip
 # TODO(zyksir): mscclpp is untested on AMD and therefore disabled.
 IS_MSCCLPP_AR_AVAILABLE = _is_cuda
@@ -30,7 +33,7 @@ except ImportError as e:
 if not IS_CUSTOM_AR_AVAILABLE:
     pass
 
-elif _is_cuda:
+elif _is_cuda or _is_musa:
     # CUDA custom allreduce
 
     def init_custom_ar(

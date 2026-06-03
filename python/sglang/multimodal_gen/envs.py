@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -55,6 +56,13 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
+    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
+    SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
+    SGLANG_USE_ROCM_VAE: bool = False
+    SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
+    SGLANG_USE_ROCM_VAE_CONV2D: bool = False
+    SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -243,6 +251,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Fraction of denoising steps that run both CFG branches before reusing the
+    # last conditional-minus-unconditional residual. Keep 1.0 to disable.
+    "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
+        "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
+    ),
+    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
+        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
+    ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
@@ -272,6 +288,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
+    # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
+    # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
+    # Supported values:
+    # - auto
+    # - flashinfer_cudnn
+    # - flashinfer_cutlass
+    # - flashinfer_trtllm
+    # Legacy aliases `cudnn` and `trtllm` are also accepted.
+    "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    ),
+    # ROCm: use AITer GroupNorm in VAE for improved performance
+    "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
+    # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers
+    "SGLANG_USE_ROCM_CUDNN_BENCHMARK": _lazy_bool("SGLANG_USE_ROCM_CUDNN_BENCHMARK"),
+    # ROCm: replace CausalConv3d with temporal-unfolded batched Conv2D in VAE
+    "SGLANG_USE_ROCM_VAE_CONV2D": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D"),
+    # ROCm: use BF16 compute for the Conv2D replacement (implies CONV2D=true)
+    "SGLANG_USE_ROCM_VAE_CONV2D_BF16": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D_BF16"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication

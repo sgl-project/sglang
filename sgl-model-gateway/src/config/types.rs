@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 
+// Re-export storage config types from data_connector
+pub use data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 use super::ConfigResult;
 use crate::core::ConnectionMode;
+
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +33,14 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub pool_max_idle_per_host: usize,
+    #[serde(default = "default_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
     /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
@@ -81,7 +95,7 @@ pub struct RouterConfig {
     pub ca_certificates: Vec<Vec<u8>>,
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
-    pub mcp_config: Option<crate::mcp::McpConfig>,
+    pub mcp_config: Option<smg_mcp::McpConfig>,
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
@@ -118,6 +132,22 @@ fn default_l1_max_memory() -> usize {
     50 * 1024 * 1024 // 50MB
 }
 
+fn default_pool_idle_timeout_secs() -> u64 {
+    DEFAULT_POOL_IDLE_TIMEOUT_SECS
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT_SECS
+}
+
+fn default_pool_max_idle_per_host() -> usize {
+    DEFAULT_POOL_MAX_IDLE_PER_HOST
+}
+
+fn default_tcp_keepalive_secs() -> u64 {
+    DEFAULT_TCP_KEEPALIVE_SECS
+}
+
 impl TokenizerCacheConfig {
     /// Returns Some(self) if any caching is enabled, None otherwise.
     /// Use this when passing cache config to tokenizer registration workflow.
@@ -143,169 +173,6 @@ impl Default for TokenizerCacheConfig {
 
 fn default_history_backend() -> HistoryBackend {
     HistoryBackend::Memory
-}
-
-/// History backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum HistoryBackend {
-    Memory,
-    None,
-    Oracle,
-    Postgres,
-    Redis,
-}
-
-/// Oracle history backend configuration
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-pub struct OracleConfig {
-    /// ATP wallet or TLS config files directory
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wallet_path: Option<String>,
-    /// DSN (e.g. `tcps://host:port/service`)
-    pub connect_descriptor: String,
-    pub username: String,
-    pub password: String,
-    #[serde(default = "default_pool_min")]
-    pub pool_min: usize,
-    #[serde(default = "default_pool_max")]
-    pub pool_max: usize,
-    #[serde(default = "default_pool_timeout_secs")]
-    pub pool_timeout_secs: u64,
-}
-
-impl OracleConfig {
-    pub fn default_pool_min() -> usize {
-        default_pool_min()
-    }
-
-    pub fn default_pool_max() -> usize {
-        default_pool_max()
-    }
-
-    pub fn default_pool_timeout_secs() -> u64 {
-        default_pool_timeout_secs()
-    }
-}
-
-fn default_pool_min() -> usize {
-    1
-}
-
-fn default_pool_max() -> usize {
-    16
-}
-
-fn default_pool_timeout_secs() -> u64 {
-    30
-}
-
-impl std::fmt::Debug for OracleConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OracleConfig")
-            .field("wallet_path", &self.wallet_path)
-            .field("connect_descriptor", &self.connect_descriptor)
-            .field("username", &self.username)
-            .field("pool_min", &self.pool_min)
-            .field("pool_max", &self.pool_max)
-            .field("pool_timeout_secs", &self.pool_timeout_secs)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PostgresConfig {
-    // Database connection URL,
-    // postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
-    pub db_url: String,
-    // Database pool max size
-    pub pool_max: usize,
-}
-
-impl PostgresConfig {
-    pub fn default_pool_max() -> usize {
-        16
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        let s = self.db_url.trim();
-        if s.is_empty() {
-            return Err("is it db-url should be not empty".to_string());
-        }
-
-        let url = Url::parse(s).map_err(|e| format!("invalid db_url: {}", e))?;
-
-        let scheme = url.scheme();
-        if scheme != "postgres" && scheme != "postgresql" {
-            return Err(format!("don't support URL scheme: {}", scheme));
-        }
-
-        if url.host().is_none() {
-            return Err("db_url must need host".to_string());
-        }
-
-        let path = url.path();
-        let dbname = path
-            .strip_prefix('/')
-            .filter(|p| !p.is_empty())
-            .map(|s| s.to_string());
-        if dbname.is_none() {
-            return Err("db_url must need database name".to_string());
-        }
-
-        if self.pool_max == 0 {
-            return Err("pool_max must be greater 1, default is 16".to_string());
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RedisConfig {
-    // Redis connection URL
-    // redis://[:password@]host[:port][/db]
-    pub url: String,
-    // Connection pool max size
-    #[serde(default = "default_redis_pool_max")]
-    pub pool_max: usize,
-    // Data retention in days. If None, data persists indefinitely.
-    #[serde(default = "default_redis_retention_days")]
-    pub retention_days: Option<u64>,
-}
-
-fn default_redis_pool_max() -> usize {
-    16
-}
-
-fn default_redis_retention_days() -> Option<u64> {
-    Some(30)
-}
-
-impl RedisConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        let s = self.url.trim();
-        if s.is_empty() {
-            return Err("redis url should not be empty".to_string());
-        }
-
-        let url = Url::parse(s).map_err(|e| format!("invalid redis url: {}", e))?;
-
-        let scheme = url.scheme();
-        if scheme != "redis" && scheme != "rediss" {
-            return Err(format!("unsupported URL scheme: {}", scheme));
-        }
-
-        if url.host().is_none() {
-            return Err("redis url must have a host".to_string());
-        }
-
-        if self.pool_max == 0 {
-            return Err("pool_max must be greater than 0".to_string());
-        }
-
-        Ok(())
-    }
 }
 
 /// Routing mode configuration
@@ -654,6 +521,10 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            pool_max_idle_per_host: default_pool_max_idle_per_host(),
+            tcp_keepalive_secs: default_tcp_keepalive_secs(),
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
@@ -775,6 +646,16 @@ mod tests {
         assert!(config.trace_config.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert_eq!(
+            config.pool_idle_timeout_secs,
+            DEFAULT_POOL_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(config.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
+        assert_eq!(
+            config.pool_max_idle_per_host,
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        );
+        assert_eq!(config.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
     }
 
     #[test]
@@ -822,6 +703,33 @@ mod tests {
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
+    }
+
+    #[test]
+    fn test_router_config_http_client_deserialization_defaults() {
+        let config = RouterConfig::default();
+        let mut json = serde_json::to_value(&config).unwrap();
+        let json_object = json.as_object_mut().unwrap();
+        json_object.remove("pool_idle_timeout_secs");
+        json_object.remove("connect_timeout_secs");
+        json_object.remove("pool_max_idle_per_host");
+        json_object.remove("tcp_keepalive_secs");
+
+        let deserialized: RouterConfig = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            deserialized.pool_idle_timeout_secs,
+            DEFAULT_POOL_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            deserialized.connect_timeout_secs,
+            DEFAULT_CONNECT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            deserialized.pool_max_idle_per_host,
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        );
+        assert_eq!(deserialized.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
     }
 
     #[test]

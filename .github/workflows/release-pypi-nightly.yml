@@ -43,13 +43,40 @@ jobs:
         run: |
           pip install build wheel setuptools setuptools-scm
 
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
       - name: Build wheel
         id: build
         run: |
           cd python
           cp ../README.md ../LICENSE .
 
-          # Build wheel - setuptools-scm automatically generates version from git tags
+          TAG=$(python3 ../python/tools/get_version_tag.py)
+          HASH="g$(git rev-parse --short HEAD)"
+          BUILD_DATE=$(date -u +%Y%m%d)
+
+          # Increment patch version for nightlies (e.g., v0.5.9 -> 0.5.10)
+          # Must always increment so nightly > latest tag per PEP 440 ordering:
+          #   X.Y.Z.devN < X.Y.Z.rcN < X.Y.Z < X.Y.(Z+1).devN
+          VERSION=${TAG#v}  # Remove 'v' prefix
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH_RAW=$(echo "$VERSION" | cut -d. -f3)
+          # Strip pre-release suffixes (rc0, post1, etc.) to get numeric patch
+          PATCH=$(echo "$PATCH_RAW" | sed 's/[^0-9].*//')
+          NEXT_PATCH=$((PATCH + 1))
+          NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+
+          # Use date-based dev number for correct chronological sorting
+          # e.g., 0.5.9.dev20260215+g4cf4f0859 > 0.5.9.dev20260214+g45a4697d4
+          FORCE_VERSION="${NEXT_VERSION}.dev${BUILD_DATE}+${HASH}"
+          echo "Forcing nightly version to: $FORCE_VERSION"
+          export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
+
+          # Build wheel
           python3 -m build --wheel
 
           # Extract version from built wheel filename
@@ -80,6 +107,15 @@ jobs:
     needs: build-nightly-wheel
     runs-on: ubuntu-latest
     environment: 'prod'
+    strategy:
+      fail-fast: false
+      # The wheel is CUDA-agnostic and built once — we just register the same
+      # artifact under cu129/sglang/ and cu130/sglang/ wheel indexes so users
+      # can install via either --extra-index-url. Serialize because both matrix
+      # runs clone and push to the same sgl-whl branch.
+      max-parallel: 1
+      matrix:
+        cuda_version: ['129', '130']
     steps:
       - uses: actions/checkout@v4
 
@@ -128,11 +164,12 @@ jobs:
           python3 scripts/update_nightly_whl_index.py \
             --commit-hash ${{ needs.build-nightly-wheel.outputs.commit_hash }} \
             --nightly-version ${{ needs.build-nightly-wheel.outputs.nightly_version }} \
+            --cuda-version ${{ matrix.cuda_version }} \
             --build-date ${{ needs.build-nightly-wheel.outputs.build_date }}
 
       - name: Push wheel index
         run: |
           cd sgl-whl
           git add -A
-          git diff --staged --quiet || git commit -m "Update nightly wheel index for commit ${{ needs.build-nightly-wheel.outputs.commit_hash }}"
+          git diff --staged --quiet || git commit -m "Update cu${{ matrix.cuda_version }} nightly wheel index for commit ${{ needs.build-nightly-wheel.outputs.commit_hash }}"
           git push

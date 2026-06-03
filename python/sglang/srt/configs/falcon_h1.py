@@ -14,11 +14,14 @@
 # limitations under the License.
 """Falcon-H1 model configuration"""
 
-
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -307,4 +310,6 @@ class FalconH1Config(PretrainedConfig):
             state_size=self.mamba_d_state,
             conv_kernel=self.mamba_d_conv,
         )
-        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
+        )
