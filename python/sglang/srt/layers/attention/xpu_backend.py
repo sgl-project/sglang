@@ -906,7 +906,10 @@ class XPUAttentionBackend(AttentionBackend):
         return 1
 
     def _init_local_attn_metadata(
-        self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
+        self,
+        forwardbatch: ForwardBatch,
+        metadata: FlashAttentionMetadata,
+        device,
     ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
         if self.attention_chunk_size is None:
@@ -924,6 +927,17 @@ class XPUAttentionBackend(AttentionBackend):
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
+
+        # make_local_attention_virtual_batches expects a page-granularity block table:
+        # column p is the logical page number, and the value stored at that column is the
+        # physical page index. The raw req_to_token table is token-granularity (column i =
+        # the KV slot for token i), so when page_size > 1 we must stride and divide first
+        # so that block_starts = k_seqstarts_absolute // page_size correctly indexes the table.
+        if self.page_size > 1:
+            strided_indices = torch.arange(
+                0, page_table.shape[1], self.page_size, device=page_table.device
+            )
+            page_table = page_table[:, strided_indices] // self.page_size
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seq_lens_np = cache_seqlens_int32.cpu().numpy()

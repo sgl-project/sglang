@@ -22,8 +22,11 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
 )
 
 if TYPE_CHECKING:
@@ -287,6 +290,8 @@ class HiCacheController:
         self.has_draft = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -399,9 +404,9 @@ class HiCacheController:
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
 
-        self.prefetch_revoke_queue = Queue()
-        self.ack_backup_queue = Queue()
-        self.host_mem_release_queue = Queue()
+        self.prefetch_revoke_queue: Queue[str] = Queue()
+        self.ack_backup_queue: Queue[StorageOperation] = Queue()
+        self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
         self.prefetch_thread.start()
         self.backup_thread.start()
@@ -507,8 +512,6 @@ class HiCacheController:
             self.prefetch_capacity_limit = max(
                 0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
             )
-            # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -529,6 +532,8 @@ class HiCacheController:
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
+
+            self._maybe_register_draft_with_storage()
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -554,6 +559,8 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+            self.draft_page_get_func = None
+            self.draft_page_set_func = None
             raise
 
     def detach_storage_backend(self):
@@ -595,6 +602,8 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -845,6 +854,47 @@ class HiCacheController:
             draft_host_pool.size,
         )
 
+        # If storage is already attached, wire up the draft I/O path now.
+        # Otherwise this will be deferred until attach_storage_backend().
+        self._maybe_register_draft_with_storage()
+
+    def _maybe_register_draft_with_storage(self) -> None:
+        """Pick the draft L3 IO implementation."""
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
+        if not self.has_draft or not self.enable_storage:
+            return
+
+        backend = self.storage_backend_type
+
+        # Multi-pool zero-copy backends.
+        if backend == "mooncake":
+            if self.storage_config.should_split_heads:
+                logger.warning(
+                    "HiCache draft L3 disabled: should_split_heads not yet "
+                    "supported on the mooncake v2 path."
+                )
+                return
+            self.storage_backend.register_mem_host_pool_v2(
+                self.mem_pool_host_draft, PoolName.DRAFT
+            )
+            self.draft_page_get_func = self._draft_page_get_v2
+            self.draft_page_set_func = self._draft_page_set_v2
+            return
+
+        # TODO: support "hf3fs", "eic", "nixl", "simm"
+        if backend in {"hf3fs", "eic", "nixl", "simm"}:
+            logger.warning(
+                "HiCache draft L3 disabled: backend %s does not yet support "
+                "draft pool registration.",
+                backend,
+            )
+            return
+
+        # Generic backends.
+        self.draft_page_get_func = self._draft_page_get_generic
+        self.draft_page_set_func = self._draft_page_set_generic
+
     def prefetch(
         self,
         request_id: str,
@@ -915,8 +965,8 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
@@ -978,11 +1028,9 @@ class HiCacheController:
         hash_value = []
 
         for start in range(
-            0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
+            0, len(tokens_to_fetch), self.page_size * STORAGE_BATCH_SIZE
         ):
-            end = min(
-                start + self.page_size * self.storage_batch_size, len(tokens_to_fetch)
-            )
+            end = min(start + self.page_size * STORAGE_BATCH_SIZE, len(tokens_to_fetch))
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
             for i in range(0, len(batch_tokens), self.page_size):
@@ -1078,50 +1126,77 @@ class HiCacheController:
         )
 
     def _draft_page_set(self, hash_values, host_indices) -> None:
-        """Best-effort write draft KV pages to L3 with 'd:' prefixed keys.
-
-        TODO: support batch_set_v1 (zero-copy) for high-performance backends.
-        """
+        """Best-effort write draft KV pages to L3 alongside the target backup."""
+        if self.draft_page_set_func is None:
+            return
         try:
-            draft_keys = [f"d:{h}" for h in hash_values]
-            draft_data = [
-                self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
-                for i in range(len(draft_keys))
-            ]
-            self.storage_backend.batch_set(draft_keys, draft_data)
+            self.draft_page_set_func(hash_values, host_indices)
         except Exception:
             logger.debug(
                 "Draft L3 write failed (best-effort), skipping.", exc_info=True
             )
 
     def _draft_page_get(self, hash_values, host_indices) -> None:
-        """Best-effort read draft KV pages from L3 with 'd:' prefixed keys.
-
-        TODO: support batch_get_v1 (zero-copy) for high-performance backends.
-        """
+        """Best-effort read draft KV pages from L3 (mirrors `_draft_page_set`)."""
+        if self.draft_page_get_func is None:
+            return
         try:
-            draft_keys = [f"d:{h}" for h in hash_values]
-            draft_dummy = [
-                self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
-            ]
-            draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
-            if draft_pages is None:
-                return
-
-            for i, p in enumerate(draft_pages):
-                if p is not None:
-                    self.mem_pool_host_draft.set_from_flat_data_page(
-                        host_indices[i * self.page_size], p
-                    )
+            self.draft_page_get_func(hash_values, host_indices)
         except Exception:
             logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
+
+    def _draft_page_set_v2(self, hash_values, host_indices) -> None:
+        self.storage_backend.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    host_indices=host_indices,
+                    keys=list(hash_values),
+                )
+            ]
+        )
+
+    def _draft_page_get_v2(self, hash_values, host_indices) -> None:
+        self.storage_backend.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    host_indices=host_indices,
+                    keys=list(hash_values),
+                )
+            ]
+        )
+
+    def _draft_page_set_generic(self, hash_values, host_indices) -> None:
+        # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
+        # `{key}.{pool_name}` convention so target/draft pages never collide.
+        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
+        draft_data = [
+            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
+            for i in range(len(draft_keys))
+        ]
+        self.storage_backend.batch_set(draft_keys, draft_data)
+
+    def _draft_page_get_generic(self, hash_values, host_indices) -> None:
+        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
+        draft_dummy = [
+            self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
+        ]
+        draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
+        if draft_pages is None:
+            return
+        for i, p in enumerate(draft_pages):
+            if p is not None:
+                self.mem_pool_host_draft.set_from_flat_data_page(
+                    host_indices[i * self.page_size], p
+                )
 
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]

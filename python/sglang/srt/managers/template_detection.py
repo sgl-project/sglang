@@ -334,12 +334,6 @@ def match_rules(
     for rule in rules:
         try:
             if rule.predicate(ctx):
-                logger.info(
-                    "Detected %s '%s' from template rule '%s'.",
-                    label,
-                    rule.value,
-                    rule.name,
-                )
                 return rule.value
         except Exception as e:
             logger.warning(
@@ -367,11 +361,6 @@ def detect_reasoning_pattern(
     )
     for rule in REASONING_MODE_RULES:
         if rule.predicate(ctx):
-            logger.info(
-                "Detected reasoning config '%s' from template rule '%s'.",
-                rule.value,
-                rule.name,
-            )
             return rule.value.always_on, rule.value
 
     return False, None
