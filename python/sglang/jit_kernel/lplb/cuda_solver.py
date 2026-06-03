@@ -250,9 +250,9 @@ def dispatch_probability(
     if random_vals is None:
         random_vals = torch.rand(n, dtype=torch.float32, device=topk_ids.device)
     else:
-        assert random_vals.shape == (n,), (
-            f"random_vals must be shape ({n},), got {tuple(random_vals.shape)}"
-        )
+        assert random_vals.shape == (
+            n,
+        ), f"random_vals must be shape ({n},), got {tuple(random_vals.shape)}"
     module = _dispatch_module(max_copies, DISPATCH_BLOCK_DIM)
     module.dispatch_probability(out, flat_ids, log2phy_prob, map32, random_vals)
     return out.view(original_shape).to(topk_ids.dtype)
@@ -299,9 +299,9 @@ def dispatch_probability_torch_reference(
     n = flat_ids.shape[0]
     num_logical, max_copies = log2phy_prob.shape
     assert log2phy_map.shape == (num_logical, max_copies)
-    assert random_vals.shape == (n,), (
-        f"random_vals must be shape ({n},), got {tuple(random_vals.shape)}"
-    )
+    assert random_vals.shape == (
+        n,
+    ), f"random_vals must be shape ({n},), got {tuple(random_vals.shape)}"
 
     # Gather per-row probabilities and physical maps.
     probs = log2phy_prob[flat_ids]  # (N, max_copies), float32
