@@ -160,7 +160,9 @@ class BaseTpWorker(ABC):
         monkey_patch_torch_reductions()
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
+                recv_req.serialized_named_tensors[
+                    self.tp_size * self.pp_rank + self.tp_rank
+                ]
             ),
             load_format=recv_req.load_format,
         )
