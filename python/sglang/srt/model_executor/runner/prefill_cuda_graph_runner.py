@@ -347,32 +347,34 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     # capture
     # -----------------------------------------------------------------
     def capture(self) -> None:
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
-            stream = graph_capture_context.stream
-            with self.backend.capture_session(stream):
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            with graph_capture() as graph_capture_context:
+                self.stream = graph_capture_context.stream
+                with self.backend.capture_session(self.stream):
+                    self._capture_one_stream()
+
+    def _capture_one_stream(self) -> None:
+        avail_mem = get_available_gpu_memory(
+            self.model_runner.device,
+            self.model_runner.gpu_id,
+            empty_cache=False,
+        )
+        capture_range = (
+            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+            if get_tensor_model_parallel_rank() == 0
+            else reversed(self.capture_num_tokens)
+        )
+        for num_tokens in capture_range:
+            if get_tensor_model_parallel_rank() == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,
                     empty_cache=False,
                 )
-                capture_range = (
-                    tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                    if get_tensor_model_parallel_rank() == 0
-                    else reversed(self.capture_num_tokens)
+                capture_range.set_description(
+                    f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-                for num_tokens in capture_range:
-                    if get_tensor_model_parallel_rank() == 0:
-                        avail_mem = get_available_gpu_memory(
-                            self.model_runner.device,
-                            self.model_runner.gpu_id,
-                            empty_cache=False,
-                        )
-                        capture_range.set_description(
-                            f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
-                        )
-                    self.capture_one_shape(num_tokens)
+            self.capture_one_shape(num_tokens)
 
     # -----------------------------------------------------------------
     # capture_one_shape

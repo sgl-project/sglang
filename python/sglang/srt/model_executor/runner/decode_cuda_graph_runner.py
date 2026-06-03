@@ -609,50 +609,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
-        def _capture_one_stream(stream_idx: Optional[int] = None):
-            avail_mem = get_available_gpu_memory(
-                self.model_runner.device,
-                self.model_runner.gpu_id,
-                empty_cache=False,
-            )
-            # Reverse the order to enable better memory sharing across cuda graphs.
-            capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_bs)))
-                if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_bs)
-            )
-            lora_variants = (
-                [("lora", True), ("nolora", False)]
-                if getattr(self, "record_nolora_graph", False)
-                else [(None, None)]
-            )
-            for i, bs in enumerate(capture_range):
-                if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
-                    )
-
-                for variant_label, _variant_has_lora in lora_variants:
-                    _set_capture_lora_variant(variant_label)
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        self.capture_one_shape(bs, forward, stream_idx, variant_label)
-
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
-                        _capture_one_stream()
+                        self._capture_one_stream()
             else:
                 set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
@@ -662,10 +624,48 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ):
                         self.stream = graph_capture_context.stream
                         with self.backend.capture_session(self.stream):
-                            _capture_one_stream(i)
+                            self._capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
+
+    def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
+        avail_mem = get_available_gpu_memory(
+            self.model_runner.device,
+            self.model_runner.gpu_id,
+            empty_cache=False,
+        )
+        # Reverse so cuda graphs share memory better.
+        capture_range = (
+            tqdm.tqdm(list(reversed(self.capture_bs)))
+            if get_tensor_model_parallel_rank() == 0
+            else reversed(self.capture_bs)
+        )
+        lora_variants = (
+            [("lora", True), ("nolora", False)]
+            if getattr(self, "record_nolora_graph", False)
+            else [(None, None)]
+        )
+        for bs in capture_range:
+            if get_tensor_model_parallel_rank() == 0:
+                avail_mem = get_available_gpu_memory(
+                    self.model_runner.device,
+                    self.model_runner.gpu_id,
+                    empty_cache=False,
+                )
+                capture_range.set_description(
+                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                )
+
+            for variant_label, _variant_has_lora in lora_variants:
+                _set_capture_lora_variant(variant_label)
+                with patch_model(
+                    self.model_runner.model,
+                    bs in self.compile_bs,
+                    num_tokens=bs * self.num_tokens_per_bs,
+                    tp_group=self.model_runner.tp_group,
+                ) as forward:
+                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
     # -----------------------------------------------------------------
     # capture_one_shape
