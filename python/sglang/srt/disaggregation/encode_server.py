@@ -69,7 +69,7 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
-HEALTH_CHECK_TIMEOUT = 10
+HEALTH_CHECK_TIMEOUT = 30
 
 # Minimal 32x32 black PNG for health check dummy encode
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
@@ -2466,6 +2466,50 @@ async def _dp_worker_encode_and_send(
     return None
 
 
+async def _dp_worker_health_encode(enc: MMEncoder) -> None:
+    """Functional health probe run on a DP worker.
+
+    Process-liveness (proc.sentinel) can't see a worker that's alive but
+    wedged — hung GPU, NCCL deadlock, stalled ZMQ, or a blocked event loop.
+    When idle, run a tiny dummy encode to exercise the VIT forward and surface
+    those stalls. No prefill destination: the embedding is discarded, mirroring
+    the non-DP /health path. Raises on encode failure so the worker envelope
+    carries ``_error`` back to the dispatcher.
+    """
+    # Busy worker: in-flight traffic already proves liveness, so skip the probe
+    # and report healthy — same `embedding_to_send` signal the non-DP /health
+    # path uses. A wedged-but-busy worker never reaches here (it can't service
+    # the recv), so the dispatcher's broadcast still times out → 503.
+    if enc.embedding_to_send:
+        return None
+
+    if enc.image_processor is not None:
+        mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
+        modality = Modality.IMAGE
+    elif enc.audio_processor is not None:
+        mm_items = [f"data:audio/wav;base64,{MINIMUM_WAV_SILENCE_BASE64}"]
+        modality = Modality.AUDIO
+    else:
+        # No processor → can't functionally probe; liveness alone is healthy.
+        return None
+
+    req_id = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+    try:
+        _, _, _, error_msg, error_code = await enc.encode(
+            mm_items=mm_items,
+            modality=modality,
+            req_id=req_id,
+            num_parts=1,
+            part_idx=0,
+        )
+    finally:
+        # Never leave the dummy embedding sitting in the send map.
+        enc.embedding_to_send.pop(req_id, None)
+
+    if error_msg:
+        raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
 class DPDispatcher:
     """Routes encode requests across DP ranks by least-pending count."""
 
@@ -2642,10 +2686,13 @@ class DPDispatcher:
             self.req_id_to_rank.pop(req_id, None)
             raise
 
-    async def broadcast(self, request: dict) -> List[dict]:
+    async def broadcast(
+        self, request: dict, timeout: Optional[float] = None
+    ) -> List[dict]:
         # Skip dead ranks: a PUSH to a gone worker would just buffer and then
         # surface as a spurious per-rank timeout. All dead → 503 (same as
         # dispatch), which the profile endpoints turn into an HTTP error.
+        eff_timeout = timeout if timeout is not None else ENCODER_REQ_TIMEOUT
         alive_ranks = self.alive_ranks
         if not alive_ranks:
             raise MMError(
@@ -2667,13 +2714,10 @@ class DPDispatcher:
                 request_copy = {**request, "req_id": req_id}
                 await self.dispatch_sockets[rank].send_pyobj(request_copy)
                 futures.append(future)
-            # Concurrent wait → total bounded by ENCODER_REQ_TIMEOUT, not
-            # dp_size × ENCODER_REQ_TIMEOUT.
+            # Concurrent wait → total bounded by eff_timeout, not
+            # dp_size × eff_timeout.
             outcomes = await asyncio.gather(
-                *(
-                    asyncio.wait_for(fut, timeout=ENCODER_REQ_TIMEOUT)
-                    for fut in futures
-                ),
+                *(asyncio.wait_for(fut, timeout=eff_timeout) for fut in futures),
                 return_exceptions=True,
             )
             results: List[dict] = []
@@ -2685,7 +2729,7 @@ class DPDispatcher:
                             req_id,
                             dp_type,
                             f"Encoder DP rank={rank} broadcast timed out "
-                            f"after {ENCODER_REQ_TIMEOUT}s",
+                            f"after {eff_timeout}s",
                         )
                     )
                 elif isinstance(outcome, BaseException):
@@ -2854,6 +2898,8 @@ async def _dp_worker_handle_request(
     try:
         if dp_type in ("start_profile", "stop_profile"):
             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
+        elif dp_type == "health_encode":
+            content = await _dp_worker_health_encode(enc)
         elif dp_type == "send":
             req_id = request["req_id"]
             await enc.send(
@@ -3476,8 +3522,21 @@ async def health_generate():
     Returns 200 if the encoder is healthy, 503 otherwise.
     """
     if dp_dispatcher is not None:
-        # Strict: any dead rank fails health → orchestrator restarts the pod.
+        # Strict: any dead (exited) rank fails health → orchestrator restarts.
         if not dp_dispatcher.all_ranks_alive:
+            return Response(status_code=503)
+        # Process-liveness (proc.sentinel) can't see a worker that's alive but
+        # wedged (hung GPU / NCCL deadlock / stalled ZMQ). Probe every rank with
+        # a tiny dummy encode; each worker runs it only when idle and otherwise
+        # reports healthy at once, keeping the probe off the GPU under load.
+        try:
+            results = await dp_dispatcher.broadcast(
+                {"_dp_type": "health_encode"},
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+        except MMError:
+            return Response(status_code=503)
+        if any(r.get("_error") for r in results):
             return Response(status_code=503)
         return Response(status_code=200)
     if encoder is None:
