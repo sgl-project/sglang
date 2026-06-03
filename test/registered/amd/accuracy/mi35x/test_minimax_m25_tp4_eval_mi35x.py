@@ -6,7 +6,6 @@ benchmark on MI35x. This configuration uses unified attention with FP8 KV cache.
 Registry: nightly-amd-4-gpu-mi35x-minimax-m25-tp4 suite
 """
 
-import ast
 import os
 
 os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
@@ -115,13 +114,15 @@ def get_few_shot_examples(lines, k):
 
 def get_answer_value(answer_str):
     """Extract numerical answer from response."""
+    if not isinstance(answer_str, str):
+        return INVALID
     answer_str = answer_str.replace(",", "")
     numbers = re.findall(r"\d+", answer_str)
-    if len(numbers) < 1:
+    if not numbers:
         return INVALID
     try:
-        return ast.literal_eval(numbers[-1])
-    except SyntaxError:
+        return int(numbers[-1])
+    except ValueError:
         return INVALID
 
 
