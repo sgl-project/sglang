@@ -380,9 +380,11 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
-            attn_metadata.max_seqlen_q = query.shape[1]
-            attn_metadata.max_seqlen_k = key.shape[1]
+        if attn_metadata is not None:
+            if attn_metadata.max_seqlen_q is None:
+                attn_metadata.max_seqlen_q = query.shape[1]
+            if attn_metadata.max_seqlen_k is None:
+                attn_metadata.max_seqlen_k = key.shape[1]
             max_seqlen_q = attn_metadata.max_seqlen_q
             max_seqlen_k = attn_metadata.max_seqlen_k
         else:
