@@ -202,7 +202,11 @@ def _preview_dimensions(
     height: int,
     preview_max_width: int | None,
 ) -> tuple[int, int]:
-    if preview_max_width is None or preview_max_width <= 0 or width <= preview_max_width:
+    if (
+        preview_max_width is None
+        or preview_max_width <= 0
+        or width <= preview_max_width
+    ):
         return width, height
     preview_width = int(preview_max_width)
     preview_height = max(1, round(height * preview_width / width))

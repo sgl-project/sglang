@@ -707,8 +707,12 @@ def _resolve_model_path(model_path: str) -> str:
 
     parsed_url = urlparse(model_path)
     if parsed_url.scheme in ("http", "https"):
-        filename = os.path.basename(unquote(parsed_url.path)) or _DEFAULT_REALESRGAN_FILENAME
-        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "realesrgan")
+        filename = (
+            os.path.basename(unquote(parsed_url.path)) or _DEFAULT_REALESRGAN_FILENAME
+        )
+        cache_dir = os.path.join(
+            os.path.expanduser("~"), ".cache", "sglang", "realesrgan"
+        )
         os.makedirs(cache_dir, exist_ok=True)
         cache_key = sha256(model_path.encode("utf-8")).hexdigest()[:12]
         local_path = os.path.join(cache_dir, f"{cache_key}-{filename}")

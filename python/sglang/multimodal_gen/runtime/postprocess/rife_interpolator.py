@@ -395,7 +395,9 @@ class FrameInterpolator:
         return (arr * 255.0).astype(np.uint8)
 
     @staticmethod
-    def _frames_to_tensor(frames: list[np.ndarray], device: torch.device) -> torch.Tensor:
+    def _frames_to_tensor(
+        frames: list[np.ndarray], device: torch.device
+    ) -> torch.Tensor:
         t = torch.from_numpy(np.stack(frames, axis=0))
         t = t.permute(0, 3, 1, 2).contiguous().float() / 255.0
         return t.to(device, non_blocking=True)
