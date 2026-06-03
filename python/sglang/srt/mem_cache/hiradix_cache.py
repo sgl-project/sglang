@@ -1381,13 +1381,16 @@ class HiRadixCache(RadixCache):
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
-            avaliable_size = self.cache_controller.mem_pool_host.available_size()
-            prefetch_length = avaliable_size - (avaliable_size % self.page_size)
+            available_size = self.cache_controller.mem_pool_host.available_size()
+            prefetch_length = available_size - (available_size % self.page_size)
             if prefetch_length >= self.prefetch_threshold:
-                new_input_tokens = new_input_tokens[:prefetch_length]
+                prefetch_key = prefetch_key[:prefetch_length]
                 host_indices = self.cache_controller.mem_pool_host.alloc(
                     prefetch_length
                 )
+                if host_indices is None:
+                    last_host_node.release_host()
+                    return
             else:
                 last_host_node.release_host()
                 # no sufficient host memory for prefetch
