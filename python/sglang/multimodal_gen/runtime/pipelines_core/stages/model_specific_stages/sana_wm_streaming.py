@@ -52,6 +52,13 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
+# --- debug parity harness (gated by env; no-op in production) ---
+import os as _os
+from pathlib import Path as _Path
+
+_SANAWM_INJECT_DIR = _os.environ.get("SANAWM_INJECT_DIR")
+_SANAWM_FORK_DUMP_DIR = _os.environ.get("SANAWM_FORK_DUMP_DIR")
+
 
 class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
     """Autoregressive self-forcing streaming variant of SanaWMDenoisingStage."""
@@ -183,6 +190,19 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
         init_latents = latents.clone()
         B, C, total_frames, H, W = latents.shape
 
+        def _iload(_name):
+            return torch.load(f"{_SANAWM_INJECT_DIR}/{_name}.pt", map_location=device)
+
+        def _fdump(_name, _t):
+            if _SANAWM_FORK_DUMP_DIR and _t is not None:
+                _Path(_SANAWM_FORK_DUMP_DIR).mkdir(parents=True, exist_ok=True)
+                torch.save(_t.detach().float().cpu(), f"{_SANAWM_FORK_DUMP_DIR}/{_name}.pt")
+
+        if _SANAWM_INJECT_DIR:  # parity harness: run the OFFICIAL's exact stage-1 inputs
+            latents = _iload("z_full_initial").to(device=device, dtype=target_dtype).clone()
+            init_latents = latents.clone()
+            B, C, total_frames, H, W = latents.shape
+
         num_frame_per_block = int(getattr(pcfg, "num_frame_per_block", 3))
         num_cached_blocks = int(getattr(pcfg, "num_cached_blocks", 2))
         sink_token = bool(getattr(pcfg, "sink_token", True))
@@ -191,7 +211,10 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
             raise ValueError(f"denoising_step_list must end with 0, got {schedule}")
         explicit_sigmas = [float(t) / 1000.0 for t in schedule[:-1]]
 
-        cfg_scale = float(getattr(batch, "guidance_scale", 1.0) or 1.0)
+        # Streaming uses its OWN cfg scale (official StreamingGenerationConfig.cfg_scale=1.0
+        # => no CFG on the distilled 4-step model). The general guidance_scale (e.g. 4.5)
+        # is for the dense path; using it here ran CFG=4.5 vs the reference's none.
+        cfg_scale = float(getattr(pcfg, "streaming_cfg_scale", 1.0) or 1.0)
         do_cfg = bool(batch.do_classifier_free_guidance) and cfg_scale > 1.0
         if server_args.enable_cfg_parallel and do_cfg:
             raise NotImplementedError(
@@ -218,6 +241,12 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
             )
         embeds_in = torch.cat([neg_embeds, pos_embeds], dim=0) if do_cfg else pos_embeds
         mask_in = _cat_optional_tensors(neg_mask, pos_mask) if do_cfg else pos_mask
+        if _SANAWM_INJECT_DIR and not do_cfg:
+            _cond = _iload("cond").to(device=device, dtype=target_dtype)
+            while _cond.dim() > embeds_in.dim():
+                _cond = _cond.squeeze(1)
+            embeds_in = _cond
+            mask_in = _iload("cond_mask").to(device=device)
 
         # --- camera / plücker (FULL length; forward_long windows internally) ---
         extra = batch.extra or {}
@@ -237,6 +266,12 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
             if do_cfg and chunk_plucker is not None
             else chunk_plucker
         )
+        if _SANAWM_INJECT_DIR:
+            cam_in = _iload("raymap").to(device=device, dtype=target_dtype)
+            plk_in = _iload("chunk_plucker").to(device=device, dtype=target_dtype)
+            if do_cfg:
+                cam_in = torch.cat([cam_in, cam_in], dim=0)
+                plk_in = torch.cat([plk_in, plk_in], dim=0)
 
         scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
 
@@ -359,6 +394,7 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
                         frame_index=frame_index,
                     )
                 kv_cache[chunk_idx] = updated_cache
+                _fdump(f"stage1_{chunk_idx:03d}_{start_f}_{end_f}", latents[:, :, start_f:end_f])
 
         log_sana_wm_tensor_stats("stream.output_latents", latents)
         self.log_info(
