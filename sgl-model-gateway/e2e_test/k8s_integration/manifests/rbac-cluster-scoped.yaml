@@ -1,0 +1,30 @@
+# Cluster-wide RBAC for the multi-namespace discovery test.
+# Distinct ServiceAccount/ClusterRole names so it does not collide with the
+# namespace-scoped Role in rbac.yaml that the default gateway uses.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: smg-gateway-cluster
+  namespace: smg-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: smg-gateway-cluster
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: smg-gateway-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: smg-gateway-cluster
+subjects:
+  - kind: ServiceAccount
+    name: smg-gateway-cluster
+    namespace: smg-test

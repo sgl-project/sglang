@@ -190,7 +190,7 @@ class BenchArgs:
             "--dataset-name",
             type=str,
             default=BenchArgs.dataset_name,
-            choices=["mmmu", "random", "generated-shared-prefix"],
+            choices=["mmmu", "random", "random-ids", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
         )
         parser.add_argument(
@@ -464,6 +464,18 @@ def _warmup_cache(
     print("Cache warmup completed")
 
 
+def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
+    """Post to a cache flush endpoint with retries on failure."""
+    for attempt in range(max_retries):
+        response = requests.post(url + endpoint, timeout=DEFAULT_TIMEOUT)
+        if response.status_code == 200:
+            return
+        if attempt < max_retries - 1:
+            time.sleep(2)
+        else:
+            response.raise_for_status()
+
+
 def run_one_case(
     url: str,
     batch_size: int,
@@ -500,14 +512,12 @@ def run_one_case(
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
-        response = requests.post(url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
+        _flush_cache_with_retry(url, "/reset_prefix_cache")
     else:
-        response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
+        _flush_cache_with_retry(url, "/flush_cache")
 
     # Load input token ids via bench_serving.get_dataset
-    supported_datasets = ("random", "mmmu", "generated-shared-prefix")
+    supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
     if dataset_name not in supported_datasets:
         raise ValueError(
             f"Unsupported dataset for batch benchmark: {dataset_name}. "
