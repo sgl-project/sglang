@@ -46,7 +46,7 @@ class TestPCGGlm5Fp4(CustomTestCase):
                 "--enforce-piecewise-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
-            ]
+            ],
         )
 
     @classmethod
