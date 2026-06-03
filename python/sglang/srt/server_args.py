@@ -4418,7 +4418,6 @@ class ServerArgs:
                         exist_ok=True,
                     )
 
-
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")

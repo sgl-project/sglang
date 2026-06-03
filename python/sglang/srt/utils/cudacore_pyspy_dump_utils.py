@@ -89,9 +89,7 @@ def pyspy_dump_schedulers(scheduler_only=False):
             except subprocess.CalledProcessError as e:
                 logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
                 if attempt == 1:
-                    logger.error(
-                        f"All pyspy dump attempts failed for PID {pid}."
-                    )
+                    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
 
 def trigger_cuda_user_coredump(scheduler_only=False):
