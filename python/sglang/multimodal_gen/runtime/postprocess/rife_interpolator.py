@@ -25,9 +25,16 @@ logger = init_logger(__name__)
 
 # Default HuggingFace repo for RIFE 4.22.lite weights
 _DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
+RIFE_TORCH_COMPILE_ENV = "SGLANG_RIFE_TORCH_COMPILE"
+RIFE_TORCH_COMPILE_MODE_ENV = "SGLANG_RIFE_TORCH_COMPILE_MODE"
 
 # Module-level cache: model_path -> Model instance
 _MODEL_CACHE: dict[str, "Model"] = {}
+
+
+def _is_inference_tensor(tensor: torch.Tensor) -> bool:
+    is_inference = getattr(tensor, "is_inference", None)
+    return bool(is_inference()) if is_inference is not None else False
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +272,7 @@ class Model:
     def __init__(self):
         self.flownet = IFNet()
         self.device_type: str = "cpu"
+        self.uses_torch_compile = False
 
     def eval(self) -> "Model":
         self.flownet.eval()
@@ -346,8 +354,13 @@ class FrameInterpolator:
     per model_path to avoid reloading across requests.
     """
 
-    def __init__(self, model_path: Optional[str] = None):
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        optimize_for_realtime: bool = False,
+    ):
         self._model_path = model_path
+        self._optimize_for_realtime = optimize_for_realtime
         self._resolved_path: Optional[str] = None
 
     def _ensure_model_loaded(self) -> Model:
@@ -367,16 +380,33 @@ class FrameInterpolator:
         model_path = maybe_download_model(model_path)
 
         self._resolved_path = model_path
+        compile_enabled = (
+            self._optimize_for_realtime
+            and os.environ.get(RIFE_TORCH_COMPILE_ENV, "0") == "1"
+        )
+        compile_mode = os.environ.get(RIFE_TORCH_COMPILE_MODE_ENV, "reduce-overhead")
+        cache_key = (
+            f"{model_path}|realtime_opt={self._optimize_for_realtime}"
+            f"|compile={compile_enabled}"
+            f"|mode={compile_mode if compile_enabled else ''}"
+        )
 
-        if model_path in _MODEL_CACHE:
-            return _MODEL_CACHE[model_path]
+        if cache_key in _MODEL_CACHE:
+            return _MODEL_CACHE[cache_key]
 
         device = current_platform.get_local_torch_device()
         model = Model()
         model.load_model(model_path, strip_module_prefix=True)
         model.eval()
         model.flownet = model.flownet.to(device)
-        _MODEL_CACHE[model_path] = model
+        if compile_enabled:
+            try:
+                model.flownet = torch.compile(model.flownet, mode=compile_mode)
+                model.uses_torch_compile = True
+                logger.info("Enabled torch.compile for RIFE: mode=%s", compile_mode)
+            except Exception as e:
+                logger.warning("Failed to torch.compile RIFE: %s", e)
+        _MODEL_CACHE[cache_key] = model
         logger.info("RIFE model loaded on device: %s", device)
         return model
 
@@ -431,9 +461,33 @@ class FrameInterpolator:
                 "Frame interpolation requires at least 2 frames; returning input unchanged."
             )
             return frames, 1
+        if exp <= 0:
+            return frames, 1
 
         model = self._ensure_model_loaded()
         device = model.device()
+
+        if (
+            self._optimize_for_realtime
+            and exp == 1
+            and all(frame.shape == frames[0].shape for frame in frames)
+        ):
+            input_tensors = torch.cat(
+                [self._frame_to_tensor(frame, device) for frame in frames],
+                dim=0,
+            ).contiguous()
+            middle_tensors = model.inference(
+                input_tensors[:-1],
+                input_tensors[1:],
+                scale=scale,
+            )
+
+            result = []
+            for idx, frame in enumerate(frames[:-1]):
+                result.append(frame)
+                result.append(self._tensor_to_frame(middle_tensors[idx : idx + 1]))
+            result.append(frames[-1])
+            return result, 2
 
         n_intermediate = 2**exp // 2  # intermediates per adjacent pair
 
@@ -453,6 +507,69 @@ class FrameInterpolator:
         result.append(frames[-1])
         multiplier = 2**exp
         return result, multiplier
+
+    def interpolate_tensor(
+        self,
+        frames: torch.Tensor,
+        exp: int = 1,
+        scale: float = 1.0,
+    ) -> tuple[torch.Tensor, int]:
+        """Interpolate NCHW RGB frames without converting through numpy."""
+        if frames.dim() == 3:
+            frames = frames.unsqueeze(0)
+        if frames.dim() != 4:
+            raise ValueError(
+                f"RIFE tensor input must be NCHW, got shape={tuple(frames.shape)}"
+            )
+        if frames.shape[0] < 2 or exp <= 0:
+            return frames, 1
+
+        model = self._ensure_model_loaded()
+        device = model.device()
+
+        if frames.shape[1] == 1:
+            frames = frames.repeat(1, 3, 1, 1)
+        elif frames.shape[1] > 3:
+            frames = frames[:, :3]
+        elif frames.shape[1] != 3:
+            raise ValueError(
+                f"RIFE tensor input must have 1, 3, or 4 channels, got {frames.shape[1]}"
+            )
+
+        frames = frames.to(device=device)
+        if frames.dtype == torch.uint8:
+            frames = frames.float().mul_(1.0 / 255.0)
+        else:
+            frames = frames.float()
+        if model.uses_torch_compile and _is_inference_tensor(frames):
+            frames = frames.clone(memory_format=torch.contiguous_format)
+        else:
+            frames = frames.contiguous()
+
+        if exp == 1:
+            middle_tensors = model.inference(
+                frames[:-1],
+                frames[1:],
+                scale=scale,
+            )
+            out = torch.empty(
+                (frames.shape[0] * 2 - 1, *frames.shape[1:]),
+                dtype=middle_tensors.dtype,
+                device=middle_tensors.device,
+            )
+            out[0::2] = frames
+            out[1::2] = middle_tensors
+            return out, 2
+
+        n_intermediate = 2**exp // 2
+        result: list[torch.Tensor] = []
+        for i in range(frames.shape[0] - 1):
+            I0 = frames[i : i + 1]
+            I1 = frames[i + 1 : i + 2]
+            result.append(I0)
+            result.extend(self._make_inference(model, I0, I1, n_intermediate, scale))
+        result.append(frames[-1:])
+        return torch.cat(result, dim=0), 2**exp
 
 
 # ---------------------------------------------------------------------------
@@ -481,3 +598,17 @@ def interpolate_video_frames(
     """
     interpolator = FrameInterpolator(model_path=model_path)
     return interpolator.interpolate(frames, exp=exp, scale=scale)
+
+
+def interpolate_video_tensor(
+    frames: torch.Tensor,
+    exp: int = 1,
+    scale: float = 1.0,
+    model_path: Optional[str] = None,
+) -> tuple[torch.Tensor, int]:
+    """Convenience wrapper around FrameInterpolator.interpolate_tensor."""
+    interpolator = FrameInterpolator(
+        model_path=model_path,
+        optimize_for_realtime=True,
+    )
+    return interpolator.interpolate_tensor(frames, exp=exp, scale=scale)
