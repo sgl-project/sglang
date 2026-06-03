@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
 from enum import IntEnum
@@ -19,7 +20,11 @@ from sglang.srt.mem_cache.common import (
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.speculative.triton_ops.spec_tree import (
+    sgl_build_tree_kernel_efficient_triton,
+    verify_tree_greedy_kernel_triton,
+)
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -34,6 +39,9 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
+
+logger = logging.getLogger(__name__)
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -88,7 +96,6 @@ def _eagle_prefill_tail_tokens(
                 break
     return tail_tokens
 
-
 def organize_draft_results(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],
@@ -123,6 +130,118 @@ class TreeMaskMode(IntEnum):
     FULL_MASK = 0
     QLEN_ONLY = 1
     QLEN_ONLY_BITPACKING = 2
+
+
+def sgl_build_tree_kernel_efficient_pytorch(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,  # TODO: QLEN_ONLY_BITPACKING needs to be added
+):
+    # TODO: Add support for QLEN_ONLY_BITPACKING mode
+    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+        raise NotImplementedError(
+            "QLEN_ONLY_BITPACKING is not supported in PyTorch implementation"
+        )
+
+    prefix_sums = torch.cumsum(verified_seq_len, dim=0)
+    for batch_idx in range(verified_seq_len.shape[0]):
+        seq_len_prefix_sum = prefix_sums[batch_idx - 1] if batch_idx > 0 else 0
+        seq_tree_idx = (
+            draft_token_num * draft_token_num * batch_idx
+            + seq_len_prefix_sum * draft_token_num
+        )
+
+        seq_len = verified_seq_len[batch_idx]
+        for draft_token_idx in range(draft_token_num):
+            if tree_mask_mode == TreeMaskMode.FULL_MASK:
+                token_tree_idx = (
+                    seq_tree_idx
+                    + (seq_len + draft_token_num) * draft_token_idx
+                    + seq_len
+                    + 1
+                )
+            else:
+                token_tree_idx = (
+                    draft_token_num * draft_token_num * batch_idx
+                    + draft_token_num * draft_token_idx
+                    + 1
+                )
+
+            tree_mask[token_tree_idx - 1] = True
+            for i in range(draft_token_num - 1):
+                tree_mask[token_tree_idx + i] = False
+
+            if draft_token_idx == 0:
+                positions[batch_idx * draft_token_num] = seq_len
+
+                retrive_index_offset = batch_idx * draft_token_num
+                for i in range(draft_token_num - 1, 0, -1):
+                    current_token_idx = retrive_index_offset + i
+                    retrive_index[batch_idx][i] = current_token_idx
+                    parent_tb_idx = int(selected_index[batch_idx][i - 1]) // topk
+                    parent_position = 0
+                    found_parent = parent_tb_idx == 0
+                    if parent_tb_idx > 0:
+                        parent_token_idx = parent_list[batch_idx][parent_tb_idx]
+                        while parent_position < draft_token_num - 1:
+                            if (
+                                selected_index[batch_idx][parent_position]
+                                == parent_token_idx
+                            ):
+                                parent_position += 1
+                                found_parent = True
+                                break
+                            parent_position += 1
+
+                    if not found_parent:
+                        logger.warning(
+                            "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
+                            "Please check if the logprob has nan. The token will be ignored to keep proceeding."
+                        )
+                        continue
+
+                    if retrive_next_token[batch_idx][parent_position] == -1:
+                        retrive_next_token[batch_idx][parent_position] = i
+                    else:
+                        origin_next_token = retrive_next_token[batch_idx][
+                            parent_position
+                        ].item()
+                        retrive_next_token[batch_idx][parent_position] = i
+                        retrive_next_sibling[batch_idx][i] = origin_next_token
+
+                retrive_index[batch_idx][0] = batch_idx * draft_token_num
+            else:
+                cur_position = draft_token_idx - 1
+                position = 0
+                for _ in range(depth):
+                    position += 1
+                    tree_mask[token_tree_idx + cur_position] = True
+                    parent_tb_idx = int(selected_index[batch_idx][cur_position]) // topk
+                    if parent_tb_idx == 0:
+                        break
+
+                    parent_token_idx = parent_list[batch_idx][parent_tb_idx]
+                    found = False
+                    for cp in range(draft_token_num - 1):
+                        if selected_index[batch_idx][cp] == parent_token_idx:
+                            cur_position = cp
+                            found = True
+                            break
+                    if not found:
+                        break
+
+                positions[batch_idx * draft_token_num + draft_token_idx] = (
+                    position + seq_len
+                )
 
 
 def build_tree_kernel_efficient(
@@ -214,6 +333,39 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    elif _is_xpu:
+        # Try Triton implementation first, fallback to PyTorch if not available
+        try:
+            sgl_build_tree_kernel_triton(
+                parent_list,
+                top_scores_index,
+                seq_lens,
+                tree_mask,
+                positions,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                topk,
+                spec_steps,
+                num_verify_tokens,
+                tree_mask_mode,
+            )
+        except (AttributeError, RuntimeError):
+            # Fallback to PyTorch implementation
+            sgl_build_tree_kernel_efficient_pytorch(
+                parent_list,
+                top_scores_index,
+                seq_lens,
+                tree_mask,
+                positions,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                topk,
+                spec_steps,
+                num_verify_tokens,
+                tree_mask_mode,
+            )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -236,6 +388,136 @@ def build_tree_kernel_efficient(
         retrieve_next_token,
         retrieve_next_sibling,
         draft_tokens,
+    )
+
+
+def verify_tree_greedy_pytorch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+):
+    batch_size = candidates.shape[0]
+    num_speculative_tokens = accept_index.shape[1]
+    num_draft_tokens = candidates.shape[1]
+
+    for bx in range(batch_size):
+        last_accepted_retrive_idx = retrive_index[bx][0]
+        accept_index[bx][0] = last_accepted_retrive_idx
+        num_accepted_tokens = 0
+        cur_index = 0
+
+        for j in range(1, num_speculative_tokens):
+            cur_index = retrive_next_token[bx][cur_index]
+            while cur_index != -1:
+                draft_index = retrive_index[bx][cur_index]
+                draft_token_id = candidates[bx][cur_index]
+                target_token_id = target_predict[
+                    last_accepted_retrive_idx // num_draft_tokens
+                ][last_accepted_retrive_idx % num_draft_tokens]
+
+                if draft_token_id == target_token_id:
+                    # accept token
+                    predicts[last_accepted_retrive_idx] = target_token_id
+                    num_accepted_tokens += 1
+                    accept_index[bx][num_accepted_tokens] = draft_index
+                    last_accepted_retrive_idx = draft_index
+                    break
+                else:
+                    cur_index = retrive_next_sibling[bx][cur_index]
+
+            if cur_index == -1:
+                break
+
+        accept_token_num[bx] = num_accepted_tokens
+        predicts[last_accepted_retrive_idx] = target_predict[
+            last_accepted_retrive_idx // num_draft_tokens
+        ][last_accepted_retrive_idx % num_draft_tokens]
+
+
+def sgl_build_tree_kernel_triton(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
+):
+    """Triton-based implementation."""
+    # TODO: Add support for QLEN_ONLY_BITPACKING mode
+    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+        raise NotImplementedError(
+            "QLEN_ONLY_BITPACKING is not supported in Triton implementation"
+        )
+
+    batch_size = verified_seq_len.shape[0]
+    seq_len_prefix_sum = torch.cumsum(verified_seq_len, dim=0) - verified_seq_len
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    sgl_build_tree_kernel_efficient_triton[grid](
+        parent_list,
+        selected_index,
+        verified_seq_len,
+        seq_len_prefix_sum,
+        tree_mask,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        topk=topk,
+        depth=depth,
+        draft_token_num=draft_token_num,
+        tree_mask_mode=int(tree_mask_mode),
+        batch_size=batch_size,
+        parent_list_stride=(
+            parent_list.stride(0) if parent_list.dim() > 1 else parent_list.shape[0]
+        ),
+        selected_index_stride=selected_index.stride(0),
+    )
+
+
+def verify_tree_greedy_triton(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+):
+    """Triton-based implementation."""
+    batch_size = candidates.shape[0]
+    num_speculative_tokens = accept_index.shape[1]
+    num_draft_tokens = candidates.shape[1]
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    verify_tree_greedy_kernel_triton[grid](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        target_predict,
+        batch_size=batch_size,
+        num_speculative_tokens=num_speculative_tokens,
+        num_draft_tokens=num_draft_tokens,
     )
 
 
@@ -279,6 +561,31 @@ def verify_tree_greedy_func(
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
+    elif _is_xpu:
+        # Try Triton implementation first, fallback to PyTorch if not available
+        try:
+            verify_tree_greedy_triton(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrieve_index,
+                retrive_next_token=retrieve_next_token,
+                retrive_next_sibling=retrieve_next_sibling,
+                target_predict=target_predict,
+            )
+        except (AttributeError, RuntimeError):
+            # Fallback to PyTorch implementation
+            verify_tree_greedy_pytorch(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrieve_index,
+                retrive_next_token=retrieve_next_token,
+                retrive_next_sibling=retrieve_next_sibling,
+                target_predict=target_predict,
+            )
     return predicts, accept_index, accept_token_num
 
 
