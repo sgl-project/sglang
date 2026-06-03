@@ -8,7 +8,7 @@ const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
 const DEFAULT_TARGET_FPS = 25;
-const DEFAULT_UPSCALING_MODEL_PATH = "/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth";
+const DEFAULT_UPSCALING_MODEL_PATH = "/home/admin/realesr-general-x4v3.pth";
 const DEFAULT_UPSCALING_SCALE = 2;
 const DEFAULT_FRAME_INTERPOLATION_MODEL_PATH = "/home/admin/RIFE-4.22.lite";
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
