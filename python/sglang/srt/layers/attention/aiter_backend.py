@@ -488,8 +488,8 @@ class AiterAttnBackend(AttentionBackend):
         tile_q = 256
         qhead_granularity = gqa_ratio
         qlen_granularity = tile_q // qhead_granularity
-        kvlen_granularity = max(128, self.page_size)
-        block_size = self.page_size
+        kvlen_granularity = 128
+        block_size = 1
 
         qo_indptr_cpu = qo_indptr.to("cpu", dtype=torch.int32)
         kv_indptr_cpu = kv_indptr.to("cpu", dtype=torch.int32)
