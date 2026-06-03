@@ -17,19 +17,19 @@ from sglang.test.test_utils import CustomTestCase
 
 # Concrete subclass for testing
 class DummyOp(MultiPlatformOp):
-    def forward_native(self, x):
+    def forward_native(self, x: str) -> str:
         return x + "native"
 
-    def forward_cuda(self, x):
+    def forward_cuda(self, x: str) -> str:
         return x + "cuda"
 
-    def forward_npu(self, x):
+    def forward_npu(self, x: str) -> str:
         return x + "npu"
 
-    def forward_cpu(self, x):
+    def forward_cpu(self, x: str) -> str:
         return x + "cpu"
 
-    def forward_custom_gpu(self, x):
+    def forward_custom_gpu(self, x: str) -> str:
         return x + "custom"
 
 
@@ -39,6 +39,8 @@ class TestMultiPlatformOp(CustomTestCase):
         # Clear OOT registry before each test to ensure isolation
         MultiPlatformOp._oot_forward_registry.clear()
 
+    @patch("sglang.srt.layers.utils.multi_platform._is_cpu", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_cpu_amx_available", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_cuda", True)
     @patch("sglang.srt.layers.utils.multi_platform._is_hip", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_npu", False)
@@ -48,6 +50,8 @@ class TestMultiPlatformOp(CustomTestCase):
         op = DummyOp()
         self.assertEqual(op("input_"), "input_cuda")
 
+    @patch("sglang.srt.layers.utils.multi_platform._is_cpu", False)
+    @patch("sglang.srt.layers.utils.multi_platform._is_cpu_amx_available", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_cuda", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_hip", False)
     @patch("sglang.srt.layers.utils.multi_platform._is_npu", True)
@@ -96,7 +100,7 @@ class TestMultiPlatformOp(CustomTestCase):
         mock_platform.get_dispatch_key_name.return_value = "custom_gpu"
 
         # Define a custom OOT forward function
-        def oot_forward_fn(self, x):
+        def oot_forward_fn(self: DummyOp, x: str) -> str:
             return x + "registered_oot"
 
         # Register it for DummyOp on 'custom_gpu'
