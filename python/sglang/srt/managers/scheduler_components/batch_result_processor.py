@@ -896,15 +896,13 @@ class SchedulerBatchResultProcessor:
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen).  The boundary condition uses
-        the same seq_len that ``prepare_for_decode`` used for the tracking
-        mask (``seq_lens_cpu % interval == 0``).  Since
-        ``prepare_for_decode`` increments ``seq_lens_cpu`` by 1 before
-        computing the mask, the matching value here is
-        ``len(origin_input_ids) + len(output_ids)`` (output_ids already
-        includes the token appended in this step).  ``track_seqlen`` is
-        capped at ``kv_committed_len`` so it never exceeds the KV that
-        was actually allocated.
+        Returns (at_boundary, track_seqlen).  The boundary condition
+        matches what the forward's tracking mask used:
+        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
+        ``kv_committed_len`` by 1, then checks
+        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
+        here reproduces that check exactly, and the value is always a
+        multiple of ``interval`` (hence page-aligned).
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
@@ -912,8 +910,7 @@ class SchedulerBatchResultProcessor:
         interval = get_global_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
-            seq_len = len(req.origin_input_ids) + len(req.output_ids)
-            if seq_len % interval == 0:
+            if req.kv_committed_len % interval == 0:
                 return True, req.kv_committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
