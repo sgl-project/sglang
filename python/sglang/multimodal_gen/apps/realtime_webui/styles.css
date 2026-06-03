@@ -17,6 +17,7 @@
 
 body {
   margin: 0;
+  overflow-x: hidden;
   min-height: 100vh;
   background:
     linear-gradient(90deg, rgba(23, 26, 22, 0.035) 1px, transparent 1px),
@@ -32,8 +33,10 @@ button:disabled { cursor: wait; opacity: 0.64; transform: none; }
 
 .shell {
   display: grid;
-  grid-template-columns: minmax(260px, 320px) minmax(560px, 1fr);
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
   gap: 18px;
+  width: 100%;
+  max-width: 100vw;
   min-height: 100vh;
   padding: 18px;
 }
@@ -219,6 +222,7 @@ button:focus-visible {
   display: grid;
   gap: 18px;
   min-width: 0;
+  max-width: 100%;
 }
 
 .stage {
@@ -227,6 +231,7 @@ button:focus-visible {
   grid-template-rows: auto auto auto auto auto;
   align-self: start;
   justify-self: center;
+  min-width: 0;
   width: 100%;
   max-width: min(1500px, 100%);
   overflow: hidden;
@@ -274,6 +279,7 @@ button:focus-visible {
   display: flex;
   align-items: center;
   gap: 14px;
+  min-width: 0;
   height: 44px;
   padding: 0 14px;
   color: #e8eadf;
@@ -295,6 +301,7 @@ button:focus-visible {
   justify-content: center;
   gap: 6px;
   flex: 0 0 104px;
+  width: 104px;
   min-height: 28px;
   height: 28px;
   padding: 0 9px;
@@ -308,6 +315,12 @@ button:focus-visible {
   border-color: rgba(232, 234, 223, 0.44);
   background: rgba(238, 241, 236, 0.14);
   box-shadow: none;
+  transform: none;
+}
+.record-button:active:not(:disabled),
+.record-button.is-pressed:not(:disabled),
+.record-button:focus-visible {
+  transform: none;
 }
 .record-button.is-recording {
   border-color: color-mix(in oklch, var(--accent), white 18%);
@@ -377,8 +390,8 @@ button:focus-visible {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  flex: 0 0 auto;
-  min-width: max-content;
+  flex: 0 1 auto;
+  min-width: 0;
   color: rgba(232, 234, 223, 0.72);
   line-height: 1;
 }
@@ -393,6 +406,21 @@ button:focus-visible {
 #renderFps { min-width: 2ch; text-align: right; }
 #theoreticalFpsText { min-width: 116px; }
 #stageLatencyText { min-width: 120px; }
+
+@media (max-width: 1600px) {
+  .topbar {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 44px;
+    padding: 8px 14px;
+    row-gap: 7px;
+  }
+  .topbar-spacer { display: none; }
+  .preview-scale-control { flex-basis: 170px; min-width: 170px; }
+  #outputSizeText { min-width: 156px; }
+  #theoreticalFpsText { min-width: 100px; }
+  #stageLatencyText { min-width: 108px; }
+}
 
 .timeline { justify-content: flex-end; border-top: 1px solid rgba(232, 234, 223, 0.12); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }

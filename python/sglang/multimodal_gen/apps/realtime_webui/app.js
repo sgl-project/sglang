@@ -227,11 +227,16 @@ let socketServerError = "";
 let renderedPreviewFrames = 0;
 let previewScaleFrame = 0;
 let recordingActive = false;
-let recordingFrames = [];
+let recordingSamples = [];
+let recordingEncoder = null;
+let recordingEncoderReady = null;
+let recordingEncoderConfig = null;
 let recordingFrameIndex = 0;
 let recordingStartedAt = 0;
+let recordingFirstFrameAt = 0;
 let recordingTimer = 0;
 let recordingSaving = false;
+let recordingEncodeChain = Promise.resolve();
 const decodeRequests = new Map();
 let controlStateController = null;
 
@@ -487,7 +492,7 @@ function closeFrames(items) {
 
 function recordingFileName() {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return `sglang-realtime-${stamp}.zip`;
+  return `sglang-realtime-${stamp}.mp4`;
 }
 
 function updateRecordButton() {
@@ -512,10 +517,20 @@ function formatRecordingDuration(elapsedMs) {
 
 function startRecording() {
   if (recordingActive || recordingSaving) return;
+  if (!window.VideoEncoder || !window.VideoFrame) {
+    setStatus("MP4 unsupported", "error");
+    addHistory("MP4 recording requires WebCodecs H.264 support");
+    return;
+  }
   recordingActive = true;
-  recordingFrames = [];
+  recordingSamples = [];
+  recordingEncoder = null;
+  recordingEncoderReady = null;
+  recordingEncoderConfig = null;
   recordingFrameIndex = 0;
   recordingStartedAt = performance.now();
+  recordingFirstFrameAt = 0;
+  recordingEncodeChain = Promise.resolve();
   recordingTimer = window.setInterval(updateRecordButton, 250);
   updateRecordButton();
   addHistory("recording started");
@@ -538,23 +553,23 @@ async function stopRecording() {
       fileHandle = await window.showSaveFilePicker({
         suggestedName: fileName,
         types: [{
-          description: "Realtime frame archive",
-          accept: { "application/zip": [".zip"] },
+          description: "MP4 video",
+          accept: { "video/mp4": [".mp4"] },
         }],
       });
     }
-    const framesToSave = recordingFrames;
-    recordingFrames = [];
-    if (!framesToSave.length) throw new Error("No frames were recorded");
-    const zipBlob = await buildRecordingArchive(framesToSave);
+    await recordingEncodeChain;
+    if (!recordingEncoder || !recordingSamples.length) throw new Error("No frames were recorded");
+    await recordingEncoder.flush();
+    const mp4Blob = buildRecordingMp4();
     if (fileHandle) {
       const writable = await fileHandle.createWritable();
-      await writable.write(zipBlob);
+      await writable.write(mp4Blob);
       await writable.close();
     } else {
-      downloadBlob(zipBlob, fileName);
+      downloadBlob(mp4Blob, fileName);
     }
-    addHistory(`saved ${framesToSave.length} recorded frames`);
+    addHistory(`saved ${recordingSamples.length} frames as mp4`);
   } catch (error) {
     if (error?.name === "AbortError") {
       addHistory("recording save canceled");
@@ -563,62 +578,101 @@ async function stopRecording() {
       setStatus("Save failed", "error");
     }
   } finally {
+    recordingEncoder?.close?.();
+    recordingEncoder = null;
+    recordingEncoderReady = null;
     recordingSaving = false;
-    recordingFrames = [];
+    recordingSamples = [];
     updateRecordButton();
   }
 }
 
 function captureRecordingFrame(item, now) {
   if (!recordingActive) return;
+  if (!recordingFirstFrameAt) recordingFirstFrameAt = now;
+  const timestamp = Math.max(0, Math.round((now - recordingFirstFrameAt) * 1000));
+  const duration = Math.round(1_000_000 / Math.max(1, previewPlaybackTargetFps()));
+  let frame;
+  try {
+    frame = new VideoFrame(canvas, { timestamp, duration });
+  } catch (error) {
+    recordingActive = false;
+    addHistory(error.message || "recording frame capture failed");
+    updateRecordButton();
+    return;
+  }
   const index = recordingFrameIndex++;
-  const path = `frames/frame_${String(index + 1).padStart(6, "0")}.png`;
-  const frame = {
-    index,
-    path,
-    chunk: item.chunk,
-    width: canvas.width,
-    height: canvas.height,
-    timestampMs: Math.round(now - recordingStartedAt),
-  };
-  frame.blobPromise = new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) resolve(blob);
-      else reject(new Error("Failed to encode recorded frame"));
-    }, "image/png");
-  });
-  recordingFrames.push(frame);
+  recordingEncodeChain = recordingEncodeChain
+    .then(async () => {
+      await ensureRecordingEncoder(frame.displayWidth, frame.displayHeight);
+      recordingEncoder.encode(frame, { keyFrame: index === 0 || index % 120 === 0 });
+      frame.close();
+    })
+    .catch((error) => {
+      frame.close();
+      recordingActive = false;
+      addHistory(error.message || "recording encode failed");
+      updateRecordButton();
+    });
 }
 
-async function buildRecordingArchive(framesToSave) {
-  const frames = [];
-  for (const frame of framesToSave) {
-    frames.push({
-      ...frame,
-      blob: await frame.blobPromise,
-    });
+async function ensureRecordingEncoder(width, height) {
+  if (recordingEncoderReady) return recordingEncoderReady;
+  recordingEncoderReady = createRecordingEncoder(width, height);
+  return recordingEncoderReady;
+}
+
+async function createRecordingEncoder(width, height) {
+  const fps = Math.max(1, previewPlaybackTargetFps());
+  const bitrate = Math.round(Math.min(
+    180_000_000,
+    Math.max(24_000_000, width * height * fps * 0.8),
+  ));
+  const configs = [
+    { codec: "avc1.640028", width, height, bitrate, framerate: fps },
+    { codec: "avc1.4d4028", width, height, bitrate, framerate: fps },
+    { codec: "avc1.42e028", width, height, bitrate, framerate: fps },
+  ];
+  let supported = null;
+  for (const config of configs) {
+    const candidate = {
+      ...config,
+      avc: { format: "avc" },
+      bitrateMode: "variable",
+      hardwareAcceleration: "prefer-hardware",
+      latencyMode: "realtime",
+    };
+    const result = await VideoEncoder.isConfigSupported(candidate);
+    if (result.supported) {
+      supported = result.config;
+      break;
+    }
   }
-  const first = frames[0];
-  const manifest = {
-    format: "sglang-realtime-frame-archive",
-    version: 1,
-    width: first.width,
-    height: first.height,
-    fps: previewPlaybackTargetFps(),
-    frame_count: frames.length,
-    frames: frames.map((frame) => ({
-      file: frame.path,
-      index: frame.index,
-      chunk: frame.chunk,
-      timestamp_ms: frame.timestampMs,
-    })),
-  };
-  const entries = [{
-    path: "manifest.json",
-    blob: new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" }),
-  }];
-  for (const frame of frames) entries.push({ path: frame.path, blob: frame.blob });
-  return zipEntries(entries);
+  if (!supported) throw new Error("This browser cannot encode H.264 MP4");
+  recordingEncoderConfig = supported;
+  recordingEncoder = new VideoEncoder({
+    output: (chunk, metadata) => recordEncodedChunk(chunk, metadata),
+    error: (error) => {
+      recordingActive = false;
+      addHistory(error.message || "recording encoder failed");
+      updateRecordButton();
+    },
+  });
+  recordingEncoder.configure(supported);
+}
+
+function recordEncodedChunk(chunk, metadata) {
+  if (metadata?.decoderConfig?.description) {
+    recordingEncoderConfig.description = metadata.decoderConfig.description;
+  }
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  recordingSamples.push({
+    data,
+    timestamp: chunk.timestamp,
+    duration: chunk.duration || 0,
+    key: chunk.type === "key",
+  });
 }
 
 function downloadBlob(blob, fileName) {
@@ -632,121 +686,259 @@ function downloadBlob(blob, fileName) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function zipEntries(entries) {
-  const encoder = new TextEncoder();
-  const localParts = [];
-  const centralParts = [];
-  let offset = 0;
-
-  for (const entry of entries) {
-    const nameBytes = encoder.encode(entry.path);
-    const data = new Uint8Array(await entry.blob.arrayBuffer());
-    const crc = crc32(data);
-    const timeDate = zipTimeDate(new Date());
-    const localHeader = new Uint8Array(30 + nameBytes.length);
-    const localView = new DataView(localHeader.buffer);
-    writeZipHeader(localView, {
-      signature: 0x04034b50,
-      timeDate,
-      crc,
-      size: data.byteLength,
-      nameBytes,
-    });
-    localHeader.set(nameBytes, 30);
-    localParts.push(localHeader, data);
-
-    const centralHeader = new Uint8Array(46 + nameBytes.length);
-    const centralView = new DataView(centralHeader.buffer);
-    writeZipHeader(centralView, {
-      signature: 0x02014b50,
-      timeDate,
-      crc,
-      size: data.byteLength,
-      nameBytes,
-      offset,
-    });
-    centralHeader.set(nameBytes, 46);
-    centralParts.push(centralHeader);
-    offset += localHeader.byteLength + data.byteLength;
+function buildRecordingMp4() {
+  if (!recordingEncoderConfig.description) {
+    throw new Error("H.264 encoder did not return MP4 decoder config");
   }
-
-  const centralOffset = offset;
-  const centralSize = centralParts.reduce((size, part) => size + part.byteLength, 0);
-  const end = new Uint8Array(22);
-  const endView = new DataView(end.buffer);
-  endView.setUint32(0, 0x06054b50, true);
-  endView.setUint16(8, entries.length, true);
-  endView.setUint16(10, entries.length, true);
-  endView.setUint32(12, centralSize, true);
-  endView.setUint32(16, centralOffset, true);
-  return new Blob([...localParts, ...centralParts, end], { type: "application/zip" });
+  const width = recordingEncoderConfig.width;
+  const height = recordingEncoderConfig.height;
+  const samples = normalizeRecordingSamples(recordingSamples);
+  const mdatPayload = concatBytes(samples.map((sample) => sample.data));
+  const ftyp = mp4Box("ftyp", ascii("isom"), u32(0x200), ascii("isom"), ascii("iso2"), ascii("avc1"), ascii("mp41"));
+  const mdat = mp4Box("mdat", mdatPayload);
+  const firstSampleOffset = ftyp.byteLength + 8;
+  const moov = buildMoovBox({
+    width,
+    height,
+    samples,
+    firstSampleOffset,
+    avcConfig: new Uint8Array(recordingEncoderConfig.description),
+  });
+  return new Blob([ftyp, mdat, moov], { type: "video/mp4" });
 }
 
-function writeZipHeader(view, {
-  signature,
-  timeDate,
-  crc,
-  size,
-  nameBytes,
-  offset = 0,
-}) {
-  view.setUint32(0, signature, true);
-  if (signature === 0x02014b50) {
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 20, true);
-    view.setUint16(8, 0, true);
-    view.setUint16(10, 0, true);
-    view.setUint16(12, timeDate.time, true);
-    view.setUint16(14, timeDate.date, true);
-    view.setUint32(16, crc, true);
-    view.setUint32(20, size, true);
-    view.setUint32(24, size, true);
-    view.setUint16(28, nameBytes.length, true);
-    view.setUint32(42, offset, true);
-  } else {
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 0, true);
-    view.setUint16(8, 0, true);
-    view.setUint16(10, timeDate.time, true);
-    view.setUint16(12, timeDate.date, true);
-    view.setUint32(14, crc, true);
-    view.setUint32(18, size, true);
-    view.setUint32(22, size, true);
-    view.setUint16(26, nameBytes.length, true);
+function normalizeRecordingSamples(samples) {
+  const ordered = [...samples].sort((left, right) => left.timestamp - right.timestamp);
+  const timescale = 90_000;
+  const fallbackDuration = Math.round(timescale / Math.max(1, previewPlaybackTargetFps()));
+  const normalized = ordered.map((sample) => ({
+    ...sample,
+    time: Math.round(sample.timestamp * timescale / 1_000_000),
+  }));
+  for (let i = 0; i < normalized.length; i++) {
+    const next = normalized[i + 1];
+    normalized[i].duration = next
+      ? Math.max(1, next.time - normalized[i].time)
+      : Math.max(1, Math.round((ordered[i].duration || 0) * timescale / 1_000_000) || fallbackDuration);
   }
+  return normalized;
 }
 
-function zipTimeDate(date) {
-  return {
-    time:
-      (date.getHours() << 11) |
-      (date.getMinutes() << 5) |
-      Math.floor(date.getSeconds() / 2),
-    date:
-      ((date.getFullYear() - 1980) << 9) |
-      ((date.getMonth() + 1) << 5) |
-      date.getDate(),
-  };
+function buildMoovBox({ width, height, samples, firstSampleOffset, avcConfig }) {
+  const timescale = 90_000;
+  const duration = samples.reduce((sum, sample) => sum + sample.duration, 0);
+  const movieTimescale = 1000;
+  const movieDuration = Math.ceil(duration * movieTimescale / timescale);
+  return mp4Box(
+    "moov",
+    buildMvhdBox(movieTimescale, movieDuration),
+    mp4Box(
+      "trak",
+      buildTkhdBox(width, height, movieDuration),
+      mp4Box(
+        "mdia",
+        buildMdhdBox(timescale, duration),
+        buildHdlrBox(),
+        mp4Box(
+          "minf",
+          buildVmhdBox(),
+          buildDinfBox(),
+          buildStblBox({ width, height, samples, firstSampleOffset, avcConfig }),
+        ),
+      ),
+    ),
+  );
 }
 
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let value = i;
-    for (let bit = 0; bit < 8; bit++) {
-      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+function buildMvhdBox(timescale, duration) {
+  return mp4Box(
+    "mvhd",
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(timescale),
+    u32(duration),
+    u32(0x00010000),
+    u16(0x0100),
+    u16(0),
+    zeros(8),
+    u32(0x00010000), u32(0), u32(0),
+    u32(0), u32(0x00010000), u32(0),
+    u32(0), u32(0), u32(0x40000000),
+    zeros(24),
+    u32(2),
+  );
+}
+
+function buildTkhdBox(width, height, duration) {
+  return mp4Box(
+    "tkhd",
+    u32(0x00000007),
+    u32(0),
+    u32(0),
+    u32(1),
+    u32(0),
+    u32(duration),
+    zeros(8),
+    u16(0),
+    u16(0),
+    u16(0),
+    u16(0),
+    u32(0x00010000), u32(0), u32(0),
+    u32(0), u32(0x00010000), u32(0),
+    u32(0), u32(0), u32(0x40000000),
+    u32(width << 16),
+    u32(height << 16),
+  );
+}
+
+function buildMdhdBox(timescale, duration) {
+  return mp4Box(
+    "mdhd",
+    u32(0),
+    u32(0),
+    u32(0),
+    u32(timescale),
+    u32(duration),
+    u16(0x55c4),
+    u16(0),
+  );
+}
+
+function buildHdlrBox() {
+  return mp4Box("hdlr", u32(0), u32(0), ascii("vide"), zeros(12), ascii("VideoHandler\0"));
+}
+
+function buildVmhdBox() {
+  return mp4Box("vmhd", u32(0x00000001), u16(0), u16(0), u16(0), u16(0));
+}
+
+function buildDinfBox() {
+  return mp4Box(
+    "dinf",
+    mp4Box(
+      "dref",
+      u32(0),
+      u32(1),
+      mp4Box("url ", u32(0x00000001)),
+    ),
+  );
+}
+
+function buildStblBox({ width, height, samples, firstSampleOffset, avcConfig }) {
+  return mp4Box(
+    "stbl",
+    buildStsdBox(width, height, avcConfig),
+    buildSttsBox(samples),
+    buildStssBox(samples),
+    buildStscBox(samples.length),
+    buildStszBox(samples),
+    buildStcoBox(firstSampleOffset),
+  );
+}
+
+function buildStsdBox(width, height, avcConfig) {
+  const compressor = new Uint8Array(32);
+  return mp4Box(
+    "stsd",
+    u32(0),
+    u32(1),
+    mp4Box(
+      "avc1",
+      zeros(6),
+      u16(1),
+      zeros(16),
+      u16(width),
+      u16(height),
+      u32(0x00480000),
+      u32(0x00480000),
+      u32(0),
+      u16(1),
+      compressor,
+      u16(24),
+      u16(0xffff),
+      mp4Box("avcC", avcConfig),
+    ),
+  );
+}
+
+function buildSttsBox(samples) {
+  const entries = [];
+  for (const sample of samples) {
+    const last = entries[entries.length - 1];
+    if (last && last.duration === sample.duration) {
+      last.count += 1;
+    } else {
+      entries.push({ count: 1, duration: sample.duration });
     }
-    table[i] = value >>> 0;
   }
-  return table;
-})();
+  return mp4Box("stts", u32(0), u32(entries.length), ...entries.flatMap((entry) => [u32(entry.count), u32(entry.duration)]));
+}
 
-function crc32(data) {
-  let crc = 0xffffffff;
-  for (const byte of data) {
-    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+function buildStssBox(samples) {
+  const keySamples = samples
+    .map((sample, index) => sample.key ? index + 1 : 0)
+    .filter(Boolean);
+  if (!keySamples.length && samples.length) keySamples.push(1);
+  return mp4Box("stss", u32(0), u32(keySamples.length), ...keySamples.map(u32));
+}
+
+function buildStscBox(sampleCount) {
+  return mp4Box("stsc", u32(0), u32(1), u32(1), u32(sampleCount), u32(1));
+}
+
+function buildStszBox(samples) {
+  return mp4Box("stsz", u32(0), u32(0), u32(samples.length), ...samples.map((sample) => u32(sample.data.byteLength)));
+}
+
+function buildStcoBox(firstSampleOffset) {
+  return mp4Box("stco", u32(0), u32(1), u32(firstSampleOffset));
+}
+
+function mp4Box(type, ...payloads) {
+  const size = 8 + payloads.reduce((sum, payload) => sum + payload.byteLength, 0);
+  const output = new Uint8Array(size);
+  const view = new DataView(output.buffer);
+  view.setUint32(0, size, false);
+  output.set(ascii(type), 4);
+  let offset = 8;
+  for (const payload of payloads) {
+    output.set(payload, offset);
+    offset += payload.byteLength;
   }
-  return (crc ^ 0xffffffff) >>> 0;
+  return output;
+}
+
+function concatBytes(parts) {
+  const output = new Uint8Array(parts.reduce((sum, part) => sum + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
+}
+
+function ascii(text) {
+  const output = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) output[i] = text.charCodeAt(i);
+  return output;
+}
+
+function zeros(length) {
+  return new Uint8Array(length);
+}
+
+function u16(value) {
+  const output = new Uint8Array(2);
+  new DataView(output.buffer).setUint16(0, value, false);
+  return output;
+}
+
+function u32(value) {
+  const output = new Uint8Array(4);
+  new DataView(output.buffer).setUint32(0, value >>> 0, false);
+  return output;
 }
 
 function hasPendingPlaybackInput() {
