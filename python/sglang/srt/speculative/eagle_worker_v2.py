@@ -239,8 +239,13 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         num_steps = self.speculative_num_steps
         sa = self.server_args
+        decode_max_bs = (
+            sa.cuda_graph_config.decode.max_bs
+            if sa.cuda_graph_config is not None
+            else None
+        )
         max_bs = max(
-            sa.cuda_graph_max_bs or 0,
+            decode_max_bs or 0,
             sa.max_running_requests or 0,
             1,
         )
