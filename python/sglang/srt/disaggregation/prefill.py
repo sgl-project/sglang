@@ -333,10 +333,15 @@ class PrefillBootstrapQueue:
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None:
-                # if req not in reqs_info_to_check, skip
-                if req.rid not in rids_to_check:
-                    continue
+            if (
+                rids_to_check is not None
+                and req.rid not in rids_to_check
+                and poll != KVPoll.Failed
+            ):
+                # In PP mode, successful bootstrap still requires cross-rank
+                # consensus. Local failures are terminal and must be drained
+                # even if an earlier PP rank has already removed the request.
+                continue
 
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)

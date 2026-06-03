@@ -147,6 +147,53 @@ class WaveAttnBackend(AttentionBackend):
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        if in_capture:
+            assert forward_batch.encoder_lens is None, "Not supported"
+            # kv buffers come from spec_info rather than the cuda-graph pool.
+            if forward_mode.is_decode_or_idle() and spec_info is not None:
+                self.forward_metadata = ForwardMetadata(
+                    attn_logits=self.cuda_graph_attn_logits,
+                    attn_lse=self.cuda_graph_attn_lse,
+                    max_extend_len=None,
+                    num_kv_splits=self.cuda_graph_num_kv_splits,
+                    kv_indptr=spec_info.kv_indptr,
+                    kv_indices=spec_info.kv_indices,
+                    qo_indptr=None,
+                    custom_mask=None,
+                    mask_indptr=None,
+                )
+                return
+
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+            )
+            self.forward_metadata = self._build_cuda_graph_forward_metadata(
+                bs, forward_mode, spec_info
+            )
+        else:
+            self._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for wave attention backend."""
 
@@ -373,59 +420,18 @@ class WaveAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        assert encoder_lens is None, "Not supported"
-
-        # Multi-step speculative decode: kv buffers come from spec_info rather than
-        # the cuda-graph pool, so replay is not involved for this path.
-        if forward_mode.is_decode_or_idle() and spec_info is not None:
-            self.forward_metadata = ForwardMetadata(
-                attn_logits=self.cuda_graph_attn_logits,
-                attn_lse=self.cuda_graph_attn_lse,
-                max_extend_len=None,
-                num_kv_splits=self.cuda_graph_num_kv_splits,
-                kv_indptr=spec_info.kv_indptr,
-                kv_indices=spec_info.kv_indices,
-                qo_indptr=None,
-                custom_mask=None,
-                mask_indptr=None,
-            )
-            return
-
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=None,
-        )
-        self.forward_metadata = self._build_cuda_graph_forward_metadata(
-            bs, forward_mode, spec_info
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
     ):
+        """Shared capture+replay body for the cuda-graph init path.
+
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
+        """
         if forward_mode.is_decode_or_idle():
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
