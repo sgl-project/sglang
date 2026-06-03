@@ -281,6 +281,11 @@ button:focus-visible {
   font-size: 12px;
 }
 
+.topbar > * {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
 .topbar-spacer { flex: 1; }
 .preview-scale-control {
   display: inline-flex;
@@ -290,6 +295,7 @@ button:focus-visible {
   margin: 0;
   color: rgba(232, 234, 223, 0.72);
   font-size: 11px;
+  line-height: 1;
 }
 .preview-scale-control input {
   width: 92px;
@@ -307,17 +313,20 @@ button:focus-visible {
 #statusText {
   display: inline-block;
   min-width: 92px;
+  line-height: 1;
 }
 #chunkText {
   display: inline-block;
   min-width: 70px;
+  line-height: 1;
 }
 .stage-stat {
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 5px;
   min-width: max-content;
   color: rgba(232, 234, 223, 0.72);
+  line-height: 1;
 }
 .stage-stat b {
   color: #fffdf7;
@@ -357,34 +366,12 @@ button:focus-visible {
 }
 
 .preview-loader {
-  position: relative;
-  width: 7px;
-  height: 7px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  background: rgba(238, 241, 236, 0.88);
-  animation: previewDotPulse 1.05s ease-in-out infinite;
-}
-
-.preview-loader::before,
-.preview-loader::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: rgba(238, 241, 236, 0.88);
-  animation: previewDotPulse 1.05s ease-in-out infinite;
-}
-
-.preview-loader::before {
-  left: -16px;
-  animation-delay: -0.18s;
-}
-
-.preview-loader::after {
-  left: 16px;
-  animation-delay: 0.18s;
+  border: 2px solid rgba(238, 241, 236, 0.22);
+  border-top-color: rgba(238, 241, 236, 0.82);
+  animation: previewProgressSpin 0.8s linear infinite;
 }
 
 .stage-controls {
@@ -626,7 +613,6 @@ button:focus-visible {
   .preview-scale-control { min-width: 160px; }
 }
 
-@keyframes previewDotPulse {
-  0%, 80%, 100% { opacity: 0.32; }
-  40% { opacity: 1; }
+@keyframes previewProgressSpin {
+  to { transform: rotate(360deg); }
 }

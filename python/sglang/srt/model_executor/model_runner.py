@@ -2420,6 +2420,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
 
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+
         cache_path = self._flashinfer_autotune_cache_path()
         if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
             autotune_cache = cache_path
@@ -2441,7 +2443,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(autotune_cache)):
+            with (
+                torch.inference_mode(),
+                autotune(True, cache=str(autotune_cache)),
+                autotune_dummy_run_mode(),
+            ):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
@@ -2606,39 +2612,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if require_mlp_tp_gather_:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.server_args.dp_size,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.server_args.dp_size,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens * self.server_args.dp_size
             global_num_tokens_cpu = [num_tokens] * self.server_args.dp_size
         elif require_attn_tp_gather(self.server_args):
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens
             global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=self.device
+            )
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
         else:
             global_dp_buffer_len = None
             global_num_tokens_cpu = None
@@ -2754,6 +2740,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
 
