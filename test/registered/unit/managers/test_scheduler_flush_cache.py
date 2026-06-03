@@ -49,6 +49,17 @@ class TestSchedulerFlushCache(unittest.TestCase):
         self.assertTrue(output.success)
         scheduler.flush_cache.assert_called_once()
 
+    def test_flush_can_skip_emptying_allocator_cache(self):
+        """empty_cache=False is forwarded to the underlying flush_cache callable."""
+        scheduler = self._new_scheduler()
+
+        output = scheduler.flush_wrapper.handle(
+            FlushCacheReqInput(timeout_s=None, empty_cache=False)
+        )
+
+        self.assertTrue(output.success)
+        scheduler.flush_cache.assert_called_once_with(False)
+
     def test_defers_when_busy(self):
         """Positive timeout + busy → defers, returns None."""
         scheduler = self._new_scheduler()

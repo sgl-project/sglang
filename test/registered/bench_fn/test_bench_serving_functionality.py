@@ -1,12 +1,18 @@
+import asyncio
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from sglang.bench_serving import run_benchmark
+import sglang.bench_serving as bench_serving
+from sglang.bench_serving import RequestFuncOutput, run_benchmark
+from sglang.benchmark.datasets import DatasetRow
 from sglang.benchmark.utils import parse_custom_headers
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.utils import kill_process_tree
@@ -185,6 +191,81 @@ class TestBenchServingCustomHeaders(CustomTestCase):
         headers = generate_reqs[0]["headers"]
         self.assertEqual(headers.get("X-Custom-Test"), "TestValue123")
         self.assertEqual(headers.get("X-Another"), "AnotherVal")
+
+
+    def test_flush_cache_keeps_allocator_cache_by_default(self):
+        """bench_serving --flush-cache should pass empty_cache=False by default."""
+
+        async def fake_request(request_func_input, pbar=None):
+            return RequestFuncOutput(
+                generated_text="ok",
+                success=True,
+                latency=0.02,
+                ttft=0.01,
+                itl=[0.01],
+                prompt_len=request_func_input.prompt_len,
+                output_len=2,
+                start_time=time.perf_counter(),
+            )
+
+        class FakeTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [1, 2]
+
+        class FakeResponse:
+            status_code = 404
+
+            def json(self):
+                return {}
+
+        previous_request_func = bench_serving.ASYNC_REQUEST_FUNCS["sglang"]
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            output_file = f.name
+        bench_serving.args = SimpleNamespace(
+            backend="sglang",
+            dataset_name="random",
+            sharegpt_output_len=None,
+            random_input_len=8,
+            random_output_len=2,
+            random_range_ratio=0.0,
+            num_prompts=1,
+            warmup_requests=0,
+            output_file=output_file,
+            output_details=False,
+            plot_throughput=False,
+        )
+
+        try:
+            bench_serving.ASYNC_REQUEST_FUNCS["sglang"] = fake_request
+            with patch.object(bench_serving.requests, "post") as post, patch.object(
+                bench_serving.requests, "get", return_value=FakeResponse()
+            ):
+                asyncio.run(
+                    bench_serving.benchmark(
+                        backend="sglang",
+                        api_url="http://127.0.0.1:30000/generate",
+                        base_url="http://127.0.0.1:30000",
+                        model_id="dummy",
+                        tokenizer=FakeTokenizer(),
+                        input_requests=[DatasetRow("hi", 1, 2)],
+                        request_rate=float("inf"),
+                        max_concurrency=None,
+                        disable_tqdm=True,
+                        lora_names=[],
+                        lora_request_distribution=None,
+                        lora_zipf_alpha=None,
+                        extra_request_body={},
+                        profile=False,
+                        flush_cache=True,
+                        warmup_requests=0,
+                    )
+                )
+
+            post.assert_called_once()
+            self.assertEqual(post.call_args.kwargs["params"], {"empty_cache": False})
+        finally:
+            bench_serving.ASYNC_REQUEST_FUNCS["sglang"] = previous_request_func
+            os.remove(output_file)
 
 
 if __name__ == "__main__":

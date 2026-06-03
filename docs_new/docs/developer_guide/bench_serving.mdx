@@ -171,7 +171,8 @@ python3 -m sglang.bench_serving \
 - `--extra-request-body '&#123;"top_p":0.9,"temperature":0.6&#125;'`: merged into payload (sampling params, etc.)
 - `--disable-ignore-eos`: pass through EOS behavior (varies by backend)
 - `--warmup-requests N`: run warmup requests with short output first (default 1)
-- `--flush-cache`: call `/flush_cache` (sglang) before main run
+- `--flush-cache`: call `/flush_cache` (sglang) before main run without emptying the device allocator cache by default
+- `--flush-cache-empty-cache`: when used with `--flush-cache`, also empty the device allocator cache to preserve the older benchmark flush behavior
 - `--profile`: call `/start_profile` and `/stop_profile` (requires server to enable profiling, e.g., `SGLANG_TORCH_PROFILER_DIR`)
 - `--lora-name name1 name2 ...`: randomly pick one per request and pass to backend (e.g., `lora_path` for sglang)
 - `--tokenize-prompt`: send integer IDs instead of text (currently supports `--backend sglang` only)
