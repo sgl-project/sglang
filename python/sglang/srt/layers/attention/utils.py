@@ -1,4 +1,6 @@
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.attention.triton_ops.cache_ops import (
