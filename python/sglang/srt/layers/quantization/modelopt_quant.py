@@ -48,6 +48,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
+    prepare_moe_nvfp4_layer_for_marlin,
+    prepare_nvfp4_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -59,6 +64,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
+    get_device_capability,
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
@@ -1190,7 +1196,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        return 80
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -1367,6 +1373,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
+        layer.quant_config = self.quant_config
         if input_size_per_partition % 16 != 0:
             raise ValueError(
                 "Unsupported model when in features size is not multiple of 16"
@@ -1433,6 +1441,23 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
+
+        if get_fp4_gemm_runner_backend().is_marlin():
+            if self.quant_config.group_size != 16:
+                raise ValueError(
+                    f"NVFP4 Marlin requires group_size=16, got {self.quant_config.group_size}."
+                )
+            copy_or_rebind_param(layer, "input_global_scale", input_scale_2)
+            copy_or_rebind_param(layer, "weight_global_scale", weight_scale_2)
+            prepare_nvfp4_layer_for_marlin(layer)
+            layer.weights_padding_cols = 0
+            return
+
+        if not is_blackwell_supported():
+            raise ValueError(
+                "ModelOpt NVFP4 native dense GEMM backends require SM100+. "
+                "Use --fp4-gemm-backend marlin on SM80-SM90."
+            )
 
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
@@ -1579,6 +1604,18 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if get_fp4_gemm_runner_backend().is_marlin():
+            return apply_fp4_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                weight_global_scale=layer.weight_global_scale,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+
         # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
         # tuple from unrelated code can't silently bypass quantization.
         if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(x, tuple):
@@ -1639,11 +1676,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        if not is_blackwell_supported():
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto() and is_cuda():
+            capability = get_device_capability()
+            use_marlin_fallback = (8, 0) <= capability < (10, 0)
+        else:
+            use_marlin_fallback = moe_runner_backend.is_marlin()
+        if not is_blackwell_supported() and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
-                " quantization. Please use Blackwell and"
-                " above."
+                " quantization with the selected MoE backend. Please use "
+                "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
@@ -1843,6 +1886,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
+
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        if moe_runner_backend.is_marlin():
+            copy_or_rebind_param(
+                layer,
+                "w13_weight_scale_2",
+                w13_weight_scale_2.contiguous(),
+            )
+            prepare_moe_nvfp4_layer_for_marlin(layer)
+            return
 
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
@@ -2115,9 +2170,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            # TRTLLM is currently the most performant and tested FP4 MoE
-            # backend, so use it as the default.
-            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+                moe_runner_backend = MoeRunnerBackend.MARLIN
+            else:
+                # TRTLLM is currently the most performant and tested FP4 MoE
+                # backend, so use it as the default.
+                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+
+        self._moe_runner_backend = moe_runner_backend
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
@@ -2137,11 +2197,41 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # tuple). Defer per-attribute access to the branches that actually
         # consume them.
         activation = self.moe_runner_config.activation
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
 
         assert (
             activation in _SUPPORTED_ACT_STRS
         ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS}"
         moe_runner_config = self.moe_runner_config
+
+        if moe_runner_backend.is_marlin():
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            expert_map = None
+            global_num_experts = -1
+            if hasattr(layer, "dispatcher") and hasattr(
+                layer.dispatcher, "local_expert_mapping"
+            ):
+                expert_map = layer.dispatcher.local_expert_mapping
+                if expert_map is not None:
+                    global_num_experts = self.moe_runner_config.num_experts
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=4,
+                w13_global_scale=layer.w13_weight_scale_2,
+                w2_global_scale=layer.w2_weight_scale_2,
+                expert_map=expert_map,
+                global_num_experts=global_num_experts,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path
         if self.enable_flashinfer_trtllm_moe and hasattr(layer, "g1_scale_c"):
