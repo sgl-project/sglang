@@ -67,27 +67,17 @@ Gemma 4 is Google's next-generation family of open models, building on the Gemma
 
 ## 2. SGLang Installation
 
-Gemma 4 support requires [sgl-project/sglang#21952](https://github.com/sgl-project/sglang/pull/21952) and a specific transformers commit:
+Gemma 4 (including the encoder-free unified 12B, [sgl-project/sglang#27167](https://github.com/sgl-project/sglang/pull/27167)) is supported on SGLang main. Install it together with the matching transformers commit:
 
 ```bash Command
-# Install SGLang from main branch (after sglang#21952 is merged)
+# Install SGLang from main
 pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
-# Install transformers with Gemma 4 support
-pip install 'git+https://github.com/huggingface/transformers.git@91b1ab1fdfa81a552644a92fbe3e8d88de40e167'
-# gemma-4-12B-it (unified) additionally requires a transformers build that
-# includes the gemma4_unified model family (>= 5.10).
-
-# Or use Docker AMD64
-docker pull lmsysorg/sglang:gemma4 # CUDA 12.9
-docker pull lmsysorg/sglang:cu13-gemma4 # CUDA 13
-
-# For ARM64 (GB200 / GB300)
-docker pull lmsysorg/sglang:dev-gemma4 # CUDA 12.9
-docker pull lmsysorg/sglang:dev-cu13-gemma4 # CUDA 13
+# Install transformers with Gemma 4 support (encoder-free unified family included)
+pip install 'git+https://github.com/huggingface/transformers.git@1423d22f7a3b62e8c70ad67b58ec25cd9b675897'
 ```
 
-For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+For other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
 ## 3. Model Deployment
 
@@ -1436,6 +1426,28 @@ Median ITL (ms):                         15.11
 </table>
 
 > **Note**: These GSM8K numbers use the raw few-shot completion harness (`sglang.test.few_shot_gsm8k`). `gemma-4-12B-it` is reasoning-oriented and is under-elicited by raw few-shot prompting; with the chat template it scores **0.950** on the same 1319 GSM8K test questions (`sglang.test.run_eval --eval-name gsm8k`).
+
+#### gemma-4-12B-it with sgl-eval
+
+`gemma-4-12B-it` is reasoning-oriented and answers verbosely (step-by-step) rather than emitting a terse final line. Strict last-line `Answer: $LETTER` extraction (as in `sglang.test.run_eval`) therefore undercounts its correct answers. [sgl-eval](https://github.com/sgl-project/sgl-eval) — sgl-project's evaluation CLI, which uses robust answer extraction — gives a faithful score on the served model:
+
+| Benchmark | Examples | Accuracy |
+| --- | --- | --- |
+| MMLU | 2000 | **0.878** |
+| GSM8K | 1319 | **0.960** |
+
+Reproduce against a running server (`--base-url` points at your endpoint):
+
+```bash Command
+pip install git+https://github.com/sgl-project/sgl-eval
+
+# Sanity-check the endpoint
+sgl-eval ping --base-url http://localhost:30000/v1
+
+# Run the benchmarks (greedy, single-shot)
+sgl-eval run gsm8k --base-url http://localhost:30000/v1
+sgl-eval run mmlu  --base-url http://localhost:30000/v1 --num-examples 2000
+```
 
 #### MMMU
 
