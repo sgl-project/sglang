@@ -39,6 +39,73 @@ def _jit_sparse_module(
     )
 
 
+@functools.cache
+def _jit_dsv4_transfer_module(block_size: int) -> Module:
+    template_args = make_cpp_args(block_size)
+    return load_jit(
+        "sparse_cache_dsv4_transfer",
+        block_size,
+        cuda_files=["hisparse.cuh"],
+        cuda_wrappers=[
+            (
+                "transfer_cache_dsv4_mla",
+                f"transfer_cache_dsv4_mla<{template_args}>",
+            )
+        ],
+    )
+
+
+def transfer_cache_dsv4_mla(
+    src_ptrs: torch.Tensor,
+    dst_ptrs: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    block_size: int = 1024,
+) -> None:
+    """Transfer DSv4 C4 tokens between page-padded C4 buffers."""
+    module = _jit_dsv4_transfer_module(block_size)
+    module.transfer_cache_dsv4_mla(
+        src_ptrs,
+        dst_ptrs,
+        src_indices,
+        dst_indices,
+    )
+
+
+def backup_cache_to_host_dsv4_mla(
+    device_ptrs: torch.Tensor,
+    host_ptrs: torch.Tensor,
+    device_indices: torch.Tensor,
+    host_indices: torch.Tensor,
+    block_size: int = 1024,
+) -> None:
+    """Back up DSv4 C4 tokens from GPU page rows to host page rows."""
+    transfer_cache_dsv4_mla(
+        src_ptrs=device_ptrs,
+        dst_ptrs=host_ptrs,
+        src_indices=device_indices,
+        dst_indices=host_indices,
+        block_size=block_size,
+    )
+
+
+def load_cache_from_host_to_device_dsv4_mla(
+    host_ptrs: torch.Tensor,
+    device_ptrs: torch.Tensor,
+    host_indices: torch.Tensor,
+    device_indices: torch.Tensor,
+    block_size: int = 1024,
+) -> None:
+    """Load DSv4 C4 tokens from paged host rows into paged GPU C4 rows."""
+    transfer_cache_dsv4_mla(
+        src_ptrs=host_ptrs,
+        dst_ptrs=device_ptrs,
+        src_indices=host_indices,
+        dst_indices=device_indices,
+        block_size=block_size,
+    )
+
+
 def _load_cache_to_device_buffer_mla(
     *,
     is_dsv4_layout: bool,
@@ -156,7 +223,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
 ) -> None:
-    """DSv4 hisparse swap-in: page-padded device + linear host (kvcacheio.cuh layout)."""
+    """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=True,
         top_k_tokens=top_k_tokens,

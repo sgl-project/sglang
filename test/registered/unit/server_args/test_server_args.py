@@ -3,9 +3,11 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -89,6 +91,28 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertIn("('nixl', 'mooncake')", str(context.exception))
         self.assertIn("'fake'", str(context.exception))
+
+
+class TestHiSparseValidation(unittest.TestCase):
+    def _dsv4_args(self, mode, *, disable_radix_cache=True):
+        hf_config = object()
+        return SimpleNamespace(
+            enable_hisparse=True,
+            disable_radix_cache=disable_radix_cache,
+            disaggregation_mode=mode,
+            get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        )
+
+    @patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False)
+    @patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=True)
+    def test_dsv4_hisparse_rejects_pd_prefill(self, *_):
+        with self.assertRaisesRegex(ValueError, "decode side"):
+            validate_hisparse(self._dsv4_args("prefill", disable_radix_cache=False))
+
+    @patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False)
+    @patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=True)
+    def test_dsv4_hisparse_allows_pd_decode(self, *_):
+        validate_hisparse(self._dsv4_args("decode"))
 
 
 class TestPortArgs(unittest.TestCase):

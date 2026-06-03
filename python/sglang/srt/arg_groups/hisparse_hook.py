@@ -63,14 +63,23 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
     if is_v4_hisparse:
+        if server_args.disaggregation_mode == "prefill":
+            raise ValueError(
+                "DeepSeek V4 HiSparse is only supported on the decode side in "
+                "PD disaggregation. Do not set --enable-hisparse on the prefill "
+                "server."
+            )
+        assert (
+            server_args.disable_radix_cache
+        ), "Hierarchical sparse attention currently requires --disable-radix-cache."
         return
+
+    assert (
+        server_args.disable_radix_cache
+    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
     if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
         raise ValueError(

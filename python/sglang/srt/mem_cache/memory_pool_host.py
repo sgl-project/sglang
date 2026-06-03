@@ -30,6 +30,10 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.jit_kernel.hisparse import (
+    backup_cache_to_host_dsv4_mla,
+    load_cache_from_host_to_device_dsv4_mla,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     KVCache,
@@ -1874,7 +1878,7 @@ class LogicalHostPool:
         return 0
 
 
-class DeepSeekV4PagedHostPool(HostKVCache):
+class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     """Host mirror for a DeepSeek V4 paged KV/indexer sub-pool."""
 
     def __init__(
@@ -1888,6 +1892,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        reserve_page_zero: bool = False,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
@@ -1904,6 +1909,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self.size_per_token = item_bytes
         self.start_layer = 0
         self.end_layer = self.layer_num
+        self.reserve_page_zero = reserve_page_zero
         self.lock = threading.RLock()
 
         self.device_buffers = device_buffers
@@ -1979,6 +1985,18 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         )
         self.clear()
 
+    def get_contiguous_buf_infos(self):
+        """Return per-layer page-row buffers for PD direct-to-host transfer."""
+        if self.layout != "layer_first":
+            raise ValueError(
+                f"{self.pool_name} contiguous transfer info requires layer_first "
+                f"layout, got {self.layout}."
+            )
+        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
+        return data_ptrs, data_lens, item_lens
+
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.numel() % self.slot_page_size != 0:
             raise ValueError(
@@ -1986,6 +2004,54 @@ class DeepSeekV4PagedHostPool(HostKVCache):
                 f"got numel={indices.numel()}, slot_page_size={self.slot_page_size}"
             )
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+
+    def _backup_tokens_from_device_all_layer(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor, io_backend: str
+    ) -> None:
+        if host_indices.numel() != device_indices.numel():
+            raise ValueError(
+                f"{self.pool_name} token backup index size mismatch: "
+                f"host={host_indices.numel()}, device={device_indices.numel()}"
+            )
+        if host_indices.numel() == 0:
+            return
+        if self.layout != "layer_first" or io_backend != "kernel":
+            raise ValueError(
+                f"{self.pool_name} non-page-aligned token backup only supports "
+                f"layer_first/kernel, got {self.layout}/{io_backend}"
+            )
+        assert self.data_ptrs is not None
+        backup_cache_to_host_dsv4_mla(
+            device_ptrs=self.device_ptrs,
+            host_ptrs=self.data_ptrs,
+            device_indices=device_indices.to(dtype=torch.int64),
+            host_indices=host_indices.to(dtype=torch.int64),
+        )
+
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if host_indices is None or device_indices is None:
+            return
+        if host_indices.numel() != device_indices.numel():
+            raise ValueError(
+                f"{self.pool_name} token load index size mismatch: "
+                f"host={host_indices.numel()}, device={device_indices.numel()}"
+            )
+        if host_indices.numel() == 0:
+            return
+        if self.layout != "layer_first" or io_backend != "kernel":
+            raise ValueError(
+                f"{self.pool_name} DSV4 token load only supports "
+                f"layer_first/kernel, got {self.layout}/{io_backend}"
+            )
+        assert self.data_ptrs is not None
+        load_cache_from_host_to_device_dsv4_mla(
+            host_ptrs=self.data_ptrs,
+            device_ptrs=self.device_ptrs,
+            host_indices=host_indices.to(dtype=torch.int64),
+            device_indices=device_indices.to(dtype=torch.int64),
+        )
 
     def get_size_per_token(self):
         return self.item_bytes
@@ -2000,7 +2066,8 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
     def clear(self):
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        start = self.slot_page_size if self.reserve_page_zero else 0
+        self.free_slots = torch.arange(start, self.size, dtype=torch.int64)
 
     def available_size(self):
         return len(self.free_slots)
@@ -2027,6 +2094,14 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if host_indices is None or device_indices is None:
+            return
+        if (
+            host_indices.numel() != device_indices.numel()
+            or host_indices.numel() % self.slot_page_size != 0
+        ):
+            self._backup_tokens_from_device_all_layer(
+                host_indices, device_indices, io_backend
+            )
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)

@@ -12,7 +12,6 @@ namespace device::hisparse {
 /// VALUE 0, VALUE 1, ..., VALUE 63,
 /// SCALE 0, SCALE 1, ..., SCALE 63,
 /// [Padding to align to 576 bytes]
-/// CPU Cache follow a trivial linear layout without any padding.
 inline constexpr int64_t kGPUPageSize = 64;
 inline constexpr int64_t kGPUPageBits = 6;  // log2(kGPUPageSize)
 inline constexpr int64_t kValueBytes = 576;
