@@ -1150,11 +1150,17 @@ class DeepseekSparseAttnBackend(
                 )
             else:
                 metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            # `copy_` preserves the buffer's data_ptr that the captured graph captured.
+            # `copy_` preserves the buffer's data_ptr that the captured graph
+            # captured. Slice the destination to the source size: in draft_extend
+            # the source is sized by the runtime sum(extend_seq_lens) (5 in the
+            # narrow test case), while the captured buffer is sized for the
+            # padded bs * num_tokens_per_bs (6).
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+                metadata.paged_mqa_ctx_lens_2d[: seqlens_32_2d.shape[0]].copy_(
+                    seqlens_32_2d
+                )
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
