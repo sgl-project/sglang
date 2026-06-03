@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -341,6 +342,61 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             input_ids=object(),
             out_cache_loc=None,
         )
+
+    def _make_sentinel_radix_attention(self, layer_id=0):
+        return RadixAttention(
+            num_heads=1,
+            head_dim=8,
+            scaling=1.0,
+            num_kv_heads=1,
+            layer_id=layer_id,
+        )
+
+    def test_hybrid_dispatch_full_qkv_payload_overrides_layer_id(self):
+        backend, full_attn_backend, linear_attn_backend = (
+            self._make_dispatch_spy_backend()
+        )
+        layer = self._make_sentinel_radix_attention(layer_id=0)
+        forward_batch = object()
+        q = torch.empty(1, 8)
+        k = torch.empty(1, 8)
+        v = torch.empty(1, 8)
+
+        backend.forward_extend(
+            layer=layer,
+            forward_batch=forward_batch,
+            q=q,
+            k=k,
+            v=v,
+            mixed_qkv=None,
+        )
+
+        self._assert_fanout_forwarded(
+            full_attn_backend.forward_extend, q, k, v, layer, forward_batch
+        )
+        linear_attn_backend.forward_extend.assert_not_called()
+
+    def test_hybrid_dispatch_plain_radix_attention_linear_by_layer_id(self):
+        backend, full_attn_backend, linear_attn_backend = (
+            self._make_dispatch_spy_backend()
+        )
+        layer = self._make_sentinel_radix_attention(layer_id=0)
+        forward_batch = object()
+        mixed_qkv = torch.empty(1, 24)
+
+        backend.forward_extend(
+            layer=layer,
+            forward_batch=forward_batch,
+            q=None,
+            k=None,
+            v=None,
+            mixed_qkv=mixed_qkv,
+        )
+
+        self._assert_fanout_forwarded(
+            linear_attn_backend.forward_extend, mixed_qkv, layer, forward_batch
+        )
+        full_attn_backend.forward_extend.assert_not_called()
 
     def test_hybrid_dispatch_replay_init_forward_metadata_fan_out(self):
         backend, full_attn_backend, linear_attn_backend = (

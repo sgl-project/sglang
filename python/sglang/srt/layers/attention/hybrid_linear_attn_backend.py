@@ -799,6 +799,23 @@ class HybridLinearAttnBackend(AttentionBackend):
         assert layer_id is not None, "either layer or layer_id must be provided"
         return layer_id in self.full_attn_layers
 
+    def _is_full_attn_call(
+        self,
+        layer: Optional[Union[RadixAttention, RadixLinearAttention]],
+        layer_id: Optional[int] = None,
+        q: Optional[torch.Tensor] = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,
+    ) -> bool:
+        # Speculative draft layers can reuse base-model layer ids. When a
+        # full-attention draft layer overlaps a base linear-attention layer id,
+        # the payload is still an unambiguous q/k/v call and must not be routed
+        # to the linear backend.
+        if mixed_qkv is None and q is not None:
+            return True
+        return self._is_full_attn(layer, layer_id)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -866,7 +883,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
     ):
-        if self._is_full_attn(layer, kwargs.get("layer_id")):
+        if self._is_full_attn_call(
+            layer,
+            kwargs.get("layer_id"),
+            q=q,
+            k=k,
+            v=v,
+            mixed_qkv=mixed_qkv,
+        ):
             return self.full_attn_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
@@ -897,7 +921,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
     ):
-        if self._is_full_attn(layer, kwargs.get("layer_id")):
+        if self._is_full_attn_call(
+            layer,
+            kwargs.get("layer_id"),
+            q=q,
+            k=k,
+            v=v,
+            mixed_qkv=mixed_qkv,
+        ):
             return self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
@@ -928,7 +959,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,  # For linear attention
         **kwargs,
     ):
-        is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
+        is_linear_attn = not self._is_full_attn_call(
+            layer,
+            kwargs.get("layer_id"),
+            q=q,
+            k=k,
+            v=v,
+            mixed_qkv=mixed_qkv,
+        )
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
