@@ -237,8 +237,8 @@ SGL_DEVICE void c128_prefill_segment_softmax(
 ///   Reads optional prior state from `read_page_0` (-1 = none), emits compressed
 ///   kv to `kv_compressed_output[plan_id]` (compact).
 /// `kWrite=true`  (write pass)   : handles trailing partial segments.
-///   Reads optional prior state from `read_page_0` (-1 = none), writes new
-///   running state to `read_page_1`.
+///   Reads optional prior state from `read_page_1` (-1 = fallback to
+///   `read_page_0`), writes new running state to `read_page_0`.
 template <int64_t kHeadDim, bool kWrite, bool kUsePDL>
 __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
     void flash_c128_online_prefill_v2(const __grid_constant__ Compress128OnlinePrefillParams params) {
@@ -336,9 +336,10 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
     out_max_vec.load(seg_max, lane_id);
     out_sum_vec.load(seg_sum, lane_id);
 
-    if (chunk_offset != 0 && plan.read_page_0 >= 0) {
+    const int32_t read_page = plan.read_page_1 >= 0 ? plan.read_page_1 : plan.read_page_0;
+    if (chunk_offset != 0 && read_page >= 0) {
       // Combine with prior partial state for this slot.
-      const auto buf_load = kv_score_buffer + plan.read_page_0 * (kHeadDim * 3) + split_offset;
+      const auto buf_load = kv_score_buffer + read_page * (kHeadDim * 3) + split_offset;
       PrefillStorage buf_max_vec, buf_sum_vec, buf_kv_vec;
       buf_max_vec.load(buf_load + 0 * kHeadDim, lane_id);
       buf_sum_vec.load(buf_load + 1 * kHeadDim, lane_id);
@@ -469,8 +470,8 @@ struct FlashCompress128OnlineKernel {
         .with_device(device_)
         .verify(ape);
 
-    // Both compress and write segments use PlanC layout. plan_c uses
-    // read_page_1=-1 (unused); plan_w uses read_page_1=store_slot.
+    // Both compress and write segments use PlanC layout. Stage 1 stores the
+    // committed-bank load slot in read_page_1 and the write slot in read_page_0.
     const auto plan_c = compress::verify_plan_c(plan_c_, C, device_);
     const auto plan_w = compress::verify_plan_c(plan_w_, W, device_);
     const auto device = device_.unwrap();
@@ -514,8 +515,9 @@ struct FlashCompress128OnlineKernel {
 //     GPU kernel that finalizes `read_page_0` to `req_to_token[rid][chunk_start]`,
 //     so the slot tensors never leave GPU memory. The online state pool keeps
 //     a single in-progress chunk per request, so each segment's load and
-//     store slot collapse to one value (the slot for the segment's own chunk),
-//     and `read_page_1` is unused.
+//     store slot collapse to one value (the slot for the segment's own chunk).
+//     For online-c128 MTP, stage 1 keeps that write slot in `read_page_0` and
+//     stores the committed-bank load slot in `read_page_1`.
 // ===========================================================================
 
 namespace host::compress {
@@ -660,7 +662,7 @@ inline std::tuple<uint32_t, uint32_t> _plan_prefill_partial(const OnlinePrefillS
           .ragged_id = static_cast<uint16_t>(last_ragged),
           .buffer_len = static_cast<uint16_t>(seg_len),
           .read_page_0 = static_cast<int32_t>(i),  // batch_id placeholder
-          .read_page_1 = -1,                       // unused, kept so MSB layout is stable
+          .read_page_1 = -1,                       // filled by stage 1 with committed-bank slot
       };
       if (chunk_off + seg_len == 128u) {
         // close-chunk segment
@@ -707,7 +709,9 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   const int32_t chunk_start = (position / 128) * 128;
   const int32_t full_loc = params.req_to_token[rid * params.stride_r2t + chunk_start];
   const int32_t swa_loc = static_cast<int32_t>(params.full_to_swa[full_loc]);
-  plan.read_page_0 = swa_loc / params.swa_page_size + params.state_slot_offset;
+  const int32_t main_slot = swa_loc / params.swa_page_size;
+  plan.read_page_0 = main_slot + params.state_slot_offset;
+  plan.read_page_1 = main_slot;
   *plan_ptr = plan;
 }
 

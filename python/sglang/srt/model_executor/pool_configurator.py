@@ -367,7 +367,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             allow_experimental_online_c128_mtp = (
                 envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
                 and mr.spec_algorithm.is_eagle()
-                #and mr.server_args.speculative_eagle_topk == 1
             )
             assert mr.spec_algorithm.is_none() or allow_experimental_online_c128_mtp, (
                 "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "

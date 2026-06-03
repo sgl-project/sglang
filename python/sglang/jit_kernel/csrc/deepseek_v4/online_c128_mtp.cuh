@@ -36,23 +36,94 @@ struct OnlineC128MTPWritePrefixParams {
   int64_t state_slot_stride;
 };
 
-template <typename TOldSeq, typename TCurSeq, typename TOldReq, typename TCurReq>
-struct OnlineC128MTPLazyCommitParams {
-  const TOldSeq* __restrict__ old_seq_lens;
-  const TOldReq* __restrict__ old_req_pool_indices;
-  const TCurSeq* __restrict__ cur_seq_lens;
-  const TCurReq* __restrict__ cur_req_pool_indices;
+template <typename TSeq, typename TReq>
+struct OnlineC128MTPMarkPendingParams {
+  const TSeq* __restrict__ seq_lens;
+  const TReq* __restrict__ req_pool_indices;
+  int64_t* __restrict__ pending_seq_lens;
+  int64_t bs;
+  int64_t max_num_reqs;
+};
+
+template <typename TSeq, typename TReq>
+struct OnlineC128MTPCommitPendingParams {
+  const TSeq* __restrict__ cur_seq_lens;
+  const TReq* __restrict__ cur_req_pool_indices;
   const int32_t* __restrict__ req_to_token;
   const int64_t* __restrict__ full_to_swa;
+  const int64_t* __restrict__ pending_seq_lens;
   float* __restrict__ state;
-  int64_t old_bs;
   int64_t cur_bs;
   int64_t req_to_token_stride_b;
   int64_t state_stride_b;
   int64_t swa_page_size;
   int64_t num_verify_tokens;
   int64_t state_slot_stride;
+  int64_t max_num_reqs;
 };
+
+template <typename TReq>
+struct OnlineC128MTPClearPendingParams {
+  const TReq* __restrict__ req_pool_indices;
+  int64_t* __restrict__ pending_seq_lens;
+  int64_t bs;
+};
+
+__global__ void online_c128_mtp_clear_all_pending_kernel(int64_t* pending_seq_lens, int64_t max_num_reqs) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < max_num_reqs) pending_seq_lens[idx] = -1;
+}
+
+template <typename TSeq, typename TReq>
+__global__ void online_c128_mtp_mark_pending_kernel(
+    const OnlineC128MTPMarkPendingParams<TSeq, TReq> params) {
+  const int64_t bid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (bid >= params.bs) return;
+  const int64_t req = static_cast<int64_t>(params.req_pool_indices[bid]);
+  if (req >= 0 && req < params.max_num_reqs) {
+    params.pending_seq_lens[req] = static_cast<int64_t>(params.seq_lens[bid]);
+  }
+}
+
+template <int64_t kHeadDim, typename TSeq, typename TReq>
+__global__ void online_c128_mtp_commit_pending_kernel(
+    const OnlineC128MTPCommitPendingParams<TSeq, TReq> params) {
+  const int64_t bid = static_cast<int64_t>(blockIdx.x);
+  if (bid >= params.cur_bs) return;
+
+  const int64_t req = static_cast<int64_t>(params.cur_req_pool_indices[bid]);
+  if (req < 0 || req >= params.max_num_reqs) return;
+  const int64_t old_seq = params.pending_seq_lens[req];
+  if (old_seq < 0) return;
+
+  const int64_t cur_seq = static_cast<int64_t>(params.cur_seq_lens[bid]);
+  const int64_t accept = clamp_accept_len(cur_seq - old_seq, params.num_verify_tokens);
+  if (accept <= 0) return;
+
+  const int64_t final_seq = old_seq + accept;
+  if ((final_seq & 127) == 0) return;
+
+  const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
+  const int64_t full_loc =
+      static_cast<int64_t>(params.req_to_token[req * params.req_to_token_stride_b + chunk_start]);
+  const int64_t swa_loc = params.full_to_swa[full_loc];
+  const int64_t slot = swa_loc / params.swa_page_size;
+  const float* const src = params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
+  float* const dst = params.state + slot * params.state_stride_b;
+
+  for (int64_t d = static_cast<int64_t>(threadIdx.x); d < kHeadDim * 3; d += blockDim.x) {
+    dst[d] = src[d];
+  }
+}
+
+template <typename TReq>
+__global__ void online_c128_mtp_clear_pending_kernel(
+    const OnlineC128MTPClearPendingParams<TReq> params) {
+  const int64_t bid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (bid >= params.bs) return;
+  const int64_t req = static_cast<int64_t>(params.req_pool_indices[bid]);
+  params.pending_seq_lens[req] = -1;
+}
 
 template <int64_t kHeadDim, typename TSeq, typename TReq>
 __global__ void online_c128_mtp_write_prefix_kernel(
@@ -128,41 +199,6 @@ __global__ void online_c128_mtp_write_prefix_kernel(
         run_sum = 0.0f;
       }
     }
-  }
-}
-
-template <int64_t kHeadDim, typename TOldSeq, typename TCurSeq, typename TOldReq, typename TCurReq>
-__global__ void online_c128_mtp_lazy_commit_kernel(
-    const OnlineC128MTPLazyCommitParams<TOldSeq, TCurSeq, TOldReq, TCurReq> params) {
-  const int64_t bid = static_cast<int64_t>(blockIdx.x);
-  if (bid >= params.old_bs) return;
-
-  const int64_t old_req = static_cast<int64_t>(params.old_req_pool_indices[bid]);
-  const int64_t old_seq = static_cast<int64_t>(params.old_seq_lens[bid]);
-  int64_t matched_seq = old_seq;
-  for (int64_t i = 0; i < params.cur_bs; ++i) {
-    if (static_cast<int64_t>(params.cur_req_pool_indices[i]) == old_req) {
-      matched_seq = static_cast<int64_t>(params.cur_seq_lens[i]);
-      break;
-    }
-  }
-
-  const int64_t accept = clamp_accept_len(matched_seq - old_seq, params.num_verify_tokens);
-  if (accept <= 0) return;
-
-  const int64_t final_seq = old_seq + accept;
-  if ((final_seq & 127) == 0) return;
-
-  const int64_t chunk_start = ((final_seq - 1) / 128) * 128;
-  const int64_t full_loc =
-      static_cast<int64_t>(params.req_to_token[old_req * params.req_to_token_stride_b + chunk_start]);
-  const int64_t swa_loc = params.full_to_swa[full_loc];
-  const int64_t slot = swa_loc / params.swa_page_size;
-  const float* const src = params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
-  float* const dst = params.state + slot * params.state_stride_b;
-
-  for (int64_t d = static_cast<int64_t>(threadIdx.x); d < kHeadDim * 3; d += blockDim.x) {
-    dst[d] = src[d];
   }
 }
 
@@ -266,121 +302,207 @@ struct OnlineC128MTPWritePrefixKernel {
 };
 
 template <int64_t kHeadDim>
-struct OnlineC128MTPLazyCommitKernel {
-  template <typename TOldSeq, typename TCurSeq, typename TOldReq, typename TCurReq>
+struct OnlineC128MTPMarkPendingKernel {
+  template <typename TSeq, typename TReq>
   static void launch(
-      tvm::ffi::TensorView old_seq_lens,
-      tvm::ffi::TensorView old_req_pool_indices,
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView req_pool_indices,
+      tvm::ffi::TensorView pending_seq_lens,
+      int64_t bs,
+      int64_t max_num_reqs,
+      DLDevice device) {
+    using namespace host;
+
+    const auto params = OnlineC128MTPMarkPendingParams<TSeq, TReq>{
+        .seq_lens = static_cast<const TSeq*>(seq_lens.data_ptr()),
+        .req_pool_indices = static_cast<const TReq*>(req_pool_indices.data_ptr()),
+        .pending_seq_lens = static_cast<int64_t*>(pending_seq_lens.data_ptr()),
+        .bs = bs,
+        .max_num_reqs = max_num_reqs,
+    };
+
+    constexpr uint32_t kThreads = 256;
+    const uint32_t clear_blocks = host::div_ceil(static_cast<uint32_t>(max_num_reqs), kThreads);
+    LaunchKernel(clear_blocks, kThreads, device)(online_c128_mtp_clear_all_pending_kernel, params.pending_seq_lens, max_num_reqs);
+    const uint32_t mark_blocks = host::div_ceil(static_cast<uint32_t>(bs), kThreads);
+    LaunchKernel(mark_blocks, kThreads, device)(online_c128_mtp_mark_pending_kernel<TSeq, TReq>, params);
+  }
+
+  static void run(
+      tvm::ffi::TensorView seq_lens,
+      tvm::ffi::TensorView req_pool_indices,
+      tvm::ffi::TensorView pending_seq_lens,
+      int64_t bs,
+      int64_t max_num_reqs) {
+    using namespace host;
+
+    auto seq_dtype = SymbolicDType{};
+    auto req_dtype = SymbolicDType{};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(seq_dtype).with_device(device).verify(seq_lens);
+    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(req_pool_indices);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(pending_seq_lens);
+
+    if (bs <= 0) return;
+    RuntimeCheck(bs <= seq_lens.shape()[0], "bs exceeds seq_lens rows");
+    RuntimeCheck(bs <= req_pool_indices.shape()[0], "bs exceeds req_pool_indices rows");
+    RuntimeCheck(max_num_reqs <= pending_seq_lens.shape()[0], "max_num_reqs exceeds pending rows");
+
+    if (seq_dtype.is_type<int32_t>()) {
+      if (req_dtype.is_type<int32_t>()) {
+        launch<int32_t, int32_t>(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
+      } else {
+        launch<int32_t, int64_t>(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
+      }
+    } else {
+      if (req_dtype.is_type<int32_t>()) {
+        launch<int64_t, int32_t>(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
+      } else {
+        launch<int64_t, int64_t>(seq_lens, req_pool_indices, pending_seq_lens, bs, max_num_reqs, device.unwrap());
+      }
+    }
+  }
+};
+
+template <int64_t kHeadDim>
+struct OnlineC128MTPCommitPendingKernel {
+  template <typename TSeq, typename TReq>
+  static void launch(
       tvm::ffi::TensorView cur_seq_lens,
       tvm::ffi::TensorView cur_req_pool_indices,
       tvm::ffi::TensorView req_to_token,
       tvm::ffi::TensorView full_to_swa,
+      tvm::ffi::TensorView pending_seq_lens,
       tvm::ffi::TensorView state,
-      int64_t old_bs,
       int64_t cur_bs,
       int64_t swa_page_size,
       int64_t num_verify_tokens,
       int64_t state_slot_stride,
+      int64_t max_num_reqs,
       DLDevice device) {
     using namespace host;
 
-    const auto params = OnlineC128MTPLazyCommitParams<TOldSeq, TCurSeq, TOldReq, TCurReq>{
-        .old_seq_lens = static_cast<const TOldSeq*>(old_seq_lens.data_ptr()),
-        .old_req_pool_indices = static_cast<const TOldReq*>(old_req_pool_indices.data_ptr()),
-        .cur_seq_lens = static_cast<const TCurSeq*>(cur_seq_lens.data_ptr()),
-        .cur_req_pool_indices = static_cast<const TCurReq*>(cur_req_pool_indices.data_ptr()),
+    const auto params = OnlineC128MTPCommitPendingParams<TSeq, TReq>{
+        .cur_seq_lens = static_cast<const TSeq*>(cur_seq_lens.data_ptr()),
+        .cur_req_pool_indices = static_cast<const TReq*>(cur_req_pool_indices.data_ptr()),
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
         .full_to_swa = static_cast<const int64_t*>(full_to_swa.data_ptr()),
+        .pending_seq_lens = static_cast<const int64_t*>(pending_seq_lens.data_ptr()),
         .state = static_cast<float*>(state.data_ptr()),
-        .old_bs = old_bs,
         .cur_bs = cur_bs,
         .req_to_token_stride_b = req_to_token.stride(0),
         .state_stride_b = state.stride(0),
         .swa_page_size = swa_page_size,
         .num_verify_tokens = num_verify_tokens,
         .state_slot_stride = state_slot_stride,
+        .max_num_reqs = max_num_reqs,
     };
 
     constexpr uint32_t kThreads = 256;
-    LaunchKernel(static_cast<uint32_t>(old_bs), kThreads, device)
-        (online_c128_mtp_lazy_commit_kernel<kHeadDim, TOldSeq, TCurSeq, TOldReq, TCurReq>, params);
+    LaunchKernel(static_cast<uint32_t>(cur_bs), kThreads, device)
+        (online_c128_mtp_commit_pending_kernel<kHeadDim, TSeq, TReq>, params);
   }
 
   static void run(
-      tvm::ffi::TensorView old_seq_lens,
-      tvm::ffi::TensorView old_req_pool_indices,
       tvm::ffi::TensorView cur_seq_lens,
       tvm::ffi::TensorView cur_req_pool_indices,
       tvm::ffi::TensorView req_to_token,
       tvm::ffi::TensorView full_to_swa,
+      tvm::ffi::TensorView pending_seq_lens,
       tvm::ffi::TensorView state,
-      int64_t old_bs,
       int64_t cur_bs,
       int64_t swa_page_size,
       int64_t num_verify_tokens,
-      int64_t state_slot_stride) {
+      int64_t state_slot_stride,
+      int64_t max_num_reqs) {
     using namespace host;
 
-    auto old_seq_dtype = SymbolicDType{};
-    auto cur_seq_dtype = SymbolicDType{};
-    auto old_req_dtype = SymbolicDType{};
-    auto cur_req_dtype = SymbolicDType{};
+    auto seq_dtype = SymbolicDType{};
+    auto req_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(old_seq_dtype).with_device(device).verify(old_seq_lens);
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(old_req_dtype).with_device(device).verify(old_req_pool_indices);
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(cur_seq_dtype).with_device(device).verify(cur_seq_lens);
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(cur_req_dtype).with_device(device).verify(cur_req_pool_indices);
+    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(seq_dtype).with_device(device).verify(cur_seq_lens);
+    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(cur_req_pool_indices);
     TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(req_to_token);
     TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(full_to_swa);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(pending_seq_lens);
     TensorMatcher({-1, kHeadDim * 3}).with_dtype<float>().with_device(device).verify(state);
 
-    if (old_bs <= 0 || cur_bs <= 0) return;
+    if (cur_bs <= 0) return;
     RuntimeCheck(num_verify_tokens > 0 && num_verify_tokens <= 8, "unsupported num_verify_tokens=", num_verify_tokens);
     RuntimeCheck(state_slot_stride > 0, "state_slot_stride must be positive");
-    RuntimeCheck(old_bs <= old_seq_lens.shape()[0], "old_bs exceeds old_seq_lens rows");
-    RuntimeCheck(old_bs <= old_req_pool_indices.shape()[0], "old_bs exceeds old_req rows");
-    RuntimeCheck(cur_bs <= cur_seq_lens.shape()[0], "cur_bs exceeds cur_seq_lens rows");
-    RuntimeCheck(cur_bs <= cur_req_pool_indices.shape()[0], "cur_bs exceeds cur_req rows");
+    RuntimeCheck(cur_bs <= cur_seq_lens.shape()[0], "cur_bs exceeds seq_lens rows");
+    RuntimeCheck(cur_bs <= cur_req_pool_indices.shape()[0], "cur_bs exceeds req rows");
+    RuntimeCheck(max_num_reqs <= pending_seq_lens.shape()[0], "max_num_reqs exceeds pending rows");
 
-#define DISPATCH_CUR_SEQ(OLD_SEQ_T, OLD_REQ_T)                                                             \
-  if (cur_seq_dtype.is_type<int32_t>()) {                                                                   \
-    if (cur_req_dtype.is_type<int32_t>()) {                                                                 \
-      launch<OLD_SEQ_T, int32_t, OLD_REQ_T, int32_t>(                                                       \
-          old_seq_lens, old_req_pool_indices, cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, \
-          state, old_bs, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, device.unwrap());      \
-    } else {                                                                                                \
-      launch<OLD_SEQ_T, int32_t, OLD_REQ_T, int64_t>(                                                       \
-          old_seq_lens, old_req_pool_indices, cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, \
-          state, old_bs, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, device.unwrap());      \
-    }                                                                                                       \
-  } else {                                                                                                  \
-    if (cur_req_dtype.is_type<int32_t>()) {                                                                 \
-      launch<OLD_SEQ_T, int64_t, OLD_REQ_T, int32_t>(                                                       \
-          old_seq_lens, old_req_pool_indices, cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, \
-          state, old_bs, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, device.unwrap());      \
-    } else {                                                                                                \
-      launch<OLD_SEQ_T, int64_t, OLD_REQ_T, int64_t>(                                                       \
-          old_seq_lens, old_req_pool_indices, cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, \
-          state, old_bs, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, device.unwrap());      \
-    }                                                                                                       \
-  }
-
-    if (old_seq_dtype.is_type<int32_t>()) {
-      if (old_req_dtype.is_type<int32_t>()) {
-        DISPATCH_CUR_SEQ(int32_t, int32_t)
+    if (seq_dtype.is_type<int32_t>()) {
+      if (req_dtype.is_type<int32_t>()) {
+        launch<int32_t, int32_t>(
+            cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, pending_seq_lens,
+            state, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       } else {
-        DISPATCH_CUR_SEQ(int32_t, int64_t)
+        launch<int32_t, int64_t>(
+            cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, pending_seq_lens,
+            state, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       }
     } else {
-      if (old_req_dtype.is_type<int32_t>()) {
-        DISPATCH_CUR_SEQ(int64_t, int32_t)
+      if (req_dtype.is_type<int32_t>()) {
+        launch<int64_t, int32_t>(
+            cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, pending_seq_lens,
+            state, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       } else {
-        DISPATCH_CUR_SEQ(int64_t, int64_t)
+        launch<int64_t, int64_t>(
+            cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, pending_seq_lens,
+            state, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       }
     }
-#undef DISPATCH_CUR_SEQ
+  }
+};
+
+template <int64_t kHeadDim>
+struct OnlineC128MTPClearPendingKernel {
+  template <typename TReq>
+  static void launch(
+      tvm::ffi::TensorView req_pool_indices,
+      tvm::ffi::TensorView pending_seq_lens,
+      int64_t bs,
+      DLDevice device) {
+    using namespace host;
+
+    const auto params = OnlineC128MTPClearPendingParams<TReq>{
+        .req_pool_indices = static_cast<const TReq*>(req_pool_indices.data_ptr()),
+        .pending_seq_lens = static_cast<int64_t*>(pending_seq_lens.data_ptr()),
+        .bs = bs,
+    };
+
+    constexpr uint32_t kThreads = 256;
+    const uint32_t blocks = host::div_ceil(static_cast<uint32_t>(bs), kThreads);
+    LaunchKernel(blocks, kThreads, device)(online_c128_mtp_clear_pending_kernel<TReq>, params);
+  }
+
+  static void run(
+      tvm::ffi::TensorView req_pool_indices,
+      tvm::ffi::TensorView pending_seq_lens,
+      int64_t bs) {
+    using namespace host;
+
+    auto req_dtype = SymbolicDType{};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(req_pool_indices);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(pending_seq_lens);
+    if (bs <= 0) return;
+    RuntimeCheck(bs <= req_pool_indices.shape()[0], "bs exceeds req rows");
+
+    if (req_dtype.is_type<int32_t>()) {
+      launch<int32_t>(req_pool_indices, pending_seq_lens, bs, device.unwrap());
+    } else {
+      launch<int64_t>(req_pool_indices, pending_seq_lens, bs, device.unwrap());
+    }
   }
 };
 
