@@ -252,7 +252,6 @@ def create_paged_compressor_data(
     num_q_tokens: Optional[int] = None,
     online_state_slot_offset: int = 0,
 ) -> FusedCompressMetadata:
-    del online_state_slot_offset
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
     # assert ring_size % compress_ratio == 0
