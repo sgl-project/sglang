@@ -639,6 +639,8 @@ class MooncakeKVManager(CommonKVManager):
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                if len(prefill_index) == 0 or len(decode_index) == 0:
+                    continue
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
@@ -1159,6 +1161,7 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1358,10 +1361,38 @@ class MooncakeKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                # fail only this request; never kill the worker (a dead worker stalls all transfers -> 300s timeouts)
+                failed_room = getattr(kv_chunk, "room", None)
+                logger.error(
+                    f"transfer_worker error (room={failed_room}, "
+                    f"bootstrap_port={self.bootstrap_port}): {e}",
+                    exc_info=True,
                 )
+                # don't flip an already-concluded Success to Failed; .get tolerates a raced clear()
+                current_status = self.request_status.get(failed_room)
+                if current_status is not None and current_status != KVPoll.Success:
+                    self.record_failure(failed_room, f"transfer_worker exception: {e}")
+                    self.update_status(failed_room, KVPoll.Failed)
+                    # notify decode so it fails fast instead of waiting its own timeout
+                    prefill_rank = (
+                        self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                        + self.pp_rank * self.attn_cp_size
+                        + self.attn_cp_rank
+                    )
+                    for info in list(self.transfer_infos.get(failed_room, {}).values()):
+                        if info.is_dummy:
+                            continue
+                        try:
+                            self.sync_status_to_decode_endpoint(
+                                info.endpoint,
+                                info.dst_port,
+                                failed_room,
+                                KVPoll.Failed,
+                                prefill_rank,
+                            )
+                        except Exception:
+                            pass
+                continue
 
     def start_prefill_thread(self):
         def bootstrap_thread():
