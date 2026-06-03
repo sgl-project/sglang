@@ -554,7 +554,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
             if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.warning(
+                logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
             elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
