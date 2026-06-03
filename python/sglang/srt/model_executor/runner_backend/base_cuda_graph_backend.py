@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import torch
 
@@ -31,10 +31,12 @@ class BaseCudaGraphBackend(ABC):
     """Capture/replay protocol for one cuda-graph backend.
 
     Lifecycle:
-        1. ``__init__(cuda_graph_runner, ...)`` — backend allocates its
-           captured artifact tables and binds runner-derived handles
-           (``device_module``, ``tp_group``). Subclasses do additional
-           per-backend setup (memory saver, torch.compile, …) here.
+        1. ``__init__(cuda_graph_runner, ...)`` — base binds the
+           runner-derived handles every backend needs
+           (``device_module``, ``tp_group``, ``pool``,
+           ``capture_stream``). Subclasses add their own per-backend
+           setup (the per-shape ``_graphs`` / ``_outputs`` tables,
+           memory saver, torch.compile, …) on top.
         2. ``capture_session(stream)`` — context wrapping the runner's
            outer capture loop. Backend binds the stream/pool here and
            opens any per-backend "we are capturing now" flags.
@@ -51,25 +53,24 @@ class BaseCudaGraphBackend(ABC):
            code. Sets per-backend global flags so model code takes the
            static-buffer / fixed-shape path.
         6. ``can_run(forward_batch, shape_key)`` — "can this backend
-           replay for this batch at this shape?" Default: yes iff
-           ``capture_one`` has produced a graph for ``shape_key``.
-           Subclasses can override to AND in backend-specific
-           eligibility (page-size constraints, sparsity caps, …).
+           replay for this batch at this shape?" Backends that maintain
+           a per-shape ``_graphs`` table answer this with shape
+           membership; TcPiecewise answers it as "always yes"
+           (torch.compile manages its own cache). Subclasses can also
+           AND in backend-specific eligibility (page-size constraints,
+           sparsity caps, …).
         7. ``cleanup()`` — release pool, drop captured artifacts.
     """
 
     def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
-        self._graphs: Dict[Any, Any] = {}
-        self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
 
+    @abstractmethod
     def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
-        """Can this backend replay for the given shape? Default: yes iff
-        ``capture_one`` has produced a graph for ``shape_key``."""
-        return shape_key in self._graphs
+        """Can this backend replay for the given shape?"""
 
     @abstractmethod
     @contextmanager

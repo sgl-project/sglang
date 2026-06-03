@@ -16,7 +16,7 @@ from __future__ import annotations
 import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
@@ -54,6 +54,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
     ) -> None:
         super().__init__(cuda_graph_runner)
+        self._graphs: Dict[Any, Any] = {}
+        self._outputs: Dict[Any, Any] = {}
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -61,6 +63,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
+
+    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+        return shape_key in self._graphs
 
     @contextmanager
     def capture_session(self, stream):
