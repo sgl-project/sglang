@@ -34,10 +34,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Floor priority (just above the root's -sys.maxsize) for KV inserted by a
-# radix-native session (req.session_id set). Session KV must be the FIRST thing
-# reclaimed under pressure, so the pool cannot wedge even though nothing is
-# pinned. Effective under `--radix-eviction-policy priority`; inert under lru.
+# Floor priority for session-radix-cache KV: evicted first under pressure so the
+# pool cannot wedge. Effective under `--radix-eviction-policy priority`.
 RADIX_NATIVE_SESSION_PRIORITY = -(sys.maxsize - 1)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -225,10 +223,8 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
-        # Radix-native session tag: the session_id whose request last extended
-        # this node to a leaf. release_session(id) seeds from these leaves and
-        # frees the session's unique leaf-to-branch chain (shared prefixes are
-        # branch points and are preserved). None for ordinary cache nodes.
+        # Session tag: the session_id whose request last extended this node to a
+        # leaf. release_session(id) seeds from these leaves. None for plain nodes.
         self.session_id: Optional[str] = None
 
         self.id = TreeNode.counter if id is None else id
@@ -297,13 +293,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
         self.evictable_leaves = set()
-        # Per-session leaf index for radix-native sessions: session_id -> set of
-        # nodes its requests tagged as leaves. release_session seeds from this so
-        # a close is O(session) instead of O(all tree leaves).
+        # session_id -> set of leaf nodes it tagged. Lets release_session be
+        # O(session) instead of scanning all tree leaves.
         self._session_leaves: Dict[str, set] = {}
-        # Deferred-release stack: close() enqueues a session's leaf seeds here and
-        # drain_pending_release() frees them a bounded number of nodes per
-        # scheduler iteration, so a close never blocks (no synchronous free spike).
+        # Leaf seeds queued by release_session, freed a bounded number per
+        # scheduler iteration by drain_pending_release (close never blocks).
         self._pending_release: list = []
         self.reset()
 
@@ -556,26 +550,20 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self._tag_session_leaf(req, radix_key, node=new_last_node)
 
     def _radix_node_priority(self, req: Req) -> int:
-        """Eviction priority for the radix node a request inserts. Radix-native
-        session KV gets the floor so it is reclaimed before general prefix cache;
-        everything else keeps the request's own priority. This only sets NODE
-        priority -- it does not touch req.priority (which drives scheduling)."""
+        """Node insert priority: session KV gets the floor (reclaimed first);
+        others keep req.priority. Sets NODE priority only, not req.priority."""
         if getattr(req, "session_id", None) is not None:
             return RADIX_NATIVE_SESSION_PRIORITY
         return getattr(req, "priority", 0) or 0
 
     def register_session(self, session_id: str) -> None:
-        """Start tracking a radix-native session's leaves. Called at session open;
-        release_session pops the entry. _tag_session_leaf only records leaves for
-        registered sessions, so a request that finishes AFTER its session closed
-        cannot re-create a dangling entry (no leak)."""
+        """Track a session's leaves from open. Only registered sessions are
+        tagged, so a request finishing after close can't re-create the entry."""
         self._session_leaves.setdefault(session_id, set())
 
     def _tag_session_leaf(self, req: Req, radix_key, node=None) -> None:
-        """Tag the leaf node for this request's full key with its session_id, so
-        release_session can later free the session's unique chain. No-op for
-        non-session requests, and for sessions no longer registered (closed).
-        The tag rides req.session_id directly -- no Session object is involved."""
+        """Tag this request's leaf node with its session_id for release_session.
+        No-op for non-session requests and for closed (unregistered) sessions."""
         sid = getattr(req, "session_id", None)
         if sid is None or sid not in self._session_leaves:
             return
@@ -586,15 +574,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._session_leaves[sid].add(node)
 
     def release_session(self, session_id: str) -> int:
-        """Queue a radix-native session's KV for deferred release at close. The
-        actual free is done by drain_pending_release() a few nodes at a time on
-        the scheduler's idle path, so close never causes a synchronous free spike.
-
-        Enqueues only the session's own tagged leaves (O(session), from the leaf
-        registry -- not a scan of all tree leaves). Each seed starts a free of the
-        session's unique leaf->branch chain; shared prefixes are branch points and
-        are preserved. Floor-priority eviction is the live-pressure backstop, so a
-        not-yet-drained session can still be reclaimed under load."""
+        """Queue a session's tagged leaves for deferred free (drained by
+        drain_pending_release). Each seed frees the session's unique leaf->branch
+        chain; shared prefixes are branch points and are preserved."""
         registered = self._session_leaves.pop(session_id, None)
         if not registered:
             return 0
@@ -605,11 +587,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         return len(seeds)
 
     def drain_pending_release(self, max_nodes: int = 64) -> int:
-        """Free up to ``max_nodes`` queued radix-native session nodes. Called once
-        per scheduler iteration so deferred releases never block: a large session
-        is spread across iterations. `node not in self.evictable_leaves` is the
-        liveness guard -- a node already reclaimed by normal eviction (which
-        removes it from evictable_leaves) is skipped, so there is no double free."""
+        """Free up to ``max_nodes`` queued session nodes per call so a close never
+        blocks. `node not in evictable_leaves` guards against double-free of a node
+        already reclaimed by normal eviction."""
         freed_nodes = 0
         while self._pending_release and freed_nodes < max_nodes:
             node = self._pending_release[-1]
