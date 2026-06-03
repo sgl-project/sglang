@@ -174,7 +174,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self.is_gemma4 = (
             hasattr(self.tokenizer_manager.model_config, "hf_config")
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
+            and self.tokenizer_manager.model_config.hf_config.model_type
+            in ("gemma4", "gemma4_unified")
         )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
@@ -505,6 +506,8 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        require_reasoning = self._get_reasoning_from_request(request)
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -528,7 +531,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
-            require_reasoning=self._get_reasoning_from_request(request),
+            require_reasoning=require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
@@ -556,7 +559,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
         xgrammar_reasoning = thinking_mode and (
-            self.tokenizer_manager.server_args.reasoning_parser is not None
+            self.tokenizer_manager.server_args.reasoning_parser is None
         )
         tool_call_constraint = None
 
