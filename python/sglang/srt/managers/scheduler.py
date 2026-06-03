@@ -123,6 +123,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
+    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -3836,13 +3837,30 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        output = self.session_controller.open(recv_req)
+        if _radix_native_enabled():
+            # Radix-native session: no Session object, no lifecycle state, no
+            # timeout. A session is just a tag namespace over evictable radix KV.
+            # "Open" only registers the id so the cache can group this session's
+            # leaves; the data path tags req.session_id and floor-prices its KV.
+            session_id = recv_req.session_id
+            register = getattr(self.tree_cache, "register_session", None)
+            if register is not None and session_id is not None:
+                register(session_id)
+            output = OpenSessionReqOutput(session_id, session_id is not None)
+        else:
+            output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        self.session_controller.close(recv_req)
+        if _radix_native_enabled():
+            # "Close" is purely an eviction trigger: drop the session's tagged KV
+            # from the radix cache (deferred/bounded via drain_pending_release).
+            # No Session to tear down, nothing to defer on in-flight slots.
+            self.tree_cache.release_session(recv_req.session_id)
+        else:
+            self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
