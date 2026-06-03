@@ -65,7 +65,7 @@ FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-triton
     GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        v3.5.1
+    GIT_TAG        v3.6.0
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-triton)
@@ -258,6 +258,7 @@ set(SOURCES
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
+    "csrc/elementwise/dsv4_norm_rope.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"

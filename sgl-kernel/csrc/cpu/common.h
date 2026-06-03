@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
 
 #if defined(_OPENMP)
@@ -43,6 +44,14 @@ namespace {
       }                                                                  \
     }                                                                    \
   }()
+
+// Half + BFloat16, plus one extra scalar type
+#define AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, ...) \
+  AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES(__VA_ARGS__)               \
+  AT_DISPATCH_CASE(SCALARTYPE, __VA_ARGS__)
+
+#define AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES_AND(SCALARTYPE, __VA_ARGS__))
 
 // dispatch: bfloat16, float16, int8_t, fp8_e4m3, uint8_t(mxfp4/int4)
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
@@ -339,6 +348,13 @@ inline int get_cache_blocks(int chunk_size) {
 template <>
 inline int get_cache_blocks<at::Float8_e4m3fn>(int chunk_size) {
   // fp8 uses bf16 as accumulate type
+  int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
+  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
+}
+
+template <>
+inline int get_cache_blocks<uint8_t>(int chunk_size) {
+  // mxfp4 uses bf16 as accumulate type
   int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
   return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
 }

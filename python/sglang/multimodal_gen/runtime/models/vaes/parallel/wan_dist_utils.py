@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     WanRMS_norm,
     WanUpsample,
     attention_block_forward,
+    match_conv3d_input_format,
     mid_block_forward,
     resample_forward,
     residual_block_forward,
@@ -91,10 +92,21 @@ def split_for_parallel_decode(
     return x, expected_height
 
 
+def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
+    if (
+        x.dim() == 5
+        and hasattr(torch, "channels_last_3d")
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+        and not x.is_contiguous()
+    ):
+        return x.contiguous()
+    return x
+
+
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
     if expected_height is None:
         return x
-    x = get_sp_group().all_gather(x, dim=-2)
+    x = get_sp_group().all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
     if x.shape[-2] != expected_height:
         x = x[..., :expected_height, :].contiguous()
     return x
@@ -190,23 +202,24 @@ class WanDistConv2d(nn.Conv2d):
 
         self.padding: tuple[int, int]
         if self.height_halo_size > 0:
-            self._padding = (self.padding[1], self.padding[1], 0, 0)
+            self._padding = (0, 0, 0, 0)
         else:
             self._padding = (
-                self.padding[1],
-                self.padding[1],
+                0,
+                0,
                 self.padding[0],
                 self.padding[0],
             )
 
-        self.padding = (0, 0)
+        self.padding = (0, self.padding[1])
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
         self.rank = get_sp_parallel_rank()
         self.world_size = get_sp_world_size()
 
     def forward(self, x):
-        x = F.pad(x, self._padding)
+        if any(self._padding):
+            x = F.pad(x, self._padding)
 
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
             x,
@@ -323,6 +336,7 @@ class WanDistCausalConv3d(nn.Conv3d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
+        x_padded = match_conv3d_input_format(x_padded, self.weight)
         out = super().forward(x_padded)
 
         if self.height_halo_size == 0:
@@ -484,7 +498,7 @@ class WanDistAttentionBlock(nn.Module):
 
     def forward(self, x):
         if self.world_size > 1:
-            x = self.sp_group.all_gather(x, dim=-2)
+            x = self.sp_group.all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
             x = x.contiguous()
         x = attention_block_forward(self, x)
         if self.world_size > 1:
