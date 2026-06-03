@@ -7,28 +7,28 @@
     deliveryFpsAlphaUp: 0.08,
     deliveryFpsAlphaDown: 0.55,
     targetLeadChunkRatio: 1.5,
-    minTargetLeadMs: 700,
-    maxTargetLeadMs: 1500,
-    maxLeadExtraChunkRatio: 5.0,
+    minTargetLeadMs: 1500,
+    maxTargetLeadMs: 2600,
+    maxLeadExtraChunkRatio: 8.0,
     startLeadChunkRatio: 1.85,
-    minStartLeadMs: 900,
-    resumeLeadChunkRatio: 0.8,
-    minResumeLeadMs: 300,
-    maxResumeLeadMs: 800,
+    minStartLeadMs: 1700,
+    resumeLeadChunkRatio: 2.5,
+    minResumeLeadMs: 1000,
+    maxResumeLeadMs: 1800,
     rebufferLeadBoostMs: 250,
     rebufferLeadBoostDecayMsPerSecond: 120,
     deliveryLeadBoostDecayMsPerSecond: 80,
-    maxDeliveryLeadBoostMs: 1200,
+    maxDeliveryLeadBoostMs: 2000,
     deliveryStallExpectedMultiplier: 1.25,
     receiveStallPlaybackRateMin: 0.65,
     receiveStallPlaybackRateSlewPerSecond: 0.5,
     lowWaterRatio: 0.4,
-    playbackRateGain: 0.1,
+    playbackRateGain: 0.14,
     playbackRateMin: 0.92,
-    playbackRateMax: 1.04,
+    playbackRateMax: 1.08,
     emergencyPlaybackRateMin: 0.9,
-    emergencyPlaybackRateMax: 1.08,
-    playbackRateSlewPerSecond: 0.05,
+    emergencyPlaybackRateMax: 1.12,
+    playbackRateSlewPerSecond: 0.08,
     eventCutoverMaxMs: 420,
     eventCutoverMaxFrames: 10,
     settleEventCutoverMaxMs: 720,
@@ -191,6 +191,17 @@
       const bufferMs = this.bufferDurationMs;
       if (
         hasPendingInput &&
+        this.receiveStalled &&
+        this.renderedFrames &&
+        bufferMs < this.targetLeadMs
+      ) {
+        this.buffering = true;
+        this.lastDrawAt = 0;
+        return { action: "hold", droppedFrames, snapshot: this.snapshot() };
+      }
+
+      if (
+        hasPendingInput &&
         this.buffering &&
         bufferMs < (this.renderedFrames ? this.#resumeLeadMs() : this.#startLeadMs())
       ) {
@@ -290,7 +301,7 @@
         this.hasServerSample = true;
       }
       const effectiveFps = this.hasServerSample
-        ? (this.hasDeliverySample ? Math.min(this.serverFps, this.deliveryFps) : this.serverFps)
+        ? this.serverFps
         : (this.hasDeliverySample ? this.deliveryFps : this.targetFps);
       this.sourceFps = clamp(effectiveFps, this.config.minSourceFps, this.targetFps);
       if (!isDelivery || !this.hasServerSample) {
@@ -408,7 +419,7 @@
       this.renderFps = clamp(
         this.sourceFps * this.playbackRate,
         this.config.minSourceFps,
-        this.targetFps,
+        this.targetFps * this.config.emergencyPlaybackRateMax,
       );
     }
 

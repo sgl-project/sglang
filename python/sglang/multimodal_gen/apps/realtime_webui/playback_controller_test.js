@@ -68,7 +68,7 @@ function slowServerCapsRenderFps() {
 function backlogDropsContiguousOldFrames() {
   const controller = new RealtimePlaybackController({ targetFps: 25 });
   let now = 100;
-  for (let chunk = 0; chunk < 10; chunk += 1) {
+  for (let chunk = 0; chunk < 13; chunk += 1) {
     enqueueChunk(controller, { chunk, now, durationMs: 480 });
     now += 20;
   }
