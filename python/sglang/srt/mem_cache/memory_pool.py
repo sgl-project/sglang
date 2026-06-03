@@ -11,11 +11,7 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-"""
 
-from __future__ import annotations
-
-"""
 Memory pool.
 
 SGLang has two levels of memory pool.
@@ -23,6 +19,8 @@ ReqToTokenPool maps a request to its token locations.
 TokenToKVPoolAllocator manages the indices to kv cache data.
 KVCache actually holds the physical kv cache.
 """
+
+from __future__ import annotations
 
 import abc
 import dataclasses
@@ -33,8 +31,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -48,6 +44,9 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.triton_ops.cache_move import (
+    copy_all_layer_kv_cache_tiled,
+)
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -610,11 +609,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
         assert len(select_index) == len(
             mamba_indices
-        ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
             assert len(select_index) == len(
                 mamba_ping_pong_track_buffers
-            ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -795,7 +794,6 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
-
     def __init__(
         self,
         size: int,
@@ -1257,7 +1255,6 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1434,7 +1431,6 @@ class HybridLinearKVPool(KVCache):
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
-
             TokenToKVPoolClass = MHATokenToKVPool
 
             if current_platform.is_out_of_tree():
@@ -1457,7 +1453,6 @@ class HybridLinearKVPool(KVCache):
                 enable_memory_saver=enable_memory_saver,
             )
         else:
-
             TokenToKVPoolClass = MLATokenToKVPool
 
             if current_platform.is_out_of_tree():
@@ -1543,7 +1538,6 @@ class HybridLinearKVPool(KVCache):
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
-
         @contextmanager
         def _patch_layer_id(layer):
             original_layer_id = layer.layer_id
@@ -1863,7 +1857,6 @@ class MLATokenToKVPool(KVCache):
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
-
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -2012,7 +2005,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
     ):
-
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
@@ -2232,39 +2224,3 @@ def move_kv_cache_native(
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
-
-
-@triton.jit
-def copy_all_layer_kv_cache_tiled(
-    data_ptrs,
-    strides,
-    tgt_loc_ptr,
-    src_loc_ptr,
-    num_locs,
-    num_locs_upper: tl.constexpr,
-    BYTES_PER_TILE: tl.constexpr,
-):
-    """2D tiled kernel. Safe for in-place copy."""
-    bid = tl.program_id(0)
-    tid = tl.program_id(1)
-
-    stride = tl.load(strides + bid)
-    base_ptr = tl.load(data_ptrs + bid)
-    base_ptr = tl.cast(base_ptr, tl.pointer_type(tl.uint8))
-
-    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
-    mask_byte = byte_off < stride
-    tl.multiple_of(byte_off, 16)
-
-    loc_idx = tl.arange(0, num_locs_upper)
-    mask_loc = loc_idx < num_locs
-
-    src = tl.load(src_loc_ptr + loc_idx, mask=mask_loc, other=0)
-    tgt = tl.load(tgt_loc_ptr + loc_idx, mask=mask_loc, other=0)
-
-    src_ptr = base_ptr + src[:, None] * stride + byte_off[None, :]
-    tgt_ptr = base_ptr + tgt[:, None] * stride + byte_off[None, :]
-
-    mask = mask_loc[:, None] & mask_byte[None, :]
-    vals = tl.load(src_ptr, mask=mask)
-    tl.store(tgt_ptr, vals, mask=mask)
