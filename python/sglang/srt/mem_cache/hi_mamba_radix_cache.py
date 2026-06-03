@@ -1494,21 +1494,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)
-                mp = cc.mem_pool_host
-                n = host_indices.numel()
-                logger.debug(
-                    "[HiCachePrefetchHostMem] host_mem_release_before_free num_indices=%s pool_size=%s available_size=%s",
-                    n,
-                    mp.size,
-                    mp.available_size(),
-                )
                 cc.mem_pool_host.free(host_indices)
-                logger.debug(
-                    "[HiCachePrefetchHostMem] host_mem_release_after_free num_indices=%s pool_size=%s available_size=%s",
-                    n,
-                    mp.size,
-                    mp.available_size(),
-                )
 
         _drain_revoke()
         _drain_backup()
@@ -1723,28 +1709,11 @@ class HiMambaRadixCache(MambaRadixCache):
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
-        if not self.enable_storage:
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d reason=storage_disabled",
-                req_id,
-                prefetch_length,
-            )
-            return
-        if prefetch_length < self.prefetch_threshold:
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d threshold=%d "
-                "reason=below_threshold",
-                req_id,
-                prefetch_length,
-                self.prefetch_threshold,
-            )
-            return
-        if self.cache_controller.prefetch_rate_limited():
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d reason=rate_limited",
-                req_id,
-                prefetch_length,
-            )
+        if (
+            not self.enable_storage
+            or prefetch_length < self.prefetch_threshold
+            or self.cache_controller.prefetch_rate_limited()
+        ):
             return
 
         self._protect_host_node(last_host_node, protect_mamba=False)
@@ -1757,12 +1726,6 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         if host_indices is None:
             self._release_host_node(last_host_node, release_mamba=False)
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d "
-                "reason=host_mem_unavailable",
-                req_id,
-                prefetch_length,
-            )
             return
 
         # Allocate host mamba slot
@@ -1770,12 +1733,6 @@ class HiMambaRadixCache(MambaRadixCache):
         if extra_pools is None:
             self.cache_controller.mem_pool_host.free(host_indices)
             self._release_host_node(last_host_node, release_mamba=False)
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d "
-                "reason=mamba_pool_unavailable",
-                req_id,
-                prefetch_length,
-            )
             return
 
         # mamba is also being loaded, protect host mamba as well
@@ -1783,14 +1740,6 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.mamba_host_lru_list.in_list(last_host_node):
             self.mamba_host_lru_list.remove_node(last_host_node)
 
-        logger.debug(
-            "[prefetch_from_storage] started rid=%s tokens=%d prefetch_length=%d "
-            "last_host_node_id=%s",
-            req_id,
-            len(new_input_tokens),
-            prefetch_length,
-            last_host_node.id,
-        )
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,

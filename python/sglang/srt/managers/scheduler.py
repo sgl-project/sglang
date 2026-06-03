@@ -2017,30 +2017,12 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                logger.debug(
-                    "[prefetch_kvcache] submit rid=%s matched_len=%d new_tokens=%d "
-                    "last_host_node_id=%s backuped=%s pass_prefix_keys=%s",
-                    req.rid,
-                    matched_len,
-                    len(new_input_tokens),
-                    last_host_node.id,
-                    last_host_node.backuped,
-                    self.tree_cache.hicache_storage_pass_prefix_keys,
-                )
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
-                )
-            else:
-                logger.debug(
-                    "[prefetch_kvcache] skip rid=%s last_host_node_id=%s backuped=%s "
-                    "(eligible only when backuped or root)",
-                    req.rid,
-                    last_host_node.id,
-                    last_host_node.backuped,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):

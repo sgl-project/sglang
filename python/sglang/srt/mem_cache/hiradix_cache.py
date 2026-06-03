@@ -16,9 +16,6 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.managers.cache_controller import (
     HiCacheController,
     PrefetchOperation,
-    hicache_debug_enabled,
-    log_hicache_debug,
-    radix_evict_host_leaf_context,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -530,22 +527,7 @@ class HiRadixCache(RadixCache):
                 host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)
-                mp = cc.mem_pool_host
-                n = host_indices.numel()
-                avail_before = mp.available_size()
-                log_hicache_debug(
-                    "[HiCachePrefetchHostMem] host_mem_release_before_free num_indices=%s pool_size=%s available_size=%s",
-                    n,
-                    mp.size,
-                    avail_before,
-                )
                 cc.mem_pool_host.free(host_indices)
-                log_hicache_debug(
-                    "[HiCachePrefetchHostMem] host_mem_release_after_free num_indices=%s pool_size=%s available_size=%s",
-                    n,
-                    mp.size,
-                    mp.available_size(),
-                )
 
         _drain_revoke()
         _drain_backup()
@@ -867,156 +849,20 @@ class HiRadixCache(RadixCache):
             node = node.parent
         return DecLockRefResult(delta=delta)
 
-    def _host_leaf_node_snapshot(self, node: TreeNode) -> str:
-        return (
-            f"id={node.id} evicted={node.evicted} backuped={node.backuped} "
-            f"lock_ref={node.lock_ref} host_ref_counter={node.host_ref_counter} "
-            f"in_evictable_host_leaves={node in self.evictable_host_leaves}"
-        )
-
-    def _host_leaf_children_trace(self, node: TreeNode, max_children: int = 16) -> str:
-        if not node.children:
-            return "children=[]"
-        parts: List[str] = []
-        for i, ch in enumerate(node.children.values()):
-            if i >= max_children:
-                parts.append(f"...(+{len(node.children) - max_children} more)")
-                break
-            parts.append(
-                f"(id={ch.id},evicted={ch.evicted},backuped={ch.backuped},"
-                f"lock_ref={ch.lock_ref},host_ref_counter={ch.host_ref_counter})"
-            )
-        return "children=[" + ",".join(parts) + "]"
-
-    def _trace_host_leaf_node(
-        self,
-        *,
-        caller: str,
-        phase: str,
-        node: TreeNode,
-        reason: Optional[str] = None,
-        mutation: Optional[str] = None,
-    ) -> None:
-        if not hicache_debug_enabled():
-            return
-        rs = reason if reason is not None else "-"
-        mut = mutation if mutation is not None else "-"
-        logger.debug(
-            "[HiCacheHostLeafDebug] caller=%s phase=%s {%s} %s reason=%s mutation=%s "
-            "evictable_host_leaves_size=%s",
-            caller,
-            phase,
-            self._host_leaf_node_snapshot(node),
-            self._host_leaf_children_trace(node),
-            rs,
-            mut,
-            len(self.evictable_host_leaves),
-        )
-
-    def _log_prefetch_from_storage_abort_root_diag(
-        self,
-        *,
-        phase: str,
-        req_id: str,
-        evict_host_attempted: bool,
-    ) -> None:
-        if not hicache_debug_enabled():
-            return
-        ev_sz = len(self.evictable_host_leaves)
-        root_child_total = len(self.root_node.children)
-        if ev_sz == 0:
-            hot_cnt = sum(
-                1
-                for c in self.root_node.children.values()
-                if c.backuped and not c.evicted
-            )
-            hot_display = str(hot_cnt)
-            diag_note = (
-                "root_children_hot_backuped_count_only_when_evictable_host_leaves_empty"
-            )
-        else:
-            hot_display = "n/a"
-            diag_note = (
-                "skip_root_children_hot_backuped_count_evictable_host_leaves_nonempty"
-            )
-        logger.debug(
-            "[HiCachePrefetchAbortDebug] phase=%s req_id=%s evict_host_attempted=%s "
-            "evictable_host_leaves=%s root_children_total=%s root_children_backuped_T_evicted_F=%s diag=%s",
-            phase,
-            req_id,
-            evict_host_attempted,
-            ev_sz,
-            root_child_total,
-            hot_display,
-            diag_note,
-        )
-
     def _update_host_leaf_status(self, node: TreeNode):
-        self._trace_host_leaf_node(
-            caller="_update_host_leaf_status",
-            phase="entry",
-            node=node,
-            mutation="observe",
-        )
         if not node.evicted or node.lock_ref > 0:
-            parts: List[str] = []
-            if not node.evicted:
-                parts.append("not_evicted_still_has_device_kv")
-            if node.lock_ref > 0:
-                parts.append("lock_ref_protects_hot_path")
-            reason = "|".join(parts) if parts else "ambiguous"
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
-                mutation = "removed_from_evictable_host_leaves_was_member"
-            else:
-                mutation = "not_eligible_already_absent"
-            self._trace_host_leaf_node(
-                caller="_update_host_leaf_status",
-                phase="withdraw_not_candidate",
-                node=node,
-                reason=reason,
-                mutation=mutation,
-            )
             return
 
         for child in node.children.values():
             if child.backuped:
-                blocked_id = child.id
-                reason = (
-                    f"blocked_by_backuped_child child_id={blocked_id} "
-                    f"(child evicted={child.evicted})"
-                )
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
-                    mutation = "removed_from_evictable_host_leaves_child_still_backuped_under_subtree"
-                else:
-                    mutation = "cannot_enter_while_backuped_children_remain"
-                self._trace_host_leaf_node(
-                    caller="_update_host_leaf_status",
-                    phase="withdraw_blocked_by_backuped_child",
-                    node=node,
-                    reason=reason,
-                    mutation=mutation,
-                )
                 return
 
-        inserted = node not in self.evictable_host_leaves
-        if inserted:
+        if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
-            mutation = "inserted_into_evictable_host_leaves"
-        else:
-            mutation = "unchanged_already_in_evictable_host_leaves"
-        reason = (
-            "eligible_gpu_evicted_on_host subtree_has_no_backuped_children "
-            "and_no_lock_ref"
-        )
-        self._trace_host_leaf_node(
-            caller="_update_host_leaf_status",
-            phase="promote_evictable_host_leaf",
-            node=node,
-            reason=reason,
-            mutation=mutation,
-        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
@@ -1070,51 +916,15 @@ class HiRadixCache(RadixCache):
         # GPU -> CPU demotion: block moves from device to host.
         # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
         # The matching store(CPU) was emitted when write_backup() copied to host.
-        self._trace_host_leaf_node(
-            caller="_evict_backuped",
-            phase="pre_demote_gpu",
-            node=node,
-            reason=(
-                "before_device_free:not_in_evictable_host_leaves_typically "
-                "because_need_gpu_evicted_plus_host_backup_for_eligibility "
-                "(evicted=F until value cleared)"
-            ),
-            mutation="observe",
-        )
         self._record_remove_event(node, medium=StorageMedium.GPU)
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
-        self._trace_host_leaf_node(
-            caller="_evict_backuped",
-            phase="gpu_value_cleared_evicted=T",
-            node=node,
-            reason="node.value_cleared_gpu_tier_removed_device_indices_freed",
-            mutation="observe",
-        )
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
-        self._trace_host_leaf_node(
-            caller="_evict_backuped",
-            phase="after_host_leaf_updates_on_node",
-            node=node,
-            reason=(
-                "_update_leaf_status_and_update_host_leaf_status_applied;_see_above_traces "
-                "for_whether_promoted_into_evictable_host_leaves"
-            ),
-            mutation="observe",
-        )
-        parent = node.parent
-        self._trace_host_leaf_node(
-            caller="_evict_backuped",
-            phase="will_update_gpu_leaf_parent",
-            node=parent,
-            reason="parent_device_leaf_bookkeeping_after_child_gpu_demoted",
-            mutation="observe",
-        )
-        self._update_leaf_status(parent)
+        self._update_leaf_status(node.parent)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -1129,135 +939,38 @@ class HiRadixCache(RadixCache):
 
     def evict_host(self, num_tokens: int):
         leaves = list(self.evictable_host_leaves)
-        n_evictable = len(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
-        log_hicache_debug(
-            "[HiCacheHostEvict] evict_host_begin num_tokens_requested=%s evictable_host_leaves=%s heap_size=%s",
-            num_tokens,
-            n_evictable,
-            len(eviction_heap),
-        )
-
         num_evicted = 0
-        skip_hit_root_break = 0
-        skip_not_evicted = 0
-        skip_host_ref_blocked = 0
-        successful_kv_frees = 0
-
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
-            self._trace_host_leaf_node(
-                caller="evict_host",
-                phase="heap_pop",
-                node=x,
-                reason="candidate_from_prior_evictable_host_leaves_snapshot",
-                mutation="-",
-            )
             if x == self.root_node:
-                skip_hit_root_break += 1
-                self._trace_host_leaf_node(
-                    caller="evict_host",
-                    phase="break_hit_root",
-                    node=x,
-                    reason="root_not_valid_host_leaf_candidate",
-                    mutation="abort_evict_host_loop_break",
-                )
                 break
             # only evict the host value of evicted nodes
             if not x.evicted:
-                skip_not_evicted += 1
-                self._trace_host_leaf_node(
-                    caller="evict_host",
-                    phase="skip_still_hot_on_gpu",
-                    node=x,
-                    reason="not_evicted_device_value_present_not_eligible_host_cpu_trim",
-                    mutation="heap_continue",
-                )
                 continue
 
             if x.host_ref_counter > 0:
-                skip_host_ref_blocked += 1
-                self._trace_host_leaf_node(
-                    caller="evict_host",
-                    phase="skip_host_protected",
-                    node=x,
-                    reason="host_ref_counter_gt_0_protects_host_kv_even_if_gpu_demoted",
-                    mutation="heap_continue",
-                )
                 continue
 
-            self._trace_host_leaf_node(
-                caller="evict_host",
-                phase="execute_cpu_kv_release",
-                node=x,
-                reason=(
-                    f"eligible_evicted_gpu_none backuped={x.backuped} "
-                    f"host_ref_counter={x.host_ref_counter} will_detach_radix_leaf"
-                ),
-                mutation="calling_cache_controller.evict_host",
-            )
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
-            with radix_evict_host_leaf_context(len(self.evictable_host_leaves)):
-                num_evicted += self.cache_controller.evict_host(x.host_value)
-            successful_kv_frees += 1
+            num_evicted += self.cache_controller.evict_host(x.host_value)
 
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
             assert v == x, f"parent does not have child key, {key}"
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
-                leaf_mut = (
-                    "removed_from_evictable_host_leaves_explicit_after_detach_from_tree"
-                )
-            else:
-                leaf_mut = "unexpected_missing_from_evictable_host_leaves_during_explicit_evict_host"
-            self._trace_host_leaf_node(
-                caller="evict_host",
-                phase="detached_radix_leaf_after_controller_free",
-                node=x,
-                reason="radix_unlinked_child_cpu_buffers_released_above",
-                mutation=leaf_mut,
-            )
             self._update_host_leaf_status(x.parent)
-            self._trace_host_leaf_node(
-                caller="evict_host",
-                phase="after_parent_host_leaf_refresh",
-                node=x.parent,
-                mutation="observe",
-                reason=("may_promote_parent_if_no_backuped_children_remain_in_subtree"),
-            )
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
-
-        if num_evicted >= num_tokens:
-            exit_reason = "goal_met"
-        elif skip_hit_root_break > 0:
-            exit_reason = "hit_root"
-        else:
-            exit_reason = "heap_exhausted"
-
-        log_hicache_debug(
-            "[HiCacheHostEvict] evict_host_summary exit_reason=%s num_tokens_requested=%s "
-            "num_indices_freed_total=%s evictable_host_leaves_remain=%s successful_kv_node_frees=%s "
-            "skip_hit_root_break=%s skip_not_evicted=%s skip_host_ref_blocked=%s heap_remain_size=%s",
-            exit_reason,
-            num_tokens,
-            num_evicted,
-            len(self.evictable_host_leaves),
-            successful_kv_frees,
-            skip_hit_root_break,
-            skip_not_evicted,
-            skip_host_ref_blocked,
-            len(eviction_heap),
-        )
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -1337,46 +1050,16 @@ class HiRadixCache(RadixCache):
     ):
         last_node = params.best_match_node
         mem_quota = params.mem_quota
-        req = params.req
-        rid = getattr(req, "rid", None) if req is not None else None
-        logger.debug(
-            "[init_load_back] enter rid=%s host_hit_length=%d last_node_id=%s "
-            "evicted=%s backuped=%s mem_quota=%s load_back_threshold=%s",
-            rid,
-            params.host_hit_length,
-            last_node.id,
-            last_node.evicted,
-            getattr(last_node, "backuped", None),
-            mem_quota,
-            self.load_back_threshold,
-        )
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
                 logger.debug(
-                    "[init_load_back] loaded rid=%s tokens=%d last_node_id=%s",
-                    rid,
-                    len(loading_values),
-                    last_node.id,
+                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
                 return loading_values, last_node
 
-            start_id = last_node.id
             while last_node.evicted:
                 last_node = last_node.parent
-            logger.debug(
-                "[init_load_back] load_back returned None rid=%s start_node_id=%s "
-                "resolved_node_id=%s (walked ancestors while evicted)",
-                rid,
-                start_id,
-                last_node.id,
-            )
-        else:
-            logger.debug(
-                "[init_load_back] skip rid=%s last_node_id=%s not evicted",
-                rid,
-                last_node.id,
-            )
 
         return (
             self._empty_match_result.device_indices,
@@ -1592,117 +1275,28 @@ class HiRadixCache(RadixCache):
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         if not self.enable_storage:
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d reason=storage_disabled",
-                req_id,
-                prefetch_length,
-            )
             return
         if prefetch_length < self.prefetch_threshold:
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d threshold=%d "
-                "reason=below_threshold",
-                req_id,
-                prefetch_length,
-                self.prefetch_threshold,
-            )
             return
         if self.cache_controller.prefetch_rate_limited():
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d reason=rate_limited",
-                req_id,
-                prefetch_length,
-            )
             return
 
-        mp = self.cache_controller.mem_pool_host
-        log_hicache_debug(
-            "[HiCachePrefetchHostMem] prefetch_from_storage_begin req_id=%s prefetch_length=%s pool_size=%s available_size=%s",
-            req_id,
-            prefetch_length,
-            mp.size,
-            mp.available_size(),
-        )
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        evict_host_for_prefetch = False
         if host_indices is None:
-            evict_host_for_prefetch = True
-            log_hicache_debug(
-                "[HiCachePrefetchHostMem] prefetch_alloc_failed_then_radix_evict_host req_id=%s prefetch_length=%s pool_size=%s available_size=%s",
-                req_id,
-                prefetch_length,
-                mp.size,
-                mp.available_size(),
-            )
             self.evict_host(prefetch_length)
-            log_hicache_debug(
-                "[HiCachePrefetchHostMem] prefetch_after_radix_evict_host req_id=%s pool_size=%s available_size=%s",
-                req_id,
-                mp.size,
-                mp.available_size(),
-            )
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             available_size = self.cache_controller.mem_pool_host.available_size()
-            reduced_prefetch_length = available_size - (available_size % self.page_size)
-            if reduced_prefetch_length >= self.prefetch_threshold:
-                log_hicache_debug(
-                    "[HiCachePrefetchHostMem] prefetch_retry_with_reduced_length req_id=%s "
-                    "reduced_prefetch_length=%s pool_size=%s available_size=%s",
-                    req_id,
-                    reduced_prefetch_length,
-                    mp.size,
-                    mp.available_size(),
-                )
-                prefetch_length = reduced_prefetch_length
+            prefetch_length = available_size - (available_size % self.page_size)
+            if prefetch_length >= self.prefetch_threshold:
                 prefetch_key = prefetch_key[:prefetch_length]
                 host_indices = self.cache_controller.mem_pool_host.alloc(
                     prefetch_length
                 )
             if host_indices is None:
-                self._log_prefetch_from_storage_abort_root_diag(
-                    phase="prefetch_from_storage_abort_before",
-                    req_id=req_id,
-                    evict_host_attempted=evict_host_for_prefetch,
-                )
                 last_host_node.release_host()
-                logger.debug(
-                    "[prefetch_from_storage] skip rid=%s prefetch_length=%d "
-                    "reason=host_mem_unavailable",
-                    req_id,
-                    prefetch_length,
-                )
-                log_hicache_debug(
-                    "[HiCachePrefetchHostMem] prefetch_from_storage_abort req_id=%s "
-                    "reason=host_mem_unavailable evict_host_attempted=%s pool_size=%s available_size=%s",
-                    req_id,
-                    evict_host_for_prefetch,
-                    mp.size,
-                    mp.available_size(),
-                )
-                self._log_prefetch_from_storage_abort_root_diag(
-                    phase="prefetch_from_storage_abort_after",
-                    req_id=req_id,
-                    evict_host_attempted=evict_host_for_prefetch,
-                )
                 return
-        log_hicache_debug(
-            "[HiCachePrefetchHostMem] prefetch_from_storage_alloc_ok req_id=%s prefetch_length=%s evict_host_attempted=%s pool_size=%s available_size=%s",
-            req_id,
-            prefetch_length,
-            evict_host_for_prefetch,
-            mp.size,
-            mp.available_size(),
-        )
-        logger.debug(
-            "[prefetch_from_storage] started rid=%s tokens=%d prefetch_length=%d "
-            "last_host_node_id=%s",
-            req_id,
-            len(prefetch_key),
-            prefetch_length,
-            last_host_node.id,
-        )
 
         operation = self.cache_controller.prefetch(
             req_id,
