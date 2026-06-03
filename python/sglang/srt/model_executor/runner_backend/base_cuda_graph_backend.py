@@ -32,10 +32,9 @@ class BaseCudaGraphBackend(ABC):
         the captured artifact.
       - ``cleanup()`` — release pool and drop captured artifacts.
 
-    The outer capture loop (which shapes to iterate over, in what order,
-    how to construct the per-shape ``forward_fn``) is runner-specific —
-    decode / prefill / each speculative variant iterates differently —
-    so it lives on the runner, not here.
+    Notes:
+      - The outer capture loop is runner-specific; it lives on the
+        runner, not here.
     """
 
     @abstractmethod
