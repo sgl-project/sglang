@@ -62,13 +62,6 @@ struct OnlineC128MTPCommitPendingParams {
   int64_t max_num_reqs;
 };
 
-template <typename TReq>
-struct OnlineC128MTPClearPendingParams {
-  const TReq* __restrict__ req_pool_indices;
-  int64_t* __restrict__ pending_seq_lens;
-  int64_t bs;
-};
-
 __global__ void online_c128_mtp_clear_all_pending_kernel(int64_t* pending_seq_lens, int64_t max_num_reqs) {
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx < max_num_reqs) pending_seq_lens[idx] = -1;
@@ -114,15 +107,6 @@ __global__ void online_c128_mtp_commit_pending_kernel(
   for (int64_t d = static_cast<int64_t>(threadIdx.x); d < kHeadDim * 3; d += blockDim.x) {
     dst[d] = src[d];
   }
-}
-
-template <typename TReq>
-__global__ void online_c128_mtp_clear_pending_kernel(
-    const OnlineC128MTPClearPendingParams<TReq> params) {
-  const int64_t bid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (bid >= params.bs) return;
-  const int64_t req = static_cast<int64_t>(params.req_pool_indices[bid]);
-  params.pending_seq_lens[req] = -1;
 }
 
 template <int64_t kHeadDim, typename TSeq, typename TReq>
@@ -458,50 +442,6 @@ struct OnlineC128MTPCommitPendingKernel {
             cur_seq_lens, cur_req_pool_indices, req_to_token, full_to_swa, pending_seq_lens,
             state, cur_bs, swa_page_size, num_verify_tokens, state_slot_stride, max_num_reqs, device.unwrap());
       }
-    }
-  }
-};
-
-template <int64_t kHeadDim>
-struct OnlineC128MTPClearPendingKernel {
-  template <typename TReq>
-  static void launch(
-      tvm::ffi::TensorView req_pool_indices,
-      tvm::ffi::TensorView pending_seq_lens,
-      int64_t bs,
-      DLDevice device) {
-    using namespace host;
-
-    const auto params = OnlineC128MTPClearPendingParams<TReq>{
-        .req_pool_indices = static_cast<const TReq*>(req_pool_indices.data_ptr()),
-        .pending_seq_lens = static_cast<int64_t*>(pending_seq_lens.data_ptr()),
-        .bs = bs,
-    };
-
-    constexpr uint32_t kThreads = 256;
-    const uint32_t blocks = host::div_ceil(static_cast<uint32_t>(bs), kThreads);
-    LaunchKernel(blocks, kThreads, device)(online_c128_mtp_clear_pending_kernel<TReq>, params);
-  }
-
-  static void run(
-      tvm::ffi::TensorView req_pool_indices,
-      tvm::ffi::TensorView pending_seq_lens,
-      int64_t bs) {
-    using namespace host;
-
-    auto req_dtype = SymbolicDType{};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
-
-    TensorMatcher({-1}).with_dtype<int32_t, int64_t>(req_dtype).with_device(device).verify(req_pool_indices);
-    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).verify(pending_seq_lens);
-    if (bs <= 0) return;
-    RuntimeCheck(bs <= req_pool_indices.shape()[0], "bs exceeds req rows");
-
-    if (req_dtype.is_type<int32_t>()) {
-      launch<int32_t>(req_pool_indices, pending_seq_lens, bs, device.unwrap());
-    } else {
-      launch<int64_t>(req_pool_indices, pending_seq_lens, bs, device.unwrap());
     }
   }
 };

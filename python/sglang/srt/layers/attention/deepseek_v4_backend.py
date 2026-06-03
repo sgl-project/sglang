@@ -395,20 +395,6 @@ class DeepseekV4AttnBackend(
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
 
-    def write_online_c128_mtp_prefix_states(
-        self,
-        layer_id: int,
-        compressor,
-        kv_score_input: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> None:
-        self.online_c128_mtp.write_prefix_states(
-            layer_id=layer_id,
-            compressor=compressor,
-            kv_score_input=kv_score_input,
-            logical_forward_mode=_get_logical_forward_mode(forward_batch),
-        )
-
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(
             page_size=self.page_size,
@@ -422,7 +408,6 @@ class DeepseekV4AttnBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        online_c128_state_slot_offset: int = 0,
     ) -> Union[DSV4Metadata, DSV4RawDecodeMetadata]:
         assert (
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
@@ -453,7 +438,6 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            online_state_slot_offset=online_c128_state_slot_offset,
         )
 
         return DSV4Metadata(
@@ -642,7 +626,6 @@ class DeepseekV4AttnBackend(
     def make_forward_metadata_from_raw_decode(
         self,
         raw_metadata: DSV4RawDecodeMetadata,
-        online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
@@ -665,7 +648,6 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            online_state_slot_offset=online_c128_state_slot_offset,
         )
 
         return DSV4Metadata(
@@ -865,7 +847,6 @@ class DeepseekV4AttnBackend(
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
             seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-            seq_lens_sum = bs
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device
             )

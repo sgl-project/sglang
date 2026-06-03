@@ -434,12 +434,15 @@ class Compressor(nn.Module):
             forward_batch=forward_batch,
             is_paged=True,
         )
-        if hasattr(attn_backend, "write_online_c128_mtp_prefix_states"):
-            attn_backend.write_online_c128_mtp_prefix_states(
+        online_c128_mtp = getattr(attn_backend, "online_c128_mtp", None)
+        if online_c128_mtp is not None:
+            online_c128_mtp.write_prefix_states(
                 layer_id=self.layer_id,
                 compressor=self,
                 kv_score_input=kv_score,
-                forward_batch=forward_batch,
+                logical_forward_mode=getattr(
+                    forward_batch, "_original_forward_mode", forward_batch.forward_mode
+                ),
             )
         return kv_compressed
 

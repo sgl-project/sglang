@@ -519,12 +519,15 @@ class CompressorBackendMixin:
                 page_size=page_size,
                 out_loc=out_loc,
             )
-        if hasattr(self, "write_online_c128_mtp_prefix_states"):
-            self.write_online_c128_mtp_prefix_states(
+        online_c128_mtp = getattr(self, "online_c128_mtp", None)
+        if online_c128_mtp is not None:
+            online_c128_mtp.write_prefix_states(
                 layer_id=layer_id,
                 compressor=compressor,
                 kv_score_input=kv_score_input,
-                forward_batch=forward_batch,
+                logical_forward_mode=getattr(
+                    forward_batch, "_original_forward_mode", forward_batch.forward_mode
+                ),
             )
 
     def _forward_unified_hip(
