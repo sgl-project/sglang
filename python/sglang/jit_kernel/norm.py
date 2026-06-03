@@ -163,21 +163,20 @@ if _HAS_XPU:
 
                 queue = torch.xpu.current_stream().sycl_queue
 
-                num_tokens = input.shape[0] if input.dim() > 1 else 1
-                input_stride = (
-                    input.stride(0) if input.dim() > 1 else input.numel()
-                )
-                output_stride = (
-                    output.stride(0) if output.dim() > 1 else output.numel()
-                )
+                # Flatten to 2D to correctly handle multi-dimensional tensors
+                input_2d = input.view(-1, input.size(-1))
+                output_2d = output.view(-1, output.size(-1))
+                num_tokens = input_2d.shape[0]
+                input_stride = input_2d.stride(0)
+                output_stride = output_2d.stride(0)
 
                 func = self._module.get_function(self._func_name, self._argtypes)
 
                 func(
                     queue,
-                    input.data_ptr(),
+                    input_2d.data_ptr(),
                     weight.data_ptr(),
-                    output.data_ptr(),
+                    output_2d.data_ptr(),
                     num_tokens,
                     input_stride,
                     output_stride,
