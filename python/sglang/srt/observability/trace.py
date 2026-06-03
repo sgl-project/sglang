@@ -22,9 +22,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_int_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 opentelemetry_imported = False
@@ -137,7 +141,7 @@ if hasattr(time, "time_ns"):
     get_cur_time_ns = lambda: int(time.time_ns())
 
 
-def __get_host_id() -> str:
+def _get_host_id() -> str:
     """
     In distributed tracing systems, obtain a unique node identifier
     and inject it into all subsequently generated spans
@@ -237,7 +241,7 @@ def trace_set_thread_info(
         return
 
     threads_info[pid] = TraceThreadInfo(
-        host_id=__get_host_id(),
+        host_id=_get_host_id(),
         pid=pid,
         thread_label=thread_label,
         tp_rank=tp_rank,
@@ -258,6 +262,10 @@ class TraceReqContext:
         self.rid: str = str(rid)
         self.trace_level = global_trace_level
         self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
+
+        server_args: ServerArgs = get_global_server_args()
+        if module_name not in server_args.trace_modules.split(","):
+            self.tracing_enable = False
 
         if not self.tracing_enable:
             return
@@ -385,6 +393,66 @@ class TraceReqContext:
                 is_remote=True,
             )
         self.events_cache = []
+
+    def copy_for_thread(self) -> "TraceReqContext":
+        """
+        Create a copy of this context for use in another thread.
+
+        The copy shares the same root_span_context but has its own thread_context.
+        This is useful for propagating trace context across threads (e.g., worker threads).
+
+        Usage:
+            # Sender (main thread)
+            trace_ctx_copy = trace_ctx.copy_for_thread()
+            queue.put(TransferKVChunk(..., trace_ctx=trace_ctx_copy))
+
+            # Receiver (worker thread)
+            kv_chunk = queue.get()
+            kv_chunk.trace_ctx.rebuild_thread_context()
+        """
+        # Fast path: not tracing
+        if not self.tracing_enable or not self.root_span_context:
+            return TraceNullContext()
+
+        # Extract prev_span_context from current thread state
+        prev_span_context = self.last_span_context
+        if self.thread_context and self.thread_context.cur_slice_stack:
+            cur_slice = self.thread_context.cur_slice_stack[0]
+            if cur_slice.span:
+                prev_span_context = cur_slice.span.get_span_context()
+
+        # Create new instance with shared state
+        copied = TraceReqContext.__new__(TraceReqContext)
+        copied.tracing_enable = self.tracing_enable
+        copied.rid = self.rid
+        copied.bootstrap_room = self.bootstrap_room
+        copied.start_time_ns = self.start_time_ns
+        copied.role = self.role
+        copied.trace_level = self.trace_level
+        copied.module_name = self.module_name
+        copied.is_copy = True  # Mark as copy
+        copied.pid = self.pid
+
+        # thread_context is None, will be rebuilt via rebuild_thread_context()
+        copied.thread_context = None
+        copied.root_span = None
+
+        # Share root_span_context (already a context, no need to serialize)
+        copied.root_span_context = self.root_span_context
+
+        # Set prev_span_context for linking spans
+        if prev_span_context:
+            copied.last_span_context = trace.span.SpanContext(
+                trace_id=prev_span_context.trace_id,
+                span_id=prev_span_context.span_id,
+                is_remote=True,
+            )
+        else:
+            copied.last_span_context = None
+
+        copied.events_cache = []
+
+        return copied
 
     def rebuild_thread_context(self, ts: Optional[int] = None):
         if not self.tracing_enable:
