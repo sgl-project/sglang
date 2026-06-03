@@ -48,6 +48,20 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
 - See [hyperparameter tuning](./hyperparameter_tuning) on tuning hyperparameters for better performance.
 - For docker and Kubernetes runs, you need to set up shared memory which is used for communication between processes. See `--shm-size` for docker and `/dev/shm` size update for Kubernetes manifests.
+
+- **Multi-detokenizer workers** ([#24944](https://github.com/sgl-project/sglang/pull/24944)): use `--detokenizer-worker-num` to run multiple `DetokenizerManager` processes. A `MultiDetokenizerRouter` fans scheduler outputs to workers (hashed by `http_worker_ipc`). Pair with `--tokenizer-worker-num` when the HTTP tokenizer path is also contended.
+
+  - `--detokenizer-router-sharding single` (default): one router receives output from all DP schedulers.
+  - `--detokenizer-router-sharding dp_rank`: one router per DP rank (scheduler-to-router 1:1). Requires `--detokenizer-worker-num > 1` and `--dp-size > 1`. Useful when a single router becomes a bottleneck under high request rate or long outputs.
+
+  ```bash Command
+  python -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
+    --dp-size 3 \
+    --tokenizer-worker-num 4 \
+    --detokenizer-worker-num 4 \
+    --detokenizer-router-sharding dp_rank
+  ```
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 
   ```bash Command
@@ -125,6 +139,18 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The worker num of the tokenizer manager.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>` 1`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>` --detokenizer-worker-num`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of parallel detokenizer manager processes. When greater than 1, a <code>MultiDetokenizerRouter</code> fans scheduler outputs to workers. See <a href="https://github.com/sgl-project/sglang/pull/24944">#24944</a>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>` 1`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>` --detokenizer-router-sharding`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Sharding of <code>MultiDetokenizerRouter</code> when <code>--detokenizer-worker-num</code> &gt; 1. <code>single</code>: one router for all DP schedulers. <code>dp_rank</code>: one router per DP rank (scheduler-to-router 1:1); requires <code>--dp-size</code> &gt; 1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>` single`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>single</code>, <code>dp_rank</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>` --skip-tokenizer-init`</td>
