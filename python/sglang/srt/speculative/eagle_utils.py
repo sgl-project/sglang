@@ -351,6 +351,17 @@ def build_tree_kernel_efficient(
                 tree_mask_mode,
             )
         except (AttributeError, RuntimeError):
+            # Reinitialize buffers to original state in case Triton partially corrupted them
+            if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+                tree_mask.fill_(True)
+            elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+                tree_mask.fill_(0)
+            elif tree_mask_mode == TreeMaskMode.FULL_MASK:
+                tree_mask.fill_(True)
+            retrive_index.fill_(-1)
+            retrive_next_token.fill_(-1)
+            retrive_next_sibling.fill_(-1)
+
             # Fallback to PyTorch implementation
             sgl_build_tree_kernel_efficient_pytorch(
                 parent_list,
@@ -575,6 +586,10 @@ def verify_tree_greedy_func(
                 target_predict=target_predict,
             )
         except (AttributeError, RuntimeError):
+            # Reinitialize buffers to original state in case Triton partially corrupted them
+            accept_index.fill_(-1)
+            accept_token_num.fill_(0)
+
             # Fallback to PyTorch implementation
             verify_tree_greedy_pytorch(
                 predicts=predicts,
