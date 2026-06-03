@@ -535,8 +535,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
+                # Skip relies on the unconditional mark above (pre-existing
+                # no-pre-plan behavior preserved verbatim).
                 draft_logits_output = self.draft_runner_list[step].forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 )
                 probs = torch.softmax(
                     draft_logits_output.logits_output.next_token_logits[select_index],
@@ -783,7 +785,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
         )
         logits_output = forward_batch_output.logits_output
 
