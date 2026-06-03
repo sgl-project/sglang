@@ -1173,7 +1173,7 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug("Prefetch %s completed with %s tokens", req_id, completed_tokens)
+        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
         # Synchronize workers before mutating host cache tree state.
@@ -1274,11 +1274,11 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if not self.enable_storage:
-            return
-        if prefetch_length < self.prefetch_threshold:
-            return
-        if self.cache_controller.prefetch_rate_limited():
+        if (
+            not self.enable_storage
+            or prefetch_length < self.prefetch_threshold
+            or self.cache_controller.prefetch_rate_limited()
+        ):
             return
 
         last_host_node.protect_host()
@@ -1290,14 +1290,14 @@ class HiRadixCache(RadixCache):
             available_size = self.cache_controller.mem_pool_host.available_size()
             prefetch_length = available_size - (available_size % self.page_size)
             if prefetch_length >= self.prefetch_threshold:
-                prefetch_key = prefetch_key[:prefetch_length]
+                new_input_tokens = new_input_tokens[:prefetch_length]
                 host_indices = self.cache_controller.mem_pool_host.alloc(
                     prefetch_length
                 )
-            if host_indices is None:
+            else:
                 last_host_node.release_host()
+                # no sufficient host memory for prefetch
                 return
-
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,

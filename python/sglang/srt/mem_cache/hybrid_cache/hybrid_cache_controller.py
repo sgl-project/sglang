@@ -20,9 +20,6 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
-from sglang.srt.managers.cache_controller import (
-    log_hicache_debug,
-)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -406,14 +403,6 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
-        )
-        mp = self.mem_pool_host
-        log_hicache_debug(
-            "[HiCachePrefetchHostMem] prefetch_enqueued req_id=%s host_indices=%s pool_size=%s available_size=%s",
-            request_id,
-            host_indices.numel(),
-            mp.size,
-            mp.available_size(),
         )
         self.prefetch_queue.put(operation)
         return operation
