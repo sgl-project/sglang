@@ -313,6 +313,9 @@ class ServerArgs(DisaggArgsMixin):
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
+    # Debug tensor dump
+    debug_tensor_dump_output_folder: Optional[str] = None
+
     # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
@@ -663,6 +666,11 @@ class ServerArgs(DisaggArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
+        if self.debug_tensor_dump_output_folder is not None:
+            logger.warning("Warmup is disabled because tensor dump mode is enabled.")
+            self.warmup = False
+            return
+
         if self.warmup_resolutions is not None:
             self.warmup = True
             self.server_warmup = False
@@ -1515,6 +1523,13 @@ class ServerArgs(DisaggArgsMixin):
             help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
             "Defaults to empty (disabled). "
             "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-output-folder",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_output_folder,
+            help="Output folder for dumping intermediate tensors from forward passes. "
+            "Each GPU rank creates a subdirectory. Disables warmup when set.",
         )
         parser.add_argument(
             "--backend",
