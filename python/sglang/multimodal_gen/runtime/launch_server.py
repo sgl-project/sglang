@@ -21,9 +21,9 @@ from sglang.multimodal_gen.runtime.server_args import (
     prepare_server_args,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import init_diffusion_tracing
 
 
 def _find_available_port(

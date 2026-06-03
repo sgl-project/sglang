@@ -10,7 +10,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-
 DIFFUSION_TRACE_MODULE = "diffusion"
 
 
