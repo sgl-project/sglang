@@ -130,7 +130,7 @@ def register_inductor_fallback_ops():
             make_fallback(op, warn=False)
 
 
-def register_fake_ops():
+def register_fake_ops(tp_size: int):
     """
     Registers fake/meta implementations for all custom sgl_kernel CPU operators
     using torch.library.register_fake to support torch.compile
@@ -168,6 +168,10 @@ def register_fake_ops():
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("shm_allgather")
+    def _(data, dim):
+        return torch.cat([data] * tp_size, dim=dim)
 
     @register_cpu_compile_fake("qkv_proj_with_rope")
     def _(
@@ -587,7 +591,7 @@ class CPUGraphRunner:
         )
 
         if self.enable_torch_compile:
-            register_fake_ops()
+            register_fake_ops(self.tp_size)
             set_torch_compile_config()
 
         # Graph inputs
