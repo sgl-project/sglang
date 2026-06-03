@@ -691,10 +691,11 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
         if self.use_sliding_window_kv_pool:
+            # FA3 requires an int32 page_table.
             metadata.swa_page_table = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     metadata.page_table
-                )
+                ).to(torch.int32)
             )
 
         # Convert the page table to a strided format which is needed by FA3 API
@@ -884,7 +885,7 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                         metadata.page_table
-                    )
+                    ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -1363,7 +1364,7 @@ class FlashAttentionBackend(AttentionBackend):
                         page_table = (
                             self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 metadata.page_table
-                            )
+                            ).to(torch.int32)
                         )
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
@@ -2422,7 +2423,7 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 metadata.page_table
-            )
+            ).to(torch.int32)
         else:
             page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
@@ -2549,7 +2550,7 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             sliced_page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 metadata.page_table[:bs, :max_seq_len]
-            )
+            ).to(torch.int32)
         else:
             sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
@@ -2626,10 +2627,10 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             page_table_a = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 page_table_a
-            )
+            ).to(torch.int32)
             page_table_b = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 page_table_b
-            )
+            ).to(torch.int32)
 
         prepare_swa_spec_page_table_triton(
             page_table,

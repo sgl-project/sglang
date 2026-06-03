@@ -730,9 +730,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                if self.model_runner.is_hybrid_swa:
-                    self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
                 # Must run inside the capture block: warmup mutations here are
                 # undone by on_after_cuda_graph_warmup so capture starts clean.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
