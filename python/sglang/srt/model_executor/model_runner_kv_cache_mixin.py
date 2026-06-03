@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
@@ -233,9 +234,16 @@ class ModelRunnerKVCacheMixin:
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
+            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
             if not self.server_args.disable_overlap_schedule:
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+                if self.server_args.enable_mamba_extra_buffer_lazy():
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
+                else:
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
+                assert (
+                    not self.server_args.enable_mamba_extra_buffer_lazy()
+                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
@@ -352,6 +360,7 @@ class ModelRunnerKVCacheMixin:
                         ]
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,

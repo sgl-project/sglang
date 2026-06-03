@@ -286,7 +286,12 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
+MAMBA_SCHEDULER_STRATEGY_CHOICES = [
+    "auto",
+    "no_buffer",
+    "extra_buffer",
+    "extra_buffer_lazy",
+]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
@@ -2663,6 +2668,10 @@ class ServerArgs:
                 is_cuda() or is_musa() or is_npu()
             ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
+                assert not self.enable_mamba_extra_buffer_lazy(), (
+                    "extra_buffer_lazy is not yet supported with speculative decoding. "
+                    "Use --mamba-scheduler-strategy extra_buffer instead."
+                )
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
                 ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
@@ -7240,7 +7249,10 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return self.mamba_scheduler_strategy == "extra_buffer"
+        return self.mamba_scheduler_strategy in ("extra_buffer", "extra_buffer_lazy")
+
+    def enable_mamba_extra_buffer_lazy(self) -> bool:
+        return self.mamba_scheduler_strategy == "extra_buffer_lazy"
 
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:

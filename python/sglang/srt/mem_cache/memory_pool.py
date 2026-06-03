@@ -138,6 +138,8 @@ def _set_kv_buffer_impl(
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
+    enable_mamba_extra_buffer_lazy: bool = False
+
     def __init__(
         self,
         size: int,
@@ -511,6 +513,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         cache_params: BaseLinearStateParams,
         mamba_layer_ids: List[int],
         enable_mamba_extra_buffer: bool,
+        enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
@@ -524,6 +527,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
+        self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
@@ -599,13 +603,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
-                    req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
-                        self.mamba_ping_pong_track_buffer_size
-                    )
-                    assert (
-                        req.mamba_ping_pong_track_buffer is not None
-                    ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-                    req.mamba_next_track_idx = 0
+                    self._alloc_ping_pong_buffer(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
         assert len(select_index) == len(
             mamba_indices
@@ -647,6 +645,77 @@ class HybridReqToTokenPool(ReqToTokenPool):
         else:
             return mamba_next_track_idx
 
+    def get_mamba_ping_pong_keep_idx(self, req: "Req") -> int:
+        """Return the ping-pong index holding the most recent tracked state.
+
+        In lazy mode the valid state stays at next_track_idx (no eager swap).
+        In normal mode it is at the "other" index (swapped after each track).
+        """
+        if self.enable_mamba_extra_buffer_lazy:
+            return req.mamba_next_track_idx
+        return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+
+    def _alloc_ping_pong_buffer(self, req: "Req"):
+        """Allocate the ping-pong track buffer for a new request.
+
+        Lazy mode allocates 1 slot with the second set to -1 (allocated
+        on demand at track boundaries). Normal mode allocates all slots upfront.
+        """
+        n = (
+            1
+            if self.enable_mamba_extra_buffer_lazy
+            else self.mamba_ping_pong_track_buffer_size
+        )
+        slots = self.mamba_pool.alloc(n)
+        assert slots is not None, (
+            "Not enough space for mamba ping pong idx, "
+            "try to increase --mamba-full-memory-ratio."
+        )
+        buf = torch.full(
+            (self.mamba_ping_pong_track_buffer_size,),
+            -1,
+            dtype=slots.dtype,
+            device=slots.device,
+        )
+        buf[:n] = slots
+        req.mamba_ping_pong_track_buffer = buf
+        req.mamba_next_track_idx = 0
+
+    def set_mamba_ping_pong_slot(self, req: "Req", idx: int, value):
+        """Update a ping-pong slot value and sync the device-side mapping.
+
+        The req holds the authoritative buffer; this keeps the
+        req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
+        set_mamba_track_indices_from_reqs reads correct slot indices.
+        """
+        req.mamba_ping_pong_track_buffer[idx] = value
+        self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx] = (
+            req.mamba_ping_pong_track_buffer
+        )
+
+    def donate_mamba_ping_pong_slot(
+        self, req: "Req", new_slot: torch.Tensor
+    ) -> torch.Tensor:
+        """Donate the tracked-state ping-pong slot to the radix cache.
+
+        Returns the old slot index (shape [1]) for cache insertion and
+        replaces it with new_slot so the request can continue tracking.
+        In lazy mode the valid state is at next_track_idx; in normal mode
+        it is at the "other" index.
+        """
+        donate_idx = self.get_mamba_ping_pong_keep_idx(req)
+        mamba_value_donated = (
+            req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
+        )
+        assert mamba_value_donated.item() != -1, (
+            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
+            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+            f"next_track_idx={req.mamba_next_track_idx}, "
+            f"rid={req.rid}"
+        )
+        self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
+        return mamba_value_donated
+
     def free_mamba_cache(
         self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
@@ -686,6 +755,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     mamba_ping_pong_track_buffer_to_free = (
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
+            if self.enable_mamba_extra_buffer_lazy:
+                mamba_ping_pong_track_buffer_to_free = (
+                    mamba_ping_pong_track_buffer_to_free[
+                        mamba_ping_pong_track_buffer_to_free != -1
+                    ]
+                )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
 
     def clear(self):
