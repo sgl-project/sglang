@@ -385,6 +385,10 @@ class HiMambaRadixCache(MambaRadixCache):
             while len(self.ongoing_write_through) > 0:
                 for ack in self.cache_controller.ack_write_queue:
                     ack.finish_event.synchronize()
+                    self.cache_controller.record_l1_l2_transfer_complete(
+                        direction="offload",
+                        ack=ack,
+                    )
                     for ack_id in ack.node_ids:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         self._record_store_event(
