@@ -2448,6 +2448,17 @@ async def _dp_worker_encode_and_send(
             logger.error(
                 f"DP error-send failed for req_id={req_id}: {e}", exc_info=True
             )
+        # Free the error EmbeddingData stored during encode, or it leaks in
+        # embedding_to_send and pins /health into "busy" (a non-empty
+        # embedding_to_send reads as busy, skipping the probe). Neither path
+        # guarantees cleanup on its own: mooncake's _push_embedding_to_prefill
+        # is a no-op, and a swallowed zmq send failure above skips its own pop.
+        # zmq lacks the inflight attrs so _cleanup_inflight_encode_state would
+        # early-return on it — pop directly. Mirrors the non-DP error path.
+        if backend == "mooncake":
+            await enc._cleanup_inflight_encode_state(req_id)
+        else:
+            enc.embedding_to_send.pop(req_id, None)
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
 
     if backend == "mooncake":
