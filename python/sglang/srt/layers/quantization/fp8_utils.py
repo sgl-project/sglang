@@ -64,6 +64,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
+# gfx942 uses CK gemm_a8w8_blockscale, not Triton.
+# _is_fp8_fnuz checks device 0 for "gfx94" (assumes homogeneous GPUs, same as is_fp8_fnuz()).
+_use_aiter_gfx94 = _use_aiter and (not _is_gfx95_supported) and _is_fp8_fnuz
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -88,6 +91,7 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
 if _use_aiter:
     import aiter
     from aiter import (
+        gemm_a8w8_blockscale,
         gemm_a8w8_blockscale_bpreshuffle,
         gemm_a8w8_bpreshuffle,
         get_hip_quant,
@@ -773,6 +777,8 @@ def aiter_w8a8_block_fp8_linear(
 
     if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+    elif _use_aiter_gfx94:
+        use_triton = False
     else:
         use_triton = True
 
@@ -791,6 +797,8 @@ def aiter_w8a8_block_fp8_linear(
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+    elif _use_aiter_gfx94:
+        gemm_a8w8_blockscale_op = gemm_a8w8_blockscale
     else:
         # TODO(1am9trash), to deal with chance of this branch changes
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
