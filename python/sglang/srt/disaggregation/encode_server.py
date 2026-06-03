@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
+import requests as http_requests
 import torch
 import uvicorn
 import zmq
@@ -2412,10 +2413,6 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     Retries on failure to handle the case where a prefill server may not
     be ready immediately.
     """
-    import time
-
-    import requests as http_requests
-
     encoder_url = server_args.url()
     payload = {"url": encoder_url}
     max_retries = 5

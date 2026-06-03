@@ -3887,9 +3887,7 @@ class ServerArgs:
             )
 
         if self.language_only and len(self.encoder_urls) == 0:
-            import logging as _logging
-
-            _logging.getLogger(__name__).info(
+            logger.info(
                 "--language-only is set without --encoder-urls. Encoders are "
                 "expected to register dynamically via the "
                 "EncoderBootstrapServer."
