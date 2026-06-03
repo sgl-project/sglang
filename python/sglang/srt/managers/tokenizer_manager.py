@@ -840,6 +840,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
+            # Caller-supplied per-image hashes (external KV routers, e.g.
+            # routing-aware orchestrators that compute a content-addressed
+            # hash before dispatch). Setting MultimodalDataItem.hash here
+            # short-circuits the internal hash_feature() recompute inside
+            # set_pad_value(), making the derived pad_value deterministic
+            # from the caller's hash. That alignment lets the router's
+            # routing decision agree with sglang's prefix-cache key for
+            # the same image. On any per-item parse error or list-length
+            # mismatch we fall back to the internal recompute so a
+            # malformed mm_hashes never blocks a request.
+            caller_mm_hashes = getattr(obj, "mm_hashes", None)
+            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
+                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
+                    logger.warning(
+                        "mm_hashes length (%d) != mm_items length (%d); "
+                        "ignoring caller hashes for this request.",
+                        len(caller_mm_hashes),
+                        len(mm_inputs.mm_items),
+                    )
+                else:
+                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
+                        if not isinstance(item, MultimodalDataItem):
+                            continue
+                        try:
+                            item.hash = int(hex_hash, 16)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Ignoring malformed mm_hashes entry %r; "
+                                "this item will fall back to hash_feature().",
+                                hex_hash,
+                            )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -1749,6 +1780,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
+            # Surface scheduler load info on each response so clients can do
+            # response-based flow control without polling /v1/loads. The
+            # scheduler already piggy-backs the per-DP-rank load on
+            # BatchStrOutput / BatchTokenIDOutput via the ``load`` field.
+            load = getattr(recv_obj, "load", None)
+            if load is not None:
+                num_running_reqs = getattr(load, "num_running_reqs", None)
+                num_waiting_reqs = getattr(load, "num_waiting_reqs", None)
+                if num_running_reqs is not None:
+                    meta_info["num_running_reqs"] = num_running_reqs
+                if num_waiting_reqs is not None:
+                    meta_info["num_waiting_reqs"] = num_waiting_reqs
+
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
@@ -2144,7 +2188,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
+            if token_logprobs_val[i] is not None:
                 ret.append(
                     self.detokenize_logprob_tokens(
                         token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
