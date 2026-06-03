@@ -8,7 +8,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import sglang.srt.observability.trace as mod
 from sglang.srt.observability.trace import (
@@ -195,25 +195,12 @@ class TestProcessTracingInit(unittest.TestCase):
             mod.opentelemetry_imported = orig
 
 
-def _mock_get_global_server_args():
-    """Return a mock ServerArgs for tests that create TraceReqContext."""
-    mock = MagicMock()
-    mock.trace_modules = ""
-    return mock
-
-
 class TestTraceReqContextDisabled(unittest.TestCase):
     def setUp(self):
         self.orig = mod.opentelemetry_initialized
         mod.opentelemetry_initialized = False
-        self._sa_patcher = patch(
-            "sglang.srt.observability.trace.get_global_server_args",
-            side_effect=_mock_get_global_server_args,
-        )
-        self._sa_patcher.start()
 
     def tearDown(self):
-        self._sa_patcher.stop()
         mod.opentelemetry_initialized = self.orig
 
     def test_init_disabled(self):
@@ -269,14 +256,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         mod.tracer = otel_trace.get_tracer("test")
         mod.global_trace_level = 3
 
-        self._sa_patcher = patch(
-            "sglang.srt.observability.trace.get_global_server_args",
-            side_effect=_mock_get_global_server_args,
-        )
-        self._sa_patcher.start()
-
     def tearDown(self):
-        self._sa_patcher.stop()
         mod.opentelemetry_initialized = self.orig_initialized
         mod.tracer = self.orig_tracer
         mod.threads_info.clear()
@@ -293,6 +273,23 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         # Second call for same thread is a no-op
         trace_set_thread_info("different_label")
         self.assertEqual(mod.threads_info[pid].thread_label, "scheduler")
+
+    def test_module_filtering(self):
+        """global_trace_modules gates only explicitly named modules."""
+        orig_modules = mod.global_trace_modules
+        mod.global_trace_modules = ["request"]
+        try:
+            # Default empty module_name is never filtered
+            ctx = TraceReqContext(rid="req-1")
+            self.assertTrue(ctx.tracing_enable)
+            # Listed module is traced
+            ctx = TraceReqContext(rid="req-1", module_name="request")
+            self.assertTrue(ctx.tracing_enable)
+            # Unlisted module is filtered out
+            ctx = TraceReqContext(rid="req-1", module_name="mooncake")
+            self.assertFalse(ctx.tracing_enable)
+        finally:
+            mod.global_trace_modules = orig_modules
 
     def test_full_lifecycle(self):
         """Start → slice_start → slice_end → finish."""
