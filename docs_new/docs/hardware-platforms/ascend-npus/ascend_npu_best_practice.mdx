@@ -786,6 +786,86 @@ you encounter issues or have any questions, please [open an issue](https://githu
   </tbody>
 </table>
 
+## Kimi Series Models
+
+### Low Latency
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Kimi-K2.5-w4a8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#kimi-k25-w4a8-3_5k-1_5k-20ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+    </tr>
+</tbody>
+</table>
+
+### High Throughput
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "12%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cards</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Deploy Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Dataset</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>TPOT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Configuration</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Kimi-K2.5-w4a8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#kimi-k25-w4a8-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
+    </tr>
+</tbody>
+</table>
+
 ## Optimal Configuration
 
 ### DeepSeek-R1 3_5K-1_5K 50ms on A3 32 Cards Disaggregation Mode
@@ -5774,4 +5854,154 @@ We tested it based on the `RANDOM` dataset.
 
 ```shell Command
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --random-input-len 131072 --random-output-len 1024 --num-prompts 192 --random-range-ratio 1 --max-concurrency 48
+```
+
+
+### Kimi K2.5 w4a8 3_5K-1_5K 20ms on A3 8 Cards Mixed Mode
+
+Model: Kimi-K2.5-w4a8
+
+Hardware: Atlas 800I A3 8Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 20ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export STREAMS_PER_DEVICE=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=48
+export HCCL_BUFFSIZE=1200
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+
+MODEL_PATH=xxx
+DRAFT_PATH=xxx
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH --quantization modelslim --dtype bfloat16 \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
+    --host 0.0.0.0 --port 6699 \
+    --trust-remote-code --device npu --attention-backend ascend \
+    --tp-size 16 --base-gpu-id 0 --mem-fraction-static 0.78 --max-running-requests 64 \
+    --chunked-prefill-size 32768 --context-length 8192 --max-prefill-tokens 16384 \
+    --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
+    --enable-dp-attention --dp-size 16 \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --cuda-graph-bs 1 2 3 4 --disable-radix-cache \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_PATH \
+    --speculative-num-steps 4 --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```bash Command
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 64 --random-output-len 1500 --random-input-len 3500 --num-prompts 64
+```
+
+
+### Kimi K2.5 w4a8 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
+
+Model: Kimi-K2.5-w4a8
+
+Hardware: Atlas 800I A3 8Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 50ms
+
+#### Model Deployment
+
+```bash Command
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export STREAMS_PER_DEVICE=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
+export HCCL_BUFFSIZE=1200
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+
+MODEL_PATH=xxx
+DRAFT_PATH=xxx
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH --quantization modelslim --dtype bfloat16 \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
+    --host 0.0.0.0 --port 6699 \
+    --trust-remote-code --device npu --attention-backend ascend \
+    --tp-size 16 --base-gpu-id 0 --mem-fraction-static 0.7 --max-running-requests 120 \
+    --chunked-prefill-size 32768 --context-length 8192 --max-prefill-tokens 16384 \
+    --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
+    --enable-dp-attention --dp-size 16 \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --cuda-graph-bs 1 2 4 8 12 16 24 32 48 64 96 120 --disable-radix-cache \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_PATH \
+    --speculative-num-steps 4 --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --speculative-draft-model-quantization unquant
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```bash Command
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 120 --random-output-len 1500 --random-input-len 3500 --num-prompts 120
 ```
