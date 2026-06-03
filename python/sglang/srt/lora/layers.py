@@ -991,16 +991,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         moe_lora_info = batch_info.moe_lora_info
         assert moe_lora_info is not None
 
-        # Disable rank-0 (dummy/inactive) adapters so the virtual-experts kernel
-        # adds no delta for them — critical during cuda-graph capture where no
-        # real adapter is active (otherwise a garbage gate_up_delta corrupts the
-        # captured decode). In-place on the stable per-batch buffer (cuda-graph
-        # safe; idempotent across layers). Matches the NVFP4 GB200 cookbook fix.
-        rank_enabled = (lora_ranks > 0).to(
-            device=moe_lora_info.adapter_enabled.device,
-            dtype=moe_lora_info.adapter_enabled.dtype,
-        )
-        moe_lora_info.adapter_enabled.mul_(rank_enabled)
+        # NOTE: rank-0 (dummy/inactive) adapters are already disabled at the single
+        # build site of moe_lora_info — _compute_moe_lora_info() zeroes adapter_enabled
+        # and only sets (rank > 0) entries (both the Triton kernel and the eager
+        # scatter path; see backend/base_backend.py). The per-batch buffer is rebuilt
+        # every prepare_lora_batch (including the persistent cuda-graph buffer), so no
+        # stale rank-0 "1" can survive into a captured decode. A per-layer
+        # adapter_enabled.mul_(rank > 0) here would therefore be a no-op repeated once
+        # per MoE layer (3 CUDA launches × N layers, also baked into the CUDA graph),
+        # so it is intentionally omitted.
 
         # Single source of truth: lora_manager precomputes this per-batch from
         # the Python weight_indices list, no GPU sync needed.
