@@ -81,16 +81,24 @@ class PrefillStats:
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
     ):
+        log_hit_tokens_device = sum(
+            getattr(req, "cached_tokens_device", 0) for req in adder.can_run_list
+        )
+        log_hit_tokens_host = sum(
+            getattr(req, "cached_tokens_host", 0) for req in adder.can_run_list
+        )
+        log_hit_tokens_storage = sum(
+            getattr(req, "cached_tokens_storage", 0) for req in adder.can_run_list
+        )
+
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
             reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
             reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
-            log_hit_tokens_device=getattr(
-                adder, "log_hit_tokens_device", adder.log_hit_tokens
-            ),
-            log_hit_tokens_host=getattr(adder, "log_hit_tokens_host", 0),
-            log_hit_tokens_storage=getattr(adder, "log_hit_tokens_storage", 0),
+            log_hit_tokens_device=log_hit_tokens_device,
+            log_hit_tokens_host=log_hit_tokens_host,
+            log_hit_tokens_storage=log_hit_tokens_storage,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
