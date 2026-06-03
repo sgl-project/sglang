@@ -51,7 +51,7 @@ import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.network import is_valid_ipv6_address
+from sglang.srt.utils.network import is_zmq_endpoint_ipv6
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import GetLoadsReqOutput
@@ -64,17 +64,6 @@ logger = logging.getLogger(__name__)
 
 DISAGG_MODE_TO_INT = {"null": 0, "prefill": 1, "decode": 2}
 INT_TO_DISAGG_MODE = {v: k for k, v in DISAGG_MODE_TO_INT.items()}
-
-
-def _endpoint_is_ipv6(endpoint: str) -> bool:
-    """Check whether a ZMQ endpoint (e.g. ``tcp://[::1]:1234``) uses IPv6."""
-    start = endpoint.find("[")
-    if start == -1:
-        return False
-    end = endpoint.find("]", start)
-    if end == -1:
-        return False
-    return is_valid_ipv6_address(endpoint[start + 1 : end])
 
 
 def _native(v):
@@ -451,7 +440,7 @@ class ZmqLoadSnapshotWriter:
         self._zmq = _zmq
         self._ctx = _zmq.Context.instance()
         self._socket = self._ctx.socket(_zmq.PUSH)
-        if _endpoint_is_ipv6(endpoint):
+        if is_zmq_endpoint_ipv6(endpoint):
             self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
@@ -591,7 +580,7 @@ class ZmqShmLoadSnapshotReader:
         self._zmq = _zmq
         self._ctx = _zmq.Context.instance()
         self._socket = self._ctx.socket(_zmq.PULL)
-        if _endpoint_is_ipv6(endpoint):
+        if is_zmq_endpoint_ipv6(endpoint):
             self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
