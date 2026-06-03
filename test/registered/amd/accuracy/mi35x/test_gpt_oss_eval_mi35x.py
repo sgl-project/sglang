@@ -77,6 +77,7 @@ MI35X_GPT_OSS_MODELS = [
         env_vars={
             "SGLANG_USE_AITER": "1",
             "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "GPTOSS_SWIGLU_MXFP4_BF16_BOUND": "128",
         },
     ),
     ModelConfig(
@@ -98,6 +99,7 @@ MI35X_GPT_OSS_MODELS = [
         env_vars={
             "SGLANG_USE_AITER": "1",
             "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "GPTOSS_SWIGLU_MXFP4_BF16_BOUND": "128",
         },
     ),
 ]
@@ -159,7 +161,7 @@ def run_gsm8k_benchmark(
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
         s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+            "answer", max_tokens=2048, stop=["Question", "Assistant:", "<|separator|>"]
         )
 
     backend = RuntimeEndpoint(base_url)
