@@ -18,6 +18,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
+    LINGBOT_WORLD_REALTIME_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
     MODELOPT_TI2I_CI_sampling_params,
@@ -53,6 +54,7 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
+
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
@@ -237,6 +239,32 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
         ),
     ),
+    DiffusionTestCase(
+        "cosmos3_nano_t2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
+            modality="video",
+            env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
+        ),
+        DiffusionSamplingParams(
+            prompt="A blue box slides across a clean warehouse floor.",
+            output_size="832x480",
+            seconds=1,
+            num_frames=9,
+            extras={
+                "num_inference_steps": 4,
+                "seed": 0,
+                "max_sequence_length": 128,
+                "flow_shift": 10.0,
+                "use_guardrails": False,
+                "use_duration_template": False,
+                "use_resolution_template": False,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+    ),
     # TeaCache acceleration test for Wan video model
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_teacache_enabled",
@@ -395,6 +423,20 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_world_realtime_plastic_beach",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-world-fast-diffusers",
+            modality="video",
+            num_gpus=1,
+            extras=["--pipeline-class-name LingBotWorldCausalDMDPipeline"],
+            text_encoder_cpu_offload=True,
+        ),
+        LINGBOT_WORLD_REALTIME_sampling_params,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
 ]
 

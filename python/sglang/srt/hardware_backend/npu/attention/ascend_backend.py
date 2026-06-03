@@ -362,6 +362,29 @@ class AscendAttnBackend(AttentionBackend):
     ):
         pass
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        if in_capture:
+            self._init_cuda_graph_metadata(
+                bs, forward_batch.forward_mode, forward_batch.seq_lens
+            )
+        self._apply_cuda_graph_metadata(
+            bs=bs,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            seq_lens_cpu=(
+                forward_batch.seq_lens.cpu()
+                if in_capture
+                else forward_batch.seq_lens_cpu
+            ),
+            forward_mode=forward_batch.forward_mode,
+            spec_info=forward_batch.spec_info,
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
@@ -538,39 +561,19 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_metadata[bs] = metadata
         return metadata
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
+        seq_lens_cpu: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        self._init_cuda_graph_metadata(bs, forward_mode, seq_lens)
-        self.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=None,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens.cpu(),
-        )
+        """Shared capture+replay body for the cuda-graph init path.
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
+        """
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify():
@@ -2395,6 +2398,32 @@ class AscendAttnMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        def call_fn(i, _forward_batch):
+            self.attn_backends[i].init_forward_metadata_out_graph(
+                inner_fb, in_capture=in_capture
+            )
+
+        self.common_template(forward_batch, call_fn)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        def call_fn(i, _forward_batch):
+            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
+
+        self.common_template(forward_batch, call_fn)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
             assert forward_batch.spec_info is not None
@@ -2405,34 +2434,3 @@ class AscendAttnMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs, max_num_tokens):
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
-
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-        self.common_template(forward_batch, call_fn)
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
-
-        self.common_template(forward_batch, call_fn)
