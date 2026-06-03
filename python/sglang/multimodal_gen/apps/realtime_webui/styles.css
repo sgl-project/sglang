@@ -278,7 +278,7 @@ button:focus-visible {
 .topbar, .timeline {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   min-width: 0;
   height: 44px;
   padding: 0 14px;
@@ -300,8 +300,8 @@ button:focus-visible {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  flex: 0 0 104px;
-  width: 104px;
+  flex: 0 0 118px;
+  width: 118px;
   min-height: 28px;
   height: 28px;
   padding: 0 9px;
@@ -331,9 +331,15 @@ button:focus-visible {
   cursor: wait;
   opacity: 0.76;
 }
+#recordLabel {
+  flex: 0 0 36px;
+  text-align: left;
+}
 .record-button-icon {
+  flex: 0 0 9px;
   width: 9px;
   height: 9px;
+  min-width: 9px;
   border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.16);
@@ -345,6 +351,7 @@ button:focus-visible {
 }
 .record-button-duration {
   display: inline-block;
+  flex: 0 0 34px;
   min-width: 34px;
   text-align: right;
   color: rgba(232, 234, 223, 0.7);
@@ -356,8 +363,8 @@ button:focus-visible {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  flex: 0 0 190px;
-  min-width: 190px;
+  flex: 0 0 170px;
+  min-width: 170px;
   margin: 0;
   color: rgba(232, 234, 223, 0.72);
   font-size: 11px;
@@ -407,7 +414,7 @@ button:focus-visible {
 #theoreticalFpsText { min-width: 116px; }
 #stageLatencyText { min-width: 120px; }
 
-@media (max-width: 1600px) {
+@media (max-width: 1180px) {
   .topbar {
     flex-wrap: wrap;
     height: auto;
