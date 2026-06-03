@@ -6,10 +6,13 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
+from sglang.srt.layers.moe import topk as topk_module
+from sglang.srt.layers.moe.topk import TopKConfig
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.test.test_utils import CustomTestCase
 
@@ -51,6 +54,47 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
 
         self.assertEqual(len(weights), 1)
         self.assertEqual(weights[0].shape, (experts.num_local_experts, 2))
+
+    def test_topk_recorder_ids_exclude_deepep_fused_shared_slots(self):
+        topk_ids = torch.tensor([[0, 33, 263, 256]], dtype=torch.int32)
+        topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+        topk_config = TopKConfig(
+            top_k=4,
+            num_fused_shared_experts=1,
+            routed_scaling_factor=1.0,
+        )
+        dispatch_info = SimpleNamespace(num_physical_experts=264)
+
+        def fake_eplb_postprocess(
+            ids, expert_location_dispatch_info, num_token_non_padded
+        ):
+            return ids
+
+        with (
+            patch.object(topk_module, "_is_cuda", True),
+            patch.object(topk_module, "_use_aiter", False),
+            patch.object(topk_module, "is_deepep_class_backend", return_value=True),
+            patch.object(
+                topk_module, "get_moe_expert_parallel_world_size", return_value=8
+            ),
+            patch.object(topk_module, "get_moe_expert_parallel_rank", return_value=7),
+            patch.object(
+                topk_module,
+                "_biased_grouped_topk_postprocess",
+                side_effect=fake_eplb_postprocess,
+            ),
+        ):
+            processed_ids, _, recorder_ids = topk_module._post_process_topk_ids(
+                topk_ids=topk_ids.clone(),
+                topk_weights=topk_weights.clone(),
+                topk_config=topk_config,
+                router_logits=torch.empty((1, 256)),
+                layer_id=0,
+                expert_location_dispatch_info=dispatch_info,
+            )
+
+        self.assertTrue(torch.equal(processed_ids, torch.tensor([[0, 34, 270, 271]])))
+        self.assertTrue(torch.equal(recorder_ids, torch.tensor([[0, 33, 263]])))
 
 
 if __name__ == "__main__":
