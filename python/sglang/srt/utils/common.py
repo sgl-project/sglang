@@ -2538,7 +2538,31 @@ def kill_itself_when_parent_died():
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
     else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+        # macOS / other platforms have no PR_SET_PDEATHSIG equivalent, so the
+        # kernel will not signal this process when the parent dies; the worker
+        # would be reparented to PID 1 and leak (holding GPU/host memory and
+        # ports). Emulate PDEATHSIG with a daemon thread that polls the parent
+        # PID and SIGKILLs *this* process once it gets orphaned.
+        #
+        # SIGKILL is sent from this watcher thread and is uncatchable /
+        # unblockable, so it works even when the main thread is stuck inside a
+        # blocking native call (e.g. an MLX/Metal `mx.eval` / `.tolist()`).
+        original_ppid = os.getppid()
+
+        def _watch_parent():
+            while True:
+                # getppid() returns 1 (reparented to init/launchd) once the
+                # original parent has exited.
+                if os.getppid() != original_ppid:
+                    os.kill(os.getpid(), signal.SIGKILL)
+                time.sleep(1.0)
+
+        watcher = threading.Thread(
+            target=_watch_parent,
+            name="parent-death-watcher",
+            daemon=True,
+        )
+        watcher.start()
 
 
 class UvicornAccessLogFilter(logging.Filter):
