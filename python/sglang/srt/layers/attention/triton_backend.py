@@ -15,11 +15,7 @@ from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_tr
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 from sglang.srt.utils import (
@@ -173,10 +169,8 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.use_pdl = False
 
-        # Bidirectional attention is only safe during EXTEND (prefill).
-        # Gate on whether prefill captures, not decode.
         self.allow_bidirectional_attention_in_extend = (
-            check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+            cuda_graph_fully_disabled()
             and model_runner.server_args.chunked_prefill_size == -1
         )
 
