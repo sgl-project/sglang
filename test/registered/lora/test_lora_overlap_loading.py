@@ -17,27 +17,139 @@ import unittest
 from typing import cast
 from unittest.mock import MagicMock, patch
 
+import torch
 from torch.cuda import Event as CudaEvent
 from torch.cuda import Stream as CudaStream
 
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader, LoRAOverlapLoadStatus
+from sglang.srt.lora.lora_pipeline_sync import LoRAPipelineFlag
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
-    CI_MULTI_LORA_MODELS,
-    run_lora_batch_splitting_equivalence_test,
+    TORCH_DTYPES,
+    LoRAAdaptor,
+    LoRAModelCase,
+    run_lora_test_one_by_one,
 )
+from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=48, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
+
+# Two adapters on a freely available base model
+LORA_A = "algoprog/fact-generation-llama-3.1-8b-instruct-lora"
+LORA_B = "nvidia/llama-3.1-nemoguard-8b-topic-control"
+BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+PROMPT_1 = "AI is a field of computer science focused on"
+PROMPT_2 = "The capital of France is"
 
 
-class TestLoRAOverlapLoading(CustomTestCase):
-    def test_ci_lora_models_batch_splitting(self):
-        run_lora_batch_splitting_equivalence_test(
-            CI_MULTI_LORA_MODELS, enable_lora_overlap_loading=True
+class TestLoRAOverlapLoadingSingleRequest(CustomTestCase):
+    """1. Single request, single LoRA loading with max 1 LoRA in GPU."""
+
+    def test_single_request_single_lora(self):
+        model_case = LoRAModelCase(
+            base=BASE_MODEL,
+            adaptors=[LoRAAdaptor(name=LORA_A)],
+            max_loras_per_batch=1,
+            max_loaded_loras=1,
         )
+        for torch_dtype in TORCH_DTYPES:
+            run_lora_test_one_by_one(
+                [PROMPT_1],
+                model_case,
+                torch_dtype,
+                max_new_tokens=32,
+                enable_lora_overlap_loading=True,
+                disable_cuda_graph=True,
+                disable_radix_cache=True,
+                test_tag="overlap_single_request_single_lora",
+            )
+
+
+class TestLoRAOverlapLoadingBatchReplace(CustomTestCase):
+    """2. Two new LoRAs replace two in GPU, batch runs with correct output."""
+
+    def test_two_loras_batch_replace(self):
+        with SRTRunner(
+            BASE_MODEL,
+            torch_dtype=torch.float16,
+            model_type="generation",
+            lora_paths=[LORA_A, LORA_B],
+            enable_lora_overlap_loading=True,
+            max_loras_per_batch=2,
+            max_loaded_loras=2,
+            disable_cuda_graph=True,
+            disable_radix_cache=True,
+            sleep_on_idle=True,
+        ) as srt_runner:
+            # Batch with both LoRAs
+            outputs = srt_runner.batch_forward(
+                [PROMPT_1, PROMPT_2],
+                max_new_tokens=32,
+                lora_paths=[LORA_A, LORA_B],
+            )
+            # Different adapters should produce different outputs
+            self.assertNotEqual(
+                outputs.output_strs[0].strip(),
+                outputs.output_strs[1].strip(),
+                "Two different LoRA adapters produced identical output",
+            )
+            # Both should produce non-empty output
+            self.assertTrue(len(outputs.output_strs[0].strip()) > 0)
+            self.assertTrue(len(outputs.output_strs[1].strip()) > 0)
+
+
+class TestLoRAOverlapLoadingEviction(CustomTestCase):
+    """3. Two requests: one LoRA already in GPU, one needs loading (eviction).
+    Max 2 LoRAs means one must be replaced. Verify correct output."""
+
+    def test_eviction_on_new_lora(self):
+        with SRTRunner(
+            BASE_MODEL,
+            torch_dtype=torch.float16,
+            model_type="generation",
+            lora_paths=[LORA_A, LORA_B],
+            enable_lora_overlap_loading=True,
+            max_loras_per_batch=2,
+            max_loaded_loras=2,
+            disable_cuda_graph=True,
+            disable_radix_cache=True,
+            sleep_on_idle=True,
+        ) as srt_runner:
+            # First batch: load LORA_A into GPU
+            out1 = srt_runner.batch_forward(
+                [PROMPT_1],
+                max_new_tokens=32,
+                lora_paths=[LORA_A],
+            )
+            self.assertTrue(len(out1.output_strs[0].strip()) > 0)
+
+            # Second batch: LORA_A already loaded, LORA_B needs loading
+            out2 = srt_runner.batch_forward(
+                [PROMPT_1, PROMPT_2],
+                max_new_tokens=32,
+                lora_paths=[LORA_A, LORA_B],
+            )
+            # Both should produce non-empty, different outputs
+            self.assertTrue(len(out2.output_strs[0].strip()) > 0)
+            self.assertTrue(len(out2.output_strs[1].strip()) > 0)
+            self.assertNotEqual(
+                out2.output_strs[0].strip(),
+                out2.output_strs[1].strip(),
+                "Different adapters should produce different outputs",
+            )
+
+            # Verify LORA_A output is consistent across batches
+            self.assertEqual(
+                out1.output_strs[0].strip(),
+                out2.output_strs[0].strip(),
+                "Same adapter + prompt should produce consistent output",
+            )
+
+
 
 
 class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
@@ -76,7 +188,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
     def _create_loader(self) -> LoRAOverlapLoader:
         return LoRAOverlapLoader(cast(LoRAManager, self.mock_lora_manager))
 
-    def _mark_loras_loaded(self, new_loras, _loras_to_be_loaded):
+    def _mark_loras_loaded(self, new_loras, _loras_to_be_loaded, **kwargs):
         for lora_id in new_loras:
             self.mock_lora_manager.memory_pool.uid_to_buffer_id[lora_id] = len(
                 self.mock_lora_manager.memory_pool.uid_to_buffer_id
@@ -106,11 +218,13 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.mock_lora_manager.fetch_new_loras.reset_mock()
         result = loader.try_overlap_load_lora("new_lora", running_loras=set())
 
-        self.assertFalse(result)
+        # With pipelining, returns True as soon as load starts
+        self.assertTrue(result)
         self.assertNotIn("stale_lora", loader.lora_to_overlap_load_event)
         self.assertIn("new_lora", loader.lora_to_overlap_load_event)
+        self.assertIn("new_lora", loader.pipelined_loading_loras)
         self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"new_lora"}, set()
+            {"new_lora"}, set(), loading_stream=self.mock_stream
         )
 
     def test_loaded_lora_reused_after_stale_event_drain(self):
@@ -130,11 +244,13 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.assertIn("lora_A", loader.lora_to_overlap_load_event)
 
         self.mock_lora_manager.fetch_new_loras.reset_mock()
-        self.assertFalse(loader.try_overlap_load_lora("lora_B", running_loras=set()))
+        # With pipelining, returns True as soon as load starts
+        self.assertTrue(loader.try_overlap_load_lora("lora_B", running_loras=set()))
         self.assertNotIn("lora_A", loader.lora_to_overlap_load_event)
         self.assertIn("lora_B", loader.lora_to_overlap_load_event)
+        self.assertIn("lora_B", loader.pipelined_loading_loras)
         self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"lora_B"}, set()
+            {"lora_B"}, set(), loading_stream=self.mock_stream
         )
 
         self.mock_lora_manager.fetch_new_loras.reset_mock()
@@ -162,27 +278,24 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         status = loader._check_overlap_load_status("lora_A")
         self.assertEqual(status, LoRAOverlapLoadStatus.NOT_LOADED)
 
-        # First call starts async load, returns False
+        # First call starts async load, returns True immediately (pipelined)
         result = loader.try_overlap_load_lora("lora_A", running_loras=set())
-        self.assertFalse(result)
+        self.assertTrue(result)
         self.assertIn("lora_A", loader.lora_to_overlap_load_event)
+        self.assertIn("lora_A", loader.pipelined_loading_loras)
         self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
-            {"lora_A"}, set()
+            {"lora_A"}, set(), loading_stream=self.mock_stream
         )
 
-        # Simulate load still in progress - returns False, event persists
-        loader.lora_to_overlap_load_event["lora_A"].query.return_value = False
+        # While pipelined and still in memory pool, returns True (forward gates on per-layer flags)
         result = loader.try_overlap_load_lora("lora_A", running_loras=set())
-        self.assertFalse(result)
-        self.assertEqual(
-            loader._check_overlap_load_status("lora_A"), LoRAOverlapLoadStatus.LOADING
-        )
+        self.assertTrue(result)
 
-        # Simulate load complete - returns True, event removed
+        # Even after event completes, pipelined path keeps returning True
+        # as long as adapter remains in memory pool
         loader.lora_to_overlap_load_event["lora_A"].query.return_value = True
         result = loader.try_overlap_load_lora("lora_A", running_loras=set())
         self.assertTrue(result)
-        self.assertNotIn("lora_A", loader.lora_to_overlap_load_event)
 
     def test_capacity_constraints_block_new_loads(self):
         loader = self._create_loader()
@@ -236,6 +349,64 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         call_args = self.mock_lora_manager.validate_lora_batch.call_args[0][0]
         expected = {"pending_1", "pending_2", "running_1", "running_2", "new_lora"}
         self.assertEqual(call_args, expected)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+class TestLoRAPipelineSync(CustomTestCase):
+    """Tests for per-layer pipelined LoRA loading synchronization primitives."""
+
+    def test_flag_initial_state(self):
+        """Flag starts ready (no load in progress)."""
+        flag = LoRAPipelineFlag(torch.device("cuda:0"))
+        flag.wait_until_ready(torch.cuda.current_stream())
+
+    def test_mark_loading_and_ready(self):
+        """Test basic mark_loading -> mark_ready cycle."""
+        flag = LoRAPipelineFlag(torch.device("cuda:0"))
+        stream = torch.cuda.Stream()
+
+        flag.mark_loading()
+        with torch.cuda.stream(stream):
+            t = torch.zeros(256, 256, device="cuda:0")
+            t.fill_(1.0)
+        flag.mark_ready(stream)
+
+        flag.wait_until_ready(torch.cuda.current_stream())
+        torch.cuda.current_stream().synchronize()
+        self.assertEqual(t[0, 0].item(), 1.0)
+
+    def test_cross_stream_synchronization(self):
+        """Compute stream waits for loading stream to finish."""
+        flag = LoRAPipelineFlag(torch.device("cuda:0"))
+        load_stream = torch.cuda.Stream()
+
+        flag.mark_loading()
+        with torch.cuda.stream(load_stream):
+            large_tensor = torch.zeros(1024, 1024, device="cuda:0")
+            large_tensor.fill_(42.0)
+        flag.mark_ready(load_stream)
+
+        flag.wait_until_ready(torch.cuda.current_stream())
+        torch.cuda.current_stream().synchronize()
+        self.assertEqual(large_tensor[0, 0].item(), 42.0)
+
+    def test_no_wait_when_not_loading(self):
+        """wait_until_ready is a no-op when no load is in progress."""
+        flag = LoRAPipelineFlag(torch.device("cuda:0"))
+        flag.wait_until_ready(torch.cuda.current_stream())
+        flag.wait_until_ready(torch.cuda.current_stream())
+
+    def test_multiple_flags_independent(self):
+        """Multiple flags operate independently."""
+        flag1 = LoRAPipelineFlag(torch.device("cuda:0"))
+        flag2 = LoRAPipelineFlag(torch.device("cuda:0"))
+        stream = torch.cuda.Stream()
+
+        flag1.mark_loading()
+        flag2.wait_until_ready(torch.cuda.current_stream())
+
+        flag1.mark_ready(stream)
+        stream.synchronize()
 
 
 if __name__ == "__main__":

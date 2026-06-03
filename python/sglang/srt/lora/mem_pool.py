@@ -671,6 +671,17 @@ class LoRAMemoryPool:
 
         return cached_weight
 
+    @staticmethod
+    def _get_layer_pipeline_flag(layer_modules):
+        """Get the shared pipeline flag for a layer's modules.
+
+        All modules in a layer share one flag, so just return the first one found.
+        """
+        for module in layer_modules.values():
+            if module._pipeline_flag is not None:
+                return module._pipeline_flag
+        return None
+
     def prepare_lora_batch(
         self,
         cur_uids: Set[Optional[str]],
@@ -679,7 +690,16 @@ class LoRAMemoryPool:
         lora_refs: Dict[str, LoRARef],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        loading_stream: Optional[torch.cuda.Stream] = None,
     ):
+        """
+        Prepare LoRA batch for inference.
+
+        If loading_stream is provided, enables pipelined loading with per-module
+        synchronization signals, allowing the compute stream to begin before all
+        layers are loaded.
+        """
+
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
             for buffer_id in range(self.max_loras_per_batch):
@@ -706,7 +726,8 @@ class LoRAMemoryPool:
 
             if not candidates:
                 raise ValueError(
-                    "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
+                    "No available buffer slots found. Please ensure the number of "
+                    "active (pinned) loras is less than max_loras_per_batch."
                 )
 
             # Prefer evicting LoRA adapters over the base model (None).
@@ -714,10 +735,8 @@ class LoRAMemoryPool:
             # and no other adapters can be evicted.
             non_none_candidates = candidates - {None}
             if non_none_candidates:
-                # Prioritize evicting actual LoRA adapters
                 candidates_to_use = non_none_candidates
             else:
-                # Only None is available for eviction (batch is all LoRA requests)
                 candidates_to_use = candidates
 
             # Select victim using eviction policy
@@ -748,6 +767,7 @@ class LoRAMemoryPool:
                     lora_modules,
                     lora_embed_tokens_module,
                     lora_lm_head_module,
+                    loading_stream=loading_stream,
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
@@ -760,7 +780,17 @@ class LoRAMemoryPool:
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        loading_stream: Optional[torch.cuda.Stream] = None,
     ):
+        """
+        Load LoRA weights into the buffer slot.
+
+        If loading_stream is provided, emits per-module pipeline signals
+        (mark_loading before DMA, mark_ready after) so the compute stream
+        can overlap with weight loading.
+        """
+        pipelined = loading_stream is not None
+
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
@@ -787,6 +817,7 @@ class LoRAMemoryPool:
             return
 
         assert lora_adapter is not None
+
         lora_rank = lora_adapter.config.r
 
         # Pre-validate weight names against target modules across all layers
@@ -826,6 +857,13 @@ class LoRAMemoryPool:
                 logger.warning(msg)
 
         for layer_id in range(self.num_layer):
+            # Signal this layer's shared flag as LOADING before DMA.
+            # All modules in a layer share one flag, so we only signal once.
+            if pipelined:
+                layer_flag = self._get_layer_pipeline_flag(lora_modules[layer_id])
+                if layer_flag is not None:
+                    layer_flag.mark_loading()
+
             layer = lora_adapter.layers[layer_id]
             layer_weights = layer.weights
             pinned_layer_weights = layer.pinned_weights
@@ -1188,6 +1226,25 @@ class LoRAMemoryPool:
                         # contracts over the full padded max_rank, so the tail must be clean.
                         target_buffer[buffer_id, :, lora_rank:].zero_()
 
+            # Signal this layer's shared flag as READY after DMA
+            if pipelined:
+                layer_flag = self._get_layer_pipeline_flag(lora_modules[layer_id])
+                if layer_flag is not None:
+                    layer_flag.mark_ready(loading_stream)
+
+        # Signal embed_tokens and lm_head as LOADING before embedding DMA
+        if pipelined:
+            if (
+                lora_embed_tokens_module is not None
+                and lora_embed_tokens_module._pipeline_flag is not None
+            ):
+                lora_embed_tokens_module._pipeline_flag.mark_loading()
+            if (
+                lora_lm_head_module is not None
+                and lora_lm_head_module._pipeline_flag is not None
+            ):
+                lora_lm_head_module._pipeline_flag.mark_loading()
+
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
             lora_added_tokens_size = lora_adapter.config.lora_added_tokens_size
@@ -1329,6 +1386,19 @@ class LoRAMemoryPool:
                 and "input_embeddings" in self.new_embeddings_buffer
             ):
                 self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+
+        # Signal embed_tokens and lm_head as READY after embedding DMA
+        if pipelined:
+            if (
+                lora_embed_tokens_module is not None
+                and lora_embed_tokens_module._pipeline_flag is not None
+            ):
+                lora_embed_tokens_module._pipeline_flag.mark_ready(loading_stream)
+            if (
+                lora_lm_head_module is not None
+                and lora_lm_head_module._pipeline_flag is not None
+            ):
+                lora_lm_head_module._pipeline_flag.mark_ready(loading_stream)
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType

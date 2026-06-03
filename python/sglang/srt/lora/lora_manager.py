@@ -302,9 +302,17 @@ class LoRAManager:
         return required_slots <= mem_pool_vacancy
 
     def fetch_new_loras(
-        self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
+        self,
+        new_loras: set[Optional[str]],
+        running_loras: set[Optional[str]] = set(),
+        loading_stream: Optional[torch.cuda.Stream] = None,
     ):
-        # Load active loras into lora memory pool
+        """
+        Load active LoRA adapters into the memory pool.
+
+        If loading_stream is provided, emits per-layer pipeline signals so the
+        compute stream can overlap with weight loading.
+        """
         cur_uids = new_loras | running_loras
 
         assert len(cur_uids) <= self.max_loras_per_batch
@@ -312,9 +320,10 @@ class LoRAManager:
             cur_uids=cur_uids,
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
-            lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
-            lora_embed_tokens_module=self.embed_tokens_module,  # merge into embedding or lora module
-            lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
+            lora_refs=self.lora_refs.copy(),
+            lora_embed_tokens_module=self.embed_tokens_module,
+            lora_lm_head_module=self.lm_head_module,
+            loading_stream=loading_stream,
         )
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
@@ -837,9 +846,8 @@ class LoRAManager:
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
-                )
+                lora_module = self.set_lora_module(module_name, module)
+                self.lora_modules[layer_id][module_name] = lora_module
                 continue
 
             if isinstance(module, FusedMoE) and all(
@@ -856,3 +864,24 @@ class LoRAManager:
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
                 lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
+
+        # Initialize pipeline flags for pipelined LoRA loading.
+        # All modules within the same transformer layer share a single flag
+        # since their weights are loaded together in one DMA batch.
+        if self.enable_lora_overlap_loading:
+            from sglang.srt.lora.lora_pipeline_sync import LoRAPipelineFlag
+
+            for layer_id in range(len(self.lora_modules)):
+                layer_flag = LoRAPipelineFlag(self.device)
+                for module in self.lora_modules[layer_id].values():
+                    module.init_pipeline_flag(layer_flag)
+            # embed_tokens and lm_head get their own flags (loaded separately)
+            if self.embed_tokens_module is not None:
+                self.embed_tokens_module.init_pipeline_flag(
+                    LoRAPipelineFlag(self.device)
+                )
+            if self.lm_head_module is not None:
+                self.lm_head_module.init_pipeline_flag(
+                    LoRAPipelineFlag(self.device)
+                )
+
