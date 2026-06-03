@@ -34,12 +34,12 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.utils import require_gathered_buffer
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-        BaseCudaGraphBackend,
-    )
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+        BaseCudaGraphBackend,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,6 @@ def get_batch_sizes_to_capture(
     Filters ``cuda_graph_config[decode].bs`` by attention-tp/cp alignment
     constraints and clamps to req_to_token_pool.size.
     """
-    from sglang.srt.model_executor.cuda_graph_config import Phase
 
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_config.decode.bs

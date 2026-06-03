@@ -17,9 +17,6 @@ Public API:
     runners that were authored against the legacy public surface.
 """
 
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (  # noqa: F401
-    TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
-)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (  # noqa: F401
     BaseCudaGraphRunner,
     freeze_gc,
@@ -33,6 +30,9 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (  # noqa:
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa: F401
     PrefillCudaGraphRunner,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (  # noqa: F401
+    TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.model_executor.runner_utils import (  # noqa: F401
     DecodeInputBuffers,

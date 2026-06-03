@@ -55,17 +55,26 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+    compute_local_num_token_non_padded,
+    enable_num_token_non_padded,
+)
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    BaseCudaGraphRunner,
+    freeze_gc,
+    get_batch_sizes_to_capture,
+)
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.factory import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
-)
-from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-    BaseCudaGraphRunner,
-    freeze_gc,
-    get_batch_sizes_to_capture,
 )
 from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
@@ -77,15 +86,6 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-    compute_local_num_token_non_padded,
-    enable_num_token_non_padded,
-)
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -557,9 +557,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_out_graph(
-                forward_batch, in_capture=True
-            )
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
                 if self.model_runner.is_hybrid_swa:

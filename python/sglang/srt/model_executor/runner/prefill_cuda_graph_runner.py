@@ -43,20 +43,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.model_executor.runner_backend.factory import (
-    resolve_prefill_backend,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    set_tc_piecewise_forward_context,
-)
-from sglang.srt.model_executor.cuda_graph_config import Phase
-from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-    BaseCudaGraphRunner,
-    freeze_gc,
-)
-from sglang.srt.model_executor.runner_utils.buffers import (
-    PrefillInputBuffers,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -64,6 +50,19 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    BaseCudaGraphRunner,
+    freeze_gc,
+)
+from sglang.srt.model_executor.runner_backend.factory import (
+    resolve_prefill_backend,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    set_tc_piecewise_forward_context,
+)
+from sglang.srt.model_executor.runner_utils.buffers import (
+    PrefillInputBuffers,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions.
