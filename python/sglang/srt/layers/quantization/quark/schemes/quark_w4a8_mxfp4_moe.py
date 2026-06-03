@@ -77,6 +77,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 f"Found {self.input_quant}."
             )
 
+
         self.with_bias = False
 
     @classmethod
@@ -347,4 +348,6 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             intermediate_pad=self.intermediate_pad,
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
         )
-        return self.runner.run(dispatch_output._replace(hidden_states=x_padded), quant_info)
+        return self.runner.run(
+            dispatch_output._replace(hidden_states=x_padded), quant_info
+        )
