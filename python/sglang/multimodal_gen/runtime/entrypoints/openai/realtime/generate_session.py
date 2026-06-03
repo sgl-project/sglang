@@ -36,6 +36,8 @@ class GenerateSession:
         self.realtime_session = RealtimeSession()
         self.adapter: RealtimeModelAdapter | None = None
         self.adapter_state: Any = None
+        self.output_pace_next_send_at: float | None = None
+        self.output_pace_last_event_id: int | None = None
 
     def set_adapter(self, adapter: RealtimeModelAdapter):
         self.adapter = adapter
@@ -53,6 +55,8 @@ class GenerateSession:
         self.current_chunk = None
         self.adapter = None
         self.adapter_state = None
+        self.output_pace_next_send_at = None
+        self.output_pace_last_event_id = None
         self.realtime_session.dispose()
 
     def new_chunk(self) -> RealtimeChunkContext:

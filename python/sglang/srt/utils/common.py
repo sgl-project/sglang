@@ -283,6 +283,11 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+is_sm80_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+    )
+)
 is_sm90_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -1154,7 +1159,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.11.post1")
+        min_version: Minimum version required (e.g., "0.6.12")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -3647,6 +3652,18 @@ def is_gfx95_supported():
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
     else:
         return False
 
