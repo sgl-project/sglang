@@ -264,32 +264,6 @@ function drawIdle() {
   renderedPreviewFrames = 0;
   ctx.fillStyle = "#11140f";
   ctx.fillRect(0, 0, w, h);
-
-  const surface = ctx.createLinearGradient(0, 0, 0, h);
-  surface.addColorStop(0, "rgba(238,241,236,0.045)");
-  surface.addColorStop(0.5, "rgba(238,241,236,0.012)");
-  surface.addColorStop(1, "rgba(0,0,0,0.16)");
-  ctx.fillStyle = surface;
-  ctx.fillRect(0, 0, w, h);
-
-  ctx.strokeStyle = "rgba(238,241,236,0.11)";
-  ctx.lineWidth = 1;
-  ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
-  ctx.strokeStyle = "rgba(238,241,236,0.08)";
-  ctx.beginPath();
-  if (ctx.roundRect) {
-    ctx.roundRect(w * 0.38, h * 0.42, w * 0.24, h * 0.16, 18);
-  } else {
-    ctx.rect(w * 0.38, h * 0.42, w * 0.24, h * 0.16);
-  }
-  ctx.stroke();
-
-  ctx.fillStyle = "rgba(238,241,236,0.22)";
-  for (let i = -1; i <= 1; i++) {
-    ctx.beginPath();
-    ctx.arc(w * 0.5 + i * 22, h * 0.5, 4.5, 0, Math.PI * 2);
-    ctx.fill();
-  }
 }
 
 function resetStreamStats() {
