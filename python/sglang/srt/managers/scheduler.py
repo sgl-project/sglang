@@ -3019,9 +3019,10 @@ class Scheduler(
         num_layers = self.model_config.num_hidden_layers
         page_size = self.token_to_kv_pool_allocator.page_size
 
-        # Prepare KV page indices for all requests (same for every layer)
+        # Prepare KV page indices for requests that can be sent per-layer.
         req_page_indices_list = []
         for req in batch.reqs:
+            req.pipelined_kv_sent = False
             start_idx = req.start_send_idx
             end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
             kv_indices = (
@@ -3051,9 +3052,10 @@ class Scheduler(
             if ret is not None:
                 logits_output = ret
 
-            # Enqueue KV transfer for all layers in this group.
-            # Skip chunked (non-last) requests — their KV is sent via
-            # send_kv_chunk in process_batch_result after the forward pass.
+            # Enqueue KV transfer for all layers in this group. Requests with
+            # no pages, or with unfinished chunked-prefill chunks, fall back to
+            # send_kv_chunk in process_batch_result so their final metadata is
+            # still sent.
             is_last_group = group_end == num_layers
             for req, page_indices in zip(batch.reqs, req_page_indices_list):
                 if len(page_indices) == 0 or req.inflight_middle_chunks > 0:
@@ -3069,8 +3071,8 @@ class Scheduler(
                             req.pipelined_state_indices if is_last else None
                         ),
                     )
-                # Mark KV as fully sent so send_kv_chunk won't resend
                 if is_last_group:
+                    req.pipelined_kv_sent = True
                     req.start_send_idx = min(
                         len(req.fill_ids), len(req.origin_input_ids)
                     )

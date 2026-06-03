@@ -371,6 +371,34 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def _batch_needs_staging_for_heterogeneous_tp(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> bool:
+        if not getattr(self, "enable_staging", False):
+            return False
+
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        transfer_infos = getattr(kv_mgr, "transfer_infos", {})
+        decode_kv_args_table = getattr(kv_mgr, "decode_kv_args_table", {})
+        attn_tp_size = getattr(kv_mgr, "attn_tp_size", self.ps.attn_tp_size)
+
+        for req in batch.reqs:
+            room = getattr(req, "bootstrap_room", None)
+            if room is None:
+                continue
+            for transfer_info in transfer_infos.get(room, {}).values():
+                if transfer_info.is_dummy:
+                    continue
+                register_info = decode_kv_args_table.get(
+                    transfer_info.mooncake_session_id
+                )
+                if (
+                    register_info is not None
+                    and register_info.dst_attn_tp_size != attn_tp_size
+                ):
+                    return True
+        return False
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -500,6 +528,11 @@ class SchedulerDisaggregationPrefillMixin:
         if any(req.input_embeds is not None for req in batch.reqs):
             return 0
 
+        # The layer path bypasses staging gather/scatter. When staging is needed
+        # for heterogeneous TP, use the normal chunk path.
+        if self._batch_needs_staging_for_heterogeneous_tp(batch):
+            return 0
+
         # If user explicitly set group_size, it takes priority over all heuristics.
         if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
             return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
@@ -561,14 +594,13 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
-                if self.enable_staging:
-                    self.maybe_prefetch_staging_for_batch(batch)
                 group_size = self._get_pipeline_group_size(batch)
                 if group_size > 0:
                     result = self.run_batch_pipelined(batch, group_size=group_size)
-                    batch._pipelined_kv_sent = True
                     self.process_batch_result(batch, result)
                 else:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
             else:
@@ -634,11 +666,10 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue.
         Adapted from process_batch_result_prefill.
 
-        When pipelined=True (or batch._pipelined_kv_sent is set), KV data was
-        already sent per-layer in run_batch_pipelined, so only the metadata
-        buffer is set here instead of calling send_kv_chunk.
+        When pipelined=True, or req.pipelined_kv_sent is set by
+        run_batch_pipelined, KV data was already sent per-layer, so only the
+        metadata buffer is set here instead of calling send_kv_chunk.
         """
-        pipelined = pipelined or getattr(batch, "_pipelined_kv_sent", False)
         (
             logits_output,
             next_token_ids,
@@ -709,7 +740,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
 
-                if pipelined:
+                if pipelined or getattr(req, "pipelined_kv_sent", False):
                     # KV already sent per-layer in run_batch_pipelined.
                     # Only set the metadata buffer here.
                     self.disagg_metadata_buffers.set_buf(req)

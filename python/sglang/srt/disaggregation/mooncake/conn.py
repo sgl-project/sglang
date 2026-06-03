@@ -1848,7 +1848,13 @@ class MooncakeKVSender(CommonKVSender):
         state_indices: Optional[List[int]] = None,
     ):
         """Enqueue a single layer's KV transfer for layer-pipelined mode."""
-        index_slice = slice(0, len(kv_indices))
+        kv_indices, index_slice, should_skip = self._prepare_layer_send_indices(
+            kv_indices,
+            is_last,
+        )
+        if should_skip:
+            return
+
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,

@@ -63,6 +63,9 @@ class FakeKVSender(BaseKVSender):
     def get_transfer_metric(self) -> KVTransferMetric:
         return KVTransferMetric()
 
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0 or last_chunk
+
     def init(
         self,
         kv_indices: list[int],
