@@ -47,16 +47,16 @@ try:
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
-    from aiter.ops.triton.gluon.pa_decode_gluon import (
-        get_recommended_splits,
-        pa_decode_gluon,
-    )
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.aiter_utils import (
+    forward_decode_vectorized_5d,
+    forward_extend_vectorized_5d,
+)
 from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
@@ -219,13 +219,12 @@ class AiterAttnBackend(AttentionBackend):
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        # Plan A: detect SHUFFLE 5D ("vectorized") KV cache layout. When active
+        # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
         # we (a) skip the launch_reshape_and_cache_flash shortcut and always go
         # through `set_kv_buffer` (which dispatches to the 5D Triton writer),
-        # and (b) route the decode attention through `mha_batch_prefill_func`
-        # (q_len=1 per seq) since unified_attention's 4D `.view(-1, page, H, D)`
-        # cannot be applied to a 5D pool. pa_decode_gluon for full-attn decode
-        # is wired separately in P6 for the perf win.
+        # and (b) route the decode attention through pa_decode_gluon (see the
+        # corresponding branch in forward_decode), since unified_attention's
+        # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
         def _pool_is_vec5d(pool):
             if isinstance(pool, SWAKVPool):
                 return getattr(pool.full_kv_pool, "kv_cache_layout", "nhd") == (
@@ -1985,7 +1984,7 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                # Plan A: 5D pool cannot be reshaped to the 4D paged view used by
+                # 5D pool cannot be reshaped to the 4D paged view used by
                 # launch_reshape_and_cache_flash; always route through
                 # set_kv_buffer which dispatches to the SHUFFLE 5D writer.
                 if self.kv_cache_is_vectorized_5d:
@@ -2374,165 +2373,20 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
-            # Plan A debug shortcut: when --disable-radix-cache (no prefix
-            # reuse) we already have the entire prompt's K/V as the freshly
-            # arrived (k, v) inputs — no need to read the pool. Run
-            # mha_batch_prefill_func in 3D LINEAR mode against (k, v)
-            # directly in their native bf16 (q/k/v come from QKV projection
-            # before any fp8 cast). No descale arguments needed since no
-            # data is read from the fp8 cache here.
-            _extend_no_prefix = (
-                forward_batch.extend_prefix_lens_cpu is not None
-                and not any(forward_batch.extend_prefix_lens_cpu)
-            )
-            if _extend_no_prefix:
-                k_lin = k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-                v_lin = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
-                total_tokens = k_lin.shape[0]
-                kv_indices_lin = torch.arange(
-                    total_tokens, dtype=torch.int32, device=k_lin.device
-                )
-                kv_indptr_lin = self.qo_indptr[:bs0]
-                max_q = int(self.forward_metadata.max_q_len)
-                o = mha_batch_prefill_func(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_lin,
-                    v_lin,
-                    self.qo_indptr[:bs0],
-                    kv_indptr_lin,
-                    kv_indices_lin,
-                    max_q,
-                    max_q,
-                    causal=True,
-                    logits_soft_cap=self.logits_soft_cap,
-                    alibi_slopes=None,
-                    return_lse=False,
-                    return_attn_probs=False,
-                    window_size=window_size,
-                    sink_ptr=sinks,
-                )
-                if o.dtype != self.input_dtype:
-                    o = o.to(self.input_dtype)
-                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-            # Plan A: when a chunked-prefill (or any non-first-chunk) batch
-            # reaches forward_extend with non-zero extend_prefix_lens, the
-            # aiter `mha_batch_prefill_func` paged path below does not have
-            # a compiled kernel for our (page_size=64, bf16/fp8, SHUFFLE 5D)
-            # configuration and aborts with "no matching kernel found".
-            # Sidestep it for the 5D pool by gathering the full per-request
-            # K/V (prefix + just-written fresh tokens — `set_kv_buffer` has
-            # already happened by the time forward_extend runs) from the 5D
-            # pool into a contiguous (T, H, D) buffer via a triton inverse
-            # of the SHUFFLE writer, then running mha_batch_prefill_func in
-            # 3D LINEAR mode (page_size=1) which *does* have a working
-            # kernel. fp8-store layers are gathered as raw fp8 and the
-            # per-tensor descales are forwarded to the kernel — aiter's
-            # LINEAR-mode prefill supports fp8 KV natively, so no host-side
-            # dequant is needed.
             if self.kv_cache_is_vectorized_5d:
-                # Late-import to keep the NHD path import-clean.
-                from sglang.srt.layers.attention.utils import (
-                    launch_gather_shuffle_5d_to_linear,
+                return forward_extend_vectorized_5d(
+                    self,
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    bs0,
+                    window_size,
+                    sinks,
                 )
 
-                bs = forward_batch.batch_size
-
-                # SWA layers gather from the SWA sub-pool via swa_page_table;
-                # full-attn layers gather from the full sub-pool via kv_indices.
-                # Both are per-TOKEN slot id lists populated by
-                # `create_flashinfer_kv_indices_triton` from `req_to_token`
-                # (req_to_token stores one slot id per logical token), so the
-                # first `seq_lens_sum` entries of either tensor are exactly
-                # the per-token absolute pool slot ids in request-major order
-                # — no per-token gather metadata to build on host.
-                is_swa_layer = (
-                    layer.sliding_window_size is not None
-                    and layer.sliding_window_size > -1
-                    and self.forward_metadata.swa_page_table is not None
-                )
-                total_kv = int(forward_batch.seq_lens_sum)
-                if is_swa_layer:
-                    slot_ids = self.forward_metadata.swa_page_table[:total_kv]
-                else:
-                    slot_ids = self.forward_metadata.kv_indices[:total_kv]
-
-                # Resolve the raw 5D K/V buffer for this layer (going through
-                # the SWA→sub-pool mapping when applicable).
-                pool = self.token_to_kv_pool
-                if hasattr(pool, "layers_mapping"):
-                    sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
-                    sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
-                else:
-                    sub_pool = pool
-                    sub_layer_id = layer.layer_id
-                k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
-                v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
-
-                k_lin, v_lin = launch_gather_shuffle_5d_to_linear(
-                    k_buf, v_buf, slot_ids
-                )
-                # k_lin / v_lin come out in `store_dtype` (uint8 for fp8
-                # pools because Tensor.index_put isn't implemented for fp8
-                # — see MHATokenToKVPool ctor). Reinterpret them back to
-                # the compute dtype so aiter sees matching q/k/v dtypes.
-                # The bytes are identical; this is a zero-copy view.
-                if sub_pool.store_dtype != sub_pool.dtype:
-                    k_lin = k_lin.view(sub_pool.dtype)
-                    v_lin = v_lin.view(sub_pool.dtype)
-                # For fp8 K/V we hand the raw fp8 tensors and the layer's
-                # per-tensor descales straight to aiter — its LINEAR-mode
-                # mha_batch_prefill_func supports fp8 K/V/Q natively, so
-                # no host-side dequant is needed.
-                if sub_pool.dtype == fp8_dtype:
-                    q_local = q.to(fp8_dtype)
-                    q_descale_local = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    k_descale_local = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    v_descale_local = (
-                        layer.v_scale if layer.v_scale is not None else self.v_scale
-                    )
-                else:
-                    q_local = q
-                    q_descale_local = None
-                    k_descale_local = None
-                    v_descale_local = None
-
-                kv_indptr_lin = self.forward_metadata.kv_indptr[:bs0]
-                kv_indices_lin = torch.arange(
-                    total_kv, dtype=torch.int32, device=k_lin.device
-                )
-                max_kv = int(self.forward_metadata.max_kv_len)
-                max_q = int(self.forward_metadata.max_q_len)
-
-                o = mha_batch_prefill_func(
-                    q_local.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_lin,
-                    v_lin,
-                    self.qo_indptr[:bs0],
-                    kv_indptr_lin,
-                    kv_indices_lin,
-                    max_q,
-                    max_kv,
-                    causal=True,
-                    logits_soft_cap=self.logits_soft_cap,
-                    alibi_slopes=None,
-                    return_lse=False,
-                    return_attn_probs=False,
-                    window_size=window_size,
-                    sink_ptr=sinks,
-                    q_descale=q_descale_local,
-                    k_descale=k_descale_local,
-                    v_descale=v_descale_local,
-                )
-                if o.dtype != self.input_dtype:
-                    o = o.to(self.input_dtype)
-                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-            # NHD fallback path below — original aiter paged batch_prefill.
+            # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
                 q = q.to(fp8_dtype)
@@ -2599,7 +2453,7 @@ class AiterAttnBackend(AttentionBackend):
             v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
 
         if save_kv_cache:
-            # Plan A: 5D pool path — see forward_extend for rationale.
+            # SHUFFLE 5D pool path — see forward_extend for rationale.
             if self.kv_cache_is_vectorized_5d:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v, k_descale, v_descale
@@ -2698,90 +2552,12 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 o = torch.empty_like(q, dtype=self.input_dtype)
 
-            # Plan A: when the env-driven SHUFFLE 5D layout is active both
-            # the full-attn and SWA sub-pools are allocated 5D (see
-            # SWAKVPool ctor), so we route BOTH layer kinds through
-            # pa_decode_gluon below. SWA layers pass swa_page_table +
-            # sliding_window=layer.sliding_window_size; full-attn layers
-            # pass the normal kv_indices + sliding_window=0. The legacy
-            # unified_attention path is only taken when the layout is NHD.
-            is_swa_layer = (
-                layer.sliding_window_size is not None and layer.sliding_window_size > -1
-            )
             if self.kv_cache_is_vectorized_5d:
-                # Plan A (P6) v2 perf-tuned: pa_decode_gluon for full + SWA.
-                # Reuses preallocated scratch (self._pa_*) and a per-step
-                # cached ctx_lens int32 (self._pa_ctx_lens_i32_view /
-                # _pa_ctx_lens_swa_i32_view) to avoid 36-layers-worth of
-                # repeated torch.empty / .to(int32) / .clamp calls per step.
-                bs = forward_batch.batch_size
-                num_kv_heads = layer.tp_k_head_num
-                num_q_heads = layer.tp_q_head_num
-                q_group = num_q_heads // num_kv_heads
-                if is_swa_layer:
-                    block_tables_pa = (
-                        self.forward_metadata.swa_page_table
-                        if self.forward_metadata.swa_page_table is not None
-                        else self.forward_metadata.kv_indices
-                    )
-                    ctx_lens_pa = forward_batch.seq_lens
-                    ctx_part = 256
-                    max_part_num = 1
-                    sliding_window_arg = int(layer.sliding_window_size)
-                else:
-                    block_tables_pa = self.forward_metadata.kv_indices
-                    ctx_lens_pa = forward_batch.seq_lens
-                    ctx_part = 256
-                    max_part_num = get_recommended_splits(bs, num_kv_heads)
-                    sliding_window_arg = 0
-
-                q_in = q.view(-1, num_q_heads, layer.qk_head_dim)
-                # Direct view of o as kernel output — saves a per-layer
-                # o.copy_ of bs*H_q*D bf16 elementwise.
-                o_view = o.view(-1, num_q_heads, layer.v_head_dim)
-                exp_sums = torch.empty(
-                    (bs, num_kv_heads, max_part_num, q_group),
-                    dtype=torch.float32,
-                    device=q_in.device,
-                )
-                max_logits = torch.empty_like(exp_sums)
-                temporary_output = torch.empty(
-                    (bs, num_kv_heads, max_part_num, q_group, layer.qk_head_dim),
-                    dtype=q_in.dtype,
-                    device=q_in.device,
-                )
-                # For fp8 KV cache the kernel needs per-tensor dequant scales
-                # (key_scale/value_scale). Without them the fp8 bytes are
-                # interpreted as fp8 values directly with no dequant.
-                _pa_key_scale = None
-                _pa_value_scale = None
-                if self.kv_cache_dtype == fp8_dtype:
-                    _pa_key_scale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    _pa_value_scale = (
-                        layer.v_scale if layer.v_scale is not None else self.v_scale
-                    )
-                pa_decode_gluon(
-                    output=o_view,
-                    query=q_in,
-                    key_cache=k_cache,
-                    value_cache=v_cache,
-                    context_lengths=ctx_lens_pa,
-                    block_tables=block_tables_pa,
-                    softmax_scale=layer.scaling,
-                    query_length=1,
-                    max_context_partition_num=max_part_num,
-                    context_partition_size=ctx_part,
-                    compute_type=self.input_dtype,
-                    key_scale=_pa_key_scale,
-                    value_scale=_pa_value_scale,
-                    exp_sums=exp_sums,
-                    max_logits=max_logits,
-                    temporary_output=temporary_output,
-                    sinks=sinks,
-                    sliding_window=sliding_window_arg,
-                    ps=True,
+                # SHUFFLE 5D pool: pa_decode_gluon for full + SWA layers
+                # (see :func:`aiter_utils.forward_decode_vectorized_5d`
+                # for the dispatch rationale).
+                forward_decode_vectorized_5d(
+                    self, q, layer, forward_batch, k_cache, v_cache, o, sinks
                 )
             elif self.use_triton_unified_attention:
                 bs = forward_batch.batch_size

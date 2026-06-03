@@ -405,8 +405,8 @@ class Envs:
     # and V as (num_blocks, H_kv, page_size/x, head_dim, x) (x = 16 / dtype_size),
     # matching the SHUFFLE layout that aiter's CK FmhaBatchPrefill kernel and
     # `aiter.ops.triton.gluon.pa_decode_gluon` both consume natively. This is
-    # the Plan A KV layout that enables pa_decode_gluon for full-attn decode
-    # without runtime permutes.
+    # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
+    # decode without runtime permutes.
     SGLANG_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)

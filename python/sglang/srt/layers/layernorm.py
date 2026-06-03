@@ -229,18 +229,20 @@ class RMSNorm(MultiPlatformOp):
         # `fused_add_rmsnorm_pad` Triton kernel. The padded output has
         # shape (M, ceil(N/x_pad_to_multiple)*x_pad_to_multiple); the
         # residual_out stays at the original (M, N) shape.
-        self.x_pad_to_multiple = x_pad_to_multiple
-        self._fused_pad_kernel = None
-        if _use_aiter and x_pad_to_multiple > 0:
-            try:
-                from aiter.ops.triton.fused_add_rmsnorm_pad import (
-                    fused_add_rmsnorm_pad as _fused_add_rmsnorm_pad,
-                )
 
-                self._fused_pad_kernel = _fused_add_rmsnorm_pad
-            except ImportError:
-                self._fused_pad_kernel = None
         if _use_aiter:
+            self.x_pad_to_multiple = x_pad_to_multiple
+            self._fused_pad_kernel = None
+
+            if x_pad_to_multiple > 0:
+                try:
+                    from aiter.ops.triton.fused_add_rmsnorm_pad import (
+                        fused_add_rmsnorm_pad as _fused_add_rmsnorm_pad,
+                    )
+
+                    self._fused_pad_kernel = _fused_add_rmsnorm_pad
+                except ImportError:
+                    self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
 
     def forward_cuda(

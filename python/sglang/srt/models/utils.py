@@ -277,8 +277,8 @@ class AutoWeightsLoader:
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache.
 
-    Plan A: SHUFFLE 5D pools on HIP also work — the underlying triton
-    kernel (`fused_qk_rope_reshape_and_cache`) natively supports the 5D
+    SHUFFLE 5D pools on HIP also work — the underlying triton kernel
+    (`fused_qk_rope_reshape_and_cache`) natively supports the 5D
     SHUFFLE layout (key_cache.ndim==5, value_cache.ndim==5). We just need
     the per-layer arg builder to pass the raw 5D buffers without the
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
@@ -321,7 +321,7 @@ def create_fused_set_kv_buffer_arg(
             if layer.sliding_window_size > 0
             else None
         )
-        # Plan A: SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
+        # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
         # fused_qk_rope_reshape_and_cache via flash_layout=False. For the
         # legacy NHD 3D pool we reshape to the (num_blocks, page_size, H, D)
         # paged view the kernel expects under flash_layout=True.

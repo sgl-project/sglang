@@ -360,7 +360,7 @@ class RotaryEmbedding(MultiPlatformOp):
             if fused_set_kv_buffer_arg is not None and _is_hip:
                 extra_args = fused_set_kv_buffer_arg
                 k_cache = fused_set_kv_buffer_arg["key_cache"]
-                # Plan A: 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;
+                # 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;
                 # NHD 3D pool feeds the legacy 4D paged view. Auto-detect.
                 is_shuffle_5d = k_cache.ndim == 5
                 if is_shuffle_5d:

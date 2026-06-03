@@ -812,8 +812,8 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
-        # Plan A: explicit per-pool override for the physical KV layout.
-        # When None (default) the env var SGLANG_KV_CACHE_LAYOUT is consulted.
+        # Explicit per-pool override for the physical KV layout. When
+        # None (default) the env var SGLANG_KV_CACHE_LAYOUT is consulted.
         # SWAKVPool passes "nhd" explicitly for its SWA sub-pool so the SWA
         # decode path continues using unified_attention on the legacy layout.
         kv_cache_layout: Optional[str] = None,
@@ -836,7 +836,7 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
-        # Plan A: optional SHUFFLE 5D ("vectorized") physical layout for K/V.
+        # Optional SHUFFLE 5D ("vectorized") physical layout for K/V.
         # Selected by `SGLANG_KV_CACHE_LAYOUT=vectorized_5d`. When active:
         #   K shape: (num_blocks, H, D_k // X, page, X)
         #   V shape: (num_blocks, H, page // X, D_v, X)   where X = 16 / dtype_bytes

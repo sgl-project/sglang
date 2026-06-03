@@ -70,7 +70,7 @@ class SWAKVPool(BaseSWAKVPool):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        # Plan A v2: both sub-pools follow the env-driven layout so SWA
+        # Both sub-pools follow the env-driven layout so SWA
         # decode can also route through pa_decode_gluon. SWA semantics:
         # swa_page_table[i] is left-aligned to FULL seq_len; positions
         # outside the window are mapped to dummy swa slot 0. The kernel
