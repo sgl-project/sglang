@@ -329,6 +329,11 @@ class TestPushRun(CustomTestCase):
         mock_manifest.return_value = ([existing_row], json.dumps(existing_row) + "\n")
         mock_api = MagicMock()
         mock_api_cls.return_value = mock_api
+        # Capture pt file count before push_run cleans up the temp staging dir.
+        captured_pt_count = []
+        mock_api.upload_folder.side_effect = lambda *a, **kw: captured_pt_count.append(
+            len(list(Path(kw["folder_path"]).rglob("*.pt")))
+        )
 
         with tempfile.TemporaryDirectory() as tensor_dir:
             (Path(tensor_dir) / "layer0.pt").write_bytes(b"\x01")
@@ -340,10 +345,7 @@ class TestPushRun(CustomTestCase):
                 meta={"tp_size": 8},
             )
 
-        folder_call = mock_api.upload_folder.call_args
-        staged_path = Path(folder_call[1]["folder_path"])
-        pt_files = list(staged_path.rglob("*.pt"))
-        self.assertEqual(len(pt_files), 0)
+        self.assertEqual(captured_pt_count[0], 0)
 
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
@@ -357,6 +359,11 @@ class TestPushRun(CustomTestCase):
         mock_manifest.return_value = ([existing_row], json.dumps(existing_row) + "\n")
         mock_api = MagicMock()
         mock_api_cls.return_value = mock_api
+        # Capture pt file count before push_run cleans up the temp staging dir.
+        captured_pt_count = []
+        mock_api.upload_folder.side_effect = lambda *a, **kw: captured_pt_count.append(
+            len(list(Path(kw["folder_path"]).rglob("*.pt")))
+        )
 
         with tempfile.TemporaryDirectory() as tensor_dir:
             (Path(tensor_dir) / "layer0.pt").write_bytes(b"\x01")
@@ -369,10 +376,7 @@ class TestPushRun(CustomTestCase):
                 force=True,
             )
 
-        folder_call = mock_api.upload_folder.call_args
-        staged_path = Path(folder_call[1]["folder_path"])
-        pt_files = list(staged_path.rglob("*.pt"))
-        self.assertGreater(len(pt_files), 0)
+        self.assertGreater(captured_pt_count[0], 0)
 
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
@@ -414,7 +418,13 @@ class TestPushRun(CustomTestCase):
     @patch.object(hfs, "_read_manifest")
     def test_includes_comparator_report(self, mock_manifest, mock_api_cls):
         mock_manifest.return_value = ([], "")
-        mock_api_cls.return_value = MagicMock()
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+        # Capture file existence before push_run cleans up the temp staging dir.
+        captured_files = []
+        mock_api.upload_folder.side_effect = lambda *a, **kw: captured_files.append(
+            list(Path(kw["folder_path"]).iterdir())
+        )
 
         with tempfile.TemporaryDirectory() as tensor_dir:
             (Path(tensor_dir) / "layer0.pt").write_bytes(b"\x01")
@@ -430,9 +440,8 @@ class TestPushRun(CustomTestCase):
                 comparator_report=report_path,
             )
 
-        folder_call = mock_api_cls.return_value.upload_folder.call_args
-        staged = Path(folder_call[1]["folder_path"])
-        self.assertTrue((staged / "comparator_report.jsonl").exists())
+        staged_names = [f.name for f in captured_files[0]]
+        self.assertIn("comparator_report.jsonl", staged_names)
 
 
 class TestPruneOldRuns(CustomTestCase):
