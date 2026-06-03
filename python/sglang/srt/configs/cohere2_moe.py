@@ -44,6 +44,10 @@ class Cohere2MoeConfig(PretrainedConfig):
     rms_norm_eps: float | None = None
     sliding_window_pattern: int = 4
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.__post_init__(**kwargs)
+
     def __post_init__(self, **kwargs):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
@@ -73,8 +77,6 @@ class Cohere2MoeConfig(PretrainedConfig):
                 for i in range(self.num_hidden_layers - self.first_k_dense_replace)
             ]
             self.layer_types = prefix_layers + rest_layers
-
-        super().__post_init__(**kwargs)
 
 
 try:
