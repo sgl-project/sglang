@@ -1,0 +1,571 @@
+---
+title: NVIDIA Nemotron3-Super
+metatags:
+    description: "Deploy NVIDIA Nemotron3-Super with SGLang - 120B hybrid MoE model (12B active) with 1M context window optimized for multi-agent systems and tool use."
+---
+
+import { Nemotron3SuperDeployment } from '/src/snippets/autoregressive/nemotron3-super-deployment.jsx';
+
+## 1. Model Introduction
+
+`NVIDIA Nemotron3-Super` is a leading open model in the Nemotron 3 family, built for running many collaborating agents together. It is optimized for agentic systems that chain planning, reasoning, and tool use workloads that generate far more tokens than single turn chat and require strong reasoning at every step.
+
+Nemotron 3 Super is a 120B parameter hybrid MoE model that activates only 12B parameters per forward pass, delivering strong accuracy for coding, tool calling, and instruction following at a fraction of the cost. It also supports a 1M token context window so agents can keep conversation history and plan state in view across long workflows.
+
+Architecture and key features:
+
+- **Hybrid Transformer-Mamba Architecture (MoE):** Combines Mixture of Experts with a hybrid Transformer-Mamba architecture, enabling efficient routing and sequence modeling in a single stack.
+- **Highest throughput efficiency in its size category:** Delivers up to 5x higher throughput compared to the previous Nemotron Super model (Llama Nemotron Super 1.5).
+- **Multi-Token Prediction (MTP):** By predicting several future tokens simultaneously in a single forward pass, MTP drastically accelerates the generation of long-form text.
+- **Thinking Budget support:** Supports Thinking Budget for optimal accuracy with minimum reasoning token generation.
+
+## 2. SGLang Installation
+
+SGLang from the main branch is required for Nemotron3-Super. You can install from source and with a nightly docker.
+
+```bash Command
+# Install from source
+uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+
+# Or use Docker
+docker pull lmsysorg/sglang:nightly-dev-20260310-0fd9a57d
+```
+
+For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+## 3. Model Deployment
+
+This section provides a progressive guide from quick deployment to performance tuning.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: select hardware, tensor parallelism, and common knobs to generate a launch command.
+
+<Nemotron3SuperDeployment />
+
+### 3.2 Configuration Tips
+
+- **Attention backend**:
+
+    **H200**: Use flash attention 3 backend by default.
+    **B200**: Use flashinfer backend by default.
+
+- **TP support**:
+
+    To set tp size, use `--tp <2|4|8>`.
+
+- **FP8 KV cache**:
+
+    To enable fp8 kv cache, please append `--kv-cache-dtype fp8_e4m3`.
+
+## 4. Model Invocation
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
+  --host 0.0.0.0 \
+  --port 5000 \
+  --trust-remote-code \
+  --tp 4 \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser nemotron_3
+```
+
+### 4.1 Basic Usage (OpenAI-Compatible API)
+
+SGLang provides an OpenAI-compatible endpoint. Example with the OpenAI Python client:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:5000/v1",
+    api_key="EMPTY",
+)
+
+resp = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant."},
+        {"role": "user", "content": "Give me 3 bullet points about SGLang."},
+    ],
+    temperature=0.6,
+    max_tokens=1024,
+)
+print("Reasoning:", resp.choices[0].message.reasoning_content, "\nContent:", resp.choices[0].message.content)
+print("\n")
+```
+
+Output:
+```text Output
+Reasoning: Okay, the user is asking for 3 bullet points about SGLang. Let me recall what I know about SGLang. It's a framework for serving large language models, right? Developed by the team at UC Berkeley and others.
+
+First, I should verify the key features. SGLang is known for its high-performance serving capabilities, especially with features like Radix Attention and chunked prefill. Those are important points to mention...(more tokens)
+
+Content: - SGLang introduces **Radix Attention**, an innovative attention mechanism that significantly reduces KV cache memory usage and improves computational efficiency during LLM serving by reusing intermediate states across tokens.
+- It features **chunked prefill** for handling long prompts efficiently, breaking input sequences into manageable chunks to minimize latency and memory pressure while maintaining high throughput.
+- Designed for **high-performance LLM serving**, SGLang achieves superior throughput and lower latency compared to traditional systems (like vLLM or TensorRT-LLM) through optimized kernel fusion, dynamic batching, and seamless integration with Hugging Face Transformers.
+```
+
+Streaming chat completion:
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:5000/v1",
+    api_key="EMPTY",
+)
+
+stream = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant."},
+        {"role": "user", "content": "What are the first 5 prime numbers?"}
+    ],
+    temperature=0.7,
+    max_tokens=1024,
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta and delta.content:
+        print(delta.content, end="", flush=True)
+```
+
+Output:
+```text Output
+The first 5 prime numbers are:
+**2, 3, 5, 7, 11**.
+
+### Explanation:
+- A **prime number** is a natural number greater than 1 that has no positive divisors other than 1 and itself.
+- **2** is the smallest and only even prime number.
+- **3** is prime (divisible only by 1 and 3).
+- **4** is not prime (divisible by 2).
+- **5** is prime.
+- **6** is not prime (divisible by 2 and 3).
+- **7** is prime.
+- **8, 9, 10** are not prime.
+- **11** is prime (the fifth in the sequence).
+
+Note: **1 is not considered a prime number** by definition, as it has only one positive divisor.
+This list is universally accepted in mathematics. Let me know if you'd like to explore more primes or related concepts! 😊
+```
+
+### 4.2 Reasoning
+
+The model supports two modes — Reasoning ON (default) vs OFF. This can be toggled by setting `enable_thinking` to `False`, as shown below.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:5000/v1",
+    api_key="EMPTY",
+)
+
+# Reasoning on (default)
+print("Reasoning on")
+resp = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Write a haiku about GPUs. Please make thinking process short."}
+    ],
+    temperature=1,
+    max_tokens=1024,
+)
+print(f"Reasoning: \n{resp.choices[0].message.reasoning_content[:200]}... \nContent: \n{resp.choices[0].message.content[:200]}...")
+print("\n")
+# Reasoning off
+print("Reasoning off")
+resp = client.chat.completions.create(
+    model="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Give me 3 facts about SGLang."}
+    ],
+    temperature=0,
+    max_tokens=256,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+)
+print(f"Content: \n{resp.choices[0].message.reasoning_content[:200]}...")
+```
+
+Output:
+```text Output
+Reasoning on
+Reasoning:
+We need to output a haiku about GPUs, with short thinking process. Probably we just need to produce the haiku. No extra commentary needed. Provide a haiku: 5-7-5 syllable lines about GPUs.
+
+Let's deci...
+Content:
+Silicon hearts beat
+Paint vivid worlds with bright light
+GPU dreams rise...
+
+Reasoning off
+Content:
+Certainly! Here are three accurate and informative facts about **SGLang**:
+
+1. **SGLang is a high-performance serving system for large language models (LLMs)**
+   Developed by researchers at UC Berk...
+```
+
+### 4.3 Tool Calling
+
+Call functions using the OpenAI Tools schema and inspect returned `tool_calls`.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:5000/v1",
+    api_key="EMPTY",
+)
+
+# Tool calling via OpenAI tools schema
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_tip",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bill_total": {
+                        "type": "integer",
+                        "description": "The total amount of the bill"
+                    },
+                    "tip_percentage": {
+                        "type": "integer",
+                        "description": "The percentage of tip to be applied"
+                    }
+                },
+                "required": ["bill_total", "tip_percentage"]
+            }
+        }
+    }
+]
+
+completion = client.chat.completions.create(
+    model="nemotron",
+    messages=[
+        {"role": "system", "content": ""},
+        {"role": "user", "content": "My bill is $50. What will be the amount for 15% tip?"}
+    ],
+    tools=TOOLS,
+    temperature=0.6,
+    top_p=0.95,
+    max_tokens=512,
+    stream=False
+)
+
+print(completion.choices[0].message.reasoning_content)
+print(completion.choices[0].message.tool_calls)
+```
+
+Output:
+```text Output
+The user wants to calculate a 15% tip on a $50 bill. I have a function called calculate_tip that takes bill_total and tip_percentage as parameters. The bill_total is $50, and tip_percentage is 15. I need to call the function with these values. Let me do that.
+
+[ChatCompletionMessageFunctionToolCall(id='call_ced9a83a3baa448e9d587aaf', function=Function(arguments='{"bill_total": 50, "tip_percentage": 15}', name='calculate_tip'), type='function', index=0)]
+```
+
+### 4.4 Controlling Reasoning Budget
+
+The `reasoning_budget` parameter allows you to limit the length of the model's reasoning trace. When the reasoning output reaches the specified token budget, the model will attempt to gracefully end the reasoning at the next newline character.
+
+If no newline is encountered within 500 tokens after reaching the budget threshold, the reasoning trace will be forcibly terminated at `reasoning_budget + 500` tokens.
+
+```python Example
+from typing import Any, Dict, List
+import openai
+from transformers import AutoTokenizer
+
+class ThinkingBudgetClient:
+    def __init__(self, base_url: str, api_key: str, tokenizer_name_or_path: str):
+        self.base_url = base_url
+        self.api_key = api_key
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
+        self.client = openai.OpenAI(base_url=self.base_url, api_key=self.api_key)
+
+    def chat_completion(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        reasoning_budget: int = 512,
+        max_tokens: int = 1024,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        assert (
+            max_tokens > reasoning_budget
+        ), f"reasoning_budget must be smaller than max_tokens. Given {max_tokens=} and {reasoning_budget=}"
+
+        # 1. first call chat completion to get reasoning content
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=reasoning_budget,
+            **kwargs
+        )
+
+        reasoning_content = response.choices[0].message.reasoning_content or ""
+
+        if "</think>" not in reasoning_content:
+            # reasoning content is too long, closed with a period (.)
+            reasoning_content = f"{reasoning_content}.\n</think>\n\n"
+
+        reasoning_tokens_used = len(
+            self.tokenizer.encode(reasoning_content, add_special_tokens=False)
+        )
+        remaining_tokens = max_tokens - reasoning_tokens_used
+
+        assert (
+            remaining_tokens > 0
+        ), f"remaining tokens must be positive. Given {remaining_tokens=}. Increase max_tokens or lower reasoning_budget."
+
+        # 2. append reasoning content to messages and call completion
+        messages.append({"role": "assistant", "content": reasoning_content})
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            continue_final_message=True,
+        )
+
+        response = self.client.completions.create(
+            model=model,
+            prompt=prompt,
+            max_tokens=remaining_tokens,
+            **kwargs
+        )
+
+        response_data = {
+            "reasoning_content": reasoning_content.strip().strip("</think>").strip(),
+            "content": response.choices[0].text,
+            "finish_reason": response.choices[0].finish_reason,
+        }
+        return response_data
+```
+
+Usage example with `reasoning_budget=128`:
+
+```python Example
+SERVED_MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+
+# Client
+client = ThinkingBudgetClient(
+    base_url="http://127.0.0.1:5000/v1",
+    api_key="null",
+    tokenizer_name_or_path=SERVED_MODEL_NAME
+)
+
+resp = client.chat_completion(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Write a haiku about GPUs."}
+    ],
+    temperature=1,
+    max_tokens=512,
+    reasoning_budget=128
+)
+print("Reasoning:", resp["reasoning_content"], "\nContent:", resp["content"])
+```
+
+Output:
+```text Output
+Reasoning: Okay, the user wants a haiku about GPUs. Let me recall what a haiku is: a traditional Japanese poem with three lines, 5-7-5 syllable structure. So I need to make sure the syllable count is exact.
+
+First, I should think about what makes GPUs interesting. They're used for graphics rendering, parallel processing, AI, gaming, etc. Maybe focus on their speed, power, or how they handle many tasks at once.
+
+Let me brainstorm some words and phrases related to GPUs: silicon, cores, transistors, parallel, rendering, pixels, frames per second, CUDA, tensor.
+Content:
+
+Silicon minds awaken,
+Thousands of cores hum in unison—
+Lightning paints the void.
+```
+
+---
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+- Hardware: H200 (4x)
+- Model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+- Tensor Parallelism: 4
+- SGLang Version: main branch
+
+- Model Deployment Command:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
+  --trust-remote-code \
+  --tp 4 \
+  --max-running-requests 1024 \
+  --host 0.0.0.0 \
+  --port 5000
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 5000 \
+  --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 4096 \
+  --max-concurrency 256
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 256
+Successful requests:                     4096
+Benchmark duration (s):                  623.49
+Total input tokens:                      2081726
+Total input text tokens:                 2081726
+Total generated tokens:                  2087288
+Total generated tokens (retokenized):    2044666
+Request throughput (req/s):              6.57
+Input token throughput (tok/s):          3338.85
+Output token throughput (tok/s):         3347.77
+Peak output token throughput (tok/s):    6349.00
+Peak concurrent requests:                270
+Total token throughput (tok/s):          6686.62
+Concurrency:                             250.35
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   38108.46
+Median E2E Latency (ms):                 37186.80
+P90 E2E Latency (ms):                    69325.24
+P99 E2E Latency (ms):                    77776.90
+---------------Time to First Token----------------
+Mean TTFT (ms):                          436.49
+Median TTFT (ms):                        114.90
+P99 TTFT (ms):                           6938.11
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          75.02
+Median TPOT (ms):                        76.02
+P99 TPOT (ms):                           92.27
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           74.07
+Median ITL (ms):                         38.45
+P95 ITL (ms):                            230.42
+P99 ITL (ms):                            242.70
+Max ITL (ms):                            7181.72
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 GSM8K Benchmark
+
+**Environment**
+- Hardware: H200 (4x)
+- Model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+- Tensor Parallelism: 4
+- SGLang Version: main branch
+
+**Launch Model**
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
+  --trust-remote-code \
+  --tp 4 \
+  --reasoning-parser nemotron_3
+```
+
+**Run Benchmark**
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py --port 5000
+```
+
+**Test Results:**
+```text Output
+Accuracy: 0.950
+Invalid: 0.000
+Latency: 21.442 s
+Output throughput: 996.815 token/s
+```
+
+#### 5.2.2 MMLU Benchmark
+
+**Run Benchmark**
+```bash Command
+python3 benchmark/mmlu/bench_sglang.py --port 5000
+```
+
+**Test Results:**
+```text Output
+subject: abstract_algebra, #q:100, acc: 0.730
+subject: anatomy, #q:135, acc: 0.830
+subject: astronomy, #q:152, acc: 0.934
+subject: business_ethics, #q:100, acc: 0.830
+subject: clinical_knowledge, #q:265, acc: 0.879
+subject: college_biology, #q:144, acc: 0.931
+subject: college_chemistry, #q:100, acc: 0.620
+subject: college_computer_science, #q:100, acc: 0.840
+subject: college_mathematics, #q:100, acc: 0.820
+subject: college_medicine, #q:173, acc: 0.821
+subject: college_physics, #q:102, acc: 0.794
+subject: computer_security, #q:100, acc: 0.880
+subject: conceptual_physics, #q:235, acc: 0.919
+subject: econometrics, #q:114, acc: 0.746
+subject: electrical_engineering, #q:145, acc: 0.828
+subject: elementary_mathematics, #q:378, acc: 0.926
+subject: formal_logic, #q:126, acc: 0.857
+subject: global_facts, #q:100, acc: 0.570
+subject: high_school_biology, #q:310, acc: 0.952
+subject: high_school_chemistry, #q:203, acc: 0.828
+subject: high_school_computer_science, #q:100, acc: 0.940
+subject: high_school_european_history, #q:165, acc: 0.861
+subject: high_school_geography, #q:198, acc: 0.939
+subject: high_school_government_and_politics, #q:193, acc: 0.990
+subject: high_school_macroeconomics, #q:390, acc: 0.928
+subject: high_school_mathematics, #q:270, acc: 0.700
+subject: high_school_microeconomics, #q:238, acc: 0.966
+subject: high_school_physics, #q:151, acc: 0.834
+subject: high_school_psychology, #q:545, acc: 0.960
+subject: high_school_statistics, #q:216, acc: 0.852
+subject: high_school_us_history, #q:204, acc: 0.926
+subject: high_school_world_history, #q:237, acc: 0.937
+subject: human_aging, #q:223, acc: 0.879
+subject: human_sexuality, #q:131, acc: 0.939
+subject: international_law, #q:121, acc: 0.934
+subject: jurisprudence, #q:108, acc: 0.898
+subject: logical_fallacies, #q:163, acc: 0.914
+subject: machine_learning, #q:112, acc: 0.821
+subject: management, #q:103, acc: 0.903
+subject: marketing, #q:234, acc: 0.944
+subject: medical_genetics, #q:100, acc: 0.980
+subject: miscellaneous, #q:783, acc: 0.945
+subject: moral_disputes, #q:346, acc: 0.861
+subject: moral_scenarios, #q:895, acc: 0.542
+subject: nutrition, #q:306, acc: 0.902
+subject: philosophy, #q:311, acc: 0.884
+subject: prehistory, #q:324, acc: 0.920
+subject: professional_accounting, #q:282, acc: 0.805
+subject: professional_law, #q:1534, acc: 0.681
+subject: professional_medicine, #q:272, acc: 0.923
+subject: professional_psychology, #q:612, acc: 0.889
+subject: public_relations, #q:110, acc: 0.800
+subject: security_studies, #q:245, acc: 0.837
+subject: sociology, #q:201, acc: 0.960
+subject: us_foreign_policy, #q:100, acc: 0.920
+subject: virology, #q:166, acc: 0.590
+subject: world_religions, #q:171, acc: 0.906
+Total latency: 150.267
+Average accuracy: 0.841
+```

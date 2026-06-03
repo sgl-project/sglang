@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -66,6 +68,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
 
@@ -270,6 +273,9 @@ def replace_rms_norm_class(rms_norm: nn.Module, hidden_size: int) -> nn.Module:
             kwargs["weight_dtype"] = weight_meta.dtype
         else:
             kwargs["has_weight"] = False
+        kwargs["cast_x_before_out_mul"] = (
+            True  # match HF fp16-weight-multiply semantics
+        )
         base_cls = RMSNorm
         norm = base_cls(**kwargs)
 
@@ -664,7 +670,7 @@ class TransformersBase(nn.Module):
                 new_param = nn.Parameter(
                     torch.empty_like(
                         param.data,
-                        device="cuda",
+                        device=get_device(),
                     )
                 )
                 setattr(module, name, new_param)

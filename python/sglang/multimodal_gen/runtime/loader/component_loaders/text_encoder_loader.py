@@ -81,6 +81,19 @@ class TextEncoderLoader(ComponentLoader):
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if ComponentLoader._is_component_set_as_layerwise_load(
+            server_args, component_name
+        ):
+            logger.info(
+                "Loading %s on CPU first because it is selected for layerwise offload",
+                component_name,
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def load_native(
         self,
         component_model_path: str,
@@ -150,7 +163,9 @@ class TextEncoderLoader(ComponentLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
-        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+        # Sort weight files when SGLANG_SORT_WEIGHT_FILES >= 0 (default).
+        # Staggering is not applicable to text-encoder loading (no TP split).
+        if envs.SGLANG_SORT_WEIGHT_FILES.get() >= 0:
             hf_weights_files.sort()
 
         return hf_folder, hf_weights_files, use_safetensors
@@ -276,10 +291,15 @@ class TextEncoderLoader(ComponentLoader):
         # Determine CPU offload behavior and target device
 
         local_torch_device = get_local_torch_device()
-        fsdp_cpu_offload = self.should_offload(server_args, model_config)
-        should_offload = (
-            cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
-        )
+
+        if not current_platform.is_cpu():
+            fsdp_cpu_offload = self.should_offload(server_args, model_config)
+            should_offload = (
+                cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
+            )
+        else:
+            fsdp_cpu_offload = False
+            should_offload = False
 
         if should_offload and not current_platform.is_mps():
             model_device = torch.device("cpu")

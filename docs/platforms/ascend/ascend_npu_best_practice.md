@@ -10,9 +10,9 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Model             | Hardware      | Cards | Deploy Mode       | Dataset   | TPOT | Quantization | Configuration                                                                             |
 |-------------------|---------------|-------|-------------------|-----------|------|--------------|-------------------------------------------------------------------------------------------|
 | Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 6K+1.6K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-disaggregation-mode)     |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.9K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_9k-1k-20ms-on-a3-32-cards-disaggregation-mode)     |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1.5K | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-20ms-on-a3-32-cards-disaggregation-mode)   |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1k-20ms-on-a3-32-cards-disaggregation-mode)     |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.9K+1K   | 19ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_9k-1k-19ms-on-a3-32-cards-disaggregation-mode)     |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1.5K | 19ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-19ms-on-a3-32-cards-disaggregation-mode)   |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1K   | 19ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1k-19ms-on-a3-32-cards-disaggregation-mode)     |
 | DeepSeek-V3.2     | Atlas 800I A3 | 32    | PD Disaggregation | 128K+1K   | 26ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-128k-1k-26ms-on-a3-32-cards-disaggregation-mode)    |
 
 ### High Throughput
@@ -20,6 +20,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Model       | Hardware      | Cards | Deploy Mode       | Dataset   | TPOT | Quantization | Configuration                                                                           |
 |-------------|---------------|-------|-------------------|-----------|------|--------------|-----------------------------------------------------------------------------------------|
 | Deepseek-R1 | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1.5K | 50ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-32-cards-disaggregation-mode) |
+| Deepseek-R1 | Atlas 800I A3 | 24    | PD Disaggregation | 2K+2K     | 50ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-24-cards-disaggregation-mode)     |
 | Deepseek-R1 | Atlas 800I A3 | 8     | PD Mixed          | 2K+2K     | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-8-cards-mixed-mode)               |
 | Deepseek-R1 | Atlas 800I A3 | 16    | PD Disaggregation | 2K+2K     | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-16-cards-disaggregation-mode)     |
 | Deepseek-R1 | Atlas 800I A3 | 8     | PD Mixed          | 3.5K+1.5K | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)           |
@@ -29,23 +30,26 @@ you encounter issues or have any questions, please [open an issue](https://githu
 
 ### Low Latency
 
-| Model           | Hardware      | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration                                                                  |
-|-----------------|---------------|-------|-------------|---------|------|--------------|--------------------------------------------------------------------------------|
-| Qwen3-235B-A22B | Atlas 800I A3 | 8     | PD Mixed    | 11K+1K  | 10ms | BF16         | [Optimal Configuration](#qwen3-235b-a22b-11k-1k-10ms-on-a3-8-cards-mixed-mode) |
-| Qwen3-32B       | Atlas 800I A3 | 4     | PD Mixed    | 6K+1.5K | 18ms | BF16         | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a3-4-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 4     | PD Mixed    | 4K+1.5K | 11ms | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a3-4-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 8     | PD Mixed    | 18K+4K  | 6ms  | BF16         | [Optimal Configuration](#qwen3-32b-18k-4k-6ms-on-a3-8-cards-mixed-mode)        |
-| Qwen3-32B       | Atlas 800I A2 | 8     | PD Mixed    | 6K+1.5K | 18ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a2-8-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A2 | 8     | PD Mixed    | 4K+1.5K | 11ms | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a2-8-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-1k-0_3k-12ms-on-a3-2-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 17ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-17ms-on-a3-2-cards-mixed-mode)      |
-| Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)        |
-| Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-12ms-on-a3-1-cards-mixed-mode)       |
-| Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 10ms | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-6k-1_5k-10ms-on-a3-1-cards-mixed-mode)  |
-| Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)   |
-| Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 14.21ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-1k-0_3k-14_21ms-on-a3-2-cards-mixed-mode)      |
-| Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 15.62ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-6k-1_5k-15_62ms-on-a3-2-cards-mixed-mode)      |
-| Qwen3-14B                     | Atlas 800I A3 | 1     | PD Mixed    | 3.5K+1.5K | 9ms   | W8A8 INT8    | [Optimal Configuration](#qwen3-14b-3_5k-1_5k-9ms-on-a3-1-cards-mixed-mode)         |
+| Model                   | Hardware      | Cards | Deploy Mode | Dataset   | TPOT    | Quantization | Configuration                                                                      |
+|-------------------------|---------------|-------|-------------|-----------|---------|--------------|------------------------------------------------------------------------------------|
+| Qwen3-235B-A22B         | Atlas 800I A3 | 8     | PD Mixed    | 11K+1K    | 10ms    | BF16         | [Optimal Configuration](#qwen3-235b-a22b-11k-1k-10ms-on-a3-8-cards-mixed-mode)     |
+| Qwen3-32B               | Atlas 800I A3 | 4     | PD Mixed    | 6K+1.5K   | 18ms    | BF16         | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a3-4-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A3 | 4     | PD Mixed    | 4K+1.5K   | 11ms    | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a3-4-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A3 | 8     | PD Mixed    | 18K+4K    | 6ms     | BF16         | [Optimal Configuration](#qwen3-32b-18k-4k-6ms-on-a3-8-cards-mixed-mode)            |
+| Qwen3-32B               | Atlas 800I A2 | 8     | PD Mixed    | 6K+1.5K   | 18ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a2-8-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A2 | 8     | PD Mixed    | 4K+1.5K   | 11ms    | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a2-8-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K   | 12ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-1k-0_3k-12ms-on-a3-2-cards-mixed-mode)          |
+| Qwen3-32B               | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K   | 17ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-17ms-on-a3-2-cards-mixed-mode)          |
+| Qwen3-8B                | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K   | 7ms     | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)            |
+| Qwen3-8B                | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K   | 12ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-12ms-on-a3-1-cards-mixed-mode)           |
+| Qwen3-8B                | Atlas 800I A3 | 1     | PD Mixed    | 3.5K+1.5K | 5ms     | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-3_5k-1_5k-5ms-on-a3-1-cards-mixed-mode)          |
+| Qwen3-30B-A3B           | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K   | 10ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-6k-1_5k-10ms-on-a3-1-cards-mixed-mode)      |
+| Qwen3-30B-A3B           | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K   | 7ms     | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)       |
+| Qwen3-Next-A3B-Instruct | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K   | 14.21ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-1k-0_3k-14_21ms-on-a3-2-cards-mixed-mode)      |
+| Qwen3-Next-A3B-Instruct | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K   | 15.62ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-6k-1_5k-15_62ms-on-a3-2-cards-mixed-mode)      |
+| Qwen3-Next-A3B-Instruct | Atlas 800I A3 | 2     | PD Mixed    | 3.5K+1.5K | 20ms    | W8A8 INT8    | [Optimal Configuration](#qwen3-next-3_5k-1_5k-20ms-on-a3-2-cards-mixed-mode)       |
+| Qwen3-14B               | Atlas 800I A3 | 1     | PD Mixed    | 3.5K+1.5K | 9ms     | W8A8 INT8    | [Optimal Configuration](#qwen3-14b-3_5k-1_5k-9ms-on-a3-1-cards-mixed-mode)         |
+| Qwen3.5-397B-A17B       | Atlas 800I A3 | 8     | PD Mixed    | 3.5K+1.5K | 22ms    | W4A8         | [Optimal Configuration](#qwen35-397B-a17b-3_5k-1_5k-22ms-on-a3-8-cards-mixed-mode) |
 
 ### High Throughput
 
@@ -66,6 +70,8 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-3_5k-1_5k-50ms-on-a2-8-cards-mixed-mode)                                |
 | Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed          | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a2-8-cards-mixed-mode)                                    |
 | Qwen3-14B                      | Atlas 800I A3 | 1     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-14b-3_5k-1_5k-50ms-on-a3-1-cards-mixed-mode)                                |
+| Qwen3-8B                       | Atlas 800I A3 | 1     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-3_5k-1_5k-50ms-on-a3-1-cards-mixed-mode)                                 |
+| Qwen3.5-397B-A17B              | Atlas 800I A3 | 8     | PD Mixed          | 3.5K+1.5K | 50ms  | W4A8         | [Optimal Configuration](#qwen35-397B-a17b-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)                         |
 
 ## Optimal Configuration
 
@@ -123,7 +129,6 @@ do
         echo "${P_IP[$i]}"
         export SGLANG_USE_AG_AFTER_QLORA=1
         export HCCL_BUFFSIZE=800
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export SGLANG_NPU_FUSED_MOE_MODE=2
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
@@ -132,7 +137,7 @@ do
         export GLOO_SOCKET_IFNAME=lo
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
         --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
-        --tp-size 16 --mem-fraction-static 0.778 --attention-backend ascend --device npu --quantization modelslim \
+        --tp-size 16 --mem-fraction-static 0.778 --attention-backend ascend --device npu \
         --disaggregation-transfer-backend ascend --max-running-requests 16 --disable-radix-cache \
         --chunked-prefill-size -1 --max-prefill-tokens 60000 --moe-a2a-backend ascend_fuseep --deepep-mode normal \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
@@ -173,6 +178,7 @@ done
 ```
 
 ```shell
+export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -190,6 +196,133 @@ We tested it based on the `RANDOM` dataset.
 
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1 --request-rate 16
+```
+
+### DeepSeek-R1 2K-2K 50ms on A3 24 Cards Disaggregation Mode
+
+Model: Deepseek R1
+
+Hardware: Atlas 800I A3 24Card
+
+DeployMode: PD Disaggregation
+
+Dataset: random
+
+Input Output Length: 2K+2K
+
+TPOT: 50ms
+
+#### Model Deployment
+
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_USE_FIA_NZ=1
+
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1')
+D_IP=('your decode ip1' 'your decode ip2')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export HCCL_BUFFSIZE=1600
+        export TASK_QUEUE_ENABLE=2
+        export SGLANG_USE_AG_AFTER_QLORA=1
+        export HCCL_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=lo
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
+        --tp-size 16 --mem-fraction-static 0.8 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 20 --context-length 8192 --disable-radix-cache \
+        --chunked-prefill-size -1 --max-prefill-tokens 28680 --moe-a2a-backend deepep --deepep-mode normal \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
+        --dp-size 4 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16 --enable-attn-tp-input-scattered
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export HCCL_BUFFSIZE=800
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=102
+        export TASK_QUEUE_ENABLE=1
+        export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
+        export SGLANG_NPU_FUSED_MOE_MODE=1
+        export HCCL_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=xxx
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 \
+        --mem-fraction-static 0.81 --max-running-requests 1088 --attention-backend ascend --device npu --quantization modelslim \
+        --moe-a2a-backend ascend_fuseep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
+        --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3  \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16 \
+        --load-balance-method round_robin
+        NODE_RANK=$i
+        break
+    fi
+done
+
+```
+
+```shell
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python -m sglang.bench_serving --dataset-name random --backend sglang \
+--host 127.0.0.1 \
+--port 6688 \
+--max-concurrency 1088 \
+--random-input-len 2048 \
+--random-output-len 2048 \
+--num-prompts 12800 \
+--random-range-ratio 1 \
+--request-rate 24
 ```
 
 ### DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Disaggregation Mode
@@ -242,7 +375,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -250,7 +382,7 @@ do
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
         --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
         --tp-size 16 --mem-fraction-static 0.81 --attention-backend ascend --device npu --quantization modelslim \
-        --disaggregation-transfer-backend ascend --max-running-requests 4 --context-length 8192  --disable-radix-cache \
+        --disaggregation-transfer-backend ascend --max-running-requests 4 --disable-radix-cache \
         --chunked-prefill-size -1 --max-prefill-tokens 28680 --moe-a2a-backend deepep --deepep-mode normal \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
         --dp-size 2 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16 --enable-attn-tp-input-scattered
@@ -277,10 +409,10 @@ do
         --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 8 \
         --mem-fraction-static 0.75 --max-running-requests 32 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
-        --cuda-graph-bs 2 4 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --cuda-graph-bs 2 4 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16 \
-        --load-balance-method decode_round_robin
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -289,6 +421,7 @@ done
 ```
 
 ```shell
+export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -305,10 +438,18 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 6000 --random-output-len 1600 --num-prompts 32 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 32 \
+    --random-input-len 6000 \
+    --random-output-len 1600 \
+    --num-prompts 32 \
+    --random-range-ratio 1 \
+    --request-rate 16
 ```
 
-### DeepSeek-R1 3_9K-1K 20ms on A3 32 Cards Disaggregation Mode
+### DeepSeek-R1 3_9K-1K 19ms on A3 32 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
@@ -320,21 +461,119 @@ Dataset: random
 
 Input Output Length: 3.9K+1K
 
-TPOT: 20ms
+TPOT: 19ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Disaggregation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-disaggregation-mode)
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_USE_FIA_NZ=1
+export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24669"
+
+P_IP=('your prefill ip1' 'your prefill ip2')
+D_IP=('your decode ip1' 'your decode ip2')
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# prefill
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export HCCL_BUFFSIZE=1536
+        export TASK_QUEUE_ENABLE=2
+        export HCCL_SOCKET_IFNAME=lo
+        export GLOO_SOCKET_IFNAME=lo
+
+        python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
+        --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
+        --tp-size 16 --mem-fraction-static 0.81 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 4 --context-length 8192 --disable-radix-cache \
+        --chunked-prefill-size -1 --max-prefill-tokens 28680 --moe-a2a-backend deepep --deepep-mode normal \
+        --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
+        --dp-size 2 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16 --enable-attn-tp-input-scattered
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# decode
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
+        export HCCL_BUFFSIZE=650
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
+        export TASK_QUEUE_ENABLE=1
+        export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
+        export HCCL_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=xxx
+        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
+        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 16 \
+        --mem-fraction-static 0.75 --max-running-requests 32 --attention-backend ascend --device npu --quantization modelslim \
+        --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
+        --cuda-graph-bs 2 4 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
+        --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16 \
+        --load-balance-method round_robin
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell
+export SGLANG_DP_ROUND_ROBIN=1
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://P_IP:8000 8998 \
+    --prefill http://P_IP:8000 8999 \
+    --decode http://D_IP:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --mini-lb
+```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3900 --random-output-len 1000 --num-prompts 768 --random-range-ratio 1 --request-rate 16
+python -m sglang.bench_serving --dataset-name random --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 32 \
+    --random-input-len 3900 \
+    --random-output-len 1024 \
+    --num-prompts 32 \
+    --random-range-ratio 1 \
+    --request-rate 16
 ```
 
-### DeepSeek-R1 3_5K-1_5K 20ms on A3 32 Cards Disaggregation Mode
+### DeepSeek-R1 3_5K-1_5K 19ms on A3 32 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
@@ -346,21 +585,29 @@ Dataset: random
 
 Input Output Length: 3.5K+1.5K
 
-TPOT: 20ms
+TPOT: 19ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Disaggregation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-disaggregation-mode)
+Please Turn to [DeepSeek-R1 3_9K-1K 19ms on A3 32 Cards Disaggregation Mode](#deepseek-r1-3_9k-1k-19ms-on-a3-32-cards-disaggregation-mode)
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```bash
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 768 --random-range-ratio 1 --request-rate 16
+```shell
+python -m sglang.bench_serving --dataset-name random --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 32 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 32 \
+    --random-range-ratio 1 \
+    --request-rate 16
 ```
 
-### DeepSeek-R1 3_5K-1K 20ms on A3 32 Cards Disaggregation Mode
+### DeepSeek-R1 3_5K-1K 19ms on A3 32 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
@@ -372,18 +619,26 @@ Dataset: random
 
 Input Output Length: 3.5K+1K
 
-TPOT: 20ms
+TPOT: 19ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Disaggregation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-disaggregation-mode)
+Please Turn to [DeepSeek-R1 3_9K-1K 19ms on A3 32 Cards Disaggregation Mode](#deepseek-r1-3_9k-1k-19ms-on-a3-32-cards-disaggregation-mode)
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1000 --num-prompts 768 --random-range-ratio 1 --request-rate 16
+python -m sglang.bench_serving --dataset-name random --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 32 \
+    --random-input-len 3500 \
+    --random-output-len 1024 \
+    --num-prompts 32 \
+    --random-range-ratio 1 \
+    --request-rate 16
 ```
 
 ### DeepSeek-R1 2K-2K 50ms on A3 8 Cards Mixed Mode
@@ -433,7 +688,6 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
 MODEL_PATH=xxx
 
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -462,7 +716,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 256  --random-input-len 2048 --random-output-len 2048 --num-prompts 1024 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 352  --random-input-len 2048 --random-output-len 2048 --num-prompts 1408 --random-range-ratio 1
 ```
 
 ### DeepSeek-R1 2K-2K 50ms on A3 16 Cards Disaggregation Mode
@@ -523,19 +777,18 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export HCCL_BUFFSIZE=2600
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
         --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
-        --tp-size 16 --mem-fraction-static 0.8 --attention-backend ascend --device npu --quantization modelslim \
-        --disaggregation-transfer-backend ascend --max-running-requests 8 --context-length 8192  --disable-radix-cache \
-        --chunked-prefill-size 32768 --max-prefill-tokens 28680 --moe-a2a-backend deepep --deepep-mode normal \
+        --tp-size 16 --mem-fraction-static 0.7 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 32 --context-length 8192  --disable-radix-cache \
+        --chunked-prefill-size -1 --max-prefill-tokens 10240 --moe-a2a-backend deepep --deepep-mode normal \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
-        --dp-size 1 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16
+        --dp-size 8 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16
         NODE_RANK=$i
         break
     fi
@@ -549,20 +802,20 @@ do
         echo "${D_IP[$i]}"
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
-        export HCCL_BUFFSIZE=720
+        export HCCL_BUFFSIZE=900
         export SGLANG_DP_ROUND_ROBIN=1
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=112
         export TASK_QUEUE_ENABLE=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 4 \
-        --mem-fraction-static 0.8 --max-running-requests 24 --attention-backend ascend --device npu --quantization modelslim \
+        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 16 \
+        --mem-fraction-static 0.8 --max-running-requests 448 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
-        --cuda-graph-bs 8 10 12 14 16 18 20 22 24 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
-		--load-balance-method round_robin
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -586,7 +839,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 400  --random-input-len 2048 --random-output-len 2048 --num-prompts 3200 --random-range-ratio 1 --request-rate 8
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 448  --random-input-len 2048 --random-output-len 2048 --num-prompts 1792 --random-range-ratio 1 --request-rate 32
 ```
 
 ### DeepSeek-R1 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
@@ -631,7 +884,6 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=56
 export HCCL_BUFFSIZE=1200
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -662,7 +914,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 144  --random-input-len 3500 --random-output-len 1500 --num-prompts 576 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 224  --random-input-len 3500 --random-output-len 1500 --num-prompts 896 --random-range-ratio 1
 ```
 
 ### DeepSeek-R1 3_5K-1_5K 50ms on A3 16 Cards Disaggregation Mode
@@ -724,7 +976,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=3500
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -785,7 +1036,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 384  --random-input-len 3500 --random-output-len 1500 --num-prompts 1536 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 416  --random-input-len 3500 --random-output-len 1500 --num-prompts 1664 --random-range-ratio 1
 ```
 
 ### DeepSeek-V3.2 128K-1K 26ms on A3 32 Cards Disaggregation Mode
@@ -842,7 +1093,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1200
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
@@ -865,8 +1115,8 @@ do
         --nnodes 2 --node-rank $i \
         --disaggregation-bootstrap-port 8995 \
         --moe-dense-tp-size 1 \
-	    --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+	    --enable-dsa-prefill-context-parallel \
+        --dsa-prefill-cp-mode in-seq-split \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
         --dist-init-addr ${P_IP[0]}:10000
@@ -1009,7 +1259,6 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
         export STREAMS_PER_DEVICE=32
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         # P节点
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
@@ -1063,7 +1312,8 @@ done
 ```
 
 ```shell
-SGLANG_DP_ROUND_ROBIN=1 python -m sglang_router.launch_router \
+export SGLANG_DP_ROUND_ROBIN=1
+python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://PIP:8000 8995 \
@@ -1944,7 +2194,6 @@ do
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
@@ -2041,7 +2290,6 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
 MODEL_PATH=xxx
@@ -2955,7 +3203,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
@@ -2986,7 +3233,8 @@ export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 
-python3 -m sglang.launch_server --model-path ${MODEL_PATH} \--page-size 128 \
+python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
+    --page-size 128 \
     --tp-size 4 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -3001,7 +3249,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \--page-size 128 \
     --mamba-ssm-dtype bfloat16 \
     --base-gpu-id 0 \
     --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
-    --quantization modelslim \
     --moe-a2a-backend deepep --deepep-mode auto \
 ```
 
@@ -3049,7 +3296,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
@@ -3080,7 +3326,8 @@ export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 
-python3 -m sglang.launch_server --model-path ${MODEL_PATH} \--page-size 128 \
+python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
+    --page-size 128 \
     --tp-size 4 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -3258,4 +3505,418 @@ We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 144 --random-output-len 1500 --random-input-len 3500 --num-prompts 576 --random-range-ratio 1
+```
+
+### Qwen3-8B 3_5K-1_5K 50ms on A3 1 Cards Mixed Mode
+
+Model: Qwen3-8B
+
+Hardware: Atlas 800I A3 1Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 50ms
+
+#### Model Deployment
+
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+MODEL_PATH=xxx
+
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=50
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
+    --attention-backend ascend --device npu --quantization modelslim \
+    --disable-radix-cache --mem-fraction-static 0.9 \
+    --tp-size 1 \
+    --max-running-requests 70 \
+    --max-prefill-tokens 16384 \
+    --served-model-name Qwen3-8B \
+    --chunked-prefill-size 16384 \
+    --cuda-graph-bs 8 12 24 36 48 51 55 60 63 64 66 68 70 \
+    --dtype bfloat16 \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 64 --random-output-len 1500 --random-input-len 3500 --num-prompts 256 --random-range-ratio 1
+```
+
+### Qwen3-8B 3_5K-1_5K 5ms on A3 1 Cards Mixed Mode
+
+Model: Qwen3-8B
+
+Hardware: Atlas 800I A3 1Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 5ms
+
+#### Model Deployment
+
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+MODEL_PATH=xxx
+
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
+    --attention-backend ascend --device npu --quantization modelslim \
+    --disable-radix-cache --mem-fraction-static 0.894 \
+    --tp-size 2 \
+    --max-running-requests 1 \
+    --max-prefill-tokens 16384 \
+    --served-model-name Qwen3-8B \
+    --chunked-prefill-size -1 \
+    --cuda-graph-bs 1 \
+    --dtype bfloat16 \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 4 --random-range-ratio 1
+```
+
+### Qwen3-Next 3_5K-1_5K 20ms on A3 2 Cards Mixed Mode
+
+Model: Qwen3-Next-80B-A3B-Instruct
+
+Hardware: Atlas 800I A3 2Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 20ms
+
+#### Model Deployment
+
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export HCCL_OP_EXPANSION_MODE="AIV"
+export TASK_QUEUE_ENABLE=1
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_WARMUP_TIMEOUT=3600
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export HCCL_BUFFSIZE=2000
+export ZBCCL_LOCAL_MEM_SIZE=60416
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+
+export ZBCCL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export ZBCCL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export ZBCCL_ENABLE_GRAPH=1
+
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+MODEL_PATH=xxx
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
+    --page-size 128 \
+    --tp-size 4 --dp-size 2 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 6699 \
+    --mem-fraction-static 0.85 \
+    --disable-radix-cache --max-prefill-tokens 28672 --context-length 26384 --max-total-tokens 122304 \
+    --enable-dp-attention --enable-dp-lm-head \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant \
+    --chunked-prefill-size -1 --max-running-requests 16 \
+    --cuda-graph-bs 2 4 8 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 1
+```
+
+## Qwen3.5-397B-A17B 3_5K-1_5K 22ms on A3 8 Cards Mixed Mode
+
+Model: Qwen3.5-397B-A17B
+
+Hardware: Atlas 800I A3 8Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 22ms
+
+#### Model Deployment
+
+```shell
+# high performance cpu
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export ASCEND_USE_FIA=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export HCCL_BUFFSIZE=3000
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export STREAMS_PER_DEVICE=32
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=58624
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export ZBAL_ENABLE_GRAPH=1
+
+MODEL_PATH=xxx
+
+python3 -m sglang.launch_server \
+--model-path $MODEL_PATH \
+--attention-backend ascend \
+--device npu \
+--tp-size 16 \
+--chunked-prefill-size -1 --max-prefill-tokens 35000 \
+--disable-radix-cache \
+--trust-remote-code \
+--host 127.0.0.1 --max-running-requests 160 \
+--mem-fraction-static 0.8 \
+--port 6699 \
+--cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 \
+--quantization modelslim \
+--enable-multimodal --moe-a2a-backend deepep --deepep-mode auto \
+--mm-attention-backend ascend_attn \
+--dtype bfloat16 --mamba-ssm-dtype bfloat16 --max-total-tokens 128000 \
+--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+--speculative-draft-model-quantization unquant \
+--dp-size 8 --enable-dp-attention --enable-dp-lm-head \
+--enable-prefill-delayer --prefill-delayer-max-delay-passes 100
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 120 --random-output-len 1500 --random-input-len 3500 --num-prompts 480
+```
+
+## Qwen3.5-397B-A17B 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
+
+Model: Qwen3.5-397B-A17B
+
+Hardware: Atlas 800I A3 8Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 50ms
+
+#### Model Deployment
+
+```shell
+# high performance cpu
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export ASCEND_USE_FIA=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+export HCCL_BUFFSIZE=3000
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+export STREAMS_PER_DEVICE=32
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:24669"
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export ZBAL_ENABLE_GRAPH=1
+
+MODEL_PATH=xxx
+
+python3 -m sglang.launch_server \
+--model-path $MODEL_PATH \
+--attention-backend ascend \
+--device npu \
+--tp-size 16 \
+--chunked-prefill-size -1 --max-prefill-tokens 17500 \
+--disable-radix-cache \
+--trust-remote-code \
+--host 127.0.0.1 --max-running-requests 432 \
+--mem-fraction-static 0.75 \
+--port 6699 \
+--cuda-graph-bs 2 4 6 8 12 16 20 24 28 32 36 40 44 48 52 56 \
+--quantization modelslim \
+--enable-multimodal --moe-a2a-backend deepep --deepep-mode auto \
+--mm-attention-backend ascend_attn \
+--dtype bfloat16 --mamba-ssm-dtype bfloat16 --max-total-tokens 280000 \
+--dp-size 8 --enable-dp-attention --enable-dp-lm-head \
+--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+--speculative-draft-model-quantization unquant \
+--enable-prefill-delayer --prefill-delayer-max-delay-passes 200
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 176 --random-output-len 1500 --random-input-len 3500 --num-prompts 352
 ```
