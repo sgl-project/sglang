@@ -406,6 +406,45 @@ def _likely_no_gpu_jobs(workflow_name: str) -> bool:
     return any(h in n for h in _NON_GPU_WORKFLOW_HINTS)
 
 
+def _wallclock_busy_seconds(jobs, window_start, window_end):
+    """Wall-clock busy seconds on a single runner across the window.
+
+    Each job contributes its `[start, end]` interval clipped to the
+    window. Overlapping intervals are merged with a sweep so the
+    result is bounded by `(window_end - window_start).total_seconds()`
+    per runner. Without the merge, three pathologies double-count
+    busy time:
+
+    1. GitHub API timestamp slop -- consecutive back-to-back jobs on
+       the same runner aren't reliably monotonic, so job N+1's
+       `started_at` can land slightly before job N's `completed_at`.
+    2. `filter=all` on the jobs API returns every retry attempt as a
+       separate row; same runner_name, near-adjacent intervals.
+    3. An `in_progress` job uses `end=now`, which can straddle a
+       just-completed job's `completed_at` by a few seconds.
+
+    These pushed per-label utilization slightly above 100% on busy
+    multi-GPU pools (e.g. `2-gpu-h100` rendered at 108.8% before this
+    helper landed). After merging, utilization is mathematically
+    capped at 100% per label.
+    """
+    intervals = []
+    for j in jobs:
+        cs = max(j["start"], window_start)
+        ce = min(j["end"], window_end)
+        if ce > cs:
+            intervals.append((cs, ce))
+    intervals.sort()
+    busy = 0.0
+    covered_until = window_start
+    for s, e in intervals:
+        s = max(s, covered_until)
+        if e > s:
+            busy += (e - s).total_seconds()
+            covered_until = e
+    return busy
+
+
 def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None):
     """Calculate runner utilization metrics."""
 
@@ -541,15 +580,10 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
 
     # Per-host window-clamped busy time (each physical machine counted once).
     # This is the source of truth for how loaded each host actually is.
-    host_busy_seconds = {}
-    for host, jobs in host_jobs.items():
-        busy = 0.0
-        for j in jobs:
-            cs = max(j["start"], window_start)
-            ce = min(j["end"], window_end)
-            if ce > cs:
-                busy += (ce - cs).total_seconds()
-        host_busy_seconds[host] = busy
+    host_busy_seconds = {
+        host: _wallclock_busy_seconds(jobs, window_start, window_end)
+        for host, jobs in host_jobs.items()
+    }
 
     results = []
     for label in sorted(all_labels):

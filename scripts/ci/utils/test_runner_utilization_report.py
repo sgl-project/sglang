@@ -90,6 +90,65 @@ class TestClassifyJob(unittest.TestCase):
         self.assertIsNone(rur.classify_job(job, NOW))
 
 
+class TestWallclockBusySeconds(unittest.TestCase):
+    """Guards the merge that keeps per-host busy time <= window_seconds
+    (and therefore per-label utilization <= 100%). Before this merge,
+    job-interval overlap from GitHub timestamp slop / `filter=all`
+    retries / in_progress `end=now` was double-counted -- busy pools
+    rendered above 100% in the report."""
+
+    WS = NOW - timedelta(hours=24)
+    WE = NOW
+
+    def _intv(self, h0: float, h1: float):
+        """Build a job_info-shaped dict spanning [WS+h0h, WS+h1h]."""
+        return {
+            "start": self.WS + timedelta(hours=h0),
+            "end": self.WS + timedelta(hours=h1),
+        }
+
+    def test_disjoint_intervals_sum_straight(self):
+        # Two non-overlapping 1h intervals -> 2h busy.
+        jobs = [self._intv(0, 1), self._intv(2, 3)]
+        busy = rur._wallclock_busy_seconds(jobs, self.WS, self.WE)
+        self.assertEqual(busy, 2 * 3600)
+
+    def test_overlap_merged_not_double_counted(self):
+        # Two 1h jobs overlapping by 30min -> wall-clock 1.5h, not 2h.
+        # This is the canonical timestamp-slop / retry-row case.
+        jobs = [self._intv(0, 1), self._intv(0.5, 1.5)]
+        busy = rur._wallclock_busy_seconds(jobs, self.WS, self.WE)
+        self.assertEqual(busy, 1.5 * 3600)
+
+    def test_fully_contained_interval_absorbed(self):
+        # A 30-min job entirely inside a 2h job -> still 2h busy.
+        jobs = [self._intv(0, 2), self._intv(0.5, 1)]
+        busy = rur._wallclock_busy_seconds(jobs, self.WS, self.WE)
+        self.assertEqual(busy, 2 * 3600)
+
+    def test_intervals_clipped_to_window(self):
+        # Job spans before window_start and after window_end -> clipped to 24h.
+        jobs = [
+            {
+                "start": self.WS - timedelta(hours=5),
+                "end": self.WE + timedelta(hours=5),
+            }
+        ]
+        busy = rur._wallclock_busy_seconds(jobs, self.WS, self.WE)
+        self.assertEqual(busy, 24 * 3600)
+
+    def test_busy_bounded_by_window(self):
+        # Many overlapping jobs covering the whole window -> busy capped
+        # at 24h regardless of how many overlap. This is the property
+        # that guarantees utilization <= 100% per label.
+        jobs = [self._intv(0, 24) for _ in range(50)]
+        busy = rur._wallclock_busy_seconds(jobs, self.WS, self.WE)
+        self.assertEqual(busy, 24 * 3600)
+
+    def test_empty_jobs(self):
+        self.assertEqual(rur._wallclock_busy_seconds([], self.WS, self.WE), 0.0)
+
+
 class TestConcurrencyHandlesQueuedJobs(unittest.TestCase):
     def test_queued_job_does_not_crash_and_counts_in_peak_queue(self):
         window_start = NOW - timedelta(hours=24)
