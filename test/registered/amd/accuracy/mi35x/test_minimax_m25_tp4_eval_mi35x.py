@@ -179,7 +179,7 @@ class TestMiniMaxM25TP4EvalMI35x(unittest.TestCase):
     def setUpClass(cls):
         cls.models = MI35X_MINIMAX_M25_TP4_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_minimax_m25_tp4_accuracy(self):
         """Test MiniMax-M2.5 TP=4 with GSM8K completion benchmark."""
