@@ -1086,8 +1086,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
-        # The gpu-only draft-extend path leaves seq_lens_sum unset (None) to
-        # skip a D2H sync; DP MLP-sync padding needs it, so derive it here.
+        # gpu-only draft-extend leaves seq_lens_sum None (skips D2H); DP
+        # MLP-sync padding needs it, so derive it here.
         if self.seq_lens_sum is None:
             self.seq_lens_sum = int(self.seq_lens.sum())
         self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (

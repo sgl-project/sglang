@@ -854,8 +854,7 @@ class MHATokenToKVPool(KVCache):
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
-        # A zero-layer pool has no buffers (e.g. the full-attention sub-pool of a
-        # SWAKVPool for an all-sliding-window model). Nothing to copy; skip warmup.
+        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
         if self.layer_num == 0:
             self._kv_copy_config = None
             return
@@ -1096,8 +1095,7 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # A zero-layer pool has no buffers (e.g. the full-attention sub-pool of a
-        # SWAKVPool for an all-sliding-window model); nothing to move.
+        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
         if self.layer_num == 0:
             return
 

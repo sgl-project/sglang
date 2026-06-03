@@ -108,10 +108,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.padded_static_len = -1
 
         # Attention backend
-        # Draft-extend fills the whole tree width per req (num_draft_tokens);
-        # for topk == 1 this equals num_steps + 1, but for topk > 1 trees it is
-        # larger, so the cuda-graph buffers must be sized by num_draft_tokens or
-        # a topk > 1 draft-extend overflows them.
+        # Size cuda-graph buffers by num_draft_tokens (full tree width), not
+        # num_steps + 1, or topk > 1 draft-extend overflows them.
         self.num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
