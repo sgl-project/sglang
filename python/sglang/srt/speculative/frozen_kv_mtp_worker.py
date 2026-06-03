@@ -288,34 +288,33 @@ class FrozenKVMTPWorker(TpModelWorker):
         self, forward_batch: ForwardBatch
     ) -> None:
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.positions.numel(),
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
+            self.draft_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=True
             )
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
     ) -> None:
+        from types import SimpleNamespace
+
+        fb_view = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=getattr(forward_batch, "input_ids", None),
+            req_pool_indices=forward_batch.req_pool_indices[:bs],
+            seq_lens=forward_batch.seq_lens[:bs],
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=(
+                forward_batch.seq_lens_cpu[:bs]
+                if forward_batch.seq_lens_cpu is not None
+                else None
+            ),
+            encoder_lens=None,
+            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            spec_info=None,
+        )
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices[:bs],
-                forward_batch.seq_lens[:bs],
-                seq_lens_sum,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-                seq_lens_cpu=(
-                    forward_batch.seq_lens_cpu[:bs]
-                    if forward_batch.seq_lens_cpu is not None
-                    else None
-                ),
-            )
+            self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
