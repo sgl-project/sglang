@@ -4,11 +4,11 @@ import os
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import sglang.srt.observability.trace as mod
 from sglang.srt.observability.trace import (
@@ -38,7 +38,7 @@ except ImportError:
     _has_otel = False
 
 # Access the private module-level function (avoid name mangling inside classes).
-_get_host_id = getattr(mod, "__get_host_id")
+_get_host_id = getattr(mod, "_get_host_id")
 
 
 class TestTraceFunctions(unittest.TestCase):
@@ -123,32 +123,38 @@ class TestTraceCustomIdGenerator(unittest.TestCase):
 # __get_host_id
 class TestGetHostId(unittest.TestCase):
     def test_from_machine_id_file(self):
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open",
-            unittest.mock.mock_open(read_data="abc123\n"),
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "builtins.open",
+                unittest.mock.mock_open(read_data="abc123\n"),
+            ),
         ):
             self.assertEqual(_get_host_id(), "abc123")
 
     def test_from_machine_id_file_error(self):
         """Falls back to MAC address when file read fails."""
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open", side_effect=IOError("read error")
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("builtins.open", side_effect=IOError("read error")),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_from_mac_address(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0x112233445566
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0x112233445566),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_unknown_fallback(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0),
         ):
             self.assertEqual(_get_host_id(), "unknown")
 
@@ -189,12 +195,25 @@ class TestProcessTracingInit(unittest.TestCase):
             mod.opentelemetry_imported = orig
 
 
+def _mock_get_global_server_args():
+    """Return a mock ServerArgs for tests that create TraceReqContext."""
+    mock = MagicMock()
+    mock.trace_modules = ""
+    return mock
+
+
 class TestTraceReqContextDisabled(unittest.TestCase):
     def setUp(self):
         self.orig = mod.opentelemetry_initialized
         mod.opentelemetry_initialized = False
+        self._sa_patcher = patch(
+            "sglang.srt.observability.trace.get_global_server_args",
+            side_effect=_mock_get_global_server_args,
+        )
+        self._sa_patcher.start()
 
     def tearDown(self):
+        self._sa_patcher.stop()
         mod.opentelemetry_initialized = self.orig
 
     def test_init_disabled(self):
@@ -240,13 +259,24 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.orig_threads = mod.threads_info.copy()
         self.orig_level = mod.global_trace_level
 
+        # Reset OTel global TracerProvider so set_tracer_provider works each test
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+        otel_trace._TRACER_PROVIDER = None
+
         self.provider = TracerProvider()
         otel_trace.set_tracer_provider(self.provider)
         mod.opentelemetry_initialized = True
         mod.tracer = otel_trace.get_tracer("test")
         mod.global_trace_level = 3
 
+        self._sa_patcher = patch(
+            "sglang.srt.observability.trace.get_global_server_args",
+            side_effect=_mock_get_global_server_args,
+        )
+        self._sa_patcher.start()
+
     def tearDown(self):
+        self._sa_patcher.stop()
         mod.opentelemetry_initialized = self.orig_initialized
         mod.tracer = self.orig_tracer
         mod.threads_info.clear()
@@ -266,7 +296,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
 
     def test_full_lifecycle(self):
         """Start → slice_start → slice_end → finish."""
-        ctx = TraceReqContext(rid="req-1", role="unified", module_name="test")
+        ctx = TraceReqContext(rid="req-1", role="unified")
         self.assertTrue(ctx.tracing_enable)
 
         ctx.trace_req_start(ts=1000)

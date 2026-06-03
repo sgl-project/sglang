@@ -1,7 +1,7 @@
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.utils.common import is_sm100_supported
+from sglang.srt.utils.common import get_device_capability, is_cuda, is_sm100_supported
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -36,14 +36,26 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
                     "Use flashinfer_trtllm as MoE runner backend on sm100 for "
                     f"{model_arch}"
                 )
+            elif (
+                (
+                    model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
+                    or server_args.quantization == "modelopt_fp4"
+                )
+                and is_cuda()
+                and (8, 0) <= get_device_capability() < (10, 0)
+            ):
+                server_args.moe_runner_backend = "marlin"
+                logger.info(
+                    "Use marlin as MoE runner backend on SM80-SM90 for "
+                    f"{model_arch} {model_config.quantization}"
+                )
             else:
                 server_args.moe_runner_backend = "flashinfer_cutlass"
 
     server_args._handle_mamba_radix_cache(
         model_arch=model_arch,
-        support_mamba_cache=True,
-        support_mamba_cache_extra_buffer=False,
         sm100_default_attention_backend="flashinfer",
+        fallback_attention_backend="flashinfer",
     )
     assert server_args.attention_backend != "triton", (
         "NemotronHForCausalLM does not support triton attention backend,"
