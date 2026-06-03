@@ -426,9 +426,19 @@ def get_mathdx_root() -> Optional[pathlib.Path]:
         if (candidate / "include").exists():
             return candidate
 
-    pkg = _find_package_root("nvidia.mathdx")
-    if pkg is not None and (pkg / "include").exists():
-        return pkg
+    # The ``nvidia-mathdx`` wheel installs as the namespace package
+    # ``nvidia.mathdx`` (no __init__, so spec.origin is None); resolve it via
+    # submodule_search_locations rather than _find_package_root, which only
+    # handles regular packages.
+    spec = importlib.util.find_spec("nvidia.mathdx")
+    if spec is not None:
+        roots = list(spec.submodule_search_locations or [])
+        if spec.origin is not None:
+            roots.append(str(pathlib.Path(spec.origin).parent))
+        for root in roots:
+            candidate = pathlib.Path(root).resolve()
+            if (candidate / "include").exists():
+                return candidate
 
     return None
 
