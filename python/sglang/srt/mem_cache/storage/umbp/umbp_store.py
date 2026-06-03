@@ -257,6 +257,10 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd.spdk_proxy_reserved_shared_bytes = int(
                 extra["spdk_proxy_reserved_shared_bytes"]
             )
+        if "ssd_high_watermark" in extra and hasattr(cfg.ssd, "high_watermark"):
+            cfg.ssd.high_watermark = float(extra["ssd_high_watermark"])
+        if "ssd_low_watermark" in extra and hasattr(cfg.ssd, "low_watermark"):
+            cfg.ssd.low_watermark = float(extra["ssd_low_watermark"])
 
         # Operator-controlled escape hatch for hosts whose RDMA NIC cannot
         # register a single memory region as large as the full host KV buffer
@@ -342,6 +346,17 @@ class UMBPStore(HiCacheStorage):
 
             if "staging_buffer_size" in extra:
                 dist_cfg.staging_buffer_size = int(extra["staging_buffer_size"])
+
+            if "ssd_staging_buffer_size" in extra and hasattr(
+                dist_cfg, "ssd_staging_buffer_size"
+            ):
+                dist_cfg.ssd_staging_buffer_size = int(extra["ssd_staging_buffer_size"])
+            if "ssd_staging_buffer_slots" in extra and hasattr(
+                dist_cfg, "ssd_staging_buffer_slots"
+            ):
+                dist_cfg.ssd_staging_buffer_slots = int(
+                    extra["ssd_staging_buffer_slots"]
+                )
 
             peer_service_port = extra.get(
                 "peer_service_port", _optional_env_str("UMBP_PEER_SERVICE_PORT")
