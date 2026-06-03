@@ -2490,6 +2490,12 @@ class DPDispatcher:
     def pending_counts(self) -> List[int]:
         return [len(d) for d in self.pending_futures]
 
+    @property
+    def alive_ranks(self) -> List[int]:
+        # Ranks whose worker subprocess is still running; the watchdog moves
+        # the rest into _dead_ranks on process exit.
+        return [r for r in range(self.dp_size) if r not in self._dead_ranks]
+
     def start(self) -> None:
         logger.info(f"DP dispatcher started: {self.dp_size} ranks (all remote)")
         asyncio.create_task(self._result_listener())
@@ -2514,7 +2520,7 @@ class DPDispatcher:
     async def dispatch(self, request: dict) -> dict:
         counts = self.pending_counts
         # Skip ranks whose worker process has died.
-        alive_ranks = [r for r in range(self.dp_size) if r not in self._dead_ranks]
+        alive_ranks = self.alive_ranks
         if not alive_ranks:
             raise MMError(
                 "All encoder DP workers are dead.",
@@ -3382,6 +3388,9 @@ async def health_generate():
     Returns 200 if the encoder is healthy, 503 otherwise.
     """
     if dp_dispatcher is not None:
+        # All worker subprocesses dead → nothing can serve, report unhealthy.
+        if not dp_dispatcher.alive_ranks:
+            return Response(status_code=503)
         return Response(status_code=200)
     if encoder is None:
         return Response(status_code=503)
