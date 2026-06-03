@@ -71,18 +71,6 @@ from sglang.srt.lora.utils import LoRABatchInfo
 # ---------------------------------------------------------------------------
 
 _BLOCK_S = 16
-# Tuned per kernel (B200; H=16, kv_lora_rank=512, qk_nope=v_head_dim=128, rank 16/32).
-# The a/b pair don't share: step_a contracts a wide K into a tiny N=rank output,
-# step_b is the inverse, so they want opposite tiles.
-# step_a output N == rank, so BLOCK_N = next_power_of_2(rank) (set per call) covers it
-# in one tile and adapts to any rank (16/32/64/...), like sgemm/qkv's BLOCK_R.
-_STEP_A_Q_BLOCK_K = 128  # step_a_q: K=qk_nope (~128) -> single contraction block
-_STEP_A_V_BLOCK_K = (
-    256  # step_a_v: K=kv_lora_rank (~512); 256 -> 2 iters (was 8) ~-25..-40%
-)
-_STEP_B_BLOCK_K = 16  # step_b contraction is rank (q and v agree here)
-_STEP_B_Q_BLOCK_N = 128  # step_b_q output is kv_lora_rank (~512); 128 ~-6..-16%
-_STEP_B_V_BLOCK_N = 64  # step_b_v output is v_head_dim (~128); 64 already optimal
 
 
 def _num_segments(batch_info: LoRABatchInfo) -> int:
@@ -141,7 +129,7 @@ def _step_a_q_kernel(
     # meta
     FULL_K: tl.constexpr,  # per-head row stride in B (qk_nope + v_head_dim)
     SORTED_BY_ADAPTER: tl.constexpr,
-    K_DIV: tl.constexpr,  # K % BLOCK_K == 0 -> drop safe_k (keep contraction load coalesced)
+    K_DIV: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -254,6 +242,7 @@ def step_a_q_fwd(
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
+    _STEP_A_Q_BLOCK_K = 128
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, block_n),
@@ -333,7 +322,7 @@ def _step_b_q_kernel(
     num_segments,
     # meta
     SORTED_BY_ADAPTER: tl.constexpr,
-    N_DIV: tl.constexpr,  # N % BLOCK_N == 0 -> drop safe_n (keep the store coalesced)
+    N_DIV: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -377,9 +366,6 @@ def _step_b_q_kernel(
     row_mask = s_offset < seg_len
     safe_row = tl.minimum(s_physical, S - 1)
     n_mask = n_offset[None, :] < N
-    # safe_n only matters when N isn't a BLOCK_N multiple; otherwise the raw affine
-    # index keeps the W load + output store coalesced. Clamping the contiguous
-    # kv_lora_rank axis here is a ~4-5x scatter/gather cliff (forces non-affine addrs).
     safe_n = n_offset if N_DIV else tl.minimum(n_offset, N - 1)
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
@@ -446,6 +432,8 @@ def step_b_q_fwd(
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
+    _STEP_B_Q_BLOCK_N = 128
+    _STEP_B_BLOCK_K = 16
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S)
@@ -524,7 +512,7 @@ def _step_a_v_kernel(
     num_segments,
     # meta
     SORTED_BY_ADAPTER: tl.constexpr,
-    K_DIV: tl.constexpr,  # K % BLOCK_K == 0 -> drop safe_k (keep contraction load coalesced)
+    K_DIV: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -625,11 +613,12 @@ def step_a_v_fwd(
     """
     S, H, kv_lora_rank = attn_output.shape
     rank = A_buf.shape[1]
-    block_n = triton.next_power_of_2(rank)  # output N == rank -> one tile
+    block_n = triton.next_power_of_2(rank)
     out = torch.empty((S, H, rank), device=attn_output.device, dtype=attn_output.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
+    _STEP_A_V_BLOCK_K = 256
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, block_n),
@@ -753,9 +742,6 @@ def _step_b_v_kernel(
     row_mask = s_offset < seg_len
     safe_row = tl.minimum(s_physical, S - 1)
     n_mask = n_offset[None, :] < N
-    # safe_n only matters when N isn't a BLOCK_N multiple; otherwise the raw affine
-    # index keeps the W load + output store coalesced. Clamping the contiguous
-    # v_head_dim axis here is a ~4-5x scatter/gather cliff (forces non-affine addrs).
     safe_n = n_offset if N_DIV else tl.minimum(n_offset, N - 1)
 
     # V-half row base for this head: h*FULL_K + qk_nope
@@ -829,6 +815,8 @@ def step_b_v_fwd(
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
+    _STEP_B_V_BLOCK_N = 64
+    _STEP_B_BLOCK_K = 16
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S)
