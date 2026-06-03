@@ -145,7 +145,7 @@ class ViTCudaGraphRunner:
         ca_comm = tp_group.ca_comm
         capture_ctx = ca_comm.capture() if ca_comm is not None else nullcontext()
 
-        with capture_ctx, torch.cuda.graph(graph):
+        def run_blocks():
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
@@ -231,6 +231,18 @@ class ViTCudaGraphRunner:
                 )
             else:
                 self.block_output[graph_key] = main_out
+
+        # Warmup run: execute the blocks once outside the CUDA graph context so that
+        # any torch.compile-decorated function (e.g. apply_rotary_pos_emb_native) is
+        # compiled for the exact input shapes before capture begins. Compilation inside
+        # torch.cuda.graph() triggers inductor's SFDP initialization which does
+        # CPU->CUDA tensor copies — an operation forbidden during stream capture.
+        torch.cuda.synchronize()
+        run_blocks()
+        torch.cuda.synchronize()
+
+        with capture_ctx, torch.cuda.graph(graph):
+            run_blocks()
 
         self.block_graphs[graph_key] = graph
 
