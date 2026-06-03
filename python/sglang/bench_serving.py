@@ -1720,6 +1720,11 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "return_logprob"):
         args.return_logprob = False
 
+    if not hasattr(args, "temperature"):
+        args.temperature = 0.0
+    if not hasattr(args, "top_p"):
+        args.top_p = 1.0
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
