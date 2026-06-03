@@ -54,6 +54,7 @@ from fastapi import (
     Query,
     Request,
     UploadFile,
+    WebSocket,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -163,6 +164,7 @@ from sglang.srt.utils import (
     add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
+    is_mps,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -304,7 +306,11 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Init tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
         elif server_args.disaggregation_mode == "decode":
@@ -1298,15 +1304,21 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.post("/weights_checker")
+@app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message, ranks = await _global_state.tokenizer_manager.check_weights(
-        obj, request
+async def check_weights(
+    obj: Optional[CheckWeightsReqInput] = None, request: Request = None
+):
+    if obj is None:
+        obj = CheckWeightsReqInput()
+    success, message, ranks, per_engine_checksum = (
+        await _global_state.tokenizer_manager.check_weights(obj, request)
     )
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
+    if per_engine_checksum is not None:
+        body["per_engine_checksum"] = per_engine_checksum
     return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
@@ -1605,6 +1617,17 @@ async def openai_v1_audio_transcriptions(
     )
 
 
+@app.websocket("/v1/realtime")
+async def openai_v1_realtime_transcription(ws: WebSocket):
+    """OpenAI Realtime transcription WebSocket endpoint."""
+    # /v1/realtime is OpenAI's unified Realtime URL covering transcription +
+    # chat modes. This handler implements the transcription subset only;
+    # chat-mode session.update payloads are rejected by the
+    # `Literal["transcription"]` constraint on TranscriptionSessionConfig.type
+    # (see realtime/protocol.py).
+    await ws.app.state.openai_serving_transcription.handle_websocket(ws)
+
+
 @app.get("/v1/models", response_class=ORJSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
@@ -1891,8 +1914,8 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     model_info = res.json()
 
-    # Construct a warmup request
-    is_vlm = bool(model_info.get("has_image_understanding", False))
+    # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
+    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"

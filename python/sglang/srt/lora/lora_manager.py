@@ -631,10 +631,6 @@ class LoRAManager:
         )
         lora_adapter.initialize_weights()
 
-        # If we want to overlap loading LoRA adapters with compute, they must be pinned in CPU memory
-        if self.enable_lora_overlap_loading:
-            lora_adapter.pin_weights_in_cpu()
-
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_weights_from_tensors(
@@ -707,6 +703,7 @@ class LoRAManager:
             lora_added_tokens_size=self.lora_added_tokens_size,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
+            enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
 
         # Initializing memory pool with base model
