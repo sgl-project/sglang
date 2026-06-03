@@ -534,9 +534,15 @@ class TritonAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None:
+            if spec_info is None or spec_info.kv_indptr is None:
+                # kv_indptr is None for draft-extend's idle batch (no tree
+                # indices); build plain metadata from seq_lens.
+                # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
+                seq_lens_sum = forward_batch.seq_lens_sum
+                if seq_lens_sum is None:
+                    seq_lens_sum = bs * self.max_context_len
                 kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
+                    seq_lens_sum, dtype=torch.int64, device=self.device
                 )
                 kv_indptr = self._fill_kv_indptr_and_indices(
                     bs,

@@ -398,6 +398,20 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table = self.req_to_token_pool.req_to_token[
                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
                     ]
+                elif self.speculative_num_steps == 0:
+                    # Draft-extend's idle batch (padded for DP MLP-sync) has no
+                    # tree; build plain metadata (padded output is discarded).
+                    metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.cu_seqlens_q = torch.arange(
+                        0, batch_size + 1, dtype=torch.int32, device=device
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                    metadata.page_table = self.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
