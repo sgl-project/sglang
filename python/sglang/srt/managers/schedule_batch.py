@@ -75,6 +75,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -767,6 +768,9 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
         self.mamba_needs_clear: bool = False
+        # Lazy extra buffer: skip radix cache insert when prealloc failed at
+        # boundary — the forward overwrites the only slot, corrupting the state.
+        self.mamba_lazy_is_insert: bool = True
 
         # Check finish
         self.tokenizer = None
@@ -2123,11 +2127,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            req.mamba_next_track_idx = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+            # In lazy mode, skip the swap — the second ping-pong slot is not
+            # allocated yet; it will be allocated on demand at the track boundary
+            # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
+            if not get_global_server_args().enable_mamba_extra_buffer_lazy():
+                req.mamba_next_track_idx = (
+                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
                 )
-            )
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -2380,6 +2388,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
+    def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
+        """Allocate a temporary second ping-pong slot for reqs at a track boundary.
+
+        In lazy mode each request normally holds only 1 ping-pong slot.
+        When seq_len hits a track interval boundary, we allocate the
+        second slot so the forward pass can write the new tracked state
+        there. The old slot is freed after the forward in
+        mamba_lazy_post_decode_at_boundary.
+        """
+        pool = self.req_to_token_pool
+        for i, req in enumerate(self.reqs):
+            buf = req.mamba_ping_pong_track_buffer
+            assert buf is not None
+            # Skip reqs not at a track boundary
+            if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
+                continue
+            other_idx = 1 - req.mamba_next_track_idx
+            if buf[other_idx].item() != -1:
+                # With overlap the previous forward's post-processing
+                # (which frees this slot) hasn't run yet. Skip.
+                continue
+            if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
+                new_slot = None
+            else:
+                new_slot = pool.mamba_pool.alloc(1)
+                if new_slot is None:
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    new_slot = pool.mamba_pool.alloc(1)
+            if new_slot is not None:
+                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
+                req.mamba_next_track_idx = other_idx
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2460,16 +2500,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
+                if get_global_server_args().enable_mamba_extra_buffer_lazy():
+                    self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
             # async H2D
             self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
+                (self.seq_lens_cpu % mamba_track_interval == 0)
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )

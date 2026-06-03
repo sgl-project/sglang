@@ -790,11 +790,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            # stride = accept_tokens per-req width = accept_index.shape[1].
             fill_bonus_tokens[(bs,)](
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
-                self.speculative_num_draft_tokens,
+                accept_index.shape[1],
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
