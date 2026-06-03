@@ -92,10 +92,15 @@ class MambaComponent(TreeComponent):
             if req.mamba_pool_idx is None:
                 dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
                 if dst_index is None:
-                    self.cache.inc_lock_ref(last_node)
+                    # Capture the inc result and thread swa_uuid_for_lock back
+                    # into dec. Without it, SWA's release walks past this
+                    # request's window boundary all the way to root and
+                    # over-decrements SWA locks held by other resident requests
+                    # on ancestor nodes.
+                    lock_result = self.cache.inc_lock_ref(last_node)
                     self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                     dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
-                    self.cache.dec_lock_ref(last_node)
+                    self.cache.dec_lock_ref(last_node, lock_result.to_dec_params())
                     assert dst_index is not None, "Can not alloc mamba cache"
                 req.mamba_pool_idx = dst_index[0]
             req.mamba_cow_src_index = mamba_value
