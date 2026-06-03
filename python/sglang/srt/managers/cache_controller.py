@@ -1379,6 +1379,13 @@ class HiCacheController:
         - "offload": L1 -> L2
         - "onboard": L2 -> L1
         """
+        should_log = logger.isEnabledFor(logging.DEBUG)
+        should_record_metrics = (
+            self.hicache_l1_l2_transfer_metrics_collector is not None
+        )
+        if not should_log and not should_record_metrics:
+            return
+
         if direction == "offload":
             action = "Offload"
             src = "sglang_hicache::L1"
@@ -1391,23 +1398,24 @@ class HiCacheController:
             raise ValueError(f"Unknown HiCache L1/L2 transfer direction: {direction}")
 
         xfer_us = self._transfer_elapsed_us(ack)
-        ts_us = time.time_ns() // 1000
 
-        logger.debug(
-            "%s transfer complete ts_us=%d blocks=%d bytes=%d xfer_us=%d "
-            "bandwidth=%.2fGB/s "
-            'src="%s" dst="%s"',
-            action,
-            ts_us,
-            ack.block_count,
-            ack.byte_count,
-            xfer_us,
-            ack.byte_count * 0.001 / xfer_us if xfer_us > 0 else 0,
-            src,
-            dst,
-        )
+        if should_log:
+            ts_us = time.time_ns() // 1000
+            logger.debug(
+                "%s transfer complete ts_us=%d blocks=%d bytes=%d xfer_us=%d "
+                "bandwidth=%.2fGB/s "
+                'src="%s" dst="%s"',
+                action,
+                ts_us,
+                ack.block_count,
+                ack.byte_count,
+                xfer_us,
+                ack.byte_count * 0.001 / xfer_us if xfer_us > 0 else 0,
+                src,
+                dst,
+            )
 
-        if self.hicache_l1_l2_transfer_metrics_collector is not None:
+        if should_record_metrics:
             self.hicache_l1_l2_transfer_metrics_collector.record_transfer(
                 direction=direction,
                 src=src,
@@ -1417,24 +1425,25 @@ class HiCacheController:
                 xfer_us=xfer_us,
             )
 
-        totals = self.hicache_l1_l2_transfer_totals[direction]
-        totals["events"] += 1
-        totals["blocks"] += ack.block_count
-        totals["bytes"] += ack.byte_count
-        totals["xfer_us"] += xfer_us
+        if should_log:
+            totals = self.hicache_l1_l2_transfer_totals[direction]
+            totals["events"] += 1
+            totals["blocks"] += ack.block_count
+            totals["bytes"] += ack.byte_count
+            totals["xfer_us"] += xfer_us
 
-        logger.debug(
-            '%s transfer cumulative direction="%s" total_events=%d '
-            "total_blocks=%d total_bytes=%d total_xfer_us=%d "
-            "bandwidth=%.2fGB/s cumulative "
-            'src="%s" dst="%s"',
-            action,
-            direction,
-            totals["events"],
-            totals["blocks"],
-            totals["bytes"],
-            totals["xfer_us"],
-            totals["bytes"] * 0.001 / totals["xfer_us"] if totals["xfer_us"] > 0 else 0,
-            src,
-            dst,
-        )
+            logger.debug(
+                '%s transfer cumulative direction="%s" total_events=%d '
+                "total_blocks=%d total_bytes=%d total_xfer_us=%d "
+                "bandwidth=%.2fGB/s cumulative "
+                'src="%s" dst="%s"',
+                action,
+                direction,
+                totals["events"],
+                totals["blocks"],
+                totals["bytes"],
+                totals["xfer_us"],
+                totals["bytes"] * 0.001 / totals["xfer_us"] if totals["xfer_us"] > 0 else 0,
+                src,
+                dst,
+            )
