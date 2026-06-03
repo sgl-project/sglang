@@ -65,17 +65,17 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft cuda-graph runner.
 
-    Subclasses ``DecodeCudaGraphRunner`` to inherit the outer capture
-    loop (``capture()``), bucket-padding helper (``_pad_to_bucket``),
+    Subclasses DecodeCudaGraphRunner to inherit the outer capture
+    loop (capture()), bucket-padding helper (_pad_to_bucket),
     and the backend-driven capture/replay scaffolding. EAGLE-specific
-    bits — buffer dataclass, dummy ``ForwardBatch`` construction in
-    ``capture_one_shape``, replay output unwrap, and ``can_run`` — are
+    bits — buffer dataclass, dummy ForwardBatch construction in
+    capture_one_shape, replay output unwrap, and can_run — are
     overridden.
 
-    EAGLE does not call ``DecodeCudaGraphRunner.__init__`` (that init
+    EAGLE does not call DecodeCudaGraphRunner.__init__ (that init
     sets up many decode-only fields like SWA/encoder-decoder/MLA-aware
     state). Instead it sets up its own state directly while making sure
-    the parent's ``capture()`` / backend contract is satisfied.
+    the parent's capture() / backend contract is satisfied.
     """
 
     def __init__(

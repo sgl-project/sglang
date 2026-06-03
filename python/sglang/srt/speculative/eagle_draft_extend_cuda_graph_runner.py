@@ -67,9 +67,9 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft-extend cuda-graph runner.
 
-    Subclasses ``DecodeCudaGraphRunner`` to inherit the outer capture
-    loop + backend scaffolding. Overrides ``capture_one_shape``,
-    ``replay``, ``can_run`` for EAGLE-specific draft-extend semantics.
+    Subclasses DecodeCudaGraphRunner to inherit the outer capture
+    loop + backend scaffolding. Overrides capture_one_shape,
+    replay, can_run for EAGLE-specific draft-extend semantics.
     """
 
     def __init__(

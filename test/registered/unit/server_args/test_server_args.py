@@ -676,9 +676,9 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
     to exercise the math independently of __post_init__ resolution.
 
-    cg-refactor: the legacy ``disable_piecewise_cuda_graph`` /
-    ``piecewise_cuda_graph_max_tokens`` / ``cuda_graph_max_bs`` fields were
-    consolidated into ``cuda_graph_config``; the helper accepts the legacy
+    cg-refactor: the legacy disable_piecewise_cuda_graph /
+    piecewise_cuda_graph_max_tokens / cuda_graph_max_bs fields were
+    consolidated into cuda_graph_config; the helper accepts the legacy
     kwarg names for test readability and translates them to the per-phase
     dataclasses.
     """

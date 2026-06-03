@@ -1349,7 +1349,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch: The batch to run.
             accept_index: The index of the accepted tokens (incl. bonus).
             num_correct_drafts: Per-req count of correct drafts (excludes bonus);
-                seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+                seq_lens is advanced by num_correct_drafts + 1 to cover the bonus slot.
         """
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens

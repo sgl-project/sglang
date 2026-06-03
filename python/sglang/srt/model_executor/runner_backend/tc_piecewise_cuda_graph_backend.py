@@ -2,9 +2,9 @@
 
 FX-splits the model forward at attention layers; per-shape compiled
 callables internally capture sub-graphs via
-``compilation/cuda_piecewise_backend``. torch.compile owns the per-shape
-cache so this backend has no ``_graphs`` table — only a single
-``_compiled_fn`` reused for every shape.
+compilation/cuda_piecewise_backend. torch.compile owns the per-shape
+cache so this backend has no _graphs table — only a single
+_compiled_fn reused for every shape.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ _VALID_COMPILERS = ("eager", "inductor")
 def _toggle_multi_platform_ops(
     model: torch.nn.Module, *, reverse: bool, num_tokens: int
 ) -> None:
-    """Recursively flip ``MultiPlatformOp`` submodules into / out of
+    """Recursively flip MultiPlatformOp submodules into / out of
     torch.compile mode."""
     for sub in model._modules.values():
         if isinstance(sub, MultiPlatformOp):
@@ -84,7 +84,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     @staticmethod
     def build_compilation_config(server_args: ServerArgs) -> CompilationConfig:
-        """Construct a ``CompilationConfig`` from ``ServerArgs`` and
+        """Construct a CompilationConfig from ServerArgs and
         register the MoE A2A split-op when DeepEP / Mooncake is in use."""
         prefill = server_args.cuda_graph_config.prefill
         num_tokens = prefill.bs
@@ -115,7 +115,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         fullgraph: bool = True,
         dynamic_arg_dims: Optional[Any] = None,
     ) -> None:
-        """Wrap ``language_model.model.forward`` with ``torch.compile``."""
+        """Wrap language_model.model.forward with torch.compile."""
         install_torch_compiled(
             language_model,
             fullgraph=fullgraph,
@@ -126,8 +126,8 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     def _run_compile_pass(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         """JIT-activate kernels at the smallest shape, install
-        ``torch.compile``, then run one forward per shape inside
-        ``enable_torch_compile_warmup`` to drive FX / inductor through
+        torch.compile, then run one forward per shape inside
+        enable_torch_compile_warmup to drive FX / inductor through
         every shape without capturing cuda graphs yet."""
         language_model = self._language_model
         compiler = self._compile_config.compiler

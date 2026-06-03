@@ -24,7 +24,7 @@ def get_is_capture_mode() -> bool:
 
 
 def compile_in_capture_mode(func):
-    """Decorator: wrap ``func`` with ``torch.compile`` only when defined
+    """Decorator: wrap func with torch.compile only when defined
     inside model capture mode; passthrough otherwise.
 
     Used by model code (e.g. DeepSeek-V4) to opt nested helpers into

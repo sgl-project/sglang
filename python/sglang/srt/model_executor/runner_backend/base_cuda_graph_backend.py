@@ -14,23 +14,23 @@ if TYPE_CHECKING:
 class BaseCudaGraphBackend(ABC):
     """Pure ABC: no state, no defaults. Each implementation owns its
     per-backend state and binds the handles it needs from the
-    ``cuda_graph_runner`` passed to its ``__init__``.
+    cuda_graph_runner passed to its __init__.
 
     Methods:
-      - ``capture_session(stream)`` — context wrapping the runner's outer
+      - capture_session(stream) — context wrapping the runner's outer
         capture loop; backends bind stream / pool and open per-backend
         capture flags here.
-      - ``capture_one(shape_key, forward_fn, dummies, post_warmup_hook)``
-        — record the replayable artifact for ``shape_key``; one call per
-        shape inside ``capture_session``.
-      - ``can_run(forward_batch, shape_key)`` — can this backend replay
+      - capture_one(shape_key, forward_fn, dummies, post_warmup_hook)
+        — record the replayable artifact for shape_key; one call per
+        shape inside capture_session.
+      - can_run(forward_batch, shape_key) — can this backend replay
         for the given batch at the given shape.
-      - ``replay_session()`` — context wrapping replay-time model code;
+      - replay_session() — context wrapping replay-time model code;
         backends open the "we are replaying" flag here when they have
         one.
-      - ``replay(shape_key, static_forward_batch, **kwargs)`` — invoke
+      - replay(shape_key, static_forward_batch, **kwargs) — invoke
         the captured artifact.
-      - ``cleanup()`` — release pool and drop captured artifacts.
+      - cleanup() — release pool and drop captured artifacts.
 
     Notes:
       - The outer capture loop is runner-specific; it lives on the

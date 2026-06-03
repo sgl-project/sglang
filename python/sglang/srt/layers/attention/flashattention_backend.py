@@ -2010,7 +2010,7 @@ class FlashAttentionBackend(AttentionBackend):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`. This helper
-        formerly lived as the legacy ``init_forward_metadata_replay_cuda_graph``;
+        formerly lived as the legacy init_forward_metadata_replay_cuda_graph;
         the capture path used to wrap it. Both legacy method overrides
         are gone.
         """

@@ -3,16 +3,16 @@
 One concrete runner per phase. Each runner owns its phase-specific
 shape semantics (decode → batch size; prefill → token count) and
 delegates capture/replay mechanics to a pluggable
-``BaseCudaGraphBackend`` chosen via ``cuda_graph_config``.
+BaseCudaGraphBackend chosen via cuda_graph_config.
 
 Public API:
-  - ``BaseCudaGraphRunner`` — abstract base; shared init + bucket
+  - BaseCudaGraphRunner — abstract base; shared init + bucket
     padding + capture-loop scaffolding.
-  - ``DecodeCudaGraphRunner`` — concrete decode-phase runner.
-  - ``PrefillCudaGraphRunner`` — concrete prefill-phase runner.
+  - DecodeCudaGraphRunner — concrete decode-phase runner.
+  - PrefillCudaGraphRunner — concrete prefill-phase runner.
   - Buffer dataclasses, capture-mode flags, the global memory pool,
     and the DeepEP adapter live in
-    ``sglang.srt.model_executor.runner_utils``; they are
+    sglang.srt.model_executor.runner_utils; they are
     re-exported here for the EAGLE / multi-step draft cuda graph
     runners that were authored against the legacy public surface.
 """

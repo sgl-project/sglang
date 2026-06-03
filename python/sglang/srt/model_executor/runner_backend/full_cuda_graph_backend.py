@@ -1,5 +1,5 @@
 """FullCudaGraphBackend — captures the entire model forward as one
-``torch.cuda.CUDAGraph`` per shape.
+torch.cuda.CUDAGraph per shape.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 class FullCudaGraphBackend(BaseCudaGraphBackend):
-    """One ``torch.cuda.CUDAGraph`` per shape; attention metadata is
+    """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
     """
 

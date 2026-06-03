@@ -900,7 +900,7 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward under a per-step ForwardContext so the model layer
-            # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
+            # reads attn_backends[i] for the i-th draft step. _forward_raw
             # is no-op for the attn_backend half when a context is already
             # active, so this outer wrap is what reaches RadixAttention.
             with forward_context(

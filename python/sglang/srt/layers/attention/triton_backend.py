@@ -318,8 +318,8 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Fill KV (and SWA) cuda-graph buffers for decode/idle mode.
 
-        Returns ``(kv_indptr, window_kv_indptr, window_kv_lens)`` where
-        ``window_kv_lens`` is ``None`` when sliding-window is disabled.
+        Returns (kv_indptr, window_kv_indptr, window_kv_lens) where
+        window_kv_lens is None when sliding-window is disabled.
         """
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -417,7 +417,7 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Fill QO + KV cuda-graph buffers for draft_extend mode.
 
-        Returns ``(qo_indptr, kv_indptr, num_tokens_per_bs)``.
+        Returns (qo_indptr, kv_indptr, num_tokens_per_bs).
         """
         seq_lens = seq_lens[:bs]
         num_tokens_per_bs = self.speculative_num_steps + 1
@@ -822,7 +822,7 @@ class TritonAttnBackend(AttentionBackend):
 
         Called by capture after the buffer-update helpers have already run
         (either via replay or directly).  All fields reference the same
-        ``self.cuda_graph_*`` tensors that the captured graph kernels will
+        self.cuda_graph_* tensors that the captured graph kernels will
         read — the Python object is rebuilt each capture, but the underlying
         GPU memory addresses are stable.
         """
@@ -1477,9 +1477,9 @@ def update_sliding_window_buffer(
 ):
     """Fill window KV buffers for sliding-window attention.
 
-    Pass ``window_kv_indices`` to write into a pre-allocated buffer (CUDA-graph
-    path); omit it (or pass ``None``) to allocate a fresh tensor (eager path,
-    requires ``device``).
+    Pass window_kv_indices to write into a pre-allocated buffer (CUDA-graph
+    path); omit it (or pass None) to allocate a fresh tensor (eager path,
+    requires device).
     """
     window_kv_lens = torch.minimum(
         seq_lens,

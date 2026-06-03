@@ -39,9 +39,9 @@ _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
 def resolve_decode_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
 ) -> BaseCudaGraphBackend:
-    """Pick a backend instance from ``cuda_graph_config['decode']['backend']``.
+    """Pick a backend instance from cuda_graph_config['decode']['backend'].
 
-    NPU device returns ``NPUCudaGraphBackend`` regardless of mode (only
+    NPU device returns NPUCudaGraphBackend regardless of mode (only
     the Full-style backend is wired for NPU today).
     """
     model_runner = cuda_graph_runner.model_runner
@@ -81,7 +81,7 @@ def resolve_decode_backend(
 def resolve_prefill_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
 ) -> BaseCudaGraphBackend:
-    """Pick a backend instance from ``cuda_graph_config['prefill']['backend']``."""
+    """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
     model_runner = cuda_graph_runner.model_runner
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
@@ -92,5 +92,5 @@ def resolve_prefill_backend(
             enable_memory_saver=model_runner.server_args.enable_memory_saver,
             debug_eager=model_runner.server_args.debug_cuda_graph,
         )
-    # Default: tc_piecewise. ``(prefill, full)`` is rejected at config validation.
+    # Default: tc_piecewise. (prefill, full) is rejected at config validation.
     return TcPiecewiseCudaGraphBackend(cuda_graph_runner)

@@ -402,8 +402,8 @@ class PrefillInputBuffers(ForwardInputBuffers):
         is_multimodal: bool,
     ) -> None:
         """Copy serving-batch values into static buffers and zero out
-        the padding region between ``raw_num_tokens`` and
-        ``static_num_tokens``.
+        the padding region between raw_num_tokens and
+        static_num_tokens.
         """
         if static_num_tokens != raw_num_tokens:
             self.out_cache_loc.zero_()

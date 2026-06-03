@@ -99,10 +99,10 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
 class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     """Per-step multi-layer EAGLE draft-extend runner.
 
-    Subclasses ``DecodeCudaGraphRunner``. Shares buffers across steps
-    via the composite ``MultiLayerEagleMultiStepDraftExtendCudaGraphRunner``,
-    so initialization is split: ``__init__`` does basic field setup,
-    ``init_buffers_and_capture`` (called by the composite once shared
+    Subclasses DecodeCudaGraphRunner. Shares buffers across steps
+    via the composite MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
+    so initialization is split: __init__ does basic field setup,
+    init_buffers_and_capture (called by the composite once shared
     buffers exist) finishes by allocating per-step buffers and running
     capture.
     """
@@ -615,9 +615,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
 
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
-    """Composite orchestrator that owns ``speculative_num_steps`` per-step
+    """Composite orchestrator that owns speculative_num_steps per-step
     runners with shared input buffers. Not itself a
-    ``DecodeCudaGraphRunner`` — it only routes work to the per-step
+    DecodeCudaGraphRunner — it only routes work to the per-step
     runners.
     """
 

@@ -1,5 +1,5 @@
 """Shared graph memory pool used by the speculative-draft cuda graph
-runners. The new ``DecodeCudaGraphRunner`` and ``PrefillCudaGraphRunner``
+runners. The new DecodeCudaGraphRunner and PrefillCudaGraphRunner
 backends each own their pool internally; this global is retained for the
 EAGLE / multi-step draft runners that haven't been folded into the new
 backend interface.

@@ -779,7 +779,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return output[:total_tokens, :, :]
 
     def _compute_decode_bmm1_scale(self, layer: RadixAttention) -> float:
-        """BMM1 scale ``q_scale * k_scale * softmax_scale``. k_scale only
+        """BMM1 scale q_scale * k_scale * softmax_scale. k_scale only
         applies when the KV cache stores FP8."""
         q_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
@@ -857,7 +857,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
-        Returns the output tensor or ``(output, lse)`` if ``return_lse``."""
+        Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)

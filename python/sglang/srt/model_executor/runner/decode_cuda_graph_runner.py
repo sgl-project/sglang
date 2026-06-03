@@ -14,13 +14,13 @@
 """DecodeCudaGraphRunner — runs DECODE / TARGET_VERIFY / DLLM_EXTEND under
 a pluggable backend.
 
-Backend selection comes from ``cuda_graph_config.decode``:
-  - ``"full"``      — default, ``FullCudaGraphBackend``: one
-                      ``torch.cuda.CUDAGraph`` per shape.
-  - ``"breakable"`` — experimental, ``BreakableCudaGraphBackend``:
+Backend selection comes from cuda_graph_config.decode:
+  - "full"      — default, FullCudaGraphBackend: one
+                      torch.cuda.CUDAGraph per shape.
+  - "breakable" — experimental, BreakableCudaGraphBackend:
                       segmented capture (no torch.compile).
-  - ``"tc_piecewise"``     — not implemented for decode; logs a one-shot warning
-                      and falls back to ``"full"``.
+  - "tc_piecewise"     — not implemented for decode; logs a one-shot warning
+                      and falls back to "full".
 """
 
 from __future__ import annotations
@@ -134,18 +134,18 @@ def build_replay_fb_view(
 ) -> SimpleNamespace:
     """Construct a ForwardBatch-like view for backend replay-side init.
 
-    Combines the original ``forward_batch`` (for unpadded / per-iter
-    fields like ``spec_info``, ``out_cache_loc``, and the runtime
-    ``actual_forward_mode``) with the padded capture-time buffers from
-    ``buffers`` (for ``req_pool_indices``, ``seq_lens``, ``seq_lens_cpu``,
-    ``encoder_lens``).
+    Combines the original forward_batch (for unpadded / per-iter
+    fields like spec_info, out_cache_loc, and the runtime
+    actual_forward_mode) with the padded capture-time buffers from
+    buffers (for req_pool_indices, seq_lens, seq_lens_cpu,
+    encoder_lens).
 
-    ``forward_mode`` is the capture-time mode (used by backends for
-    bucket / dispatch decisions); ``actual_forward_mode`` is the
+    forward_mode is the capture-time mode (used by backends for
+    bucket / dispatch decisions); actual_forward_mode is the
     runtime mode (may be IDLE while the captured graph targets DECODE
     — DSV4's replay metadata prep uses this for IDLE substitution).
 
-    Subsumes the ``_replay_forward_batch`` side channel that DSV4 used to
+    Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
     return SimpleNamespace(
@@ -170,9 +170,9 @@ def build_replay_fb_view(
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
-    Owns: static input buffers (``DecodeInputBuffers``), capture-bs list,
+    Owns: static input buffers (DecodeInputBuffers), capture-bs list,
     attention backend, two-batch-overlap plugin, DeepEP adapter, and the
-    pluggable ``self.backend`` that handles the actual capture/replay.
+    pluggable self.backend that handles the actual capture/replay.
     """
 
     def __init__(
@@ -465,12 +465,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         size: int,
         stream_idx: Optional[int] = None,
     ):
-        """Build the dummy decode ForwardBatch for capture at ``size`` (=bs),
+        """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
         optionally build pp_proxy_tensors.
 
-        Returns ``(forward_batch, attn_backend, pp_proxy_tensors)``;
-        ``pp_proxy_tensors`` is None unless ``pp_size > 1``.
+        Returns (forward_batch, attn_backend, pp_proxy_tensors);
+        pp_proxy_tensors is None unless pp_size > 1.
         """
         bs = size
         buffers: DecodeInputBuffers = self.buffers

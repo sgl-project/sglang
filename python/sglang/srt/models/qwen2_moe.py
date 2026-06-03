@@ -131,7 +131,7 @@ def can_fuse_shared_expert(
 ) -> bool:
     """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
 
-    Caller must still gate on ``support_shared_expert_fusion`` and ``_use_aiter``.
+    Caller must still gate on support_shared_expert_fusion and _use_aiter.
     """
     if (
         get_global_server_args().disable_shared_experts_fusion is True

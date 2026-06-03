@@ -1,5 +1,5 @@
 """BreakableCudaGraphBackend — segment-captured graphs with eager break
-markers (``eager_on_graph`` decorators on attention / mamba layers).
+markers (eager_on_graph decorators on attention / mamba layers).
 No torch.compile.
 """
 

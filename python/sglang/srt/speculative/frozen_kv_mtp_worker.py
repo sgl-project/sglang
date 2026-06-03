@@ -367,8 +367,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         mm_input_embeds: Optional[torch.Tensor] = None,
         draft_input: Optional[FrozenKVMTPDraftInput] = None,
     ) -> None:
-        """Stash seed inputs on ``batch.spec_info``; the forward runs inside
-        the captured draft graph (see ``draft_forward``'s seed iter)."""
+        """Stash seed inputs on batch.spec_info; the forward runs inside
+        the captured draft graph (see draft_forward's seed iter)."""
         del seq_lens_cpu, mm_input_embeds, draft_input
 
         if batch.forward_mode.is_idle() or last_token_ids.numel() == 0:

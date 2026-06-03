@@ -13,15 +13,15 @@
 # ==============================================================================
 """PrefillCudaGraphRunner — runs the EXTEND phase under a pluggable backend.
 
-Backend selection comes from ``cuda_graph_config.prefill``:
-  - ``"tc_piecewise"``     — default, ``TcPiecewiseCudaGraphBackend``: torch.compile
+Backend selection comes from cuda_graph_config.prefill:
+  - "tc_piecewise"     — default, TcPiecewiseCudaGraphBackend: torch.compile
                       wraps the model; per-shape graphs live in
                       torch.compile's internal cache. Multi-batch supported.
-  - ``"breakable"`` — ``BreakableCudaGraphBackend``: segmented capture (no
+  - "breakable" — BreakableCudaGraphBackend: segmented capture (no
                       torch.compile). Captures with bs=1; rejects multi-req
-                      prefill in ``can_run``.
-  - ``"full"``      — rejected at config validation; not supported for prefill.
-  - ``"disabled"``  — handled at the model_runner level — runner not
+                      prefill in can_run.
+  - "full"      — rejected at config validation; not supported for prefill.
+  - "disabled"  — handled at the model_runner level — runner not
                       constructed.
 """
 
@@ -91,8 +91,8 @@ if TYPE_CHECKING:
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
-    Owns: ``PrefillInputBuffers``, capture-num-tokens list, attention layers
-    snapshot, and the pluggable ``self.backend``. The backend handles capture
+    Owns: PrefillInputBuffers, capture-num-tokens list, attention layers
+    snapshot, and the pluggable self.backend. The backend handles capture
     + replay mechanics; this runner handles dummy ForwardBatch construction,
     buffer population, attention metadata init, and output slicing.
     """
@@ -107,7 +107,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # --- bucket sizes ---------------------------------------------
-        # ``bs`` in prefill carries the captured shape (token count for
+        # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = model_runner.server_args.cuda_graph_config.prefill.bs
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
@@ -205,10 +205,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
         """Build a dummy ForwardBatch at this shape, init attn metadata,
-        run forward once. Used by ``TcPiecewiseCudaGraphBackend.prepare``
+        run forward once. Used by TcPiecewiseCudaGraphBackend.prepare
         for both the JIT-activate forward (single shape, before
         torch.compile install) and the compile-loop pass (every shape,
-        inside ``enable_torch_compile_warmup``).
+        inside enable_torch_compile_warmup).
         """
         fb = self.capture_prepare(num_tokens)
         self.model_runner.attn_backend.init_forward_metadata(fb)
@@ -243,7 +243,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         # No backend-level shape check here: replay_prepare bucket-pads
         # num_tokens up to the nearest captured shape, so eligibility is
-        # bounded by ``num_tokens <= self.max_num_tokens`` (already
+        # bounded by num_tokens <= self.max_num_tokens (already
         # checked above), not by exact shape membership.
         return True
 
@@ -381,7 +381,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     # -----------------------------------------------------------------
     def capture_one_shape(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
-        delegate to backend. ``size`` is the prefill token count.
+        delegate to backend. size is the prefill token count.
         """
         num_tokens = size
         forward_batch = self.capture_prepare(num_tokens)

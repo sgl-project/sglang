@@ -1,15 +1,15 @@
 """Capture-mechanism backends for CUDA graphs.
 
 A backend owns *how* a captured artifact is produced and replayed for
-one shape; it is phase-agnostic. Runners (``cuda_graph_runner/``) own
+one shape; it is phase-agnostic. Runners (cuda_graph_runner/) own
 *what* data flows in and out.
 
 Public API:
-  - ``BaseCudaGraphBackend`` — abstract interface.
-  - ``FullCudaGraphBackend`` — single ``torch.cuda.CUDAGraph`` per shape.
-  - ``BreakableCudaGraphBackend`` — segmented capture with eager break
+  - BaseCudaGraphBackend — abstract interface.
+  - FullCudaGraphBackend — single torch.cuda.CUDAGraph per shape.
+  - BreakableCudaGraphBackend — segmented capture with eager break
     markers; no torch.compile.
-  - ``TcPiecewiseCudaGraphBackend`` — torch.compile-driven piecewise
+  - TcPiecewiseCudaGraphBackend — torch.compile-driven piecewise
     capture; FX-splits the model at attention layers.
 """
 

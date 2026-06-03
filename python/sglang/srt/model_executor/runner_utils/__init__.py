@@ -1,10 +1,10 @@
 """Low-level utilities used by the CUDA graph runners.
 
-Mirror of ``cuda_graph_backend_utils/`` for runner-side state — buffer
+Mirror of cuda_graph_backend_utils/ for runner-side state — buffer
 dataclasses, process-global capture flags, the speculative-shared
 graph memory pool, and the DeepEP capture/replay adapter. Runners in
-``cuda_graph_runner/`` import from here; nothing here should import
-back into ``cuda_graph_runner/``.
+cuda_graph_runner/ import from here; nothing here should import
+back into cuda_graph_runner/.
 """
 
 from sglang.srt.model_executor.runner_utils.buffers import (  # noqa: F401

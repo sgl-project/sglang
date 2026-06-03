@@ -61,14 +61,14 @@ class AdaptiveSpecWorker(Protocol):
 class AdaptiveController:
     """Facade that owns adaptive decision-making and runtime state switching.
 
-    Works with any worker that implements ``AdaptiveSpecWorker`` protocol:
-      - ``build_adaptive_runtime_state(steps, draft_tokens)`` → runtime state
-      - ``apply_runtime_state(state)`` → apply it to the worker
+    Works with any worker that implements AdaptiveSpecWorker protocol:
+      - build_adaptive_runtime_state(steps, draft_tokens) → runtime state
+      - apply_runtime_state(state) → apply it to the worker
 
     The worker only needs to:
-      1. Call ``register()`` for the initial state, then ``init_states()``
+      1. Call register() for the initial state, then init_states()
          once during startup.
-      2. Call ``on_verify_complete(num_correct_drafts_per_req)`` after each decode verify.
+      2. Call on_verify_complete(num_correct_drafts_per_req) after each decode verify.
     """
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
@@ -86,7 +86,7 @@ class AdaptiveController:
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
 
-        *steps* defaults to ``state.speculative_num_steps`` when not given.
+        *steps* defaults to state.speculative_num_steps when not given.
         """
         key = steps if steps is not None else state.speculative_num_steps
         self._states[key] = state

@@ -3,20 +3,20 @@
 Owns two pieces of cross-cutting state used by *every* piecewise-style
 backend (currently breakable + tc_piecewise):
 
-* ``_in_tc_piecewise_cuda_graph`` — a process-global flag set true while we
+* _in_tc_piecewise_cuda_graph — a process-global flag set true while we
   are inside the capture or replay window of a piecewise CUDA graph.
   Read by model code that needs to take the static-buffer / fixed-shape
-  branch. See ``refactor/plan.md`` §6.5 for the full semantics.
-* ``TcPiecewiseForwardContext`` — a dataclass propagated across attention/MoE
+  branch. See refactor/plan.md §6.5 for the full semantics.
+* TcPiecewiseForwardContext — a dataclass propagated across attention/MoE
   layers during capture and replay so that submodules can reach the
-  current ``ForwardBatch`` and per-layer metadata without threading
-  arguments through every call site. Named ``TcPiecewise…`` (matches
-  ``Backend.TC_PIECEWISE`` + ``enable_tc_piecewise_cuda_graph``) to
+  current ForwardBatch and per-layer metadata without threading
+  arguments through every call site. Named TcPiecewise… (matches
+  Backend.TC_PIECEWISE + enable_tc_piecewise_cuda_graph) to
   disambiguate from the per-forward-call
-  ``sglang.srt.model_executor.forward_context.ForwardContext``.
+  sglang.srt.model_executor.forward_context.ForwardContext.
 
 This module deliberately does **not** own torch.compile-specific state
-(warmup flag, capture stream); those live in ``compilation/compile_phase.py``.
+(warmup flag, capture stream); those live in compilation/compile_phase.py.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def is_in_tc_piecewise_cuda_graph() -> bool:
 @contextmanager
 def enable_tc_piecewise_cuda_graph():
     """Mark the enclosed scope as "we are inside a piecewise CUDA graph
-    capture/replay". Sets ``_in_tc_piecewise_cuda_graph`` true for the duration.
+    capture/replay". Sets _in_tc_piecewise_cuda_graph true for the duration.
 
     Errors during capture surface a hint that lets users disable the
     feature while filing a bug.

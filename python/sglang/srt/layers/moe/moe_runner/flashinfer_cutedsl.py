@@ -304,17 +304,17 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
 
     Shared by the two CuteDSL runner entries:
 
-    * "v2" standard path (a2a=``none``/``flashinfer``): consumed by the
-      ``@register_fused_func("none", "flashinfer_cutedsl")`` entry, which
-      drives ``CuteDslMoEWrapper.run``. Weights are ``[Up, Gate]``
-      interleaved with MMA-layout blockscales. ``wrapper`` is set;
-      ``w*_scale`` are scalarized.
+    * "v2" standard path (a2a=none/flashinfer): consumed by the
+      @register_fused_func("none", "flashinfer_cutedsl") entry, which
+      drives CuteDslMoEWrapper.run. Weights are [Up, Gate]
+      interleaved with MMA-layout blockscales. wrapper is set;
+      w*_scale are scalarized.
 
-    * "v1" DeepEP low-latency path (a2a=``deepep``): consumed by the
-      ``@register_fused_func("deepep", "flashinfer_cutedsl")`` entry,
-      which drives ``flashinfer_cutedsl_moe_masked``. Weights are
-      ``[Gate, Up]`` non-interleaved with swizzled blockscales.
-      ``wrapper`` is ``None``; ``w*_scale`` are per-expert.
+    * "v1" DeepEP low-latency path (a2a=deepep): consumed by the
+      @register_fused_func("deepep", "flashinfer_cutedsl") entry,
+      which drives flashinfer_cutedsl_moe_masked. Weights are
+      [Gate, Up] non-interleaved with swizzled blockscales.
+      wrapper is None; w*_scale are per-expert.
     """
 
     # FP4 packed weights (uint8)
@@ -335,10 +335,10 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     a1_scale: torch.Tensor
     a2_scale: torch.Tensor
 
-    # v2 only: lazily-created CuteDslMoEWrapper (``None`` on the v1 path).
+    # v2 only: lazily-created CuteDslMoEWrapper (None on the v1 path).
     wrapper: Optional[Any] = None
 
-    # v1 only: ``True`` when DeepEP pre-quantizes activations to NVFP4.
+    # v1 only: True when DeepEP pre-quantizes activations to NVFP4.
     use_nvfp4_dispatch: bool = False
 
     # v1 only: SBO down-GEMM overlap args.

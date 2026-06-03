@@ -1,12 +1,12 @@
-"""NPUCudaGraphBackend — Ascend NPU full-graph capture (``torch.npu.NPUGraph``).
+"""NPUCudaGraphBackend — Ascend NPU full-graph capture (torch.npu.NPUGraph).
 
-Mirrors ``FullCudaGraphBackend`` with two differences:
-  - Captures via ``torch.npu.graph(...)`` into ``torch.npu.NPUGraph``.
-  - ``replay_with_input_update(shape_key, seq_lens, attr_name)`` rebinds
+Mirrors FullCudaGraphBackend with two differences:
+  - Captures via torch.npu.graph(...) into torch.npu.NPUGraph.
+  - replay_with_input_update(shape_key, seq_lens, attr_name) rebinds
     the recorded graph's input bindings for variable seq_lens at replay
-    time (NPU's ``NPUGraph.update(...)`` API).
+    time (NPU's NPUGraph.update(...) API).
 
-``torch.npu`` is imported lazily inside methods so the module loads on
+torch.npu is imported lazily inside methods so the module loads on
 non-NPU hosts.
 """
 
@@ -38,8 +38,8 @@ if TYPE_CHECKING:
 
 
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
-    """One ``torch.npu.NPUGraph`` per shape; attention metadata captured
-    inside the graph. ``replay_with_input_update`` substitutes fresh
+    """One torch.npu.NPUGraph per shape; attention metadata captured
+    inside the graph. replay_with_input_update substitutes fresh
     seq_lens without re-recording."""
 
     def __init__(
@@ -139,7 +139,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_name: str,
         attr_type: Any,
     ) -> Any:
-        """Rebind ``seq_lens`` on the recorded NPU graph in a background
+        """Rebind seq_lens on the recorded NPU graph in a background
         thread, then replay. Used when the model is not deepseek-nsa."""
         if isinstance(attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))

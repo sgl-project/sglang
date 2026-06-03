@@ -310,7 +310,7 @@ class FrozenKVMTPCudaGraphRunner:
 
         # Swap the draft backend's token_to_kv_pool to the frozen target pool
         # for the capture; the single backend-attr swap is seen by both
-        # ``get_token_to_kv_pool()`` (via ``get_attn_backend()``) and the
+        # get_token_to_kv_pool() (via get_attn_backend()) and the
         # backend's own reads.
         target_pool = self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool

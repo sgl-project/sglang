@@ -2490,8 +2490,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         """Run a dummy forward pass for warmup/profiling.
 
-        ``forward_mode_override`` forces EXTEND/DECODE regardless of
-        ``is_generation`` (used by the PP-parallel DeepGEMM warmup).
+        forward_mode_override forces EXTEND/DECODE regardless of
+        is_generation (used by the PP-parallel DeepGEMM warmup).
         """
         if forward_mode_override is not None:
             capture_forward_mode = forward_mode_override

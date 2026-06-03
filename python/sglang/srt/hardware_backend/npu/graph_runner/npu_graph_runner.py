@@ -13,15 +13,15 @@
 # ==============================================================================
 """Run the model with NPU graph and torch.compile.
 
-``NPUGraphRunner`` is a thin subclass of ``DecodeCudaGraphRunner``: the
-factory returns ``NPUCudaGraphBackend`` for NPU devices, so all
+NPUGraphRunner is a thin subclass of DecodeCudaGraphRunner: the
+factory returns NPUCudaGraphBackend for NPU devices, so all
 capture/replay mechanics live in the backend. This class adds:
-  - NPU-specific ``patch_model`` monkey-patch for the decode-Full +
+  - NPU-specific patch_model monkey-patch for the decode-Full +
     torch.compile path.
   - Profile context override (NPU profiler emits to disk, not in-mem).
-  - Replay override that issues an async ``NPUGraph.update`` for
+  - Replay override that issues an async NPUGraph.update for
     seq_lens before replay (skipped for deepseek-nsa).
-  - Smaller ``cache_loc`` dtype (int32 instead of int64).
+  - Smaller cache_loc dtype (int32 instead of int64).
 """
 
 from __future__ import annotations

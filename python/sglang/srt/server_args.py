@@ -733,10 +733,10 @@ class ServerArgs:
     debug_cuda_graph: bool = False
 
     # Accepts dict (CLI JSON / SDK) at construction time; normalized to
-    # ``CudaGraphConfig`` by ``_parse_cuda_graph_config``.
+    # CudaGraphConfig by _parse_cuda_graph_config.
     cuda_graph_config: Optional[CudaGraphConfig] = None
 
-    # Per-phase convenience CLI inputs that fold into ``cuda_graph_config``.
+    # Per-phase convenience CLI inputs that fold into cuda_graph_config.
     cuda_graph_backend_decode: Optional[
         Literal["full", "breakable", "tc_piecewise", "disabled"]
     ] = None
@@ -749,7 +749,7 @@ class ServerArgs:
     cuda_graph_tokens_prefill: Optional[List[int]] = None
     cuda_graph_tc_compiler: Optional[Literal["eager", "inductor"]] = None
 
-    # Legacy CLI inputs that fold into ``cuda_graph_config`` (with a CLI
+    # Legacy CLI inputs that fold into cuda_graph_config (with a CLI
     # deprecation warning). Internal-only after parsing.
     disable_cuda_graph: bool = False
     disable_prefill_cuda_graph: bool = False
@@ -1245,11 +1245,11 @@ class ServerArgs:
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local
-        ModelScope cache when possible, falling back to ``snapshot_download``
+        ModelScope cache when possible, falling back to snapshot_download
         for any path that is not already present on disk.
 
-        Note: ``speculative_token_map`` is intentionally NOT handled here
-        because its value uses ``repo_id/filename`` semantics rather than a
+        Note: speculative_token_map is intentionally NOT handled here
+        because its value uses repo_id/filename semantics rather than a
         plain repo ID.  That resolution lives in
         :func:`sglang.srt.speculative.spec_utils.load_token_map`.
         """
@@ -1359,16 +1359,16 @@ class ServerArgs:
         self._validate_cuda_graph_config()
 
     def _parse_cuda_graph_config(self):
-        """Resolve ``cuda_graph_config`` from explicit JSON, per-phase
+        """Resolve cuda_graph_config from explicit JSON, per-phase
         convenience flags, legacy global flags, and defaults.
         Precedence (highest first): explicit JSON > convenience > legacy > defaults.
-        Also populates ``self._cuda_graph_config_locked`` — the set of
-        ``(phase, key)`` tuples that came from non-default sources; the
+        Also populates self._cuda_graph_config_locked — the set of
+        (phase, key) tuples that came from non-default sources; the
         auto-disable cascade respects this lock (the old
-        ``--enforce-piecewise-cuda-graph`` semantics generalized).
+        --enforce-piecewise-cuda-graph semantics generalized).
         """
-        # ``cuda_graph_config`` arrives as dict (CLI / SDK) or as
-        # ``CudaGraphConfig`` (SDK passing the new type, or re-parse).
+        # cuda_graph_config arrives as dict (CLI / SDK) or as
+        # CudaGraphConfig (SDK passing the new type, or re-parse).
         # Normalize to a plain dict overlay for the precedence cascade.
         raw_input = self.cuda_graph_config
         if isinstance(raw_input, CudaGraphConfig):
@@ -1431,7 +1431,7 @@ class ServerArgs:
         Rules are split per backend — TcPiecewise and Breakable have
         different constraints. Skipped when the user explicitly set the
         prefill backend (this folds in the old
-        ``--enforce-piecewise-cuda-graph`` contract).
+        --enforce-piecewise-cuda-graph contract).
         """
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
@@ -1500,7 +1500,7 @@ class ServerArgs:
 
     def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces HIP
-        / memory-saver rejection in its own ``__init__``; config-time
+        / memory-saver rejection in its own __init__; config-time
         rules can be added here as they're discovered.
         """
         rules = [
@@ -1772,7 +1772,7 @@ class ServerArgs:
 
     def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
         """
-        Generate the list of batch sizes for CUDA graph capture based on ``max_bs``.
+        Generate the list of batch sizes for CUDA graph capture based on max_bs.
         This integrates the logic from cuda_graph_runner.py.
         """
         # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
@@ -1826,7 +1826,7 @@ class ServerArgs:
     def _generate_prefill_cuda_graph_batch_sizes(self, max_bs: int):
         """
         Generate the list of batch sizes for prefill CUDA graph capture
-        based on ``max_bs``. For tc_piecewise prefill, ``bs`` carries the
+        based on max_bs. For tc_piecewise prefill, bs carries the
         captured token count (one shape knob per phase).
         """
         capture_sizes = (
@@ -4000,14 +4000,14 @@ class ServerArgs:
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
-        Looks for ``consolidated*.safetensors`` with no competing
-        ``model-*.safetensors``; when both weight formats ship in the
+        Looks for consolidated*.safetensors with no competing
+        model-*.safetensors; when both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
         HF-named architecture.
 
-        Name override: ``mistral-large-3`` / ``mistral-small-4`` /
-        ``leanstral`` always treat as Mistral-native when ``params.json``
+        Name override: mistral-large-3 / mistral-small-4 /
+        leanstral always treat as Mistral-native when params.json
         is present -- those families need Mistral weight loading
         regardless of which weight files happen to be present.
         """
@@ -7447,7 +7447,7 @@ class ServerArgs:
         return self.url(port=self.engine_info_bootstrap_port)
 
     def ssl_verify(self):
-        """Return the value for the requests library's ``verify=`` parameter.
+        """Return the value for the requests library's verify= parameter.
 
         When SSL is configured:
           - If a CA certificate file is provided, return its path so requests
@@ -8019,8 +8019,8 @@ class ServerArgs:
         `/server_info` so KV-aware routers (e.g. the SGLang model
         gateway) can subscribe per-worker without operator-supplied port
         coordination. The router constructs the per-DP-rank SUB endpoint
-        as ``tcp://<worker_host>:<endpoint_port_base + dp_rank>`` for
-        every rank reported in ``dp_size``.
+        as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
+        every rank reported in dp_size.
 
         Returned descriptor shape:
 
@@ -8042,23 +8042,23 @@ class ServerArgs:
                                                   # to open
             }
 
-        Returns ``None`` (i.e. "no publisher to describe") when any of:
+        Returns None (i.e. "no publisher to describe") when any of:
 
-        * ``--kv-events-config`` is unset / empty / malformed JSON,
-        * the configured publisher is ``"null"``,
-        * ``page_size`` is missing or non-positive (a placeholder
-          ``block_size`` would cause silent KV-cache misses by hashing
+        * --kv-events-config is unset / empty / malformed JSON,
+        * the configured publisher is "null",
+        * page_size is missing or non-positive (a placeholder
+          block_size would cause silent KV-cache misses by hashing
           prompts at the wrong granularity on the router side),
-        * the endpoint is not a routable TCP address (``inproc://`` /
-          ``ipc://``, missing port, non-integer port, or port outside
-          ``1..65535``).
+        * the endpoint is not a routable TCP address (inproc:// /
+          ipc://, missing port, non-integer port, or port outside
+          1..65535).
 
-        Reuses ``KVEventsConfig.from_cli`` for JSON parsing; the inline
-        ``rfind(":")`` endpoint split mirrors
-        ``ZmqEventPublisher.offset_endpoint_port`` rather than adding a
+        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
+        rfind(":") endpoint split mirrors
+        ZmqEventPublisher.offset_endpoint_port rather than adding a
         new module-level helper.
         """
-        # Lazy import so loading ``server_args`` doesn't pull in
+        # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
         from sglang.srt.disaggregation.kv_events import KVEventsConfig
 
@@ -8070,7 +8070,7 @@ class ServerArgs:
             cfg = KVEventsConfig.from_cli(raw)
         except Exception:
             # Malformed JSON / schema mismatch. The publisher would
-            # have failed at server startup; ``/server_info`` must
+            # have failed at server startup; /server_info must
             # keep working, so just report "no publisher" to consumers.
             return None
         if cfg.publisher == "null" or not cfg.endpoint:

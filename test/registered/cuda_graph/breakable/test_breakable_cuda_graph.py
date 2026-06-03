@@ -1,10 +1,10 @@
 """Tests for the breakable CUDA graph (BCG) runner.
 
 Two test classes:
-- ``TestBreakableCUDAGraphBasic`` / ``TestCopyOutput`` / ``TestBreakGraphHelper``:
+- TestBreakableCUDAGraphBasic / TestCopyOutput / TestBreakGraphHelper:
   unit tests for the core capture / replay mechanism (simple tensor ops).
-- ``TestBreakableCudaGraph``: integration test — spin up Qwen3-8B with
-  ``--enable-breakable-cuda-graph`` and check mgsm_en accuracy.
+- TestBreakableCudaGraph: integration test — spin up Qwen3-8B with
+  --enable-breakable-cuda-graph and check mgsm_en accuracy.
 """
 
 import unittest

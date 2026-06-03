@@ -1,9 +1,9 @@
 """Phase / backend identifiers, the canonical default for
-``cuda_graph_config``, and the ``--cuda-graph-config`` JSON CLI parser.
+cuda_graph_config, and the --cuda-graph-config JSON CLI parser.
 
 Module-level imports are pure stdlib — no torch / sglang.srt deps — so
-``ServerArgs`` can import everything here without pulling in backend
-classes. ``check_cuda_graph_backend`` lazy-imports ``get_global_server_args``
+ServerArgs can import everything here without pulling in backend
+classes. check_cuda_graph_backend lazy-imports get_global_server_args
 inside the function body to preserve that invariant.
 """
 
@@ -39,16 +39,16 @@ ALLOWED_BACKENDS_PER_PHASE = {
         Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
-    # ``full`` is rejected for prefill — full CUDA graph capture only
-    # fits fixed-shape and prefill is variable-shape. Use ``breakable``
-    # or ``tc_piecewise`` for prefill.
+    # full is rejected for prefill — full CUDA graph capture only
+    # fits fixed-shape and prefill is variable-shape. Use breakable
+    # or tc_piecewise for prefill.
     Phase.PREFILL: (Backend.BREAKABLE, Backend.TC_PIECEWISE, Backend.DISABLED),
 }
 
-# Per-phase settings schema. Keys other than ``backend`` are runner-level
-# (read by any backend in that phase); ``tc_compiler`` is the lone
+# Per-phase settings schema. Keys other than backend are runner-level
+# (read by any backend in that phase); tc_compiler is the lone
 # backend-specific knob (only meaningful when backend == tc_piecewise).
-# For prefill, ``bs`` carries the captured shape size (token count for
+# For prefill, bs carries the captured shape size (token count for
 # tc_piecewise, request count for breakable) — one shape knob per phase.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
@@ -63,13 +63,13 @@ class PhaseConfig:
     backend: str = Backend.DISABLED
     max_bs: Optional[int] = None
     bs: Optional[List[int]] = None
-    # Only meaningful when ``backend == tc_piecewise``; ignored otherwise.
+    # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
 
 
 @dataclass
 class CudaGraphConfig:
-    """Top-level CUDA graph config: one ``PhaseConfig`` per phase."""
+    """Top-level CUDA graph config: one PhaseConfig per phase."""
 
     decode: PhaseConfig = field(
         default_factory=lambda: PhaseConfig(backend=Backend.FULL)
@@ -85,7 +85,7 @@ class CudaGraphConfig:
         return getattr(self, phase)
 
     def to_dict(self) -> Dict[str, Dict[str, Any]]:
-        """Serialize to the legacy ``{phase: {key: value}}`` shape (used
+        """Serialize to the legacy {phase: {key: value}} shape (used
         by the parser pipeline that re-applies explicit input)."""
         return {
             Phase.DECODE: dataclasses.asdict(self.decode),
@@ -96,7 +96,7 @@ class CudaGraphConfig:
     def from_dict(cls, raw: Optional[Dict[str, Dict[str, Any]]]) -> "CudaGraphConfig":
         """Build from a (partial) dict of overrides, defaults fill the rest.
         Unknown phases / keys are silently dropped — the JSON-input
-        validator (``parse_cuda_graph_config_arg``) rejects them upstream."""
+        validator (parse_cuda_graph_config_arg) rejects them upstream."""
         cfg = cls()
         if not raw:
             return cfg
@@ -112,12 +112,12 @@ class CudaGraphConfig:
 
 
 def default_cuda_graph_config() -> CudaGraphConfig:
-    """Fresh ``CudaGraphConfig`` populated with canonical defaults."""
+    """Fresh CudaGraphConfig populated with canonical defaults."""
     return CudaGraphConfig()
 
 
 def check_cuda_graph_backend(phase: str, backend: str) -> bool:
-    """True if ``cuda_graph_config[phase].backend == backend`` on the
+    """True if cuda_graph_config[phase].backend == backend on the
     global server args. Returns False if the global server args have not
     been initialized yet (e.g. unit tests, early startup)."""
     from sglang.srt.server_args import get_global_server_args
@@ -135,7 +135,7 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
 def cuda_graph_fully_disabled() -> bool:
     """True iff cuda_graph_config has Backend.DISABLED on every phase.
 
-    Use at sites that ask the legacy ``server_args.disable_cuda_graph``
+    Use at sites that ask the legacy server_args.disable_cuda_graph
     question ("no CG anywhere globally") — e.g., preallocating buffers
     that any captured graph would otherwise reuse, or one-shot init
     that's a no-op when CG is completely off.
@@ -146,10 +146,10 @@ def cuda_graph_fully_disabled() -> bool:
 
 
 def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
-    """argparse type for ``--cuda-graph-config``: parse JSON dict of
+    """argparse type for --cuda-graph-config: parse JSON dict of
     phase → settings dict. Each phase's settings dict is itself validated
-    against ``ALLOWED_KEYS_PER_PHASE``. Returns a plain dict — the
-    precedence pipeline in ``ServerArgs`` converts to ``CudaGraphConfig``
+    against ALLOWED_KEYS_PER_PHASE. Returns a plain dict — the
+    precedence pipeline in ServerArgs converts to CudaGraphConfig
     after merging."""
     try:
         parsed = json.loads(raw)
@@ -186,8 +186,8 @@ def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
 def explicit_keys_in(
     settings: Optional[Dict[str, Dict[str, Any]]],
 ) -> set:
-    """Return the set of ``(phase, key)`` tuples present in ``settings``
-    (the raw dict form, as it arrives from CLI/SDK). Used by ``ServerArgs``
+    """Return the set of (phase, key) tuples present in settings
+    (the raw dict form, as it arrives from CLI/SDK). Used by ServerArgs
     to track keys the user explicitly set so the auto-disable cascade can
     skip them."""
     out: set = set()
