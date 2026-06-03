@@ -203,7 +203,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
                 ),
             )
 
-        await send_queue.join()
+        await _join_realtime_send_queue(send_queue, sender_task)
         _raise_if_sender_failed(sender_task)
         await send_queue.put(None)
         await sender_task
@@ -283,6 +283,23 @@ async def _enqueue_realtime_send_item(
             await _await_realtime_task(task)
         _raise_if_sender_failed(sender_task)
     await put_task
+
+
+async def _join_realtime_send_queue(
+    send_queue: asyncio.Queue[_RealtimeSendQueueItem | None],
+    sender_task: asyncio.Task,
+) -> None:
+    join_task = asyncio.create_task(send_queue.join())
+    done, pending = await asyncio.wait(
+        {join_task, sender_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if sender_task in done:
+        for task in pending:
+            task.cancel()
+            await _await_realtime_task(task)
+        _raise_if_sender_failed(sender_task)
+    await join_task
 
 
 async def _send_output_and_log(

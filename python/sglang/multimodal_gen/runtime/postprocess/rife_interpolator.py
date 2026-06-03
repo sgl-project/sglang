@@ -538,7 +538,7 @@ class FrameInterpolator:
 
         frames = frames.to(device=device)
         if frames.dtype == torch.uint8:
-            frames = frames.float().mul_(1.0 / 255.0)
+            frames = frames.float().mul(1.0 / 255.0)
         else:
             frames = frames.float()
         if model.uses_torch_compile and _is_inference_tensor(frames):

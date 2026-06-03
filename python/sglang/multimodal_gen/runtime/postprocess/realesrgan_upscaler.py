@@ -288,7 +288,7 @@ class UpscalerModel:
         return torch.from_numpy(frames).to(self.device)
 
     def _preprocess_input_tensor(self, imgs_t: torch.Tensor) -> torch.Tensor:
-        imgs_t = imgs_t.permute(0, 3, 1, 2).to(dtype=self.dtype).mul_(1.0 / 255.0)
+        imgs_t = imgs_t.permute(0, 3, 1, 2).to(dtype=self.dtype).mul(1.0 / 255.0)
         if self.device.type == "cuda":
             imgs_t = imgs_t.contiguous(memory_format=torch.channels_last)
         return imgs_t
@@ -311,7 +311,7 @@ class UpscalerModel:
 
         frames = frames.to(device=self.device)
         if frames.dtype == torch.uint8:
-            frames = frames.to(dtype=self.dtype).mul_(1.0 / 255.0)
+            frames = frames.to(dtype=self.dtype).mul(1.0 / 255.0)
         else:
             frames = frames.to(dtype=self.dtype)
         if self.device.type == "cuda":
@@ -324,7 +324,7 @@ class UpscalerModel:
 
     @staticmethod
     def _postprocess_output_tensor(out: torch.Tensor) -> torch.Tensor:
-        out = out.permute(0, 2, 3, 1).clamp(0.0, 1.0).mul_(255.0)
+        out = out.permute(0, 2, 3, 1).clamp(0.0, 1.0).mul(255.0)
         return out.to(torch.uint8).contiguous()
 
     @staticmethod

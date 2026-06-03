@@ -239,16 +239,21 @@ def _tensor_sample_to_processed_rgb24_array(
 
 def _tensor_sample_to_nchw_rgb_tensor(sample: torch.Tensor) -> torch.Tensor:
     if sample.dim() == 3:
-        sample = sample.unsqueeze(1)
-    if sample.dim() != 4:
-        raise ValueError(f"Unexpected tensor sample shape: {tuple(sample.shape)}")
-
-    if sample.shape[0] in (1, 3, 4):
-        frames = sample.permute(1, 0, 2, 3)
-    elif sample.shape[1] in (1, 3, 4):
-        frames = sample
-    elif sample.shape[-1] in (1, 3, 4):
-        frames = sample.permute(0, 3, 1, 2)
+        if sample.shape[0] in (1, 3, 4):
+            frames = sample.unsqueeze(0)
+        elif sample.shape[-1] in (1, 3, 4):
+            frames = sample.permute(2, 0, 1).unsqueeze(0)
+        else:
+            frames = sample.unsqueeze(1)
+    elif sample.dim() == 4:
+        if sample.shape[1] in (1, 3, 4):
+            frames = sample
+        elif sample.shape[0] in (1, 3, 4):
+            frames = sample.permute(1, 0, 2, 3)
+        elif sample.shape[-1] in (1, 3, 4):
+            frames = sample.permute(0, 3, 1, 2)
+        else:
+            raise ValueError(f"Unexpected tensor sample shape: {tuple(sample.shape)}")
     else:
         raise ValueError(f"Unexpected tensor sample shape: {tuple(sample.shape)}")
 
