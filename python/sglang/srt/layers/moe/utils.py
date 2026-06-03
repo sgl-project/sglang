@@ -390,6 +390,18 @@ def filter_moe_weight_param_global_expert(name, x, num_local_experts):
     )
 
 
+def get_moe_weight_param_eplb_view(
+    name, x, num_local_experts, num_local_physical_experts=None
+):
+    """Return the writable expert-weight view that EPLB may rebalance."""
+    if not filter_moe_weight_param_global_expert(name, x, num_local_experts):
+        return None
+    if num_local_physical_experts is None:
+        return x.data
+    assert 0 < num_local_physical_experts <= num_local_experts
+    return x.data[:num_local_physical_experts]
+
+
 def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
