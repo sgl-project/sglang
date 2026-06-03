@@ -7,8 +7,8 @@ Env knobs:
   SGLANG_PRECISION_DIFF_THRESHOLD per-tensor rel_diff cutoff (default 1e-3)
   SGLANG_PRECISION_FORCE_UPDATE=1 skip comparison, refresh baseline
   SGLANG_PRECISION_COMMIT         override sglang sha (7-40 hex) tagged on push
-  SGLANG_PRECISION_HF_REPO        optional HF dataset for cross-runner storage;
-                                  see sglang.test.precision_baseline_store
+  SGLANG_PRECISION_HF_REPO        required HF dataset repo for cross-runner
+                                  baseline storage; see precision_baseline_store
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# Soft dep: missing huggingface_hub → local-only baseline mode.
+# Soft dep: missing huggingface_hub → import fails loudly in setUpClass.
 try:
     from sglang.test import precision_baseline_store as _hfs
 except Exception:  # pragma: no cover
