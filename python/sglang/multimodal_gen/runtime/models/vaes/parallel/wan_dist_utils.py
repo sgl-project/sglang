@@ -121,7 +121,9 @@ def _ensure_recv_buf(
         or recv_buf.dtype != reference.dtype
         or recv_buf.device != reference.device
     ):
-        return torch.empty_like(reference)
+        return torch.empty(
+            reference.shape, dtype=reference.dtype, device=reference.device
+        )
     return recv_buf
 
 
@@ -140,11 +142,11 @@ def halo_exchange(
     group = sp_group.device_group
     group_ranks = sp_group.ranks
 
-    top_row = x[..., :height_halo_size, :].contiguous()
-    bottom_row = x[..., -height_halo_size:, :].contiguous()
+    top_row_ref = x[..., :height_halo_size, :]
+    bottom_row_ref = x[..., -height_halo_size:, :]
 
-    recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row)
-    recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row)
+    recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row_ref)
+    recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row_ref)
 
     # use batched P2P operations
     p2p_ops = []
@@ -152,11 +154,13 @@ def halo_exchange(
     if rank > 0:
         # has previous neighbor, recv previous rank's data to recv_top_buf and send top_row to it.
         prev_rank = group_ranks[rank - 1]
+        top_row = top_row_ref.contiguous()
         p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
         p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
     if rank < world_size - 1:
         # has next neighbor, send bottom_row to next rank and recv next rank's data to recv_bottom_buf.
         next_rank = group_ranks[rank + 1]
+        bottom_row = bottom_row_ref.contiguous()
         p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
         p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
 
