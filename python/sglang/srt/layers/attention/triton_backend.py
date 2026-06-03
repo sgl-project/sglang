@@ -173,8 +173,10 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.use_pdl = False
 
+        # Bidirectional attention is only safe during EXTEND (prefill).
+        # Gate on whether prefill captures, not decode.
         self.allow_bidirectional_attention_in_extend = (
-            check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+            check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
             and model_runner.server_args.chunked_prefill_size == -1
         )
 

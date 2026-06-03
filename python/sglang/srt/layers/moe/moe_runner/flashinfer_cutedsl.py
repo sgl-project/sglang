@@ -11,11 +11,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
@@ -256,9 +252,9 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     )
 
     server_args = get_global_server_args()
-    use_cuda_graph = server_args is not None and not check_cuda_graph_backend(
-        Phase.DECODE, Backend.DISABLED
-    )
+    # CuteDSL wrapper preallocates CG buffers used by any captured graph
+    # that routes through this MoE — decode and prefill alike.
+    use_cuda_graph = not cuda_graph_fully_disabled()
 
     # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
     # single forward can route through this layer.

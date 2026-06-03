@@ -142,6 +142,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -737,12 +738,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
-            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+            if not cuda_graph_fully_disabled():
                 # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
                 # intermediate buffers before init_memory_pool() so memory
-                # profiling accounts for them.  Phase 2 (dense LoRA batch
-                # metadata) is handled in CudaGraphRunner.__init__() via
-                # lora_manager.init_cuda_graph_batch_info().
+                # profiling accounts for them. The buffers are reused by
+                # any captured graph (decode today; widen here so any
+                # future prefill capture path also picks them up).
                 self._init_lora_cuda_graph_moe_buffers()
 
         # Enable batch invariant mode

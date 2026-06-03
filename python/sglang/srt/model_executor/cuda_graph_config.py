@@ -132,6 +132,19 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     return getattr(cfg, phase).backend == backend
 
 
+def cuda_graph_fully_disabled() -> bool:
+    """True iff cuda_graph_config has Backend.DISABLED on every phase.
+
+    Use at sites that ask the legacy ``server_args.disable_cuda_graph``
+    question ("no CG anywhere globally") — e.g., preallocating buffers
+    that any captured graph would otherwise reuse, or one-shot init
+    that's a no-op when CG is completely off.
+    """
+    return check_cuda_graph_backend(
+        Phase.DECODE, Backend.DISABLED
+    ) and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+
+
 def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
     """argparse type for ``--cuda-graph-config``: parse JSON dict of
     phase → settings dict. Each phase's settings dict is itself validated

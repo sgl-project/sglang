@@ -33,11 +33,7 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
 
 @dataclass
@@ -216,10 +212,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.num_splits = (
             1
             if model_runner.server_args.enable_deterministic_inference
-            or (
-                self.fa_impl_ver == 4
-                and not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-            )
+            or (self.fa_impl_ver == 4 and not cuda_graph_fully_disabled())
             else 0
         )
 
