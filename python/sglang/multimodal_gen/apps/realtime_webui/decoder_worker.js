@@ -80,18 +80,36 @@ function rawFramesToRgbaBuffers(header, payload) {
   return buffers;
 }
 
-async function encodedFrameToImageBitmap(header, payload) {
+function splitEncodedPayload(header, payload) {
+  const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+  const lengths = Array.isArray(header.payload_lengths) && header.payload_lengths.length
+    ? header.payload_lengths.map(Number)
+    : [bytes.byteLength];
+  const payloads = [];
+  let offset = 0;
+  for (const length of lengths) {
+    payloads.push(bytes.buffer.slice(
+      bytes.byteOffset + offset,
+      bytes.byteOffset + offset + length,
+    ));
+    offset += length;
+  }
+  return payloads;
+}
+
+async function encodedFramesToImageBitmaps(header, payload) {
   if (typeof createImageBitmap === "undefined") {
     throw new Error("This browser does not support worker image decoding");
   }
 
-  const blob = new Blob([payload], { type: header.content_type });
-  const bitmap = await createImageBitmap(blob);
+  const frames = await Promise.all(splitEncodedPayload(header, payload).map((framePayload) => (
+    createImageBitmap(new Blob([framePayload], { type: header.content_type }))
+  )));
   return {
-    width: bitmap.width,
-    height: bitmap.height,
+    width: frames[0]?.width || 0,
+    height: frames[0]?.height || 0,
     frame_type: "bitmap",
-    frames: [bitmap],
+    frames,
   };
 }
 
@@ -101,7 +119,7 @@ async function decode(header, payload) {
     header.content_type === WEBP_FRAME_CONTENT_TYPE ||
     header.content_type === JPEG_FRAME_CONTENT_TYPE
   ) {
-    const decoded = await encodedFrameToImageBitmap(header, payload);
+    const decoded = await encodedFramesToImageBitmaps(header, payload);
     return {
       id: header.__decode_id,
       width: decoded.width,

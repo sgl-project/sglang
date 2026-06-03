@@ -62,8 +62,13 @@
         </div>
         <label>SR model
           <select id="upscalingModel">
-            <option value="" selected>Quality x2</option>
-            <option value="/scratch/realesr-general-x4v3.pth">Fast general</option>
+            <option value="">Quality x2</option>
+            <option
+              value="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
+              selected
+            >
+              Fast general
+            </option>
             <option value="/scratch/realesr-animevideov3.pth">Fast anime</option>
           </select>
         </label>
@@ -89,8 +94,8 @@
             </label>
             <span class="stage-stat">output <b id="outputSizeText">832x480</b></span>
             <span class="stage-stat">render <b id="renderFps">0</b> fps</span>
-            <span class="stage-stat">theoretical <b id="theoreticalFpsText">-</b></span>
-            <span class="stage-stat">wait <b id="stageLatencyText">-</b></span>
+            <span class="stage-stat">source <b id="theoreticalFpsText">-</b></span>
+            <span class="stage-stat">buffer <b id="stageLatencyText">-</b></span>
           </div>
           <div class="preview-frame">
             <canvas id="viewport" width="1280" height="720"></canvas>
@@ -152,6 +157,7 @@
         </section>
       </section>
     </main>
-    <script src="./app.js?v=realtime-sr-v45"></script>
-  </body>
+  <script src="./playback_controller.js?v=realtime-playback-v7"></script>
+  <script src="./app.js?v=realtime-playback-v65"></script>
+</body>
 </html>
