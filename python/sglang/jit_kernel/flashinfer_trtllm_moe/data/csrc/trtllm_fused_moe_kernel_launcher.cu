@@ -2432,29 +2432,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
 // SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION). No fp4-input dequant round-trip.
 // ===========================================================================
 
-// De-interleave the gated gate_up GEMM output for the decomposed NvFP4 MoE-LoRA path.
-//
-// The deployed w13 weight is prepared in the trtllm GEMM1 "gated" layout, which applies
-// reorder_rows_for_gated_act_gemm: row 2k = half0[k], row 2k+1 = half1[k] (a pairwise interleave
-// of the two N/2 halves). A trtllm-gen GEMM emits output in LOGICAL row order, so feeding this
-// weight to our raw Gemm2::Runner produces gate_up columns interleaved as
-//   [h0_0, h1_0, h0_1, h1_1, ..., h0_{inter-1}, h1_{inter-1}].
-// The standalone activation kernel (and the contiguous gate_up_lora_delta from the
-// virtual-experts LoRA) expect the CONTIGUOUS [half0(0..inter-1); half1(0..inter-1)] layout (==
-// the non-gated w13 output). Reverse the pairwise interleave here -- cheap (O(rows*inter)),
-// avoids storing a second non-gated w13 copy (~tens of GB/rank) or a runtime weight re-shuffle.
-__global__ void sgl_fp4_lora_deinterleave_gate_up_kernel(cutlass::bfloat16_t const* __restrict__ in,
-                                                         cutlass::bfloat16_t* __restrict__ out,
-                                                         int64_t rows, int64_t inter) {
-  int64_t const two_inter = 2 * inter;
-  for (int64_t r = blockIdx.y; r < rows; r += gridDim.y) {
-    for (int64_t k = threadIdx.x + blockDim.x * blockIdx.x; k < inter; k += blockDim.x * gridDim.x) {
-      out[r * two_inter + k] = in[r * two_inter + 2 * k];              // half0[k] <- col 2k
-      out[r * two_inter + inter + k] = in[r * two_inter + 2 * k + 1];  // half1[k] <- col 2k+1
-    }
-  }
-}
-
 // Decomposed NvFP4 MoE-LoRA launcher. Reuses FusedMoeLauncher's routing-phase
 // workspace allocation/bookkeeping (via prepare_routing-style setup) but owns
 // the MoE compute pipeline.
@@ -2661,24 +2638,15 @@ class FP4BlockScaleLoraLauncher {
           (int)cfg, enable_pdl);
     }
 
-    // ---- 5b) de-interleave the gated gate_up columns -> contiguous [half0; half1] ----
-    // The activation kernel and gate_up_lora_delta both assume the contiguous layout; the gated
-    // w13 gives interleaved columns (see sgl_fp4_lora_deinterleave_gate_up_kernel). Process all
-    // max_padded rows (padding rows are ignored downstream via the permuted-idx map).
-    Tensor gate_up_contig = alloc_tensor({max_num_padded_tokens, gate_up_n}, dl_bfloat16, device);
-    {
-      int const nthreads = 256;
-      dim3 grid((int)((inter + nthreads - 1) / nthreads),
-                (unsigned)std::min<int64_t>(8192, max_num_padded_tokens));
-      sgl_fp4_lora_deinterleave_gate_up_kernel<<<grid, nthreads, 0, stream>>>(
-          static_cast<cutlass::bfloat16_t const*>(gate_up_bf16.data_ptr()),
-          static_cast<cutlass::bfloat16_t*>(gate_up_contig.data_ptr()), max_num_padded_tokens,
-          inter);
-    }
+    // The gated w13 weight makes GEMM1 emit gate_up columns pairwise-interleaved as
+    // (g0,u0,g1,u1,...) instead of the contiguous [gate | up] layout. Rather than run a
+    // standalone de-interleave kernel into a [max_num_padded_tokens, gate_up_n] scratch
+    // buffer, the activation kernel below de-interleaves on read (interleavedGateUpInput),
+    // fusing away that kernel + its HBM round-trip + the scratch allocation.
 
     // GEMM1-LoRA overlap: wait the side-stream LoRA event that produced the
-    // gate_up_lora_delta consumed by the activation below, so the gate_up GEMM1 +
-    // de-interleave above overlap the side-stream LoRA shrink/expand. No-op (0)
+    // gate_up_lora_delta consumed by the activation below, so the gate_up GEMM1
+    // above overlaps the side-stream LoRA shrink/expand. No-op (0)
     // on the single-stream path.
     if (lora_ready_event_ != 0) {
       cudaStreamWaitEvent(stream, reinterpret_cast<cudaEvent_t>(lora_ready_event_), 0);
@@ -2691,7 +2659,8 @@ class FP4BlockScaleLoraLauncher {
       actData.mDtypeElt = btg::Dtype::Bfloat16;
       actData.mUsePdl = false;
       actData.mUseDeepSeekFp8 = false;
-      actData.inPtr = gate_up_contig.data_ptr();
+      actData.inPtr = gate_up_bf16.data_ptr();
+      actData.interleavedGateUpInput = true;
       actData.outPtr = activated_bf16.data_ptr();
       actData.inDqSfsPtr = nullptr;
       actData.outDqSfsPtr = nullptr;

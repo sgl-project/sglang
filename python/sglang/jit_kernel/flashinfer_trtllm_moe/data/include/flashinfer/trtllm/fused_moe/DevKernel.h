@@ -174,6 +174,13 @@ struct Data {
   cutlass::bfloat16_t const* gateUpLoraDeltaPtr = nullptr;
   cutlass::bfloat16_t* activationLoraInputOutPtr = nullptr;
 
+  // When true, inPtr holds the column-interleaved gate/up GEMM1 output
+  // (g0,u0,g1,u1,...) and the kernel de-interleaves on read (x1=col 2k, x2=col 2k+1);
+  // when false, inPtr is the contiguous [gate | up] layout. Default false keeps the
+  // FP8 / non-LoRA semantics; the FP4 LoRA path sets it true to fuse the standalone
+  // de-interleave kernel into this activation read.
+  bool interleavedGateUpInput = false;
+
   int32_t innerDim;
   int32_t numTokens;
   int32_t topK;
@@ -196,6 +203,8 @@ struct KernelParams {
   cutlass::bfloat16_t const* gateUpLoraDeltaPtr = nullptr;
   cutlass::bfloat16_t* activationLoraInputOutPtr = nullptr;
 
+  bool interleavedGateUpInput = false;
+
   int32_t innerDim;
   int32_t numTokens;
   int32_t topK;
@@ -212,6 +221,7 @@ struct KernelParams {
     params.outDqSfsPtr = data.outDqSfsPtr;
     params.gateUpLoraDeltaPtr = data.gateUpLoraDeltaPtr;
     params.activationLoraInputOutPtr = data.activationLoraInputOutPtr;
+    params.interleavedGateUpInput = data.interleavedGateUpInput;
 
     params.expandedIdxToPermutedIdx = data.expandedIdxToPermutedIdx;
 

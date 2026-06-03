@@ -87,10 +87,18 @@ __global__ void activationKernel(KernelParams params) {
         }
 
         // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
-        int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
+        int64_t const permBase = (int64_t)permutedIdx * params.innerDim;
 
-        float x1 = (float)params.inPtr[baseIdx];
-        float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
+        // Contiguous input: gate = col hiddenIdx, up = col innerDim/2 + hiddenIdx.
+        // Interleaved input (fused de-interleave): gate = col 2*hiddenIdx, up = col 2*hiddenIdx+1.
+        float x1, x2;
+        if (params.interleavedGateUpInput) {
+          x1 = (float)params.inPtr[permBase + 2 * hiddenIdx];
+          x2 = (float)params.inPtr[permBase + 2 * hiddenIdx + 1];
+        } else {
+          x1 = (float)params.inPtr[permBase + hiddenIdx];
+          x2 = (float)params.inPtr[permBase + hiddenIdx + params.innerDim / 2];
+        }
         if (params.gateUpLoraDeltaPtr != nullptr) {
           int64_t const loraBaseIdx = (int64_t)expandedIdx * params.innerDim + hiddenIdx;
           x1 += static_cast<float>(params.gateUpLoraDeltaPtr[loraBaseIdx + params.innerDim / 2]);
