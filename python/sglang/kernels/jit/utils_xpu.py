@@ -118,7 +118,11 @@ def _resolve_sycl_kernel_path() -> pathlib.Path:
 _SYCL_KERNEL_PATH = _resolve_sycl_kernel_path()
 
 def _get_pytorch_sycl_lib_path() -> str:
-    """Get the directory containing PyTorch's libsycl.so."""
+    """Get the directory containing PyTorch's libsycl.so.
+    
+    Assumes a properly configured environment where PyTorch is installed
+    with SYCL support in the standard location.
+    """
     try:
         import torch
         import pathlib
@@ -127,21 +131,6 @@ def _get_pytorch_sycl_lib_path() -> str:
         torch_lib_path = pathlib.Path(torch.__file__).parent / "lib"
         if (torch_lib_path / "libsycl.so").exists() or (torch_lib_path / "libsycl.so.8").exists():
             return str(torch_lib_path)
-            
-        # Fallback: check conda environment lib directory
-        torch_file = pathlib.Path(torch.__file__)
-        for parent in torch_file.parents:
-            if parent.name == "site-packages":
-                candidate_lib_dirs = [
-                    parent.parent,
-                    parent.parent.parent / "lib",
-                ]
-                for lib_dir in candidate_lib_dirs:
-                    if lib_dir.name == "lib" and (
-                        (lib_dir / "libsycl.so").exists()
-                        or (lib_dir / "libsycl.so.8").exists()
-                    ):
-                        return str(lib_dir)
     except Exception:
         pass
     return ""
