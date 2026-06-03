@@ -138,6 +138,20 @@ def set_torch_compile_config():
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
 
+    # torch_npu patches os.getenv to record every seen env-var key in a global set
+    # (_seen) for once-logging. Dynamo guards on that global, and it keeps growing as
+    # more env vars are read -> spurious runtime recompiles of the piecewise graph
+    # (which then re-capture on a live request and corrupt order-sensitive mamba
+    # recurrence). Neutralize the once-logging so the global stops mutating and dynamo
+    # no longer guards on it.
+    if is_npu():
+        try:
+            from torch_npu.utils import patch_getenv
+
+            patch_getenv._log_once = lambda *a, **k: None
+        except Exception:
+            pass
+
     if _is_musa:
         from sglang.srt.hardware_backend.musa.utils.patch_torch import (
             patch_fx_custom_device,
@@ -218,17 +232,15 @@ class PiecewiseCudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        # For hybrid linear-attention (mamba/GDN) models, do NOT make the speculative
-        # prefill hit PCG. The mamba/linear recurrence is order-sensitive and the
-        # request that triggers NPU graph capture computes a wrong recurrent state
-        # (garbled output). Leaving capture_hidden_mode at the default (NULL) makes
-        # the spec prefill (FULL/LAST) miss can_run() -> it runs eager (correct),
-        # while verify/draft/decode still use their own (full) cuda graphs. Non-mamba
-        # models keep the spec-aware capture_hidden_mode so their prefill uses PCG.
-        is_mambaish = getattr(model_runner, "mambaish_config", None) is not None
+        # Speculative (EAGLE/MTP) prefill needs hidden states, so the PCG graphs must
+        # be captured with the matching capture_hidden_mode (FULL on the target, LAST
+        # on the draft) for can_run() to admit the spec prefill. This lets the spec
+        # prefill use the piecewise graph. (Correctness for hybrid linear-attention/
+        # mamba models relies on the dynamic-shape marking in compile.py so the live
+        # request reuses the init-captured graph instead of re-capturing on a live
+        # request — see _mark_token_dims there.)
         if (
-            not is_mambaish
-            and model_runner.spec_algorithm is not None
+            model_runner.spec_algorithm is not None
             and model_runner.spec_algorithm.is_eagle()
         ):
             if model_runner.is_draft_worker:
