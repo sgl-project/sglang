@@ -3333,7 +3333,9 @@ async def handle_send_request(request: dict):
             )
         if result.get("_error"):
             req_id = request.get("req_id", "?")
-            status_code = result.get("_error_code") or HTTPStatus.INTERNAL_SERVER_ERROR
+            status_code = result.get("_error_code") or int(
+                HTTPStatus.INTERNAL_SERVER_ERROR
+            )
             logger.error(
                 f"DP worker send error for req_id={req_id}: {result['_error']}"
             )
