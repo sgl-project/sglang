@@ -18,8 +18,8 @@ collector required):
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
