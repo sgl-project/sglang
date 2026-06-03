@@ -497,8 +497,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertTrue(loaded)
         producer_id = tree.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
-        for _, finish_event, _ in list(tree.cache_controller.ack_load_queue):
-            finish_event.synchronize()
+        for ack in list(tree.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
         tree.loading_check()
 
     def test_kv_events_store_and_remove_full_blocks(self):
@@ -2792,8 +2792,8 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(loaded)
         producer_id = tree.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
-        for _, finish_event, _ in list(tree.cache_controller.ack_load_queue):
-            finish_event.synchronize()
+        for ack in list(tree.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
         tree.loading_check()
         return node.component_data[ComponentType.FULL].value
 
@@ -3294,8 +3294,8 @@ class UnifiedRadixCacheSuite:
     def _finish_pending_loads(self, tree):
         producer_id = tree.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
-        for _, finish_event, _ in list(tree.cache_controller.ack_load_queue):
-            finish_event.synchronize()
+        for ack in list(tree.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
         tree.loading_check()
 
     def _match_tokens_for_chain(self, chain):
