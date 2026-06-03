@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
@@ -119,12 +121,8 @@ def build_raw_rgb_frame_batches(
 
     for sample in outputs:
         stage_start = time.monotonic()
-        if (
-            isinstance(sample, torch.Tensor)
-            and not req.enable_frame_interpolation
-            and not req.enable_upscaling
-        ):
-            frames = _tensor_sample_to_rgb24_array(sample)
+        if isinstance(sample, torch.Tensor):
+            frames = _tensor_sample_to_processed_rgb24_array(sample, req)
         else:
             frames = post_process_sample_fn(
                 sample,
@@ -204,8 +202,72 @@ def build_raw_rgb_frame_batches(
     return frame_batches, frame_metadata
 
 
-def _tensor_sample_to_rgb24_array(sample: torch.Tensor) -> np.ndarray:
+def _tensor_sample_to_processed_rgb24_array(
+    sample: torch.Tensor,
+    req: Req,
+) -> np.ndarray:
+    frames_t = _tensor_sample_to_nchw_rgb_tensor(sample)
+
+    if (
+        req.enable_frame_interpolation
+        and req.data_type == DataType.VIDEO
+        and frames_t.shape[0] > 1
+    ):
+        from sglang.multimodal_gen.runtime.postprocess import (
+            interpolate_video_tensor,
+        )
+
+        frames_t, _ = interpolate_video_tensor(
+            frames_t,
+            exp=req.frame_interpolation_exp,
+            scale=req.frame_interpolation_scale,
+            model_path=req.frame_interpolation_model_path,
+        )
+
+    if req.enable_upscaling and frames_t.numel() > 0:
+        from sglang.multimodal_gen.runtime.postprocess import upscale_tensor
+
+        frames_t = upscale_tensor(
+            frames_t,
+            model_path=req.upscaling_model_path,
+            scale=req.upscaling_scale,
+            half_precision=current_platform.is_cuda(),
+        )
+
+    return _nchw_rgb_tensor_to_rgb24_array(frames_t)
+
+
+def _tensor_sample_to_nchw_rgb_tensor(sample: torch.Tensor) -> torch.Tensor:
     if sample.dim() == 3:
-        sample = sample.unsqueeze(1)
-    sample = (sample * 255).clamp(0, 255).to(torch.uint8)
-    return sample.permute(1, 2, 3, 0).contiguous().cpu().numpy()
+        frames = sample.unsqueeze(0)
+    elif sample.dim() == 4:
+        frames = sample.permute(1, 0, 2, 3)
+    else:
+        raise ValueError(f"Unexpected realtime tensor sample shape: {tuple(sample.shape)}")
+
+    if frames.shape[1] == 1:
+        frames = frames.repeat(1, 3, 1, 1)
+    elif frames.shape[1] > RAW_RGB_CHANNELS:
+        frames = frames[:, :RAW_RGB_CHANNELS]
+    elif frames.shape[1] != RAW_RGB_CHANNELS:
+        raise ValueError(f"Unexpected realtime tensor channel count: {frames.shape[1]}")
+    return frames.contiguous()
+
+
+def _nchw_rgb_tensor_to_rgb24_array(frames: torch.Tensor) -> np.ndarray:
+    if frames.dim() == 3:
+        frames = frames.unsqueeze(0)
+    if frames.dim() != 4:
+        raise ValueError(f"Unexpected NCHW RGB tensor shape: {tuple(frames.shape)}")
+    if frames.shape[1] == 1:
+        frames = frames.repeat(1, 3, 1, 1)
+    elif frames.shape[1] > RAW_RGB_CHANNELS:
+        frames = frames[:, :RAW_RGB_CHANNELS]
+    elif frames.shape[1] != RAW_RGB_CHANNELS:
+        raise ValueError(f"Unexpected NCHW RGB channel count: {frames.shape[1]}")
+
+    if frames.dtype == torch.uint8:
+        frames_u8 = frames
+    else:
+        frames_u8 = (frames * 255).clamp(0, 255).to(torch.uint8)
+    return frames_u8.permute(0, 2, 3, 1).contiguous().cpu().numpy()

@@ -3,6 +3,7 @@
 import asyncio
 import shutil
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import msgspec.msgpack
@@ -36,13 +37,26 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+        OutputBatch,
+        Req,
+    )
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 _ACTIVE_SESSION_IDS: set[str] = set()
 _ACTIVE_SESSION_WAIT_SECONDS = 1.0
 _ACTIVE_SESSION_WAIT_INTERVAL_SECONDS = 0.1
+
+
+@dataclass
+class _RealtimeSendQueueItem:
+    chunk: RealtimeChunkContext
+    batch: "Req"
+    result: "OutputBatch"
+    request_prepare_ms: float
+    scheduler_forward_ms: float
+    chunk_started: float
 
 
 def _transport_ms(value: float) -> int:
@@ -144,14 +158,13 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
     if adapter is None:
         raise ValueError("realtime adapter is not initialized")
 
-    pending_send_task = None
-    while not session.reached_max_chunks():
-        try:
-            if pending_send_task is not None and pending_send_task.done():
-                await pending_send_task
-                pending_send_task = None
-
-            # send to scheduler and generate video chunk
+    send_queue: asyncio.Queue[_RealtimeSendQueueItem | None] = asyncio.Queue(maxsize=1)
+    sender_task = asyncio.create_task(
+        _send_realtime_chunk_loop(ws, session, send_queue)
+    )
+    try:
+        while not session.reached_max_chunks():
+            _raise_if_sender_failed(sender_task)
             server_args = get_global_server_args()
 
             await adapter.wait_for_next_chunk(session)
@@ -179,70 +192,117 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
             # finish
             adapter.on_chunk_complete(session, result)
-            if pending_send_task is not None:
-                await pending_send_task
-            if batch.realtime_output_pacing:
-                await _send_output_and_log(
-                    ws,
-                    session,
-                    chunk,
-                    batch,
-                    result,
-                    request_prepare_ms,
-                    scheduler_forward_ms,
-                    chunk_started,
-                )
-                pending_send_task = None
-            else:
-                pending_send_task = asyncio.create_task(
-                    _send_output_and_log(
-                        ws,
-                        session,
-                        chunk,
-                        batch,
-                        result,
-                        request_prepare_ms,
-                        scheduler_forward_ms,
-                        chunk_started,
-                    )
-                )
-
-        except asyncio.CancelledError:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
-            logger.info("generation completed, session_id=%s", session.id)
-            break
-        except WebSocketDisconnect:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
-            logger.info(
-                "client disconnected during generation, session_id=%s", session.id
+            _raise_if_sender_failed(sender_task)
+            await _enqueue_realtime_send_item(
+                send_queue,
+                sender_task,
+                _RealtimeSendQueueItem(
+                    chunk=chunk,
+                    batch=batch,
+                    result=result,
+                    request_prepare_ms=request_prepare_ms,
+                    scheduler_forward_ms=scheduler_forward_ms,
+                    chunk_started=chunk_started,
+                ),
             )
-            break
-        except Exception as e:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
-            err_msg = str(e).splitlines()[0]
-            logger.error("error during generate loop: %s", err_msg)
-            try:
-                await write_error_msg(f"error during generate loop: {err_msg}", ws)
-            except Exception as send_error:
-                logger.error(
-                    "error during sending complete msg: %s",
-                    send_error,
-                )
-            break
-    else:
-        if pending_send_task is not None:
-            await pending_send_task
+
+        await _join_realtime_send_queue(send_queue, sender_task)
+        _raise_if_sender_failed(sender_task)
+        await send_queue.put(None)
+        await sender_task
         logger.info(
             "generation reached max chunks, session_id=%s, max_chunks=%s",
             session.id,
             session.request.max_chunks if session.request is not None else None,
         )
+    except asyncio.CancelledError:
+        logger.info("generation completed, session_id=%s", session.id)
+    except WebSocketDisconnect:
+        logger.info("client disconnected during generation, session_id=%s", session.id)
+    except Exception as e:
+        err_msg = str(e).splitlines()[0]
+        logger.error("error during generate loop: %s", err_msg)
+        try:
+            await write_error_msg(f"error during generate loop: {err_msg}", ws)
+        except Exception as send_error:
+            logger.error(
+                "error during sending complete msg: %s",
+                send_error,
+            )
+    finally:
+        if not sender_task.done():
+            sender_task.cancel()
+            await _await_realtime_task(sender_task)
+
+
+async def _send_realtime_chunk_loop(
+    ws: WebSocket,
+    session: GenerateSession,
+    send_queue: asyncio.Queue[_RealtimeSendQueueItem | None],
+) -> None:
+    while True:
+        item = await send_queue.get()
+        try:
+            if item is None:
+                return
+            await _send_output_and_log(
+                ws,
+                session,
+                item.chunk,
+                item.batch,
+                item.result,
+                item.request_prepare_ms,
+                item.scheduler_forward_ms,
+                item.chunk_started,
+            )
+        finally:
+            send_queue.task_done()
+
+
+def _raise_if_sender_failed(sender_task: asyncio.Task) -> None:
+    if not sender_task.done():
+        return
+    if sender_task.cancelled():
+        raise asyncio.CancelledError()
+    exc = sender_task.exception()
+    if exc is not None:
+        raise exc
+    raise RuntimeError("realtime sender task exited unexpectedly")
+
+
+async def _enqueue_realtime_send_item(
+    send_queue: asyncio.Queue[_RealtimeSendQueueItem | None],
+    sender_task: asyncio.Task,
+    item: _RealtimeSendQueueItem,
+) -> None:
+    put_task = asyncio.create_task(send_queue.put(item))
+    done, pending = await asyncio.wait(
+        {put_task, sender_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if sender_task in done:
+        for task in pending:
+            task.cancel()
+            await _await_realtime_task(task)
+        _raise_if_sender_failed(sender_task)
+    await put_task
+
+
+async def _join_realtime_send_queue(
+    send_queue: asyncio.Queue[_RealtimeSendQueueItem | None],
+    sender_task: asyncio.Task,
+) -> None:
+    join_task = asyncio.create_task(send_queue.join())
+    done, pending = await asyncio.wait(
+        {join_task, sender_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if sender_task in done:
+        for task in pending:
+            task.cancel()
+            await _await_realtime_task(task)
+        _raise_if_sender_failed(sender_task)
+    await join_task
 
 
 async def _send_output_and_log(

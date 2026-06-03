@@ -24,6 +24,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     realtime_video_api,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.warmup import (
+    realtime_warmup_enabled,
+    run_realtime_warmup,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     rollout_api,
@@ -77,32 +81,36 @@ async def _run_server_warmup_after_http_ready(
     server_args: ServerArgs, warmup_done: asyncio.Event
 ) -> None:
     try:
-        if (
-            not server_args.warmup
-            or not server_args.server_warmup
-            or server_args.warmup_resolutions is not None
-        ):
+        run_standard_warmup = (
+            server_args.warmup
+            and server_args.server_warmup
+            and server_args.warmup_resolutions is None
+        )
+        if not run_standard_warmup and not realtime_warmup_enabled():
             warmup_done.set()
             return
 
         await _wait_until_http_ready(server_args)
 
-        warmup_input_path = None
-        if should_include_warmup_image(server_args, server_based_warmup=True):
-            warmup_input_path = await prepare_warmup_image_path(server_args)
+        if run_standard_warmup:
+            warmup_input_path = None
+            if should_include_warmup_image(server_args, server_based_warmup=True):
+                warmup_input_path = await prepare_warmup_image_path(server_args)
 
-        warmup_reqs = build_warmup_reqs(
-            server_args,
-            warmup_resolutions=None,
-            warmup_input_path=warmup_input_path,
-            return_warmup_result=True,
-            server_based_warmup=True,
-            use_model_sampling_defaults=True,
-        )
-        for req in warmup_reqs:
-            response = await async_scheduler_client.forward(req)
-            if response.error is not None:
-                raise RuntimeError(response.error)
+            warmup_reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path=warmup_input_path,
+                return_warmup_result=True,
+                server_based_warmup=True,
+                use_model_sampling_defaults=True,
+            )
+            for req in warmup_reqs:
+                response = await async_scheduler_client.forward(req)
+                if response.error is not None:
+                    raise RuntimeError(response.error)
+
+        await run_realtime_warmup(server_args, async_scheduler_client)
 
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
@@ -129,7 +137,7 @@ async def lifespan(app: FastAPI):
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     warmup_task = None
-    if server_args.server_warmup:
+    if server_args.server_warmup or realtime_warmup_enabled():
         warmup_task = asyncio.create_task(
             _run_server_warmup_after_http_ready(server_args, warmup_done)
         )
