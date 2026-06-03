@@ -134,8 +134,14 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         # WEIGHTS
         # MXFP4 weights are stored as uint8, with two FP4 values packed per
         # byte. The AITER path later views these buffers as float4_e2m1fn_x2.
+        # Use ``zeros`` (not ``empty``) so the alignment padding (hidden
+        # 2880->3072, intermediate 2880->3072 for GPT-OSS) dequantizes to
+        # 0.0 if it ever reaches the matmul. The current AITER kernel
+        # skips the padded tail via ``n_pad_zeros`` / ``k_pad_zeros`` so
+        # this is defensive, but it matches ``Mxfp4MoEMethod``'s
+        # convention for the same kernel.
         w13_weight = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 w13_up_dim,
                 hidden_size // 2,
@@ -147,7 +153,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w2_weight = torch.nn.Parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 hidden_size,
                 w2_down_dim,

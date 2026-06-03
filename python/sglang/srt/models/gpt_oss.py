@@ -879,14 +879,224 @@ class GptOssForCausalLM(nn.Module):
         quant_config_name = (
             self.quant_config.get_name() if self.quant_config is not None else None
         )
-        if quant_config_name != "mxfp4":
-            self._load_normal_weights(
-                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
-            )
-        else:
+        if quant_config_name == "mxfp4":
             self._load_weights_mxfp4(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
+        elif quant_config_name == "quark":
+            # AMD Quark GPT-OSS checkpoints store experts per-expert as
+            # `experts.{N}.gate_up_proj.{weight,weight_scale,input_scale,bias}`
+            # and `experts.{N}.down_proj.{...}`. The default fused mapping
+            # (`experts.gate_up_proj`) does not match these names, so without a
+            # dedicated path the MoE buffers would never be populated and the
+            # model would produce garbage. Split the per-expert tensors off
+            # here and copy them into the padded Quark MoE parameters; let the
+            # remaining tensors (attention, norms, etc.) flow through the
+            # normal loader.
+            self._load_weights_quark(
+                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
+            )
+        else:
+            self._load_normal_weights(
+                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
+            )
+
+    # Regex matching `model.layers.{L}.mlp.experts.{N}.{gate_up_proj|down_proj}.{suffix}`
+    # used by the AMD Quark GPT-OSS per-expert checkpoint layout.
+    _QUARK_EXPERT_PAT = re.compile(
+        r"^(.*\.mlp\.experts)\.(\d+)\.(gate_up_proj|down_proj)\."
+        r"(weight|weight_scale|input_scale|bias)$"
+    )
+
+    def _load_weights_quark(self, weights, is_nextn, weight_name_mapping):
+        quark_experts_weights = []
+        normal_weights = []
+
+        for name, weight in weights:
+            if self._QUARK_EXPERT_PAT.match(name) is not None:
+                quark_experts_weights.append((name, weight))
+            else:
+                normal_weights.append((name, weight))
+
+        quark_loaded = self._load_quark_experts_weights(quark_experts_weights)
+        self._load_normal_weights(
+            normal_weights,
+            is_nextn=is_nextn,
+            weight_name_mapping=weight_name_mapping,
+            other_loaded_param_names=quark_loaded,
+        )
+
+    def _load_quark_experts_weights(self, weights):
+        """Copy per-expert Quark MoE tensors into the padded fused buffers.
+
+        Quark stores each expert separately:
+            experts.{N}.gate_up_proj.{weight,weight_scale,input_scale,bias}
+            experts.{N}.down_proj.{weight,weight_scale,input_scale,bias}
+
+        We mirror the static MXFP4 expert loader: slice the checkpoint along
+        the TP-sharded dimension (intermediate axis) and copy into a window
+        of the padded ``w13_*`` / ``w2_*`` parameters allocated by
+        :class:`QuarkW4A8MXFp4MoE`. Down-proj bias is loaded only on
+        ``moe_tp_rank == 0`` to avoid double-counting after all-reduce.
+        """
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        mxfp4_block = 32
+
+        moe_tp_rank = get_moe_tensor_parallel_rank()
+        moe_tp_size = get_moe_tensor_parallel_world_size()
+        moe_ep_rank = get_moe_expert_parallel_rank()
+        moe_ep_size = get_moe_expert_parallel_world_size()
+
+        intermediate_size = self.config.intermediate_size
+        assert intermediate_size % mxfp4_block == 0, (
+            f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+        )
+        intermediate_size_block = intermediate_size // mxfp4_block
+        per_rank_intermediate_size_block = math.ceil(
+            intermediate_size_block / moe_tp_size
+        )
+        per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
+        moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
+        moe_tp_rank_end = min(
+            (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
+        )
+
+        assert self.config.num_local_experts % moe_ep_size == 0
+        moe_num_local_experts = self.config.num_local_experts // moe_ep_size
+        moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
+        moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
+
+        for name, weight in weights:
+            m = self._QUARK_EXPERT_PAT.match(name)
+            if m is None:
+                continue
+            prefix, expert_str, proj, suffix = m.groups()
+            global_expert_id = int(expert_str)
+            if (
+                global_expert_id < moe_ep_rank_start
+                or global_expert_id >= moe_ep_rank_end
+            ):
+                continue
+            local_expert_id = global_expert_id - moe_ep_rank_start
+
+            if proj == "gate_up_proj":
+                base = "w13"
+            else:
+                base = "w2"
+
+            param_suffix_map = {
+                "weight": f"{base}_weight",
+                "weight_scale": f"{base}_weight_scale",
+                "bias": f"{base}_weight_bias",
+                "input_scale": f"{base}_input_scale",
+            }
+            param_name = f"{prefix}.{param_suffix_map[suffix]}"
+            if param_name not in params_dict:
+                # Layer outside this PP/EP shard or scheme didn't allocate the
+                # parameter (e.g. dynamic input scales). Skip silently rather
+                # than warn so PP/EP work as expected.
+                continue
+            param = params_dict[param_name]
+
+            if _is_cuda:
+                weight = weight.cuda()
+
+            if suffix == "input_scale":
+                # Per-expert per-tensor FP8 activation scale (scalar). Saved as
+                # bf16 in the checkpoint; promote to fp32 to match the param.
+                param.data[local_expert_id].copy_(
+                    weight.to(param.data.dtype).reshape(())
+                )
+                loaded_params.add(param_name)
+                continue
+
+            if proj == "gate_up_proj":
+                # HF GPT-OSS (and the Quark checkpoint built on top of it)
+                # stores ``gate_up_proj`` as gate/up *interleaved* row pairs
+                # ``[g0, u0, g1, u1, ..., g_{N-1}, u_{N-1}]`` along dim 0.
+                # The AITER MoE kernels expect the *separated* layout
+                # ``[g0, g1, ..., g_{N-1}, u0, u1, ..., u_{N-1}]``, so we
+                # de-interleave here (gate = even rows, up = odd rows) and
+                # then apply TP slicing on each half independently.
+                #
+                # IMPORTANT: the destination buffer is padded along the
+                # intermediate axis (``2 * intermediate_pad`` rows). Gate
+                # must land at ``[:intermediate_pad]`` and up at
+                # ``[intermediate_pad : 2*intermediate_pad]``. Padding gaps
+                # between them are pre-zeroed at ``create_weights`` time and
+                # MUST be left untouched (concatenating ``[gate; up]`` into
+                # ``[:2*inter]`` would shift up into the gate's padding hole).
+                # This matches the post-de-interleave layout produced by
+                # :class:`Mxfp4MoEMethod`.
+                gate_full = weight[0::2]
+                up_full = weight[1::2]
+                gate = gate_full.narrow(
+                    0, moe_tp_rank_start, moe_tp_rank_end - moe_tp_rank_start
+                ).contiguous()
+                up = up_full.narrow(
+                    0, moe_tp_rank_start, moe_tp_rank_end - moe_tp_rank_start
+                ).contiguous()
+
+                if suffix in ("weight", "weight_scale"):
+                    # ``param.data[local_expert_id]`` has shape
+                    # ``(2*intermediate_pad, K_pad)``; intermediate_pad is the
+                    # first-dim half.
+                    intermediate_pad = param.data.shape[1] // 2
+                    g0, g1 = gate.shape
+                    param.data[local_expert_id, :g0, :g1].copy_(
+                        gate.to(param.data.dtype)
+                    )
+                    u0, u1 = up.shape
+                    param.data[
+                        local_expert_id,
+                        intermediate_pad : intermediate_pad + u0,
+                        :u1,
+                    ].copy_(up.to(param.data.dtype))
+                else:
+                    # bias: 1D length (2 * intermediate_pad,).
+                    intermediate_pad = param.data.shape[1] // 2
+                    g0 = gate.shape[0]
+                    u0 = up.shape[0]
+                    param.data[local_expert_id, :g0].copy_(
+                        gate.to(param.data.dtype)
+                    )
+                    param.data[
+                        local_expert_id,
+                        intermediate_pad : intermediate_pad + u0,
+                    ].copy_(up.to(param.data.dtype))
+            else:
+                # down_proj: contracts along the intermediate axis. The K dim
+                # is the last for weight/weight_scale and is sharded along TP.
+                if suffix in ("weight", "weight_scale"):
+                    # weight shape (hidden, intermediate/2) packed FP4 -> slice
+                    # the packed K dim by half of the TP boundary; scales use
+                    # intermediate/32 -> slice by mxfp4_block as well.
+                    if suffix == "weight":
+                        k_start = moe_tp_rank_start // 2
+                        k_end = moe_tp_rank_end // 2
+                    else:
+                        k_start = moe_tp_rank_start // mxfp4_block
+                        k_end = moe_tp_rank_end // mxfp4_block
+                    sliced = weight.narrow(-1, k_start, k_end - k_start)
+                    dim0, dim1 = sliced.shape
+                    param.data[local_expert_id, :dim0, :dim1].copy_(
+                        sliced.to(param.data.dtype)
+                    )
+                else:
+                    # bias: only TP rank 0 receives the actual bias; other
+                    # ranks zero out their slice so that the all-reduce after
+                    # w2 sums to the correct value once.
+                    if moe_tp_rank == 0:
+                        dim0 = weight.shape[0]
+                        param.data[local_expert_id, :dim0].copy_(
+                            weight.to(param.data.dtype)
+                        )
+                    else:
+                        param.data[local_expert_id].zero_()
+            loaded_params.add(param_name)
+
+        return loaded_params
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
         mxfp4_weights = []
