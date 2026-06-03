@@ -234,7 +234,7 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
 | `get_graph_runner_cls()` | `raise NotImplementedError` | Graph Runner class |
 | `get_mha_kv_pool_cls()` | `raise NotImplementedError` | MHA KV cache pool class |
 | `get_mla_kv_pool_cls()` | `raise NotImplementedError` | MLA KV cache pool class |
-| `get_nsa_kv_pool_cls()` | `raise NotImplementedError` | NSA KV cache pool class (DeepSeek V3.2) |
+| `get_dsa_kv_pool_cls()` | `raise NotImplementedError` | DSA KV cache pool class (DeepSeek V3.2) |
 | `get_paged_allocator_cls()` | `raise NotImplementedError` | Paged allocator class |
 | `get_piecewise_backend_cls()` | `raise NotImplementedError` | Piecewise compilation backend class |
 | `get_compile_backend(mode)` | `"inductor"` | Compilation backend string |

@@ -25,9 +25,10 @@ jobs:
 
       - name: Update est_time values
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODEL_URL: "https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/main/model.json"
         run: |
           python scripts/ci/update_est_time.py \
+            --model-url "$MODEL_URL" \
             --summary-file /tmp/est_time_summary.md
 
       - name: Check for changes
@@ -61,9 +62,9 @@ jobs:
           {
             echo "## Summary"
             echo
-            echo "Updates \`est_time\` values in CI test registration calls based on the 90th percentile of the last 15 successful executions from scheduled PR Test runs on main."
+            echo "Refreshes \`est_time\` literals from [\`sgl-project/sglang-ci-stats\`](https://github.com/sgl-project/sglang-ci-stats)'s \`model.json\` (per-(suite, file) p90 over recent successful CI runs on \`main\`)."
             echo
-            echo "This keeps the LPT load-balancing algorithm accurate for partitioning tests across parallel CI jobs."
+            echo "This keeps the LPT load-balancing algorithm accurate for partitioning tests across parallel CI jobs, and serves as the static fallback when \`compute_partitions\` cannot fetch the live model at PR time."
             echo
             if [ -f /tmp/est_time_summary.md ]; then
               cat /tmp/est_time_summary.md

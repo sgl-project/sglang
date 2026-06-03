@@ -7,15 +7,10 @@ and adds SRT-specific subsystem factory methods, capability flags, and
 configuration lifecycle hooks.
 
 Out-of-tree platforms register via setuptools entry_points under the
-"sglang.platform_plugins" group and should subclass SRTPlatform.
+"sglang.srt.platforms" group and should subclass SRTPlatform.
 """
 
-from typing import TYPE_CHECKING
-
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
-
-if TYPE_CHECKING:
-    pass
 
 # Re-export for convenience
 __all__ = ["SRTPlatform", "PlatformEnum"]
@@ -66,8 +61,8 @@ class SRTPlatform(DeviceMixin):
         """Return the MLA KV pool class for this platform."""
         raise NotImplementedError
 
-    def get_nsa_kv_pool_cls(self) -> type:
-        """Return the NSA KV pool class for this platform (DeepSeek V3.2)."""
+    def get_dsa_kv_pool_cls(self) -> type:
+        """Return the DSA KV pool class for this platform (DeepSeek V3.2)."""
         raise NotImplementedError
 
     def get_paged_allocator_cls(self) -> type:

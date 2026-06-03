@@ -22,6 +22,9 @@ from sglang.multimodal_gen.configs.models import (
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
@@ -227,6 +230,7 @@ class PipelineConfig:
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
     image_encoder_precision: str = "fp32"
+    image_encoder_extra_args: dict = field(default_factory=lambda: {})
 
     # Text encoder configuration
     DEFAULT_TEXT_ENCODER_PRECISIONS = ("fp32",)
@@ -237,8 +241,8 @@ class PipelineConfig:
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
-    # image encoding
-    image_encoder_extra_args: dict = field(default_factory=lambda: {})
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig()
 
     def postprocess_image(self, image):
         return image.last_hidden_state
@@ -259,6 +263,10 @@ class PipelineConfig:
 
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # return the model-specific config for optimal deployment setting
+        return ModelDeploymentConfig()
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
@@ -302,6 +310,9 @@ class PipelineConfig:
         return image.resize(
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
+
+    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
+        return False
 
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
@@ -348,6 +359,13 @@ class PipelineConfig:
     # tokenize the prompt
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
+
+    def is_flux_v1(self) -> bool:
+        """True if this pipeline is FLUX v1 (dual CLIP + T5 text encoders).
+
+        Used by text encoding (e.g. fixed CLIP context). Other pipelines return False.
+        """
+        return False
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio
@@ -422,6 +440,10 @@ class PipelineConfig:
 
     def maybe_prepare_latent_ids(self, latents):
         return None
+
+    # called before vae encode
+    def preprocess_vae_encode(self, image, vae):
+        return image
 
     # called after vae encode
     def postprocess_vae_encode(self, image_latents, vae):
@@ -667,6 +689,9 @@ class PipelineConfig:
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
 
+    def prepare_world_condition(self, batch, device, dtype):
+        return None
+
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
 
@@ -786,6 +811,18 @@ class PipelineConfig:
             type=parse_int_list,
             default=PipelineConfig.dmd_denoising_steps,
             help="Comma-separated list of denoising steps (e.g., '1000,757,522')",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-sink-size",
+            type=int,
+            default=None,
+            help="Override the number of sink frames kept by realtime causal DiT pipelines that support it.",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}realtime-causal-kv-cache-num-frames",
+            type=int,
+            default=None,
+            help="Override the total frame capacity of realtime causal DiT KV cache for pipelines that support it.",
         )
 
         # Add VAE configuration arguments
