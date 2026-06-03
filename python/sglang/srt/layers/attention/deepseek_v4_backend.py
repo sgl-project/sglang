@@ -941,7 +941,6 @@ class DeepseekV4AttnBackend(
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
 
-
     def replay_cuda_graph_metadata_from(
         self,
         bs: int,
@@ -997,7 +996,6 @@ class DeepseekV4AttnBackend(
                 raw_loc=raw_loc,
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
             )
-
 
     def forward(
         self,
@@ -1332,7 +1330,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     def on_after_cuda_graph_warmup(self):
         for backend in self.attn_backends:
             backend.on_after_cuda_graph_warmup()
-
 
 
 def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
