@@ -1,0 +1,33 @@
+---
+title: "Disaggregation of Diffusion Pipeline on Ascend NPU"
+---
+
+## Quick Start
+
+Please follow the [NPU installation guide](../ascend_npu.mdx) first.
+
+Then install Mooncake from sources.
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+git checkout v0.3.10.post2
+bash dependencies.sh
+mkdir build
+cd build
+export GLOG_logtostderr=1
+cmake -DUSE_ASCEND_DIRECT=ON ..
+make -j
+make install
+cd ../mooncake-wheel/
+pip install .
+```
+
+Before run servers ensure that *.so files of mooncake in LD_LIBRARY_PATH
+```bash
+export LD_LIBRARY_PATH=/usr/local/python3.11.14/lib/python3.11/site-packages/mooncake:$LD_LIBRARY_PATH
+```
+
+## Examples
+
+For usage examples please follow the [main disaggregation guide](../../../sglang-diffusion/disaggregation.mdx)

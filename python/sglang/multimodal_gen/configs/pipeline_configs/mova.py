@@ -38,8 +38,9 @@ class MOVAPipelineConfig(PipelineConfig):
 
     # Video VAE (Wan) + Audio VAE (DAC)
     vae_config: WanVAEConfig = field(default_factory=WanVAEConfig)
+    vae_precision: str = "bf16"
     audio_vae_config: DacVAEConfig = field(default_factory=DacVAEConfig)
-    audio_vae_precision: str = "fp32"
+    audio_vae_precision: str = "bf16"
 
     # Text encoder (UMT5 compatible)
     text_encoder_configs: tuple = field(default_factory=lambda: (T5Config(),))

@@ -1,7 +1,7 @@
 """DSV4 Flash PD-disagg with NIXL backend. Both sides run dp-attention
 + deepep + EAGLE MTP so attn_tp_size and the V4 state pool layout are
 fully symmetric: same SWA item_len under matching attn_tp, and same
-NSA c4/c128 indexer ring buffer size under matching spec status. nixl
+DSA c4/c128 indexer ring buffer size under matching spec status. nixl
 `send_state` is page-by-index and has no V4 TP-slice / spec-asymmetric
 path, so any layout mismatch would trip the item_len assert in
 `nixl/conn.py`."""

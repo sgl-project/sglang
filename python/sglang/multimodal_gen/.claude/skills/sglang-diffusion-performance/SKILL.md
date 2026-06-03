@@ -89,12 +89,12 @@ sglang generate --model-path Lightricks/LTX-2 \
   --pipeline-class-name LTX2TwoStagePipeline \
   --prompt "A cat and a dog baking a cake together in a kitchen." \
   --width 768 --height 512 \
-  --num-frames 121 --num-inference-steps 50 --guidance-scale 4.0 \
+  --num-frames 121 \
   --seed 42 --num-gpus 2 --enable-cfg-parallel \
   --enable-torch-compile --warmup --save-output
 ```
 
-Note: this generate recipe is aligned with the nightly comparison case `ltx2_twostage_t2v`. `LTX2TwoStagePipeline` is a native path and auto-resolves the spatial upsampler plus distilled LoRA from the same model snapshot unless you override them.
+Note: this generate recipe is aligned with the nightly comparison case `ltx2_twostage_t2v`. The nightly config omits explicit steps and guidance, so this command omits them too and uses runtime defaults. `LTX2TwoStagePipeline` is a native path and auto-resolves the spatial upsampler plus distilled LoRA from the same model snapshot unless you override them.
 
 ### Nightly-aligned model, 2 GPUs: LTX-2.3 TI2V two-stage
 
@@ -104,12 +104,12 @@ sglang generate --model-path Lightricks/LTX-2.3 \
   --prompt "The cat starts walking slowly towards the camera." \
   --image-path "${ASSET_DIR}/cat.png" \
   --width 768 --height 512 \
-  --num-frames 121 --num-inference-steps 50 --guidance-scale 4.0 \
-  --seed 42 --num-gpus 2 \
+  --num-frames 121 \
+  --seed 42 --num-gpus 2 --cfg-parallel-size 2 \
   --enable-torch-compile --warmup --save-output
 ```
 
-Note: this matches the nightly comparison case `ltx2.3_twostage_ti2v_2gpus`. Download `${ASSET_DIR}/cat.png` with the benchmark/profile skill before running it.
+Note: this matches the nightly comparison case `ltx2.3_twostage_ti2v_2gpus`. The nightly config omits explicit steps and guidance, so this command omits them too and uses runtime defaults. Download `${ASSET_DIR}/cat.png` with the benchmark/profile skill before running it.
 
 ### Native baseline, 2 GPUs: LTX-2.3 one-stage
 
@@ -251,12 +251,12 @@ Use these as first commands to benchmark, not as universal winners.
 
 | Model family | First performance shape | Starting flags | Notes |
 |---|---|---|---|
-| FLUX.1 / FLUX.2 image | 1024x1024, 50 steps, 1 GPU | `--enable-torch-compile --warmup --dit-layerwise-offload false` | `black-forest-labs/FLUX.*` repos are gated; for FP8/NVFP4 use validated `--transformer-path` or `--transformer-weights-path` flows from the quant skill. |
-| Qwen-Image / Qwen-Image-Edit | 1024x1024, 50 steps, 1 GPU | `--enable-torch-compile --warmup`; optionally native `SGLANG_CACHE_DIT_ENABLED=true` | Cache-DiT is lossy. For edit tasks, keep reference image, seed, and output size fixed. |
-| Z-Image-Turbo | 1024x1024, 9 steps, guidance 4.0 | `--enable-torch-compile --warmup` | Mainline has Z-Image tanh/gate norm fusions; PR #21912 tracks FP8 plus CUDA Graph work. |
-| Wan2.2 A14B T2V/I2V | 720p, 81 frames | Nightly: `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory` | For lowest latency, also benchmark pure Ulysses on the same GPUs. |
-| Wan2.2 TI2V 5B | 720p, 81 frames, 1 GPU | `--enable-torch-compile --warmup` | Keep the input image and motion prompt fixed when comparing sparse attention or Cache-DiT. |
-| LTX-2 / LTX-2.3 | 768x512, 121 frames, 2 GPUs | `--pipeline-class-name LTX2TwoStagePipeline --enable-torch-compile --warmup`; LTX-2 nightly also uses `--enable-cfg-parallel` | Use the benchmark/profile skill presets for exact nightly alignment. PRs #22441, #24025, and #23736 track additional LTX2 perf/parallel work. |
+| FLUX.1 / FLUX.2 image | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup --dit-layerwise-offload false` | `black-forest-labs/FLUX.*` repos are gated; for FP8/NVFP4 use validated `--transformer-path` or `--transformer-weights-path` flows from the quant skill. |
+| Qwen-Image / Qwen-Image-Edit | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup`; optionally native `SGLANG_CACHE_DIT_ENABLED=true` | Cache-DiT is lossy. For edit tasks, keep reference image, seed, and output size fixed. |
+| Z-Image-Turbo | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup` | Mainline has Z-Image tanh/gate norm fusions; PR #21912 tracks FP8 plus CUDA Graph work. |
+| Wan2.2 A14B T2V/I2V | 1280x720, 81 frames | Nightly: `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory` | For lowest latency, also benchmark pure Ulysses on the same GPUs. |
+| Wan2.2 TI2V 5B | 1280x720, 81 frames, 1 GPU | `--enable-torch-compile --warmup` | Keep the input image and motion prompt fixed when comparing sparse attention or Cache-DiT. |
+| LTX-2 / LTX-2.3 | 768x512, 121 frames, runtime-default steps/guidance, 2 GPUs | `--pipeline-class-name LTX2TwoStagePipeline --enable-torch-compile --warmup`; LTX-2 uses `--enable-cfg-parallel`, LTX-2.3 TI2V uses `--cfg-parallel-size 2` | Use the benchmark/profile skill presets for exact nightly alignment. PRs #22441, #24025, and #23736 track additional LTX2 perf/parallel work. |
 | HunyuanVideo | 848x480 or 720p class video | `--text-encoder-cpu-offload --pin-cpu-memory --enable-torch-compile --warmup` | Check VAE decode separately. GroupNorm+SiLU is default-eligible in mainline when wrapper guards pass; use `bench_group_norm_silu.py` when VAE residual blocks are hot. |
 | JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; 2-GPU CFG parallel is the validated H100 starting point. |
 | FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
