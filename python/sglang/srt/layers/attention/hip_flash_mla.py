@@ -14,7 +14,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
 
         backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "tilelang")
     else:
-        import flash_mla
+        import sgl_kernel.flash_mla as flash_mla
 
     if backend == "comparison":
         pack_ref, pack_fast_via_tester = flash_mla_with_kvcache_entrypoint(
