@@ -1,6 +1,7 @@
 """Regression tests for the SWA chunked-req stash gate (#24252)."""
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -27,13 +28,13 @@ def _make_req(
 ) -> Req:
     req = Req.__new__(Req)
     req.rid = "test-req"
-    req.origin_input_ids = list(fill_ids)
-    req.output_ids = []
-    req.fill_ids = list(fill_ids)
+    req.origin_input_ids = array("q", fill_ids)
+    req.output_ids = array("q")
+    req.fill_ids = array("q", fill_ids)
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
     req.extend_input_len = extend_input_len
-    req.is_chunked = 0
+    req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.cache_protected_len = 0
     req.skip_radix_cache_insert = False

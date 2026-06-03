@@ -7,6 +7,7 @@ from typing import (
     Callable,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -85,7 +86,7 @@ class SchedulerBatchResultProcessor:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
-            req.check_finished()
+            req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
@@ -116,25 +117,27 @@ class SchedulerBatchResultProcessor:
         if capturer is None:
             return
         start_len = req.routed_experts_start_len
+        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
-            seqlen=req.seqlen,
+            seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
             start_len=start_len,
         )
 
-        expected_rows = max(0, req.seqlen - 1 - start_len)
+        expected_rows = max(0, seqlen - 1 - start_len)
         if (
             req.routed_experts is not None
             and req.routed_experts.shape[0] != expected_rows
         ):
             logger.warning(
-                "routed_experts row-count mismatch for req %s: got %d, "
-                "expected %d (seqlen=%d, cached_tokens=%d, start_len=%s). "
+                "routed_experts row-count mismatch for req %s: got %d, expected %d "
+                "(seqlen=%d, raw_seqlen=%d, cached_tokens=%d, start_len=%s). "
                 "This indicates a silent bug.",
                 req.rid,
                 req.routed_experts.shape[0],
                 expected_rows,
+                seqlen,
                 req.seqlen,
                 req.cached_tokens,
                 req.routed_experts_start_len,
@@ -144,9 +147,10 @@ class SchedulerBatchResultProcessor:
         capturer = get_global_indexer_capturer()
         if capturer is None:
             return
+        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         req.indexer_topk = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
-            seqlen=req.seqlen,
+            seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )
 
@@ -202,27 +206,9 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs.tolist()
-                    )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        logits_output.input_token_logprobs.tolist()
-                    )
-                if logits_output.next_token_top_logprobs_val:
-                    logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
-                    ]
-                    logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                    ]
-                if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
+            self._move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
+
+            self._validate_pp_skip_output_comm(batch, result)
 
             hidden_state_offset = 0
 
@@ -234,7 +220,7 @@ class SchedulerBatchResultProcessor:
                     # decode req in mixed batch or retracted req
                     continue
 
-                if req.is_chunked <= 0:
+                if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
@@ -242,7 +228,7 @@ class SchedulerBatchResultProcessor:
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
-                    req.check_finished()
+                    req.update_finish_state()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -256,62 +242,34 @@ class SchedulerBatchResultProcessor:
                     self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
-                        assert extend_logprob_start_len_per_req is not None
-                        assert extend_input_len_per_req is not None
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-
-                        num_input_logprobs = (
-                            self.logprob_result_processor.calculate_num_input_logprobs(
-                                req,
-                                extend_input_len,
-                                extend_logprob_start_len,
-                            )
+                        logprob_pt = self._apply_prefill_logprobs(
+                            req=req,
+                            i=i,
+                            logits_output=logits_output,
+                            extend_input_len_per_req=extend_input_len_per_req,
+                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                            next_token_ids=next_token_ids,
+                            logprob_pt=logprob_pt,
                         )
-
-                        if req.return_logprob:
-                            self.logprob_result_processor.add_logprob_return_values(
-                                i,
-                                req,
-                                logprob_pt,
-                                next_token_ids,
-                                num_input_logprobs,
-                                logits_output,
-                            )
-                        logprob_pt += num_input_logprobs
 
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
-                        req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
-                            .cpu()
-                            .clone()
-                            .tolist()
+                        hidden_state_offset = self._append_prefill_hidden_states(
+                            req=req,
+                            logits_output=logits_output,
+                            hidden_state_offset=hidden_state_offset,
                         )
 
                     if req.grammar is not None:
-                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                        try:
-                            req.grammar.accept_token(next_token_id)
-                        except ValueError as e:
-                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                            # This can happen if the grammar is not set correctly or the token is invalid.
-                            logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                            )
-                            self.abort_request(AbortReq(rid=req.rid))
-                        req.grammar.finished = req.finished()
+                        self._apply_prefill_grammar(
+                            req=req, next_token_id=next_token_id
+                        )
 
                 else:
                     # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
+                    req.inflight_middle_chunks -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
@@ -319,25 +277,14 @@ class SchedulerBatchResultProcessor:
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-                        if extend_logprob_start_len < extend_input_len:
-                            # Update input logprobs.
-                            num_input_logprobs = self.logprob_result_processor.calculate_num_input_logprobs(
-                                req,
-                                extend_input_len,
-                                extend_logprob_start_len,
-                            )
-                            if req.return_logprob:
-                                self.logprob_result_processor.add_input_logprob_return_values(
-                                    i,
-                                    req,
-                                    logits_output,
-                                    logprob_pt,
-                                    num_input_logprobs,
-                                    last_prefill_chunk=False,
-                                )
-                            logprob_pt += num_input_logprobs
+                        logprob_pt = self._apply_chunked_prefill_logprobs(
+                            req=req,
+                            i=i,
+                            logits_output=logits_output,
+                            extend_input_len_per_req=extend_input_len_per_req,
+                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                            logprob_pt=logprob_pt,
+                        )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -345,25 +292,8 @@ class SchedulerBatchResultProcessor:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
 
-            is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
-
-            embeddings = result.embeddings
+            embeddings = self._convert_embeddings(result=result)
             phs = result.pooled_hidden_states
-
-            if is_sparse:
-                batch_ids, token_ids = embeddings.indices()
-                values = embeddings.values()
-
-                embeddings = [{} for _ in range(embeddings.size(0))]
-                for i in range(batch_ids.shape[0]):
-                    embeddings[batch_ids[i].item()][token_ids[i].item()] = values[
-                        i
-                    ].item()
-            else:
-                if isinstance(embeddings, torch.Tensor):
-                    embeddings = embeddings.tolist()
-                else:
-                    embeddings = [tensor.tolist() for tensor in embeddings]
 
             if phs is not None:
                 if isinstance(phs, list):
@@ -379,11 +309,11 @@ class SchedulerBatchResultProcessor:
                 req.embedding = embeddings[i]
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
-                if req.is_chunked <= 0:
+                if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
-                    req.check_finished()
+                    req.update_finish_state()
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
@@ -392,20 +322,207 @@ class SchedulerBatchResultProcessor:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
+                    req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
 
-        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+        can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
+        is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+
+        embeddings = result.embeddings
+
+        if is_sparse:
+            batch_ids, token_ids = embeddings.indices()
+            values = embeddings.values()
+
+            embeddings = [{} for _ in range(embeddings.size(0))]
+            for i in range(batch_ids.shape[0]):
+                embeddings[batch_ids[i].item()][token_ids[i].item()] = values[i].item()
+        else:
+            if isinstance(embeddings, torch.Tensor):
+                embeddings = embeddings.tolist()
+            else:
+                embeddings = [tensor.tolist() for tensor in embeddings]
+        return embeddings
+
+    def _move_logprobs_to_cpu(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+    ) -> None:
+        if batch.return_logprob:
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = (
+                    logits_output.next_token_logprobs.tolist()
+                )
+            if logits_output.input_token_logprobs is not None:
+                logits_output.input_token_logprobs = tuple(
+                    logits_output.input_token_logprobs.tolist()
+                )
+            if logits_output.next_token_top_logprobs_val:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                ]
+            if logits_output.next_token_token_ids_logprobs_val:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                ]
+
+    def _apply_prefill_logprobs(
+        self,
+        *,
+        req: Req,
+        i: int,
+        logits_output: LogitsProcessorOutput,
+        extend_input_len_per_req: Optional[List[int]],
+        extend_logprob_start_len_per_req: Optional[List[int]],
+        next_token_ids: List[int],
+        logprob_pt: int,
+    ) -> int:
+        assert extend_logprob_start_len_per_req is not None
+        assert extend_input_len_per_req is not None
+        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+        extend_input_len = extend_input_len_per_req[i]
+
+        num_input_logprobs = self.logprob_result_processor.calculate_num_input_logprobs(
+            req,
+            extend_input_len,
+            extend_logprob_start_len,
+        )
+
+        if req.return_logprob:
+            self.logprob_result_processor.add_logprob_return_values(
+                i,
+                req,
+                logprob_pt,
+                next_token_ids,
+                num_input_logprobs,
+                logits_output,
+            )
+        logprob_pt += num_input_logprobs
+        return logprob_pt
+
+    @staticmethod
+    def _validate_pp_skip_output_comm(
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ):
+        """Validate PP skip output comm correctness.
+
+        - When skip=True: all reqs must be middle chunks (inflight_middle_chunks > 0)
+          so placeholder zeros are never consumed via req.output_ids.append().
+        - When skip=False: at least one req should consume next_token_ids
+          (inflight_middle_chunks <= 0), otherwise warn.
+        """
+        if not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
+            return
+
+        if not getattr(result, "skipped_output_comm", False):
+            if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
+                has_consumed_output = any(
+                    req.inflight_middle_chunks <= 0
+                    for req in batch.reqs
+                    if not req.finished() and not req.is_retracted
+                )
+                if not has_consumed_output and len(batch.reqs) > 0:
+                    chunks = list([r.inflight_middle_chunks for r in batch.reqs])
+                    logger.warning(
+                        f"PP non-skip output comm: no req consumed next_token_ids. "
+                        f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
+                        f"num_reqs={len(batch.reqs)}, all inflight_middle_chunks={chunks}"
+                    )
+            return
+
+        for req in batch.reqs:
+            if not req.finished() and not req.is_retracted:
+                assert req.inflight_middle_chunks > 0, (
+                    f"PP skip output comm invariant violated: req {req.rid} "
+                    f"has inflight_middle_chunks={req.inflight_middle_chunks} "
+                    f"but output was skipped (contains_last_prefill_chunk="
+                    f"{batch.contains_last_prefill_chunk}). "
+                    f"Placeholder zeros would be appended to output_ids."
+                )
+
+    def _append_prefill_hidden_states(
+        self,
+        *,
+        req: Req,
+        logits_output: LogitsProcessorOutput,
+        hidden_state_offset: int,
+    ) -> int:
+        req.hidden_states.append(
+            logits_output.hidden_states[
+                hidden_state_offset : (
+                    hidden_state_offset := hidden_state_offset
+                    + len(req.origin_input_ids)
+                )
+            ]
+            .cpu()
+            .clone()
+            .tolist()
+        )
+        return hidden_state_offset
+
+    def _apply_prefill_grammar(self, *, req: Req, next_token_id: int) -> None:
+        # FIXME: this try-except block is for handling unexpected xgrammar issue.
+        try:
+            req.grammar.accept_token(next_token_id)
+        except ValueError as e:
+            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+            # This can happen if the grammar is not set correctly or the token is invalid.
+            logger.error(
+                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+            )
+            self.abort_request(AbortReq(rid=req.rid))
+        req.grammar.finished = req.finished()
+
+    def _apply_chunked_prefill_logprobs(
+        self,
+        *,
+        req: Req,
+        i: int,
+        logits_output: LogitsProcessorOutput,
+        extend_input_len_per_req: Optional[List[int]],
+        extend_logprob_start_len_per_req: Optional[List[int]],
+        logprob_pt: int,
+    ) -> int:
+        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+        extend_input_len = extend_input_len_per_req[i]
+        if extend_logprob_start_len < extend_input_len:
+            # Update input logprobs.
+            num_input_logprobs = (
+                self.logprob_result_processor.calculate_num_input_logprobs(
+                    req,
+                    extend_input_len,
+                    extend_logprob_start_len,
+                )
+            )
+            if req.return_logprob:
+                self.logprob_result_processor.add_input_logprob_return_values(
+                    i,
+                    req,
+                    logits_output,
+                    logprob_pt,
+                    num_input_logprobs,
+                    last_prefill_chunk=False,
+                )
+            logprob_pt += num_input_logprobs
+        return logprob_pt
 
     def _resolve_spec_overlap_tokens(
         self,
@@ -488,31 +605,12 @@ class SchedulerBatchResultProcessor:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
-            elif isinstance(next_token_ids, list):
-                pass  # MLX path: already a list[int], skip torch round-trip
-            else:
-                next_token_ids = next_token_ids.tolist()
-
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if logits_output.next_token_top_logprobs_val:
-                    logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
-                    ]
-                    logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                    ]
-
-                if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
-        # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
-        # are already handled in the verify phase (eagle_info.py / ngram_info.py).
+        next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
+            batch=batch,
+            result=result,
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+        )
 
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -526,7 +624,7 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
+        # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
@@ -566,41 +664,19 @@ class SchedulerBatchResultProcessor:
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
-            req.check_finished(new_accepted_len)
+            req.update_finish_state(new_accepted_len)
 
             self._handle_finished_req(req, i, logits_output)
 
             if req.return_logprob:
-                # Spec v1 handles logprobs inside its own worker.
-                # Normalize: non-spec has 1 token, spec v2 has multiple.
-                if batch.is_spec_v2:
-                    accepted_logprobs = next_token_logprobs[i]
-                    accepted_ids = next_token_id
-                    max_accept = len(accepted_logprobs)
-                else:
-                    accepted_logprobs = [next_token_logprobs[i]]
-                    accepted_ids = [next_token_id]
-                    max_accept = 1
-
-                for j, tok_id in enumerate(accepted_ids):
-                    req.output_token_logprobs_val.append(accepted_logprobs[j])
-                    req.output_token_logprobs_idx.append(tok_id)
-                    if req.top_logprobs_num > 0:
-                        flat_idx = i * max_accept + j
-                        req.output_top_logprobs_val.append(
-                            logits_output.next_token_top_logprobs_val[flat_idx]
-                        )
-                        req.output_top_logprobs_idx.append(
-                            logits_output.next_token_top_logprobs_idx[flat_idx]
-                        )
-                    if req.token_ids_logprob is not None:
-                        flat_idx = i * max_accept + j
-                        req.output_token_ids_logprobs_val.append(
-                            logits_output.next_token_token_ids_logprobs_val[flat_idx]
-                        )
-                        req.output_token_ids_logprobs_idx.append(
-                            logits_output.next_token_token_ids_logprobs_idx[flat_idx]
-                        )
+                self._apply_decode_logprobs(
+                    req=req,
+                    i=i,
+                    batch=batch,
+                    next_token_id=next_token_id,
+                    next_token_logprobs=next_token_logprobs,
+                    logits_output=logits_output,
+                )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -608,23 +684,9 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.grammar is not None:
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    if batch.spec_algorithm.is_none():
-                        # Normal decode: single token
-                        req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
-                        for token_id in next_token_id:
-                            req.grammar.accept_token(token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
-                    self.abort_request(AbortReq(rid=req.rid))
-                req.grammar.finished = req.finished()
+                self._apply_decode_grammar(
+                    req=req, next_token_id=next_token_id, batch=batch
+                )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -637,6 +699,108 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
         )
+
+    def _normalize_decode_outputs(
+        self,
+        *,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        logits_output: LogitsProcessorOutput,
+        next_token_ids: Union[torch.Tensor, List[int]],
+    ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
+        next_token_logprobs = None
+        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
+            if batch.is_spec_v2:
+                next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
+            elif isinstance(next_token_ids, list):
+                pass  # MLX path: already a list[int], skip torch round-trip
+            else:
+                next_token_ids = next_token_ids.tolist()
+
+            if batch.return_logprob:
+                next_token_logprobs = logits_output.next_token_logprobs.tolist()
+                if logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+
+                if logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
+        # else: Spec V1 — output_ids, update_finish_state, grammar, and reasoning tokens
+        # are already handled in the verify phase (eagle_info.py / ngram_info.py).
+        return next_token_ids, next_token_logprobs
+
+    def _apply_decode_logprobs(
+        self,
+        *,
+        req: Req,
+        i: int,
+        batch: ScheduleBatch,
+        next_token_id: Union[int, List[int]],
+        next_token_logprobs: list,
+        logits_output: LogitsProcessorOutput,
+    ) -> None:
+        # Spec v1 handles logprobs inside its own worker.
+        # Normalize: non-spec has 1 token, spec v2 has multiple.
+        if batch.is_spec_v2:
+            accepted_logprobs = next_token_logprobs[i]
+            accepted_ids = next_token_id
+            max_accept = len(accepted_logprobs)
+        else:
+            accepted_logprobs = [next_token_logprobs[i]]
+            accepted_ids = [next_token_id]
+            max_accept = 1
+
+        for j, tok_id in enumerate(accepted_ids):
+            req.logprob.output_token_logprobs_val.append(accepted_logprobs[j])
+            req.logprob.output_token_logprobs_idx.append(tok_id)
+            if req.logprob.top_logprobs_num > 0:
+                flat_idx = i * max_accept + j
+                req.logprob.output_top_logprobs_val.append(
+                    logits_output.next_token_top_logprobs_val[flat_idx]
+                )
+                req.logprob.output_top_logprobs_idx.append(
+                    logits_output.next_token_top_logprobs_idx[flat_idx]
+                )
+            if req.logprob.token_ids_logprob is not None:
+                flat_idx = i * max_accept + j
+                req.logprob.output_token_ids_logprobs_val.append(
+                    logits_output.next_token_token_ids_logprobs_val[flat_idx]
+                )
+                req.logprob.output_token_ids_logprobs_idx.append(
+                    logits_output.next_token_token_ids_logprobs_idx[flat_idx]
+                )
+
+    def _apply_decode_grammar(
+        self,
+        *,
+        req: Req,
+        next_token_id: Union[int, List[int]],
+        batch: ScheduleBatch,
+    ) -> None:
+        # FIXME: this try-except block is for handling unexpected xgrammar issue.
+        try:
+            if batch.spec_algorithm.is_none():
+                # Normal decode: single token
+                req.grammar.accept_token(next_token_id)
+            elif batch.is_spec_v2:
+                # Speculative decode: next_token_id is a list of accepted tokens
+                for token_id in next_token_id:
+                    req.grammar.accept_token(token_id)
+        except ValueError as e:
+            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+            # This can happen if the grammar is not set correctly or the token is invalid.
+            logger.error(
+                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+            )
+            self.abort_request(AbortReq(rid=req.rid))
+        req.grammar.finished = req.finished()
 
     def _handle_finished_req(
         self,
@@ -664,6 +828,11 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()

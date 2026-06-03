@@ -30,7 +30,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
-        scheduler.send_to_tokenizer = MagicMock()
+        scheduler.ipc_channels = MagicMock()
         return scheduler
 
     def _new_req(self, priority=None):
@@ -72,7 +72,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler._add_request_to_queue(req)
 
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
-        scheduler.send_to_tokenizer.send_output.assert_called_once()
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
 
 
@@ -106,11 +106,13 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._allocatable_tokens = MagicMock(return_value=1000)
-        queue._pre_alloc = MagicMock(
-            side_effect=lambda req, prefix_indices=None, prefix_len=0: torch.arange(
+
+        def pre_alloc_mock(req, prefix_indices=None, prefix_len=0, total_prefix_len=0):
+            return torch.arange(
                 len(req.origin_input_ids) - prefix_len, dtype=torch.int64
             )
-        )
+
+        queue._pre_alloc = MagicMock(side_effect=pre_alloc_mock)
 
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 100

@@ -328,7 +328,7 @@ export const MiMoV25Deployment = () => {
         flags.push("  --max-running-requests 128");
         flags.push("  --chunked-prefill-size 16384");
         if (hardware === "b200") flags.push("  --swa-full-tokens-ratio 0.1");
-        flags.push(`  --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}'`);
+        flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);
       } else {
         flags.push("  --mem-fraction-static 0.7");
         flags.push("  --max-running-requests 128");
@@ -336,7 +336,7 @@ export const MiMoV25Deployment = () => {
         flags.push("  --cuda-graph-max-bs 64");
         flags.push("  --page-size 64");
         flags.push("  --swa-full-tokens-ratio 0.3");
-        flags.push(`  --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}'`);
+        flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);
       }
     } else {
       flags.push("  --mem-fraction-static 0.65");
@@ -348,7 +348,7 @@ export const MiMoV25Deployment = () => {
       flags.push("  --speculative-num-steps 3");
       flags.push("  --speculative-eagle-topk 1");
       flags.push("  --speculative-num-draft-tokens 4");
-      if (!blackwell) flags.push("  --enable-multi-layer-eagle");
+      flags.push("  --enable-multi-layer-eagle");
     }
 
     if (reasoningParser === "enabled") flags.push("  --reasoning-parser mimo");
