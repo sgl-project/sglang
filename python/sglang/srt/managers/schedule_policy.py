@@ -116,7 +116,9 @@ def match_prefix_for_req(
         match_result.host_hit_length,
     )
     max_len = req._compute_max_prefix_len(len(token_ids))
-    req.matched_prefix_len = min(len(req.prefix_indices) + req.host_hit_length, max_len)
+    req.num_matched_prefix_tokens = min(
+        len(req.prefix_indices) + req.host_hit_length, max_len
+    )
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
@@ -166,7 +168,7 @@ class SchedulePolicy:
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
-        # Populate req.matched_prefix_len at schedule time. Cache-aware policies
+        # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
         # set it in _compute_prefix_matches; do the same full match for
         # cache-agnostic policies when the radix supports it, so the load
         # snapshot has it. Skip on decode (never prefills).
@@ -293,7 +295,7 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
             key=lambda r: (
-                -r.matched_prefix_len
+                -r.num_matched_prefix_tokens
                 if r.rid not in temporary_deprioritized
                 else float("inf")
             )
