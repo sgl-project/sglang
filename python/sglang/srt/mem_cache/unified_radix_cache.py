@@ -2140,6 +2140,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
+                    cc.record_l1_l2_transfer_complete(
+                        direction="offload",
+                        ack=ack,
+                    )
                     for ack_id in ack.node_ids:
                         entry = self.ongoing_write_through.pop(ack_id, None)
                         if entry is not None:
