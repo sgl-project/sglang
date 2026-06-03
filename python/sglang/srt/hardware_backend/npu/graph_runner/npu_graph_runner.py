@@ -94,7 +94,6 @@ class NPUGraphRunner(CudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.forward_mode = None
         self.if_use_v2 = any(
             arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
@@ -217,7 +216,6 @@ class NPUGraphRunner(CudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
-        self.forward_mode = forward_batch.forward_mode
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
         # Replay
