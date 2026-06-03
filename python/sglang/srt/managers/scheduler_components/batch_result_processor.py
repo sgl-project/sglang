@@ -206,7 +206,7 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
-            self._move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
+            self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
 
@@ -356,7 +356,7 @@ class SchedulerBatchResultProcessor:
                 embeddings = [tensor.tolist() for tensor in embeddings]
         return embeddings
 
-    def _move_logprobs_to_cpu(
+    def move_logprobs_to_cpu(
         self,
         *,
         batch: ScheduleBatch,
@@ -828,6 +828,11 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                prepare_release = getattr(
+                    self.model_worker, "prepare_for_kv_cache_release", None
+                )
+                if callable(prepare_release):
+                    prepare_release(req)
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()

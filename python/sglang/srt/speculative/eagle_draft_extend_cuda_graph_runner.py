@@ -316,37 +316,28 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens_for_logprob] * self.dp_size,
-                    dtype=torch.int32,
-                    device=buffers.input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
-                    [num_tokens],
+                    global_num_tokens_cpu,
                     dtype=torch.int32,
                     device=buffers.input_ids.device,
                 )
             )
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [num_tokens_for_logprob],
+                    [num_tokens_for_logprob] * len(global_num_tokens_cpu),
                     dtype=torch.int32,
                     device=buffers.input_ids.device,
                 )
             )
-            global_dp_buffer_len = num_tokens
         else:
             global_dp_buffer_len = None
 
@@ -392,6 +383,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
 
@@ -423,20 +415,22 @@ class EAGLEDraftExtendCudaGraphRunner:
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend)
         ):
-            self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs=bs,
-                num_tokens=num_tokens,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                encoder_lens=None,
-                forward_mode=self.forward_mode,
-                spec_info=spec_info,
+            self.draft_extend_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=True
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
-            self._capture_init(run_once)
-            out = self._capture_graph(
-                graph, get_global_graph_memory_pool(), stream, run_once
+
+            canary_ctx = (
+                c.with_active_single_forward_manager(0)
+                if (c := self.model_runner.canary_manager) is not None
+                else contextlib.nullcontext()
             )
+            with canary_ctx:
+                self._capture_init(run_once)
+
+                out = self._capture_graph(
+                    graph, get_global_graph_memory_pool(), stream, run_once
+                )
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out
@@ -534,17 +528,24 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
-        self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
+        from types import SimpleNamespace
+
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        fb_view = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=self.forward_mode,
+            input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=forward_batch.spec_info,
+            seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=buffers.seq_lens_cpu,
+            encoder_lens=None,
+            out_cache_loc=forward_batch.out_cache_loc,
+            spec_info=forward_batch.spec_info,
         )
+        self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Replay
         self.raw_bs = raw_bs
