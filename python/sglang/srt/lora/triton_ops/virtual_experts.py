@@ -265,9 +265,22 @@ def _invoke_moe_lora_shrink_splitk(
     GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
 
     num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M)
-    num_n_blocks = triton.cdiv(N, BLOCK_SIZE_N)
+    num_n_blocks = triton.cdiv(
+        N, BLOCK_SIZE_N
+    )  # == 1, BLOCK_SIZE_N == next_pow2(N) >= N
     base_grid = num_m_blocks * num_n_blocks
-    SPLIT_K = config.get("SPLIT_K", 4)
+
+    # Rank-tiered split-K occupancy fill. The K reduction (e.g. 7168 / 256 = 28
+    # iters) dominates this skinny-N grouped GEMV, so splitting K stays useful well
+    # past full SM occupancy -- a plain `1 if base_grid >= num_sm else ...` rule
+    # collapses SPLIT_K too early and costs up to ~2x at the decode/prefill border.
+    # Skinnier ranks want more splits (their output tile carries less work). The
+    # target / tiers were picked from an offline per-M B200 sweep over
+    # E in {48,96,384}, N in {16,32,64}; this heuristic lands within ~5% of the
+    # per-shape tuned optimum across the decode regime.
+    target = 512 if N <= 16 else 384 if N <= 32 else 256
+    max_split_k = max(1, K // BLOCK_SIZE_K)
+    SPLIT_K = max(1, min(triton.cdiv(target, base_grid), max_split_k, 8))
 
     grid = (SPLIT_K * base_grid,)
 
@@ -574,29 +587,22 @@ def _merged_experts_fused_moe_lora_add_impl(
             }
         return cfg
 
-    def _get_shrink_stage_config(
-        weight: torch.Tensor,
-        stage_top_k: int,
-        M: int,
-    ) -> dict[str, Any]:
-        """Config for the LoRA A (shrink) stage.
+    def _get_shrink_stage_config(weight: torch.Tensor, M: int) -> dict[str, Any]:
+        """Heuristic launch config for the LoRA A (shrink) stage.
 
-        Prefers an auto-tuned config (keyed by rank N, hidden K, token count M)
-        produced by benchmark/kernels/lora_moe_shrink/tune_lora_moe_shrink.py.
-        Falls back to the shared heuristic when no tuned config is available.
+        Only BLOCK_SIZE_M / num_warps / num_stages are chosen here (a simple
+        decode/prefill rule). SPLIT_K is intentionally NOT set: the launcher
+        derives it from the post-alignment grid, see _invoke_moe_lora_shrink_splitk.
+        M is the number of input tokens; N (= weight.shape[1]) is the LoRA rank.
         """
-        from sglang.srt.lora.triton_ops.moe_lora_shrink_config import (
-            get_moe_lora_shrink_config,
-        )
-
-        # weight: [num_virtual_experts, N(=rank), K(=hidden)]
-        E = weight.shape[0]
         N = weight.shape[1]
-        K = weight.shape[2]
-        tuned = get_moe_lora_shrink_config(E, N, K, M)
-        if tuned is not None:
-            return tuned
-        return _get_stage_config(weight, stage_top_k)
+        if M < 512:  # decode / small batch: pin a small block, latency-bound
+            return {
+                "BLOCK_SIZE_M": 16,
+                "num_warps": 4 if (M <= 4 or N >= 32) else 2,
+                "num_stages": 3,
+            }
+        return {"BLOCK_SIZE_M": 32, "num_warps": 2, "num_stages": 2}  # prefill
 
     def _align_block_size(
         topk_ids: torch.Tensor,
@@ -676,7 +682,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     )
 
     a_stage_config = _get_shrink_stage_config(
-        lora_a_virtual, input_top_k, token_lora_mapping.shape[0]
+        lora_a_virtual, token_lora_mapping.shape[0]
     )
     (
         sorted_token_ids,
