@@ -45,7 +45,6 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -978,6 +977,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
+        # Local import: a module-level cp_utils import here is circular (#27014).
+        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -990,11 +992,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
-        # make sure that each rank has the same number of tokens to do collective communication and
-        # we can divide the tokens into 2 * CP chunks for load balance.
-        attn_cp_size = get_attention_cp_size()
+        # make sure that each rank has the same number of tokens to do collective communication.
+        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
+        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
+        # prefill with NaN draft logits, see #23269).
+        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
+        cp_align_size = get_cp_padding_align_size()
         for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size * 2)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
