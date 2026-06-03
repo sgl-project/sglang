@@ -585,6 +585,11 @@ def pre_permute_standard_to_deep_gemm(
     topk_weights, topk_ids = topk_weights, topk_ids
 
     # PreReorder
+    output_dtype = (
+        torch.bfloat16
+        if quant_info.w13_weight.dtype == torch.bfloat16
+        else torch.float8_e4m3fn
+    )
     masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
         moe_ep_deepgemm_preprocess(
             topk_ids,
@@ -592,6 +597,7 @@ def pre_permute_standard_to_deep_gemm(
             hidden_states,
             runner_config.top_k,
             quant_info.block_shape,
+            output_dtype=output_dtype,
         )
     )
 

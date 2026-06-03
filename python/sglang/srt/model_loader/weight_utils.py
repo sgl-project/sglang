@@ -685,7 +685,13 @@ def maybe_add_mtp_safetensors(
         getattr(hf_config, "num_nextn_predict_layers", 0),
     )
     if not (
-        arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
+        arch
+        in [
+            "Glm4MoeForCausalLM",
+            "Glm4MoeForCausalLMNextN",
+            "Glm4MoeLiteForCausalLM",
+            "Glm4MoeLiteForCausalLMNextN",
+        ]
         and num_nextn_layers > 0
     ):
         return hf_weights_files
