@@ -981,10 +981,36 @@ class DeepseekV4AttnBackend(
         if current_raw is not None:
             self.forward_metadata = current_raw
 
+    def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Resolve the SWA KV-store write target for the current forward.
+
+        Fast path: the per-forward value cached by init_forward_metadata_in_graph
+        (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
+        translate at store time, matching the pre-cache behavior, for paths that
+        never run the in-graph init — eager idle (forward_idle skips attn init),
+        runners that only run the out-graph prep (e.g.
+        EAGLEDraftExtendCudaGraphRunner) — or whose batch was re-padded after
+        init (shape mismatch). Idle always falls back: its metadata is absent or
+        left over from a previous forward, and translating the zero-padded
+        out_cache_loc writes to the dummy slot.
+        """
+        out_cache_loc = forward_batch.out_cache_loc
+        core = getattr(self.forward_metadata, "core_attn_metadata", None)
+        cached = core.swa_out_cache_loc if core is not None else None
+        if (
+            cached is not None
+            and not forward_batch.forward_mode.is_idle()
+            and cached.shape[0] == out_cache_loc.shape[0]
+        ):
+            return cached
+        return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+            torch.int32
+        )
+
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
-        swa_loc = self.forward_metadata.core_attn_metadata.swa_out_cache_loc
+        swa_loc = self.get_swa_out_cache_loc(forward_batch)
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
