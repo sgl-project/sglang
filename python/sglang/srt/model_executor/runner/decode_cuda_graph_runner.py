@@ -72,6 +72,10 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    CudaGraphBufferRegistry,
+    build_decode_registry,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -323,6 +327,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
         )
         self.buffers.share_buffers()
+        # FB-shared slot registry adopting DecodeInputBuffers storage (same
+        # physical tensors, stable data_ptr for capture vs replay). Provides
+        # the unified fill_from / slot access surface, replacing
+        # populate_from_forward_batch on capture/replay paths.
+        self.buffer_registry: CudaGraphBufferRegistry = build_decode_registry(
+            device=self.device,
+            max_bs=self.max_bs,
+            max_num_token=self.max_num_token,
+            seq_len_fill_value=self.seq_len_fill_value,
+            cache_loc_dtype=self._cache_loc_dtype(),
+            enable_mamba_track=enable_mamba_track,
+            is_encoder_decoder=self.is_encoder_decoder,
+            encoder_len_fill_value=self.encoder_len_fill_value,
+            enable_num_token_non_padded=enable_num_token_non_padded(),
+            require_gathered_buffer=self.require_gathered_buffer,
+            enable_prefill_cp=self.enable_prefill_cp,
+            require_mlp_tp_gather=self.require_mlp_tp_gather,
+            dp_size=self.dp_size,
+            source=self.buffers,
+        )
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -476,18 +500,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         buffers: DecodeInputBuffers = self.buffers
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
-        req_pool_indices = buffers.req_pool_indices[:bs]
-        seq_lens = buffers.seq_lens[:bs]
-        seq_lens_cpu = buffers.seq_lens_cpu[:bs]
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
-        positions = buffers.positions[:num_tokens]
-        if self.is_encoder_decoder:
-            encoder_lens = buffers.encoder_lens[:bs]
-        else:
-            encoder_lens = None
-        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        # Registry-owned FB-shared slots come through the registry (which
+        # shares physical storage with self.buffers via source=...); the rest
+        # still come off buffers directly.
+        registry = self.buffer_registry
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
+        input_ids = _slot("input_ids")
+        req_pool_indices = _slot("req_pool_indices")
+        seq_lens = _slot("seq_lens")
+        seq_lens_cpu = _slot("seq_lens_cpu")
+        out_cache_loc = _slot("out_cache_loc")
+        positions = _slot("positions")
+        encoder_lens = (
+            _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
+        )
+        mrope_positions = _slot("mrope_positions")
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
@@ -543,14 +573,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             lora_ids = None
 
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
 
         if stream_idx is None:
@@ -838,18 +866,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
-        buffers.populate_from_forward_batch(
-            forward_batch=forward_batch,
+        self.buffer_registry.fill_from(
+            forward_batch,
             raw_bs=raw_bs,
-            raw_num_token=raw_num_token,
-            bs=bs,
-            seq_len_fill_value=self.seq_len_fill_value,
-            require_gathered_buffer=self.require_gathered_buffer,
-            num_tokens_per_bs=self.num_tokens_per_bs,
-            # Parameter name retained for API stability; semantically this is
-            # "any prefill-CP flavor enabled" (DSA CP or MLA CP).
-            dsa_enable_prefill_cp=self.enable_prefill_cp,
-            enable_num_token_non_padded_flag=enable_num_token_non_padded(),
+            padded_bs=bs,
+            raw_num_tokens=raw_num_token,
+            padded_num_tokens=bs * self.num_tokens_per_bs,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 

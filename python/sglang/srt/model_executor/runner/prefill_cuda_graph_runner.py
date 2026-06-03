@@ -49,6 +49,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    CudaGraphBufferRegistry,
+    build_prefill_registry,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
@@ -141,6 +145,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             enable_mamba_track=self.mamba_track_enabled,
         )
         self.buffers.share_buffers()
+        # Token-axis FB-shared slot registry adopting PrefillInputBuffers
+        # storage; same physical tensors, stable data_ptr for capture vs
+        # replay. Replaces populate_from_forward_batch on capture/replay paths.
+        self.buffer_registry: CudaGraphBufferRegistry = build_prefill_registry(
+            device=self.device,
+            max_bs=self.max_bs,
+            max_num_token=self.max_num_tokens,
+            cache_loc_dtype=self._cache_loc_dtype(),
+            is_multimodal=self.is_multimodal,
+            hidden_size=self.model_runner.model_config.hidden_size,
+            embed_dtype=self.model_runner.dtype,
+            enable_mamba_track=self.mamba_track_enabled,
+            source=self.buffers,
+        )
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
@@ -282,34 +300,39 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             for name in _PREFILL_STATIC_FIELDS:
                 shape_inputs[name] = s[name][:bs]
 
+        registry = self.buffer_registry
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
-                input_ids=buffers.input_ids[:num_tokens],
+                input_ids=_slot("input_ids"),
                 input_embeds=(
-                    buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+                    _slot("input_embeds") if registry.has_slot("input_embeds") else None
                 ),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=None,
                 orig_seq_lens=shape_inputs["orig_seq_lens"],
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                out_cache_loc=buffers.out_cache_loc[:num_tokens],
+                out_cache_loc=_slot("out_cache_loc"),
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=(
-                    buffers.mamba_track_indices[:bs]
-                    if buffers.mamba_track_indices is not None
+                    _slot("mamba_track_indices")
+                    if registry.has_slot("mamba_track_indices")
                     else None
                 ),
                 mamba_track_mask=(
-                    buffers.mamba_track_mask[:bs]
-                    if buffers.mamba_track_mask is not None
+                    _slot("mamba_track_mask")
+                    if registry.has_slot("mamba_track_mask")
                     else None
                 ),
                 mamba_track_seqlens=(
-                    buffers.mamba_track_seqlens[:bs]
-                    if buffers.mamba_track_seqlens is not None
+                    _slot("mamba_track_seqlens")
+                    if registry.has_slot("mamba_track_seqlens")
                     else None
                 ),
                 encoder_lens=None,
@@ -321,14 +344,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                positions=buffers.positions[:num_tokens],
+                positions=_slot("positions"),
                 global_num_tokens_gpu=None,
                 global_num_tokens_for_logprob_gpu=None,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
                 mrope_positions=(
-                    buffers.mrope_positions[:, :num_tokens]
-                    if self.is_multimodal
+                    _slot("mrope_positions")
+                    if registry.has_slot("mrope_positions")
                     else None
                 ),
                 spec_algorithm=None,
@@ -415,38 +438,43 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         bs = forward_batch.batch_size
 
-        buffers.populate_from_forward_batch(
-            forward_batch=forward_batch,
+        self.buffer_registry.fill_from(
+            forward_batch,
+            raw_bs=bs,
+            padded_bs=bs,
             raw_num_tokens=num_tokens,
-            static_num_tokens=static_num_tokens,
-            is_multimodal=self.is_multimodal,
+            padded_num_tokens=static_num_tokens,
         )
 
+        registry = self.buffer_registry
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, static_num_tokens)
+
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
         mamba_track_seqlens = (
-            buffers.mamba_track_seqlens[:bs]
-            if buffers.mamba_track_seqlens is not None
+            _slot("mamba_track_seqlens")
+            if registry.has_slot("mamba_track_seqlens")
             else None
         )
 
-        input_ids = buffers.input_ids[:static_num_tokens]
+        input_ids = _slot("input_ids")
         input_embeds = (
-            buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
-        positions = buffers.positions[:static_num_tokens]
-        out_cache_loc = buffers.out_cache_loc[:static_num_tokens]
+        positions = _slot("positions")
+        out_cache_loc = _slot("out_cache_loc")
         mrope_positions = (
-            buffers.mrope_positions[:, :static_num_tokens]
-            if forward_batch.mrope_positions is not None
+            _slot("mrope_positions")
+            if registry.has_slot("mrope_positions")
+            and forward_batch.mrope_positions is not None
             else None
         )
 
