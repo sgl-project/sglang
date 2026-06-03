@@ -594,7 +594,6 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            prefetch_tokens = kw.get("prefetch_tokens", 0)
             num_pages = min(
                 prefetch_tokens // self.cache.page_size,
                 (self.sliding_window_size + self.cache.page_size - 1)
@@ -659,7 +658,12 @@ class SWAComponent(TreeComponent):
             return
 
         if phase == CacheTransferPhase.PREFETCH:
-            self._commit_prefetch(node, transfers, **kw)
+            self._commit_prefetch(
+                node,
+                transfers,
+                insert_result=insert_result,
+                pool_storage_result=pool_storage_result,
+            )
             return
 
     def _release_swa_host(self, host_indices: torch.Tensor) -> None:
@@ -682,7 +686,14 @@ class SWAComponent(TreeComponent):
         if node.parent:
             self.cache._update_evictable_leaf_sets(node.parent)
 
-    def _commit_prefetch(self, anchor, transfers: list[PoolTransfer], **kw) -> None:
+    def _commit_prefetch(
+        self,
+        anchor,
+        transfers: list[PoolTransfer],
+        *,
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
+    ) -> None:
         """Distribute the prefetched SWA buffer onto the leaf→anchor path.
 
         The buffer holds the trailing ``loaded_pages`` of the completed KV
@@ -698,8 +709,6 @@ class SWAComponent(TreeComponent):
             return
         ct = self.component_type
         host_indices = transfers[0].host_indices
-        insert_result = kw.get("insert_result")
-        pool_storage_result = kw.get("pool_storage_result")
         loaded_pages = (
             pool_storage_result.extra_pool_hit_pages.get(PoolName.SWA, 0)
             if pool_storage_result
