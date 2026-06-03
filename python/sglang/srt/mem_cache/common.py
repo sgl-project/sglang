@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_hip, support_triton
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 _is_hip = is_hip()
 
@@ -32,6 +32,19 @@ if TYPE_CHECKING:
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
+
+# Pre-allocated scalar for -1 on GPU. Avoids HtoD transfer and avoids the
+# cuda-context allocation a pinned host tensor would force on GPU 0.
+_neg_one_gpu_cache: dict[torch.device, torch.Tensor] = {}
+
+
+def _neg_one_on(device: torch.device) -> torch.Tensor:
+    t = _neg_one_gpu_cache.get(device)
+    if t is None:
+        t = torch.full((), -1, dtype=torch.int64, device=device)
+        _neg_one_gpu_cache[device] = t
+    return t
+
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +86,12 @@ def write_cache_indices(
     req_to_token_pool: ReqToTokenPool,
 ):
     if support_triton(get_global_server_args().attention_backend):
+        _pin = is_pin_memory_available(req_to_token_pool.device)
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
-            device=req_to_token_pool.device,
             dtype=torch.uint64,
-        )
+            pin_memory=_pin,
+        ).to(req_to_token_pool.device, non_blocking=_pin)
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
             req_to_token_pool.req_to_token,
@@ -311,17 +325,28 @@ def alloc_for_extend(
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
-            for t in prefix_tensors
-        ]
+        if prefix_tensors:
+            # All ops on GPU; no CPU-GPU sync, no scalar tensor creation.
+            nonempty = [t for t in prefix_tensors if len(t) > 0]
+            if nonempty:
+                cat_prefix = torch.cat(nonempty)
+                ends = prefix_lens_device.cumsum(0) - 1
+                ends.clamp_(min=0)
+                last_loc = cat_prefix[ends]
+                last_loc = torch.where(
+                    prefix_lens_device > 0, last_loc, _neg_one_on(batch.device)
+                )
+            else:
+                last_loc = _neg_one_on(batch.device).expand(len(prefix_tensors))
+        else:
+            last_loc = torch.empty(0, dtype=torch.int64, device=batch.device)
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens=batch.seq_lens,
             seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
+            last_loc=last_loc,
             extend_num_tokens=batch.extend_num_tokens,
         )
 
