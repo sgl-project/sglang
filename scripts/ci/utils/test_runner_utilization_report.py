@@ -362,6 +362,79 @@ class TestChartBuilders(unittest.TestCase):
         self.assertEqual(rur.build_queue_timeline({}, CREATED, NOW), ([], []))
         self.assertEqual(rur.build_load_buckets({}, CREATED, NOW), ([], []))
 
+    def test_load_buckets_hybrid_includes_high_util_low_peak_pool(self):
+        """The motivating case: a pool with only 1 runner serving 1 job
+        the entire window (peak running+queued = 1) is invisible under
+        pure peak-ranking but has 100% utilization. With the hybrid it
+        must appear alongside the high-peak pools."""
+        ws = NOW - timedelta(hours=8)
+        lj = {}
+        # 8 noisy pools each peaking at 5 concurrent jobs in one bucket.
+        # Without the hybrid these claim the top 8 slots.
+        for i in range(8):
+            jobs = []
+            for _ in range(5):
+                start = ws + timedelta(hours=2)
+                end = ws + timedelta(hours=2, minutes=30)
+                jobs.append(self._info(start, start, start=start, end=end))
+            lj[f"noisy-{i}"] = jobs
+        # One "8-gpu-b200-like" pool: a single job pinning a single
+        # runner for the whole window -> peak = 1, util = 100%.
+        start = ws
+        end = NOW
+        lj["small-saturated"] = [self._info(start, start, start=start, end=end)]
+
+        util = {f"noisy-{i}": 10.0 for i in range(8)}
+        util["small-saturated"] = 100.0
+
+        _, pools_no_util = rur.build_load_buckets(lj, ws, NOW, max_pools=8)
+        names_no_util = [lbl for lbl, _, _ in pools_no_util]
+        self.assertNotIn("small-saturated", names_no_util)  # legacy: cut
+
+        _, pools_hybrid = rur.build_load_buckets(
+            lj, ws, NOW, max_pools=8, utilization_by_label=util, max_total=12
+        )
+        names_hybrid = [lbl for lbl, _, _ in pools_hybrid]
+        self.assertIn("small-saturated", names_hybrid)  # hybrid: surfaced
+        self.assertLessEqual(len(names_hybrid), 12)
+
+    def test_load_buckets_hybrid_peak_first_then_util_only(self):
+        """Display order: pools that won by peak come first, then any
+        pools only added via utilization. Within each group the order
+        mirrors the rank that included them."""
+        ws = NOW - timedelta(hours=4)
+        lj = {
+            "peaky-A": [
+                self._info(
+                    ws,
+                    ws,
+                    start=ws + timedelta(hours=1),
+                    end=ws + timedelta(hours=2),
+                )
+            ]
+            * 10,  # peak ~10
+            "peaky-B": [
+                self._info(
+                    ws,
+                    ws,
+                    start=ws + timedelta(hours=1),
+                    end=ws + timedelta(hours=2),
+                )
+            ]
+            * 5,  # peak ~5
+            "util-only": [
+                self._info(ws, ws, start=ws, end=NOW)
+            ],  # peak 1 but 100% util
+        }
+        util = {"peaky-A": 30.0, "peaky-B": 20.0, "util-only": 100.0}
+        _, pools = rur.build_load_buckets(
+            lj, ws, NOW, max_pools=2, utilization_by_label=util, max_total=12
+        )
+        names = [lbl for lbl, _, _ in pools]
+        # peaky-A, peaky-B by peak (top 2). util-only added via util.
+        self.assertEqual(names[:2], ["peaky-A", "peaky-B"])
+        self.assertIn("util-only", names[2:])
+
 
 if __name__ == "__main__":
     unittest.main()

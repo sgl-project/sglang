@@ -683,7 +683,16 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     # links + status section of the report.
     longest_waits = sorted(all_job_infos, key=lambda j: j["queue_time"], reverse=True)
     queue_timeline = build_queue_timeline(label_jobs, window_start, window_end)
-    load_buckets = build_load_buckets(label_jobs, window_start, window_end)
+    # Hand utilization to build_load_buckets so it can include
+    # small-but-saturated pools (e.g. 8-gpu-b200 at 89.5% util on a
+    # single runner) that the peak-demand ranking alone would demote.
+    utilization_by_label = {r["label"]: r["utilization_pct"] for r in results}
+    load_buckets = build_load_buckets(
+        label_jobs,
+        window_start,
+        window_end,
+        utilization_by_label=utilization_by_label,
+    )
     return (
         results,
         fetch_failure_pct,
@@ -763,20 +772,36 @@ def build_queue_timeline(label_jobs, window_start, window_end, max_series=8):
     return sample_labels, [(lbl, vals) for lbl, vals, _ in series[:max_series]]
 
 
-def build_load_buckets(label_jobs, window_start, window_end, max_pools=8):
+def build_load_buckets(
+    label_jobs,
+    window_start,
+    window_end,
+    max_pools=8,
+    *,
+    utilization_by_label=None,
+    max_total=12,
+):
     """Per runner pool, count jobs running and queued during each hourly bucket.
 
     A job is *running* in a bucket if its [start, end] interval overlaps it, and
     *queued* if its waiting interval [created_at, queue_end] overlaps it.
-    Returns (bucket_labels, [(pool, running[], queued[]), ...]) for the busiest
-    pools (by peak running+queued), capped at max_pools.
+    Returns (bucket_labels, [(pool, running[], queued[]), ...]) for the
+    pools selected by the ranking below.
 
-    `max_pools` defaults to 8 to match `build_queue_timeline`'s
-    `max_series=8` so both charts cover the same pool set -- otherwise a
-    pool with sustained-but-flat demand (e.g. 8-gpu-h200 at 85% util, 5
-    peak concurrent, 49 peak queue) appears in the Queue Wait Over Time
-    chart legend but is silently absent from the per-pool Running vs
-    Queued sub-charts, which is confusing.
+    Selection:
+      - When `utilization_by_label` is None: top `max_pools` by peak
+        (running+queued). This is the legacy behavior.
+      - When given: union of (top `max_pools` by peak) and (top
+        `max_pools` by utilization%), de-duplicated and capped at
+        `max_total`. Peak-ranked pools come first so the visual order
+        matches the queue chart; utilization-ranked additions follow.
+
+    Why the hybrid: ranking purely by peak (running+queued) demotes
+    small-but-saturated pools. e.g. 8-gpu-b200 has 1 runner busy 89.5%
+    of the window but peak running+queued is ~7, putting it around
+    15th place. With the hybrid it lands via its 94% utilization
+    instead. `max_pools=8` matches `build_queue_timeline`'s
+    `max_series=8` so both charts cover the same primary pool set.
     """
     total = (window_end - window_start).total_seconds()
     if total <= 0 or not label_jobs:
@@ -804,8 +829,29 @@ def build_load_buckets(label_jobs, window_start, window_end, max_pools=8):
         peak = max((r + q for r, q in zip(running, queued)), default=0)
         if peak > 0:
             out.append((label, running, queued, peak))
-    out.sort(key=lambda x: x[3], reverse=True)
-    return bucket_labels, [(lbl, r, q) for lbl, r, q, _ in out[:max_pools]]
+
+    by_peak = sorted(out, key=lambda x: x[3], reverse=True)
+    peak_top = [x[0] for x in by_peak[:max_pools]]
+
+    if utilization_by_label is None:
+        selected = peak_top
+    else:
+        # Restrict utilization ranking to pools that had nonzero
+        # peak (running+queued) data this window -- a pool with high
+        # historical utilization but no observed activity in this
+        # window has nothing to plot.
+        candidates = {x[0] for x in out}
+        util_top = sorted(
+            (lbl for lbl in candidates if utilization_by_label.get(lbl, 0) > 0),
+            key=lambda lbl: utilization_by_label[lbl],
+            reverse=True,
+        )[:max_pools]
+        # dict.fromkeys preserves first-seen order: peak-rank first,
+        # utilization-only additions after, then cap at max_total.
+        selected = list(dict.fromkeys(peak_top + util_top))[:max_total]
+
+    by_label = {label: (label, r, q) for label, r, q, _ in out}
+    return bucket_labels, [by_label[lbl] for lbl in selected if lbl in by_label]
 
 
 def format_report(
