@@ -643,15 +643,16 @@ def validate_dflash_request(req: Req) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 
-    if (
+    has_grammar_constraint = (
         req.sampling_params.json_schema is not None
         or req.sampling_params.regex is not None
         or req.sampling_params.ebnf is not None
         or req.sampling_params.structural_tag is not None
-    ):
+    )
+    if has_grammar_constraint and req.sampling_params.top_k > 1:
         return (
             "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
+            "non-greedy grammar-constrained decoding yet."
         )
 
     return None

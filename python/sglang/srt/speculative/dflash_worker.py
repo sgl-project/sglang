@@ -528,10 +528,6 @@ class DFlashWorker:
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
 
-        if batch.has_grammar:
-            raise RuntimeError(
-                "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
-            )
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
             if (
                 not is_dflash_sampling_verify_available()

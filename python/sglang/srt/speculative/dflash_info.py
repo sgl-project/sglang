@@ -24,6 +24,72 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
 
+def _is_token_allowed_by_bitmask(
+    bitmask_row: torch.Tensor, token_id: int, vocab_size: int
+) -> bool:
+    if token_id < 0 or token_id >= vocab_size:
+        return False
+    return (int(bitmask_row[token_id // 32].item()) & (1 << (token_id % 32))) != 0
+
+
+def _build_linear_grammar_vocab_mask(
+    *,
+    batch: ScheduleBatch,
+    candidates_cpu: torch.Tensor,
+    vocab_size: int,
+) -> tuple[torch.Tensor | None, object | None]:
+    """Build per-position grammar masks for a linear DFlash verify block.
+
+    DFlash verifies a chain rather than a tree. Row `t` of each request masks the
+    target logits for the next-token distribution after accepting draft tokens
+    `1..t` from the same chain. If a draft token is invalid under the grammar, all
+    later rows are unreachable for acceptance and can remain unfilled.
+    """
+
+    bs, draft_token_num = candidates_cpu.shape
+    allocate_token_bitmask = None
+    apply_grammar = None
+
+    for i, req in enumerate(batch.reqs):
+        grammar = req.grammar
+        if grammar is None:
+            continue
+
+        if allocate_token_bitmask is None:
+            allocate_token_bitmask = grammar.allocate_vocab_mask(
+                vocab_size=vocab_size,
+                batch_size=bs * draft_token_num,
+                device="cpu",
+            )
+        if apply_grammar is None:
+            apply_grammar = grammar
+
+        req_mask = allocate_token_bitmask[
+            i * draft_token_num : (i + 1) * draft_token_num
+        ]
+        accepted_for_mask = 0
+        try:
+            for t in range(draft_token_num):
+                if grammar.is_terminated():
+                    break
+
+                grammar.fill_vocab_mask(req_mask, t)
+                if t == draft_token_num - 1:
+                    break
+
+                token_id = int(candidates_cpu[i, t + 1].item())
+                if not _is_token_allowed_by_bitmask(req_mask[t], token_id, vocab_size):
+                    break
+
+                grammar.accept_token(token_id)
+                accepted_for_mask += 1
+        finally:
+            if accepted_for_mask > 0:
+                grammar.rollback(accepted_for_mask)
+
+    return allocate_token_bitmask, apply_grammar
+
+
 def _compute_paged_keep_slots(
     *,
     prefix_lens: torch.Tensor,
@@ -333,13 +399,38 @@ class DFlashVerifyInput(SpecInput):
         device = logits_output.next_token_logits.device
 
         sampling_info = batch.sampling_info
-        if sampling_info is not None:
-            if len(sampling_info) != bs:
+        if sampling_info is not None and len(sampling_info) != bs:
+            raise RuntimeError(
+                "DFLASH verify sampling_info size mismatch: "
+                f"len(sampling_info)={len(sampling_info)}, bs={bs}."
+            )
+
+        candidates = self.draft_token.view(bs, self.draft_token_num)
+        vocab_mask = None
+        apply_grammar = None
+        if batch.has_grammar:
+            if sampling_info is not None and not sampling_info.is_all_greedy:
                 raise RuntimeError(
-                    "DFLASH verify sampling_info size mismatch: "
-                    f"len(sampling_info)={len(sampling_info)}, bs={bs}."
+                    "DFLASH grammar-constrained verification currently supports "
+                    "greedy requests only."
                 )
 
+            vocab_size = (
+                sampling_info.vocab_size
+                if sampling_info is not None
+                else logits_output.next_token_logits.shape[-1]
+            )
+            vocab_mask, apply_grammar = _build_linear_grammar_vocab_mask(
+                batch=batch,
+                candidates_cpu=candidates.cpu(),
+                vocab_size=int(vocab_size),
+            )
+            if sampling_info is not None and vocab_mask is not None:
+                # The normal one-step grammar mask is for the current prefix only.
+                # DFlash verify needs a different mask for each block position.
+                sampling_info.vocab_mask = None
+
+        if sampling_info is not None:
             # Keep speculative verify semantics consistent with normal sampling path.
             if sampling_info.has_custom_logit_processor:
                 apply_custom_logit_processor(
@@ -362,7 +453,13 @@ class DFlashVerifyInput(SpecInput):
                     torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
                 )
 
-        candidates = self.draft_token.view(bs, self.draft_token_num)
+        if vocab_mask is not None:
+            assert apply_grammar is not None
+            vocab_mask = vocab_mask.to(device)
+            apply_grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
+            )
+
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
