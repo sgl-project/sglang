@@ -1486,9 +1486,10 @@ class DeepseekSparseAttnBackend(
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
+            # flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
-            )
+            ).to(torch.int32)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
