@@ -25,8 +25,10 @@ def _resolve_speculative_algorithm_alias(
         cfg = get_config(
             speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
         )
-        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
-            getattr(cfg, "architectures", None) or []
+        draft_archs = getattr(cfg, "architectures", None) or []
+        is_gemma4_draft = any(
+            arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
+            for arch in draft_archs
         )
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:

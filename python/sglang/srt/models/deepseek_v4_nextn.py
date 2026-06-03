@@ -258,7 +258,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
+                    core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
