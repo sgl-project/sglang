@@ -52,68 +52,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-_CPU_COMPILE_FALLBACK_OPS = (
-    "act_quant_cpu",
-    "apply_rotary_emb_interleaved_cpu",
-    "biased_grouped_topk_cpu",
-    "biased_topk_cpu",
-    "bmm_cpu",
-    "causal_conv1d_fwd_cpu",
-    "causal_conv1d_update_cpu",
-    "chunk_gated_delta_rule_cpu",
-    "compress_decode_cpu",
-    "decode_attention_cpu",
-    "extend_attention_cpu",
-    "fast_hadamard_transform_cpu",
-    "flash_mla_with_kvcache_cpu",
-    "fp8_paged_mqa_logits_cpu",
-    "fp8_scaled_mm_cpu",
-    "fused_add_layernorm_cpu",
-    "fused_add_rmsnorm_cpu",
-    "fused_experts_cpu",
-    "fused_gdn_gating_cpu",
-    "fused_linear_sigmoid_mul",
-    "fused_qkvzba_split_reshape_cat_contiguous_cpu",
-    "fused_qkvzba_split_reshape_cat_cpu",
-    "fused_rmsnorm_gated_cpu",
-    "fused_scale_cpu",
-    "fused_sigmoid_gating_delta_rule_update_cpu",
-    "gemma3_rmsnorm_cpu",
-    "gemma4_rmsnorm_cpu",
-    "gemma_fused_add_rmsnorm_cpu",
-    "gemma_rmsnorm_cpu",
-    "grouped_topk_cpu",
-    "hash_topk_cpu",
-    "hc_head_fused_cpu",
-    "hc_post_fused_cpu",
-    "hc_pre_fused_cpu",
-    "int8_scaled_mm_cpu",
-    "int8_scaled_mm_with_quant",
-    "l2norm_cpu",
-    "layernorm_cpu",
-    "multimodal_rotary_embedding_cpu",
-    "per_token_quant_int8_cpu",
-    "qkv_proj_with_rope",
-    "qkv_proj_with_rope_fused_weight",
-    "quant_to_nope_fp8_rope_bf16_pack_cpu",
-    "rmsnorm_cpu",
-    "rotary_embedding_cpu",
-    "set_k_and_s_cpu",
-    "set_k_cpu",
-    "set_s_cpu",
-    "shared_expert_cpu",
-    "shm_allgather",
-    "shm_allreduce",
-    "silu_and_mul_cpu",
-    "gelu_tanh_and_mul_cpu",
-    "gelu_and_mul_cpu",
-    "topk_sigmoid_cpu",
-    "topk_softmax_cpu",
-    "topk_transform_512_cpu",
-    "weight_packed_linear",
-)
-
-
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
@@ -155,19 +93,6 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def register_inductor_fallback_ops():
-    from torch._inductor.lowering import lowerings, make_fallback
-
-    sgl_kernel_ops = torch.ops.sgl_kernel
-    for op_name in _CPU_COMPILE_FALLBACK_OPS:
-        try:
-            op = getattr(getattr(sgl_kernel_ops, op_name), "default")
-        except AttributeError:
-            continue
-        if op not in lowerings:
-            make_fallback(op, warn=False)
-
-
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # torch compile speeds up decoding by reducing python overhead on CPU
     server_args = model_runner.server_args
@@ -184,7 +109,28 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     return capture_bs
 
 
-def register_fake_ops():
+_CPU_COMPILE_FAKE_OPS: set[str] = set()
+
+
+def register_cpu_compile_fake(op_name: str):
+    _CPU_COMPILE_FAKE_OPS.add(op_name)
+    return torch.library.register_fake(f"sgl_kernel::{op_name}")
+
+
+def register_inductor_fallback_ops():
+    from torch._inductor.lowering import lowerings, make_fallback
+
+    sgl_kernel_ops = torch.ops.sgl_kernel
+    for op_name in sorted(_CPU_COMPILE_FAKE_OPS):
+        try:
+            op = getattr(getattr(sgl_kernel_ops, op_name), "default")
+        except AttributeError:
+            continue
+        if op not in lowerings:
+            make_fallback(op, warn=False)
+
+
+def register_fake_ops(tp_size: int):
     """
     Registers fake/meta implementations for all custom sgl_kernel CPU operators
     using torch.library.register_fake to support torch.compile
@@ -207,7 +153,7 @@ def register_fake_ops():
     ]
     for op in none_return_ops:
 
-        @torch.library.register_fake(f"sgl_kernel::{op}")
+        @register_cpu_compile_fake(op)
         def _(*args, **kwargs):
             return
 
@@ -224,11 +170,15 @@ def register_fake_ops():
         "gemma4_rmsnorm_cpu",
     ]:
 
-        @torch.library.register_fake(f"sgl_kernel::{op}")
+        @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
 
-    @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope")
+    @register_cpu_compile_fake("shm_allgather")
+    def _(data, dim):
+        return torch.cat([data] * tp_size, dim=dim)
+
+    @register_cpu_compile_fake("qkv_proj_with_rope")
     def _(
         hidden_states,
         q_a_proj_weight,
@@ -269,18 +219,18 @@ def register_fake_ops():
         v_input = k_input.narrow(-1, 0, kv_lora_rank)
         return q_input, k_input, v_input
 
-    @torch.library.register_fake("sgl_kernel::rotary_embedding_cpu")
+    @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
         if query.ndim == 2:
             return query, key
         else:
             return torch.empty_like(query), torch.empty_like(key)
 
-    @torch.library.register_fake("sgl_kernel::fast_hadamard_transform_cpu")
+    @register_cpu_compile_fake("fast_hadamard_transform_cpu")
     def _(x, scale):
         return torch.empty_like(x)
 
-    @torch.library.register_fake("sgl_kernel::multimodal_rotary_embedding_cpu")
+    @register_cpu_compile_fake("multimodal_rotary_embedding_cpu")
     def _(
         positions,
         query,
@@ -293,7 +243,7 @@ def register_fake_ops():
     ):
         return query, key
 
-    @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope_fused_weight")
+    @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
     def _(
         hidden_states,
         q_a_proj_weight,
@@ -347,14 +297,14 @@ def register_fake_ops():
             return mat2.shape[1]
         return mat2.shape[0]
 
-    @torch.library.register_fake("sgl_kernel::weight_packed_linear")
+    @register_cpu_compile_fake("weight_packed_linear")
     def _(mat1, mat2, bias, is_vnni, out_dtype=None):
         M = mat1.shape[0]
         N = get_n_size(mat2, is_vnni)
         dtype = out_dtype if out_dtype is not None else mat1.dtype
         return mat1.new_empty(M, N, dtype=dtype)
 
-    @torch.library.register_fake("sgl_kernel::per_token_quant_int8_cpu")
+    @register_cpu_compile_fake("per_token_quant_int8_cpu")
     def _(input):
         M = input.shape[0]
         K = input.shape[1]
@@ -362,14 +312,14 @@ def register_fake_ops():
         As = input.new_empty(M, dtype=torch.float32)
         return Aq, As
 
-    @torch.library.register_fake("sgl_kernel::int8_scaled_mm_cpu")
+    @register_cpu_compile_fake("int8_scaled_mm_cpu")
     def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):
         M = mat1.shape[0]
         N = mat2.shape[0]
         out = mat1.new_empty(M, N, dtype=out_dtype)
         return out
 
-    @torch.library.register_fake("sgl_kernel::grouped_topk_cpu")
+    @register_cpu_compile_fake("grouped_topk_cpu")
     def _(
         hidden_states,
         gating_output,
@@ -388,7 +338,7 @@ def register_fake_ops():
         topk_ids = torch.empty(shape, device=device, dtype=torch.int)
         return topk_weights, topk_ids
 
-    @torch.library.register_fake("sgl_kernel::biased_grouped_topk_cpu")
+    @register_cpu_compile_fake("biased_grouped_topk_cpu")
     def _(
         hidden_states,
         gating_output,
@@ -408,7 +358,7 @@ def register_fake_ops():
         topk_ids = torch.empty(shape, device=device, dtype=torch.int)
         return topk_weights, topk_ids
 
-    @torch.library.register_fake("sgl_kernel::topk_sigmoid_cpu")
+    @register_cpu_compile_fake("topk_sigmoid_cpu")
     def _(hidden_states, gating_output, topk, renormalize):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
@@ -417,7 +367,7 @@ def register_fake_ops():
             torch.empty(shape, device=hidden_states.device, dtype=torch.int),
         )
 
-    @torch.library.register_fake("sgl_kernel::topk_softmax_cpu")
+    @register_cpu_compile_fake("topk_softmax_cpu")
     def _(
         hidden_states,
         gating_output,
@@ -437,7 +387,7 @@ def register_fake_ops():
         "gelu_and_mul_cpu",
     ]:
 
-        @torch.library.register_fake(f"sgl_kernel::{act_op}")
+        @register_cpu_compile_fake(act_op)
         def _(input):
             sizes = list(input.shape)
             last_dim = input.dim() - 1
@@ -445,7 +395,7 @@ def register_fake_ops():
             sizes[last_dim] = d
             return input.new_empty(sizes)
 
-    @torch.library.register_fake("sgl_kernel::int8_scaled_mm_with_quant")
+    @register_cpu_compile_fake("int8_scaled_mm_with_quant")
     def _(
         mat1,
         mat2,
@@ -458,7 +408,7 @@ def register_fake_ops():
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
-    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm_cpu")
+    @register_cpu_compile_fake("fp8_scaled_mm_cpu")
     def _(
         mat1,
         mat2,
@@ -472,7 +422,7 @@ def register_fake_ops():
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
-    @torch.library.register_fake("sgl_kernel::fused_linear_sigmoid_mul")
+    @register_cpu_compile_fake("fused_linear_sigmoid_mul")
     def _(
         mat1,
         mat2,
@@ -484,7 +434,7 @@ def register_fake_ops():
         N = post_mul_mat.shape[1]
         return mat1.new_empty(M, N)
 
-    @torch.library.register_fake("sgl_kernel::fused_qkvzba_split_reshape_cat_cpu")
+    @register_cpu_compile_fake("fused_qkvzba_split_reshape_cat_cpu")
     def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
         batch = mixed_qkvz.shape[0]
         qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
@@ -494,9 +444,7 @@ def register_fake_ops():
         a = mixed_ba.new_empty(batch, num_heads_v)
         return mixed_qkv, z, b, a
 
-    @torch.library.register_fake(
-        "sgl_kernel::fused_qkvzba_split_reshape_cat_contiguous_cpu"
-    )
+    @register_cpu_compile_fake("fused_qkvzba_split_reshape_cat_contiguous_cpu")
     def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
         batch = mixed_qkvz.shape[0]
         qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
@@ -506,9 +454,7 @@ def register_fake_ops():
         a = mixed_ba.new_empty(batch, num_heads_v)
         return mixed_qkv, z, b, a
 
-    @torch.library.register_fake(
-        "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
-    )
+    @register_cpu_compile_fake("fused_sigmoid_gating_delta_rule_update_cpu")
     def _(
         A_log,
         dt_bias,
@@ -532,7 +478,7 @@ def register_fake_ops():
         v_head_dim = v.shape[3]
         return q.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
 
-    @torch.library.register_fake("sgl_kernel::fused_gdn_gating_cpu")
+    @register_cpu_compile_fake("fused_gdn_gating_cpu")
     def _(A_log, a, b, dt_bias):
         batch = a.shape[0]
         num_heads = a.shape[1]
@@ -540,7 +486,7 @@ def register_fake_ops():
         beta = b.new_empty(1, batch, num_heads)
         return out, beta
 
-    @torch.library.register_fake("sgl_kernel::flash_mla_with_kvcache_cpu")
+    @register_cpu_compile_fake("flash_mla_with_kvcache_cpu")
     def _(
         q,
         k_cache,
@@ -562,7 +508,7 @@ def register_fake_ops():
         lse = q.new_empty((batch, num_heads, seq_len), dtype=torch.float32)
         return out, lse
 
-    @torch.library.register_fake("sgl_kernel::quant_to_nope_fp8_rope_bf16_pack_cpu")
+    @register_cpu_compile_fake("quant_to_nope_fp8_rope_bf16_pack_cpu")
     def _(k_bf16):
         num_tokens = k_bf16.shape[0]
         quant_dim_nope = 448
@@ -590,7 +536,7 @@ def register_fake_ops():
             ),
         )
 
-    @torch.library.register_fake("sgl_kernel::hash_topk_cpu")
+    @register_cpu_compile_fake("hash_topk_cpu")
     def _(
         gating_output,
         tid2eid,
@@ -606,7 +552,7 @@ def register_fake_ops():
         topk_ids = torch.empty(shape, device=gating_output.device, dtype=torch.int)
         return topk_weights, topk_ids
 
-    @torch.library.register_fake("sgl_kernel::biased_topk_cpu")
+    @register_cpu_compile_fake("biased_topk_cpu")
     def _(
         hidden_states,
         gating_output,
@@ -624,7 +570,7 @@ def register_fake_ops():
         topk_ids = torch.empty(shape, device=hidden_states.device, dtype=torch.int)
         return topk_weights, topk_ids
 
-    @torch.library.register_fake("sgl_kernel::fp8_paged_mqa_logits_cpu")
+    @register_cpu_compile_fake("fp8_paged_mqa_logits_cpu")
     def _(
         q_fp8,
         kvcache_fp8,
@@ -636,7 +582,7 @@ def register_fake_ops():
     ):
         return q_fp8.new_empty((q_fp8.shape[0], max_seq_len), dtype=torch.float32)
 
-    @torch.library.register_fake("sgl_kernel::hc_pre_fused_cpu")
+    @register_cpu_compile_fake("hc_pre_fused_cpu")
     def _(x, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, rms_eps, hc_eps):
         num_tokens = x.shape[0]
         hidden_dim = x.shape[2]
@@ -645,20 +591,20 @@ def register_fake_ops():
         comb = x.new_empty((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
         return y, post, comb
 
-    @torch.library.register_fake("sgl_kernel::hc_post_fused_cpu")
+    @register_cpu_compile_fake("hc_post_fused_cpu")
     def _(x, residual, post, comb):
         num_tokens = x.shape[0]
         hc = residual.shape[1]
         hidden_dim = x.shape[1]
         return x.new_empty((num_tokens, hc, hidden_dim))
 
-    @torch.library.register_fake("sgl_kernel::hc_head_fused_cpu")
+    @register_cpu_compile_fake("hc_head_fused_cpu")
     def _(x, hc_fn, hc_scale, hc_base, hc_eps, norm_eps):
         num_tokens = x.shape[0]
         hidden_dim = x.shape[2]
         return x.new_empty((num_tokens, hidden_dim))
 
-    @torch.library.register_fake("sgl_kernel::compress_decode_cpu")
+    @register_cpu_compile_fake("compress_decode_cpu")
     def _(
         pool_kv,
         pool_score,
@@ -678,7 +624,7 @@ def register_fake_ops():
     ):
         return pool_kv.new_empty((seq_lens.shape[0], head_dim))
 
-    @torch.library.register_fake("sgl_kernel::act_quant_cpu")
+    @register_cpu_compile_fake("act_quant_cpu")
     def _(x, block_size=128, scale_fmt=None):
         scale_shape = list(x.shape)
         scale_shape[-1] = (scale_shape[-1] + block_size - 1) // block_size
@@ -687,11 +633,11 @@ def register_fake_ops():
             torch.empty(scale_shape, dtype=torch.float32, device=x.device),
         )
 
-    @torch.library.register_fake("sgl_kernel::fused_scale_cpu")
+    @register_cpu_compile_fake("fused_scale_cpu")
     def _(weight, out_scale, q_scale):
         return weight.new_empty((*weight.shape, 1), dtype=torch.float32)
 
-    @torch.library.register_fake("sgl_kernel::chunk_gated_delta_rule_cpu")
+    @register_cpu_compile_fake("chunk_gated_delta_rule_cpu")
     def _(
         query,
         key,
@@ -790,7 +736,7 @@ class CPUGraphRunner:
         )
 
         if self.enable_torch_compile:
-            register_fake_ops()
+            register_fake_ops(self.tp_size)
             set_torch_compile_config()
 
         # Graph inputs
