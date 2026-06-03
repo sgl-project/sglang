@@ -263,9 +263,17 @@ class TraceReqContext:
         self.trace_level = global_trace_level
         self.tracing_enable: bool = opentelemetry_initialized and self.trace_level > 0
 
-        server_args: ServerArgs = get_global_server_args()
-        if module_name not in server_args.trace_modules.split(","):
-            self.tracing_enable = False
+        # Filter by --trace-modules only for explicitly named modules; contexts
+        # created with the default empty module_name are always traced.
+        if module_name and self.tracing_enable:
+            try:
+                server_args: ServerArgs = get_global_server_args()
+                if module_name not in server_args.trace_modules.split(","):
+                    self.tracing_enable = False
+            except ValueError:
+                # Global server args not set (e.g. unit tests or runtimes with
+                # their own server args); skip module filtering.
+                pass
 
         if not self.tracing_enable:
             return
