@@ -1739,6 +1739,7 @@ class AscendAttnBackend(AttentionBackend):
                             *attn_output.shape[1:],
                         ),
                     ],
+                    dim=0,
                 )
             return attn_output
         else:
