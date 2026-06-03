@@ -311,6 +311,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # Tracing
     enable_trace: bool = False
+    trace_modules: str = "diffusion"
     otlp_traces_endpoint: str = "localhost:4317"
 
     # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
@@ -1508,6 +1509,12 @@ class ServerArgs(DisaggArgsMixin):
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
         )
         parser.add_argument(
+            "--trace-modules",
+            type=str,
+            default=ServerArgs.trace_modules,
+            help="Comma-separated tracing module names to enable.",
+        )
+        parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
             type=str,
             nargs="*",
@@ -2018,6 +2025,22 @@ def set_global_server_args(server_args: ServerArgs):
     """
     global _global_server_args
     _global_server_args = server_args
+
+
+def set_srt_global_server_args_for_tracing(server_args: ServerArgs):
+    """Expose diffusion server args to the SRT tracing helpers.
+
+    The diffusion runtime reuses SRT's TraceReqContext. That helper reads
+    trace_modules from SRT global server args, so keep the bridge limited to
+    that field.
+    """
+    from types import SimpleNamespace
+
+    from sglang.srt.server_args import set_global_server_args_for_scheduler
+
+    set_global_server_args_for_scheduler(
+        SimpleNamespace(trace_modules=server_args.trace_modules)
+    )
 
 
 def get_global_server_args() -> ServerArgs:

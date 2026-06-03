@@ -57,7 +57,11 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSessionCache,
 )
-from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    PortArgs,
+    ServerArgs,
+    set_srt_global_server_args_for_tracing,
+)
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
@@ -990,6 +994,7 @@ def run_scheduler_process(
         set_musa_arch()
 
     if server_args.enable_trace:
+        set_srt_global_server_args_for_tracing(server_args)
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
         trace_set_thread_info(f"DiffWorker_rank{rank}")
 

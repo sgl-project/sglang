@@ -35,7 +35,11 @@ from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    PortArgs,
+    ServerArgs,
+    set_srt_global_server_args_for_tracing,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
     RESET,
@@ -124,6 +128,7 @@ class DiffGenerator:
             server_args=server_args,
         )
         if server_args.enable_trace:
+            set_srt_global_server_args_for_tracing(server_args)
             process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
             trace_set_thread_info("DiffGenerator")
 

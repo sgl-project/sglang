@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     prepare_server_args,
     set_global_server_args,
+    set_srt_global_server_args_for_tracing,
 )
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
@@ -444,6 +445,7 @@ def _run_disagg_role_process(
 
 def launch_http_server_only(server_args):
     if server_args.enable_trace:
+        set_srt_global_server_args_for_tracing(server_args)
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
         trace_set_thread_info("DiffHTTPServer")
 
