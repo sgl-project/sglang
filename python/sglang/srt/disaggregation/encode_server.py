@@ -2598,13 +2598,22 @@ class DPDispatcher:
             raise
 
     async def broadcast(self, request: dict) -> List[dict]:
+        # Skip dead ranks: a PUSH to a gone worker would just buffer and then
+        # surface as a spurious per-rank timeout. All dead → 503 (same as
+        # dispatch), which the profile endpoints turn into an HTTP error.
+        alive_ranks = self.alive_ranks
+        if not alive_ranks:
+            raise MMError(
+                "All encoder DP workers are dead.",
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
         batch_id = self._broadcast_counter
         self._broadcast_counter += 1
         rank_keys: List[Tuple[int, str]] = []
         futures: List[asyncio.Future] = []
         dp_type = request.get("_dp_type", "unknown")
         try:
-            for rank in range(self.dp_size):
+            for rank in alive_ranks:
                 req_id = f"_broadcast_{batch_id}_{rank}"
                 future = asyncio.get_running_loop().create_future()
                 self.pending_futures[rank][req_id] = future
@@ -3103,20 +3112,28 @@ def _launch_server_dp(server_args: ServerArgs):
 
 def _summarise_dp_broadcast(results: List[dict]) -> Response:
     # Treat missing/None content as failure so a stuck rank doesn't hide
-    # behind the others' "ok".
+    # behind the others' "ok". Status = the most severe per-rank error code
+    # (5xx beats 4xx) rather than a blanket 400, so a worker's 500/503/504
+    # isn't misreported as a client error.
     msgs: List[str] = []
-    all_ok = True
+    error_codes: List[int] = []
     for r in results:
         content = r.get("content")
         if isinstance(content, dict):
             msgs.append(content.get("msg", ""))
-            all_ok = all_ok and bool(content.get("ok"))
+            if not content.get("ok"):
+                # Worker ran but reported a logical failure; no transport code,
+                # so treat as a bad request (matches the non-DP profile path).
+                error_codes.append(int(r.get("_error_code") or HTTPStatus.BAD_REQUEST))
         else:
             msgs.append(r.get("_error", "unknown error"))
-            all_ok = False
+            error_codes.append(
+                int(r.get("_error_code") or HTTPStatus.INTERNAL_SERVER_ERROR)
+            )
+    status_code = 200 if not error_codes else max(error_codes)
     return Response(
         content="\n".join(msgs) + "\n",
-        status_code=200 if all_ok else HTTPStatus.BAD_REQUEST,
+        status_code=status_code,
     )
 
 
