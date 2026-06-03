@@ -280,9 +280,9 @@ class FrozenKVMTPCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             hidden_states_backup = forward_batch.spec_info.hidden_states
-            ret = self.frozen_kv_mtp_worker.draft_forward(
-                forward_batch, skip_attn_backend_init=True
-            )
+            # The capture batch is marked by the capture metadata helper
+            # below, so draft_forward skips its eager plan.
+            ret = self.frozen_kv_mtp_worker.draft_forward(forward_batch)
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
