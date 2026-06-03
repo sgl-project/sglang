@@ -1143,6 +1143,12 @@
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
                     ]
+                  },
+                  {
+                    "group": "LingBot World",
+                    "pages": [
+                      "cookbook/diffusion/LingBot-World/LingBot-World"
+                    ]
                   }
                 ]
               },

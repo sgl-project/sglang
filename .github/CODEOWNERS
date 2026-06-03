@@ -44,7 +44,8 @@
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/managers/scheduler_pp_mixin.py @ShangmingCai @XucSh
 /python/sglang/srt/managers/tokenizer_manager_score_mixin.py @sundar24295s @chanh @fortunecookiee
-/python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077 @hzh0425 @ispobock
+/python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077 @hzh0425 @ispobock @alphabetc1
+/python/sglang/srt/mem_cache/allocator @hnyls2002 @ispobock @alphabetc1
 /python/sglang/srt/mem_cache/storage/mooncake_store/embedding_cache_controller.py @liusy58
 /python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py @liusy58
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
