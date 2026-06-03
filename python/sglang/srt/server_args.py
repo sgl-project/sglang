@@ -2332,6 +2332,7 @@ class ServerArgs:
         elif model_arch in (
             "Gemma4ForConditionalGeneration",
             "Gemma4ForCausalLM",
+            "Gemma4UnifiedForConditionalGeneration",
         ):
             default_attention_backend = (
                 "trtllm_mha" if is_sm100_supported() else "triton"
