@@ -89,25 +89,25 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
 
         self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
         self.add_standard_latent_preparation_stage()
-        self._add_flux_denoising_stage()
+        self._add_flux_denoising_stage(server_args)
         self.add_standard_decoding_stage()
 
-    def _add_flux_denoising_stage(self, stage_name: str = "denoising_stage") -> None:
-        """Add FluxProgressiveDenoisingStage.
-
-        Routes to DenoisingStage.forward() when progressive_mode == 'fullres'
-        (the default), preserving identical behaviour for non-progressive requests.
-        """
-
-        def create_stage():
-            return FluxProgressiveDenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-                pipeline=self,
-                vae=self.get_module("vae", None),
+    def _add_flux_denoising_stage(
+        self, server_args: ServerArgs, stage_name: str = "denoising_stage"
+    ) -> None:
+        if server_args.progressive_mode in ("dct", "dct_rewind"):
+            self.add_stage_factory(
+                RoleType.DENOISER,
+                lambda: FluxProgressiveDenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                    pipeline=self,
+                    vae=self.get_module("vae", None),
+                ),
+                stage_name,
             )
-
-        self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
+        else:
+            self.add_standard_denoising_stage(stage_name=stage_name)
 
 
 EntryClass = FluxPipeline
