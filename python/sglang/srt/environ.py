@@ -196,7 +196,14 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
-    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
+    # Controls weight-file ordering for load-time I/O optimization.
+    #   -1 : no sorting, no staggering; preserves original file order.
+    #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
+    #   k>0: sort files and stagger per-rank order with factor k.
+    #        Files are processed in groups of (tp_size * k), and rank r starts each
+    #        group at offset (r * k), improving multi-rank I/O concurrency while
+    #        keeping access relatively ordered.
+    SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
@@ -250,6 +257,7 @@ class Envs:
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
+    SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -323,6 +331,7 @@ class Envs:
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
+    SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
@@ -380,7 +389,13 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_AG = EnvBool(True)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Select the gate/up tile layout for AITER MoE: True -> interleave
+    # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
+    # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
+    # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
+    SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
@@ -464,6 +479,7 @@ class Envs:
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
+    SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
@@ -727,6 +743,13 @@ class Envs:
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
+    # Replicate the input embedding across TP ranks instead of sharding it
+    # along the vocab dimension (saves an all-reduce/all-gather in the embed
+    # lookup at the cost of replicated embedding weights). Drives both the
+    # target and every draft that shares its embedding (see
+    # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
+    # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
+    SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
