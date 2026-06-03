@@ -196,7 +196,14 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
-    SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
+    # Controls weight-file ordering for load-time I/O optimization.
+    #   -1 : no sorting, no staggering; preserves original file order.
+    #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
+    #   k>0: sort files and stagger per-rank order with factor k.
+    #        Files are processed in groups of (tp_size * k), and rank r starts each
+    #        group at offset (r * k), improving multi-rank I/O concurrency while
+    #        keeping access relatively ordered.
+    SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
