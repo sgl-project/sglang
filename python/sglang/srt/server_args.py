@@ -29,13 +29,16 @@ import uuid
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
+from sglang.srt.configs.linear_attn_model_registry import (
+    get_linear_attn_spec_by_arch,
+)
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -100,6 +103,8 @@ LLAMA4_MODEL_ARCHS = (
 )
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+    SAMPLING_BACKEND_CHOICES.add("token_oracle")
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -252,6 +257,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
+    "marlin",
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
@@ -772,6 +778,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
     enable_return_indexer_topk: bool = False
+    enable_deepseek_v4_fp4_indexer: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -779,6 +786,9 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     disable_attn_tp_gather: bool = False
     gc_threshold: Optional[List[int]] = None
+    kv_canary: str = "none"
+    kv_canary_real_data: str = "none"
+    kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
     dsa_prefill_cp_mode: str = "round-robin-split"
@@ -813,6 +823,7 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    optimistic_prefill_retries: int = 0
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -1771,6 +1782,7 @@ class ServerArgs:
             is_deepseek_dsa,
         )
 
+        self.uses_mamba_radix_cache = False
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
@@ -1778,7 +1790,7 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
-        if _hybrid_spec is not None:
+        if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=_hybrid_spec.support_mamba_cache,
@@ -2062,6 +2074,20 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
 
+            if is_sm120_supported():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "marlin"
+                    logger.info(
+                        "Use marlin as MoE runner backend on SM120 for DeepseekV4"
+                    )
+                # SM120 lacks tcgen05/TMEM: disable features that depend on
+                # DeepGEMM or require >99KB SMEM (topk_v2).
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
@@ -2144,6 +2170,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
                     )
+                    # The AITER MXFP4 fused-MoE path for GPT-OSS expects the
+                    # SEPARATED gate/up tile layout (matches the
+                    # `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+                    # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4
+                    # callers default to INTERLEAVE; opt this path out
+                    # unless the user explicitly overrode it.
+                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
@@ -2594,6 +2627,8 @@ class ServerArgs:
         sm100_default_attention_backend: str = None,
         fallback_attention_backend: str = "triton",
     ):
+        self.uses_mamba_radix_cache = True
+
         if (
             is_sm100_supported()
             and self.attention_backend is None
@@ -3123,17 +3158,14 @@ class ServerArgs:
     def _handle_linear_attn_backend(self):
         import torch
 
-        # SM100+: default to FlashInfer GDN decode when the user hasn't
-        # explicitly chosen a decode backend and mamba-ssm-dtype is bf16
-        # (required by FlashInfer GDN on SM100+).
+        # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
+        # when the user hasn't explicitly chosen a decode backend and
+        # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
-        # Excluded when MTP speculative decoding is enabled because
-        # FlashInfer GDN MTP verify is not yet supported on SM100+.
         if (
             self.linear_attn_decode_backend is None
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
-            and self.speculative_algorithm is None
         ):
             self.linear_attn_decode_backend = "flashinfer"
             logger.info(
@@ -4056,6 +4088,11 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
+        if self.enable_deepseek_v4_fp4_indexer and not is_sm100_supported():
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
+                "DeepGEMM FP4 indexer support."
+            )
         # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
         if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
             if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
@@ -4280,6 +4317,24 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
+        # Handle optimistic prefill validation
+        if (
+            self.optimistic_prefill_retries > 0
+            and self.disaggregation_mode == "prefill"
+        ):
+            if self.pp_size > 1:
+                logger.warning("Optimistic prefill does not support pp_size > 1")
+                self.optimistic_prefill_retries = 0
+            elif self.enable_hierarchical_cache:
+                logger.warning("Optimistic prefill does not support hierarchical cache")
+                self.optimistic_prefill_retries = 0
+            elif getattr(self, "uses_mamba_radix_cache", False):
+                logger.warning(
+                    "Optimistic prefill does not support models that use "
+                    "mamba radix cache."
+                )
+                self.optimistic_prefill_retries = 0
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
@@ -5636,12 +5691,13 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, flashinfer_cutlass otherwise), "
+            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise), "
             "'cutlass' (SGLang CUTLASS kernel), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
             "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
-            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), "
+            "'marlin' (weight-only W4A16 fallback for SM80+). ",
         )
         parser.add_argument(
             "--disable-flashinfer-autotune",
@@ -6308,6 +6364,36 @@ class ServerArgs:
             help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
+            "--kv-canary",
+            type=str,
+            default=ServerArgs.kv_canary,
+            choices=["none", "log", "raise"],
+            help=(
+                "KV cache canary mode. "
+                "'none' disables the canary (default). "
+                "'log' prints them while the server keeps running (production-safe). "
+                "'raise' fails the server on the first detected mismatch (CI lane)."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-real-data",
+            type=str,
+            default=ServerArgs.kv_canary_real_data,
+            choices=[m.name.lower() for m in RealKvHashMode],
+            help=(
+                "Check the real KV-cache in the canary. "
+                "'none' (default) disables the feature. "
+                "'partial' checks the first 16 bytes of each real-KV slot. "
+                "'all' checks the full real-KV slot."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-sweep-interval",
+            type=int,
+            default=ServerArgs.kv_canary_sweep_interval,
+            help="Every N forward steps, run a full-pool sweep.",
+        )
+        parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
             default=ServerArgs.cuda_graph_max_bs,
@@ -6619,6 +6705,11 @@ class ServerArgs:
             help="Enable returning indexer topk indices of layers with indexer with responses.",
         )
         parser.add_argument(
+            "--enable-deepseek-v4-fp4-indexer",
+            action="store_true",
+            help="Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -6799,9 +6890,12 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
-            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+            help="The InfiniBand devices for disaggregation transfer. Supports a single device "
+            "(e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list "
+            "(e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping "
+            '(e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), '
+            "or a path to a JSON file containing that mapping. Default is None, which triggers "
+            "automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",
@@ -6824,6 +6918,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+
+        parser.add_argument(
+            "--optimistic-prefill-retries",
+            type=int,
+            default=ServerArgs.optimistic_prefill_retries,
+            help="Number of optimistic prefill retries that will skip the bootstrap wait. ",
         )
 
         # Encode prefill disaggregation
@@ -7355,6 +7456,11 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
+            raise ValueError(
+                "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
