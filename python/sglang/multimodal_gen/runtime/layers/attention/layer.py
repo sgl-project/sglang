@@ -750,6 +750,32 @@ class USPAttention(nn.Module):
 
         return torch.cat([out_rep, out_shard], dim=1)
 
+    def forward_with_replicated_kv_prefix(
+        self,
+        q: torch.Tensor,
+        k_prefix: torch.Tensor,
+        v_prefix: torch.Tensor,
+        k_suffix: torch.Tensor,
+        v_suffix: torch.Tensor,
+    ) -> torch.Tensor:
+        """attention with replicated K/V prefix supplied separately"""
+        forward_context: ForwardContext = get_forward_context()
+        ctx_attn_metadata = forward_context.attn_metadata
+
+        if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
+            k = torch.cat([k_prefix, k_suffix], dim=1)
+            v = torch.cat([v_prefix, v_suffix], dim=1)
+            return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
+        if get_ulysses_parallel_world_size() == 1:
+            k = torch.cat([k_prefix, k_suffix], dim=1)
+            v = torch.cat([v_prefix, v_suffix], dim=1)
+            return self(q, k, v)
+
+        return self._forward_with_replicated_kv_prefix_split(
+            q, k_prefix, v_prefix, k_suffix, v_suffix, ctx_attn_metadata
+        )
+
     def _forward_with_replicated_kv_prefix(
         self,
         q: torch.Tensor,
@@ -771,10 +797,24 @@ class USPAttention(nn.Module):
         3. Concatenate prefix + suffix on the sequence dim and attend.
         4. All-to-all the output back (head shard → seq shard).
         """
-        sp_rank = get_sp_parallel_rank()
-
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
+
+        return self._forward_with_replicated_kv_prefix_split(
+            q, k_rep, v_rep, k_shard, v_shard, ctx_attn_metadata
+        )
+
+    def _forward_with_replicated_kv_prefix_split(
+        self,
+        q: torch.Tensor,
+        k_rep: torch.Tensor,
+        v_rep: torch.Tensor,
+        k_shard: torch.Tensor,
+        v_shard: torch.Tensor,
+        ctx_attn_metadata,
+    ) -> torch.Tensor:
+        """split form avoids materializing full K/V before Ulysses all-to-all"""
+        sp_rank = get_sp_parallel_rank()
 
         q = _usp_input_all_to_all(q, head_dim=2)
         k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
