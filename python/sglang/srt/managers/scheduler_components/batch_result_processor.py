@@ -914,8 +914,7 @@ class SchedulerBatchResultProcessor:
         if batch.spec_algorithm.is_none():
             seq_len = len(req.origin_input_ids) + len(req.output_ids)
             if seq_len % interval == 0:
-                track_seqlen = min(seq_len, req.kv_committed_len)
-                return True, track_seqlen
+                return True, req.kv_committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
             prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
