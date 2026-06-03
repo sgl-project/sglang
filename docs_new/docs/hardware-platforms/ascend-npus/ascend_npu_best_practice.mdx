@@ -891,7 +891,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>41ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm-5-1-3_5k-1_5k-41ms-on-a3-16-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
@@ -901,7 +901,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16K+1K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>23ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm-5-1-16k-1k-23ms-on-a3-32-cards-disaggregation-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
@@ -909,9 +909,9 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>48</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>64K+1K+90%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>64K+1K+90% cache hit</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>45ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm-5-1-64k-1k-90%25_cache_hit-45ms-on-a3-48-cards-disaggregation-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
@@ -919,9 +919,9 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>48</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Disaggregation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>128K+1K+90%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>128K+1K+90% cache hit</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8 INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W4A8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#glm-5-1-128k-1k-90%25_cache_hit-32ms-on-a3-48-cards-disaggregation-mode">Optimal Configuration</a></td>
     </tr>
   </tbody>
@@ -6108,7 +6108,7 @@ export STREAMS_PER_DEVICE=32
 export HCCL_SOCKET_IFNAME=your_nic
 export GLOO_SOCKET_IFNAME=your_nic
 
-MODEL_PATH=GLM-5.1-w4a8
+MODEL_PATH=/path/to/GLM-5.1-w4a8
 
 P_IP=('your ip1' 'your ip2')
 P_MASTER="${P_IP[0]}:4567"
@@ -6216,7 +6216,7 @@ export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 P_IP=('your prefill ip1' 'your prefill ip2')
 D_IP=('your decode ip1' 'your decode ip2')
 
-MODEL_PATH=GLM-5.1-w4a8
+MODEL_PATH=/path/to/GLM-5.1-w4a8
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -6356,7 +6356,7 @@ export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200
 P_IP=('your prefill ip1' 'your prefill ip2' 'your prefill ip3' 'your prefill ip4')
 D_IP=('your decode ip1' 'your decode ip2')
 
-MODEL_PATH=GLM-5.1-w4a8
+MODEL_PATH=/path/to/GLM-5.1-w4a8
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -6502,7 +6502,7 @@ P_IP=('your prefill ip1' 'your prefill ip2')
 P1_IP=('your prefill ip3' 'your prefill ip4')
 D_IP=('your decode ip1' 'your decode ip2')
 
-MODEL_PATH=GLM-5.1-w4a8
+MODEL_PATH=/path/to/GLM-5.1-w4a8
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
