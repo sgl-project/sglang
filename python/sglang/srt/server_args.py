@@ -543,6 +543,7 @@ class ServerArgs:
     # LoRA
     enable_lora: Optional[bool] = None
     enable_lora_overlap_loading: Optional[bool] = None
+    enable_lora_pipelined_loading: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[
@@ -5425,6 +5426,15 @@ class ServerArgs:
             help="Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
         )
         parser.add_argument(
+            "--enable-lora-pipelined-loading",
+            default=ServerArgs.enable_lora_pipelined_loading,
+            action="store_true",
+            help="Enable per-layer pipelined LoRA weight loading for reduced TTFT. "
+            "Requires --enable-lora-overlap-loading. When enabled, the forward pass "
+            "can begin consuming early-layer weights while later layers are still "
+            "being transferred from CPU to GPU.",
+        )
+        parser.add_argument(
             "--max-lora-rank",
             default=ServerArgs.max_lora_rank,
             type=int,
@@ -7414,16 +7424,29 @@ class ServerArgs:
             if self.enable_lora_overlap_loading is None:
                 self.enable_lora_overlap_loading = False
 
+            if self.enable_lora_pipelined_loading is None:
+                self.enable_lora_pipelined_loading = False
+
+            if self.enable_lora_pipelined_loading:
+                if not self.enable_lora_overlap_loading:
+                    raise ValueError(
+                        "--enable-lora-pipelined-loading requires --enable-lora-overlap-loading"
+                    )
+
             if self.enable_lora_overlap_loading:
-                # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
-                max_loaded_loras_limit = self.max_loras_per_batch * 2
-                assert (
-                    self.max_loaded_loras is not None
-                    and self.max_loaded_loras <= max_loaded_loras_limit
-                ), (
-                    "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
-                    f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
-                )
+                if self.max_loaded_loras is None:
+                    raise ValueError(
+                        "--enable-lora-overlap-loading requires --max-loaded-loras to be set explicitly."
+                    )
+
+                if not self.enable_lora_pipelined_loading:
+                    max_loaded_loras_limit = self.max_loras_per_batch * 2
+                    if self.max_loaded_loras > max_loaded_loras_limit:
+                        raise ValueError(
+                            "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
+                            f"so --max-loaded-loras must be <= {max_loaded_loras_limit} "
+                            f"(2 * max_loras_per_batch with current settings), but got {self.max_loaded_loras}."
+                        )
 
             # Validate compatibility with speculative decoding
             if self.speculative_algorithm not in ["NGRAM", None]:
@@ -7508,10 +7531,17 @@ class ServerArgs:
                     "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
                     f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
                 )
-                assert len(self.lora_paths) <= self.max_loaded_loras, (
-                    "The number of LoRA paths should not exceed max_loaded_loras. "
-                    f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
-                )
+                if self.enable_lora_pipelined_loading:
+                    logger.warning(
+                        f"More LoRA adapters registered ({len(self.lora_paths)}) than "
+                        f"max_loaded_loras ({self.max_loaded_loras}). Adapters will be "
+                        f"evicted and reloaded on demand using LoRA Pipelining."
+                    )
+                else:
+                    assert len(self.lora_paths) <= self.max_loaded_loras, (
+                        "The number of LoRA paths should not exceed max_loaded_loras. "
+                    )
+
 
             if self.max_lora_chunk_size is not None:
                 assert (
