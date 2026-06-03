@@ -1167,22 +1167,6 @@ class Scheduler(
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
-        if use_mlx():
-            # MLX: no CUDA streams / FutureMap.
-            self.future_map = None
-            self.result_queue: Deque = deque()
-            return
-
-        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
-        # via scheduler_pp_mixin; init unconditionally to match main.
-        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.forward_stream
-        )
-        self.copy_stream: CudaStream = self.device_module.Stream()
-        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.copy_stream
-        )
-
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers not on BaseSpecWorker (e.g. FrozenKVMTPWorker) lack the
         # override; fall back to target-only so the helper still produces a
@@ -1200,6 +1184,23 @@ class Scheduler(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
+        )
+
+        if use_mlx():
+            # MLX uses its own overlap loop and does not create CUDA streams,
+            # but the normal non-overlap scheduler path still relays decode
+            # input IDs through FutureMap.
+            self.result_queue: Deque = deque()
+            return
+
+        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
+        # via scheduler_pp_mixin; init unconditionally to match main.
+        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.forward_stream
+        )
+        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.copy_stream
         )
 
         if not self.enable_overlap:
