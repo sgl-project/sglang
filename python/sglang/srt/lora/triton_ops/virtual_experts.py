@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
+from sglang.srt.lora.triton_ops.kernel_utils import get_pdl_launch_metadata
 
 
 @triton.jit
@@ -22,6 +23,7 @@ def _fused_virtual_topk_ids_kernel(
     M,
     top_k: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """
     Fuses _get_virtual_topk_ids: comparison + clamp + arithmetic into one kernel.
@@ -40,6 +42,9 @@ def _fused_virtual_topk_ids_kernel(
     total = M * top_k
     valid = offs < total
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     m = offs // top_k
     # k = offs % top_k  # not needed directly
 
@@ -48,6 +53,10 @@ def _fused_virtual_topk_ids_kernel(
     safe_lora = tl.maximum(lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     # Preserve negative sentinel topk_ids (e.g. -1 for non-local experts after
     # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
     # a real virtual-expert slot belonging to another adapter and trigger OOB
@@ -90,6 +99,7 @@ def _fused_virtual_topk_ids(
     BLOCK_SIZE = 1024
     grid = ((M * top_k + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _fused_virtual_topk_ids_kernel[grid](
         input_topk,
         token_lora_mapping,
@@ -99,6 +109,8 @@ def _fused_virtual_topk_ids(
         M,
         top_k,
         BLOCK_SIZE,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
 
     virtual_num_experts = num_experts_for_weight * max_loras
@@ -112,12 +124,20 @@ def _fused_sanitize_expert_ids_kernel(
     num_virtual_experts,
     N,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     valid = offs < N
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     eid = tl.load(expert_ids_ptr + offs, mask=valid, other=0)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     result = tl.where(eid < num_virtual_experts, eid, -1)
     tl.store(output_ptr + offs, result, mask=valid)
 
@@ -137,12 +157,15 @@ def fused_sanitize_expert_ids(
     BLOCK_SIZE = 1024
     grid = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _fused_sanitize_expert_ids_kernel[grid](
         expert_ids,
         output,
         num_virtual_experts,
         N,
         BLOCK_SIZE,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return output
 
@@ -175,11 +198,15 @@ def _moe_lora_shrink_splitk_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """Split-K grouped GEMM for the LoRA A (shrink) stage with few virtual experts."""
     pid = tl.program_id(0)
     pid_sk = pid % SPLIT_K
     pid_mn = pid // SPLIT_K
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
@@ -233,6 +260,9 @@ def _moe_lora_shrink_splitk_kernel(
         a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     accumulator = accumulator.to(c_ptr.dtype.element_ty)
 
     # Write output
@@ -272,6 +302,7 @@ def _invoke_moe_lora_shrink_splitk(
 
     grid = (SPLIT_K * base_grid,)
 
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _moe_lora_shrink_splitk_kernel[grid](
         hidden_states,
         weight,
@@ -295,8 +326,10 @@ def _invoke_moe_lora_shrink_splitk(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=GROUP_SIZE_M,
         SPLIT_K=SPLIT_K,
+        ENABLE_PDL=enable_pdl,
         num_warps=config.get("num_warps", 4),
         num_stages=config.get("num_stages", 4),
+        **pdl_kwargs,
     )
 
 

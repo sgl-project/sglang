@@ -534,6 +534,9 @@ class Envs:
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
 
+    # LoRA
+    SGLANG_OPT_LORA_ENABLE_PDL = EnvBool(False)
+
     # Deterministic inference
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)

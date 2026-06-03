@@ -48,7 +48,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 
 # ---------------------------------------------------------------------------
@@ -136,6 +139,7 @@ def _step_a_q_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -182,6 +186,9 @@ def _step_a_q_kernel(
         head_id * FULL_K
     )  # row offset for this head's K-half (i in [0, qk_nope))
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
@@ -210,6 +217,9 @@ def _step_a_q_kernel(
         )
 
         partial_sum += tl.dot(x_tile, w_tile)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     partial_sum = partial_sum.to(x.dtype.element_ty)
     out_offs = (
@@ -251,6 +261,7 @@ def step_a_q_fwd(
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     _step_a_q_kernel[grid](
         q_nope,
@@ -279,6 +290,8 @@ def step_a_q_fwd(
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_A_BLOCK_N,
         BLOCK_K=_STEP_A_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out
 
@@ -325,6 +338,7 @@ def _step_b_q_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -367,6 +381,9 @@ def _step_b_q_kernel(
     n_mask = n_offset[None, :] < N
     safe_n = tl.minimum(n_offset, N - 1)
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
@@ -394,6 +411,9 @@ def _step_b_q_kernel(
         )
 
         partial_sum += tl.dot(x_tile, w_tile)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
@@ -440,6 +460,7 @@ def step_b_q_fwd(
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     _step_b_q_kernel[grid](
         q_lora_a,
@@ -467,6 +488,8 @@ def step_b_q_fwd(
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_B_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return base_output
 
@@ -512,6 +535,7 @@ def _step_a_v_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -552,6 +576,9 @@ def _step_a_v_kernel(
     safe_row = tl.minimum(s_physical, S - 1)
     safe_n = tl.minimum(n_offset, N_eff - 1)
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
@@ -581,6 +608,9 @@ def _step_a_v_kernel(
         )
 
         partial_sum += tl.dot(x_tile, w_tile)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     partial_sum = partial_sum.to(x.dtype.element_ty)
     out_offs = (
@@ -620,6 +650,7 @@ def step_a_v_fwd(
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     _step_a_v_kernel[grid](
         attn_output,
@@ -646,6 +677,8 @@ def step_a_v_fwd(
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_A_BLOCK_N,
         BLOCK_K=_STEP_A_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out
 
@@ -695,6 +728,7 @@ def _step_b_v_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -739,6 +773,9 @@ def _step_b_v_kernel(
     # V-half row base for this head: h*FULL_K + qk_nope
     head_row_base = head_id * FULL_K + QK_NOPE_OFFSET
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
@@ -767,6 +804,9 @@ def _step_b_v_kernel(
         )
 
         partial_sum += tl.dot(x_tile, w_tile)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
@@ -816,6 +856,7 @@ def step_b_v_fwd(
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     _step_b_v_kernel[grid](
         attn_lora_a,
@@ -845,5 +886,7 @@ def step_b_v_fwd(
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_B_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return base_output

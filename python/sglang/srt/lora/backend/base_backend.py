@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.backend.lmhead_mixing import LoRABackendLmHeadMixing
+from sglang.srt.lora.triton_ops.kernel_utils import get_pdl_launch_metadata
 from sglang.srt.lora.utils import LoRABatchInfo, MoELoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -343,9 +344,13 @@ def _compute_moe_lora_info_kernel(
     num_segments,
     max_len,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(max_len, BLOCK_SIZE)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
     pid_seg = pid // num_pid_m
     pid_m = pid % num_pid_m
@@ -357,6 +362,10 @@ def _compute_moe_lora_info_kernel(
     valid = offs < seg_len
     lora_id = tl.load(weight_indices_ptr + pid_seg)
     lora_rank = tl.load(lora_ranks_ptr + lora_id)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     tl.store(
         adapter_enabled_ptr + lora_id,
         (lora_rank > 0).to(tl.int32),
@@ -407,6 +416,7 @@ def _compute_moe_lora_info(
             f"MoE LoRA token-mapping launch under-covers tokens: "
             f"{grid_size=} {block_size=} {num_tokens=}"
         )
+        enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
         _compute_moe_lora_info_kernel[(grid_size,)](
             seg_indptr,
             lora_ranks,
@@ -416,6 +426,8 @@ def _compute_moe_lora_info(
             weight_indices.numel(),
             max_len,
             BLOCK_SIZE=block_size,
+            ENABLE_PDL=enable_pdl,
+            **pdl_kwargs,
         )
         return adapter_enabled, token_lora_mapping
 

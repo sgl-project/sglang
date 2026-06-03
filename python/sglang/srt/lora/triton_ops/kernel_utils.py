@@ -1,6 +1,23 @@
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
+
+
+def lora_pdl_enabled() -> bool:
+    return envs.SGLANG_OPT_LORA_ENABLE_PDL.get() and is_arch_support_pdl()
+
+
+def get_pdl_launch_metadata() -> tuple[bool, dict]:
+    """Return (ENABLE_PDL constexpr value, extra launch kwargs) for LoRA kernels.
+
+    ``launch_pdl`` is NVIDIA-only Triton launch metadata; the HIP backend
+    rejects unknown kwargs, so it is only included when PDL is enabled.
+    """
+    enable_pdl = lora_pdl_enabled()
+    return enable_pdl, ({"launch_pdl": True} if enable_pdl else {})
+
 
 @triton.jit
 def _resolve_token_positions(
