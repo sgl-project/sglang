@@ -41,13 +41,19 @@ _CACHE_TYPE_STATE = 1.0
 
 
 def _tensor_cache_key(tensor: torch.Tensor) -> Tuple:
+    # Inference-mode tensors (e.g. an un-laundered camera tensor on the cfg=1.0
+    # streaming path) raise on ._version access; they are never mutated, so 0 is safe.
+    try:
+        version = int(tensor._version)
+    except (RuntimeError, AttributeError):
+        version = 0
     return (
         tuple(tensor.shape),
         tuple(tensor.stride()),
         str(tensor.device),
         tensor.dtype,
         tensor.data_ptr(),
-        int(getattr(tensor, "_version", 0)),
+        version,
     )
 
 
