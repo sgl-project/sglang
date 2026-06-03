@@ -740,8 +740,6 @@ class Envs:
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
-    # TTL (s) before evicting a mooncake mapping whose /send never arrived.
-    SGLANG_ENCODER_DP_PENDING_SEND_TTL = EnvInt(600)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)

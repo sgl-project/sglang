@@ -2457,6 +2457,9 @@ async def _dp_worker_encode_and_send(
             embedding_len=embedding_len,
             embedding_dim=embedding_dim,
         )
+        # Free the held embedding if the follow-up /send never arrives (same
+        # send_timeout cleanup the non-DP path uses).
+        enc._schedule_inflight_encode_cleanup(req_id)
         return request
 
     await _push_embedding_to_prefill(enc, request)
@@ -2793,8 +2796,10 @@ class DPDispatcher:
                 )
 
     async def _cleanup_stale_mappings(self) -> None:
-        # Evict mappings whose /send never came and free the worker's embedding.
-        ttl = envs.SGLANG_ENCODER_DP_PENDING_SEND_TTL.get()
+        # Evict req_id->rank mappings whose /send never came. The worker frees
+        # its own embedding via the send_timeout cleanup scheduled at encode,
+        # so both sides key off the same timeout.
+        ttl = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
         interval = max(ttl / 4, 30)
         while True:
             await asyncio.sleep(interval)
@@ -2802,17 +2807,7 @@ class DPDispatcher:
             stale = [rid for rid, ts in self._pending_send_at.items() if now - ts > ttl]
             for rid in stale:
                 self._pending_send_at.pop(rid, None)
-                rank = self.req_id_to_rank.pop(rid, None)
-                if rank is not None and rank not in self._dead_ranks:
-                    try:
-                        await self.dispatch_sockets[rank].send_pyobj(
-                            {"_dp_type": "drop", "req_id": rid}
-                        )
-                    except Exception:
-                        logger.error(
-                            f"failed to send drop for stale req_id={rid}",
-                            exc_info=True,
-                        )
+                self.req_id_to_rank.pop(rid, None)
             if stale:
                 logger.warning(
                     f"Evicted {len(stale)} stale encoder DP /send mapping(s) "
@@ -2855,10 +2850,6 @@ async def _dp_worker_handle_request(
     request: dict,
     dp_type: str,
 ) -> None:
-    if dp_type == "drop":
-        # dispatcher evicted a stale mapping; free the held embedding, no reply
-        enc.embedding_to_send.pop(request["req_id"], None)
-        return
     t0 = time.time()
     try:
         if dp_type in ("start_profile", "stop_profile"):
@@ -2872,7 +2863,8 @@ async def _dp_worker_handle_request(
                 session_id=request["session_id"],
                 buffer_address=request["buffer_address"],
             )
-            enc.embedding_to_send.pop(req_id, None)
+            # cancels the scheduled cleanup + frees embedding/forward state
+            await enc._cleanup_inflight_encode_state(req_id)
             content = None
         else:
             content = await _dp_worker_encode_and_send(enc, sched, request)
