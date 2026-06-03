@@ -957,8 +957,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-        # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
-        # and padding logic in prepare_mlp_sync_batch to avoid this
+        # FIXME(@rainj-me): metadata went stale because the batch was padded
+        # (prepare_mlp_sync_batch) after a pre-planner marked it
+        # forward_metadata_ready. Replace this defensive re-plan with central
+        # staleness validation on the marker (record planned_bs at mark time,
+        # invalidate when padding changes shapes).
         batch_size = getattr(metadata, "batch_size", None)
         if batch_size is not None and batch_size < forward_batch.batch_size:
             self.init_forward_metadata(forward_batch)
@@ -1059,8 +1062,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
             # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-            # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
-            # and padding logic in prepare_mlp_sync_batch to avoid this
+            # FIXME(@rainj-me): metadata went stale because the batch was
+            # padded (prepare_mlp_sync_batch) after a pre-planner marked it
+            # forward_metadata_ready. Replace this defensive re-plan with
+            # central staleness validation on the marker (record planned_bs
+            # at mark time, invalidate when padding changes shapes).
             batch_size = getattr(metadata, "batch_size", None)
             if batch_size is not None and batch_size < forward_batch.batch_size:
                 self.init_forward_metadata(forward_batch)
