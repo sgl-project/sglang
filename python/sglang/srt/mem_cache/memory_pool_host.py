@@ -2965,22 +2965,13 @@ class DSAIndexerPoolHost(HostKVCache):
 
 
 class DSAIndexerTopkPoolHost(HostKVCache):
-    """Host-side backup of the DSA indexer-topk capture buffer for HiCache slot
-    migration.
+    """Host sidecar for the DSA indexer-topk capture buffer; slot layout matches
+    the anchor MLA host pool.
 
-    Background (#26975): with hierarchical cache enabled, a host-tier cache hit
-    makes ``HiRadixCache.load_back()`` migrate KV data to new device slots, but
-    the indexer-topk capture buffer (``IndexerTopkCapturer.host_cache.buffer``,
-    a flat ``(num_tokens, num_layers, topk_size)`` int32 pinned tensor indexed by
-    KV slot) is not migrated, so ``get_topk()`` reads stale slots. This sidecar
-    pool travels with KV (``indices_from_pool=PoolName.KV``): backup copies the
-    capturer rows for evicted slots into a slot-indexed host buffer; load restores
-    them into the capturer buffer at the new slots.
-
-    All transfers are CPU<->CPU pinned-memory copies (the capturer buffer is
-    already CPU pinned, and this pool's buffer is too) -- there is no GPU DMA, so
-    ``device_pool`` and ``io_backend`` arguments are ignored. The slot layout
-    matches the anchor MLA host pool; a page is ``page_size`` contiguous rows.
+    Travels with KV (``indices_from_pool=KV``) so a HiCache load_back migrates the
+    capturer's topk rows to the new device slots too. All copies are CPU<->CPU
+    (the capturer buffer is already pinned), so ``device_pool`` and ``io_backend``
+    are ignored.
     """
 
     def __init__(
@@ -3043,8 +3034,7 @@ class DSAIndexerTopkPoolHost(HostKVCache):
         return self.num_layers * self.topk_size * 4
 
     def get_ksize_per_token(self):
-        # Required: storage backends call this during host-pool registration.
-        # HostKVCache base does not define it.
+        # Storage backends call this during host-pool registration (not on base).
         return self.get_size_per_token()
 
     def init_kv_buffer(self):
@@ -3064,23 +3054,20 @@ class DSAIndexerTopkPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ) -> None:
-        # capturer.host_cache.buffer[device_indices] -> self.buffer[host_indices].
-        # device_indices are KV slots == the capturer's index space; host_indices
-        # are this pool's slots. CPU<->CPU copy; device_pool/io_backend unused.
+        # device_indices index the capturer (KV slots); host_indices index this pool.
         if host_indices.numel() == 0:
             return
-        # host/device indices are always CPU tensors (pool device="cpu").
         self.buffer[host_indices] = self._capturer_buffer()[device_indices]
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ) -> None:
-        # self.buffer[host_indices] -> capturer.host_cache.buffer[device_indices],
-        # one layer at a time (mirrors the per-layer load contract).
+        # Inverse of backup, one layer at a time (per-layer load contract).
         if host_indices.numel() == 0:
             return
-        # host/device indices are always CPU tensors (pool device="cpu").
-        self._capturer_buffer()[device_indices, layer_id, :] = self.buffer[host_indices, layer_id, :]
+        self._capturer_buffer()[device_indices, layer_id, :] = self.buffer[
+            host_indices, layer_id, :
+        ]
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         page_idx = int(index) // self.page_size
