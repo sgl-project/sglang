@@ -4,20 +4,25 @@ const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
 const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
-const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";
+const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v7";
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
+const SMOOTH_PREVIEW_OUTPUT_QUALITY = 85;
 const DEFAULT_TARGET_FPS = 25;
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
 const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
 const DEFAULT_UPSCALING_SCALE = 2;
+const DEFAULT_UPSCALING_MODEL = "";
 const DEFAULT_PREVIEW_SCALE = 120;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const LIVE_QUEUE_SECONDS = 0.45;
 const LOW_LATENCY_FPS_FLOOR = 10;
 const LOW_LATENCY_QUEUE_SECONDS = 0.35;
-const MAX_CATCHUP_FPS = 30;
 const EVENT_QUEUE_SECONDS = 0.25;
+const PLAYBACK_FPS_EWMA_ALPHA = 0.35;
+const PLAYBACK_CATCHUP_MULTIPLIER = 1.12;
+const PLAYBACK_CATCHUP_BONUS_FPS = 4;
+const PLAYBACK_STARTUP_WARMUP_SECONDS = 1.5;
 const CONTROL_BUFFERED_AMOUNT_LIMIT = 1 << 20;
 const CONTROL_KEY_ACTIONS = new Map([
   ["w", "w"],
@@ -204,6 +209,7 @@ let chunkWaitStartedAt = 0;
 let clearQueueOnClose = false;
 let fpsSamples = [];
 let playbackFps = 0;
+let observedOutputFps = 0;
 let droppedFrames = 0;
 let decodeChain = Promise.resolve();
 let pendingDecodeBatches = 0;
@@ -274,7 +280,8 @@ function resetStreamStats() {
   fpsSamples = [];
   chunkWaitStartedAt = 0;
   clearQueueOnClose = false;
-  playbackFps = Number($("fps").value || DEFAULT_TARGET_FPS);
+  playbackFps = 0;
+  observedOutputFps = 0;
   droppedFrames = 0;
   decodeChain = Promise.resolve();
   pendingDecodeBatches = 0;
@@ -377,8 +384,10 @@ async function decodeFrameBatch(header, data) {
         resolve: (message) => {
           const decodedAt = performance.now();
           lastDecodeMs = decodedAt - decodeStartedAt;
-          resolve(message.frames.map((buffer) => ({
-            image: new ImageData(new Uint8ClampedArray(buffer), message.width, message.height),
+          resolve(message.frames.map((frame) => ({
+            image: message.frame_type === "bitmap"
+              ? frame
+              : new ImageData(new Uint8ClampedArray(frame), message.width, message.height),
             chunk: message.chunk,
             receivedAt: header.__received_at,
             decodedAt,
@@ -436,8 +445,35 @@ function updateStats(header) {
   $("byteText").textContent = `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
+function requestedInputFps() {
+  return Number($("fps").value || DEFAULT_TARGET_FPS);
+}
+
+function frameInterpolationMultiplier() {
+  return $("frameInterpolation").checked ? 2 ** DEFAULT_FRAME_INTERPOLATION_EXP : 1;
+}
+
+function previewPlaybackTargetFps() {
+  return requestedInputFps() * frameInterpolationMultiplier();
+}
+
+function playbackFpsFloor() {
+  return $("superResolution").checked ? 1 : LOW_LATENCY_FPS_FLOOR;
+}
+
+function currentPlaybackFps() {
+  return playbackFps || previewPlaybackTargetFps();
+}
+
+function clampPlaybackFps(value) {
+  return Math.min(
+    previewPlaybackTargetFps(),
+    Math.max(playbackFpsFloor(), value),
+  );
+}
+
 function trimLiveQueue(latestFrameCount) {
-  const targetFps = Number($("fps").value || DEFAULT_TARGET_FPS);
+  const targetFps = currentPlaybackFps();
   const maxQueue = Math.max(
     Number(latestFrameCount || 0),
     Math.round(targetFps * LIVE_QUEUE_SECONDS),
@@ -457,7 +493,7 @@ function liveQueueFrameFloor(header, decodedFrameCount) {
 }
 
 function trimQueueForPendingEvent() {
-  const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
+  const targetFps = currentPlaybackFps();
   const keep = Math.max(1, Math.round(targetFps * EVENT_QUEUE_SECONDS));
   if (queue.length <= keep) return;
   const dropCount = queue.length - keep;
@@ -691,11 +727,18 @@ function drawFrame(image) {
 }
 
 function renderLoop(now) {
-  const targetFps = playbackFps || Number($("fps").value || DEFAULT_TARGET_FPS);
-  const queueSeconds = queue.length / Math.max(1, targetFps);
+  const targetPlaybackFps = previewPlaybackTargetFps();
+  const basePlaybackFps = currentPlaybackFps();
+  const queueSeconds = queue.length / Math.max(1, basePlaybackFps);
   const catchupFps = !$("superResolution").checked && queueSeconds > LOW_LATENCY_QUEUE_SECONDS
-    ? Math.min(MAX_CATCHUP_FPS, Math.ceil(queue.length / LOW_LATENCY_QUEUE_SECONDS))
-    : targetFps;
+    ? Math.min(
+        targetPlaybackFps,
+        Math.max(
+          basePlaybackFps * PLAYBACK_CATCHUP_MULTIPLIER,
+          basePlaybackFps + PLAYBACK_CATCHUP_BONUS_FPS,
+        ),
+      )
+    : basePlaybackFps;
   const targetMs = 1000 / Math.max(1, catchupFps);
   const elapsedMs = lastFrameAt ? now - lastFrameAt : targetMs;
   if (queue.length && elapsedMs >= targetMs) {
@@ -1043,9 +1086,9 @@ function updateServerChunkStats(stats) {
   const wsWrite = Number(stats.ws_write_ms || 0) / 1000;
   const chunkTotal = Number(stats.chunk_total_ms || 0) / 1000;
   const numFrames = Number(stats.num_frames || 0);
-  const requestedFps = Number($("fps").value || DEFAULT_TARGET_FPS);
+  const targetFps = previewPlaybackTargetFps();
   const theoreticalFps = chunkTotal > 0 ? numFrames / chunkTotal : 0;
-  const realtimeRatio = requestedFps > 0 ? theoreticalFps / requestedFps : 0;
+  const realtimeRatio = targetFps > 0 ? theoreticalFps / targetFps : 0;
   $("serverSendText").textContent = `raw ${rawWrite.toFixed(2)}s · ws ${wsWrite.toFixed(2)}s`;
   $("chunkPayloadText").textContent = `${formatBytes(stats.ws_payload_bytes || 0)} · ${numFrames}f`;
   $("theoreticalFpsText").textContent = theoreticalFps > 0
@@ -1072,12 +1115,16 @@ function updatePlaybackPace(header, now, frameCount) {
   const waitSeconds = (now - chunkWaitStartedAt) / 1000;
   if (waitSeconds > 0) {
     const generatedFps = currentReceiveChunkFrames / Math.max(0.001, waitSeconds);
-    const requestedFps = Number($("fps").value || DEFAULT_TARGET_FPS);
-    const playbackFloor = $("superResolution").checked ? 1 : LOW_LATENCY_FPS_FLOOR;
-    playbackFps = Math.min(
-      requestedFps,
-      Math.max(playbackFloor, generatedFps * 1.05),
-    );
+    const isStartupWarmup =
+      chunkIndex === 0 && waitSeconds > PLAYBACK_STARTUP_WARMUP_SECONDS;
+    if (isStartupWarmup) {
+      playbackFps = clampPlaybackFps(requestedInputFps());
+    } else {
+      observedOutputFps = observedOutputFps
+        ? observedOutputFps * (1 - PLAYBACK_FPS_EWMA_ALPHA) + generatedFps * PLAYBACK_FPS_EWMA_ALPHA
+        : generatedFps;
+      playbackFps = clampPlaybackFps(observedOutputFps);
+    }
     const latencyText = `${waitSeconds.toFixed(1)}s · ${playbackFps.toFixed(1)}fps`;
     $("latencyText").textContent = latencyText;
     $("stageLatencyText").textContent = latencyText;
@@ -1256,6 +1303,14 @@ function readPreviewTransportParams() {
   return params;
 }
 
+function tunePreviewQualityForSmooth() {
+  if (!$("frameInterpolation").checked || $("transportFormat").value !== "webp") return;
+  const currentQuality = Number($("transportQuality").value || DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  if (currentQuality > SMOOTH_PREVIEW_OUTPUT_QUALITY) {
+    $("transportQuality").value = String(SMOOTH_PREVIEW_OUTPUT_QUALITY);
+  }
+}
+
 function readFrameInterpolationParams() {
   if (!$("frameInterpolation").checked) return {};
   return {
@@ -1271,10 +1326,13 @@ function readUpscalingScale() {
 
 function readSuperResolutionParams() {
   if (!$("superResolution").checked) return {};
-  return {
+  const params = {
     enable_upscaling: true,
     upscaling_scale: readUpscalingScale(),
   };
+  const modelPath = $("upscalingModel").value;
+  if (modelPath) params.upscaling_model_path = modelPath;
+  return params;
 }
 
 function parseSizeValue(sizeText) {
@@ -1310,7 +1368,9 @@ function updateOutputSizeFromHeader(header) {
 }
 
 function updateSuperResolutionControls() {
-  $("upscalingScale").disabled = !$("superResolution").checked;
+  const disabled = !$("superResolution").checked;
+  $("upscalingScale").disabled = disabled;
+  $("upscalingModel").disabled = disabled;
   updateOutputSizeText();
 }
 
@@ -1378,7 +1438,11 @@ async function applyQueryParams() {
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
   const srParam = params.get("sr");
   $("superResolution").checked = srParam === "1" || srParam === "true";
+  const smoothParam = params.get("smooth");
+  $("frameInterpolation").checked = smoothParam === "1" || smoothParam === "true";
   $("upscalingScale").value = params.get("sr_scale") || String(DEFAULT_UPSCALING_SCALE);
+  $("upscalingModel").value = params.get("sr_model") || DEFAULT_UPSCALING_MODEL;
+  tunePreviewQualityForSmooth();
   setPreviewScale(params.get("preview_scale") || params.get("zoom"));
   updateSuperResolutionControls();
   return {
@@ -1493,6 +1557,7 @@ $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
 $("size").addEventListener("input", () => updateOutputSizeText());
 $("superResolution").addEventListener("change", updateSuperResolutionControls);
 $("upscalingScale").addEventListener("change", () => updateOutputSizeText());
+$("frameInterpolation").addEventListener("change", tunePreviewQualityForSmooth);
 $("previewScale").addEventListener("input", () => setPreviewScale($("previewScale").value));
 $("serverUrl").addEventListener("change", () => {
   queryServerModelInfo({ applyPresetForModel: true }).catch(showError);

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-sr-v38" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-sr-v45" />
   </head>
   <body>
     <main class="shell">
@@ -60,6 +60,13 @@
             </select>
           </label>
         </div>
+        <label>SR model
+          <select id="upscalingModel">
+            <option value="" selected>Quality x2</option>
+            <option value="/scratch/realesr-general-x4v3.pth">Fast general</option>
+            <option value="/scratch/realesr-animevideov3.pth">Fast anime</option>
+          </select>
+        </label>
         <label class="toggle-row"><input id="frameInterpolation" type="checkbox" />Smooth 2x frames</label>
         <label class="toggle-row"><input id="continuous" type="checkbox" checked />Continuous session</label>
         <div class="actions">
@@ -145,6 +152,6 @@
         </section>
       </section>
     </main>
-    <script src="./app.js?v=realtime-sr-v38"></script>
+    <script src="./app.js?v=realtime-sr-v45"></script>
   </body>
 </html>
