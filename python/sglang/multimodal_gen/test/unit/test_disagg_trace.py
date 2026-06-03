@@ -18,7 +18,9 @@ collector required):
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -36,11 +38,12 @@ try:
     from opentelemetry import trace as otel_trace
     from opentelemetry.sdk.trace import TracerProvider
 
-    _OTEL_AVAILABLE = True
+    _OTEL_AVAILABLE = srt_trace.opentelemetry_imported
 except ImportError:
     _OTEL_AVAILABLE = False
 
 
+_MISSING = object()
 _OTEL_BOOTSTRAPPED = False
 
 
@@ -49,6 +52,10 @@ def _enable_minimal_otel() -> None:
     spans. Idempotent — the TracerProvider can only be set once per process."""
     global _OTEL_BOOTSTRAPPED
     if not _OTEL_BOOTSTRAPPED:
+        # Own the provider for this hermetic unit test, then restore the
+        # process-global OTel state in tearDown.
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+        otel_trace._TRACER_PROVIDER = None
         otel_trace.set_tracer_provider(TracerProvider())
         _OTEL_BOOTSTRAPPED = True
     srt_trace.opentelemetry_initialized = True
@@ -76,6 +83,52 @@ def _roundtrip_scalar_fields(scalar_fields: dict) -> dict:
 
 
 class TestDisaggTracePropagation(unittest.TestCase):
+    def setUp(self):
+        global _OTEL_BOOTSTRAPPED
+
+        self._orig_otel_initialized = srt_trace.opentelemetry_initialized
+        self._orig_tracer = srt_trace.tracer
+        self._orig_trace_level = srt_trace.global_trace_level
+        self._orig_threads_info = srt_trace.threads_info.copy()
+        self._orig_otel_bootstrapped = _OTEL_BOOTSTRAPPED
+        if _OTEL_AVAILABLE:
+            self._orig_otel_provider = getattr(otel_trace, "_TRACER_PROVIDER", _MISSING)
+            self._orig_otel_provider_set_once_done = getattr(
+                otel_trace._TRACER_PROVIDER_SET_ONCE, "_done", _MISSING
+            )
+        else:
+            self._orig_otel_provider = _MISSING
+            self._orig_otel_provider_set_once_done = _MISSING
+
+        _OTEL_BOOTSTRAPPED = False
+        srt_trace.set_global_trace_level(3)
+
+        # Isolate the disagg JSON trace-carrier contract from ServerArgs
+        # defaults; those defaults are covered by server-args/trace tests.
+        self._server_args_patcher = patch.object(
+            srt_trace,
+            "get_global_server_args",
+            return_value=SimpleNamespace(trace_modules="request"),
+        )
+        self._server_args_patcher.start()
+
+    def tearDown(self):
+        global _OTEL_BOOTSTRAPPED
+
+        self._server_args_patcher.stop()
+        srt_trace.opentelemetry_initialized = self._orig_otel_initialized
+        srt_trace.tracer = self._orig_tracer
+        srt_trace.global_trace_level = self._orig_trace_level
+        srt_trace.threads_info.clear()
+        srt_trace.threads_info.update(self._orig_threads_info)
+        _OTEL_BOOTSTRAPPED = self._orig_otel_bootstrapped
+        if self._orig_otel_provider is not _MISSING:
+            otel_trace._TRACER_PROVIDER = self._orig_otel_provider
+        if self._orig_otel_provider_set_once_done is not _MISSING:
+            otel_trace._TRACER_PROVIDER_SET_ONCE._done = (
+                self._orig_otel_provider_set_once_done
+            )
+
     def test_transfer_keeps_seed_needed_to_rebuild_generator(self):
         req = Req(request_id="test-seed", prompt="x")
         req.generator = torch.Generator(device="cpu").manual_seed(req.seed)
@@ -187,7 +240,6 @@ class TestDisaggTracePropagation(unittest.TestCase):
         self.assertTrue(rebuilt.trace_ctx.is_copy)
         self.assertFalse(hasattr(rebuilt, "_trace_state"))
 
-    @unittest.skipUnless(_OTEL_AVAILABLE, "opentelemetry SDK not installed")
     def test_build_disagg_req_falls_back_when_tracing_off(self):
         """If the sender's context is a TraceNullContext, the receiver's Req
         keeps its default TraceNullContext (no _trace_state to apply)."""
