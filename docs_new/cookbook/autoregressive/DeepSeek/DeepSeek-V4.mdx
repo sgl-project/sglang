@@ -115,12 +115,12 @@ The generator currently picks values on the **conservative** side (mirroring an 
 - `max-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP currently requires `SGLANG_ENABLE_SPEC_V2=1`.
 
-**EPLB + DeepEP Waterfill**
+**EPLB + DeepEP Waterfill (Experimental)**
 
 For recorded/static EPLB reproduction, first record an expert-distribution file by following
-[Capture expert selection distribution in MoE models](/docs/basic_usage/native_api#capture-expert-selection-distribution-in-moe-models).
+[Capture expert selection distribution in MoE models](../../../docs/basic_usage/native_api#capture-expert-selection-distribution-in-moe-models).
 For reproduction runs, use the generated `expert_distribution_recorder_*.pt` as
-the initial expert location.
+the initial expert location. **Please checkout to latest main branch for this feature.**
 
 For non-PD reproduction, use:
 
@@ -151,6 +151,10 @@ flag to both commands:
 
 You can also add `--ep-num-redundant-experts` and `--eplb-algorithm` to customize
 EPLB placement.
+
+MegaMoE is not supported with this DeepEP Waterfill recipe yet. Waterfill routes
+the shared expert through DeepEP for load balancing, so `--enable-deepep-waterfill`
+requires `--moe-a2a-backend deepep`.
 
 <a id="hopper-note" />
 
