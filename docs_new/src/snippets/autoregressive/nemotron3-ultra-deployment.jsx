@@ -195,23 +195,9 @@ export const Nemotron3UltraDeployment = () => {
         initialState[key] = option.default || '';
         return;
       }
-      let items = option.items || [];
-      if (option.getDynamicItems) {
-        const defaultValues = {};
-        Object.entries(options).forEach(([innerKey, innerOption]) => {
-          if (innerOption.type === 'checkbox') {
-            defaultValues[innerKey] = (innerOption.items || [])
-              .filter((item) => item.default)
-              .map((item) => item.id);
-          } else if (innerOption.type === 'text') {
-            defaultValues[innerKey] = innerOption.default || '';
-          } else if (innerOption.items && innerOption.items.length > 0) {
-            const defaultItem = innerOption.items.find((item) => item.default);
-            defaultValues[innerKey] = defaultItem ? defaultItem.id : innerOption.items[0].id;
-          }
-        });
-        items = option.getDynamicItems(defaultValues);
-      }
+      const items = option.getDynamicItems
+        ? option.getDynamicItems(initialState)
+        : option.items || [];
       const defaultItem = items && items.find((item) => item.default);
       initialState[key] = defaultItem ? defaultItem.id : items && items[0] ? items[0].id : '';
     });
