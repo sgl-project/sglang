@@ -898,8 +898,10 @@ class EAGLEWorker(TpModelWorker):
             with forward_context(
                 ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
             ):
+                # forward_metadata_ready (set at the multi-step pre-plan)
+                # keeps the forward path from re-planning per step.
                 logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
@@ -1230,7 +1232,7 @@ class EAGLEWorker(TpModelWorker):
                 ctx_mgr = contextlib.nullcontext()
             with ctx_mgr:
                 logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
+                    forward_batch
                 ).logits_output
             # Non-cuda-graph path: compute topk_p / topk_index inline.
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
