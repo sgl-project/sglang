@@ -507,11 +507,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def needs_forward_metadata_init(self) -> bool:
         """Single judgment point for whether the forward path must plan.
 
-        Kept as a method (not an inlined attribute read) so the predicate can
-        later grow planner-identity / staleness checks without touching the
-        call sites.
+        A marked batch is treated as stale — and re-planned — when its
+        shapes no longer match the plan record AND the mark site declared
+        the re-plan safe (replan_on_reshape). This runs after
+        prepare_mlp_sync_batch in _forward_raw, so the re-plan sees the
+        padded (final) shapes. Sites that cannot opt in (multi-step
+        wrapper plans etc.) keep today's behavior: marked stays skipped,
+        backends' defensive checks remain the backstop.
         """
-        return not self.forward_metadata_ready
+        if not self.forward_metadata_ready:
+            return True
+        if not self.forward_metadata_replan_on_reshape:
+            return False
+        num_tokens = self.input_ids.shape[0] if self.input_ids is not None else 0
+        return (
+            self.batch_size != self.forward_metadata_planned_bs
+            or num_tokens != self.forward_metadata_planned_num_tokens
+        )
 
     def apply_deprecated_skip_attn_backend_init(
         self, skip_attn_backend_init: Optional[bool]
