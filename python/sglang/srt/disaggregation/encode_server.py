@@ -2485,6 +2485,10 @@ class DPDispatcher:
         self._rr_counter = 0
         self._broadcast_counter = 0
         self._dead_ranks: Set[int] = set()
+        # req_id -> monotonic ts a mooncake mapping has waited for its /send.
+        self._pending_send_at: Dict[str, float] = {}
+        # Set when _result_listener gives up; makes alive_ranks report empty.
+        self._listener_failed = False
 
     @property
     def pending_counts(self) -> List[int]:
@@ -2492,19 +2496,49 @@ class DPDispatcher:
 
     @property
     def alive_ranks(self) -> List[int]:
-        # Ranks whose worker subprocess is still running; the watchdog moves
-        # the rest into _dead_ranks on process exit.
+        # Empty if the result listener died; else ranks not marked dead.
+        if self._listener_failed:
+            return []
         return [r for r in range(self.dp_size) if r not in self._dead_ranks]
+
+    @property
+    def all_ranks_alive(self) -> bool:
+        # Strict health (only /health uses this); routing still degrades.
+        return len(self.alive_ranks) == self.dp_size
 
     def start(self) -> None:
         logger.info(f"DP dispatcher started: {self.dp_size} ranks (all remote)")
         asyncio.create_task(self._result_listener())
         asyncio.create_task(self._worker_watchdog())
+        asyncio.create_task(self._cleanup_stale_mappings())
 
     def _drop_pending_and_mapping(self, rank: int, req_id: str) -> None:
         # dispatch / broadcast failure: no follow-up /send expected.
         self.pending_futures[rank].pop(req_id, None)
         self.req_id_to_rank.pop(req_id, None)
+
+    def _fail_pending_for_rank(self, rank: int, reason: str, error_type: str) -> None:
+        # Resolve a rank's outstanding futures with 503 so awaiters don't hang.
+        pending = self.pending_futures[rank]
+        for key, future in list(pending.items()):
+            if not future.done():
+                future.set_result(
+                    {
+                        "req_id": key.removesuffix("_send"),
+                        "_dp_type": "send" if key.endswith("_send") else "encode",
+                        "content": None,
+                        "_error": reason,
+                        "_error_type": error_type,
+                        "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+                    }
+                )
+            pending.pop(key, None)
+
+    def _fail_all_pending(self, reason: str, error_type: str) -> None:
+        for rank in range(self.dp_size):
+            self._fail_pending_for_rank(rank, reason, error_type)
+        self.req_id_to_rank.clear()
+        self._pending_send_at.clear()
 
     @staticmethod
     def _timeout_envelope(req_id: str, dp_type: str, reason: str) -> dict:
@@ -2558,6 +2592,14 @@ class DPDispatcher:
 
     async def dispatch_send(self, request: dict) -> dict:
         req_id = request["req_id"]
+        # /send arrived → stop tracking it for stale-mapping GC.
+        self._pending_send_at.pop(req_id, None)
+        if self._listener_failed:
+            return {
+                "req_id": req_id,
+                "_error": "encoder DP result listener stopped; cannot route /send",
+                "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+            }
         rank = self.req_id_to_rank.get(req_id)
         if rank is None:
             logger.warning(
@@ -2691,22 +2733,7 @@ class DPDispatcher:
                 )
                 self._dead_ranks.add(rank)
                 reason = f"DP worker rank={rank} died (exitcode={proc.exitcode})"
-                pending = self.pending_futures[rank]
-                for key, future in list(pending.items()):
-                    if not future.done():
-                        future.set_result(
-                            {
-                                "req_id": key.removesuffix("_send"),
-                                "_dp_type": (
-                                    "send" if key.endswith("_send") else "encode"
-                                ),
-                                "content": None,
-                                "_error": reason,
-                                "_error_type": "WorkerDied",
-                                "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
-                            }
-                        )
-                    pending.pop(key, None)
+                self._fail_pending_for_rank(rank, reason, "WorkerDied")
                 self.req_id_to_rank = {
                     r: rk for r, rk in self.req_id_to_rank.items() if rk != rank
                 }
@@ -2729,6 +2756,12 @@ class DPDispatcher:
                     logger.error(
                         "_result_listener giving up after 30 consecutive errors"
                     )
+                    self._listener_failed = True
+                    self._fail_all_pending(
+                        "encoder DP result listener stopped after repeated "
+                        "recv errors",
+                        "ResultListenerStopped",
+                    )
                     return
                 await asyncio.sleep(min(0.1 * consecutive_errors, 1.0))
                 continue
@@ -2746,7 +2779,9 @@ class DPDispatcher:
             # Only mooncake encode (content=request dict) needs the mapping
             # kept for the follow-up /send.
             keep_mapping = dp_type == "encode" and msg.get("content") is not None
-            if not keep_mapping:
+            if keep_mapping:
+                self._pending_send_at[req_id] = time.monotonic()
+            else:
                 self.req_id_to_rank.pop(req_id, None)
             try:
                 future.set_result(msg)
@@ -2755,6 +2790,33 @@ class DPDispatcher:
                 logger.warning(
                     f"_result_listener: future already done for "
                     f"req_id={req_id}, dp_type={dp_type}"
+                )
+
+    async def _cleanup_stale_mappings(self) -> None:
+        # Evict mappings whose /send never came and free the worker's embedding.
+        ttl = envs.SGLANG_ENCODER_DP_PENDING_SEND_TTL.get()
+        interval = max(ttl / 4, 30)
+        while True:
+            await asyncio.sleep(interval)
+            now = time.monotonic()
+            stale = [rid for rid, ts in self._pending_send_at.items() if now - ts > ttl]
+            for rid in stale:
+                self._pending_send_at.pop(rid, None)
+                rank = self.req_id_to_rank.pop(rid, None)
+                if rank is not None and rank not in self._dead_ranks:
+                    try:
+                        await self.dispatch_sockets[rank].send_pyobj(
+                            {"_dp_type": "drop", "req_id": rid}
+                        )
+                    except Exception:
+                        logger.error(
+                            f"failed to send drop for stale req_id={rid}",
+                            exc_info=True,
+                        )
+            if stale:
+                logger.warning(
+                    f"Evicted {len(stale)} stale encoder DP /send mapping(s) "
+                    f"with no /send within {ttl}s"
                 )
 
 
@@ -2793,6 +2855,10 @@ async def _dp_worker_handle_request(
     request: dict,
     dp_type: str,
 ) -> None:
+    if dp_type == "drop":
+        # dispatcher evicted a stale mapping; free the held embedding, no reply
+        enc.embedding_to_send.pop(request["req_id"], None)
+        return
     t0 = time.time()
     try:
         if dp_type in ("start_profile", "stop_profile"):
@@ -2893,44 +2959,50 @@ async def run_dp_worker(
 
     # Task-per-request so EncoderScheduler.pending_queue accumulates and
     # actual cross-request batching can happen.
-    while True:
-        await inflight_sem.acquire()
-        # Released by _run on success or the outer finally if not spawned.
-        spawned = False
-        try:
+    try:
+        while True:
+            await inflight_sem.acquire()
+            # Released by _run on success or the outer finally if not spawned.
+            spawned = False
             try:
-                request = await recv_sock.recv_pyobj()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.error(f"DP worker {dp_rank} recv error", exc_info=True)
-                continue
-            if not isinstance(request, dict):
-                logger.error(
-                    f"DP worker {dp_rank} received non-dict request "
-                    f"({type(request).__name__}); dropping"
-                )
-                continue
-            dp_type = request.pop("_dp_type", "encode")
-
-            async def _run(req=request, t=dp_type):
                 try:
-                    await _dp_worker_handle_request(
-                        enc, sched, send_sock, send_lock, dp_rank, req, t
+                    request = await recv_sock.recv_pyobj()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.error(f"DP worker {dp_rank} recv error", exc_info=True)
+                    continue
+                if not isinstance(request, dict):
+                    logger.error(
+                        f"DP worker {dp_rank} received non-dict request "
+                        f"({type(request).__name__}); dropping"
                     )
-                finally:
-                    inflight_sem.release()
+                    continue
+                dp_type = request.pop("_dp_type", "encode")
 
-            task = asyncio.create_task(_run())
-            # Ownership transferred to _run; mark before any op that could
-            # raise (theoretical: set.add / add_done_callback) and cause a
-            # double-release.
-            spawned = True
-            inflight.add(task)
-            task.add_done_callback(inflight.discard)
-        finally:
-            if not spawned:
-                inflight_sem.release()
+                async def _run(req=request, t=dp_type):
+                    try:
+                        await _dp_worker_handle_request(
+                            enc, sched, send_sock, send_lock, dp_rank, req, t
+                        )
+                    finally:
+                        inflight_sem.release()
+
+                task = asyncio.create_task(_run())
+                # Ownership transferred to _run; mark before any op that could
+                # raise (theoretical: set.add / add_done_callback) and cause a
+                # double-release.
+                spawned = True
+                inflight.add(task)
+                task.add_done_callback(inflight.discard)
+            finally:
+                if not spawned:
+                    inflight_sem.release()
+    finally:
+        # Close zmq on exception/cancellation (normal stop is parent SIGKILL).
+        for task in inflight:
+            task.cancel()
+        ctx.destroy(linger=0)
 
 
 def launch_dp_worker(
@@ -3412,8 +3484,8 @@ async def health_generate():
     Returns 200 if the encoder is healthy, 503 otherwise.
     """
     if dp_dispatcher is not None:
-        # All worker subprocesses dead → nothing can serve, report unhealthy.
-        if not dp_dispatcher.alive_ranks:
+        # Strict: any dead rank fails health → orchestrator restarts the pod.
+        if not dp_dispatcher.all_ranks_alive:
             return Response(status_code=503)
         return Response(status_code=200)
     if encoder is None:
