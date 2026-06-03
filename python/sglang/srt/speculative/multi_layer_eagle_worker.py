@@ -764,6 +764,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     self.mtp_model_runner(step).attn_backend.init_forward_metadata(
                         forward_batch
                     )
+                    forward_batch.mark_forward_metadata_ready()
                 logits_output = (
                     self.mtp_model_runner(step)
                     .forward(forward_batch, skip_attn_backend_init=True)
