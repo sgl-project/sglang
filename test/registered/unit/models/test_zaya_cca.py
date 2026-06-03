@@ -109,7 +109,9 @@ class _MockReqToTokenPool:
         self.conv_state = torch.zeros(
             num_layers, pool_size + 1, in_out_ch_per_rank, total_padding
         )
-        self.prev_hs_state = torch.zeros(num_layers, pool_size + 1, cca_config.hidden_size, 1)
+        self.prev_hs_state = torch.zeros(
+            num_layers, pool_size + 1, cca_config.hidden_size, 1
+        )
         self.temporal = torch.zeros(num_layers, pool_size + 1, 1, 1, 0)
         self._layer_map = {lid: i for i, lid in enumerate(cca_config.linear_layer_ids)}
         self._identity_map = torch.arange(pool_size + 1, dtype=torch.int32)
@@ -558,9 +560,15 @@ class TestZayaCCATensorParallel(CustomTestCase):
         k_heads_per_rank = cfg.num_query_groups // self.TP_SIZE
         q_lo, q_hi = tp_rank * q_heads_per_rank, (tp_rank + 1) * q_heads_per_rank
         k_lo, k_hi = tp_rank * k_heads_per_rank, (tp_rank + 1) * k_heads_per_rank
-        torch.testing.assert_close(rank_q, full_q[:, q_lo:q_hi, :], atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(rank_k, full_k[:, k_lo:k_hi, :], atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(rank_v, full_v[:, k_lo:k_hi, :], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            rank_q, full_q[:, q_lo:q_hi, :], atol=1e-5, rtol=1e-5
+        )
+        torch.testing.assert_close(
+            rank_k, full_k[:, k_lo:k_hi, :], atol=1e-5, rtol=1e-5
+        )
+        torch.testing.assert_close(
+            rank_v, full_v[:, k_lo:k_hi, :], atol=1e-5, rtol=1e-5
+        )
 
     def test_tp2_extend_matches_full(self):
         """Single-chunk extend with TP=2 produces the same q / k / v slices
@@ -583,7 +591,9 @@ class TestZayaCCATensorParallel(CustomTestCase):
             full_q, full_k, full_v = ref_cca.forward(hs, ref_fb)
 
         for tp_rank in range(self.TP_SIZE):
-            rank_cca, _ = _make_tiny_cca(seed=21 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE)
+            rank_cca, _ = _make_tiny_cca(
+                seed=21 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE
+            )
             self._slice_full_state_dict_into_rank(ref_cca, rank_cca, tp_rank)
             rank_pool = _MockReqToTokenPool(
                 pool_size=8, cca_config=cfg, tp_size=self.TP_SIZE
@@ -636,7 +646,9 @@ class TestZayaCCATensorParallel(CustomTestCase):
             )
 
         for tp_rank in range(self.TP_SIZE):
-            rank_cca, _ = _make_tiny_cca(seed=22 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE)
+            rank_cca, _ = _make_tiny_cca(
+                seed=22 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE
+            )
             self._slice_full_state_dict_into_rank(ref_cca, rank_cca, tp_rank)
             rank_pool = _MockReqToTokenPool(
                 pool_size=8, cca_config=cfg, tp_size=self.TP_SIZE
@@ -697,7 +709,9 @@ class TestZayaCCATensorParallel(CustomTestCase):
         k_per_rank = num_k_heads_full // self.TP_SIZE
 
         for tp_rank in range(self.TP_SIZE):
-            rank_cca, _ = _make_tiny_cca(seed=23 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE)
+            rank_cca, _ = _make_tiny_cca(
+                seed=23 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE
+            )
             self._slice_full_state_dict_into_rank(ref_cca, rank_cca, tp_rank)
             rank_pool = _MockReqToTokenPool(
                 pool_size=4, cca_config=cfg, tp_size=self.TP_SIZE

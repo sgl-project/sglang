@@ -464,7 +464,9 @@ class CCA(nn.Module):
         eps = 1e-12
         sqrt_head_dim = float(self.sqrt_head_dim)
         query_fp32 = query.to(torch.float32)
-        inv_q = torch.rsqrt(query_fp32.pow(2).sum(-1, keepdim=True) + eps) * sqrt_head_dim
+        inv_q = (
+            torch.rsqrt(query_fp32.pow(2).sum(-1, keepdim=True) + eps) * sqrt_head_dim
+        )
         query_fp32 = query_fp32 * inv_q
 
         key_fp32 = key.to(torch.float32)
@@ -503,10 +505,14 @@ class CCA(nn.Module):
             + 0.5 * query_pre_grouped_fp32
             + 0.5 * key_base_fp32.unsqueeze(-2)
         )
-        query_out = query_out_grouped.reshape(query_pre.shape[0], -1, query_pre.shape[-1])
+        query_out = query_out_grouped.reshape(
+            query_pre.shape[0], -1, query_pre.shape[-1]
+        )
 
         query_pre_mean = query_pre_grouped_fp32.mean(dim=-2, dtype=torch.float32)
-        key_out = key_conv.to(torch.float32) + 0.5 * query_pre_mean + 0.5 * key_base_fp32
+        key_out = (
+            key_conv.to(torch.float32) + 0.5 * query_pre_mean + 0.5 * key_base_fp32
+        )
         return query_out, key_out
 
     def _conv_qk_run(self, padded: torch.Tensor) -> torch.Tensor:
@@ -528,7 +534,9 @@ class CCA(nn.Module):
             return value_full
         return value_full[:, self.k_head_start : self.k_head_end, :].contiguous()
 
-    def _forward_no_state(self, hs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _forward_no_state(
+        self, hs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reference path: process the entire ``hs`` of shape ``[S, H]`` with
         a zero initial conv state and a zero ``prev_hs``.
 
@@ -569,8 +577,10 @@ class CCA(nn.Module):
         hs_shifted = F.pad(hs_3d[:-1], (0, 0, 0, 0, 1, 0))  # [S, 1, H]
         v1, _ = self.val_proj1(hs_3d)
         v2, _ = self.val_proj2(hs_shifted)
-        value_full = torch.cat([v1, v2], dim=-1).squeeze(1).view(
-            S, self.num_k_heads_full, self.head_dim
+        value_full = (
+            torch.cat([v1, v2], dim=-1)
+            .squeeze(1)
+            .view(S, self.num_k_heads_full, self.head_dim)
         )
         value = self._slice_v_per_rank(value_full)
         return query, key, value
@@ -642,17 +652,15 @@ class CCA(nn.Module):
             for i, s in enumerate(seq_lens):
                 end = start + s
                 a_i = offsets_in[i]
-                qk_out[start:end] = (
-                    packed_out[0, :, a_i : a_i + s].transpose(0, 1)
-                )
+                qk_out[start:end] = packed_out[0, :, a_i : a_i + s].transpose(0, 1)
                 new_state = packed[0, :, a_i + s : a_i + s + pad]
                 conv_state[mamba_idx_cpu[i]] = new_state.to(conv_state.dtype)
 
                 hs_cur = hidden_states[start:end]
                 first = hidden_states.new_zeros((1, self.hidden_size))
                 v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
-                prev_hs_state[mamba_idx_cpu[i]] = hs_cur[-1].unsqueeze(-1).to(
-                    prev_hs_state.dtype
+                prev_hs_state[mamba_idx_cpu[i]] = (
+                    hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
                 )
                 start = end
         else:
@@ -666,9 +674,7 @@ class CCA(nn.Module):
                 if has_prefix:
                     left_pad = conv_state[mamba_idx].unsqueeze(0).to(dtype)
                 else:
-                    left_pad = qk_cur.new_zeros(
-                        (1, self.in_out_ch, self.total_padding)
-                    )
+                    left_pad = qk_cur.new_zeros((1, self.in_out_ch, self.total_padding))
                 padded = torch.cat([left_pad, qk_cur], dim=-1)
 
                 out = self._conv_qk_run(padded)  # [1, C, S_cur]
@@ -679,16 +685,14 @@ class CCA(nn.Module):
 
                 hs_cur = hidden_states[start:end]
                 if has_prefix:
-                    first = (
-                        prev_hs_state[mamba_idx].squeeze(-1).to(dtype).unsqueeze(0)
-                    )
+                    first = prev_hs_state[mamba_idx].squeeze(-1).to(dtype).unsqueeze(0)
                 else:
                     first = hidden_states.new_zeros((1, self.hidden_size))
                 shifted = torch.cat([first, hs_cur[:-1]], dim=0)
                 v2_input[start:end] = shifted
 
-                prev_hs_state[mamba_idx] = hs_cur[-1].unsqueeze(-1).to(
-                    prev_hs_state.dtype
+                prev_hs_state[mamba_idx] = (
+                    hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
                 )
 
                 start = end
@@ -744,9 +748,7 @@ class CCA(nn.Module):
         qk_out = out.squeeze(-1)  # [T, C]
 
         new_state = padded[..., -self.total_padding :]
-        conv_state.index_copy_(
-            0, mamba_indices, new_state.to(conv_state.dtype)
-        )
+        conv_state.index_copy_(0, mamba_indices, new_state.to(conv_state.dtype))
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
             T, self.num_q_heads, self.head_dim
@@ -847,15 +849,11 @@ class ZayaAttention(nn.Module):
             f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
             "DP attention (enable_dp_attention) is not supported for ZAYA1."
         )
-        assert (
-            self.num_q_heads_full % self.tp_size == 0
-        ), (
+        assert self.num_q_heads_full % self.tp_size == 0, (
             f"num_attention_heads ({self.num_q_heads_full}) must be divisible "
             f"by tp_size ({self.tp_size}) for ZAYA1 head-parallel attention"
         )
-        assert (
-            self.num_k_heads_full % self.tp_size == 0
-        ), (
+        assert self.num_k_heads_full % self.tp_size == 0, (
             f"num_query_groups ({self.num_k_heads_full}) must be divisible by "
             f"tp_size ({self.tp_size}); set tp_size <= num_k_heads to keep "
             "both grouped-mean and conv_qk.1 head-local on each rank"
@@ -1584,7 +1582,9 @@ class ZayaForCausalLM(nn.Module):
 
             match = self._EXPERT_RE.match(ckpt_name)
             if match is not None:
-                experts_prefix = match.group(1)  # e.g. model.layers.1.zaya_block.experts
+                experts_prefix = match.group(
+                    1
+                )  # e.g. model.layers.1.zaya_block.experts
                 expert_id = int(match.group(2))
                 kind = match.group(3)
                 moe_module = fused_moe_modules.get(experts_prefix)

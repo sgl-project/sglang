@@ -29,9 +29,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _reference_blend(
-    hidden_states: torch.Tensor,   # [T, H]
-    probs: torch.Tensor,           # [T, 1]
-    indices: torch.Tensor,         # [T, 1]
+    hidden_states: torch.Tensor,  # [T, H]
+    probs: torch.Tensor,  # [T, 1]
+    indices: torch.Tensor,  # [T, 1]
     experts_out_full: torch.Tensor,  # [T, H] -- already-reduced full experts output
     num_moe_experts: int,
 ) -> torch.Tensor:
@@ -119,15 +119,16 @@ class TestZayaMODUnderTP(CustomTestCase):
                 )
                 full, partials = self._make_partials(T, H, tp_size)
 
-                ref = _reference_blend(
-                    hidden_states, probs, indices, full, num_experts
-                )
+                ref = _reference_blend(hidden_states, probs, indices, full, num_experts)
                 real = _real_tp_blend(
                     hidden_states, probs, indices, partials, num_experts
                 )
 
                 torch.testing.assert_close(
-                    real, ref, atol=1e-5, rtol=1e-5,
+                    real,
+                    ref,
+                    atol=1e-5,
+                    rtol=1e-5,
                     msg=f"tp_size={tp_size} frac_skip={frac_skip}",
                 )
 
