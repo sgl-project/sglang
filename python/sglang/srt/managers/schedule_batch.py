@@ -2405,17 +2405,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
             other_idx = 1 - req.mamba_next_track_idx
-            assert buf[other_idx].item() == -1, (
-                f"Lazy ping-pong slot leak: buf={buf.tolist()}, "
-                f"next_track_idx={req.mamba_next_track_idx}, "
-                f"seq_len={self.seq_lens_cpu[i].item()}, "
-                f"forward_mode={self.forward_mode}, "
-                f"rid={req.rid}"
-            )
-            new_slot = pool.mamba_pool.alloc(1)
-            if new_slot is None:
-                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            if buf[other_idx].item() != -1:
+                # With overlap the previous forward's post-processing
+                # (which frees this slot) hasn't run yet. Skip.
+                continue
+            if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
+                new_slot = None
+            else:
                 new_slot = pool.mamba_pool.alloc(1)
+                if new_slot is None:
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    new_slot = pool.mamba_pool.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx
