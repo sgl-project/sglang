@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-sr-v46" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-record-v47" />
   </head>
   <body>
     <main class="shell">
@@ -87,6 +87,11 @@
             <span id="statusDot" class="dot"></span>
             <span id="statusText">Idle</span>
             <span id="chunkText">chunk -</span>
+            <button id="recordBtn" class="record-button" type="button" aria-pressed="false" title="Record preview">
+              <span class="record-button-icon" aria-hidden="true"></span>
+              <span id="recordLabel">Record</span>
+              <span id="recordDuration" class="record-button-duration">00:00</span>
+            </button>
             <span class="topbar-spacer"></span>
             <label class="preview-scale-control">Preview
               <input id="previewScale" type="range" min="80" max="170" value="120" />
@@ -158,6 +163,6 @@
       </section>
     </main>
   <script src="./playback_controller.js?v=realtime-playback-v13"></script>
-  <script src="./app.js?v=realtime-playback-v70"></script>
+  <script src="./app.js?v=realtime-record-v71"></script>
 </body>
 </html>

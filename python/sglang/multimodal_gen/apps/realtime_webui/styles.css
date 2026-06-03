@@ -289,6 +289,56 @@ button:focus-visible {
 }
 
 .topbar-spacer { flex: 1; }
+.record-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 0 0 104px;
+  min-height: 28px;
+  height: 28px;
+  padding: 0 9px;
+  border-color: rgba(232, 234, 223, 0.22);
+  background: rgba(238, 241, 236, 0.08);
+  color: #e8eadf;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.record-button:hover:not(:disabled) {
+  border-color: rgba(232, 234, 223, 0.44);
+  background: rgba(238, 241, 236, 0.14);
+  box-shadow: none;
+}
+.record-button.is-recording {
+  border-color: color-mix(in oklch, var(--accent), white 18%);
+  background: var(--accent);
+  color: #fffdf7;
+}
+.record-button.is-saving {
+  cursor: wait;
+  opacity: 0.76;
+}
+.record-button-icon {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.16);
+}
+.record-button.is-recording .record-button-icon {
+  border-radius: 2px;
+  background: #fffdf7;
+  box-shadow: none;
+}
+.record-button-duration {
+  display: inline-block;
+  min-width: 34px;
+  text-align: right;
+  color: rgba(232, 234, 223, 0.7);
+}
+.record-button.is-recording .record-button-duration {
+  color: rgba(255, 253, 247, 0.86);
+}
 .preview-scale-control {
   display: inline-flex;
   align-items: center;

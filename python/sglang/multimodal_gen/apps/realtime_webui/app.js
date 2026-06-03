@@ -226,6 +226,12 @@ let socketCloseExpected = false;
 let socketServerError = "";
 let renderedPreviewFrames = 0;
 let previewScaleFrame = 0;
+let recordingActive = false;
+let recordingFrames = [];
+let recordingFrameIndex = 0;
+let recordingStartedAt = 0;
+let recordingTimer = 0;
+let recordingSaving = false;
 const decodeRequests = new Map();
 let controlStateController = null;
 
@@ -477,6 +483,270 @@ function clearFrameQueue() {
 
 function closeFrames(items) {
   for (const item of items || []) item.image?.close?.();
+}
+
+function recordingFileName() {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `sglang-realtime-${stamp}.zip`;
+}
+
+function updateRecordButton() {
+  const button = $("recordBtn");
+  button.classList.toggle("is-recording", recordingActive);
+  button.classList.toggle("is-saving", recordingSaving);
+  button.disabled = recordingSaving;
+  button.setAttribute("aria-pressed", recordingActive ? "true" : "false");
+  $("recordLabel").textContent = recordingSaving
+    ? "Saving"
+    : recordingActive ? "Stop" : "Record";
+  const elapsedMs = recordingActive ? performance.now() - recordingStartedAt : 0;
+  $("recordDuration").textContent = formatRecordingDuration(elapsedMs);
+}
+
+function formatRecordingDuration(elapsedMs) {
+  const seconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+}
+
+function startRecording() {
+  if (recordingActive || recordingSaving) return;
+  recordingActive = true;
+  recordingFrames = [];
+  recordingFrameIndex = 0;
+  recordingStartedAt = performance.now();
+  recordingTimer = window.setInterval(updateRecordButton, 250);
+  updateRecordButton();
+  addHistory("recording started");
+}
+
+async function stopRecording() {
+  if (!recordingActive || recordingSaving) return;
+  recordingActive = false;
+  if (recordingTimer) {
+    window.clearInterval(recordingTimer);
+    recordingTimer = 0;
+  }
+  recordingSaving = true;
+  updateRecordButton();
+
+  let fileHandle = null;
+  const fileName = recordingFileName();
+  try {
+    if (window.showSaveFilePicker) {
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: fileName,
+        types: [{
+          description: "Realtime frame archive",
+          accept: { "application/zip": [".zip"] },
+        }],
+      });
+    }
+    const framesToSave = recordingFrames;
+    recordingFrames = [];
+    if (!framesToSave.length) throw new Error("No frames were recorded");
+    const zipBlob = await buildRecordingArchive(framesToSave);
+    if (fileHandle) {
+      const writable = await fileHandle.createWritable();
+      await writable.write(zipBlob);
+      await writable.close();
+    } else {
+      downloadBlob(zipBlob, fileName);
+    }
+    addHistory(`saved ${framesToSave.length} recorded frames`);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      addHistory("recording save canceled");
+    } else {
+      addHistory(error.message || "recording save failed");
+      setStatus("Save failed", "error");
+    }
+  } finally {
+    recordingSaving = false;
+    recordingFrames = [];
+    updateRecordButton();
+  }
+}
+
+function captureRecordingFrame(item, now) {
+  if (!recordingActive) return;
+  const index = recordingFrameIndex++;
+  const path = `frames/frame_${String(index + 1).padStart(6, "0")}.png`;
+  const frame = {
+    index,
+    path,
+    chunk: item.chunk,
+    width: canvas.width,
+    height: canvas.height,
+    timestampMs: Math.round(now - recordingStartedAt),
+  };
+  frame.blobPromise = new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("Failed to encode recorded frame"));
+    }, "image/png");
+  });
+  recordingFrames.push(frame);
+}
+
+async function buildRecordingArchive(framesToSave) {
+  const frames = [];
+  for (const frame of framesToSave) {
+    frames.push({
+      ...frame,
+      blob: await frame.blobPromise,
+    });
+  }
+  const first = frames[0];
+  const manifest = {
+    format: "sglang-realtime-frame-archive",
+    version: 1,
+    width: first.width,
+    height: first.height,
+    fps: previewPlaybackTargetFps(),
+    frame_count: frames.length,
+    frames: frames.map((frame) => ({
+      file: frame.path,
+      index: frame.index,
+      chunk: frame.chunk,
+      timestamp_ms: frame.timestampMs,
+    })),
+  };
+  const entries = [{
+    path: "manifest.json",
+    blob: new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" }),
+  }];
+  for (const frame of frames) entries.push({ path: frame.path, blob: frame.blob });
+  return zipEntries(entries);
+}
+
+function downloadBlob(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function zipEntries(entries) {
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.path);
+    const data = new Uint8Array(await entry.blob.arrayBuffer());
+    const crc = crc32(data);
+    const timeDate = zipTimeDate(new Date());
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const localView = new DataView(localHeader.buffer);
+    writeZipHeader(localView, {
+      signature: 0x04034b50,
+      timeDate,
+      crc,
+      size: data.byteLength,
+      nameBytes,
+    });
+    localHeader.set(nameBytes, 30);
+    localParts.push(localHeader, data);
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const centralView = new DataView(centralHeader.buffer);
+    writeZipHeader(centralView, {
+      signature: 0x02014b50,
+      timeDate,
+      crc,
+      size: data.byteLength,
+      nameBytes,
+      offset,
+    });
+    centralHeader.set(nameBytes, 46);
+    centralParts.push(centralHeader);
+    offset += localHeader.byteLength + data.byteLength;
+  }
+
+  const centralOffset = offset;
+  const centralSize = centralParts.reduce((size, part) => size + part.byteLength, 0);
+  const end = new Uint8Array(22);
+  const endView = new DataView(end.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(8, entries.length, true);
+  endView.setUint16(10, entries.length, true);
+  endView.setUint32(12, centralSize, true);
+  endView.setUint32(16, centralOffset, true);
+  return new Blob([...localParts, ...centralParts, end], { type: "application/zip" });
+}
+
+function writeZipHeader(view, {
+  signature,
+  timeDate,
+  crc,
+  size,
+  nameBytes,
+  offset = 0,
+}) {
+  view.setUint32(0, signature, true);
+  if (signature === 0x02014b50) {
+    view.setUint16(4, 20, true);
+    view.setUint16(6, 20, true);
+    view.setUint16(8, 0, true);
+    view.setUint16(10, 0, true);
+    view.setUint16(12, timeDate.time, true);
+    view.setUint16(14, timeDate.date, true);
+    view.setUint32(16, crc, true);
+    view.setUint32(20, size, true);
+    view.setUint32(24, size, true);
+    view.setUint16(28, nameBytes.length, true);
+    view.setUint32(42, offset, true);
+  } else {
+    view.setUint16(4, 20, true);
+    view.setUint16(6, 0, true);
+    view.setUint16(8, 0, true);
+    view.setUint16(10, timeDate.time, true);
+    view.setUint16(12, timeDate.date, true);
+    view.setUint32(14, crc, true);
+    view.setUint32(18, size, true);
+    view.setUint32(22, size, true);
+    view.setUint16(26, nameBytes.length, true);
+  }
+}
+
+function zipTimeDate(date) {
+  return {
+    time:
+      (date.getHours() << 11) |
+      (date.getMinutes() << 5) |
+      Math.floor(date.getSeconds() / 2),
+    date:
+      ((date.getFullYear() - 1980) << 9) |
+      ((date.getMonth() + 1) << 5) |
+      date.getDate(),
+  };
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let value = i;
+    for (let bit = 0; bit < 8; bit++) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[i] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(data) {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function hasPendingPlaybackInput() {
@@ -787,6 +1057,7 @@ function renderLoop(now) {
   if (decision.action === "draw") {
     const item = decision.frame;
     drawFrame(item.image);
+    captureRecordingFrame(item, now);
     fpsSamples.push(now);
     fpsSamples = fpsSamples.filter((t) => now - t < 1000);
     const renderedFps = String(fpsSamples.length);
@@ -1567,10 +1838,18 @@ applyQueryParams()
   }))
   .catch(showError);
 requestAnimationFrame(renderLoop);
+updateRecordButton();
 $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
 $("enhanceBtn").onclick = enhancePrompt;
+$("recordBtn").onclick = () => {
+  if (recordingActive) {
+    stopRecording();
+  } else {
+    startRecording();
+  }
+};
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
 $("size").addEventListener("input", () => updateOutputSizeText());
 $("fps").addEventListener("input", syncPlaybackTargetFps);
