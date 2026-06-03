@@ -2864,9 +2864,15 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-            if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+            if self.kv_cache_dtype not in [
+                "fp8_e4m3",
+                "nvfp4",
+                "mxfp4",
+                "bf16",
+                "auto",
+            ]:
                 raise ValueError(
-                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, nvfp4, mxfp4, bf16, or auto."
                 )
 
         if (
@@ -3037,7 +3043,7 @@ class ServerArgs:
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
-        if self.kv_cache_dtype != "fp4_e2m1":
+        if self.kv_cache_dtype not in ("nvfp4", "mxfp4"):
             return
 
         use_mla_backend = self.use_mla_backend()
@@ -3047,6 +3053,13 @@ class ServerArgs:
         )
 
         if is_cuda():
+            if self.kv_cache_dtype == "nvfp4" and not (
+                is_sm100_supported() or is_sm120_supported()
+            ):
+                raise RuntimeError(
+                    "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
+                    "Use --kv-cache-dtype=mxfp4 for the MXFP4 recipe."
+                )
             if (
                 self.prefill_attention_backend_str != self.decode_attention_backend_str
                 and self.prefill_attention_backend_str != "fa4"
@@ -3608,11 +3621,11 @@ class ServerArgs:
                 "Other prefill-only workloads may be supported in a future change once "
                 "their attention paths stop reading or writing the paged KV cache."
             )
-        if self.kv_cache_dtype == "fp4_e2m1":
+        if self.kv_cache_dtype in ("nvfp4", "mxfp4"):
             raise ValueError(
                 "--prefill-only-disable-kv-cache does not currently support "
-                "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
-                "allocation path."
+                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=mxfp4 because "
+                "the FP4 pool uses a separate allocation path."
             )
 
         # Structural preconditions for the FA backend's fa_skip_kv_cache path,
@@ -4644,8 +4657,16 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" uses internal FP4 KV recipe selection (NVFP4 on SM100/SM120, MXFP4 otherwise) and requires CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "nvfp4",
+                "mxfp4",
+            ],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "nvfp4" and "mxfp4" explicitly select FP4 E2M1 KV cache recipes and require CUDA 12.8+ and PyTorch 2.8.0+',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

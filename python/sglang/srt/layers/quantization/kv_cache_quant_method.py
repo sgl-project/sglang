@@ -12,15 +12,18 @@
 # limitations under the License.
 # ==============================================================================
 """
-KV cache quantization strategy pattern.
+Canonical KV cache quantization methods.
 
-Three-player design:
-  quant_method (pure compute)  ─►  Pool (buffer + batch dequant)  ─►  Backend (view adaptation)
+This module owns the public runtime abstraction for quantized KV cache storage:
 
-Adding a new FP4 scheme only requires:
-  1. Implement a KVCacheQuantMethod subclass
-  2. Register in KV_CACHE_QUANT_REGISTRY
-  3. Resolve it internally from --kv-cache-dtype when appropriate
+* ``KVCacheQuantMethod`` defines the buffer/quantize/dequantize contract.
+* ``NVFP4Method`` and ``MXFP4Method`` implement the two FP4 recipes exposed by
+  ``--kv-cache-dtype nvfp4`` and ``--kv-cache-dtype mxfp4``.
+* ``kvfp4_tensor.py`` contains only low-level tensor/FlashInfer helpers.
+
+Recipe selection is explicit. This file must not infer NVFP4 vs MXFP4 from the
+GPU architecture; hardware only affects per-recipe implementation details such
+as NVFP4 scale conversion.
 """
 
 from abc import ABC, abstractmethod
@@ -473,35 +476,38 @@ class MXFP4Method(KVCacheQuantMethod):
         return fp4_size + scale_size + dq_size
 
 
-# Registry: name → class.  Only classes for fp4_e2m1 dtype need to be listed.
+# Registry: explicit --kv-cache-dtype value -> method class.
 KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethod]] = {
     "nvfp4": NVFP4Method,
     "mxfp4": MXFP4Method,
 }
 
 
-def _is_fp4_kv_cache_dtype(kv_cache_dtype) -> bool:
-    if isinstance(kv_cache_dtype, str):
-        return kv_cache_dtype == "fp4_e2m1"
-    return (
-        hasattr(torch, "float4_e2m1fn_x2")
-        and kv_cache_dtype == torch.float4_e2m1fn_x2
-    )
-
-
 def resolve_kv_cache_quant(
     kv_cache_dtype, sm_version: Optional[int] = None
 ) -> Optional[str]:
-    """Resolve the internal quant method from the public KV cache dtype.
+    """Resolve the explicit FP4 KV cache recipe from ``--kv-cache-dtype``."""
+    del sm_version  # Kept for older call sites; recipe selection is not hardware based.
 
-    The user-facing API remains a single parameter: --kv-cache-dtype.
-    """
-    if not _is_fp4_kv_cache_dtype(kv_cache_dtype):
+    if not isinstance(kv_cache_dtype, str):
+        if (
+            hasattr(torch, "float4_e2m1fn_x2")
+            and kv_cache_dtype == torch.float4_e2m1fn_x2
+        ):
+            raise ValueError(
+                "FP4 KV cache storage dtype does not identify the recipe. "
+                "Pass the explicit --kv-cache-dtype value: 'nvfp4' or 'mxfp4'."
+            )
         return None
 
-    if sm_version is None or sm_version in (100, 120):
-        return "nvfp4"
-    return "mxfp4"
+    if kv_cache_dtype == "fp4_e2m1":
+        raise ValueError(
+            "--kv-cache-dtype=fp4_e2m1 no longer auto-selects an FP4 KV recipe. "
+            "Use --kv-cache-dtype=nvfp4 or --kv-cache-dtype=mxfp4."
+        )
+    if kv_cache_dtype in KV_CACHE_QUANT_REGISTRY:
+        return kv_cache_dtype
+    return None
 
 
 def get_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethod:

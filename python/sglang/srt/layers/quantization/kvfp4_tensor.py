@@ -12,16 +12,14 @@
 # limitations under the License.
 # ==============================================================================
 
-# Define a enum class for FP4 formats, including MXFP4, NVFP4 and future formats
-from enum import Enum
+"""Low-level tensor helpers for FP4 KV cache quantization.
+
+Recipe selection and buffer ownership live in ``kv_cache_quant_method.py``. This
+module only implements the packing, unpacking, and FlashInfer calls used by the
+concrete quantization methods.
+"""
 
 import torch
-
-
-class FP4KVCacheRecipe(Enum):
-    MXFP4 = 1  # KVFP4: block-wise scaling
-    NVFP4 = 2  # two-level scaling: global FP32 + block FP8 E4M3
-
 
 E2M1_MAX = 6.0
 # Put constants directly on CUDA if available
