@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -56,7 +57,7 @@ def _enable_minimal_otel() -> None:
         srt_server_args.get_global_server_args()
     except ValueError:
         srt_server_args.set_global_server_args_for_scheduler(
-            srt_server_args.ServerArgs(model_path="test-model")
+            SimpleNamespace(trace_modules="request")
         )
     srt_trace.opentelemetry_initialized = True
     srt_trace.tracer = otel_trace.get_tracer("test-diffusion-disagg")
