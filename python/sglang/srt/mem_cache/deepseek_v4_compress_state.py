@@ -101,9 +101,15 @@ class CompressStatePool:
             assert ring_size == 1, "online compress requires ring_size=1"
             self._logical_size = size + self.ring_size + 1
             if envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-                # Bank 0 is the committed state. Banks 1..8 cache per-draft
+                # Bank 0 is the committed state. Banks 1..N cache per-draft
                 # prefix states for lazy commit after target verify.
-                self.online_mtp_max_draft_tokens = 8
+                self.online_mtp_max_draft_tokens = (
+                    envs.SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS.get()
+                )
+                assert self.online_mtp_max_draft_tokens > 0, (
+                    "SGLANG_ONLINE_C128_MTP_MAX_DRAFT_TOKENS must be positive "
+                    "when SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
+                )
                 self.online_mtp_state_slot_offset = self._logical_size
             self._size = self._logical_size * (
                 1 + self.online_mtp_max_draft_tokens

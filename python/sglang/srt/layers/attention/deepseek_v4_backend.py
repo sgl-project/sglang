@@ -103,6 +103,13 @@ def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
 
+def _copy_or_replace(dst, src):
+    if dst is not None and src is not None:
+        dst.copy_(src)
+        return dst
+    return src
+
+
 @dataclass
 class DSV4AttnMetadata:
     page_size: int
@@ -304,6 +311,8 @@ class DSV4RawVerifyMetadata:
     out_cache_loc: torch.Tensor
 
     extend_seq_lens: Optional[torch.Tensor] = None
+    seq_lens_cpu: Optional[List[int]] = None
+    c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
     def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
@@ -311,6 +320,10 @@ class DSV4RawVerifyMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
         self.extend_seq_lens = other.extend_seq_lens
+        self.seq_lens_cpu = other.seq_lens_cpu
+        self.c128_compress_metadata = _copy_or_replace(
+            self.c128_compress_metadata, other.c128_compress_metadata
+        )
 
 
 @dataclass
@@ -401,6 +414,42 @@ class DeepseekV4AttnBackend(
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def _target_verify_lengths_cpu(
+        self, seq_lens_cpu: List[int]
+    ) -> Tuple[List[int], List[int]]:
+        num_draft_tokens = self.speculative_num_draft_tokens
+        return (
+            [int(x) + num_draft_tokens for x in seq_lens_cpu],
+            [num_draft_tokens] * len(seq_lens_cpu),
+        )
+
+    def _make_target_verify_c128_metadata(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: List[int],
+        extend_seq_lens: torch.Tensor,
+        use_prefill_cuda_graph: bool,
+        online_c128_state_slot_offset: int,
+    ) -> Optional[FusedCompressMetadata]:
+        if not self.online_c128_mtp.enabled():
+            return None
+
+        seq_lens_cpu, extend_lens_cpu = self._target_verify_lengths_cpu(seq_lens_cpu)
+        return create_paged_compressor_data(
+            compress_ratio=128,
+            is_prefill=True,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens + self.speculative_num_draft_tokens,
+            seq_lens_cpu=seq_lens_cpu,
+            extend_lens=extend_seq_lens,
+            extend_lens_cpu=extend_lens_cpu,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+            online_state_slot_offset=online_c128_state_slot_offset,
+        )
 
     def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
         return PagedIndexerMetadata(
@@ -517,12 +566,18 @@ class DeepseekV4AttnBackend(
         max_seq_len: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
+            seq_lens_cpu_list = (
+                seq_lens.detach().cpu().tolist()
+                if seq_lens_cpu is None
+                else seq_lens_cpu.tolist()
+            )
             if not hasattr(self, "extend_seq_lens_buffer"):
                 self.extend_seq_lens_buffer = torch.tensor(
                     [self.speculative_num_draft_tokens] * 1025, device=self.device
@@ -534,6 +589,15 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
                 extend_seq_lens=extend_seq_lens,
+                seq_lens_cpu=seq_lens_cpu_list,
+                c128_compress_metadata=self._make_target_verify_c128_metadata(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_cpu_list,
+                    extend_seq_lens,
+                    use_prefill_cuda_graph,
+                    online_c128_state_slot_offset,
+                ),
             )
         else:
             seq_lens_cpu = seq_lens.tolist()
@@ -592,8 +656,16 @@ class DeepseekV4AttnBackend(
         seq_lens = seq_lens + self.speculative_num_draft_tokens
         extend_seq_lens = raw_metadata.extend_seq_lens
         assert extend_seq_lens is not None
-        seq_lens_planner = seq_lens.to(torch.int64)
-        extend_seq_lens_planner = extend_seq_lens.to(torch.int64)
+        seq_lens_cpu = raw_metadata.seq_lens_cpu
+        if seq_lens_cpu is None:
+            raise RuntimeError(
+                "target verify cuda graph path requires CPU seq_lens planner inputs"
+            )
+        seq_lens_cpu, extend_lens_cpu = self._target_verify_lengths_cpu(seq_lens_cpu)
+        seq_lens_planner = torch.tensor(seq_lens_cpu, dtype=torch.int64)
+        extend_seq_lens_planner = torch.tensor(
+            extend_lens_cpu, dtype=torch.int64
+        )
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expand_extend_with_same_length(
@@ -623,11 +695,14 @@ class DeepseekV4AttnBackend(
             num_q_tokens=num_draft_tokens * bs,
             online_state_slot_offset=online_c128_state_slot_offset,
         )
+        c128_compress_metadata = raw_metadata.c128_compress_metadata
+        if c128_compress_metadata is None:
+            c128_compress_metadata = create(compress_ratio=128)
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            c128_compress_metadata=c128_compress_metadata,
         )
 
     def make_forward_metadata_from_raw_decode(
@@ -810,6 +885,7 @@ class DeepseekV4AttnBackend(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
@@ -895,6 +971,7 @@ class DeepseekV4AttnBackend(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=forward_batch.out_cache_loc,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
             )
