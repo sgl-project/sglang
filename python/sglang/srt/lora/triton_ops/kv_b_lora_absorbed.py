@@ -141,6 +141,7 @@ def _step_a_q_kernel(
     # meta
     FULL_K: tl.constexpr,  # per-head row stride in B (qk_nope + v_head_dim)
     SORTED_BY_ADAPTER: tl.constexpr,
+    K_DIV: tl.constexpr,  # K % BLOCK_K == 0 -> drop safe_k (keep contraction load coalesced)
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -194,7 +195,7 @@ def _step_a_q_kernel(
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
         k_mask = cur_k < K
-        safe_k = tl.minimum(cur_k, K - 1)
+        safe_k = cur_k if K_DIV else tl.minimum(cur_k, K - 1)
 
         # x[s, h, k]
         x_tile = tl.load(
@@ -285,6 +286,7 @@ def step_a_q_fwd(
         num_segments,
         FULL_K=full_K_per_head,
         SORTED_BY_ADAPTER=sorted_by_adapter,
+        K_DIV=(qk_nope_dim % _STEP_A_Q_BLOCK_K == 0),
         BLOCK_S=_BLOCK_S,
         BLOCK_N=block_n,
         BLOCK_K=_STEP_A_Q_BLOCK_K,
@@ -522,6 +524,7 @@ def _step_a_v_kernel(
     num_segments,
     # meta
     SORTED_BY_ADAPTER: tl.constexpr,
+    K_DIV: tl.constexpr,  # K % BLOCK_K == 0 -> drop safe_k (keep contraction load coalesced)
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -569,7 +572,7 @@ def _step_a_v_kernel(
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
         k_mask = cur_k < K
-        safe_k = tl.minimum(cur_k, K - 1)
+        safe_k = cur_k if K_DIV else tl.minimum(cur_k, K - 1)
 
         # x[s, h, k]
         x_tile = tl.load(
@@ -657,6 +660,7 @@ def step_a_v_fwd(
         batch_info.permutation,
         num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
+        K_DIV=(kv_lora_rank % _STEP_A_V_BLOCK_K == 0),
         BLOCK_S=_BLOCK_S,
         BLOCK_N=block_n,
         BLOCK_K=_STEP_A_V_BLOCK_K,
