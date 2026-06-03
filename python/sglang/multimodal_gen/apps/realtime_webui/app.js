@@ -8,6 +8,9 @@ const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v6";
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 95;
 const DEFAULT_TARGET_FPS = 25;
+const DEFAULT_UPSCALING_MODEL_PATH = "/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth";
+const DEFAULT_UPSCALING_SCALE = 2;
+const DEFAULT_FRAME_INTERPOLATION_MODEL_PATH = "/home/admin/RIFE-4.22.lite";
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
 const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
@@ -850,6 +853,7 @@ async function connect() {
       return;
     }
     const previewTransportParams = readPreviewTransportParams();
+    const upscalingParams = readUpscalingParams();
     const frameInterpolationParams = readFrameInterpolationParams();
     const init = compact({
       type: "init",
@@ -866,6 +870,7 @@ async function connect() {
       max_chunks: $("continuous").checked ? undefined : 1,
       first_frame: firstFrame,
       ...previewTransportParams,
+      ...upscalingParams,
       ...frameInterpolationParams,
     });
     document.activeElement?.blur?.();
@@ -1229,6 +1234,12 @@ function readOptionalInteger(id) {
   return Number(value);
 }
 
+function readOptionalNumber(id) {
+  const value = $(id).value;
+  if (value === "") return undefined;
+  return Number(value);
+}
+
 function readPreviewTransportParams() {
   const outputFormat = $("transportFormat").value;
   const outputQuality = Number($("transportQuality").value || DEFAULT_PREVIEW_OUTPUT_QUALITY);
@@ -1240,13 +1251,26 @@ function readPreviewTransportParams() {
   return params;
 }
 
+function readUpscalingParams() {
+  if (!$("enableUpscaling").checked) return {};
+  return compact({
+    enable_upscaling: true,
+    upscaling_model_path: $("upscalingModelPath").value.trim() || DEFAULT_UPSCALING_MODEL_PATH,
+    upscaling_scale: readOptionalInteger("upscalingScale") ?? DEFAULT_UPSCALING_SCALE,
+  });
+}
+
 function readFrameInterpolationParams() {
   if (!$("frameInterpolation").checked) return {};
-  return {
+  return compact({
     enable_frame_interpolation: true,
-    frame_interpolation_exp: DEFAULT_FRAME_INTERPOLATION_EXP,
-    frame_interpolation_scale: DEFAULT_FRAME_INTERPOLATION_SCALE,
-  };
+    frame_interpolation_exp:
+      readOptionalInteger("frameInterpolationExp") ?? DEFAULT_FRAME_INTERPOLATION_EXP,
+    frame_interpolation_scale:
+      readOptionalNumber("frameInterpolationScale") ?? DEFAULT_FRAME_INTERPOLATION_SCALE,
+    frame_interpolation_model_path:
+      $("frameInterpolationModelPath").value.trim() || DEFAULT_FRAME_INTERPOLATION_MODEL_PATH,
+  });
 }
 
 function selectedTransportLabel() {
@@ -1278,6 +1302,12 @@ function renderPresets() {
   });
 }
 
+function readQueryFlag(params, name) {
+  const value = params.get(name);
+  if (value === null) return undefined;
+  return value === "1";
+}
+
 async function applyQueryParams() {
   const params = new URLSearchParams(window.location.search);
   const presetKey = params.get("preset");
@@ -1299,10 +1329,34 @@ async function applyQueryParams() {
   if (model) $("model").value = model;
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  const srEnabled = readQueryFlag(params, "sr");
+  if (srEnabled !== undefined) $("enableUpscaling").checked = srEnabled;
+  $("upscalingModelPath").value = params.get("sr_model") || DEFAULT_UPSCALING_MODEL_PATH;
+  $("upscalingScale").value = params.get("sr_scale") || String(DEFAULT_UPSCALING_SCALE);
+  const rifeEnabled = readQueryFlag(params, "rife");
+  if (rifeEnabled !== undefined) $("frameInterpolation").checked = rifeEnabled;
+  $("frameInterpolationModelPath").value =
+    params.get("rife_model") || DEFAULT_FRAME_INTERPOLATION_MODEL_PATH;
+  $("frameInterpolationExp").value =
+    params.get("rife_exp") || String(DEFAULT_FRAME_INTERPOLATION_EXP);
+  $("frameInterpolationScale").value =
+    params.get("rife_scale") || String(DEFAULT_FRAME_INTERPOLATION_SCALE);
+  updatePostprocessControls();
   return {
     model: Boolean(model),
     preset: Boolean(presetKey && appliedPreset),
   };
+}
+
+function updatePostprocessControls() {
+  const upscalingEnabled = $("enableUpscaling").checked;
+  ["upscalingModelPath", "upscalingScale"].forEach((id) => {
+    $(id).disabled = !upscalingEnabled;
+  });
+  const interpolationEnabled = $("frameInterpolation").checked;
+  ["frameInterpolationModelPath", "frameInterpolationExp", "frameInterpolationScale"].forEach((id) => {
+    $(id).disabled = !interpolationEnabled;
+  });
 }
 
 function pack(value) {
@@ -1406,6 +1460,8 @@ $("stopBtn").onclick = () => closeSession();
 $("sendPromptBtn").onclick = () => sendEvent("prompt", $("prompt").value);
 $("enhanceBtn").onclick = enhancePrompt;
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
+$("enableUpscaling").addEventListener("change", updatePostprocessControls);
+$("frameInterpolation").addEventListener("change", updatePostprocessControls);
 $("serverUrl").addEventListener("change", () => {
   queryServerModelInfo({ applyPresetForModel: true }).catch(showError);
 });

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v25" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-fixes-v26" />
   </head>
   <body>
     <main class="shell">
@@ -51,7 +51,20 @@
           </label>
           <label>Quality<input id="transportQuality" type="number" value="95" min="1" max="100" /></label>
         </div>
-        <label class="toggle-row"><input id="frameInterpolation" type="checkbox" />Smooth 2x frames</label>
+        <div class="section-title">Post-process</div>
+        <label class="toggle-row"><input id="enableUpscaling" type="checkbox" />SR</label>
+        <div class="postprocess-fields">
+          <label>SR model<input id="upscalingModelPath" value="/home/admin/realesr-general-x4v3/realesr-general-x4v3.pth" /></label>
+          <label>SR scale<input id="upscalingScale" type="number" value="2" min="1" step="1" /></label>
+        </div>
+        <label class="toggle-row"><input id="frameInterpolation" type="checkbox" />RIFE</label>
+        <div class="postprocess-fields">
+          <label>RIFE model<input id="frameInterpolationModelPath" value="/home/admin/RIFE-4.22.lite" /></label>
+          <div class="split">
+            <label>RIFE exp<input id="frameInterpolationExp" type="number" value="1" min="1" step="1" /></label>
+            <label>RIFE scale<input id="frameInterpolationScale" type="number" value="1.0" min="0.1" step="0.1" /></label>
+          </div>
+        </div>
         <label class="toggle-row"><input id="continuous" type="checkbox" checked />Continuous session</label>
         <div class="actions">
           <button id="connectBtn" class="primary">Generate</button>
@@ -124,6 +137,6 @@
         <div id="historyList" class="history-list"></div>
       </section>
     </main>
-    <script src="./app.js?v=realtime-model-info-v31"></script>
+    <script src="./app.js?v=realtime-model-info-v32"></script>
   </body>
 </html>

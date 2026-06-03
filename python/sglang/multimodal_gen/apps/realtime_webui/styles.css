@@ -132,6 +132,12 @@ input, textarea, select {
   outline: none;
 }
 
+input:disabled, textarea:disabled, select:disabled {
+  background: color-mix(in oklch, #fffdf7, var(--line) 24%);
+  color: color-mix(in oklch, var(--muted), white 20%);
+  cursor: not-allowed;
+}
+
 textarea { resize: vertical; line-height: 1.45; }
 input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(185, 84, 60, 0.12); }
 
@@ -148,6 +154,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
   height: 16px;
   accent-color: var(--ink);
 }
+.postprocess-fields {
+  display: grid;
+  gap: 8px;
+  margin: 6px 0 8px 25px;
+}
+.postprocess-fields label { margin: 0; }
 
 button {
   border: 1px solid var(--line);
