@@ -85,6 +85,15 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def recapture_cuda_graphs_after_weight_update(self) -> None:
+        model_runner = self.tp_worker.model_runner
+        if model_runner.graph_runner is not None:
+            logger.info("Recapturing CUDA graphs after weight update")
+            model_runner.graph_runner.capture()
+
+    def mark_cuda_graphs_stale(self) -> None:
+        self.cuda_graphs_need_recapture = True
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
@@ -93,6 +102,7 @@ class SchedulerWeightUpdaterManager:
             success, message = self.draft_worker.update_weights_from_disk(recv_req)
         if tp_success:
             self.flush_cache_after_weight_update(recv_req)
+            self.mark_cuda_graphs_stale()
         if not success:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
@@ -118,6 +128,7 @@ class SchedulerWeightUpdaterManager:
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             self.flush_cache_after_weight_update(recv_req)
+            self.mark_cuda_graphs_stale()
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
@@ -131,6 +142,7 @@ class SchedulerWeightUpdaterManager:
         success, message = worker.update_weights_from_tensor(recv_req)
         if success:
             self.flush_cache_after_weight_update(recv_req)
+            self.mark_cuda_graphs_stale()
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -144,6 +156,7 @@ class SchedulerWeightUpdaterManager:
             success, message = self.draft_worker.update_weights_from_ipc(recv_req)
         if tp_success:
             self.flush_cache_after_weight_update(recv_req)
+            self.mark_cuda_graphs_stale()
         if not success:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -207,6 +220,10 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
+        if getattr(self, "cuda_graphs_need_recapture", False):
+            self.recapture_cuda_graphs_after_weight_update()
+            self.cuda_graphs_need_recapture = False
 
         return ResumeMemoryOccupationReqOutput()
 
