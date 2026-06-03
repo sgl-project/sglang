@@ -206,25 +206,3 @@ class NVFP4QuantizeUtil:
         scales_2d = block_scales.view(torch.uint8).reshape(b * m, -1).contiguous()
         output_2d = nvfp4_kv_dequantize(quant_2d, scales_2d, global_scale, dtype)
         return output_2d.reshape(b, m, n_half * 2)
-
-# Compatibility aliases for the post-rebase main branch helpers.
-BlockFP4KVQuantizeUtil = KVFP4QuantizeUtil
-
-
-class NVFP4KVQuantizeUtil:
-    """Compatibility wrapper matching main branch naming."""
-
-    @staticmethod
-    def quantize(tensor: torch.Tensor, global_scale: torch.Tensor):
-        return NVFP4QuantizeUtil.fi_nvfp4_quantize(tensor, global_scale)
-
-    @staticmethod
-    def dequantize(
-        quant_tensor: torch.Tensor,
-        block_scales: torch.Tensor,
-        global_scale: torch.Tensor,
-        dtype: torch.dtype = torch.bfloat16,
-    ) -> torch.Tensor:
-        return NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
-            quant_tensor, block_scales, global_scale, dtype
-        )

@@ -6576,6 +6576,7 @@ class ServerArgs:
 
 
 
+
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(

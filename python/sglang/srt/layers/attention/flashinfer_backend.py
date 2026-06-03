@@ -349,6 +349,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
+        self.transfer_cur_chunk_kv = False
         # NVFP4 cache storage is packed FP4, but FlashInfer prefill metadata and
         # wrapper selection operate on the dequantized FP8 workspace.
         self.flashinfer_kv_cache_dtype = (
@@ -796,7 +797,8 @@ class FlashInferAttnBackend(AttentionBackend):
         # Ragged prefill handles current-chunk K/V with raw tensors, so the
         # paged side only contains cached prefix lengths. Non-ragged prefill
         # uses the dequant workspace for prefix + current chunk, so it needs
-        # full sequence lengths.
+        # full sequence lengths. These CPU length containers may arrive as
+        # Python lists or CPU tensors depending on the metadata builder.
         paged_seq_lens_cpu = (
             forward_batch.extend_prefix_lens_cpu
             if use_ragged

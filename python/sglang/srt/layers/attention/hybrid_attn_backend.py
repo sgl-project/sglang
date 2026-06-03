@@ -139,6 +139,7 @@ class HybridAttnBackend(AttentionBackend):
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
 
+
     def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
 
         if self.model_runner.server_args.speculative_attention_mode == "decode":

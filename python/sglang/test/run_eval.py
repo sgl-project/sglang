@@ -61,22 +61,6 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         if value is not None:
             extra_body[param_name] = value
 
-    custom_params = getattr(args, "custom_params", None)
-    if isinstance(custom_params, str):
-        custom_params = parse_json_object(custom_params)
-    if custom_params:
-        extra_body["custom_params"] = custom_params
-
-    custom_logit_processor = getattr(args, "custom_logit_processor", None)
-    if custom_logit_processor:
-        # Import and serialize the custom logit processor class
-        import importlib
-
-        module_path, class_name = custom_logit_processor.rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        cls = getattr(module, class_name)
-        extra_body["custom_logit_processor"] = cls.to_str()
-
     common_kwargs = dict(
         model=getattr(args, "model", None),
         max_tokens=getattr(args, "max_tokens", 2048),
@@ -351,18 +335,6 @@ if __name__ == "__main__":
         help="JSON object string for chat_template_kwargs, e.g. '{\"enable_thinking\": true}'",
     )
     parser.add_argument("--reasoning-effort", type=str)
-    parser.add_argument(
-        "--custom-params",
-        type=str,
-        default=None,
-        help="JSON object string for custom_params, e.g. '{\"thinking_budget\": 4096}'",
-    )
-    parser.add_argument(
-        "--custom-logit-processor",
-        type=str,
-        default=None,
-        help="Custom logit processor class path, e.g. 'sglang.srt.sampling.custom_logit_processor.Qwen3ThinkingBudgetLogitProcessor'",
-    )
     parser.add_argument(
         "--thinking-mode",
         default=None,
