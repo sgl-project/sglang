@@ -956,17 +956,6 @@ class PrefillAdder:
         storage_hit_tokens = min(storage_hit_tokens, host_hit_tokens_raw)
         host_hit_tokens = host_hit_tokens_raw - storage_hit_tokens
 
-        if device_hit_tokens + host_hit_tokens + storage_hit_tokens != prefix_len:
-            logger.warning(
-                "Cached-token split mismatch: total=%d, device=%d, host=%d, "
-                "storage=%d, rid=%s",
-                prefix_len,
-                device_hit_tokens,
-                host_hit_tokens,
-                storage_hit_tokens,
-                req.rid,
-            )
-
         # Cache the split hit tokens in the request
         req.cached_tokens_device = device_hit_tokens
         req.cached_tokens_host = host_hit_tokens
