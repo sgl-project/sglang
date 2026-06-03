@@ -149,6 +149,68 @@ class TestWallclockBusySeconds(unittest.TestCase):
         self.assertEqual(rur._wallclock_busy_seconds([], self.WS, self.WE), 0.0)
 
 
+class TestConcurrencyMergesPerRunnerSlop(unittest.TestCase):
+    """The Avg Concurrent column had the same timestamp-slop overcount
+    that Utilization did -- jobs on the SAME runner_name reporting
+    overlapping intervals briefly pushed `current_running` above the
+    real per-instant count, dragging Avg Concurrent above num_runners.
+    These tests guard the per-runner merge inside
+    calculate_concurrency_metrics."""
+
+    WS = NOW - timedelta(hours=24)
+    WE = NOW
+
+    def _running_job(self, runner, h0, h1):
+        return {
+            "start": self.WS + timedelta(hours=h0),
+            "end": self.WS + timedelta(hours=h1),
+            "runner_name": runner,
+            "created_at": self.WS + timedelta(hours=h0),
+            "queue_end": self.WS + timedelta(hours=h0),
+            "status": "pass",
+            "queue_time": 0,
+        }
+
+    def test_same_runner_overlap_does_not_inflate_avg(self):
+        # Two reported intervals on the same runner overlap by 0.5h
+        # (timestamp slop / retry-row). Real wall-clock busy = 1.5h,
+        # avg_concurrent over 24h = 1.5/24 = 0.0625. Without merge,
+        # the sum-of-intervals view would give 2.0h busy and a higher
+        # avg.
+        jobs = [
+            self._running_job("R1", 0, 1),
+            self._running_job("R1", 0.5, 1.5),
+        ]
+        conc = rur.calculate_concurrency_metrics(jobs, self.WS, self.WE, num_runners=1)
+        # peak should stay at 1: at any real instant only one job on R1
+        self.assertEqual(conc["peak_concurrent"], 1)
+        # avg = 1.5h / 24h
+        self.assertAlmostEqual(conc["avg_concurrent"], 1.5 / 24, places=4)
+
+    def test_different_runners_overlap_does_inflate_avg(self):
+        # Same intervals but on TWO different runners -> legitimately
+        # concurrent. Merge must NOT collapse across runners.
+        jobs = [
+            self._running_job("R1", 0, 1),
+            self._running_job("R2", 0.5, 1.5),
+        ]
+        conc = rur.calculate_concurrency_metrics(jobs, self.WS, self.WE, num_runners=2)
+        # 0.5h window of overlap when both runners were running
+        self.assertEqual(conc["peak_concurrent"], 2)
+        # avg = (1h + 1h) / 24h
+        self.assertAlmostEqual(conc["avg_concurrent"], 2.0 / 24, places=4)
+
+    def test_avg_concurrent_capped_by_num_runners_with_full_overlap_slop(self):
+        # 10 reported intervals all on the same runner, all covering the
+        # full window -- after merge, the runner is busy for 24h, so avg
+        # concurrent = 1 (not 10). This is the property that prevents
+        # the Concurrency column from rendering >100%.
+        jobs = [self._running_job("R1", 0, 24) for _ in range(10)]
+        conc = rur.calculate_concurrency_metrics(jobs, self.WS, self.WE, num_runners=1)
+        self.assertEqual(conc["peak_concurrent"], 1)
+        self.assertAlmostEqual(conc["avg_concurrent"], 1.0, places=4)
+
+
 class TestConcurrencyHandlesQueuedJobs(unittest.TestCase):
     def test_queued_job_does_not_crash_and_counts_in_peak_queue(self):
         window_start = NOW - timedelta(hours=24)

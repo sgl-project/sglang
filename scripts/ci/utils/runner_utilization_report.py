@@ -314,16 +314,40 @@ def calculate_concurrency_metrics(
             "saturation_pct": 0.0,
             "peak_queue": 0,
         }
-    running_events = []
+    # Group running intervals by runner_name and merge per-runner before
+    # building (start, +1) / (end, -1) events. Same overlap sources as
+    # _wallclock_busy_seconds (timestamp slop, `filter=all` retry rows,
+    # in_progress end=now straddling completed_at) -- without the merge
+    # they push `current_running` above num_runners and Avg Concurrent
+    # renders >100% (e.g. 4-gpu-b200 showed 7.5/7=107% in the previous
+    # run). Merge per-runner, not globally: jobs on DIFFERENT runners
+    # do legitimately overlap and must contribute separate events.
+    intervals_by_runner = defaultdict(list)
     for job in jobs:
-        start, end = job["start"], job["end"]
-        # Still-queued jobs have no running interval yet (start/end are None).
+        start, end = job.get("start"), job.get("end")
         if start is None or end is None:
             continue
         if end < window_start or start > window_end:
             continue
-        running_events.append((max(start, window_start), 1))
-        running_events.append((min(end, window_end), -1))
+        s = max(start, window_start)
+        e = min(end, window_end)
+        if e <= s:
+            continue
+        # Bucket runnerless jobs (rare in_progress edge case) individually
+        # so we don't merge unrelated jobs into one interval.
+        runner = job.get("runner_name") or f"_unknown_{id(job)}"
+        intervals_by_runner[runner].append((s, e))
+
+    running_events = []
+    for intervals in intervals_by_runner.values():
+        intervals.sort()
+        covered_until = window_start
+        for s, e in intervals:
+            s = max(s, covered_until)
+            if e > s:
+                running_events.append((s, 1))
+                running_events.append((e, -1))
+                covered_until = e
     queue_events = []
     for job in jobs:
         created_at = job.get("created_at")
