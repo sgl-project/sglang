@@ -1827,6 +1827,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         i
                     ]
 
+                # Add multimodal prompt token counts only for requests that
+                # actually consumed them, so plain-text meta_info stays unchanged.
+                image_tokens_list = getattr(recv_obj, "image_tokens", None)
+                audio_tokens_list = getattr(recv_obj, "audio_tokens", None)
+                video_tokens_list = getattr(recv_obj, "video_tokens", None)
+                if image_tokens_list and image_tokens_list[i]:
+                    meta_info["image_tokens"] = image_tokens_list[i]
+                if audio_tokens_list and audio_tokens_list[i]:
+                    meta_info["audio_tokens"] = audio_tokens_list[i]
+                if video_tokens_list and video_tokens_list[i]:
+                    meta_info["video_tokens"] = video_tokens_list[i]
+
             if getattr(recv_obj, "output_hidden_states", None):
                 hidden_states = recv_obj.output_hidden_states[i]
                 if hidden_states is not None:
