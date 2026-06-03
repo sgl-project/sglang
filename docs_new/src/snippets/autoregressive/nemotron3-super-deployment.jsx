@@ -79,7 +79,7 @@ export const Nemotron3SuperDeployment = () => {
     const modelPath = MODEL_PATHS[model] || MODEL_PATHS['bf16'];
 
     const specV2Env = values.mtp === 'enabled' ? 'SGLANG_ENABLE_SPEC_V2=1 ' : '';
-    let cmd = `${specV2Env}python3 -m sglang.launch_server \\\n`;
+    let cmd = `${specV2Env}sglang serve \\\n`;
     cmd += `  --model-path ${modelPath} \\\n`;
     cmd += `  --trust-remote-code \\\n`;
     cmd += `  --tp ${tp} \\\n`;
