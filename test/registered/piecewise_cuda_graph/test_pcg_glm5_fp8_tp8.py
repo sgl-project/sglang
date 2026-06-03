@@ -11,22 +11,17 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="8-gpu-h200")
 
-GLM5_FP4_MODEL = "nvidia/GLM-5-NVFP4"
+GLM5_FP8_MODEL = "zai-org/GLM-5-FP8"
 
 
-class TestPCGGlm5Fp4(CustomTestCase):
-    """PCG prefill on GLM-5-NVFP4 (DSA model, TP=4, B200).
-
-    GLM-5 uses GlmMoeDsaForCausalLM (DSA attention). This test verifies that
-    piecewise CUDA graph works correctly after the DSA indexer was updated to
-    cache k_fp8/k_scale for PCG-compatible prefill.
-    """
+class TestBCGGlm5Fp8TP8(CustomTestCase):
+    """Breakable CUDA graph prefill on GLM-5-FP8 (DSA model, TP=8, H200)."""
 
     @classmethod
     def setUpClass(cls):
-        cls.model = GLM5_FP4_MODEL
+        cls.model = GLM5_FP8_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -34,24 +29,29 @@ class TestPCGGlm5Fp4(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "4",
+                "8",
                 "--trust-remote-code",
                 "--reasoning-parser",
                 "glm45",
                 "--tool-call-parser",
                 "glm47",
-                "--quantization",
-                "modelopt_fp4",
+                "--mem-fraction-static",
+                "0.8",
                 "--disable-flashinfer-autotune",
-                "--enforce-piecewise-cuda-graph",
+                "--enable-breakable-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
-            ]
+            ],
+            env={
+                "SGLANG_ENABLE_GRAPH_DSA_SPLIT_OP_FUSION": "1",
+                "SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM": "1",
+            },
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
