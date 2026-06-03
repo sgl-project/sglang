@@ -106,7 +106,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
-    get_moe_weight_param_eplb_view,
+    filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
     is_sbo_enabled,
     is_tbo_enabled,
@@ -796,26 +796,19 @@ class DeepseekV2MoE(nn.Module):
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
-        num_local_physical_experts = None
-        if self.num_fused_shared_experts > 0:
-            # EPLB only rebalances physical routed experts. Fused shared expert
-            # slots live after each rank's routed slots; keep them stable while
-            # exposing writable routed-weight views to the updater.
-            num_local_physical_experts = self.experts._num_local_routed
+        # EPLB only rebalances physical routed experts. Fused shared expert
+        # slots live after each rank's routed slots and must stay stable.
+        num_local_experts_for_eplb = (
+            self.experts.num_local_experts - self.num_fused_shared_experts
+        )
 
         return [
-            eplb_view
+            x.data[:num_local_experts_for_eplb]
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
-            and (
-                eplb_view := get_moe_weight_param_eplb_view(
-                    name,
-                    x,
-                    self.experts.num_local_experts,
-                    num_local_physical_experts,
-                )
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
             )
-            is not None
         ]
 
     def forward(
