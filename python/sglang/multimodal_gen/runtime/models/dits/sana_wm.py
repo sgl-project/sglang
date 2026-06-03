@@ -485,6 +485,17 @@ def _sana_wm_sdpa(
     return out.transpose(1, 2).to(dtype_orig)
 
 
+def _sana_wm_padded_scale(head_dim: int) -> float:
+    """Softmax scale matching the reference's ``sdpa_with_head_padding``: it pads
+    the head dim to 128 (or 256) and lets SDPA use the *padded*-dim default scale.
+    For SANA-WM's head_dim=112 this is 1/sqrt(128), NOT 1/sqrt(112) — the reference
+    never passes an explicit scale after padding, so we replicate that here."""
+    if head_dim in (32, 64, 128, 256) or head_dim >= 256:
+        return head_dim**-0.5
+    pad_to = 128 if head_dim <= 128 else 256
+    return pad_to**-0.5
+
+
 def _sana_wm_chunked_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2824,7 +2835,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             v_in = torch.cat([cached_v.to(v_in.dtype), v_in], dim=1)
 
         out = _sana_wm_sdpa(
-            q_in, k_in, v_in, softmax_scale=self.softmax_attn.softmax_scale
+            q_in, k_in, v_in, softmax_scale=_sana_wm_padded_scale(self.dim)
         )
         out = out.reshape(B, N, C)
 
@@ -2883,10 +2894,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
         v_dn = v_proj.permute(0, 1, 3, 2)
 
-        q_dn = _downscale_to_reference_rms(q_pre_dn, q_dn)
-        k_dn = _downscale_to_reference_rms(k_pre_dn, k_dn)
-        v_dn = _downscale_to_reference_rms(v_pre_dn, v_dn)
-
+        # (RMS downscale removed to match the official cam branch: full post-UCPE
+        # q/k/v feed the scan; inflation is computed from full post-UCPE K vs
+        # pre-UCPE K and absorbed only into beta.)
         pre_ucpe_k_norm = torch.linalg.vector_norm(
             k_pre_dn.float(), dim=2, keepdim=True
         ).clamp_min(1e-6)
@@ -2952,12 +2962,11 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
         k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
-        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
-        k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
-        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
-        q_dn = _downscale_to_reference_rms(q_pre_dn, q_proj.permute(0, 1, 3, 2))
-        k_dn = _downscale_to_reference_rms(k_pre_dn, k_proj.permute(0, 1, 3, 2))
-        v_dn = _downscale_to_reference_rms(v_pre_dn, v_proj.permute(0, 1, 3, 2))
+        # (RMS downscale removed to match the official softmax cam branch:
+        # full post-UCPE q/k/v feed SDPA directly.)
+        q_dn = q_proj.permute(0, 1, 3, 2)
+        k_dn = k_proj.permute(0, 1, 3, 2)
+        v_dn = v_proj.permute(0, 1, 3, 2)
 
         q_in = q_dn.permute(0, 3, 1, 2).contiguous()  # (B, N_cur, H, D)
         k_in = k_dn.permute(0, 3, 1, 2).contiguous()
@@ -2973,7 +2982,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             v_in = torch.cat([cached_cam_v.to(v_in.dtype), v_in], dim=1)
 
         out = _sana_wm_sdpa(
-            q_in, k_in, v_in, softmax_scale=self.softmax_attn.softmax_scale
+            q_in, k_in, v_in, softmax_scale=_sana_wm_padded_scale(self.dim)
         )  # (B, N_cur, H, D)
         out_bhnd = out.transpose(1, 2).contiguous()
         out_bhnd = apply_o(out_bhnd)
