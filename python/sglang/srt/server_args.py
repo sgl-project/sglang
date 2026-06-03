@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import random
+import socket
 import tempfile
 import uuid
 from functools import cached_property
@@ -1028,6 +1029,9 @@ class ServerArgs:
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
+
+        # Handle crash dump environment variables (must run before CUDA init).
+        self._handle_crash_dump_env()
 
         # Handle debug utilities.
         self._handle_debug_utils()
@@ -4383,6 +4387,37 @@ class ServerArgs:
                 self.preferred_sampling_params = json.loads(
                     self.preferred_sampling_params
                 )
+
+    def _handle_crash_dump_env(self):
+        if not self.crash_dump_folder:
+            return
+        _CUDA_COREDUMP_DEFAULTS = {
+            "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "1",
+            "CUDA_ENABLE_USER_TRIGGERED_COREDUMP": "1",
+            "CUDA_COREDUMP_SHOW_PROGRESS": "1",
+            "CUDA_COREDUMP_GENERATION_FLAGS": (
+                "skip_nonrelocated_elf_images,skip_global_memory,"
+                "skip_shared_memory,skip_local_memory,skip_constbank_memory"
+            ),
+            "CUDA_COREDUMP_FILE": f"{self.crash_dump_folder}/%h/core.cuda.%t.%p",
+            "CUDA_COREDUMP_PIPE": "/tmp/corepipe.cuda.%h.%p",
+        }
+        for key, value in _CUDA_COREDUMP_DEFAULTS.items():
+            if key not in os.environ:
+                os.environ[key] = value
+                logger.info(
+                    "Auto-set %s=%s (from --crash-dump-folder)", key, value
+                )
+
+                if key == "CUDA_COREDUMP_FILE":
+                    # cuda curedump cannot write to a folder that does not exist,
+                    # so we have to create the folder first.
+                    hostname = socket.gethostname()
+                    os.makedirs(
+                        os.path.join(self.crash_dump_folder, hostname),
+                        exist_ok=True,
+                    )
+
 
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:

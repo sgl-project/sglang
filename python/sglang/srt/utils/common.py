@@ -50,6 +50,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
+from errno import ENXIO
 from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -2513,22 +2514,6 @@ def human_readable_int(value: str) -> int:
             "Use a plain integer, SI suffixes (1k, 1M), or IEC suffixes (1Ki, 1Mi). "
             "Suffixes are case-sensitive."
         )
-
-
-def pyspy_dump_schedulers():
-    """py-spy dump on all scheduler in a local node."""
-    pid = psutil.Process().pid
-    for attempt, native_flag in enumerate(["--native", ""]):
-        try:
-            cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, check=True
-            )
-            logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
-            return
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
 
 def kill_itself_when_parent_died():
