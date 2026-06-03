@@ -3061,12 +3061,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         # Set extra arguments
         pdmux_override = False
-        if not skip_attn_backend_init and forward_batch.needs_forward_metadata_init():
+        if forward_batch.needs_forward_metadata_init():
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -3110,7 +3109,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_extend(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
@@ -3154,7 +3152,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return (ret, can_run_graph)
 
         # Launch model forward
-        if not skip_attn_backend_init and forward_batch.needs_forward_metadata_init():
+        if forward_batch.needs_forward_metadata_init():
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -3236,11 +3234,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool = False,
+        skip_attn_backend_init: Optional[bool] = None,  # deprecated
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Deprecated kwarg: pre-planners mark the batch themselves now.
+        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+
         self.forward_pass_id += 1
 
         # Try msprob debugger
@@ -3279,7 +3280,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             output = self._forward_raw(
                 forward_batch,
-                skip_attn_backend_init,
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
@@ -3288,7 +3288,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 output = self._maybe_rebalance_after_rank_fault(
                     output,
                     forward_batch,
-                    skip_attn_backend_init,
                     pp_proxy_tensors,
                     reinit_attn_backend,
                     split_forward_count,
@@ -3330,7 +3329,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool,
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
@@ -3366,7 +3364,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if can_run_graph:
                 ret = self.graph_runner.replay(
                     forward_batch,
-                    skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
@@ -3402,7 +3399,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if forward_batch.forward_mode.is_decode():
                 ret = self.forward_decode(
                     forward_batch,
-                    skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
             elif forward_batch.forward_mode.is_split_prefill():
@@ -3414,7 +3410,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
                 ret, can_run_graph = self.forward_extend(
                     forward_batch,
-                    skip_attn_backend_init=skip_attn_backend_init,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
             elif forward_batch.forward_mode.is_idle():
@@ -3575,7 +3570,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self,
         output: ModelRunnerOutput,
         forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool,
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool,
         split_forward_count: int,
@@ -3593,7 +3587,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     break
             output = self._forward_raw(
                 forward_batch,
-                skip_attn_backend_init,
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
