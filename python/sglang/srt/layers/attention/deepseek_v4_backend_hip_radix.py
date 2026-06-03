@@ -111,6 +111,7 @@ class DSV4AttnMetadata:
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c4_sparse_topk_lengths: torch.Tensor = field(init=False)
     c4_sparse_page_indices: torch.Tensor = field(init=False)
+    c4_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
@@ -366,7 +367,9 @@ class DeepseekV4HipRadixBackend(
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
-
+        self.enable_deepseek_v4_fp4_indexer: bool = (
+            model_runner.server_args.enable_deepseek_v4_fp4_indexer
+        )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
