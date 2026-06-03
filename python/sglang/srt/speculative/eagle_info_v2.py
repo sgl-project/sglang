@@ -259,7 +259,10 @@ class EagleDraftInputV2Mixin:
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
-            forward_batch.mark_forward_metadata_ready()
+            # Planned with the runner's own backend, no special context: a
+            # forward-path re-plan is equivalent, so let the judgment
+            # re-plan post-pad if DP padding reshapes the batch.
+            forward_batch.mark_forward_metadata_ready(replan_on_reshape=True)
         return forward_batch
 
 
