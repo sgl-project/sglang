@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -13,12 +13,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LRURefreshPhase,
     TreeComponent,
     next_component_uuid,
 )
@@ -59,6 +64,31 @@ class SWAComponent(TreeComponent):
         return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
             full_indices
         )
+
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                # Walk-down would refresh every visited ancestor to MRU,
+                # but most are outside the active sliding window and must
+                # stay evictable. Window-bounded refresh runs at
+                # MATCH_END / INSERT_END instead.
+                return
+            case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
+                self.cache.lru_lists[
+                    self.component_type
+                ].reset_node_and_window_ancestors_mru(
+                    node,
+                    root_node,
+                    self.sliding_window_size + self.cache.page_size,
+                    self.node_has_component_data,
+                )
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type
@@ -235,6 +265,32 @@ class SWAComponent(TreeComponent):
             node.component_data[self.component_type].value = swa_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+        else:
+            # Entire leaf is outside the SWA window — left as a tombstone.
+            return
+
+        self._maybe_split_leaf_for_swa_lock(node)
+
+    def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
+        """Cap a fresh SWA leaf at one page-aligned window so locking it pins
+        only one window of SWA pool, not the whole (long chunked-prefill) leaf.
+        """
+        ct = self.component_type
+        cd = leaf.component_data[ct]
+        if leaf is self.cache.root_node or cd.value is None or cd.lock_ref > 0:
+            return
+
+        page_size = self.cache.page_size
+        # Smallest page-aligned size that still covers the sliding window.
+        tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
+        leaf_len = len(leaf.key)
+        if leaf_len <= tail_size:
+            return
+        split_at = leaf_len - tail_size
+        if page_size > 1 and (split_at % page_size != 0 or leaf_len % page_size != 0):
+            return
+
+        self.cache._split_node(leaf.key, leaf, split_at)
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -431,7 +487,14 @@ class SWAComponent(TreeComponent):
     # ---- HiCache Hooks ----
 
     def build_hicache_transfers(
-        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        *,
+        req: Optional[Req] = None,
+        token_ids: Optional[Sequence[int]] = None,
+        prefetch_tokens: int = 0,
+        last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
@@ -490,7 +553,9 @@ class SWAComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
-        **kw,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
         ct = self.component_type
 
