@@ -23,13 +23,13 @@ def skip_if_no_blackwell_nvfp4(func):
 class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
 
-    def test_registry_contains_nvfp4_and_mxfp4(self):
+    def test_registry_contains_nvfp4_and_blockfp4(self):
         from sglang.srt.layers.quantization.kv_cache_quant_method import (
             KV_CACHE_QUANT_REGISTRY,
         )
 
         self.assertIn("nvfp4", KV_CACHE_QUANT_REGISTRY)
-        self.assertIn("mxfp4", KV_CACHE_QUANT_REGISTRY)
+        self.assertIn("fp4_e2m1_block16", KV_CACHE_QUANT_REGISTRY)
 
     def test_factory_nvfp4(self):
         from sglang.srt.layers.quantization.kv_cache_quant_method import (
@@ -43,15 +43,15 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertIsInstance(method, NVFP4Method)
         self.assertEqual(method.name, "nvfp4")
 
-    def test_factory_mxfp4(self):
+    def test_factory_blockfp4(self):
         from sglang.srt.layers.quantization.kv_cache_quant_method import (
-            MXFP4Method,
+            BlockFP4Method,
             get_kv_cache_quant_method,
         )
 
-        method = get_kv_cache_quant_method("mxfp4")
-        self.assertIsInstance(method, MXFP4Method)
-        self.assertEqual(method.name, "mxfp4")
+        method = get_kv_cache_quant_method("fp4_e2m1_block16")
+        self.assertIsInstance(method, BlockFP4Method)
+        self.assertEqual(method.name, "fp4_e2m1_block16")
 
     def test_resolve_explicit_recipes(self):
         from sglang.srt.layers.quantization.kv_cache_quant_method import (
@@ -59,7 +59,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         )
 
         self.assertEqual(resolve_kv_cache_quant("nvfp4"), "nvfp4")
-        self.assertEqual(resolve_kv_cache_quant("mxfp4"), "mxfp4")
+        self.assertEqual(resolve_kv_cache_quant("fp4_e2m1_block16"), "fp4_e2m1_block16")
         self.assertIsNone(resolve_kv_cache_quant("fp8_e4m3"))
 
     def test_resolve_legacy_fp4_alias_raises(self):
@@ -69,6 +69,14 @@ class TestKVCacheQuantRegistry(CustomTestCase):
 
         with self.assertRaises(ValueError):
             resolve_kv_cache_quant("fp4_e2m1")
+
+    def test_resolve_mxfp4_name_raises(self):
+        from sglang.srt.layers.quantization.kv_cache_quant_method import (
+            resolve_kv_cache_quant,
+        )
+
+        with self.assertRaises(ValueError):
+            resolve_kv_cache_quant("mxfp4")
 
     def test_factory_unknown_raises(self):
         from sglang.srt.layers.quantization.kv_cache_quant_method import (
@@ -188,40 +196,40 @@ class TestNVFP4Method(CustomTestCase):
         )
 
 
-class TestMXFP4Method(CustomTestCase):
-    """Test MXFP4Method buffer creation and roundtrip."""
+class TestBlockFP4Method(CustomTestCase):
+    """Test BlockFP4Method buffer creation and roundtrip."""
 
     def test_properties(self):
         from sglang.srt.layers.quantization.kv_cache_quant_method import (
-            MXFP4Method,
+            BlockFP4Method,
         )
 
-        m = MXFP4Method()
-        self.assertEqual(m.name, "mxfp4")
+        m = BlockFP4Method()
+        self.assertEqual(m.name, "fp4_e2m1_block16")
         self.assertTrue(m.needs_dequant_workspace())
         self.assertFalse(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
         from sglang.srt.layers.quantization.kv_cache_quant_method import (
-            MXFP4Method,
+            BlockFP4Method,
         )
 
-        m = MXFP4Method()
+        m = BlockFP4Method()
         size, heads, dim, layers = 64, 8, 128, 4
         bufs = m.create_buffers(size, heads, dim, layers, "cpu")
 
         self.assertEqual(len(bufs["k_buffer"]), layers)
         self.assertEqual(bufs["k_buffer"][0].shape, (size, heads, dim // 2))
-        # MXFP4 flattens head dims for scales
+        # Block-16 FP4 flattens head dims for scales
         self.assertEqual(bufs["k_scale_buffer"][0].shape, (size, (heads * dim) // 16))
 
     def test_quantize_dequantize_roundtrip_cpu(self):
-        """Test MXFP4 quantize->dequantize roundtrip on CPU."""
+        """Test block-16 FP4 quantize->dequantize roundtrip on CPU."""
         from sglang.srt.layers.quantization.kv_cache_quant_method import (
-            MXFP4Method,
+            BlockFP4Method,
         )
 
-        m = MXFP4Method()
+        m = BlockFP4Method()
         size, heads, dim = 32, 8, 128
         bufs = m.create_buffers(size, heads, dim, 1, "cpu")
 
@@ -252,7 +260,7 @@ class TestMXFP4Method(CustomTestCase):
 
 
 class TestKVFP4QuantizeUtil(CustomTestCase):
-    """Test the existing MXFP4 KVFP4QuantizeUtil roundtrip."""
+    """Test the existing block-16 FP4 KVFP4QuantizeUtil roundtrip."""
 
     def test_roundtrip_cpu(self):
         from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil

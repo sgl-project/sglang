@@ -164,17 +164,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             raise ValueError(
                 "trtllm_mha FP4 KV cache decode supports nvfp4 only. "
                 "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
-                "for mxfp4."
-            )
-
-        if (
-            hasattr(torch, "float4_e2m1fn_x2")
-            and self.data_type == torch.float4_e2m1fn_x2
-            and not self.is_nvfp4_kvcache
-        ):
-            raise ValueError(
-                "trtllm_mha FP4 KV cache decode supports nvfp4 only. "
-                "Use --kv-cache-dtype=nvfp4 or choose another decode backend "
                 "for fp4_e2m1_block16."
             )
 

@@ -4742,12 +4742,12 @@ class ServerArgs:
             if self.kv_cache_dtype not in [
                 "fp8_e4m3",
                 "nvfp4",
-                "mxfp4",
+                "fp4_e2m1_block16",
                 "bf16",
                 "auto",
             ]:
                 raise ValueError(
-                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, nvfp4, mxfp4, bf16, or auto."
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, nvfp4, fp4_e2m1_block16, bf16, or auto."
                 )
 
         if (
@@ -4926,7 +4926,7 @@ class ServerArgs:
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
-        if self.kv_cache_dtype not in ("nvfp4", "mxfp4"):
+        if self.kv_cache_dtype not in ("nvfp4", "fp4_e2m1_block16"):
             return
 
         use_mla_backend = self.use_mla_backend()
@@ -4941,7 +4941,7 @@ class ServerArgs:
             ):
                 raise RuntimeError(
                     "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
-                    "Use --kv-cache-dtype=mxfp4 for the MXFP4 recipe."
+                    "Use --kv-cache-dtype=fp4_e2m1_block16 for the block-size-16 FP4 recipe."
                 )
             if (
                 self.prefill_attention_backend_str != self.decode_attention_backend_str
@@ -5738,10 +5738,10 @@ class ServerArgs:
                 "Other prefill-only workloads may be supported in a future change once "
                 "their attention paths stop reading or writing the paged KV cache."
             )
-        if self.kv_cache_dtype in ("nvfp4", "mxfp4"):
+        if self.kv_cache_dtype in ("nvfp4", "fp4_e2m1_block16"):
             raise ValueError(
                 "--prefill-only-disable-kv-cache does not currently support "
-                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=mxfp4 because "
+                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_e2m1_block16 because "
                 "the FP4 pool uses a separate allocation path."
             )
 
@@ -6586,6 +6586,7 @@ class ServerArgs:
 
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
+
 
 
 

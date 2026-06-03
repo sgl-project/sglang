@@ -341,7 +341,7 @@ class ModelRunnerKVCacheMixin:
                 f"{unsupported_pool_family}. Supported configurations today: plain MHA "
                 "models on CUDA with the FA (fa3/fa4) prefill backend, --is-embedding, "
                 "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
-                "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, mxfp4}."
+                "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_e2m1_block16}."
             )
 
     def _init_pools(self: ModelRunner):
@@ -1042,7 +1042,7 @@ class ModelRunnerKVCacheMixin:
                 "Supported configurations today: plain MHA models on CUDA with the FA "
                 "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
-                "and --kv-cache-dtype not in {nvfp4, mxfp4}."
+                "and --kv-cache-dtype not in {nvfp4, fp4_e2m1_block16}."
             )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:

@@ -45,7 +45,9 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
 )
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
-from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
+from sglang.srt.layers.quantization.kv_cache_quant_method import (
+    UnquantizedKVCacheMethod,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.dcp_utils import (
     dcp_enabled,
@@ -1299,6 +1301,7 @@ class MHATokenToKVPool(KVCache):
 
 
 
+
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
         # HND folds (page, head) into one paged index for per-kv-head sparse page tables
         # (paged backends like trtllm_mha consume directly). vectorized_5d SHUFFLE 5D:
@@ -1343,9 +1346,9 @@ class MHATokenToKVPool(KVCache):
                     assert self.head_dim % self._kv_vector_x == 0
                     assert self.v_head_dim % self._kv_vector_x == 0
 
-        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
-
-        self.quant_method = quant_method if quant_method is not None else NoneMethod()
+        self.quant_method = (
+            quant_method if quant_method is not None else UnquantizedKVCacheMethod()
+        )
 
         self._create_buffers()
 
@@ -1424,8 +1427,8 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        if not isinstance(self.quant_method, NoneMethod):
-            # Delegate buffer creation to quant_method (e.g. NVFP4Method, MXFP4Method).
+        if not isinstance(self.quant_method, UnquantizedKVCacheMethod):
+            # Delegate buffer creation to quant_method (e.g. NVFP4Method, BlockFP4Method).
             with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 with (
                     torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1753,7 +1756,7 @@ class MHATokenToKVPool(KVCache):
             global_layer_id = global_layer_id_override
             layer_id = layer_id_override
 
-        if not isinstance(self.quant_method, NoneMethod):
+        if not isinstance(self.quant_method, UnquantizedKVCacheMethod):
             # Delegate quantization + write to quant_method.
             # Always use global_layer_id for scale lookup (scales are indexed by global layer id).
             idx = layer_id - self.start_layer
