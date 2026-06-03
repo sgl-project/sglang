@@ -1,4 +1,4 @@
-"""Factory: ``cuda_graph_config`` → ``BaseCudaGraphBackend`` instance.
+"""runner_backend utilities — phase → BaseCudaGraphBackend resolution.
 
 Centralizes per-phase backend resolution so platform overrides (NPU,
 out-of-tree) and future backend additions can plug in without
