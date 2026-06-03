@@ -750,7 +750,7 @@ class GroupCoordinator:
             and not torch_symm_mem_comm.disabled
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
-            torch_symm_mem_comm.all_reduce(input_)
+            torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -2480,4 +2480,3 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parallel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parallel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parallel_state, "get_world_group", get_world_group)
-
