@@ -259,9 +259,7 @@ class GenerateReqInput(BaseReq):
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
     mm_data_mooncake: Optional[List] = None
     # Snapshot of encoder URLs at the time tokenizer-side computed
-    # ``num_items_assigned``.  Forwarded to the scheduler so the
-    # encoder_idx values produced here index into the same list there.
-    # Internal IPC only -- not exposed via OpenAI protocol.
+    # ``num_items_assigned``.
     encoder_urls: Optional[List[str]] = None
 
     # Multimodal tiling controls (extensions)
