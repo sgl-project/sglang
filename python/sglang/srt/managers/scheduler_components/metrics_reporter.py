@@ -57,6 +57,9 @@ class PrefillStats:
 
     log_input_tokens: int
     log_hit_tokens: int
+    new_token_ratio: float
+    num_running_reqs: QueueCount
+    num_new_seqs: int  # len(can_run_list)
 
     # Detailed prefix-cache hit split.
     # log_hit_tokens should equal:
@@ -66,9 +69,6 @@ class PrefillStats:
     log_hit_tokens_host: int = 0
     log_hit_tokens_storage: int = 0
 
-    new_token_ratio: float = 0.0
-    num_running_reqs: QueueCount = None
-    num_new_seqs: int = 0  # len(can_run_list)
     reprocessed_log_input_tokens: int = 0
     reprocessed_log_hit_tokens: int = 0
     num_pending_tokens: int = 0
@@ -566,7 +566,7 @@ class SchedulerMetricsReporter:
         )
 
         if (
-            getattr(self, "enable_hicache_storage", False)
+            getattr(self.scheduler, "enable_hicache_storage", False)
             or prefill_stats.log_hit_tokens_storage > 0
         ):
             cache_split_msg += (
