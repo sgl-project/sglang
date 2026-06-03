@@ -295,9 +295,13 @@ class Envs:
     # Adaptive iteration bounds for the pipeline formula:
     # target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX) where
     # t = (avg_tokens - MIN_TOKENS) / (SAT_TOKENS - MIN_TOKENS),
-    # SAT_TOKENS = MIN_TOKENS * 3 (saturation point).
+    # SAT_TOKENS = MIN_TOKENS * SAT_MULTIPLIER (saturation point).
+    # SAT_MULTIPLIER: controls how quickly target_iters decreases as prompt
+    # length grows. Higher = stay at more iterations longer. Tune down for
+    # fast networks (800G IB), up for slower networks (200G-400G IB).
     # MAX_ITERS: more groups for short prompts (reduces exposed T/N or C/N).
     # MIN_ITERS: fewer groups for long prompts (compute already hides transfer).
+    SGLANG_PIPELINE_SAT_MULTIPLIER = EnvFloat(3.0)
     SGLANG_PIPELINE_MAX_ITERS = EnvInt(10)
     SGLANG_PIPELINE_MIN_ITERS = EnvInt(4)
 

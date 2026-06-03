@@ -1330,6 +1330,9 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                # Early-abort: skip if room already failed (prior layer/chunk failed)
+                if self.request_status.get(kv_chunk.room) == KVPoll.Failed:
+                    continue
                 if (
                     self.enable_staging
                     and staging_strategy is None
