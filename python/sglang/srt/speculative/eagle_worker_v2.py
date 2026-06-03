@@ -424,7 +424,7 @@ class EagleDraftWorker(BaseDraftWorker):
         with canary_outside_ctx:
             # Run draft
             if can_cuda_graph:
-                parent_list, top_scores_index, draft_tokens = (
+                parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.replay(forward_batch)
                 )
             else:
@@ -435,7 +435,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
-                parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
                     forward_batch
                 )
 
@@ -616,11 +616,31 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_tokens = torch.cat(token_list, dim=1)
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens
+            draft_probs = (
+                torch.stack(draft_probs_list, dim=1)
+                if self.server_args.speculative_use_rs
+                else None
+            )
+            return parent_list, top_scores_index, draft_tokens, draft_probs
 
-        return organize_draft_results(
+        parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )
 
+        draft_probs = (
+            torch.stack(draft_probs_list, dim=1)
+            if self.server_args.speculative_use_rs
+            else None
+        )
+        return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def _renorm_draft_probs(
+        self, next_token_logits: torch.Tensor, sampling_info=None
+    ) -> torch.Tensor:
+        if not self.server_args.speculative_use_rs or not next_token_logits.size(0):
+            return torch.softmax(next_token_logits, dim=-1)
+        return torch.softmax(
+            next_token_logits / sampling_info.temperatures, dim=-1
         )
 
     def draft_extend(self):
