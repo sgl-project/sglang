@@ -148,9 +148,6 @@ class EAGLEDraftCudaGraphRunner:
             )
 
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
-            self.top_ps = torch.ones((self.max_bs,), dtype=torch.float)
-            self.top_ks = torch.full((self.max_bs,), -1, dtype=torch.int32)
-            self.min_ps = torch.zeros((self.max_bs,), dtype=torch.float)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -337,9 +334,9 @@ class EAGLEDraftCudaGraphRunner:
 
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
-            top_ps=self.top_ps[:num_seqs],
-            top_ks=self.top_ks[:num_seqs],
-            min_ps=self.min_ps[:num_seqs],
+            top_ps=torch.ones((num_seqs,), dtype=torch.float),
+            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
+            min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
@@ -480,9 +477,6 @@ class EAGLEDraftCudaGraphRunner:
 
         if forward_batch.sampling_info is not None:
             self.temperatures[:raw_bs].copy_(forward_batch.sampling_info.temperatures[:raw_bs])
-            self.top_ps[:raw_bs].copy_(forward_batch.sampling_info.top_ps[:raw_bs])
-            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
-            self.min_ps[:raw_bs].copy_(forward_batch.sampling_info.min_ps[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

@@ -183,9 +183,6 @@ class EAGLEDraftExtendCudaGraphRunner:
                 else self.max_bs
             )
             self.temperatures = torch.ones((sampling_bs, 1), dtype=torch.float)
-            self.top_ps = torch.ones((sampling_bs,), dtype=torch.float)
-            self.top_ks = torch.full((sampling_bs,), -1, dtype=torch.int32)
-            self.min_ps = torch.zeros((sampling_bs,), dtype=torch.float)
 
             if self.forward_mode.is_draft_extend_v2():
                 self.repeat_idx = torch.arange(
@@ -391,9 +388,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             sampling_bs = bs * self.num_tokens_per_bs
             sampling_info = SamplingBatchInfo(
                 temperatures=self.temperatures[:sampling_bs],
-                top_ps=self.top_ps[:sampling_bs],
-                top_ks=self.top_ks[:sampling_bs],
-                min_ps=self.min_ps[:sampling_bs],
+                top_ps=torch.ones((sampling_bs,), dtype=torch.float),
+                top_ks=torch.full((sampling_bs,), -1, dtype=torch.int32),
+                min_ps=torch.zeros((sampling_bs,), dtype=torch.float),
                 is_all_greedy=False,
                 need_top_p_sampling=False,
                 need_top_k_sampling=False,
@@ -403,9 +400,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         else:
             sampling_info = SamplingBatchInfo(
                 temperatures=self.temperatures[:bs],
-                top_ps=self.top_ps[:bs],
-                top_ks=self.top_ks[:bs],
-                min_ps=self.min_ps[:bs],
+                top_ps=torch.ones((bs,), dtype=torch.float),
+                top_ks=torch.full((bs,), -1, dtype=torch.int32),
+                min_ps=torch.zeros((bs,), dtype=torch.float),
                 is_all_greedy=False,
                 need_top_p_sampling=False,
                 need_top_k_sampling=False,
@@ -455,9 +452,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             if self.forward_mode.is_draft_extend_v2():
                 ridx = self.repeat_idx[:sampling_bs]
                 self.temperatures[:sampling_bs].copy_(self.temperatures[ridx])
-                self.top_ps[:sampling_bs].copy_(self.top_ps[ridx])
-                self.top_ks[:sampling_bs].copy_(self.top_ks[ridx])
-                self.min_ps[:sampling_bs].copy_(self.min_ps[ridx])
 
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
@@ -569,9 +563,6 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         if forward_batch.sampling_info is not None:
             self.temperatures[:raw_bs].copy_(forward_batch.sampling_info.temperatures[:raw_bs])
-            self.top_ps[:raw_bs].copy_(forward_batch.sampling_info.top_ps[:raw_bs])
-            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
-            self.min_ps[:raw_bs].copy_(forward_batch.sampling_info.min_ps[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
