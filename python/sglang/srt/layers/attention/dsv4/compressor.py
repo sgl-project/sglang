@@ -57,9 +57,6 @@ class CompressorBackendMixin:
         assert isinstance(metadata, FusedCompressMetadata)
         return metadata
 
-    def _maybe_upgrade_forward_metadata(self) -> None:
-        pass
-
     def forward_compress(
         self,
         *,
@@ -153,11 +150,6 @@ class CompressorBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        # PREP_IN_CG lazy upgrade: the concrete backend (DeepseekV4AttnBackend)
-        # owns this helper. MQALayer._forward_prepare calls us before
-        # attn_backend.forward(), so Raw -> DSV4Metadata must happen here too
-        # (e.g. 1.6T layer 0 has compress_ratio=128 and needs cX_compress_metadata).
-        self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -187,8 +179,6 @@ class CompressorBackendMixin:
         compressor: Compressor,
     ) -> None:
         assert is_overlap_compress(compressor.ratio)
-        # PREP_IN_CG lazy upgrade (see forward_core_compressor for rationale).
-        self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)

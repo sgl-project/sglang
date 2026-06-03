@@ -24,7 +24,8 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -57,6 +58,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_decode_registry
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -104,28 +106,56 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-_has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
+def build_replay_fb_view(
+    forward_batch: "ForwardBatch",
+    buffers: "DecodeInputBuffers",
+    bs: int,
+    raw_bs: int,
+    num_tokens: int,
+    seq_len_fill_value: int,
+    capture_forward_mode: "ForwardMode",
+    is_encoder_decoder: bool,
+) -> SimpleNamespace:
+    """Construct a ForwardBatch-like view for backend replay-side init.
 
-def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
+    Combines the original ``forward_batch`` (for unpadded / per-iter
+    fields like ``spec_info``, ``out_cache_loc``, and the runtime
+    ``actual_forward_mode``) with the padded capture-time buffers from
+    ``buffers`` (for ``req_pool_indices``, ``seq_lens``, ``seq_lens_cpu``,
+    ``encoder_lens``).
 
-    def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-        if _has_foreach_copy:
-            torch._foreach_copy_(dsts, srcs)
-        else:
-            for dst, src in zip(dsts, srcs):
-                dst.copy_(src)
+    Field semantics:
 
-    groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
-    for dst, src in zip(dsts, srcs):
-        key = (dst.dtype, src.dtype)
-        if key not in groups:
-            groups[key] = ([], [])
-        groups[key][0].append(dst)
-        groups[key][1].append(src)
-    for group_dsts, group_srcs in groups.values():
-        foreach_copy(group_dsts, group_srcs)
+      - ``forward_mode``: the capture-time mode (``capture_forward_mode``),
+        used by backends for bucket / dispatch decisions (e.g. choosing
+        between decode / target-verify / draft-extend code paths).
+      - ``actual_forward_mode``: the original runtime ``forward_batch
+        .forward_mode``, which may be ``IDLE`` even when the captured
+        graph corresponds to ``DECODE``. DSV4's replay metadata prep
+        uses this for IDLE-batch substitution; other backends ignore it.
+
+    This view subsumes the ``_replay_forward_batch`` side channel DSV4
+    previously read out-of-band — step 04 swaps that mechanism for this
+    explicit fb_view field.
+    """
+    return SimpleNamespace(
+        batch_size=bs,
+        forward_mode=capture_forward_mode,
+        actual_forward_mode=forward_batch.forward_mode,
+        input_ids=buffers.input_ids[:num_tokens],
+        req_pool_indices=buffers.req_pool_indices[:bs],
+        seq_lens=buffers.seq_lens[:bs],
+        seq_lens_sum=(
+            None
+            if forward_batch.seq_lens_sum is None
+            else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
+        ),
+        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
+        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        spec_info=forward_batch.spec_info,
+    )
 
 
 @dataclass
@@ -292,110 +322,19 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         dsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
+        registry,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        if bs != raw_bs:
-            self.seq_lens.fill_(seq_len_fill_value)
-            self.out_cache_loc.zero_()
-            # Pair with seq_lens fill: padded rows must point at reserved
-            # req_pool slot 0 (req_to_token[0, :] is all zeros from init),
-            # so dummy attention reads land on slot 0 instead of a stale
-            # req_to_token row left by an earlier replay.
-            self.req_pool_indices.zero_()
-            if self.mamba_track_indices is not None:
-                self.mamba_track_indices.zero_()
-            if self.mamba_track_mask is not None:
-                self.mamba_track_mask.fill_(False)
-
-        # Build batched copy lists for all GPU tensors.
-        dsts = [
-            self.input_ids[:raw_num_token],
-            self.req_pool_indices[:raw_bs],
-            self.seq_lens[:raw_bs],
-            self.out_cache_loc[:raw_num_token],
-            self.positions[:raw_num_token],
-        ]
-        srcs = [
-            forward_batch.input_ids,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-        ]
-
-        if self.ngram_embedding_info is not None:
-            ngram_embedding_info = forward_batch.ngram_embedding_info
-            self.ngram_embedding_info.column_starts[:raw_bs].copy_(
-                ngram_embedding_info.column_starts
-            )
-            self.ngram_embedding_info.req_lens[:raw_bs].copy_(
-                ngram_embedding_info.req_lens
-            )
-
-        if (
-            self.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            dsts.append(self.mamba_track_indices[:raw_bs])
-            srcs.append(forward_batch.mamba_track_indices)
-        if (
-            self.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            dsts.append(self.mamba_track_mask[:raw_bs])
-            srcs.append(forward_batch.mamba_track_mask)
-
-        if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
-            dsts.append(self.encoder_lens[:raw_bs])
-            srcs.append(forward_batch.encoder_lens)
-
-        if forward_batch.mrope_positions is not None:
-            dsts.append(self.mrope_positions[:, :raw_num_token])
-            srcs.append(forward_batch.mrope_positions)
-
-        if self.rids_int is not None and forward_batch.rids_int is not None:
-            dsts.append(self.rids_int[:raw_bs])
-            srcs.append(forward_batch.rids_int)
-        if (
-            self.bootstrap_room_ids_int is not None
-            and forward_batch.bootstrap_room_ids_int is not None
-        ):
-            dsts.append(self.bootstrap_room_ids_int[:raw_bs])
-            srcs.append(forward_batch.bootstrap_room_ids_int)
-
-        if require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
-
-        if enable_num_token_non_padded_flag:
-            if require_gathered_buffer and not dsa_enable_prefill_cp:
-                num_tokens_per_dp = bs * num_tokens_per_bs
-                local = compute_local_num_token_non_padded(
-                    global_num_token_non_padded=forward_batch.num_token_non_padded,
-                    num_tokens_per_dp=num_tokens_per_dp,
-                )
-                dsts.append(self.num_token_non_padded)
-                srcs.append(local)
-            else:
-                dsts.append(self.num_token_non_padded)
-                srcs.append(forward_batch.num_token_non_padded)
-
-        # Pipeline-parallel proxy tensors.
-        if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
-            for key, buf in self.pp_proxy_tensors.items():
-                src = pp_proxy_tensors.tensors[key]
-                dim = src.shape[0]
-                dsts.append(buf[:dim])
-                srcs.append(src)
-
-        # Batch all GPU copies, grouped by dtype pair.
-        _grouped_foreach_copy_(dsts, srcs)
-
-        # CPU tensor copy (cannot be batched with GPU tensors).
-        if forward_batch.seq_lens_cpu is not None:
-            if bs != raw_bs:
-                self.seq_lens_cpu.fill_(seq_len_fill_value)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+        # Reset padded tails + copy FB into the registry-adopted graph buffers
+        # (same storage the old per-field populate wrote).
+        registry.fill_from(
+            forward_batch,
+            raw_bs=raw_bs,
+            padded_bs=bs,
+            raw_num_tokens=raw_num_token,
+            padded_num_tokens=bs * num_tokens_per_bs,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
 
 # Detect whether the current forward pass is in capture mode
@@ -715,6 +654,26 @@ class CudaGraphRunner:
             ),
         )
         self.buffers.share_buffers()
+        # FB-shared slot registry, adopting the DecodeInputBuffers storage so
+        # it mirrors the same physical buffers (stable data_ptr for capture vs
+        # replay). This is the unified fill/extract surface that eager /
+        # capture / replay migrate onto, replacing populate_from_forward_batch.
+        self.buffer_registry = build_decode_registry(
+            device=self.device,
+            max_bs=self.max_bs,
+            max_num_token=self.max_num_token,
+            seq_len_fill_value=self.seq_len_fill_value,
+            cache_loc_dtype=self._cache_loc_dtype(),
+            enable_mamba_track=enable_mamba_track,
+            is_encoder_decoder=self.is_encoder_decoder,
+            encoder_len_fill_value=self.encoder_len_fill_value,
+            enable_num_token_non_padded=enable_num_token_non_padded(),
+            require_gathered_buffer=self.require_gathered_buffer,
+            enable_prefill_cp=self.enable_prefill_cp,
+            require_mlp_tp_gather=self.require_mlp_tp_gather,
+            dp_size=self.dp_size,
+            source=self.buffers,
+        )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -943,18 +902,24 @@ class CudaGraphRunner:
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Graph inputs
-        input_ids = buffers.input_ids[:num_tokens]
-        req_pool_indices = buffers.req_pool_indices[:bs]
-        seq_lens = buffers.seq_lens[:bs]
-        seq_lens_cpu = buffers.seq_lens_cpu[:bs]
-        out_cache_loc = buffers.out_cache_loc[:num_tokens]
-        positions = buffers.positions[:num_tokens]
-        if self.is_encoder_decoder:
-            encoder_lens = buffers.encoder_lens[:bs]
-        else:
-            encoder_lens = None
-        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        # Graph inputs. The registry-owned FB-shared slots come from the
+        # registry (it adopted the DecodeInputBuffers storage, so these are the
+        # same physical tensors); the rest still come off `buffers` directly.
+        registry = self.buffer_registry
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
+        input_ids = _slot("input_ids")
+        req_pool_indices = _slot("req_pool_indices")
+        seq_lens = _slot("seq_lens")
+        seq_lens_cpu = _slot("seq_lens_cpu")
+        out_cache_loc = _slot("out_cache_loc")
+        positions = _slot("positions")
+        encoder_lens = (
+            _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
+        )
+        mrope_positions = _slot("mrope_positions")
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
@@ -984,37 +949,19 @@ class CudaGraphRunner:
             )
 
         if self.require_mlp_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
+            global_num_tokens_cpu = [num_tokens]
+        else:
+            global_num_tokens_cpu = None
+
+        if global_num_tokens_cpu is not None:
+            global_dp_buffer_len = sum(global_num_tokens_cpu)
+            num_tokens_tensor = torch.tensor(
+                global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device
             )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens
+            buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
         else:
             global_dp_buffer_len = None
 
@@ -1031,16 +978,14 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
-        # mamba state tracking
+        # mamba state tracking (registry-owned when enabled)
         mamba_track_indices = (
-            buffers.mamba_track_indices[:bs]
-            if buffers.mamba_track_indices is not None
+            _slot("mamba_track_indices")
+            if registry.has_slot("mamba_track_indices")
             else None
         )
         mamba_track_mask = (
-            buffers.mamba_track_mask[:bs]
-            if buffers.mamba_track_mask is not None
-            else None
+            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
 
         if stream_idx is None:
@@ -1099,15 +1044,7 @@ class CudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_batch.forward_mode,
-                forward_batch.spec_info,
-            )
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
                 # Without this, warmup-1 caches the translation; the capture
@@ -1116,6 +1053,10 @@ class CudaGraphRunner:
                 if self.model_runner.is_hybrid_swa:
                     self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
+                # Must run inside the capture block: warmup mutations here are
+                # undone by on_after_cuda_graph_warmup so capture starts clean.
+                attn_backend.init_forward_metadata_in_graph(forward_batch)
+
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
                 )
@@ -1123,6 +1064,7 @@ class CudaGraphRunner:
                     global_dp_buffer_len,
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
+                    global_num_tokens_cpu,
                 )
                 set_is_extend_in_batch(False)
 
@@ -1244,6 +1186,7 @@ class CudaGraphRunner:
             # "any prefill-CP flavor enabled" (DSA CP or MLA CP).
             dsa_enable_prefill_cp=self.enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(),
+            registry=self.buffer_registry,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
@@ -1269,25 +1212,17 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
-        # FIXME: implicit channel for backends (dsv4) that need forward_batch
-        # in replay metadata prep. Should become a real param on the interface.
-        attn_backend._replay_forward_batch = forward_batch
-        seq_lens_sum_arg = (
-            None
-            if forward_batch.seq_lens_sum is None
-            else forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        fb_view = build_replay_fb_view(
+            forward_batch=forward_batch,
+            buffers=buffers,
+            bs=bs,
+            raw_bs=raw_bs,
+            num_tokens=bs * self.num_tokens_per_bs,
+            seq_len_fill_value=self.seq_len_fill_value,
+            capture_forward_mode=self.capture_forward_mode,
+            is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            seq_lens_sum_arg,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
-        attn_backend._replay_forward_batch = None
+        attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Store fields
         self.raw_bs = raw_bs

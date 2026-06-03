@@ -169,6 +169,9 @@ class BreakableCudaGraphRunner:
 
     def _init_buffers(self, model_runner):
         """Initialize input buffers."""
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
         from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
             PrefillInputBuffers,
         )
@@ -214,6 +217,21 @@ class BreakableCudaGraphRunner:
             mrope_positions=mrope_positions,
         )
         self.buffers.share_buffers()
+
+        # Token-axis FB-shared slot registry adopting the PrefillInputBuffers
+        # storage. Breakable has no mamba track and bs is not padded here, so
+        # there are no bs-axis slots (max_bs is unused).
+        self.buffer_registry = build_prefill_registry(
+            device=self.device,
+            max_bs=1,
+            max_num_token=self.max_num_tokens,
+            cache_loc_dtype=torch.int64 if not is_npu() else torch.int32,
+            is_multimodal=self.is_multimodal,
+            hidden_size=model_runner.model_config.hidden_size,
+            embed_dtype=model_runner.dtype,
+            enable_mamba_track=False,
+            source=self.buffers,
+        )
 
     @torch.no_grad()
     def _run_forward(self, forward_batch, num_tokens):
@@ -271,8 +289,12 @@ class BreakableCudaGraphRunner:
                 hidden_states=self.static_draft_hidden_states[:num_tokens],
             )
 
-        buffers = self.buffers
+        registry = self.buffer_registry
         bs = 1
+
+        def _slot(name):
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
         with torch.device(self.device):
             seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
             extend_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
@@ -284,16 +306,16 @@ class BreakableCudaGraphRunner:
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=bs,
-            input_ids=buffers.input_ids[:num_tokens],
+            input_ids=_slot("input_ids"),
             input_embeds=(
-                buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+                _slot("input_embeds") if registry.has_slot("input_embeds") else None
             ),
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             next_token_logits_buffer=None,
             orig_seq_lens=orig_seq_lens,
             seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc=_slot("out_cache_loc"),
             seq_lens_sum=num_tokens,
             mamba_track_indices=None,
             mamba_track_mask=None,
@@ -307,13 +329,15 @@ class BreakableCudaGraphRunner:
             extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
             extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
             extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            positions=buffers.positions[:num_tokens],
+            positions=_slot("positions"),
             global_num_tokens_gpu=None,
             global_num_tokens_for_logprob_gpu=None,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=None,
             mrope_positions=(
-                buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+                _slot("mrope_positions")
+                if registry.has_slot("mrope_positions")
+                else None
             ),
             spec_algorithm=None,
             spec_info=spec_info,
@@ -446,9 +470,9 @@ class BreakableCudaGraphRunner:
             if self.use_input_embeds:
                 if ie is None:
                     raise ValueError("BCG replay expects input_embeds but got None")
-                self.buffers.input_embeds[:static_num_tokens].copy_(
-                    ie[:static_num_tokens]
-                )
+                self.buffer_registry.get_slot("input_embeds").slice_for(
+                    1, static_num_tokens
+                ).copy_(ie[:static_num_tokens])
             else:
                 if ie is not None:
                     raise ValueError(
