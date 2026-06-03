@@ -397,7 +397,7 @@ def _run_frozen_kv_mtp_eager(
     worker: _FrozenKVMTPWorkerHarness,
     batch: ForwardBatch,
 ):
-    return worker.draft_forward(batch, skip_attn_backend_init=False)
+    return worker.draft_forward(batch)
 
 
 def _capture_eagle_draft_graph_runner(
@@ -588,7 +588,9 @@ class _DenseEagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
+    def __call__(
+        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
+    ):
         del skip_attn_backend_init
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
@@ -625,7 +627,9 @@ class _FrozenKVMTPDenseDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
+    def __call__(
+        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
+    ):
         del skip_attn_backend_init
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
@@ -1012,7 +1016,9 @@ class _MLAEagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
+    def __call__(
+        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
+    ):
         del skip_attn_backend_init
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
@@ -1268,7 +1274,9 @@ class _DSV4EagleDraftForward:
             hidden_size, vocab_size, bias=False, dtype=dtype, device=device
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
+    def __call__(
+        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
+    ):
         del skip_attn_backend_init
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
@@ -1568,7 +1576,9 @@ class _DSAEagleDraftForward:
             torch.full_like(indices, -1),
         )
 
-    def __call__(self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool):
+    def __call__(
+        self, forward_batch: ForwardBatch, *, skip_attn_backend_init: bool = False
+    ):
         del skip_attn_backend_init
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
