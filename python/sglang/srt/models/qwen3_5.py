@@ -105,6 +105,7 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_shared_experts_fusion = get_global_server_args().disable_shared_experts_fusion
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
@@ -574,14 +575,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=(
-                    alt_stream
-                    if get_global_server_args().disable_shared_experts_fusion
-                    else None
-                ),
+                alt_stream=(alt_stream if _disable_shared_experts_fusion else None),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=not get_global_server_args().disable_shared_experts_fusion,
+                support_shared_expert_fusion=not _disable_shared_experts_fusion,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -790,14 +787,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                alt_stream=(
-                    alt_stream
-                    if get_global_server_args().disable_shared_experts_fusion
-                    else None
-                ),
+                alt_stream=(alt_stream if _disable_shared_experts_fusion else None),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=not get_global_server_args().disable_shared_experts_fusion,
+                support_shared_expert_fusion=not _disable_shared_experts_fusion,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -1683,7 +1676,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_fused_shared_experts = 0
-        if _use_aiter and not get_global_server_args().disable_shared_experts_fusion:
+        if _use_aiter and not _disable_shared_experts_fusion:
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
