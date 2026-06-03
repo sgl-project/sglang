@@ -168,9 +168,7 @@ def halo_exchange(
     if rank > 0:
         # has previous neighbor, recv previous rank's data to recv_top_buf and send top_row to it.
         prev_rank = group_ranks[rank - 1]
-        top_row = top_row_ref.contiguous(
-            memory_format=_halo_memory_format(top_row_ref)
-        )
+        top_row = top_row_ref.contiguous(memory_format=_halo_memory_format(top_row_ref))
         p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
         p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
     if rank < world_size - 1:
