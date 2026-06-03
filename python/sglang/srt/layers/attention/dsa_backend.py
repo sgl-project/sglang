@@ -1135,10 +1135,14 @@ class DeepseekSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
         ):
+            if forward_mode.is_draft_extend(include_v2=True):
+                schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
+            else:
+                schedule_seqlens_expanded = seqlens_expanded
             seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode,
                 metadata.cache_seqlens_int32,
-                seqlens_expanded,
+                schedule_seqlens_expanded,
                 bs,
             )
             new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
@@ -1352,7 +1356,7 @@ class DeepseekSparseAttnBackend(
                 seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                     forward_mode,
                     metadata.cache_seqlens_int32,
-                    metadata.dsa_seqlens_expanded[: precomputed.seqlens_expanded_size],
+                    metadata.dsa_seqlens_expanded,
                     bs,
                 )
             new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
