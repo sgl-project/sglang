@@ -320,10 +320,14 @@ class TestPushRun(CustomTestCase):
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_skips_existing_tensors_unless_force(self, mock_manifest, mock_api_cls):
+        # The run_path must match what push_run generates: model/date/sha7.
+        # _today_path() returns today's date, so build the path accordingly.
+        today_date, today_date_path = hfs._today_path()
+        existing_run_path = f"org__m/{today_date_path}/run-abc1234"
         existing_row = {
             "model": "org/m",
-            "run_path": "org__m/2025/01/01/run-abc1234",
-            "date": "2025-01-01",
+            "run_path": existing_run_path,
+            "date": today_date,
             "push_index": 1,
         }
         mock_manifest.return_value = ([existing_row], json.dumps(existing_row) + "\n")
@@ -350,10 +354,13 @@ class TestPushRun(CustomTestCase):
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")
     def test_force_re_uploads(self, mock_manifest, mock_api_cls):
+        # Use today's date so the run_path matches what push_run generates.
+        today_date, today_date_path = hfs._today_path()
+        existing_run_path = f"org__m/{today_date_path}/run-abc1234"
         existing_row = {
             "model": "org/m",
-            "run_path": "org__m/2025/01/01/run-abc1234",
-            "date": "2025-01-01",
+            "run_path": existing_run_path,
+            "date": today_date,
             "push_index": 1,
         }
         mock_manifest.return_value = ([existing_row], json.dumps(existing_row) + "\n")
