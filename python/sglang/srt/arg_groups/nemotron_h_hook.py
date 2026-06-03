@@ -1,7 +1,7 @@
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.utils.common import is_sm100_supported
+from sglang.srt.utils.common import get_device_capability, is_cuda, is_sm100_supported
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -35,6 +35,19 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
                 logger.info(
                     "Use flashinfer_trtllm as MoE runner backend on sm100 for "
                     f"{model_arch}"
+                )
+            elif (
+                (
+                    model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
+                    or server_args.quantization == "modelopt_fp4"
+                )
+                and is_cuda()
+                and (8, 0) <= get_device_capability() < (10, 0)
+            ):
+                server_args.moe_runner_backend = "marlin"
+                logger.info(
+                    "Use marlin as MoE runner backend on SM80-SM90 for "
+                    f"{model_arch} {model_config.quantization}"
                 )
             else:
                 server_args.moe_runner_backend = "flashinfer_cutlass"
