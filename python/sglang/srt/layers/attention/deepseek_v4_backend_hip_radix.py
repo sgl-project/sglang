@@ -148,7 +148,6 @@ class DSV4AttnMetadata:
             ],
             copy_fields=[
                 "raw_out_loc",
-                "swa_out_cache_loc",
                 "seq_lens_casual",
                 "positions_casual",
                 "c4_out_loc",
@@ -164,6 +163,9 @@ class DSV4AttnMetadata:
                 "c4_sparse_page_indices",
             ],
             assign_fields=[
+                # Recomputed by the recorded init_forward_metadata_in_graph op
+                # each forward; not copied across replays.
+                "swa_out_cache_loc",
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
@@ -677,6 +679,36 @@ class DeepseekV4HipRadixBackend(
                 raw_metadata=self.forward_metadata,
             )
 
+        # Compute the SWA KV-store write target once per forward and cache it on
+        # the metadata for every layer's store. This is recorded inside the cuda
+        # graph, so replay re-reads the live out_cache_loc buffer (spec-v2 and DP
+        # padding rebind out_cache_loc after out-graph metadata prep). flash_mla
+        # kernels require int32 indices.
+        metadata = self.forward_metadata
+        if (
+            isinstance(metadata, DSV4Metadata)
+            and forward_batch.out_cache_loc is not None
+        ):
+            out_cache_loc = forward_batch.out_cache_loc
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and self.topk > 0
+                and self.speculative_num_steps > 1
+            ):
+                # Multi-step draft decode shares one out_cache_loc buffer across
+                # steps; mirror the eager init's per-step slice.
+                out_cache_loc = per_step_draft_out_cache_loc(
+                    out_cache_loc,
+                    forward_batch.batch_size,
+                    self.topk,
+                    self.speculative_num_steps,
+                )[self.speculative_step_id]
+            metadata.core_attn_metadata.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                    torch.int32
+                )
+            )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -766,9 +798,8 @@ class DeepseekV4HipRadixBackend(
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
             if out_cache_loc is not None:
-                # Pad the real write locations to the captured token count so the
-                # metadata's swa_out_cache_loc (the KV-store write target read by
-                # store_cache) reflects the actual replay out_cache_loc.
+                # Pad the real write locations to the captured token count so
+                # raw_out_loc reflects the actual replay out_cache_loc.
                 out_cache_loc = torch.nn.functional.pad(
                     out_cache_loc,
                     pad=(0, num_tokens_per_bs * bs - len(out_cache_loc)),
@@ -1152,14 +1183,6 @@ class DeepseekV4HipRadixBackend(
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
             c4_sparse_topk=self.c4_topk,
-        )
-        # Translate the KV-store write target once here so the store path reads it
-        # from metadata instead of re-translating per layer. flash_mla kernels
-        # require int32 indices.
-        core_attn_metadata.swa_out_cache_loc = (
-            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_loc).to(
-                torch.int32
-            )
         )
 
         if need_compress:
