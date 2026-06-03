@@ -494,6 +494,7 @@ class ServerArgs:
     forward_pass_metrics_worker_id: str = ""
     forward_pass_metrics_ipc_name: Optional[str] = None
     enable_trace: bool = False
+    trace_modules: str = "request"
     otlp_traces_endpoint: str = "localhost:4317"
 
     # RequestMetricsExporter configuration
@@ -5258,6 +5259,13 @@ class ServerArgs:
             action="store_true",
             help="Enable opentelemetry trace",
         )
+        parser.add_argument(
+            "--trace-modules",
+            type=str,
+            default="request",
+            help="Select the components to trace. Available options are 'request' and 'mooncake'. Format: <module1 name>,<module2 name>,...",
+        )
+
         parser.add_argument(
             "--otlp-traces-endpoint",
             type=str,
