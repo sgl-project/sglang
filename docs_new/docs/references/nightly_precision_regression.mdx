@@ -248,12 +248,13 @@ python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
 
 - SGLang installed in development mode
 - GPUs matching the model's requirements
-- `huggingface_hub` installed, `SGLANG_PRECISION_HF_REPO` and `HF_TOKEN` set
+- `huggingface_hub` installed
+- A **HuggingFace dataset** for baseline storage and a write-capable `HF_TOKEN`. The HF store is **mandatory** — `SGLANG_PRECISION_HF_REPO` must be set or the test will error at startup. This is because the nightly CI runners are ephemeral (no persistent local disk), so baselines must survive across runs via the HF dataset. There is currently no local-only fallback.
 
 ### Quick local test
 
 ```bash
-# Set model, baseline directory, and HF store (required)
+# All three are required — the test errors if SGLANG_PRECISION_HF_REPO is unset.
 export SGLANG_PRECISION_MODELS="Qwen/Qwen2.5-0.5B-Instruct"
 export SGLANG_PRECISION_BASELINE_DIR="/tmp/precision_baselines"
 export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
@@ -335,6 +336,27 @@ If an intentional numerical change (e.g., kernel optimization, model refactor) c
 3. Commit any necessary threshold adjustments
 
 If you change the capture configuration (stride, TP size, etc.), the `capture_signature` will differ and the framework automatically establishes a fresh baseline — no manual intervention needed.
+
+---
+
+## Known Limitations
+
+### Baseline drift
+
+The framework uses a **rolling baseline**: every successful comparison updates the baseline to the current run's tensors. This means the reference shifts forward each day. While individual day-to-day diffs stay within the configured threshold, tiny numerical differences can **accumulate over time**, causing the baseline to silently drift away from the original golden values.
+
+**Implications:**
+- The framework detects **regressions** (a sudden, large numerical change between consecutive runs), not **absolute accuracy** relative to a fixed reference.
+- Over weeks or months, the cumulative drift may become significant enough to mask a real regression that happened gradually, or to cause a false-positive failure when the drift eventually crosses the threshold.
+
+**Mitigation strategies (not yet implemented):**
+- Periodically re-establish a fresh anchor baseline from a known-good reference commit.
+- Track the cumulative drift in the manifest metadata and alert when it exceeds a long-term budget.
+- Compare against a fixed "epoch" baseline in addition to the rolling one.
+
+### No local-only mode
+
+The test requires a HuggingFace dataset (`SGLANG_PRECISION_HF_REPO`) and a write-capable `HF_TOKEN`. There is no local-only fallback. This is by design — CI runners have no persistent local disk, so the HF dataset is the only way to carry baselines across runs. If you need to run the test locally, you must set up a HF dataset (even a private one) and provide the corresponding token.
 
 ---
 
