@@ -388,6 +388,8 @@ class USPAttention(nn.Module):
     and Ring Attention for fine-grained sequence parallelism within subgroups.
     """
 
+    _usp_a2a_stream = None
+
     def __init__(
         self,
         num_heads: int,
@@ -454,12 +456,11 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
-        self._usp_a2a_stream = None
 
     def _get_usp_a2a_stream(self):
-        if self._usp_a2a_stream is None:
-            self._usp_a2a_stream = torch.get_device_module().Stream()
-        return self._usp_a2a_stream
+        if USPAttention._usp_a2a_stream is None:
+            USPAttention._usp_a2a_stream = torch.get_device_module().Stream()
+        return USPAttention._usp_a2a_stream
 
     def forward(
         self,
