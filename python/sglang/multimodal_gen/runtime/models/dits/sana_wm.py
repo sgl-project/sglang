@@ -11,6 +11,8 @@ from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
 from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
     get_tp_rank,
     get_tp_world_size,
     model_parallel_is_initialized,
@@ -160,6 +162,27 @@ def _sana_wm_tp_rank() -> int:
     if not model_parallel_is_initialized():
         return 0
     return get_tp_rank()
+
+
+def _sana_wm_sp_world_size() -> int:
+    if not model_parallel_is_initialized():
+        return 1
+    return get_sp_world_size()
+
+
+def _sana_wm_sp_rank() -> int:
+    if not model_parallel_is_initialized():
+        return 0
+    return get_sp_parallel_rank()
+
+
+def _sana_wm_sequence_shard_enabled(sp_size: int) -> bool:
+    if sp_size <= 1:
+        return False
+    raise NotImplementedError(
+        "SANA-WM does not support true sequence parallelism yet. "
+        "Use TP/FSDP/CFG instead of SP."
+    )
 
 
 def _sana_wm_linear(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -3250,7 +3273,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self.chunk_size,
             self.chunk_split_strategy,
             self.use_triton_kernels,
-            self.supports_true_sequence_parallel,
+            False,
         )
 
         self.blocks = nn.ModuleList(
@@ -3495,6 +3518,10 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         if not self.use_chunk_plucker_post_attn:
             plucker_emb = None
+
+        # SANA-WM currently supports TP/FSDP/CFG, but not true SP. Keep this
+        # guard close to the token path so accidental SP runs fail clearly.
+        _sana_wm_sequence_shard_enabled(_sana_wm_sp_world_size())
 
         # --- 6. Transformer blocks ---
         HW = (T, H, W)

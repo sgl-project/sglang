@@ -447,6 +447,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 component_name="transformer_2",
                 target_dtype=self.dtype,
                 memory_intensive=True,
+                allow_prefetch=False,
             ),
         ]
 

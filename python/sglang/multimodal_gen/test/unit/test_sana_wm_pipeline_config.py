@@ -32,6 +32,9 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _sana_wm_chunked_attention,
     _sana_wm_normalize_chunk_index,
     _sana_wm_padded_attention_head_size,
+    _sana_wm_sequence_shard_enabled,
+    _sana_wm_sp_rank,
+    _sana_wm_sp_world_size,
     _single_path_delta_chunk_scan_forward,
     _single_path_delta_scan_forward,
     _tensor_cache_key,
@@ -40,6 +43,9 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
 from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
     SanaWMPipeline,
     SanaWMTwoStagePipeline,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+    VanillaD2HStrategy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -231,6 +237,13 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         SanaWMTransformer3DModel._validate_tp_config(arch, 2)
         with self.assertRaisesRegex(ValueError, "num_attention_heads"):
             SanaWMTransformer3DModel._validate_tp_config(arch, 3)
+
+    def test_dit_sp_helpers_default_to_noop_without_model_parallel(self) -> None:
+        self.assertEqual(_sana_wm_sp_world_size(), 1)
+        self.assertEqual(_sana_wm_sp_rank(), 0)
+        self.assertFalse(_sana_wm_sequence_shard_enabled(1))
+        with self.assertRaisesRegex(NotImplementedError, "sequence parallelism"):
+            _sana_wm_sequence_shard_enabled(2)
 
     def test_prepare_neg_cond_kwargs_keeps_camera_for_cfg(self) -> None:
         camera_conditions = torch.zeros(1, 7, 20)
@@ -471,6 +484,193 @@ class TestSanaWMRegistry(unittest.TestCase):
 
 
 class TestSanaWMTwoStagePipeline(unittest.TestCase):
+    @staticmethod
+    def _make_two_stage_pipeline() -> SanaWMTwoStagePipeline:
+        pipeline = object.__new__(SanaWMTwoStagePipeline)
+        pipeline.modules = {
+            "text_encoder": torch.nn.Linear(1, 1),
+            "transformer": torch.nn.Linear(1, 1),
+            "text_encoder_2": torch.nn.Linear(1, 1),
+            "connectors": torch.nn.Linear(1, 1),
+            "transformer_2": torch.nn.Linear(1, 1),
+            "tokenizer_2": object(),
+        }
+        pipeline.component_residency_strategies = {}
+        return pipeline
+
+    @staticmethod
+    def _make_two_stage_server_args(**overrides) -> SimpleNamespace:
+        values = {
+            "performance_mode": "auto",
+            "tp_size": 1,
+            "enable_cfg_parallel": False,
+            "use_fsdp_inference": False,
+            "dit_cpu_offload": False,
+            "text_encoder_cpu_offload": False,
+            "vae_cpu_offload": False,
+            "dit_layerwise_offload": False,
+            "layerwise_offload_components": None,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def _assert_two_stage_sequential_residency(
+        self, pipeline: SanaWMTwoStagePipeline
+    ) -> None:
+        for component_name in (
+            "text_encoder",
+            "transformer",
+            "text_encoder_2",
+            "connectors",
+            "transformer_2",
+        ):
+            self.assertIsInstance(
+                pipeline.component_residency_strategies[component_name],
+                VanillaD2HStrategy,
+            )
+        self.assertNotIn("tokenizer_2", pipeline.component_residency_strategies)
+
+    def test_two_stage_pipeline_auto_residency_enables_for_manual_tp_overlap(
+        self,
+    ) -> None:
+        pipeline = self._make_two_stage_pipeline()
+        custom_strategy = object()
+        pipeline.component_residency_strategies = {"transformer": custom_strategy}
+        server_args = self._make_two_stage_server_args(
+            performance_mode="manual",
+            tp_size=2,
+            enable_cfg_parallel=False,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_TWO_STAGE_RESIDENCY": "auto"},
+        ):
+            pipeline._configure_two_stage_component_residency(server_args)
+
+        self.assertIs(
+            pipeline.component_residency_strategies["transformer"],
+            custom_strategy,
+        )
+        for component_name in (
+            "text_encoder",
+            "text_encoder_2",
+            "connectors",
+            "transformer_2",
+        ):
+            self.assertIsInstance(
+                pipeline.component_residency_strategies[component_name],
+                VanillaD2HStrategy,
+            )
+        self.assertNotIn("tokenizer_2", pipeline.component_residency_strategies)
+
+    def test_two_stage_pipeline_auto_residency_skips_safe_auto_path(self) -> None:
+        pipeline = self._make_two_stage_pipeline()
+        server_args = self._make_two_stage_server_args(performance_mode="auto")
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_TWO_STAGE_RESIDENCY": "auto"},
+        ):
+            pipeline._configure_two_stage_component_residency(server_args)
+
+        self.assertEqual(pipeline.component_residency_strategies, {})
+
+    def test_two_stage_pipeline_auto_residency_skips_fsdp_policy(self) -> None:
+        pipeline = self._make_two_stage_pipeline()
+        server_args = self._make_two_stage_server_args(
+            performance_mode="manual",
+            tp_size=2,
+            use_fsdp_inference=True,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_TWO_STAGE_RESIDENCY": "auto"},
+        ):
+            pipeline._configure_two_stage_component_residency(server_args)
+
+        self.assertEqual(pipeline.component_residency_strategies, {})
+
+    def test_two_stage_pipeline_auto_residency_skips_dit_layerwise_policy(
+        self,
+    ) -> None:
+        pipeline = self._make_two_stage_pipeline()
+        server_args = self._make_two_stage_server_args(
+            performance_mode="manual",
+            tp_size=2,
+            layerwise_offload_components=["dit"],
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_TWO_STAGE_RESIDENCY": "auto"},
+        ):
+            pipeline._configure_two_stage_component_residency(server_args)
+
+        self.assertEqual(pipeline.component_residency_strategies, {})
+
+    def test_two_stage_pipeline_auto_residency_allows_text_layerwise_policy(
+        self,
+    ) -> None:
+        pipeline = self._make_two_stage_pipeline()
+        server_args = self._make_two_stage_server_args(
+            performance_mode="manual",
+            tp_size=2,
+            layerwise_offload_components=["text_encoder", "vae"],
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_TWO_STAGE_RESIDENCY": "auto"},
+        ):
+            pipeline._configure_two_stage_component_residency(server_args)
+
+        self._assert_two_stage_sequential_residency(pipeline)
+
+    def test_two_stage_pipeline_auto_residency_ignores_vae_only_offload(self) -> None:
+        pipeline = self._make_two_stage_pipeline()
+        server_args = self._make_two_stage_server_args(
+            performance_mode="manual",
+            tp_size=2,
+            vae_cpu_offload=True,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_TWO_STAGE_RESIDENCY": "auto"},
+        ):
+            pipeline._configure_two_stage_component_residency(server_args)
+
+        self._assert_two_stage_sequential_residency(pipeline)
+
+    def test_two_stage_pipeline_residency_env_can_force_resident_path(self) -> None:
+        pipeline = self._make_two_stage_pipeline()
+        server_args = self._make_two_stage_server_args(
+            performance_mode="manual",
+            tp_size=2,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_TWO_STAGE_RESIDENCY": "resident"},
+        ):
+            pipeline._configure_two_stage_component_residency(server_args)
+
+        self.assertEqual(pipeline.component_residency_strategies, {})
+
+    def test_two_stage_pipeline_residency_env_can_force_sequential_path(self) -> None:
+        pipeline = self._make_two_stage_pipeline()
+        server_args = self._make_two_stage_server_args(performance_mode="auto")
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_SANA_WM_TWO_STAGE_RESIDENCY": "sequential"},
+        ):
+            pipeline._configure_two_stage_component_residency(server_args)
+
+        self._assert_two_stage_sequential_residency(pipeline)
+
     def test_resolve_refiner_paths_defaults_to_model_refiner_dir(self) -> None:
         pipeline = object.__new__(SanaWMTwoStagePipeline)
         pipeline.model_path = "/models/sana-wm"
@@ -1606,14 +1806,13 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
             dtype=torch.bfloat16,
         )
 
-        names = [
-            use.component_name
-            for use in stage.component_uses(
-                SimpleNamespace(), stage_name="sana_wm_refiner"
-            )
-        ]
+        uses = stage.component_uses(SimpleNamespace(), stage_name="sana_wm_refiner")
+        names = [use.component_name for use in uses]
 
         self.assertEqual(names, ["text_encoder_2", "connectors", "transformer_2"])
+        transformer_use = uses[-1]
+        self.assertTrue(transformer_use.memory_intensive)
+        self.assertFalse(transformer_use.allow_prefetch)
 
     def test_refiner_parallelism_runs_on_main_rank_when_cfg_parallel(self) -> None:
         stage = SanaWMLTX2RefinerStage(

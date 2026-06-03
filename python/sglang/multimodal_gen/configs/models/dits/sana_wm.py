@@ -93,8 +93,15 @@ class SanaWMArchConfig(DiTArchConfig):
     class_dropout_prob: float = 0.0
 
     # The released checkpoint stores raw upstream parameter names (no leading
-    # "transformer." prefix), so we use an identity mapping.
-    param_names_mapping: dict = field(default_factory=lambda: {})
+    # "transformer." prefix).  The bidirectional checkpoint also contains a
+    # legacy `pos_embed` tensor (absolute position embedding) that is no longer
+    # part of the architecture — SANA-WM uses RoPE instead.  Map it to "" so
+    # the weight loader skips it rather than raising on the unknown key.
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            "^pos_embed$": "",
+        }
+    )
 
     def __post_init__(self):
         super().__post_init__()
