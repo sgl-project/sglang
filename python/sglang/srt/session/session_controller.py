@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 import uuid
 from array import array
@@ -32,13 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
-
-
-def _radix_native_enabled() -> bool:
-    """Radix-native sessions: hold session KV as ordinary evictable radix entries
-    (tagged + floor-priority + bulk-evicted on close) instead of pinned streaming
-    slots. Opt-in; off preserves the legacy streaming-session behavior."""
-    return os.environ.get("SGLANG_SESSION_RADIX_NATIVE") == "1"
 
 
 class SessionReqNode:

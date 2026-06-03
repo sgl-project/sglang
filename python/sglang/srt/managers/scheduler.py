@@ -235,10 +235,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
-from sglang.srt.session.session_controller import (
-    SessionController,
-    _radix_native_enabled,
-)
+from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import (
     resolve_dflash_prefill_refill_target,
     should_delay_dflash_prefill_for_batching,
@@ -2011,16 +2008,15 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # Radix-native session: the session_id is just a tag carried on the req. The
-        # Session object (opened for lifecycle/close) never enters the data path --
-        # such requests build a plain Req (no create_req reconstruction, no slot) and
-        # are tagged + floor-priced in the radix cache keyed on req.session_id.
-        radix_native_session = session_id is not None and _radix_native_enabled()
+        # Radix-native session: session_id is just a tag on the req; it builds a
+        # plain Req tagged + floor-priced in the radix cache by req.session_id.
+        radix_native_session = (
+            session_id is not None and self.server_args.enable_session_radix_cache
+        )
         if radix_native_session:
             sp = recv_req.session_params
-            # The native path does not reconstruct server-side history, so these
-            # streaming-session params are ignored -- warn rather than silently
-            # produce wrong context. (The intended client sends full context.)
+            # Native path sends full context each turn; legacy reconstruct params
+            # don't apply -- warn rather than silently produce wrong context.
             if sp.rid or sp.offset or sp.replace or sp.drop_previous_output:
                 logger.warning(
                     "Radix-native session %s ignores session_params "
@@ -2082,9 +2078,7 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
             if radix_native_session:
-                # Tag for radix-native KV (see RadixCache._tag_session_leaf /
-                # release_session). No Session object enters the data path.
-                req.session_id = session_id
+                req.session_id = session_id  # tag for RadixCache (see release_session)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -4049,11 +4043,9 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        if _radix_native_enabled():
-            # Radix-native session: no Session object, no lifecycle state, no
-            # timeout. A session is just a tag namespace over evictable radix KV.
-            # "Open" only registers the id so the cache can group this session's
-            # leaves; the data path tags req.session_id and floor-prices its KV.
+        if self.server_args.enable_session_radix_cache:
+            # Session = a tag namespace over evictable radix KV; "open" just
+            # registers the id so the cache can group this session's leaves.
             session_id = recv_req.session_id
             register = getattr(self.tree_cache, "register_session", None)
             if register is not None and session_id is not None:
@@ -4066,10 +4058,8 @@ class Scheduler(
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if _radix_native_enabled():
-            # "Close" is purely an eviction trigger: drop the session's tagged KV
-            # from the radix cache (deferred/bounded via drain_pending_release).
-            # No Session to tear down, nothing to defer on in-flight slots.
+        if self.server_args.enable_session_radix_cache:
+            # "Close" just triggers eviction of the session's tagged KV.
             self.tree_cache.release_session(recv_req.session_id)
         else:
             self.session_controller.close(recv_req)

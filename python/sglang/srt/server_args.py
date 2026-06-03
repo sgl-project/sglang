@@ -970,6 +970,10 @@ class ServerArgs:
         bool,
         "Enable streaming session mode and StreamingSession wrapper.",
     ] = False
+    enable_session_radix_cache: A[
+        bool,
+        "Hold per-session KV as ordinary evictable radix entries, tagged by session id and bulk-evicted on close. Requires --radix-eviction-policy priority.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Constrained decoding
