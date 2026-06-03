@@ -61,6 +61,7 @@ def test_longcat_t2v_sampling_params_defaults():
         (90, 89),
         (92, 93),
         (93, 93),
+        (96, 97),
     ],
 )
 def test_longcat_pipeline_config_adjusts_num_frames_to_vae_stride(num_frames, expected):
@@ -275,10 +276,11 @@ def test_longcat_registry_does_not_resolve_avatar_variant():
 # --- Error path tests ---
 
 
-def test_longcat_sampling_params_rejects_invalid_num_frames_stride():
-    """(num_frames - 1) % 4 != 0 should raise ValueError."""
-    with pytest.raises(ValueError, match=r"num_frames"):
-        _longcat_sampling_params_cls()(num_frames=91)  # (91-1)%4 = 2 ≠ 0
+def test_longcat_sampling_params_allows_unaligned_num_frames_before_adjust():
+    """Frame stride alignment is handled by pipeline config adjust_num_frames."""
+    params = _longcat_sampling_params_cls()(num_frames=91)
+
+    assert params.num_frames == 91
 
 
 def test_longcat_sampling_params_accepts_valid_num_frames():

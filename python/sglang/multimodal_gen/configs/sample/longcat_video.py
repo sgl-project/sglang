@@ -20,14 +20,3 @@ class LongCatVideoT2VSamplingParams(SamplingParams):
             (480, 832),
         ]
     )
-
-    def __post_init__(self):
-        # LongCat-specific: VAE temporal stride = 4, so (num_frames - 1) % 4 == 0.
-        # Base class _validate() handles num_frames > 0 and resolution checks.
-        if self.num_frames > 0 and (self.num_frames - 1) % 4 != 0:
-            raise ValueError(
-                f"LongCat-Video requires (num_frames - 1) % 4 == 0, "
-                f"got num_frames={self.num_frames}. "
-                f"Valid values near {self.num_frames}: "
-                f"{self.num_frames // 4 * 4 + 1} or {(self.num_frames // 4 + 1) * 4 + 1}."
-            )
