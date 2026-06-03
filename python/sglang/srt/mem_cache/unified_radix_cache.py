@@ -304,6 +304,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.session = StreamingSession(inner=self)
 
         self.tp_group = params.tp_cache_group
+        self.attn_cp_group = params.attn_cp_cache_group
+        self.attn_tp_group = params.attn_tp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
@@ -321,6 +323,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+        reduced = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(tensor, op=op, group=group)
+                reduced = True
+        if not reduced and self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _barrier_attn_groups(self):
+        waited = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.barrier(group=group)
+                waited = True
+        if not waited and self.tp_world_size > 1:
+            torch.distributed.barrier(group=self.tp_group)
 
     def reset(self) -> None:
         self._reset_full()
@@ -2142,12 +2162,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
             finish_count += 1
 
-        # TP sync: MIN across all ranks for consistent tree updates
+        # Keep cache state transitions identical across CPxTP participants.
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                queue_size, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
         finish_count = int(queue_size.item())
 
         # Process completed acks
