@@ -477,6 +477,10 @@ class Envs:
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
     # default static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
+    # Use CU_MEM_HANDLE_TYPE_FABRIC for the DeepEP NVLink arena so EP groups can
+    # span MNNVL nodes. May be required for cross-pod GB200/GB300. See:
+    # https://github.com/deepseek-ai/DeepEP/blob/e0a5b1d9848ab3e7b4a67842bf06f067bfac67f8/csrc/deep_ep.cpp#L101-L114
+    SGLANG_DEEPEP_USE_FABRIC = EnvBool(False)
 
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)

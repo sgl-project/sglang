@@ -232,15 +232,26 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        cls._buffer = Buffer(
-            group,
-            num_nvl_bytes,
-            num_rdma_bytes,
+        buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
         )
+        if envs.SGLANG_DEEPEP_USE_FABRIC.get():
+            buffer_kwargs["use_fabric"] = True
+
+        try:
+            cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        except TypeError:
+            if "use_fabric" in buffer_kwargs:
+                logger.error(
+                    "SGLANG_DEEPEP_USE_FABRIC=1 but the installed deep_ep "
+                    "wheel does not accept the `use_fabric` kwarg. Rebuild "
+                    "DeepEP from a commit that ships use_fabric, or unset "
+                    "SGLANG_DEEPEP_USE_FABRIC."
+                )
+            raise
         return cls._buffer
 
     @classmethod
