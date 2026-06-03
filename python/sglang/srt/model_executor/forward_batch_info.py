@@ -472,15 +472,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # marker is only valid for the planning regime (backend set) it was set
     # under; a fresh batch from init_new always starts unplanned.
     forward_metadata_ready: bool = False
+    # Shapes the batch had when it was marked (plan record). Lets the
+    # judgment predicate detect staleness when DP padding
+    # (prepare_mlp_sync_batch) reshapes the batch after pre-planning.
+    # Deliberately plain ints — no planner object ref on ForwardBatch
+    # (runtime refs were removed from this dataclass on purpose).
+    forward_metadata_planned_bs: Optional[int] = None
+    forward_metadata_planned_num_tokens: Optional[int] = None
+    # Whether the forward path may re-plan this batch when its shapes no
+    # longer match the plan record. Only mark sites where the forward
+    # path's own init_forward_metadata is equivalent to the pre-plan
+    # (same backend object, no special context) may opt in; multi-step
+    # wrapper plans and view-context plans must keep this False — a
+    # forward-path re-plan would clobber their metadata.
+    forward_metadata_replan_on_reshape: bool = False
 
-    def mark_forward_metadata_ready(self):
+    def mark_forward_metadata_ready(self, replan_on_reshape: bool = False):
         """Record that attention metadata was pre-planned for this batch.
 
         Call right next to the out-of-forward planning action
         (e.g. ``draft_attn_backend.init_forward_metadata(fb)`` or
-        ``graph_runner.replay_prepare(fb)``).
+        ``graph_runner.replay_prepare(fb)``). Records the batch shapes so
+        staleness is detectable; pass ``replan_on_reshape=True`` only when
+        a forward-path re-plan is equivalent to the pre-plan (see field
+        docs).
         """
         self.forward_metadata_ready = True
+        self.forward_metadata_planned_bs = self.batch_size
+        self.forward_metadata_planned_num_tokens = (
+            self.input_ids.shape[0] if self.input_ids is not None else 0
+        )
+        self.forward_metadata_replan_on_reshape = replan_on_reshape
 
     def needs_forward_metadata_init(self) -> bool:
         """Single judgment point for whether the forward path must plan.
