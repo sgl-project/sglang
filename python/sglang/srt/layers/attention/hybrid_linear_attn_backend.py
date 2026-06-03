@@ -782,17 +782,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
 
     def _is_full_attn(
-        self,
-        layer: Optional[Union[RadixAttention, RadixLinearAttention]],
-        layer_id: Optional[int] = None,
+        self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
-        # RadixLinearAttention is unambiguously a linear-attention layer.
-        # Everything else (including plain RadixAttention) must be classified by
-        # layer id: models like Bailing/Ring use a plain RadixAttention for their
-        # linear layers, so an `isinstance(layer, RadixAttention) -> full` shortcut
-        # would misroute those linear layers to the full-attention backend.
+        # Explicit linear-attention subclass → strong linear signal (KDA, GDN,
+        # Qwen3-Next, Qwen3.5 main linear layers).
         if isinstance(layer, RadixLinearAttention):
             return False
+        # Some hybrid models (Ling-2.5/2.6) wrap their linear layers in plain
+        # `RadixAttention` rather than `RadixLinearAttention`. Those wrappers
+        # set `_is_linear_attention=True` on the attn module so we can
+        # distinguish them from full-attention RadixAttention instances —
+        # including MTP/NEXTN draft layers, which are full and must default to
+        # the full-attn path.
+        if layer is not None and getattr(layer, "_is_linear_attention", False):
+            return False
+        if isinstance(layer, RadixAttention):
+            return True
 
         if layer is not None:
             layer_id = layer.layer_id
