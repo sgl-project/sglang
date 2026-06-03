@@ -701,12 +701,8 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     def _alloc_scale_buffers(scales):
         per_expert_shape = scales[0].view(torch.uint8).shape
         per_expert_numel = scales[0].numel()
-        output = scales.new_empty(
-            (num_experts, per_expert_numel), dtype=torch.uint8
-        )
-        scratch = torch.empty(
-            per_expert_shape, dtype=torch.uint8, device=scales.device
-        )
+        output = scales.new_empty((num_experts, per_expert_numel), dtype=torch.uint8)
+        scratch = torch.empty(per_expert_shape, dtype=torch.uint8, device=scales.device)
         return output, scratch
 
     gemm1_scales_fp4_shuffled, g1s_scratch = _alloc_scale_buffers(
@@ -723,10 +719,9 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             epilogue_tile_m,
             is_gated_act_gemm=is_gated,
         )
-        gemm1_weights_fp4_shuffled[i] = (
-            gemm1_weights_fp4[i]
-            .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
-        )
+        gemm1_weights_fp4_shuffled[i] = gemm1_weights_fp4[i].view(torch.uint8)[
+            permute_indices.to(gemm1_weights_fp4.device)
+        ]
 
         permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
             _cache_permute_indices,
@@ -737,7 +732,8 @@ def prepare_static_weights_for_trtllm_fp4_moe(
         )
         # Reuse scratch buffer for the permuted scale input
         torch.index_select(
-            gemm1_scales_linear_fp4[i].view(torch.uint8), 0,
+            gemm1_scales_linear_fp4[i].view(torch.uint8),
+            0,
             permute_sf_indices.to(gemm1_scales_linear_fp4.device),
             out=g1s_scratch,
         )
@@ -748,10 +744,9 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             gemm2_weights_fp4[i].view(torch.uint8),
             epilogue_tile_m,
         )
-        gemm2_weights_fp4_shuffled[i] = (
-            gemm2_weights_fp4[i]
-            .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
-        )
+        gemm2_weights_fp4_shuffled[i] = gemm2_weights_fp4[i].view(torch.uint8)[
+            permute_indices.to(gemm2_weights_fp4.device)
+        ]
 
         permute_sf_indices = get_w2_permute_indices_with_cache(
             _cache_permute_indices,
@@ -760,7 +755,8 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             num_elts_per_sf=16,
         )
         torch.index_select(
-            gemm2_scales_linear_fp4[i].view(torch.uint8), 0,
+            gemm2_scales_linear_fp4[i].view(torch.uint8),
+            0,
             permute_sf_indices.to(gemm2_scales_linear_fp4.device),
             out=g2s_scratch,
         )
@@ -769,17 +765,13 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     del g1s_scratch, g2s_scratch
 
     # Weight outputs stay as uint8 (FP4 packed) — the TRTLLM kernel expects this.
-    gemm1_scales_fp4_shuffled = (
-        gemm1_scales_fp4_shuffled
-        .view(torch.float8_e4m3fn)
-        .reshape(num_experts, gemm1_rows, hidden_size // 16)
-    )
+    gemm1_scales_fp4_shuffled = gemm1_scales_fp4_shuffled.view(
+        torch.float8_e4m3fn
+    ).reshape(num_experts, gemm1_rows, hidden_size // 16)
 
-    gemm2_scales_fp4_shuffled = (
-        gemm2_scales_fp4_shuffled
-        .view(torch.float8_e4m3fn)
-        .reshape(num_experts, hidden_size, intermediate_size // 16)
-    )
+    gemm2_scales_fp4_shuffled = gemm2_scales_fp4_shuffled.view(
+        torch.float8_e4m3fn
+    ).reshape(num_experts, hidden_size, intermediate_size // 16)
     return (
         gemm1_weights_fp4_shuffled,
         gemm1_scales_fp4_shuffled,
