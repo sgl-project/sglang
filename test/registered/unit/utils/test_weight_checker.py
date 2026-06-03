@@ -38,7 +38,7 @@ from sglang.srt.utils.weight_checker import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 
 # ---------------------------------------------------------------------------
@@ -466,11 +466,14 @@ class TestCompare(_WeightCheckerTestBase):
 class TestHandle(_WeightCheckerTestBase):
 
     def test_routes_to_actions(self):
-        with patch.object(self.checker, "_snapshot") as m_snap, patch.object(
-            self.checker, "_reset_tensors"
-        ) as m_reset, patch.object(self.checker, "_compare") as m_compare, patch.object(
-            self.checker, "_compute_checksum", return_value={"checksums": {}}
-        ) as m_checksum:
+        with (
+            patch.object(self.checker, "_snapshot") as m_snap,
+            patch.object(self.checker, "_reset_tensors") as m_reset,
+            patch.object(self.checker, "_compare") as m_compare,
+            patch.object(
+                self.checker, "_compute_checksum", return_value={"checksums": {}}
+            ) as m_checksum,
+        ):
             self.checker.handle("snapshot")
             self.checker.handle("reset_tensors")
             self.checker.handle("compare")
@@ -488,6 +491,7 @@ class TestHandle(_WeightCheckerTestBase):
         out = self.checker.handle("checksum")
         self.assertIsInstance(out, dict)
         self.assertIn("checksums", out)
+        self.assertIn("per_gpu_checksum", out)
         self.assertIn("parallelism_info", out)
 
     def test_unknown_action_raises(self):
@@ -579,7 +583,9 @@ class TestComputeChecksum(_ChecksumTestBase):
 
     def test_returns_dict_with_expected_top_level_keys(self):
         out = self.checker._compute_checksum()
-        self.assertEqual(set(out.keys()), {"checksums", "parallelism_info"})
+        self.assertEqual(
+            set(out.keys()), {"checksums", "per_gpu_checksum", "parallelism_info"}
+        )
 
     def test_skips_non_persistent_buffers(self):
         out = self.checker._compute_checksum()
