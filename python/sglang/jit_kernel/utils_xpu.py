@@ -89,15 +89,14 @@ def _get_sgl_kernel_jit_path() -> pathlib.Path | None:
     
     return None
 
-def _resolve_sycl_kernel_path() -> pathlib.Path:
+def _resolve_sycl_kernel_path() -> pathlib.Path | None:
     """
     Resolve the path to SYCL JIT kernel headers.
     
     Requires sgl-kernel-xpu to be installed. This is the XPU equivalent of
     requiring CUDA toolkit for CUDA JIT kernels.
     
-    Raises:
-        RuntimeError: If sgl-kernel-xpu is not installed
+    Returns None if sgl-kernel-xpu is not installed, allowing deferred error handling.
     """
     sgl_kernel_path = _get_sgl_kernel_jit_path()
     
@@ -107,12 +106,7 @@ def _resolve_sycl_kernel_path() -> pathlib.Path:
         logger.info(f"Using JIT kernel headers from sgl-kernel: {sgl_kernel_path}")
         return sgl_kernel_path
     
-    raise RuntimeError(
-        "XPU JIT kernel compilation requires sgl-kernel-xpu to be installed.\n"
-        "Install it with: pip install sgl-kernel-xpu\n"
-        "Or build from source: cd sgl-kernel-xpu && pip install -e .\n\n"
-        "This is similar to CUDA requiring CUDA toolkit for JIT compilation."
-    )
+    return None
 
 # Get the SYCL kernel path (checks sgl-kernel first, then local)
 _SYCL_KERNEL_PATH = _resolve_sycl_kernel_path()
@@ -277,16 +271,14 @@ class _LRUModuleCache:
         self._maxsize = maxsize
     
     def _close_module(self, module: SYCLModule) -> None:
-        """Attempt to unload the dynamic library gracefully."""
-        if hasattr(module, "_lib") and module._lib is not None:
-            if hasattr(module._lib, "_handle"):
-                import _ctypes
-                try:
-                    _ctypes.dlclose(module._lib._handle)
-                except Exception:
-                    pass
-            module._functions.clear()
-            module._lib = None
+        """No-op to prevent unloading modules that are still referenced by cached wrappers.
+        
+        Since wrapper classes (like XPURMSNormWrapper) are cached globally via @cache_once,
+        they hold long-lived references to SYCLModule instances. Unloading a module that
+        is still in use would cause AttributeError when calling kernel functions.
+        The number of unique JIT kernels is small, so no risk of unbounded memory growth.
+        """
+        pass
 
     def get(self, key: str) -> SYCLModule | None:
         """Get module from cache, moving it to end (most recently used)."""
@@ -376,6 +368,14 @@ def load_jit_sycl(
     if not is_icpx_available():
         raise RuntimeError(
             "icpx compiler not found. Please install Intel oneAPI toolkit and source setvars.sh"
+        )
+
+    if _SYCL_KERNEL_PATH is None:
+        raise RuntimeError(
+            "XPU JIT kernel compilation requires sgl-kernel-xpu to be installed.\n"
+            "Install it with: pip install sgl-kernel-xpu\n"
+            "Or build from source: cd sgl-kernel-xpu && pip install -e .\n\n"
+            "This is similar to CUDA requiring CUDA toolkit for JIT compilation."
         )
 
     sycl_files = sycl_files or []
