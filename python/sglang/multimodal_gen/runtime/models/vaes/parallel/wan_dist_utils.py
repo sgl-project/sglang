@@ -202,23 +202,24 @@ class WanDistConv2d(nn.Conv2d):
 
         self.padding: tuple[int, int]
         if self.height_halo_size > 0:
-            self._padding = (self.padding[1], self.padding[1], 0, 0)
+            self._padding = (0, 0, 0, 0)
         else:
             self._padding = (
-                self.padding[1],
-                self.padding[1],
+                0,
+                0,
                 self.padding[0],
                 self.padding[0],
             )
 
-        self.padding = (0, 0)
+        self.padding = (0, self.padding[1])
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
         self.rank = get_sp_parallel_rank()
         self.world_size = get_sp_world_size()
 
     def forward(self, x):
-        x = F.pad(x, self._padding)
+        if any(self._padding):
+            x = F.pad(x, self._padding)
 
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
             x,

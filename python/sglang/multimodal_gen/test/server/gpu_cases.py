@@ -56,23 +56,6 @@ from sglang.multimodal_gen.test.test_utils import (
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
 
 
-def _make_lingbot_realtime_plastic_beach_case() -> DiffusionTestCase:
-    return DiffusionTestCase(
-        "lingbot_world_realtime_plastic_beach",
-        DiffusionServerArgs(
-            model_path="robbyant/lingbot-world-fast-diffusers",
-            modality="video",
-            num_gpus=1,
-            extras=["--pipeline-class-name LingBotWorldCausalDMDPipeline"],
-            text_encoder_cpu_offload=True,
-        ),
-        LINGBOT_WORLD_REALTIME_sampling_params,
-        run_component_accuracy_check=False,
-        run_models_api_check=False,
-        run_t2v_input_reference_check=False,
-    )
-
-
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [
@@ -414,6 +397,20 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_world_realtime_plastic_beach",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-world-fast-diffusers",
+            modality="video",
+            num_gpus=1,
+            extras=["--pipeline-class-name LingBotWorldCausalDMDPipeline"],
+            text_encoder_cpu_offload=True,
+        ),
+        LINGBOT_WORLD_REALTIME_sampling_params,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
 ]
 
@@ -761,8 +758,6 @@ if not current_platform.is_hip():
             MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
         )
     )
-
-ONE_GPU_CASES.append(_make_lingbot_realtime_plastic_beach_case())
 
 ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
