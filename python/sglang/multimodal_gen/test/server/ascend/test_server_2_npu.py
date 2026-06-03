@@ -16,8 +16,11 @@ from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     diffusion_server,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
+from sglang.test.ci.ci_register import register_npu_ci
 
 logger = init_logger(__name__)
+
+register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 
 class TestDiffusionServerTwoNpu(DiffusionServerBase):
@@ -27,3 +30,9 @@ class TestDiffusionServerTwoNpu(DiffusionServerBase):
     def case(self, request) -> DiffusionTestCase:
         """Provide a DiffusionTestCase for each 2-NPU test."""
         return request.param
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__], "-v"))
