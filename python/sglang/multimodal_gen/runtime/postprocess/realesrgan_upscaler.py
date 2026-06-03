@@ -37,6 +37,11 @@ REALESRGAN_TORCH_COMPILE_MODE_ENV = "SGLANG_REALESRGAN_TORCH_COMPILE_MODE"
 _MODEL_CACHE: dict[str, "UpscalerModel"] = {}
 
 
+def _is_inference_tensor(tensor: torch.Tensor) -> bool:
+    is_inference = getattr(tensor, "is_inference", None)
+    return bool(is_inference()) if is_inference is not None else False
+
+
 # ---------------------------------------------------------------------------
 # Vendored Real-ESRGAN architecture code
 # (SRVGGNetCompact, ResidualDenseBlock, RRDB, RRDBNet)
@@ -261,9 +266,15 @@ def _build_net_from_state_dict(state_dict: dict) -> nn.Module:
 class UpscalerModel:
     """Wraps a Real-ESRGAN network, provides load() and upscale() API."""
 
-    def __init__(self, net: nn.Module, scale: int):
+    def __init__(
+        self,
+        net: nn.Module,
+        scale: int,
+        uses_torch_compile: bool = False,
+    ):
         self.net = net
         self.scale = scale  # the model's native upscaling factor (e.g. 4)
+        self.uses_torch_compile = uses_torch_compile
 
     @property
     def device(self) -> torch.device:
@@ -304,7 +315,11 @@ class UpscalerModel:
         else:
             frames = frames.to(dtype=self.dtype)
         if self.device.type == "cuda":
+            if self.uses_torch_compile and _is_inference_tensor(frames):
+                return frames.clone(memory_format=torch.channels_last)
             return frames.contiguous(memory_format=torch.channels_last)
+        if self.uses_torch_compile and _is_inference_tensor(frames):
+            return frames.clone(memory_format=torch.contiguous_format)
         return frames.contiguous()
 
     @staticmethod
@@ -700,7 +715,11 @@ class ImageUpscaler:
             except Exception as e:
                 logger.warning("Failed to torch.compile Real-ESRGAN: %s", e)
 
-        model = UpscalerModel(net=net, scale=native_scale)
+        model = UpscalerModel(
+            net=net,
+            scale=native_scale,
+            uses_torch_compile=compile_enabled,
+        )
         _MODEL_CACHE[cache_key] = model
         logger.info(
             "Real-ESRGAN model loaded on device: %s (native_scale=%dx, outscale=%s, dtype=%s)",

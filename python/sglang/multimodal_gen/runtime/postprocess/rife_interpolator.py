@@ -32,6 +32,11 @@ RIFE_TORCH_COMPILE_MODE_ENV = "SGLANG_RIFE_TORCH_COMPILE_MODE"
 _MODEL_CACHE: dict[str, "Model"] = {}
 
 
+def _is_inference_tensor(tensor: torch.Tensor) -> bool:
+    is_inference = getattr(tensor, "is_inference", None)
+    return bool(is_inference()) if is_inference is not None else False
+
+
 # ---------------------------------------------------------------------------
 # Vendored RIFE 4.22.lite model code
 # (IFBlock, IFNet_HDv3 backbone, Model wrapper)
@@ -267,6 +272,7 @@ class Model:
     def __init__(self):
         self.flownet = IFNet()
         self.device_type: str = "cpu"
+        self.uses_torch_compile = False
 
     def eval(self) -> "Model":
         self.flownet.eval()
@@ -396,6 +402,7 @@ class FrameInterpolator:
         if compile_enabled:
             try:
                 model.flownet = torch.compile(model.flownet, mode=compile_mode)
+                model.uses_torch_compile = True
                 logger.info("Enabled torch.compile for RIFE: mode=%s", compile_mode)
             except Exception as e:
                 logger.warning("Failed to torch.compile RIFE: %s", e)
@@ -534,7 +541,10 @@ class FrameInterpolator:
             frames = frames.float().mul_(1.0 / 255.0)
         else:
             frames = frames.float()
-        frames = frames.contiguous()
+        if model.uses_torch_compile and _is_inference_tensor(frames):
+            frames = frames.clone(memory_format=torch.contiguous_format)
+        else:
+            frames = frames.contiguous()
 
         if exp == 1:
             middle_tensors = model.inference(
