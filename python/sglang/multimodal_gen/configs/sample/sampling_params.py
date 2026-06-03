@@ -103,6 +103,9 @@ class SamplingParams:
     # Image inputs
     image_path: str | list[str] | None = None
 
+    # Video inputs (video-to-video conditioning)
+    video_path: str | list[str] | None = None
+
     # Text inputs
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -985,6 +988,16 @@ class SamplingParams:
             type=float,
             dest="pitch_limit_deg",
             help="SANA-WM action DSL absolute pitch clamp in degrees.",
+        )
+        add_argument(
+            "--video-path",
+            type=str,
+            nargs="+",
+            help=(
+                "Path(s) to input video(s) for video-to-video generation. "
+                "The first/last frames of the video become the conditioning "
+                "frames for the generated output."
+            ),
         )
         add_argument(
             "--moba-config-path",

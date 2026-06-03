@@ -4,8 +4,9 @@ prep, denoising, decode.
 
 Cosmos3 has no separate text encoder — text is tokenized with Qwen2's chat
 template and embedded inside the transformer's UND pathway. The same
-``Cosmos3Pipeline`` serves T2V, I2V, and T2I; mode is dispatched per-request
-from ``batch.data_type`` and the presence of ``batch.preprocessed_image``.
+``Cosmos3Pipeline`` serves T2V, I2V, V2V, and T2I; mode is dispatched
+per-request from ``batch.data_type`` and the presence of
+``batch.preprocessed_image`` / ``batch.preprocessed_video``.
 """
 
 import copy
@@ -18,6 +19,7 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.vision_utils import load_video
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
 )
@@ -59,11 +61,31 @@ COSMOS3_IMAGE_SYSTEM_PROMPT = (
 )
 
 
-class Cosmos3ImagePreprocessStage(PipelineStage):
-    """Load, aspect-resize, and center-crop the I2V conditioning image.
+def _resize_crop_pil(
+    image: PIL.Image.Image, target_w: int, target_h: int
+) -> PIL.Image.Image:
+    """Aspect-preserving resize then center-crop to ``target_w x target_h``."""
+    scale = max(target_w / image.width, target_h / image.height)
+    resize_w = int(np.ceil(scale * image.width))
+    resize_h = int(np.ceil(scale * image.height))
+    image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
+    left = (resize_w - target_w) // 2
+    top = (resize_h - target_h) // 2
+    return image.crop((left, top, left + target_w, top + target_h))
 
-    No-op when the request has no image (T2V / T2I). The output is a
-    ``[1, 3, H, W]`` tensor in ``[-1, 1]`` written to ``batch.preprocessed_image``.
+
+def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
+    """PIL RGB → ``[3, H, W]`` float32 tensor in ``[-1, 1]``."""
+    arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
+class Cosmos3ImagePreprocessStage(PipelineStage):
+    """Load, aspect-resize, and center-crop the conditioning input.
+
+    For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``.
+    For V2V: writes ``[1, 3, T_in, H, W]`` to ``batch.preprocessed_video``.
+    No-op for T2V / T2I.
     """
 
     parallelism_type = StageParallelismType.REPLICATED
@@ -75,25 +97,72 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         image_path = batch.image_path
         if isinstance(image_path, list):
             image_path = image_path[0] if image_path else None
-        if not isinstance(image_path, str) or not image_path:
+        video_path = batch.video_path
+        if isinstance(video_path, list):
+            video_path = video_path[0] if video_path else None
+
+        if image_path and video_path:
+            raise ValueError(
+                "Cosmos3 accepts either --image-path (I2V) or --video-path "
+                "(V2V), not both"
+            )
+
+        target_h, target_w = batch.height, batch.width
+
+        if isinstance(image_path, str) and image_path:
+            image = PIL.Image.open(image_path).convert("RGB")
+            image = _resize_crop_pil(image, target_w, target_h)
+            batch.preprocessed_image = _pil_to_normalized_tensor(image).unsqueeze(0)
+            self.log_info(f"Preprocessed conditioning image to {target_w}x{target_h}")
             return batch
 
-        image = PIL.Image.open(image_path).convert("RGB")
-        target_h, target_w = batch.height, batch.width
-        scale = max(target_w / image.width, target_h / image.height)
-        resize_w = int(np.ceil(scale * image.width))
-        resize_h = int(np.ceil(scale * image.height))
-        image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
-        left = (resize_w - target_w) // 2
-        top = (resize_h - target_h) // 2
-        image = image.crop((left, top, left + target_w, top + target_h))
+        if isinstance(video_path, str) and video_path:
+            frames = load_video(video_path)
+            if not frames:
+                raise ValueError(f"No frames decoded from video: {video_path!r}")
 
-        arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
-        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
+            keep = (
+                getattr(batch.sampling_params, "condition_video_keep", "first")
+                or "first"
+            )
+            cond_indexes = self._resolve_condition_indexes(batch)
+            # Encode the full output-length video so that the latent positions
+            # we lock match what the decoder will reconstruct at those frame
+            # indices. Encoding only the first ``max_idx*4+1`` frames produces
+            # an out-of-distribution latent for the locked slots and decodes
+            # to noise.
+            num_source_frames = max(cond_indexes) * 4 + 1
+            num_target_frames = batch.num_frames
+            if keep == "last":
+                frames = frames[-num_source_frames:]
+            else:
+                frames = frames[:num_source_frames]
+            if len(frames) < num_source_frames:
+                frames = frames + [frames[-1]] * (num_source_frames - len(frames))
+            if len(frames) < num_target_frames:
+                frames = frames + [frames[-1]] * (num_target_frames - len(frames))
 
-        batch.preprocessed_image = tensor
-        self.log_info(f"Preprocessed conditioning image to {target_w}x{target_h}")
+            processed = [
+                _pil_to_normalized_tensor(_resize_crop_pil(f.convert("RGB"), target_w, target_h))
+                for f in frames
+            ]
+            video_tensor = torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+            batch.preprocessed_video = video_tensor
+            self.log_info(
+                f"Preprocessed conditioning video to "
+                f"{video_tensor.shape[2]}x{target_h}x{target_w} "
+                f"(keep={keep}, source frames={num_source_frames}, padded to {num_target_frames})"
+            )
+
         return batch
+
+    @staticmethod
+    def _resolve_condition_indexes(batch: Req) -> list[int]:
+        """Resolve condition_frame_indexes for V2V (default ``[0, 1]``)."""
+        cond_indexes = getattr(batch.sampling_params, "condition_frame_indexes", None)
+        if not cond_indexes:
+            return [0, 1]
+        return sorted(set(int(i) for i in cond_indexes))
 
 
 class Cosmos3TokenizationStage(PipelineStage):
@@ -251,10 +320,13 @@ class Cosmos3TokenizationStage(PipelineStage):
 class Cosmos3LatentPreparationStage(PipelineStage):
     """Initialize the noisy latent for Cosmos3.
 
-    T2V / T2I produce pure Gaussian noise. I2V VAE-encodes the conditioning
-    image, replaces frame 0 of the latent with the encoded image, and stashes
-    a per-frame velocity mask plus the clean frame-0 latent for the denoiser
-    to re-inject after each scheduler step.
+    T2V / T2I produce pure Gaussian noise. I2V / V2V VAE-encode the
+    conditioning input, write the resulting latents at the conditioned
+    frame indexes, and stash a per-frame velocity mask plus the full
+    condition latent so the denoiser can re-blend after each scheduler step.
+    I2V is the special case of conditioning at frame ``[0]`` with the image
+    expanded across the temporal axis; V2V conditions at ``[0, 1]`` (or a
+    user-supplied list) with frames from the input video.
     """
 
     parallelism_type = StageParallelismType.REPLICATED
@@ -317,26 +389,53 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
 
-        is_i2v = (
-            batch.preprocessed_image is not None and batch.data_type == DataType.VIDEO
-        )
+        is_video_gen = batch.data_type == DataType.VIDEO
+        has_image_cond = batch.preprocessed_image is not None and is_video_gen
+        has_video_cond = batch.preprocessed_video is not None and is_video_gen
 
-        if is_i2v:
+        if has_image_cond or has_video_cond:
             vae_dtype = next(self.vae.parameters()).dtype
-            pixel_video = batch.preprocessed_image.unsqueeze(2).to(
-                device=device, dtype=vae_dtype
-            )
-            with torch.no_grad():
-                cond_latent = self._vae_encode(pixel_video).to(dtype)
 
+            if has_video_cond:
+                pixel_input = batch.preprocessed_video.to(
+                    device=device, dtype=vae_dtype
+                )
+                cond_indexes = (
+                    Cosmos3ImagePreprocessStage._resolve_condition_indexes(batch)
+                )
+            else:
+                pixel_input = batch.preprocessed_image.unsqueeze(2).to(
+                    device=device, dtype=vae_dtype
+                )
+                cond_indexes = [0]
+
+            with torch.no_grad():
+                cond_latent = self._vae_encode(pixel_input).to(dtype)
+
+            max_idx = max(cond_indexes)
+            if max_idx >= num_latent_frames:
+                raise ValueError(
+                    f"condition_frame_indexes={cond_indexes} exceeds the "
+                    f"latent frame count {num_latent_frames} for "
+                    f"num_frames={batch.num_frames}"
+                )
+
+            condition_latents = torch.zeros_like(noise)
             condition_mask = torch.zeros(
                 1, 1, num_latent_frames, 1, 1, device=device, dtype=dtype
             )
-            condition_mask[:, :, 0, :, :] = 1.0
-            latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
-            batch.image_latent = cond_latent[:, :, 0:1, :, :].clone()
+            for idx in cond_indexes:
+                src = min(idx, cond_latent.shape[2] - 1)
+                condition_latents[:, :, idx, :, :] = cond_latent[:, :, src, :, :]
+                condition_mask[:, :, idx, :, :] = 1.0
+
+            latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
+            batch.extra["condition_latents"] = condition_latents
             batch.extra["velocity_mask"] = 1.0 - condition_mask
-            self.log_info("Prepared I2V latents with frame-0 conditioning")
+            mode = "V2V" if has_video_cond else "I2V"
+            self.log_info(
+                f"Prepared {mode} latents with conditioning at frames {cond_indexes}"
+            )
         else:
             latents = noise
 
@@ -526,7 +625,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             fps: Video frame rate
             cache_key: Key for the UND K/V cache. Use "cond" for conditional
                 and "uncond" for unconditional to enable cache reuse across steps.
-            noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V conditioning mask.
+            noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V / V2V conditioning mask.
         """
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
@@ -589,7 +688,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         video_shape = batch.extra["video_shape"]
         fps = batch.extra.get("fps", 24.0)
         velocity_mask = batch.extra.get("velocity_mask")
-        image_latent = batch.image_latent
+        condition_latents = batch.extra.get("condition_latents")
         guidance_interval = getattr(batch.sampling_params, "guidance_interval", None)
 
         do_cfg = guidance_scale > 1.0
@@ -725,9 +824,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             if isinstance(noise_pred, tuple):
                 noise_pred, sound_noise_pred = noise_pred
 
-            # I2V: zero-velocity at conditioned frames so the scheduler keeps
-            # them clean; UniPC's predictor-corrector still rescales the
-            # sample, so we re-inject the clean image latent below.
+            # I2V / V2V: zero-velocity at conditioned frames so the scheduler
+            # keeps them clean; UniPC's predictor-corrector still rescales the
+            # sample, so we re-blend the clean condition latents below.
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
 
@@ -746,8 +845,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                     return_dict=False,
                 )[0]
 
-            if image_latent is not None:
-                latents[:, :, 0:1, :, :] = image_latent
+            if condition_latents is not None and velocity_mask is not None:
+                latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
 
             if batch.profile and not batch.is_warmup:
                 self.step_profile()

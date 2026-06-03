@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cosmos3 sampling parameters.
 
-A single ``SamplingParams`` class serves T2V, I2V, and T2I — the per-request
-mode is dispatched in the pipeline from ``num_frames`` (``== 1`` → T2I) and
-``image_path`` (set → I2V). For ``num_frames == 1`` the output ``data_type``
-flips to ``IMAGE`` so the file extension and decode path agree.
+A single ``SamplingParams`` class serves T2V, I2V, V2V, and T2I — the
+per-request mode is dispatched in the pipeline from ``num_frames``
+(``== 1`` → T2I), ``image_path`` (set → I2V), and ``video_path`` (set →
+V2V). For ``num_frames == 1`` the output ``data_type`` flips to ``IMAGE``
+so the file extension and decode path agree.
 """
 
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 
 @dataclass
 class Cosmos3SamplingParams(SamplingParams):
-    """Cosmos3 sampling parameters (T2V defaults; also used for I2V / T2I)."""
+    """Cosmos3 sampling parameters (T2V defaults; also used for I2V / V2V / T2I)."""
 
     height: int = 720
     width: int = 1280
@@ -30,8 +31,15 @@ class Cosmos3SamplingParams(SamplingParams):
     negative_prompt: str = ""
 
     # Optional CFG window — T2I requests typically pass e.g. ``(400, 1000)`` to
-    # skip guidance at low noise levels. T2V / I2V leave it unset.
+    # skip guidance at low noise levels. T2V / I2V / V2V leave it unset.
     guidance_interval: tuple[float, float] | None = None
+
+    # V2V conditioning: which latent-frame indices stay locked to the input
+    # video. ``None`` resolves to ``[0]`` for I2V (single frame) and ``[0, 1]``
+    # for V2V. ``condition_video_keep`` controls whether the first or last
+    # source frames are used when the input video is longer than needed.
+    condition_frame_indexes: list[int] | None = None
+    condition_video_keep: str = "first"
 
     supported_resolutions: list[tuple[int, int]] | None = field(
         default_factory=lambda: [

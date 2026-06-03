@@ -85,6 +85,7 @@ class Req:
     vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
+    preprocessed_video: torch.Tensor | None = None
 
     output_file_ext: str | None = None
     # Primary encoder embeddings
