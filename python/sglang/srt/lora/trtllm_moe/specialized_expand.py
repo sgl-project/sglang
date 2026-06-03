@@ -151,6 +151,7 @@ def _invoke_moe_lora_expand_add(
     config: "dict[str, Any]",
     mul_routed_weight: bool,
     fuse_sum_all_reduce: bool,
+    force_block_size_n: "int | None" = None,
 ) -> None:
     """Launch the rank-specialized LoRA-B expand kernel.
 
@@ -165,7 +166,13 @@ def _invoke_moe_lora_expand_add(
     assert R <= 64, f"direct LoRA expand/add expects rank <= 64, got {R}"
 
     block_size_m = config["BLOCK_SIZE_M"]
-    block_size_n = 128 if N % 128 == 0 else config["BLOCK_SIZE_N"]
+    # BLOCK_SIZE_N defaults to 128 when N % 128 == 0 (a good N-divisible tile that also keeps
+    # the gated gate_up split aligned). ``force_block_size_n`` lets a tuner/bench override it;
+    # down-proj has no gate/up boundary, so any divisor of N is valid there.
+    if force_block_size_n is not None:
+        block_size_n = force_block_size_n
+    else:
+        block_size_n = 128 if N % 128 == 0 else config["BLOCK_SIZE_N"]
     group_size_m = config.get("GROUP_SIZE_M", 1)
     block_size_r = triton.next_power_of_2(R)
 
