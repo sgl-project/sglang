@@ -257,16 +257,7 @@ class EagleDraftInputV2Mixin:
             # backend max() reads from list without a per-iter D2H sync.
             forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
-        if (
-            not batch.forward_mode.is_idle()
-            and not can_cuda_graph
-            # With DP attention, `_forward_raw -> prepare_mlp_sync_batch` pads
-            # input_ids / out_cache_loc / positions AFTER this point, so initing
-            # here would snapshot pre-pad shapes (same reason
-            # prepare_for_v2_verify defers init to forward_extend). The caller
-            # passes skip_attn_backend_init accordingly.
-            and forward_batch.global_num_tokens_cpu is None
-        ):
+        if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 

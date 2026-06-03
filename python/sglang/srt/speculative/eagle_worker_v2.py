@@ -749,13 +749,8 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch
                 )
             else:
-                # prepare_for_extend_to_fill_draft_kvcache only initialized the
-                # attn metadata when no DP padding applies; with DP attention,
-                # defer to forward_extend so metadata sees the padded batch
-                # (mirrors the verify path).
                 draft_logits_output = self.draft_runner.forward(
-                    forward_batch,
-                    skip_attn_backend_init=forward_batch.global_num_tokens_cpu is None,
+                    forward_batch, skip_attn_backend_init=True
                 ).logits_output
 
         maybe_detect_nan(
