@@ -947,7 +947,13 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            seq_len = len(req.fill_ids)
+            # fill_ids includes the token sampled during prefill, but decode
+            # registers state pages over origin_input_ids (DecodePreallocQueue)
+            # and the main pool send is clamped to end_idx above. Matching that
+            # length here avoids emitting an extra state page when the sampled
+            # token crosses a page boundary, which mismatched src/dst lengths in
+            # group_concurrent_contiguous.
+            seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
 
             def _mamba_payload():
                 return [
