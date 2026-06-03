@@ -694,7 +694,7 @@ class GroupCoordinator:
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
             and not torch.cuda.is_current_stream_capturing()
-            and is_in_piecewise_cuda_graph()
+            and is_in_tc_piecewise_cuda_graph()
         ):
             if not hasattr(ca_comm, "fused_ar_rms"):
                 return None
@@ -840,7 +840,7 @@ class GroupCoordinator:
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
                     ca_comm.all_gather_reg(input, out=output, dim=0)
-                elif is_in_piecewise_cuda_graph():
+                elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
                     # True CUDA graph warmup: avoid a different host collective.
