@@ -91,6 +91,54 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertIn("'fake'", str(context.exception))
 
 
+class TestContextParallelServerArgs(unittest.TestCase):
+    def setUp(self):
+        self.parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(self.parser)
+
+    def test_canonical_prefill_cp_cli_sets_unified_fields(self):
+        args = self.parser.parse_args(
+            ["--model", "dummy", "--enable-prefill-cp", "--cp-strategy", "interleave"]
+        )
+
+        self.assertTrue(args.enable_prefill_cp)
+        self.assertEqual(args.cp_strategy, "interleave")
+
+    def test_deprecated_dsa_cp_mode_maps_to_unified_strategy(self):
+        server_args = object.__new__(ServerArgs)
+        server_args.enable_prefill_context_parallel = False
+        server_args.enable_dsa_prefill_context_parallel = False
+        server_args.enable_prefill_cp = False
+        server_args.cp_strategy = "zigzag"
+        server_args.dsa_prefill_cp_mode = "round-robin-split"
+        server_args.prefill_cp_mode = "in-seq-split"
+        server_args._legacy_dsa_prefill_cp_mode = "round-robin-split"
+        server_args._legacy_prefill_cp_mode = None
+
+        server_args._handle_context_parallelism(validate_topology=False)
+
+        self.assertTrue(server_args.enable_prefill_cp)
+        self.assertEqual(server_args.cp_strategy, "interleave")
+        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
+
+    def test_unified_cp_mirrors_to_legacy_mode_fields(self):
+        server_args = object.__new__(ServerArgs)
+        server_args.enable_prefill_cp = True
+        server_args.cp_strategy = "interleave"
+        server_args.enable_prefill_context_parallel = False
+        server_args.enable_dsa_prefill_context_parallel = False
+        server_args.dsa_prefill_cp_mode = "in-seq-split"
+        server_args.prefill_cp_mode = "in-seq-split"
+        server_args._is_dsa_model_arch = True
+
+        server_args._sync_cp_legacy_aliases()
+
+        self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
+        self.assertFalse(server_args.enable_prefill_context_parallel)
+        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
+        self.assertEqual(server_args.prefill_cp_mode, "round-robin-split")
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
@@ -609,7 +657,7 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(attn_cp_size=2, tp_size=2))
 
     def test_rejects_prefill_context_parallel(self):
-        with self.assertRaisesRegex(ValueError, "--enable-prefill-context-parallel"):
+        with self.assertRaisesRegex(ValueError, "--enable-prefill-cp"):
             ServerArgs(**self._base_kwargs(enable_prefill_context_parallel=True))
 
     def test_rejects_hisparse(self):

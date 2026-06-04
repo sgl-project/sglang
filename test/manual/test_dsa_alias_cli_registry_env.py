@@ -2,8 +2,8 @@
 Manual test for step 01: NSA → DSA user-facing alias layer.
 
 Tests:
-  1. CLI: --dsa-* canonical flags write to dsa_* attrs
-  2. CLI: --nsa-* deprecated flags write to dsa_* attrs + log deprecation warning
+  1. CLI: --dsa-* non-CP canonical flags write to dsa_* attrs
+  2. CLI: deprecated CP flags write to unified CP attrs + log deprecation warning
   3. Registry: "dsa" key creates the backend; "nsa" key triggers DeprecationWarning
   4. Env: SGLANG_DSA_* canonical vars work
   5. Env: SGLANG_NSA_* deprecated vars fall back to SGLANG_DSA_* with DeprecationWarning
@@ -79,7 +79,7 @@ class TestDSAChoicesAndFields(unittest.TestCase):
 
 
 class TestCLICanonicalFlags(unittest.TestCase):
-    """--dsa-* canonical flags write to dsa_* attributes with no warning."""
+    """Canonical flags write to canonical attributes with no warning."""
 
     def setUp(self):
         from sglang.srt.server_args import ServerArgs
@@ -98,20 +98,21 @@ class TestCLICanonicalFlags(unittest.TestCase):
         args = self._parse(["--dsa-decode-backend", "tilelang"])
         self.assertEqual(args.dsa_decode_backend, "tilelang")
 
-    def test_enable_dsa_prefill_cp_canonical(self):
-        args = self._parse(["--enable-dsa-prefill-context-parallel"])
-        self.assertTrue(args.enable_dsa_prefill_context_parallel)
+    def test_enable_prefill_cp_canonical(self):
+        args = self._parse(["--enable-prefill-cp"])
+        self.assertTrue(args.enable_prefill_cp)
 
-    def test_dsa_prefill_cp_mode_canonical(self):
-        args = self._parse(["--dsa-prefill-cp-mode", "in-seq-split"])
-        self.assertEqual(args.dsa_prefill_cp_mode, "in-seq-split")
+    def test_cp_strategy_canonical(self):
+        args = self._parse(["--cp-strategy", "interleave"])
+        self.assertEqual(args.cp_strategy, "interleave")
 
     def test_defaults_are_none_or_false(self):
         args = self._parse([])
         self.assertIsNone(args.dsa_prefill_backend)
         self.assertIsNone(args.dsa_decode_backend)
-        self.assertFalse(args.enable_dsa_prefill_context_parallel)
-        self.assertEqual(args.dsa_prefill_cp_mode, "round-robin-split")
+        self.assertFalse(args.enable_prefill_cp)
+        self.assertEqual(args.cp_strategy, "zigzag")
+        self.assertIsNone(args._legacy_dsa_prefill_cp_mode)
 
     def test_attention_backend_dsa_key_in_choices(self):
         args = self._parse(["--attention-backend", "dsa"])
@@ -119,7 +120,7 @@ class TestCLICanonicalFlags(unittest.TestCase):
 
 
 class TestCLIDeprecatedFlags(unittest.TestCase):
-    """--nsa-* deprecated flags write to dsa_* attributes and emit logger warning."""
+    """Deprecated flags write to canonical attributes and emit logger warning."""
 
     def setUp(self):
         import logging
@@ -178,14 +179,14 @@ class TestCLIDeprecatedFlags(unittest.TestCase):
         args, log_output = self._parse_capture_warnings(
             ["--enable-nsa-prefill-context-parallel"]
         )
-        self.assertTrue(args.enable_dsa_prefill_context_parallel)
+        self.assertTrue(args.enable_prefill_cp)
         self.assertIn("deprecated", log_output.lower())
 
     def test_nsa_prefill_cp_mode_deprecated(self):
         args, log_output = self._parse_capture_warnings(
             ["--nsa-prefill-cp-mode", "in-seq-split"]
         )
-        self.assertEqual(args.dsa_prefill_cp_mode, "in-seq-split")
+        self.assertEqual(args._legacy_dsa_prefill_cp_mode, "in-seq-split")
         self.assertIn("deprecated", log_output.lower())
 
     def test_attention_backend_nsa_still_accepted(self):
