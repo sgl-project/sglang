@@ -17,6 +17,8 @@ import dataclasses
 import unittest
 from unittest.mock import MagicMock, Mock
 
+import msgspec
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -159,7 +161,7 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
         fr = finished_reason
 
     kwargs = {}
-    for f in dataclasses.fields(BatchStrOutput):
+    for f in msgspec.structs.fields(BatchStrOutput):
         if f.name == "rids":
             kwargs[f.name] = [rid]
         elif f.name == "finished_reasons":
