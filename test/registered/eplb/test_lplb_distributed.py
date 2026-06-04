@@ -180,9 +180,9 @@ def test_solve_ipm_matches_torch_reference():
         "IPM returned the 0.5 non-convergence sentinel — the comparison would "
         "be trivial. Adjust the LP instance so it converges."
     )
-    assert torch.allclose(cuda_x, torch_x, atol=1e-2, rtol=1e-2), (
-        f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
-    )
+    assert torch.allclose(
+        cuda_x, torch_x, atol=1e-2, rtol=1e-2
+    ), f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
 
 
 @pytest.mark.skipif(
