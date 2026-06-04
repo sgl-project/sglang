@@ -5,11 +5,11 @@ Progressive-resolution denoising stage.
 Extends DenoisingStage with a multi-stage coarse-to-fine denoising loop:
   Stage 1 runs at 1/(2^levels) of the full latent resolution.
   Between stages, the latent is upsampled via the spectral method selected by
-  progressive_mode (default: "dct_rewind").
+  progressive_mode.
   Stage N runs at full resolution.
 
-When progressive_mode == "fullres" (default), the stage delegates entirely to
-DenoisingStage.forward() — existing behaviour is preserved unchanged.
+When progressive_mode == "fullres" (default), route the request to the standard
+DenoisingStage instead of this stage.
 
 Supported progressive_mode values
   "dct"         : DCT-II embed, IDCT upsample, no scheduler rewind
@@ -166,9 +166,11 @@ class ProgressiveDenoisingStage(DenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
 
-        # Existing path — no change in behavior
         if mode not in _PROGRESSIVE_MODES:
-            return super().forward(batch, server_args)
+            raise ValueError(
+                "ProgressiveDenoisingStage requires progressive_mode to be "
+                "'dct' or 'dct_rewind'. Route fullres requests to DenoisingStage."
+            )
 
         if get_sp_world_size() > 1:
             raise RuntimeError(
