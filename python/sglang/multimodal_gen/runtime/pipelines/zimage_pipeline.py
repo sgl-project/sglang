@@ -10,7 +10,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    DenoisingStage,
     InputValidationStage,
+    PipelineStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -69,19 +71,24 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_decoding_stage()
 
     def _add_zimage_denoising_stage(self, stage_name: str = "denoising_stage") -> None:
-        """Add ZImageProgressiveDenoisingStage.
-
-        Routes to DenoisingStage.forward() when progressive_mode == 'fullres'
-        (the default), preserving identical behaviour for non-progressive requests.
-        """
-
         def create_stage():
-            return ZImageProgressiveDenoisingStage(
+            kwargs = dict(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
                 pipeline=self,
                 vae=self.get_module("vae", None),
             )
+            standard = DenoisingStage(**kwargs)
+            progressive = ZImageProgressiveDenoisingStage(**kwargs)
+
+            class _Dispatch(PipelineStage):
+                def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+                    mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
+                    if mode in ("dct", "dct_rewind"):
+                        return progressive.forward(batch, server_args)
+                    return standard.forward(batch, server_args)
+
+            return _Dispatch()
 
         self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
 
