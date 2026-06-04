@@ -175,10 +175,11 @@ class TestForwardPassMetrics(unittest.TestCase):
             "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
             return_value=104.5,
         ):
-            self.reporter._emit_forward_pass_metrics(batch)
+            emitted = self.reporter._emit_forward_pass_metrics(batch)
 
         self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
         metrics = self.scheduler._fpm_publisher.metrics[0]
+        self.assertIs(emitted, metrics)
         self.assertEqual(metrics.worker_id, "worker-7")
         self.assertEqual(metrics.dp_rank, 3)
         self.assertEqual(metrics.wall_time, 4.5)

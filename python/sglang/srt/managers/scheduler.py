@@ -212,6 +212,7 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.self_benchmark import SelfBenchmark
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -552,6 +553,12 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
+
+        self.self_benchmark = (
+            SelfBenchmark(self) if self.server_args.benchmark_mode is not None else None
+        )
+
+        maybe_revert_pr_fix()
 
         self.is_initializing = False
 
@@ -1524,9 +1531,12 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            if self.self_benchmark is not None and self.self_benchmark.active:
+                self.self_benchmark.maybe_schedule_next()
+            else:
+                # Receive requests
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
@@ -1563,9 +1573,12 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            if self.self_benchmark is not None and self.self_benchmark.active:
+                self.self_benchmark.maybe_schedule_next()
+            else:
+                # Receive requests
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
@@ -3434,8 +3447,12 @@ class Scheduler(
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
+        fpm = None
         if self.enable_fpm:
-            self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+            fpm = self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+
+        if self.self_benchmark is not None:
+            self.self_benchmark.observe_forward_pass(batch, fpm)
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()

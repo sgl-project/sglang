@@ -321,6 +321,13 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_idx = []
 
     def accept(self, *, req: Req) -> None:
+        if getattr(req, "suppress_output", False):
+            if req.finished():
+                req.finished_output = True
+                if req.finished_len is None:
+                    req.finished_len = len(req.output_ids)
+            return
+
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
