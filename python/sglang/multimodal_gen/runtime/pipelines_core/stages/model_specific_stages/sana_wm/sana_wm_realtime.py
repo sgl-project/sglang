@@ -608,10 +608,9 @@ class SanaWMRealtimeStage(PipelineStage):
     ) -> RefinerChunkRunner:
         """Build OUR chunked LTX-2 refiner runner from the loaded refiner stage.
 
-        Mirrors ``SanaWMRealtimeEngine._build_refiner_runner``: encode the prompt
-        through the refiner's Gemma-3, wrap the unwrapped diffusers LTX-2 refiner
-        transformer in ``_RefinerCore``, and construct the ``RefinerChunkRunner``
-        that carries the sink/history KV across blocks.
+        Encodes the prompt through the refiner's Gemma-3, wraps the unwrapped
+        diffusers LTX-2 refiner transformer in ``_RefinerCore``, and constructs the
+        ``RefinerChunkRunner`` that carries the sink/history KV across blocks.
         """
         rs = self.refiner_stage
         if rs is None:
@@ -619,7 +618,7 @@ class SanaWMRealtimeStage(PipelineStage):
         # Keep the refiner sub-modules resident on the model device. The offline
         # refiner stage moves them per-call via use_declared_component / the
         # offload manager, but the realtime session encodes the prompt and runs
-        # the refiner directly outside that context (mirrors SanaWMRealtimeEngine).
+        # the refiner directly outside that context.
         for _mod in (rs.text_encoder, rs.connectors, rs.transformer):
             if _mod is not None:
                 _mod.to(device)
