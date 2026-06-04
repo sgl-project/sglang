@@ -27,7 +27,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from .realtime import (
     SanaWMRealtimeSession,
 )
-from .sana_wm_base import configure_sana_wm_ltx2_vae_for_long_video
+from .sana_wm_base import (
+    SanaWMBeforeDenoisingStage,
+    configure_sana_wm_ltx2_vae_for_long_video,
+)
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
+    compute_chunk_plucker,
+)
 from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     SanaWMLTX2RefinerStage,
@@ -48,7 +54,6 @@ from .utils import (
     load_camera,
     load_intrinsics,
     pil_to_model_tensor,
-    prepare_camera_conditions,
     resize_and_center_crop,
     snap_num_frames,
     transform_intrinsics_for_crop,
@@ -466,11 +471,49 @@ class SanaWMRealtimeStage(PipelineStage):
             state.resized_size,
             state.crop_offset,
         )
-        camera = prepare_camera_conditions(c2w, intrinsics)
-        raymap = camera["raymap"].unsqueeze(0).to(device=device, dtype=dtype)
-        chunk_plucker = camera["chunk_plucker"].unsqueeze(0).to(
-            device=device, dtype=dtype
+        # Build raymap + chunk_plucker through the SAME helpers (and on the same
+        # device) as the batch path's _build_camera_conditioning, instead of the
+        # equivalent-but-separate utils.prepare_camera_conditions: the two
+        # implementations agree only to ~1-2 bf16 ulps on some frames, and that
+        # seed amplifies to %-level stage-1 drift through the bf16 block stack
+        # across chunks (measured: plucker_emb 1.7e-7 -> chunk>=2 1.3-4% relRMS).
+        vae_time_stride = 8
+        latent_h = SANA_WM_HEIGHT // 32
+        latent_w = SANA_WM_WIDTH // 32
+        latent_t = (num_frames - 1) // vae_time_stride + 1
+        camera_to_world = (
+            torch.from_numpy(np.asarray(c2w, dtype=np.float32))
+            .unsqueeze(0)
+            .to(device=device, dtype=torch.float32)
         )
+        intrinsics_vec4 = (
+            torch.from_numpy(np.asarray(intrinsics, dtype=np.float32))
+            .unsqueeze(0)
+            .to(device=device, dtype=torch.float32)
+        )
+        rel_poses = SanaWMBeforeDenoisingStage._relative_camera_poses(camera_to_world)
+        intrinsics_latent = SanaWMBeforeDenoisingStage._scale_intrinsics_to_latent(
+            intrinsics_vec4,
+            pixel_h=SANA_WM_HEIGHT,
+            pixel_w=SANA_WM_WIDTH,
+            latent_h=latent_h,
+            latent_w=latent_w,
+        )
+        original_camera = SanaWMBeforeDenoisingStage._flatten_camera_conditions(
+            rel_poses, intrinsics_latent
+        )
+        raymap = SanaWMBeforeDenoisingStage._latent_frame_camera_conditions(
+            original_camera,
+            num_frames=num_frames,
+            latent_frames=latent_t,
+            vae_temporal_stride=vae_time_stride,
+        ).to(device=device, dtype=dtype)
+        chunk_plucker = compute_chunk_plucker(
+            original_camera,
+            HW=(latent_t, latent_h, latent_w),
+            vae_temporal_stride=vae_time_stride,
+            patch_size=(1, 1, 1),
+        ).to(device=device, dtype=dtype)
         # Carried into session.step as the next chunk's camera conditioning.
         state.raymap = raymap
         state.chunk_plucker = chunk_plucker

@@ -208,6 +208,18 @@ class SanaWMRealtimeSession:
             self.kv_cache, self.chunk_idx, self.chunk_indices,
             self.num_cached_blocks, self.sink_token, self.num_blocks,
         )
+        _rt_dump_dir = __import__("os").environ.get("SANAWM_RT_DUMP_DIR")
+        if _rt_dump_dir:  # parity harness: accumulated-KV checksums
+            _probe = {"sink_num": sink_num}
+            for _b, _slots in enumerate(chunk_kv):
+                for _s, _t in enumerate(_slots):
+                    if _t is not None:
+                        _probe[f"b{_b:02d}s{_s}"] = (
+                            tuple(_t.shape),
+                            float(_t.detach().double().sum().item()),
+                        )
+            __import__("pathlib").Path(_rt_dump_dir).mkdir(parents=True, exist_ok=True)
+            torch.save(_probe, f"{_rt_dump_dir}/kv_probe_{self.chunk_idx:03d}.pt")
         frame_index = (
             torch.arange(start_f, end_f, device=self.device, dtype=torch.long)
             if sink_num > 0 else None

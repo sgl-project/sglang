@@ -814,7 +814,12 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         prope_fns = None
         if camera_conditions is not None:
             if camera_conditions.shape[1] != T:
-                camera_conditions = camera_conditions[:, start:end]
+                # .contiguous(): canonical layout regardless of how the caller
+                # built the full-length tensor, so batch and realtime windows are
+                # kernel-level identical (slice offset/stride changes the reduction
+                # order otherwise — measured 1e-7 seeds amplifying to %-level drift
+                # through the bf16 block stack).
+                camera_conditions = camera_conditions[:, start:end].contiguous()
             if camera_conditions.shape[0] != B:
                 camera_conditions = camera_conditions.repeat(
                     B // camera_conditions.shape[0], 1, 1
@@ -825,7 +830,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # Plücker post-attn / input embedding, sliced to the chunk.
         if chunk_plucker is not None and chunk_plucker.shape[2] != T:
-            chunk_plucker = chunk_plucker[:, :, start:end]
+            chunk_plucker = chunk_plucker[:, :, start:end].contiguous()  # see camera note
         if chunk_plucker is not None and chunk_plucker.shape[0] != B:
             chunk_plucker = chunk_plucker.repeat(
                 B // chunk_plucker.shape[0], 1, 1, 1, 1
@@ -846,6 +851,22 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             plucker_emb = None
 
         # --- 6. Transformer blocks (thread per-block cache) ---
+        # parity harness (env-gated, no-op in prod): on the FIRST sink-path call
+        # (frame_index not None), checksum the pre-block tensors and x after every
+        # block to localize where the two execution paths first diverge.
+        _probe_path = __import__("os").environ.get("SANAWM_BLOCK_PROBE")
+        _probe = None
+        if _probe_path and frame_index is not None and not getattr(self, "_block_probe_done", False):
+            def _ck(t):
+                return (tuple(t.shape), float(t.detach().double().sum().item())) if t is not None else None
+            _probe = {
+                "x_embed": _ck(x), "t6": _ck(t6), "y": _ck(y),
+                "freqs": (tuple(freqs.shape), float(freqs.real.detach().double().sum().item()),
+                          float(freqs.imag.detach().double().sum().item())) if freqs is not None else None,
+                "plucker_emb": _ck(plucker_emb),
+                "frame_index": frame_index.tolist(),
+            }
+
         HW = (T, H, W)
         new_cache = []
         for i, block in enumerate(self.blocks):
@@ -862,6 +883,13 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 save_kv_cache=save_kv_cache,
             )
             new_cache.append(block_cache)
+            if _probe is not None:
+                _probe[f"x_after_block_{i:02d}"] = (
+                    tuple(x.shape), float(x.detach().double().sum().item())
+                )
+        if _probe is not None:
+            torch.save(_probe, _probe_path)
+            self._block_probe_done = True
 
         # --- 7. Final layer + 8. Un-patch ---
         x = self.final_layer(x, t_emb)

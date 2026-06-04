@@ -248,6 +248,16 @@ class SanaWMStreamingDenoisingStage(SanaWMDenoisingStage):
                 chunk_kv, sink_num = self._accumulate_kv_cache(
                     kv_cache, chunk_idx, chunk_indices, num_cached_blocks, sink_token, num_blocks
                 )
+                if _SANAWM_FORK_DUMP_DIR:  # parity harness: accumulated-KV checksums
+                    _probe = {"sink_num": sink_num}
+                    for _b, _slots in enumerate(chunk_kv):
+                        for _s, _t in enumerate(_slots):
+                            if _t is not None:
+                                _probe[f"b{_b:02d}s{_s}"] = (
+                                    tuple(_t.shape),
+                                    float(_t.detach().double().sum().item()),
+                                )
+                    torch.save(_probe, f"{_SANAWM_FORK_DUMP_DIR}/kv_probe_{chunk_idx:03d}.pt")
                 start_f = chunk_indices[chunk_idx]
                 end_f = chunk_indices[chunk_idx + 1]
                 chunk_frames = end_f - start_f
