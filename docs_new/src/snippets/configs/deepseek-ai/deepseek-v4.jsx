@@ -139,7 +139,6 @@ sgl-eval run aime25 \\
     b300:  "lmsysorg/sglang:latest",
     gb200: "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
-    rtx6000: "lmsysorg/sglang:latest",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".

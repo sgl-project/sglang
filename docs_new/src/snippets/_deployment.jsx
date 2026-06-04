@@ -362,11 +362,16 @@ export const Deployment = ({ config, benchmarks }) => {
     return Array.isArray(speed) ? speed : [speed];
   };
 
-  // Variant default accuracy merged UNDER per-cell measured accuracy.
-  const effectiveAccuracy = (entry, sel) => ({
-    ...((config.defaultAccuracy && config.defaultAccuracy[sel.variant]) || {}),
-    ...((entry && entry.accuracy) || {}),
-  });
+  // Variant default accuracy merged UNDER per-cell measured accuracy — but ONLY when
+  // a benchmark entry exists for the cell. A cell with no entry was never measured, so
+  // it shows the empty/"pending" state instead of borrowing the variant's accuracy.
+  const effectiveAccuracy = (entry, sel) =>
+    entry
+      ? {
+          ...((config.defaultAccuracy && config.defaultAccuracy[sel.variant]) || {}),
+          ...(entry.accuracy || {}),
+        }
+      : {};
 
   // Empty = every speed measurement null-only AND accuracy null-only. `workload`
   // is metadata, not a measurement — skip it so a workload-only stub stays empty.
