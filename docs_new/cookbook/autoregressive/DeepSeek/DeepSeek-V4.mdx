@@ -156,6 +156,18 @@ MegaMoE is not supported with this DeepEP Waterfill recipe yet. Waterfill routes
 the shared expert through DeepEP for load balancing, so `--enable-deepep-waterfill`
 requires `--moe-a2a-backend deepep`.
 
+**FP4 Indexer (Experimental)**
+
+DeepSeek-V4 uses the default indexer path unless `--enable-deepseek-v4-fp4-indexer` is set. Enable this flag to use the experimental FP4 C4 indexer on SM100 GPUs with DeepGEMM FP4 indexer support. This path is intended for decode-heavy long-context workloads where reducing indexer cache bandwidth is beneficial.
+
+```bash Command
+# Please use latest main branch for this feature
+sglang serve deepseek-ai/DeepSeek-V4-Flash \
+  --tp 4 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --enable-deepseek-v4-fp4-indexer
+```
+
 <a id="hopper-note" />
 
 **Hopper (H200) note**
