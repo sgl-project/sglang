@@ -676,6 +676,8 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
+    enable_mamba_cache_stochastic_rounding: bool = False
+    mamba_cache_philox_rounds: int = 0
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
@@ -3152,20 +3154,53 @@ class ServerArgs:
             self.grammar_backend = "xgrammar"
 
     def _handle_mamba_backend(self):
+        if self.mamba_cache_philox_rounds < 0:
+            raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
+
+        if self.enable_mamba_cache_stochastic_rounding:
+            if self.mamba_ssm_dtype != "float16":
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache requires "
+                    f"--mamba-ssm-dtype float16, got {self.mamba_ssm_dtype!r}. "
+                    "Run with --mamba-ssm-dtype float16 or disable "
+                    "--enable-mamba-cache-stochastic-rounding."
+                )
+            if not is_cuda():
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache is only "
+                    "supported on NVIDIA CUDA platforms. Disable "
+                    "--enable-mamba-cache-stochastic-rounding on this platform."
+                )
+            if self.mamba_backend == "triton" and not is_sm100_supported():
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache with "
+                    "--mamba-backend triton requires SM100-family Blackwell "
+                    "(GB200/B200 or GB300/B300) with CUDA >= 12.8 because it "
+                    "uses the cvt.rs.f16x2.f32 PTX instruction. On H100/SM90, "
+                    "run with --mamba-backend flashinfer --mamba-ssm-dtype "
+                    "float16, or disable "
+                    "--enable-mamba-cache-stochastic-rounding."
+                )
+
         if self.mamba_backend == "flashinfer":
+            flashinfer_error = (
+                "FlashInfer mamba module not available, please check the "
+                "FlashInfer installation."
+            )
+            if self.enable_mamba_cache_stochastic_rounding:
+                flashinfer_error += (
+                    " Stochastic rounding with --mamba-backend flashinfer "
+                    "requires FlashInfer Mamba and --mamba-ssm-dtype float16."
+                )
             if is_flashinfer_available():
                 try:
                     import flashinfer.mamba  # noqa: F401
 
                     logger.info("Successfully imported FlashInfer mamba module")
                 except (ImportError, AttributeError):
-                    raise ValueError(
-                        "FlashInfer mamba module not available, please check flashinfer installation."
-                    )
+                    raise ValueError(flashinfer_error)
             else:
-                raise ValueError(
-                    "FlashInfer mamba module not available, please check flashinfer installation."
-                )
+                raise ValueError(flashinfer_error)
 
     def _handle_linear_attn_backend(self):
         import torch
@@ -6151,6 +6186,23 @@ class ServerArgs:
             choices=["float32", "bfloat16", "float16"],
             help="The data type of the SSM states in mamba cache. "
             "If not set, will be read from model config (mamba_ssm_dtype).",
+        )
+        parser.add_argument(
+            "--enable-mamba-cache-stochastic-rounding",
+            action="store_true",
+            default=ServerArgs.enable_mamba_cache_stochastic_rounding,
+            help="Enable stochastic rounding when writing FP16 Mamba SSM cache "
+            "states. Requires --mamba-ssm-dtype float16 and CUDA. With "
+            "--mamba-backend triton, requires SM100-family Blackwell "
+            "(GB200/B200 or GB300/B300).",
+        )
+        parser.add_argument(
+            "--mamba-cache-philox-rounds",
+            type=int,
+            default=ServerArgs.mamba_cache_philox_rounds,
+            help="Number of Philox rounds to use for stochastic rounding of "
+            "FP16 Mamba SSM cache writes. Triton uses the Triton default when "
+            "set to 0; FlashInfer uses 10 rounds when set to 0.",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",
