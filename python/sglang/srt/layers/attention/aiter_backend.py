@@ -281,7 +281,7 @@ class AiterAttnBackend(AttentionBackend):
             # so all num_head size does not use qh16 kernel to simulate
             # it should not use fake-nps (fast_mode = False, intra_batch_mode = True)
             # it will cause gpu-fault or accuracy issue
-            if self.num_head == 32 or self.num_head == 128:
+            if self.num_head in (32, 64, 128):
                 fast_mode = True
                 intra_batch_mode = False
 

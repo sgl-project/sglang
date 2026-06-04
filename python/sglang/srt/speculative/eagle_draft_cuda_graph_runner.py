@@ -352,9 +352,6 @@ class EAGLEDraftCudaGraphRunner:
         )
 
         def run_once():
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
 
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
