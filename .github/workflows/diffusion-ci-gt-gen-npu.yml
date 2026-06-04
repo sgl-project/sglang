@@ -148,7 +148,7 @@ jobs:
     if: |
       needs.compute-diffusion-partitions.result == 'success' &&
       needs.compute-diffusion-partitions.outputs.matrix-2npu != '{"include":[]}'
-    runs-on: linux-aarch64-a3-2
+    runs-on: linux-aarch64-a3-16
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2npu) }}
