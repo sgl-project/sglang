@@ -37,7 +37,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.triton_ops.qkv_lora_b import qkv_lora_b_fwd
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
 
 # Reuse the validated testbed helpers (same shapes / batch_info / rotation).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -81,9 +84,10 @@ def _qkv_diag_kernel(
     BLOCK_K: tl.constexpr,
     scalings,
     WRITEBACK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
-    """Exact copy of _qkv_lora_b_kernel (PDL stripped for clean ncu/diag) with the
-    writeback op selected by the WRITEBACK constexpr."""
+    """Copy of _qkv_lora_b_kernel with the writeback op selected by WRITEBACK and PDL
+    optional (off by default for clean ncu; on to sweep the production launch path)."""
     batch_id = tl.program_id(axis=2)
     w_index = tl.load(weight_indices + batch_id)
     rank = tl.load(lora_ranks + w_index)
@@ -122,6 +126,9 @@ def _qkv_diag_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     n_mask = n_offset[None, :] < n_size
     x_tile = tl.load(
         x_ptrs,
@@ -136,6 +143,9 @@ def _qkv_diag_kernel(
     partial_sum = tl.dot(x_tile.to(w_tile.dtype), w_tile)
     partial_sum *= scaling
     partial_sum = partial_sum.to(output.dtype.element_ty)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     output_ptr = (
         output
@@ -155,6 +165,7 @@ def _qkv_diag_kernel(
 def run_diag(
     x, w, batch_info, output_offset, max_out, base_output, n_slices,
     writeback: int, block_s: int, block_out: int, num_warps: int,
+    enable_pdl: bool = False,
 ):
     s = x.shape[0]
     r = w.shape[-1]
@@ -164,6 +175,7 @@ def run_diag(
         n_slices,
         batch_info.bs,
     )
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _qkv_diag_kernel[grid](
         x, w, base_output, r, max_out,
         x.stride(0), x.stride(1),
@@ -176,7 +188,9 @@ def run_diag(
         block_s, block_out, triton.next_power_of_2(r),
         batch_info.scalings,
         writeback,
+        ENABLE_PDL=enable_pdl,
         num_warps=num_warps,
+        **pdl_kwargs,
     )
     return base_output
 
@@ -277,7 +291,7 @@ def mode_x2(args, device) -> None:
                     calls = [
                         (lambda x=x, w=w, off=off, base=base, bs_=bs_, bo=bo, nw=nw:
                          run_diag(x, w, bi, off, max_out, base, n_slices,
-                                  wb, bs_, bo, nw))
+                                  wb, bs_, bo, nw, args.pdl))
                         for x, w, off, base in groups
                     ]
                     try:
@@ -298,6 +312,7 @@ def main():
     ap.add_argument("--mode", choices=["x3", "x2", "verify"], default="x3")
     ap.add_argument("--wb", choices=["atomic", "load_add_store", "store"],
                     default="atomic", help="writeback mode for x2 sweep")
+    ap.add_argument("--pdl", action="store_true", help="enable PDL in x2 sweep")
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--scaling", type=float, default=2.0)
