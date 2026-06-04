@@ -2129,11 +2129,11 @@ _struct_types = tuple(
 )
 # str primitive types should encode to bytes
 _primitive_types = (int, float, bool, bytes)
+_all_types = _struct_types + _primitive_types
+
 
 _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)
-_msgpack_decoder = msgspec.msgpack.Decoder(
-    Union[*_struct_types, *_primitive_types], dec_hook=dec_hook
-)
+_msgpack_decoder = msgspec.msgpack.Decoder(Union[_all_types], dec_hook=dec_hook)
 
 
 def _maybe_wrap_pickle(obj: Any) -> PickleWrapperIpc:
