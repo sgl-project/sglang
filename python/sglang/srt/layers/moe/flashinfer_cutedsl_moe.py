@@ -7,6 +7,48 @@ from flashinfer import (
 )
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
+from sglang.srt.distributed.parallel_state import get_tp_group
+
+_SYMMETRIC_BARRIER_TENSORS: dict[
+    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, object]
+] = {}
+
+
+def _get_symmetric_barrier_tensors(
+    device: torch.device,
+) -> tuple[int, torch.Tensor, torch.Tensor]:
+    import cutlass.torch as cutlass_torch
+    import torch.distributed._symmetric_memory as torch_symmetric_memory
+
+    group = get_tp_group().device_group
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    cache_key = (id(group), device_index, num_sms)
+    if cache_key not in _SYMMETRIC_BARRIER_TENSORS:
+        barrier_flag_local = torch_symmetric_memory.empty(
+            (num_sms,), device=device, dtype=torch.int32
+        )
+        barrier_flag_local.zero_()
+        barrier_handle = torch_symmetric_memory.rendezvous(
+            barrier_flag_local, group=group
+        )
+        barrier_flag_multicast = cutlass_torch.as_tensor(
+            barrier_handle.multicast_ptr,
+            barrier_flag_local.shape,
+            barrier_flag_local.dtype,
+        )
+        _SYMMETRIC_BARRIER_TENSORS[cache_key] = (
+            barrier_flag_local,
+            barrier_flag_multicast,
+            barrier_handle,
+        )
+    barrier_flag_local, barrier_flag_multicast, _barrier_handle = _SYMMETRIC_BARRIER_TENSORS[
+        cache_key
+    ]
+    return group.size(), barrier_flag_local, barrier_flag_multicast
+
 
 def get_cute_dtype(input: torch.Tensor) -> str:
     if input.dtype == torch.bfloat16:
@@ -30,6 +72,11 @@ def flashinfer_cutedsl_moe_masked(
     w2_blockscale: torch.Tensor,
     w2_alpha,
     masked_m: torch.Tensor,
+    topk_weights: Optional[torch.Tensor] = None,
+    recv_rank_info: Optional[torch.Tensor] = None,
+    recv_idx_info: Optional[torch.Tensor] = None,
+    combine_out: Optional[torch.Tensor] = None,
+    combine_out_ptrs: Optional[torch.Tensor] = None,
     down_sm_count: Optional[int] = None,
     down_signals: Optional[torch.Tensor] = None,
     down_start_event: Optional[torch.cuda.Event] = None,
@@ -158,8 +205,44 @@ def flashinfer_cutedsl_moe_masked(
         down_start_event.record()
 
     # Gemm2
-    out = torch.empty((num_experts, m, k), dtype=torch.bfloat16, device=a_q.device)
-    out = out.permute(1, 2, 0)  # requirement of kernel
+    is_combine_fusion = combine_out is not None
+    if is_combine_fusion:
+        missing = [
+            name
+            for name, value in (
+                ("topk_weights", topk_weights),
+                ("recv_rank_info", recv_rank_info),
+                ("recv_idx_info", recv_idx_info),
+                ("combine_out_ptrs", combine_out_ptrs),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "fused grouped GEMM combine is missing DeepEP metadata: "
+                + ", ".join(missing)
+            )
+        num_ranks, barrier_flag_local, barrier_flag_multicast = (
+            _get_symmetric_barrier_tensors(a_q.device)
+        )
+        c_dtype = get_cute_dtype(combine_out)
+        out = combine_out
+        combine_fusion_kwargs = dict(
+            is_swap_ab=True,
+            is_combine_fusion=True,
+            topk_weights=topk_weights,
+            idx_src_info=recv_idx_info,
+            rank_src_info=recv_rank_info,
+            out_ptrs=combine_out_ptrs,
+            num_ranks=num_ranks,
+            barrier_flag_local=barrier_flag_local,
+            barrier_flag_multicast=barrier_flag_multicast,
+        )
+    else:
+        out = torch.empty((num_experts, m, k), dtype=torch.bfloat16, device=a_q.device)
+        out = out.permute(1, 2, 0)  # requirement of kernel
+        combine_fusion_kwargs = {}
+
     grouped_gemm_nt_masked(
         (diq, diq_sf),
         (w2.permute(1, 2, 0), w2_blockscale),
@@ -179,5 +262,11 @@ def flashinfer_cutedsl_moe_masked(
             if down_sm_count is not None or down_signals is not None
             else {}
         ),
-    )  # in logical [m, k, l]
+        **combine_fusion_kwargs,
+    )
+
+    if is_combine_fusion:
+        return out
+
+    # in logical [m, k, l]
     return out.permute(2, 0, 1)
