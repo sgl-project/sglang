@@ -634,7 +634,6 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         # Seed + recurrent iters share the same `seq_lens - 1` rope position,
         # so one init covers the loop. Must run even at num_steps == 1.
-        # Pre-planned batches (cuda-graph capture) carry the marker already.
         if forward_batch.needs_forward_metadata_init():
             self._init_frozen_kv_metadata(forward_batch)
 

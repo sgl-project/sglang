@@ -560,8 +560,6 @@ class EagleDraftWorker(BaseDraftWorker):
             with forward_context(
                 ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
             ), canary_index_ctx:
-                # forward_metadata_ready (set at the multi-step pre-plan)
-                # keeps the forward path from re-planning per step.
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
@@ -750,7 +748,6 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch
                 )
             else:
-                # Pre-planned in prepare_draft_extend_after_decode (marker).
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch
                 ).logits_output
