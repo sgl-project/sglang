@@ -50,7 +50,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if _is_hip:
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -273,7 +274,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "intel_xpu"
 ]
 
 
@@ -363,7 +364,10 @@ class DeepseekSparseAttnBackend(
         )
         self.speculative_step_id = speculative_step_id
 
-        self.device_capability = torch.cuda.get_device_capability()
+        if _is_xpu:
+            self.device_capability = (0, 0)
+        else:
+            self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
@@ -1682,6 +1686,17 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 bs=forward_batch.batch_size,
             )
+        elif self.dsa_decode_impl == "intel_xpu":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_intel_xpu_sparse_decode(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
 
         else:
             assert False, f"Unsupported {self.dsa_decode_impl = }"
@@ -1886,7 +1901,24 @@ class DeepseekSparseAttnBackend(
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
 
-        # Use FA3 for SM90 (Hopper/H200)
+        # Use FA3 for SM90 (Hopper/H200) / XPU
+        if _is_xpu:
+            from sgl_kernel.flash_attn import (
+                flash_attn_varlen_func as xpu_flash_attn_varlen_func,
+            )
+
+            return xpu_flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+                causal=causal,
+            )
+
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -1916,6 +1948,64 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
+
+    def _forward_intel_xpu_sparse_decode(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """Sparse decode for XPU using flash_mla_decode with gathered KV.
+
+        Gathers the sparse KV tokens selected by the indexer into a contiguous
+        buffer organized as virtual pages, then runs flash_mla_decode on it.
+        """
+        from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
+
+        B = q_nope.shape[0]
+        TOPK = page_table_1.shape[1]
+        D_ckv = kv_cache.shape[-1]
+        GATHER_PAGE_SIZE = 16
+        NUM_PAGES = TOPK // GATHER_PAGE_SIZE
+
+        # Count valid tokens per batch (non -1 entries)
+        valid_counts = (page_table_1 >= 0).sum(dim=1).to(torch.int32)
+
+        # Gather KV tokens: replace -1 with 0 for safe indexing, zero-fill after
+        safe_indices = page_table_1.clamp(min=0)
+        # kv_cache is [total_tokens, D_ckv], index with flat indices
+        gathered_kv = kv_cache[safe_indices.view(-1)].view(B, TOPK, D_ckv)
+        # Zero out invalid entries
+        invalid_mask = page_table_1 < 0  # [B, TOPK]
+        gathered_kv[invalid_mask] = 0
+
+        # Reshape to pages: [B * NUM_PAGES, GATHER_PAGE_SIZE, D_ckv]
+        gathered_kv_paged = gathered_kv.view(B * NUM_PAGES, GATHER_PAGE_SIZE, D_ckv)
+
+        # Identity page table: batch i → pages [i*NUM_PAGES, ..., (i+1)*NUM_PAGES-1]
+        identity_page_table = torch.arange(
+            B * NUM_PAGES, device=q_nope.device, dtype=torch.int32
+        ).view(B, NUM_PAGES)
+
+        # Workspace
+        ws_size = flash_mla_get_workspace_size(
+            TOPK, B, q_nope.shape[1], GATHER_PAGE_SIZE
+        )
+        workspace = torch.zeros(ws_size, device=q_nope.device, dtype=torch.uint8)
+
+        o = flash_mla_decode(
+            q_nope,
+            q_rope,
+            gathered_kv_paged,
+            valid_counts,
+            identity_page_table,
+            workspace,
+            sm_scale,
+        )
+        return o
 
     def _forward_aiter(
         self,
@@ -2214,11 +2304,11 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # Requirements: H200/B200/XPU, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
-                )  # SM90/SM100 only
+                    device_sm == 90 or (device_sm >= 100 and device_sm < 110) or _is_xpu
+                )  # SM90/SM100/XPU
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]

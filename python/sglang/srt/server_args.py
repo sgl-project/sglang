@@ -1886,6 +1886,29 @@ class ServerArgs:
                     self._set_default_dsa_kv_cache_dtype(major, self.quantization)
                     self._set_default_dsa_backends(self.kv_cache_dtype, major)
 
+                elif is_xpu():
+                    self.page_size = 128
+                    logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
+                    if self.kv_cache_dtype == "auto":
+                        self.kv_cache_dtype = "bfloat16"
+                        logger.warning(
+                            f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on XPU."
+                        )
+                    if self.dsa_prefill_backend is None:
+                        self.dsa_prefill_backend = (
+                            "flashmla_kv"  # Not used when MHA_ONE_SHOT is active
+                        )
+                    if self.dsa_decode_backend is None:
+                        self.dsa_decode_backend = "intel_xpu"
+                    self.dsa_topk_backend = "torch"
+                    # Disable fused topk (requires sgl-kernel ops not available on XPU)
+                    import os
+
+                    os.environ.setdefault("SGLANG_DSA_FUSE_TOPK", "0")
+                    logger.warning(
+                        f"Set DSA backends for XPU: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
+                    )
+
                 if self.enable_dsa_prefill_context_parallel:
                     assert (
                         self.disaggregation_mode != "decode"

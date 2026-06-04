@@ -419,7 +419,13 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
-        return torch.ops.sgl_kernel.rotary_embedding(
+        q_shape = query.shape
+        k_shape = key.shape
+        batch_size = positions.size(0)
+        query = query.view(batch_size, -1, self.head_size)
+        key = key.view(batch_size, -1, self.head_size)
+
+        query, key = torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,
             key,
@@ -427,6 +433,7 @@ class RotaryEmbedding(MultiPlatformOp):
             self.cos_sin_cache,
             self.is_neox_style,
         )
+        return query.view(q_shape), key.view(k_shape)
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

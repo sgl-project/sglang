@@ -750,13 +750,19 @@ class Indexer(MultiPlatformOp):
                     page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
         else:
-            assert page_size == 64, "only support page size 64"
+            if _is_xpu:
+                assert page_size in (
+                    64,
+                    128,
+                ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
+            else:
+                assert page_size == 64, "only support page size 64"
 
-        assert len(weights.shape) == 3
-        assert (
-            forward_batch.seq_lens_cpu is not None
-            and forward_batch.extend_seq_lens_cpu is not None
-        )
+            assert len(weights.shape) == 3
+            assert (
+                forward_batch.seq_lens_cpu is not None
+                and forward_batch.extend_seq_lens_cpu is not None
+            )
         weights = weights.squeeze(-1)
 
         if _is_hip and not _use_aiter_preshuffle:
@@ -987,7 +993,13 @@ class Indexer(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         page_size = get_token_to_kv_pool().page_size
-        assert page_size == 64, "only support page size 64"
+        if _is_xpu:
+            assert page_size in (
+                64,
+                128,
+            ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
+        else:
+            assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
         k_fp8_list = []
@@ -1136,7 +1148,13 @@ class Indexer(MultiPlatformOp):
             from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
 
         page_size = get_token_to_kv_pool().page_size
-        assert page_size == 64, "only support page size 64"
+        if _is_xpu:
+            assert page_size in (
+                64,
+                128,
+            ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
+        else:
+            assert page_size == 64, "only support page size 64"
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
