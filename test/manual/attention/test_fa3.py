@@ -5,7 +5,6 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -20,8 +19,6 @@ from sglang.test.test_utils import (
 
 # FlashAttention3 integration tests (requires SM 90+ / H100)
 # Multiple test classes: FA3, FA3+MLA, FA3+SpecDecode variants
-register_cuda_ci(est_time=551, suite="stage-b-test-1-gpu-large")
-
 GSM_DATASET_PATH = None
 
 # In case of some machine lack internet connection, we can set OFFLINE_MODE to True.
