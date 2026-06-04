@@ -2642,6 +2642,9 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is not None:
+            mamba_pool.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2707,6 +2710,9 @@ class Scheduler(
                     )
                     req.mamba_pool_idx = None
                 break
+
+        if mamba_pool is not None:
+            mamba_pool.alloc_group_end()
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
