@@ -613,9 +613,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
 
-    def free_mamba_cache(
-        self, req: "Req", donated_to_tree: bool = False
-    ):
+    def free_mamba_cache(self, req: "Req", donated_to_tree: bool = False):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_pool.free(mamba_index.unsqueeze(0))

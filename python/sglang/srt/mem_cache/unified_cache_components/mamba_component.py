@@ -346,7 +346,9 @@ class MambaComponent(TreeComponent):
                 req.mamba_track_slot = None
             else:
                 if insert_params.mamba_value is not None and mamba_exist:
-                    self.cache.req_to_token_pool.mamba_pool.free(insert_params.mamba_value)
+                    self.cache.req_to_token_pool.mamba_pool.free(
+                        insert_params.mamba_value
+                    )
             req.mamba_last_track_seqlen = None
 
     # ---- HiCache Hooks ----
