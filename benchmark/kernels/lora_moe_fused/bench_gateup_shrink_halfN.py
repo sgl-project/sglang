@@ -94,7 +94,7 @@ def bench(call, rep):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["correctness", "bench"], default="bench")
+    ap.add_argument("--mode", choices=["correctness", "bench", "sweep"], default="bench")
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--routing", choices=["uniform", "skewed"], default="skewed")
     ap.add_argument("--rep-ms", type=int, default=400)
@@ -117,6 +117,33 @@ def main():
                 print(f"seed={seed} routing={routing}: max|inter32[:16]-inter16| = {diff:.3e} {'PASS' if diff==0 else 'FAIL'}")
                 assert diff == 0, "N=16 not bit-identical to N=32[:16]"
         print("ALL PASS (bitwise identical)")
+        return
+
+    if args.mode == "sweep":
+        topk_ids0, _, _, _ = make_inputs(args.bs, ep, dtype, device, seed=0, routing=args.routing)
+        n = 16
+        gbytes = touched(topk_ids0, ep, n)
+        ng = auto_groups(gbytes, args.l2_mult, 4, args.max_groups)
+        groups = [make_inputs(args.bs, ep, dtype, device, seed=g, routing=args.routing) for g in range(ng)]
+        results = []
+        for bm in (16, 32):
+            for nw in (2, 4, 8):
+                for ns in (2, 3, 4):
+                    scfg = {"BLOCK_SIZE_M": bm, "num_warps": nw, "num_stages": ns}
+                    routings = [build_routing(gg[0], gg[1], ep, bm) for gg in groups]
+                    outs = [torch.zeros(args.bs * ep["top_k"], n, device=device, dtype=dtype) for _ in range(ng)]
+                    calls = []
+                    for (topk_ids, tlm, hidden, weight), rt, out in zip(groups, routings, outs):
+                        w = weight[:, :16, :].contiguous()
+                        calls.append((lambda h, w, o, t, r, c: (lambda: shrink(h, w, o, t, r, c)))(hidden, w, out, topk_ids, rt, scfg))
+                    try:
+                        us = bench(lambda: [c() for c in calls], args.rep_ms) / ng
+                    except Exception:
+                        continue
+                    results.append((us, f"block_m={bm} warps={nw} stages={ns}"))
+        results.sort()
+        for us, tag in results[:10]:
+            print(f"  N=16 {us:.2f} us  {tag}")
         return
 
     topk_ids0, _, _, _ = make_inputs(args.bs, ep, dtype, device, seed=0, routing=args.routing)
