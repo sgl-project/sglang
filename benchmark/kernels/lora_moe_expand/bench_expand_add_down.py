@@ -154,13 +154,22 @@ def make_gemm_inputs(proj, bs, ep, rank, dtype, device, seed=0):
     spec = PROJ[proj]
     intermediate = (
         torch.randn(
-            bs * ep["top_k"], spec["intermediate_cols"], generator=gen, device=device, dtype=dtype
+            bs * ep["top_k"],
+            spec["intermediate_cols"],
+            generator=gen,
+            device=device,
+            dtype=dtype,
         )
         * 0.1
     )
     weight = (
         torch.randn(
-            ep["num_experts"], spec["n"], rank, generator=gen, device=device, dtype=dtype
+            ep["num_experts"],
+            spec["n"],
+            rank,
+            generator=gen,
+            device=device,
+            dtype=dtype,
         )
         * 0.1
     )
@@ -213,7 +222,9 @@ def ref_expand(proj, intermediate, weight, topk_ids, topk_weights, ep):
     if spec["fuse_sum_all_reduce"]:
         out = torch.zeros(bs, spec["n"], device=weight.device, dtype=torch.float32)
     else:
-        out = torch.zeros(bs, top_k, spec["n"], device=weight.device, dtype=torch.float32)
+        out = torch.zeros(
+            bs, top_k, spec["n"], device=weight.device, dtype=torch.float32
+        )
     for m in range(bs):
         for k in range(top_k):
             e = int(topk_ids[m, k].item())
@@ -256,13 +267,16 @@ def bench_us_rotated(calls, rep_ms: int) -> float:
     return float(ms) * 1e3 / len(calls)
 
 
-def build_rotated_calls(args, proj, ep, config, routing_pack, device, dtype, force_block_n=None):
+def build_rotated_calls(
+    args, proj, ep, config, routing_pack, device, dtype, force_block_n=None
+):
     topk_ids, topk_weights, routing = routing_pack
     spec = PROJ[proj]
     group_bytes = 2 * (
         args.bs * ep["top_k"] * spec["intermediate_cols"]
         + ep["num_experts"] * spec["n"] * args.rank
-        + (args.bs if spec["fuse_sum_all_reduce"] else args.bs * ep["top_k"]) * spec["n"]
+        + (args.bs if spec["fuse_sum_all_reduce"] else args.bs * ep["top_k"])
+        * spec["n"]
     )
     num_groups = args.num_groups or auto_num_groups(
         group_bytes, args.l2_mult, args.min_groups, args.max_groups
@@ -273,7 +287,15 @@ def build_rotated_calls(args, proj, ep, config, routing_pack, device, dtype, for
     ]
     calls = [
         expand_call(
-            proj, inter, weight, out, topk_weights, topk_ids, routing, config, force_block_n
+            proj,
+            inter,
+            weight,
+            out,
+            topk_weights,
+            topk_ids,
+            routing,
+            config,
+            force_block_n,
         )
         for inter, weight, out in groups
     ]
@@ -316,8 +338,12 @@ def main():
         failures = 0
         for proj in projs:
             for bs in sorted({args.bs, 16, 64}):
-                topk_ids, topk_weights, tlm = make_routing_inputs(bs, ep, device, seed=args.seed)
-                inter, weight, out = make_gemm_inputs(proj, bs, ep, args.rank, dtype, device)
+                topk_ids, topk_weights, tlm = make_routing_inputs(
+                    bs, ep, device, seed=args.seed
+                )
+                inter, weight, out = make_gemm_inputs(
+                    proj, bs, ep, args.rank, dtype, device
+                )
                 ref = ref_expand(proj, inter, weight, topk_ids, topk_weights, ep)
                 for block_m in [16, 32, 64]:
                     config = {
@@ -329,7 +355,14 @@ def main():
                     routing = build_ep_routing(topk_ids, tlm, ep, block_m)
                     out.zero_()
                     expand_call(
-                        proj, inter, weight, out, topk_weights, topk_ids, routing, config
+                        proj,
+                        inter,
+                        weight,
+                        out,
+                        topk_weights,
+                        topk_ids,
+                        routing,
+                        config,
                     )()
                     err = float((out.float() - ref).abs().max().item())
                     ok = err <= args.tol
@@ -353,7 +386,9 @@ def main():
             "GROUP_SIZE_M": group_m,
             "num_warps": num_warps,
         }
-        topk_ids, topk_weights, tlm = make_routing_inputs(args.bs, ep, device, seed=args.seed)
+        topk_ids, topk_weights, tlm = make_routing_inputs(
+            args.bs, ep, device, seed=args.seed
+        )
 
         if args.mode == "sweep":
             best = None
@@ -407,7 +442,9 @@ def main():
             continue
 
         sorted_token_ids = routing[0]
-        grid = triton.cdiv(sorted_token_ids.shape[0], block_m) * triton.cdiv(spec["n"], 128)
+        grid = triton.cdiv(sorted_token_ids.shape[0], block_m) * triton.cdiv(
+            spec["n"], 128
+        )
         us = bench_us_rotated(calls, args.rep_ms)
         print(
             f"BENCH moe_expand proj={proj} bs={args.bs} r={args.rank} N={spec['n']} "

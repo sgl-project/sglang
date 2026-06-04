@@ -163,7 +163,8 @@ def auto_num_groups(
 
 def bench_us_rotated(calls, rep_ms: int) -> float:
     """Capture all rotated calls in ONE CUDA graph via do_bench_cudagraph; per-call us =
-    graph time / num_groups. Host launch overhead amortizes to ~0; rotation defeats L2."""
+    graph time / num_groups. Host launch overhead amortizes to ~0; rotation defeats L2.
+    """
 
     def fn():
         for call in calls:
@@ -195,7 +196,9 @@ def run_correctness(args, dtype, device) -> None:
             else:
                 s = sum(arg)
                 bi = make_multiseg_batch_info(arg, args.rank, args.scaling, device)
-            x, w, output_offset, base = make_inputs(s, slice_dims, args.rank, dtype, device)
+            x, w, output_offset, base = make_inputs(
+                s, slice_dims, args.rank, dtype, device
+            )
             ref = ref_qkv_b(x, w, output_offset, args.scaling, args.rank, base)
             out = run_qkv_b(
                 x, w, bi, output_offset, max(slice_dims), base.clone(), n_slices
@@ -254,7 +257,9 @@ def main():
         total_out = sum(slice_dims)
         max_out = max(slice_dims)
 
-        group_bytes = 2 * (s * n_slices * args.rank + total_out * args.rank + s * total_out)
+        group_bytes = 2 * (
+            s * n_slices * args.rank + total_out * args.rank + s * total_out
+        )
         num_groups = args.num_groups or auto_num_groups(
             group_bytes, args.l2_mult, args.min_groups, args.max_groups
         )

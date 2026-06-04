@@ -146,10 +146,16 @@ def ref_output(kernel, spec, x, weights, base_output, rank, scaling):
 
 def group_bytes_of(kernel, spec, s, rank) -> int:
     if kernel == "sgemm_a":
-        return 2 * (s * spec["K"] + spec["stack_num"] * rank * spec["K"] + s * spec["stack_num"] * rank)
+        return 2 * (
+            s * spec["K"]
+            + spec["stack_num"] * rank * spec["K"]
+            + s * spec["stack_num"] * rank
+        )
     if kernel == "sgemm_b":
         return 2 * (s * rank + spec["N"] * rank + s * spec["N"])
-    return 2 * (s * 2 * rank + 2 * spec["output_dim"] * rank + s * 2 * spec["output_dim"])
+    return 2 * (
+        s * 2 * rank + 2 * spec["output_dim"] * rank + s * 2 * spec["output_dim"]
+    )
 
 
 def auto_num_groups(
@@ -205,7 +211,9 @@ def run_correctness(args, shapes, dtype, device) -> None:
                 out = make_call(kernel, spec, x, weights, base_run, bi)()
                 if kernel != "sgemm_a":
                     out = base_run
-                ref = ref_output(kernel, spec, x, weights, base, args.rank, args.scaling)
+                ref = ref_output(
+                    kernel, spec, x, weights, base, args.rank, args.scaling
+                )
                 err = float((out.float() - ref).abs().max().item())
                 rel = err / float(ref.abs().max().item() + 1e-9)
                 # bf16 output quantization makes the achievable ABS error scale with the
@@ -257,7 +265,11 @@ def main():
     for name, kernel, spec in shapes:
         for variant, single_adapter in variants_for(name, kernel):
             bi = make_merged_decode_batch_info(
-                s, args.rank, args.scaling, device, with_single_adapter=bool(single_adapter)
+                s,
+                args.rank,
+                args.scaling,
+                device,
+                with_single_adapter=bool(single_adapter),
             )
             group_bytes = group_bytes_of(kernel, spec, s, args.rank)
             num_groups = args.num_groups or auto_num_groups(
@@ -267,9 +279,7 @@ def main():
                 make_inputs(name, kernel, spec, s, args.rank, dtype, device, seed=g)
                 for g in range(num_groups)
             ]
-            calls = [
-                make_call(kernel, spec, x, w, base, bi) for x, w, base in groups
-            ]
+            calls = [make_call(kernel, spec, x, w, base, bi) for x, w, base in groups]
 
             if args.mode == "profile":
                 for _ in range(2):

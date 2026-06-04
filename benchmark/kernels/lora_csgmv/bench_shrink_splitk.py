@@ -130,10 +130,17 @@ def make_gemm_inputs(proj, bs, ep, rank, dtype, device, seed=0):
     gen = torch.Generator(device=device).manual_seed(seed)
     spec = PROJ[proj]
     rows = bs if spec["input_top_k"] > 1 else bs * ep["top_k"]
-    hidden = torch.randn(rows, spec["k"], generator=gen, device=device, dtype=dtype) * 0.1
+    hidden = (
+        torch.randn(rows, spec["k"], generator=gen, device=device, dtype=dtype) * 0.1
+    )
     weight = (
         torch.randn(
-            ep["num_experts"], spec["n"], spec["k"], generator=gen, device=device, dtype=dtype
+            ep["num_experts"],
+            spec["n"],
+            spec["k"],
+            generator=gen,
+            device=device,
+            dtype=dtype,
         )
         * 0.1
     )
@@ -333,7 +340,9 @@ def main():
         for proj in projs:
             for bs in sorted({args.bs, 16, 64}):
                 topk_ids, tlm = make_routing_inputs(bs, ep, device, seed=args.seed)
-                hidden, weight, out = make_gemm_inputs(proj, bs, ep, args.rank, dtype, device)
+                hidden, weight, out = make_gemm_inputs(
+                    proj, bs, ep, args.rank, dtype, device
+                )
                 ref = ref_shrink(proj, hidden, weight, topk_ids, ep)
                 for block_m in [16, 32, 64]:
                     config = {
@@ -391,7 +400,9 @@ def main():
                                 us = bench_us_rotated(calls, args.rep_ms)
                             except Exception:
                                 continue
-                            tag = f"block_m={block_m} warps={nw} stages={ns} split_k={sk}"
+                            tag = (
+                                f"block_m={block_m} warps={nw} stages={ns} split_k={sk}"
+                            )
                             if best is None or us < best[0]:
                                 best = (us, tag)
                             print(f"  {us:7.2f} us  proj={proj} {tag}")
@@ -416,7 +427,9 @@ def main():
         sorted_token_ids = routing[0]
         # Echo the launch geometry the production launcher derives, for cross-checking
         # against the e2e capture (gate_up: SPLIT_K=5 grid 465; down: SPLIT_K=2 grid 186).
-        weight_like = torch.empty(ep["num_experts"], spec["n"], spec["k"], device="meta")
+        weight_like = torch.empty(
+            ep["num_experts"], spec["n"], spec["k"], device="meta"
+        )
         split_k = _get_moe_lora_shrink_split_k(weight_like, sorted_token_ids, config)
         num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], config["BLOCK_SIZE_M"])
         us = bench_us_rotated(calls, args.rep_ms)
