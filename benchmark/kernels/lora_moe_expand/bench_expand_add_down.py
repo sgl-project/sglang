@@ -1,43 +1,40 @@
 """Self-contained micro-benchmark + correctness check for _moe_lora_expand_add_kernel
-(LoRA-B expand-add, down-proj GEMM).
+(virtual-experts LoRA-B expand-add), covering BOTH per-layer callsites.
 
-Companion to ``bench_shrink_splitk.py`` (which covers the LoRA-A shrink). The down-proj
-expand uses the fused sum-all-reduce + routed-weight variant: each of a token's top_k
-per-expert deltas is scaled by its routing weight and atomic-added into the single
-per-token output row.
+Shapes reproduce the measured e2e decode of Qwen3.5-35B-A3B-FP8 tp4/ep4 bs64 with a
+single rank-16 adapter (SHAPECAP capture 2026-06-04):
 
-Two model shapes via ``--model`` (per-flag overrides win):
-  * ``qwen35`` (default): qwen3.5-35b local-EP, tp=4/ep=4 -> 64 local experts, N (down
-    output hidden) = 2048, rank = 16, top_k = 8.
-  * ``kimi-k25``: Kimi-K2.5-NVFP4, TP8/no-EP -> 384 routed experts, N = 7168, rank = 16,
-    top_k = 8. (Shapes from the adapter + config: down-proj LoRA-B is [r=16 x out=7168],
-    384 routed experts.)
+  * ``--proj gate_up``: intermediate [512, 32] (the 2-slice shrink output; the kernel
+    reads columns [0:R]), weight [256, 1024, 16] (N = gate+up = 2*512), output
+    [64, 8, 1024] per-(token, expert), mul_routed_weight=False,
+    fuse_sum_all_reduce=False. e2e: BLOCK 16/128/16, grid (744,), warps=4.
+  * ``--proj down``: intermediate [512, 16], weight [256, 2048, 16] (N = hidden),
+    output [64, 2048], mul_routed_weight=True, fuse_sum_all_reduce=True (each token's
+    top-k deltas are weight-scaled and atomic-added into one row). e2e: BLOCK
+    16/128/16, grid (1488,), warps=4.
 
-P0 scope: bs=64, rank=16 first.
+EP matters: LoRA expert weights stay GLOBAL (256 experts) while this rank owns 64;
+non-owned (token, expert) slots are dropped to the -1 sentinel in routing, so per-rank
+work is ~1/4 of the routed pairs and the routing buffers are sorted_token_ids [1488] /
+expert_ids [93] at bs64 block_m=16 (production ``_get_routing`` non-fused path replica).
 
-  python3 bench_expand_add_down.py --mode bench   --model kimi-k25   # default: reproduces the
-                                                                     #   PRODUCTION config (e2e kernel)
-  python3 bench_expand_add_down.py --mode bench   --model kimi-k25 --config manual --block-m 16 --block-n 512
-  python3 bench_expand_add_down.py --mode correctness --model kimi-k25  # block_m {16,32,64} x bs {16,64}
-  python3 bench_expand_add_down.py --mode profile --iters 2   # eager, for ncu
-  python3 bench_expand_add_down.py --mode sweep   --model kimi-k25      # block_m x block_n x group_m x warps
+Benchmark methodology: rotate N auto-sized buffer groups (footprint = ``--l2-mult`` x
+L2, default 4x) inside one CUDA graph timed by ``triton.testing.do_bench_cudagraph``;
+reported time = graph time / N. Host launch overhead amortizes to ~0 and no weight /
+intermediate is served out of L2 on its next use.
 
-By default ``--mode bench``/``profile`` use ``--config production``: the BLOCK_SIZE_M/GROUP_SIZE_M/
-num_warps that ``_get_stage_config`` -> ``try_get_optimal_moe_config`` picks at runtime (BLOCK_SIZE_N
-left to the launcher), so the headline number matches the e2e kernel. ``--config manual`` uses the
-explicit ``--block-*`` / ``--group-m`` / ``--num-warps`` flags instead (for A/B and tuning).
-
-``--mode sweep`` also tunes BLOCK_SIZE_N (the launcher's production default forces 128 for
-N%128==0; the sweep passes ``force_block_size_n`` to explore other tiles — valid for the
-non-gated down-proj).
-
-correctness mode also guards the routing/tiling block-size contract: the launcher must
-tile ``expert_ids`` with the same block size the routing buffers were aligned with, else
-expert_ids overruns -> IMA (the same class of bug as the shrink f2adddd regression).
+  python3 bench_expand_add_down.py --mode bench --proj down
+  python3 bench_expand_add_down.py --mode bench --proj gate_up
+  python3 bench_expand_add_down.py --mode correctness
+  python3 bench_expand_add_down.py --mode sweep --proj down       # block_n/group/warps scan
+  python3 bench_expand_add_down.py --mode profile --proj down --iters 4   # for ncu
 """
+
 from __future__ import annotations
 
 import argparse
+import functools
+import math
 
 import torch
 import triton
@@ -46,25 +43,39 @@ import triton.testing
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
-from sglang.srt.lora.triton_ops.virtual_experts import (
-    _fused_virtual_topk_ids,
-    fused_sanitize_expert_ids,
-)
+from sglang.srt.lora.triton_ops.virtual_experts import _fused_virtual_topk_ids
 from sglang.srt.lora.trtllm_moe.specialized_expand import _invoke_moe_lora_expand_add
+
+# qwen3.5-35b tp4/ep4: 256 global routed experts, 64 owned per rank, router top-8.
+QWEN35_EP4 = {
+    "num_experts": 256,
+    "local_num_experts": 64,
+    "local_expert_offset": 0,
+    "top_k": 8,
+}
+# Per-projection expand shapes. intermediate_cols: the shrink output the expand reads
+# from (gate_up's 2-slice shrink is 2*rank wide; the kernel reads columns [0:rank]).
+PROJ = {
+    "gate_up": {
+        "n": 1024,
+        "intermediate_cols": 32,
+        "mul_routed_weight": False,
+        "fuse_sum_all_reduce": False,
+    },
+    "down": {
+        "n": 2048,
+        "intermediate_cols": 16,
+        "mul_routed_weight": True,
+        "fuse_sum_all_reduce": True,
+    },
+}
 
 
 def production_config(num_experts, n, rank, bs, dtype):
-    """The config production actually launches the expand with, so the default bench run
-    reproduces the e2e kernel (not a hand-picked one).
-
-    Mirrors ``_get_stage_config`` (virtual_experts.py): call
-    ``try_get_optimal_moe_config(lora_b_virtual.shape, .., stage_top_k=1, M=bs)`` and, if it
-    raises (e.g. no tuned JSON + server args unset), use the same fallback (BLOCK_SIZE_M=64).
-    BLOCK_SIZE_N is left to the launcher (forced to 128 when N % 128 == 0), so ``force_block_n``
-    stays None. Returns ``(block_m, group_m, num_warps)``.
-    """
-    import functools
-
+    """The config production's ``_get_stage_config`` launches the expand with
+    (try_get_optimal_moe_config on the GLOBAL virtual weight shape, stage_top_k=1,
+    M=bs). BLOCK_SIZE_N is left to the launcher (forces 128 when N % 128 == 0).
+    Fallback = the e2e-observed decode config (16, 1, 4)."""
     try:
         from sglang.srt.server_args import (
             ServerArgs,
@@ -88,155 +99,185 @@ def production_config(num_experts, n, rank, bs, dtype):
         )(bs)
         return cfg["BLOCK_SIZE_M"], cfg.get("GROUP_SIZE_M", 1), cfg.get("num_warps", 4)
     except Exception:
-        # _get_stage_config's fallback when try_get_optimal_moe_config raises.
-        return 64, 1, 4
+        return 16, 1, 4
 
 
-def make_inputs(bs, num_experts, top_k, n, rank, dtype, device):
-    """Down-proj expand inputs.
-
-    ``intermediate`` is the LoRA-A shrink output [bs*top_k, rank]; ``lora_b`` is the
-    per-(lora, expert) down LoRA-B weight [1, num_experts, N, rank].
-    """
-    torch.manual_seed(0)
-    topk_ids = torch.stack(
-        [torch.randperm(num_experts, device=device)[:top_k] for _ in range(bs)]
-    ).to(torch.int32)
-    # Positive routing weights (down-proj scales each per-expert delta by these).
-    topk_weights = torch.rand(bs, top_k, device=device, dtype=torch.float32) * 0.9 + 0.1
+def make_routing_inputs(bs, ep, device, seed=0):
+    """Random uniform top-k routing over the GLOBAL expert ids + per-token routing
+    weights + the all-zero (single adapter, slot 0) token->lora mapping."""
+    gen = torch.Generator(device=device).manual_seed(seed)
+    scores = torch.rand(bs, ep["num_experts"], generator=gen, device=device)
+    topk_ids = torch.topk(scores, k=ep["top_k"], dim=1).indices.to(torch.int32)
+    topk_weights = (
+        torch.rand(bs, ep["top_k"], generator=gen, device=device, dtype=torch.float32)
+        * 0.9
+        + 0.1
+    )
     token_lora_mapping = torch.zeros(bs, device=device, dtype=torch.int32)
-    intermediate = torch.randn(bs * top_k, rank, device=device, dtype=dtype) * 0.1
-    lora_b = torch.randn(1, num_experts, n, rank, device=device, dtype=dtype) * 0.1
-    return topk_ids, topk_weights, token_lora_mapping, intermediate, lora_b
+    return topk_ids, topk_weights, token_lora_mapping
 
 
-def build_v1_routing(topk_ids, token_lora_mapping, num_experts, block_m):
-    """Single-adapter (max_loras=1) virtual-expert routing, tiled at ``block_m``.
-
-    Mirrors ``_get_routing`` in virtual_experts.py: virtual topk ids -> align ->
-    tight trim -> sanitize. The trim+sanitize matter because the launcher reads one
-    ``expert_ids`` entry per M-block.
-    """
+def build_ep_routing(topk_ids, token_lora_mapping, ep, block_m):
+    """Production ``_get_routing`` replica (non-fused path, max_loras=1, EP local mask):
+    virtual ids (non-owned -> -1) -> moe_align_block_size -> tight trim with
+    ``local_num_experts * max_loras + 1`` populated buckets."""
+    max_loras = 1
     virtual_topk_ids, _, virtual_num_experts = _fused_virtual_topk_ids(
-        topk_ids, token_lora_mapping, num_experts, shared_outer=False, max_loras=1
+        topk_ids,
+        token_lora_mapping,
+        ep["num_experts"],
+        shared_outer=False,
+        max_loras=max_loras,
+        local_expert_offset=ep["local_expert_offset"],
+        local_num_experts=ep["local_num_experts"],
     )
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         virtual_topk_ids, block_m, virtual_num_experts
     )
     num_tokens = topk_ids.numel()
-    max_nonempty = min(num_tokens, virtual_num_experts)
+    populated_buckets = ep["local_num_experts"] * max_loras + 1
+    max_nonempty = min(num_tokens, populated_buckets)
     tight = triton.cdiv(num_tokens + max_nonempty * (block_m - 1), block_m) * block_m
+    # max_loras == 1 -> fused_sanitize_expert_ids is an identity, skipped (as production).
     return (
         sorted_token_ids[:tight],
-        fused_sanitize_expert_ids(expert_ids[: tight // block_m], virtual_num_experts),
+        expert_ids[: tight // block_m],
         num_tokens_post_padded,
     )
 
 
-def expand(
+def make_gemm_inputs(proj, bs, ep, rank, dtype, device, seed=0):
+    """intermediate is the per-(token, expert) shrink output [bs*top_k, cols]; weight is
+    the GLOBAL [num_experts, N, rank] LoRA-B (production's pre-merged free view).
+    Output rows: per-(token, expert) 3D for gate_up, per-token 2D for down."""
+    gen = torch.Generator(device=device).manual_seed(seed)
+    spec = PROJ[proj]
+    intermediate = (
+        torch.randn(
+            bs * ep["top_k"], spec["intermediate_cols"], generator=gen, device=device, dtype=dtype
+        )
+        * 0.1
+    )
+    weight = (
+        torch.randn(
+            ep["num_experts"], spec["n"], rank, generator=gen, device=device, dtype=dtype
+        )
+        * 0.1
+    )
+    if spec["fuse_sum_all_reduce"]:
+        output = torch.zeros(bs, spec["n"], device=device, dtype=dtype)
+    else:
+        output = torch.zeros(bs, ep["top_k"], spec["n"], device=device, dtype=dtype)
+    return intermediate, weight, output
+
+
+def expand_call(
+    proj,
     intermediate,
-    lora_b,
-    topk_ids,
+    weight,
+    output,
     topk_weights,
+    topk_ids,
     routing,
-    block_m,
-    block_n=64,
-    group_m=1,
-    num_warps=4,
-    mul_routed_weight=True,
-    fuse_sum_all_reduce=True,
+    config,
     force_block_n=None,
 ):
+    spec = PROJ[proj]
     sorted_token_ids, expert_ids, num_tokens_post_padded = routing
-    lora_b_virtual = lora_b.reshape(lora_b.shape[0] * lora_b.shape[1], *lora_b.shape[2:])
-    n = lora_b.shape[2]
-    bs, top_k = topk_ids.shape
-    # FUSE_SUM_ALL_REDUCE atomic-adds the top_k deltas into one row -> zero each call.
-    # (Without it, each (token,expert) slot is written once -> bs*top_k rows.)
-    out_rows = bs if fuse_sum_all_reduce else bs * top_k
-    output = torch.zeros(
-        out_rows, n, dtype=intermediate.dtype, device=intermediate.device
-    )
-    config = {
-        # BLOCK_SIZE_N here is only used when N % 128 != 0 AND force_block_n is None;
-        # otherwise the launcher picks 128 (default) or force_block_n (tuning).
-        "BLOCK_SIZE_M": block_m,
-        "BLOCK_SIZE_N": block_n,
-        "GROUP_SIZE_M": group_m,
-        "num_warps": num_warps,
-    }
-    _invoke_moe_lora_expand_add(
+    return lambda: _invoke_moe_lora_expand_add(
         intermediate,
-        lora_b_virtual,
+        weight,
         output,
-        # kernel indexes topk_weights flat by virtual-token id in [0, bs*top_k).
-        topk_weights.reshape(-1),
+        topk_weights,
         topk_ids,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
         config,
-        mul_routed_weight,
-        fuse_sum_all_reduce,
+        spec["mul_routed_weight"],
+        spec["fuse_sum_all_reduce"],
         force_block_size_n=force_block_n,
     )
-    return output
 
 
-def ref_expand(
-    intermediate, lora_b, topk_ids, topk_weights,
-    mul_routed_weight=True, fuse_sum_all_reduce=True,
-):
+def ref_expand(proj, intermediate, weight, topk_ids, topk_weights, ep):
+    """fp32 reference over OWNED (token, expert) pairs only; non-owned slots stay zero
+    (the direct expand never writes them). The kernel reads intermediate[:, 0:R]."""
+    spec = PROJ[proj]
     bs, top_k = topk_ids.shape
-    n = lora_b.shape[2]
-    b = lora_b[0].float()  # [num_experts, N, R]
-    inter = intermediate.float()  # [bs*top_k, R]
-    rows = bs if fuse_sum_all_reduce else bs * top_k
-    out = torch.zeros(rows, n, device=intermediate.device, dtype=torch.float32)
+    rank = weight.shape[2]
+    lo = ep["local_expert_offset"]
+    hi = lo + ep["local_num_experts"]
+    w = weight.float()
+    inter = intermediate[:, :rank].float()
+    if spec["fuse_sum_all_reduce"]:
+        out = torch.zeros(bs, spec["n"], device=weight.device, dtype=torch.float32)
+    else:
+        out = torch.zeros(bs, top_k, spec["n"], device=weight.device, dtype=torch.float32)
     for m in range(bs):
         for k in range(top_k):
             e = int(topk_ids[m, k].item())
-            vt = m * top_k + k
-            delta = inter[vt] @ b[e].t()  # [N]
-            if mul_routed_weight:
+            if not (lo <= e < hi):
+                continue
+            delta = inter[m * top_k + k] @ w[e].t()
+            if spec["mul_routed_weight"]:
                 delta = delta * float(topk_weights[m, k].item())
-            if fuse_sum_all_reduce:
+            if spec["fuse_sum_all_reduce"]:
                 out[m] += delta
             else:
-                out[vt] = delta
+                out[m, k] = delta
     return out
 
 
-def bench_ms(fn, warmup=25, rep=100, cudagraph=True, inner=200):
-    """Per-call milliseconds.
+def auto_num_groups(
+    group_bytes: int, l2_mult: float, min_groups: int, max_groups: int
+) -> int:
+    """Enough buffer groups that the rotation footprint is ``l2_mult`` x L2, so no
+    group survives in L2 until its next use. Err on the high side: an optimized kernel
+    that reads less memory needs MORE groups for the same eviction guarantee."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    l2_bytes = getattr(props, "L2_cache_size", 128 * 1024 * 1024)
+    need = math.ceil(l2_bytes * l2_mult / max(group_bytes, 1))
+    return max(min_groups, min(need, max_groups))
 
-    With ``cudagraph``, capture ``inner`` back-to-back ``fn()`` calls in ONE graph and
-    divide the measured replay time by ``inner``. A single fn()-per-graph
-    ``do_bench(g.replay)`` floors at ~8-10us for ANY tiny op -- it measures the fixed
-    per-replay launch/dispatch overhead, not the kernel. Amortizing over ``inner``
-    back-to-back calls drives that overhead to ~0 and exposes the true device time.
-    (Same technique as bench_shrink_splitk.py.)
-    """
+
+def bench_us_rotated(calls, rep_ms: int) -> float:
+    """Capture all rotated calls in ONE CUDA graph via do_bench_cudagraph; per-call us =
+    graph time / num_groups. Outputs accumulate garbage across replays -- harmless for
+    timing; correctness mode re-zeroes."""
+
+    def fn():
+        for call in calls:
+            call()
+
+    fn()  # eager warmup: triton JIT compile outside graph capture
     torch.cuda.synchronize()
-    if cudagraph:
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                for _ in range(inner):
-                    fn()
-        torch.cuda.current_stream().wait_stream(s)
-        torch.cuda.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(inner):
-                fn()
-        torch.cuda.synchronize()
-        ms = triton.testing.do_bench(g.replay, warmup=warmup, rep=rep) / inner
-    else:
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-    torch.cuda.synchronize()
-    return float(ms)
+    ms = triton.testing.do_bench_cudagraph(fn, rep=rep_ms)
+    return float(ms) * 1e3 / len(calls)
+
+
+def build_rotated_calls(args, proj, ep, config, routing_pack, device, dtype, force_block_n=None):
+    topk_ids, topk_weights, routing = routing_pack
+    spec = PROJ[proj]
+    group_bytes = 2 * (
+        args.bs * ep["top_k"] * spec["intermediate_cols"]
+        + ep["num_experts"] * spec["n"] * args.rank
+        + (args.bs if spec["fuse_sum_all_reduce"] else args.bs * ep["top_k"]) * spec["n"]
+    )
+    num_groups = args.num_groups or auto_num_groups(
+        group_bytes, args.l2_mult, args.min_groups, args.max_groups
+    )
+    groups = [
+        make_gemm_inputs(proj, args.bs, ep, args.rank, dtype, device, seed=g)
+        for g in range(num_groups)
+    ]
+    calls = [
+        expand_call(
+            proj, inter, weight, out, topk_weights, topk_ids, routing, config, force_block_n
+        )
+        for inter, weight, out in groups
+    ]
+    return calls, num_groups, group_bytes
 
 
 def main():
@@ -246,142 +287,134 @@ def main():
         choices=["bench", "correctness", "profile", "sweep"],
         default="bench",
     )
-    # Model presets set (num_experts, n, top_k); per-flag overrides below win.
-    ap.add_argument("--model", choices=["qwen35", "kimi-k25"], default="qwen35")
-    # bench/profile config source: "production" reproduces what _get_stage_config launches
-    # (the e2e kernel); "manual" uses the --block-m/--block-n/--group-m/--num-warps flags.
-    ap.add_argument("--config", choices=["production", "manual"], default="production")
+    ap.add_argument("--proj", choices=[*PROJ, "all"], default="all")
     ap.add_argument("--bs", type=int, default=64)
-    ap.add_argument("--num-experts", type=int, default=None)
-    ap.add_argument("--top-k", type=int, default=None)
-    ap.add_argument("--n", type=int, default=None, help="down-proj output hidden")
     ap.add_argument("--rank", type=int, default=16)
-    ap.add_argument("--block-m", type=int, default=64)
-    ap.add_argument("--block-n", type=int, default=None,
-                    help="force BLOCK_SIZE_N (overrides the launcher's N%%128==0 -> 128 rule)")
-    ap.add_argument("--group-m", type=int, default=1)
-    ap.add_argument("--num-warps", type=int, default=4)
-    ap.add_argument("--iters", type=int, default=2)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--num-groups",
+        type=int,
+        default=0,
+        help="rotated buffer groups; 0 = auto-size to --l2-mult x L2",
+    )
+    ap.add_argument("--l2-mult", type=float, default=4.0)
+    ap.add_argument("--min-groups", type=int, default=16)
+    ap.add_argument("--max-groups", type=int, default=512)
+    ap.add_argument("--rep-ms", type=int, default=100)
+    ap.add_argument("--iters", type=int, default=4, help="profile-mode eager sweeps")
     ap.add_argument("--tol", type=float, default=5e-2)
     args = ap.parse_args()
 
-    # qwen35: tp4/ep4 -> 64 local experts, N=2048. kimi-k25: TP8/no-EP -> 384 experts, N=7168.
-    preset = {
-        "qwen35": {"num_experts": 64, "n": 2048, "top_k": 8},
-        "kimi-k25": {"num_experts": 384, "n": 7168, "top_k": 8},
-    }[args.model]
-    if args.num_experts is None:
-        args.num_experts = preset["num_experts"]
-    if args.n is None:
-        args.n = preset["n"]
-    if args.top_k is None:
-        args.top_k = preset["top_k"]
-
-    dev = "cuda"
-
-    if args.mode == "sweep":
-        # P0: bs=64, rank=16. Tunable knobs: BLOCK_SIZE_M / BLOCK_SIZE_N / GROUP_SIZE_M /
-        # num_warps (num_stages is hardcoded to 1 in the launcher). BLOCK_SIZE_N is swept via
-        # force_block_size_n (the production path forces 128 for N%128==0); only divisors of N
-        # are tried so no tile is wasted.
-        topk_ids, tkw, tlm, inter, lora_b = make_inputs(
-            args.bs, args.num_experts, args.top_k, args.n, args.rank,
-            torch.bfloat16, dev,
-        )
-        block_ns = [bn for bn in [64, 128, 256, 512] if args.n % bn == 0]
-        best = None
-        for block_m in [16, 32, 64]:
-            routing = build_v1_routing(topk_ids, tlm, args.num_experts, block_m)
-            for block_n in block_ns:
-                for group_m in [1, 4, 8]:
-                    for nw in [2, 4, 8]:
-                        f = lambda bm=block_m, bn=block_n, gm=group_m, w=nw, r=routing: expand(
-                            inter, lora_b, topk_ids, tkw, r, bm,
-                            group_m=gm, num_warps=w, force_block_n=bn,
-                        )
-                        try:
-                            us = bench_ms(f, warmup=15, rep=60) * 1000
-                        except Exception:
-                            continue
-                        tag = f"block_m={block_m} block_n={block_n} group_m={group_m} warps={nw}"
-                        if best is None or us < best[0]:
-                            best = (us, tag)
-                        print(f"  {us:7.2f} us  {tag}")
-        print(f"\nBEST bs={args.bs} r={args.rank} N={args.n} experts={args.num_experts}: "
-              f"{best[0]:.2f} us  {best[1]}")
-        return
-
-    topk_ids, tkw, tlm, inter, lora_b = make_inputs(
-        args.bs, args.num_experts, args.top_k, args.n, args.rank,
-        torch.bfloat16, dev,
-    )
-    # bench/profile: by default reproduce the config production launches (so the headline
-    # number matches the e2e kernel); --config manual uses the explicit flags instead.
-    if args.config == "production":
-        eff_block_m, eff_group_m, eff_warps = production_config(
-            args.num_experts, args.n, args.rank, args.bs, torch.bfloat16
-        )
-        eff_force_block_n = None  # let the launcher force 128 (N % 128 == 0), as production does
-    else:
-        eff_block_m, eff_group_m, eff_warps = args.block_m, args.group_m, args.num_warps
-        eff_force_block_n = args.block_n
-    routing = build_v1_routing(topk_ids, tlm, args.num_experts, eff_block_m)
-    fn = lambda: expand(
-        inter, lora_b, topk_ids, tkw, routing, eff_block_m,
-        group_m=eff_group_m, num_warps=eff_warps, force_block_n=eff_force_block_n,
-    )
+    device = "cuda"
+    dtype = torch.bfloat16
+    ep = QWEN35_EP4
+    projs = list(PROJ) if args.proj == "all" else [args.proj]
 
     if args.mode == "correctness":
-        # Guard the routing/tiling block-size contract: _invoke_moe_lora_expand_add tiles
-        # expert_ids with config["BLOCK_SIZE_M"] (one entry per M-block); routing must be
-        # aligned with the SAME block. Build routing AND config with the same block_m per
-        # iteration, but SWEEP block_m so any hardcoded value diverges from the routing at
-        # the other block sizes; sweep bs too so the overrun is deterministic enough to
-        # fault. Reference accumulates in fp32, kernel accumulates per-expert bf16
-        # atomic-adds -> generous abs tol.
-        block_ms = sorted({args.block_m, 16, 32, 64})
-        batch_sizes = sorted({args.bs, 16, 64})
+        # Also guard the routing/tiling block-size contract: the launcher must tile
+        # expert_ids with the same BLOCK_SIZE_M the routing was aligned with.
         failures = 0
-        for bs in batch_sizes:
-            tk, tkw_b, tlm_b, inter_b, lb = make_inputs(
-                bs, args.num_experts, args.top_k, args.n, args.rank,
-                torch.bfloat16, dev,
-            )
-            ref = ref_expand(inter_b, lb, tk, tkw_b)
-            for bm in block_ms:
-                routing_bm = build_v1_routing(tk, tlm_b, args.num_experts, bm)
-                out = expand(
-                    inter_b, lb, tk, tkw_b, routing_bm, bm,
-                    group_m=args.group_m, num_warps=args.num_warps,
-                    force_block_n=args.block_n,
-                ).float()
-                err = float((out - ref).abs().max().item())
-                rel = err / float(ref.abs().max().item() + 1e-9)
-                ok = err <= args.tol
-                failures += int(not ok)
-                print(
-                    f"{'PASS' if ok else 'FAIL'} bs={bs:<3d} block_m={bm:<2d} "
-                    f"max_abs_err={err:.4e} rel={rel:.2e}"
-                )
+        for proj in projs:
+            for bs in sorted({args.bs, 16, 64}):
+                topk_ids, topk_weights, tlm = make_routing_inputs(bs, ep, device, seed=args.seed)
+                inter, weight, out = make_gemm_inputs(proj, bs, ep, args.rank, dtype, device)
+                ref = ref_expand(proj, inter, weight, topk_ids, topk_weights, ep)
+                for block_m in [16, 32, 64]:
+                    config = {
+                        "BLOCK_SIZE_M": block_m,
+                        "BLOCK_SIZE_N": 128,
+                        "GROUP_SIZE_M": 1,
+                        "num_warps": 4,
+                    }
+                    routing = build_ep_routing(topk_ids, tlm, ep, block_m)
+                    out.zero_()
+                    expand_call(
+                        proj, inter, weight, out, topk_weights, topk_ids, routing, config
+                    )()
+                    err = float((out.float() - ref).abs().max().item())
+                    ok = err <= args.tol
+                    failures += int(not ok)
+                    print(
+                        f"{'PASS' if ok else 'FAIL'} proj={proj:<7s} bs={bs:<3d} "
+                        f"block_m={block_m:<2d} max_abs_err={err:.4e}"
+                    )
         if failures:
             raise SystemExit(1)
-    elif args.mode == "profile":
-        for _ in range(5):
-            fn()
-        torch.cuda.synchronize()
-        for _ in range(args.iters):
-            fn()
-        torch.cuda.synchronize()
-    else:
-        ms = bench_ms(fn)
-        eff_block_n = eff_force_block_n if eff_force_block_n is not None else (
-            128 if args.n % 128 == 0 else args.block_n
+        return
+
+    for proj in projs:
+        spec = PROJ[proj]
+        block_m, group_m, num_warps = production_config(
+            ep["num_experts"], spec["n"], args.rank, args.bs, dtype
         )
+        config = {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": 128,  # launcher forces 128 anyway (N % 128 == 0)
+            "GROUP_SIZE_M": group_m,
+            "num_warps": num_warps,
+        }
+        topk_ids, topk_weights, tlm = make_routing_inputs(args.bs, ep, device, seed=args.seed)
+
+        if args.mode == "sweep":
+            best = None
+            block_ns = [bn for bn in [64, 128, 256, 512] if spec["n"] % bn == 0]
+            for bm in [16, 32, 64]:
+                routing = build_ep_routing(topk_ids, tlm, ep, bm)
+                for bn in block_ns:
+                    for gm in [1, 4, 8]:
+                        for nw in [2, 4, 8]:
+                            cfg = {
+                                "BLOCK_SIZE_M": bm,
+                                "BLOCK_SIZE_N": bn,
+                                "GROUP_SIZE_M": gm,
+                                "num_warps": nw,
+                            }
+                            calls, _, _ = build_rotated_calls(
+                                args,
+                                proj,
+                                ep,
+                                cfg,
+                                (topk_ids, topk_weights, routing),
+                                device,
+                                dtype,
+                                force_block_n=bn,
+                            )
+                            try:
+                                us = bench_us_rotated(calls, args.rep_ms)
+                            except Exception:
+                                continue
+                            tag = f"block_m={bm} block_n={bn} group_m={gm} warps={nw}"
+                            if best is None or us < best[0]:
+                                best = (us, tag)
+                            print(f"  {us:7.2f} us  proj={proj} {tag}")
+            print(f"\nBEST proj={proj} bs={args.bs}: {best[0]:.2f} us  {best[1]}")
+            continue
+
+        routing = build_ep_routing(topk_ids, tlm, ep, block_m)
+        calls, num_groups, group_bytes = build_rotated_calls(
+            args, proj, ep, config, (topk_ids, topk_weights, routing), device, dtype
+        )
+
+        if args.mode == "profile":
+            for _ in range(2):
+                calls[0]()
+            torch.cuda.synchronize()
+            for _ in range(args.iters):
+                for call in calls:
+                    call()
+            torch.cuda.synchronize()
+            print(f"PROFILE proj={proj}: {args.iters} x {num_groups} groups done")
+            continue
+
+        sorted_token_ids = routing[0]
+        grid = triton.cdiv(sorted_token_ids.shape[0], block_m) * triton.cdiv(spec["n"], 128)
+        us = bench_us_rotated(calls, args.rep_ms)
         print(
-            f"BENCH expand_add down model={args.model} config={args.config} bs={args.bs} "
-            f"r={args.rank} N={args.n} experts={args.num_experts} top_k={args.top_k} "
-            f"block_m={eff_block_m} block_n={eff_block_n} group_m={eff_group_m} "
-            f"warps={eff_warps}: {ms * 1000:.2f} us (amortized true device time)"
+            f"BENCH moe_expand proj={proj} bs={args.bs} r={args.rank} N={spec['n']} "
+            f"E={ep['num_experts']}(local {ep['local_num_experts']}) "
+            f"mul_routed={int(spec['mul_routed_weight'])} fuse_sum={int(spec['fuse_sum_all_reduce'])} "
+            f"sorted={sorted_token_ids.shape[0]} block_m={block_m} grid=({grid},) "
+            f"groups={num_groups} ({group_bytes * num_groups / 1e6:.0f} MB rotated): {us:.2f} us"
         )
 
 
