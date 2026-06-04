@@ -165,6 +165,9 @@ class StorageBackendFactory:
         elif backend_name == "mooncake":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
+        elif backend_name == "tensorcast":
+            backend = backend_class(storage_config, mem_pool_host)
+            return backend
         elif backend_name == "aibrix":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
@@ -204,6 +207,12 @@ StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
+)
+
+StorageBackendFactory.register_backend(
+    "tensorcast",
+    "sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store",
+    "TensorcastStore",
 )
 
 StorageBackendFactory.register_backend(

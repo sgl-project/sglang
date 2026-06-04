@@ -3727,12 +3727,12 @@ class ServerArgs:
 
     def _resolve_layout_io_compatibility(self):
         if (
-            self.hicache_mem_layout == "page_first_direct"
+            self.hicache_mem_layout in ["page_first_direct", "page_blob_direct"]
             and self.hicache_io_backend == "kernel"
         ):
             self.hicache_io_backend = "direct"
             logger.warning(
-                "Kernel io backend does not support page first direct layout, switching to direct io backend"
+                "Kernel io backend does not support the requested direct page layout, switching to direct io backend"
             )
 
         if (
@@ -6244,6 +6244,7 @@ class ServerArgs:
                 "layer_first",
                 "page_first",
                 "page_first_direct",
+                "page_blob_direct",
                 "page_first_kv_split",
                 "page_head",
             ],
@@ -6256,6 +6257,7 @@ class ServerArgs:
             choices=[
                 "file",
                 "mooncake",
+                "tensorcast",
                 "hf3fs",
                 "nixl",
                 "aibrix",
@@ -6265,7 +6267,7 @@ class ServerArgs:
             ],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
-            "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
+            "Built-in backends: file, mooncake, tensorcast, hf3fs, nixl, aibrix. "
             "For dynamic backend, use --hicache-storage-backend-extra-config to specify: "
             "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
         )
