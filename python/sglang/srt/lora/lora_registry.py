@@ -15,11 +15,11 @@
 
 import asyncio
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import msgspec
-from msgspec.structs import fields
+from msgspec.structs import fields, replace
 
 from sglang.srt.utils import ConcurrentCounter
 from sglang.srt.utils.aio_rwlock import RWLock
@@ -38,6 +38,12 @@ class LoRARef(msgspec.Struct, frozen=True, array_like=True):
     lora_name: Optional[str] = None
     lora_path: Optional[str] = None
     pinned: Optional[bool] = None
+    # False for adapters whose weights arrived over the wire (lora_path
+    # "__stream__"): there is no disk artifact to reload from, so they must
+    # never be LRU-evicted nor implicitly reloaded.
+    # Trailing field with a default keeps the array_like wire format
+    # compatible with refs encoded before this field existed.
+    reloadable: bool = True
 
     def __post_init__(self):
         if self.lora_id is None:
@@ -123,6 +129,48 @@ class LoRARegistry:
 
         return lora_ref.lora_id
 
+    async def get_lora_id(self, lora_name: str) -> Optional[str]:
+        """Return the ``lora_id`` of a registered adapter, or ``None``."""
+        async with self._registry_lock.reader_lock:
+            lora_ref = self._registry.get(lora_name, None)
+            return lora_ref.lora_id if lora_ref is not None else None
+
+    async def register_or_reuse(
+        self, lora_ref: LoRARef, upsert: bool = False
+    ) -> Tuple[LoRARef, bool]:
+        """Resolve which identity a load request should use.
+
+        Returns ``(ref, reused)``. With ``upsert`` and a same-name adapter
+        already registered, the returned ref adopts the existing ``lora_id``
+        (``reused=True``) so the backend refreshes that adapter in place;
+        otherwise ``lora_ref`` is returned unchanged (``reused=False``).
+        Nothing is registered here: the caller commits the resolved ref with
+        ``register`` / ``refresh`` once the backend load succeeded, keeping
+        failed loads invisible to the registry.
+        """
+        if not upsert:
+            return lora_ref, False
+        async with self._registry_lock.reader_lock:
+            existing = self._registry.get(lora_ref.lora_name, None)
+        if existing is None:
+            return lora_ref, False
+        return replace(lora_ref, lora_id=existing.lora_id), True
+
+    async def refresh(self, lora_ref: LoRARef):
+        """Replace a registered adapter's ref after a successful upsert.
+
+        Keeps the id (asserted) while adopting the new path/pinned metadata,
+        and counts as a use for LRU ordering.
+        """
+        async with self._registry_lock.writer_lock:
+            existing = self._registry.get(lora_ref.lora_name, None)
+            assert existing is not None and existing.lora_id == lora_ref.lora_id, (
+                f"refresh() must target a registered adapter with the same lora_id; "
+                f"got {lora_ref}, registered: {existing}"
+            )
+            self._registry[lora_ref.lora_name] = lora_ref
+            self._registry.move_to_end(lora_ref.lora_name)
+
     async def acquire(self, lora_name: Union[str, List[str]]) -> Union[str, List[str]]:
         """
         Queries registry for LoRA IDs based on LoRA names and start tracking the usage of the corresponding LoRA adapters
@@ -142,24 +190,28 @@ class LoRARegistry:
             self._registry.move_to_end(name)
             return lora_ref.lora_id
 
+        # Lookup and increment must be one atomic admission step under the
+        # writer lock: with the increment outside, an unload can slip between
+        # them — unregister the adapter, observe the counter at zero, delete
+        # the counter — leaving this request to KeyError or to run on an
+        # adapter that is already gone. wait_for_unload never awaits inside
+        # this lock, so holding it across the increment cannot deadlock.
         if isinstance(lora_name, str):
             async with self._registry_lock.writer_lock:
                 lora_id = _lookup(lora_name)
-
-            await self._counters[lora_id].increment(notify_all=False)
+                await self._counters[lora_id].increment(notify_all=False)
             return lora_id
         elif isinstance(lora_name, list):
             async with self._registry_lock.writer_lock:
                 lora_ids = [_lookup(name) for name in lora_name]
-
-            # Increment the counters only after all IDs are looked up.
-            await asyncio.gather(
-                *[
-                    self._counters[id].increment(notify_all=False)
-                    for id in lora_ids
-                    if id is not None
-                ]
-            )
+                # Increment the counters only after all IDs are looked up.
+                await asyncio.gather(
+                    *[
+                        self._counters[id].increment(notify_all=False)
+                        for id in lora_ids
+                        if id is not None
+                    ]
+                )
             return lora_ids
         else:
             raise TypeError("lora_name must be either a string or a list of strings.")
@@ -224,14 +276,15 @@ class LoRARegistry:
         If exclude_pinned is True, then return the LRU LoRA adapter that isn't pinned.
         """
         async with self._registry_lock.reader_lock:
-            if not exclude_pinned:
-                return next(iter(self._registry), None)
-
             for lora_name, lora_ref in self._registry.items():
-                if not lora_ref.pinned:
-                    return lora_name
-            else:
-                return None
+                # Evicting a non-reloadable (wire-loaded) adapter is always
+                # destructive: there is no artifact to reload it from.
+                if not lora_ref.reloadable:
+                    continue
+                if exclude_pinned and lora_ref.pinned:
+                    continue
+                return lora_name
+            return None
 
     def _register_adapter(self, lora_ref: LoRARef):
         """
