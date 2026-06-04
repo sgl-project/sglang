@@ -1180,6 +1180,10 @@ class LoRAMemoryPool:
                             weights,
                         )
                     load_lora_weight_tensor(buffer_view, weights)
+                    # Zero beyond loaded rank -- the dense LoRA-B kernel
+                    # (sgemm_lora_b / qkv_lora_b) contracts over the full padded
+                    # max_rank, so the [lora_rank:] tail must be clean.
+                    target_buffer[buffer_id, :, lora_rank:].zero_()
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size

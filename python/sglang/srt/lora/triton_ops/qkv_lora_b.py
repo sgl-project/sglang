@@ -1,9 +1,19 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
+
+# Minimum max_len (longest segment) for the single-adapter cuBLAS path; below
+# this the Triton kernel is faster (measured crossover at the smallest
+# realistic N=768, where cuBLAS is weakest).
+_CUBLAS_MIN_MAX_LEN = 8
 
 
 @triton.jit
@@ -38,6 +48,7 @@ def _qkv_lora_b_kernel(
     BLOCK_K: tl.constexpr,
     # For fused output scaling
     scalings,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """
     This kernel packs 3 sgemms (q/k/v) into a single kernel. The multiplication
@@ -78,7 +89,7 @@ def _qkv_lora_b_kernel(
     n_start = tl.load(n_offs + qkv_id)
     n_size = tl.load(n_offs + qkv_id + 1) - n_start
     scaling = tl.load(scalings + w_index)
-    # Adjust K (rank) according to the specific LoRA adapter
+    # Adjust K (rank) according to the specific LoRA adapter.
     K = tl.minimum(K, rank)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
@@ -107,35 +118,69 @@ def _qkv_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
-    # Iterate to compute the block in output matrix
-    partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        x_tile = tl.load(
-            x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
-            other=0.0,
-        )
-        w_tile = tl.load(
-            w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < n_size),
-            other=0.0,
-        )
-        partial_sum += tl.dot(x_tile.to(w_tile.dtype), w_tile)  # cast fused: split-K returns fp32, plain path bf16 (no-op)
+    # GDC wait: ensure the prior kernel (producer of x) has fully completed
+    # before consuming its output.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
+    n_mask = n_offset[None, :] < n_size
+    x_tile = tl.load(
+        x_ptrs,
+        mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K),
+        other=0.0,
+    )
+    w_tile = tl.load(
+        w_ptrs,
+        mask=(k_offset[:, None] < K) & n_mask,
+        other=0.0,
+    )
+    # cast fused: the split-K shrink returns fp32, plain path bf16 (no-op)
+    partial_sum = tl.dot(x_tile.to(w_tile.dtype), w_tile)
 
-    # Store result to output matrix
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Store result to output matrix (cast to the OUTPUT dtype: x may be the fp32
+    # split-K shrink accumulator while base_output is bf16)
     partial_sum *= scaling
-    partial_sum = partial_sum.to(x.dtype.element_ty)
+    partial_sum = partial_sum.to(output.dtype.element_ty)
     output_ptr = (
         output
         + n_start * output_stride_1
         + (s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
     )
     output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < n_size)
-    partial_sum += tl.load(output_ptr, mask=output_mask)
-    tl.store(output_ptr, partial_sum, mask=output_mask)
+    tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+
+
+def _qkv_lora_b_cublas(
+    x: torch.Tensor,
+    qkv_lora_b: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    output_offset_cpu: torch.Tensor,
+    base_output: Optional[torch.Tensor],
+    n_slices: int,
+) -> torch.Tensor:
+    """Single-adapter dense path: one cuBLAS addmm_ per q/k/v slice.
+
+    The LoRA-A output is rank-packed (slice i at columns [i*rank, (i+1)*rank)),
+    matching the Triton kernel's K = min(K, rank) slice stride. Slice offsets
+    come from the pinned CPU copy (no GPU sync); slices are disjoint output
+    regions, so in-place addmm_ writes never collide.
+    """
+    r = batch_info.uniform_rank
+    if base_output is None:
+        base_output = torch.zeros(
+            (x.shape[0], qkv_lora_b.shape[-2]), device=x.device, dtype=x.dtype
+        )
+    w = qkv_lora_b[batch_info.uniform_weight_index]
+    x_scaled = x[:, : n_slices * r] * batch_info.uniform_scaling
+    offsets = output_offset_cpu.tolist()
+    for i in range(n_slices):
+        lo, hi = offsets[i], offsets[i + 1]
+        base_output[:, lo:hi].addmm_(x_scaled[:, i * r : (i + 1) * r], w[lo:hi, :r].t())
+    return base_output
 
 
 def qkv_lora_b_fwd(
@@ -146,6 +191,7 @@ def qkv_lora_b_fwd(
     max_qkv_out_dim: int,
     base_output: torch.Tensor = None,
     n_slices: int = 3,
+    output_offset_cpu: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     # x: (s, n_slices * r)
@@ -170,8 +216,21 @@ def qkv_lora_b_fwd(
     assert input_dim == n_slices * r
     assert output_offset.shape[0] == n_slices + 1
 
+    if (
+        output_offset_cpu is not None
+        and batch_info.uniform_weight_index is not None
+        and not batch_info.use_cuda_graph
+        and batch_info.max_len >= _CUBLAS_MIN_MAX_LEN
+    ):
+        return _qkv_lora_b_cublas(
+            x, qkv_lora_b, batch_info, output_offset_cpu, base_output, n_slices
+        )
+
     BLOCK_S = 16
-    BLOCK_R = 16
+    BLOCK_R = triton.next_power_of_2(r)
+    # BLOCK_OUT stays 64: with the 1-adapter cuBLAS dispatch the Triton path
+    # only runs for decode-sized batches, where 128 halves the grid (96->48
+    # programs on Kimi r16 bs64) and slows the kernel ~60% (11.4->18.5us, B200).
     BLOCK_OUT = 64
 
     grid_b = (
@@ -187,6 +246,7 @@ def qkv_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _qkv_lora_b_kernel[grid_b](
         x,
         qkv_lora_b,
@@ -211,6 +271,8 @@ def qkv_lora_b_fwd(
         BLOCK_OUT,
         BLOCK_R,
         batch_info.scalings,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
 
     return output

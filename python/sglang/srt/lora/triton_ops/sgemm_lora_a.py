@@ -1,9 +1,15 @@
+import functools
+
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -36,6 +42,8 @@ def _sgemm_lora_a_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr = 1,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """
     Computes a segmented batched matrix multiplication for the LoRA A matrix.
@@ -64,27 +72,31 @@ def _sgemm_lora_a_kernel(
         return
 
     pid = tl.program_id(axis=0)
+    # Fold the split-K factor out of axis-0 (SPLIT_K == 1 -> pid_sk == 0, pid_tile == pid).
+    pid_sk = pid % SPLIT_K
+    pid_tile = pid // SPLIT_K
+
     seg_start = tl.load(seg_indptr + batch_id)
     seg_len = tl.load(seg_lens + batch_id)
     if seg_len == 0:
         return
 
-    # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
+    # Adjust N (stack_num * max_rank) to this adapter's actual rank.
     N = tl.minimum(N, rank * stack_num)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(N, BLOCK_N)
-    pid_s = pid // num_pid_n
-    pid_n = pid % num_pid_n
+    pid_s = pid_tile // num_pid_n
+    pid_n = pid_tile % num_pid_n
     if pid_s * BLOCK_S >= seg_len:
         return
 
     # Create pointers for the first block of x and weights[batch_id]
     # The pointers will be advanced as we move in the K direction
-    # and accumulate
+    # and accumulate.
     s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
-    k_offset = tl.arange(0, BLOCK_K)
+    k_offset = pid_sk * BLOCK_K + tl.arange(0, BLOCK_K)
     s_physical = _resolve_token_positions(
         sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
     )
@@ -93,31 +105,53 @@ def _sgemm_lora_a_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
+    # GDC wait: ensure the prior kernel (producer of x) has fully completed
+    # before consuming its output.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+    for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+        k_remaining = K - k * (BLOCK_K * SPLIT_K)
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < k_remaining),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K) & (n_offset[None, :] < N),
+            mask=(k_offset[:, None] < k_remaining) & (n_offset[None, :] < N),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
 
-        x_ptrs += BLOCK_K * x_stride_1
-        w_ptrs += BLOCK_K * w_stride_2
+        x_ptrs += BLOCK_K * SPLIT_K * x_stride_1
+        w_ptrs += BLOCK_K * SPLIT_K * w_stride_2
+
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     # Store result to output matrix
-    partial_sum = partial_sum.to(x.dtype.element_ty)
     output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    tl.store(output_ptr, partial_sum, mask=output_mask)
+    if SPLIT_K == 1:
+        tl.store(output_ptr, partial_sum.to(output.dtype.element_ty), mask=output_mask)
+    else:
+        tl.atomic_add(
+            output_ptr,
+            partial_sum.to(output.dtype.element_ty),
+            mask=output_mask,
+            sem="relaxed",
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def sgemm_lora_a_fwd(
@@ -127,14 +161,6 @@ def sgemm_lora_a_fwd(
     stack_num: int = 1,
     out_alloc_stream=None,
 ) -> torch.Tensor:
-    # Opt-in fp32 split-K for the dense LoRA-A shrink (PR #26962): route to the gated implementation in
-    # trtllm_moe/sgemm_lora_a_split_k.py. Default (env off) falls through to the original path below.
-    if envs.SGLANG_ENABLE_LORA_SHRINK_SPLIT_K.get():
-        from sglang.srt.lora.trtllm_moe.sgemm_lora_a_split_k import sgemm_lora_a_fwd_split_k
-
-        return sgemm_lora_a_fwd_split_k(
-            x, weights, batch_info, stack_num, out_alloc_stream=out_alloc_stream
-        )
     # x: (s, input_dim)
     # weights: (num_lora, stack_num * r, input_dim)
     # output: (s, stack_num * r)
@@ -152,26 +178,54 @@ def sgemm_lora_a_fwd(
     K = weights.shape[-1]
     assert x.shape[-1] == K
 
+    single_adapter = batch_info.single_adapter
+    if single_adapter is not None:
+        idx, rank = single_adapter
+        if rank == R // stack_num:
+            return F.linear(x, weights[idx])
+
     # Block shapes
     BLOCK_S = 16
     BLOCK_K = 256
-    BLOCK_R = 16
-
-    grid = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(R, BLOCK_R),
-        batch_info.bs,
-    )
+    BLOCK_R = triton.next_power_of_2(R)
 
     sorted_by_adapter = batch_info.permutation is not None
 
-    # Allocate the output on the MAIN (consumer) stream when requested, so the caching allocator frees/
-    # reuses it on the consumer's schedule, not the side stream's (cuda-graph WAR — see
-    # lora_overlap_alloc_stream / SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC).
-    if out_alloc_stream is not None:
+    num_s_tiles = triton.cdiv(batch_info.max_len, BLOCK_S)
+    split_k = 1
+    if envs.SGLANG_ENABLE_LORA_SHRINK_SPLIT_K.get() and x.is_cuda:
+        num_k_tiles = triton.cdiv(K, BLOCK_K)
+        base_grid = batch_info.bs * num_s_tiles
+        num_sms = _num_sms(x.device.index)
+        if base_grid < num_sms and num_k_tiles >= 16:
+            split_k = max(1, min(2 * num_sms // base_grid, num_k_tiles, 16))
+
+    launch_kwargs = {}
+    if split_k > 1:
+        # out_alloc_stream (SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC) is intentionally NOT honored here:
+        # torch.zeros launches its memset on the alloc stream, which would race the side-stream
+        # shrink without extra ordering. No current config exercises split-K together with the
+        # two-stream main-alloc overlap (qwen3.5 leaves split-K off; kimi is single-stream-coherent).
+        output = torch.zeros((S, R), device=x.device, dtype=torch.float32)
+        launch_kwargs = {
+            "num_warps": 2 if split_k <= 4 else 4,
+            "num_stages": 3,
+        }
+    elif out_alloc_stream is not None:
+        # Allocate the output on the MAIN (consumer) stream when requested, so the caching allocator
+        # frees/reuses it on the consumer's schedule, not the side stream's (cuda-graph WAR — see
+        # lora_overlap_alloc_stream / SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC).
         with torch.cuda.stream(out_alloc_stream):
             output = torch.empty((S, R), device=x.device, dtype=x.dtype)
     else:
         output = torch.empty((S, R), device=x.device, dtype=x.dtype)
+
+    grid = (
+        num_s_tiles * split_k,
+        batch_info.bs,
+    )
+
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _sgemm_lora_a_kernel[grid](
         x,
         weights,
@@ -195,5 +249,11 @@ def sgemm_lora_a_fwd(
         BLOCK_S,
         BLOCK_R,
         BLOCK_K,
+        split_k,
+        ENABLE_PDL=enable_pdl,
+        **launch_kwargs,
+        **pdl_kwargs,
     )
+    # split_k>1 returns the fp32 accumulator directly; the LoRA-B expand casts x to the weight dtype
+    # on-load (fused), dropping the standalone fp32->bf16 copy kernel. split_k==1 already returns x.dtype.
     return output

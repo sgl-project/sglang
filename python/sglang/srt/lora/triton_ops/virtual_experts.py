@@ -11,6 +11,7 @@ import triton.language as tl
 
 from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
 from sglang.srt.environ import envs
+from sglang.srt.lora.triton_ops.kernel_utils import get_pdl_launch_metadata
 
 
 @triton.jit
@@ -26,6 +27,7 @@ def _fused_virtual_topk_ids_kernel(
     local_expert_offset: tl.constexpr,
     local_num_experts: tl.constexpr,
     EP_LOCAL: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """
     Fuses _get_virtual_topk_ids: comparison + clamp + arithmetic into one kernel.
@@ -43,6 +45,11 @@ def _fused_virtual_topk_ids_kernel(
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     total = M * top_k
     valid = offs < total
+
+    # GDC wait: topk_ids/token_lora_mapping come from the immediately
+    # preceding routing kernels; wait before consuming them.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
     m = offs // top_k
     # k = offs % top_k  # not needed directly
@@ -74,6 +81,10 @@ def _fused_virtual_topk_ids_kernel(
     k = offs % top_k
     is_first_k = k == 0
     tl.store(token_lora_mask_ptr + m, mask_val, mask=valid & is_first_k)
+
+    # All work is done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _fused_virtual_topk_ids(
@@ -113,6 +124,7 @@ def _fused_virtual_topk_ids(
     BLOCK_SIZE = 1024
     grid = ((M * top_k + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _fused_virtual_topk_ids_kernel[grid](
         input_topk,
         token_lora_mapping,
@@ -125,6 +137,8 @@ def _fused_virtual_topk_ids(
         local_expert_offset,
         local_num_experts if local_num_experts is not None else 0,
         ep_local,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
 
     virtual_num_experts = num_experts_for_weight * max_loras
@@ -138,14 +152,24 @@ def _fused_sanitize_expert_ids_kernel(
     num_virtual_experts,
     N,
     BLOCK_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     valid = offs < N
 
+    # GDC wait: expert_ids comes from the immediately preceding align kernel;
+    # wait before consuming it.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     eid = tl.load(expert_ids_ptr + offs, mask=valid, other=0)
     result = tl.where(eid < num_virtual_experts, eid, -1)
     tl.store(output_ptr + offs, result, mask=valid)
+
+    # All work is done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_sanitize_expert_ids(
@@ -163,12 +187,15 @@ def fused_sanitize_expert_ids(
     BLOCK_SIZE = 1024
     grid = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _fused_sanitize_expert_ids_kernel[grid](
         expert_ids,
         output,
         num_virtual_experts,
         N,
         BLOCK_SIZE,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return output
 
@@ -201,11 +228,18 @@ def _moe_lora_shrink_splitk_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """Split-K grouped GEMM for the LoRA A (shrink) stage with few virtual experts."""
     pid = tl.program_id(0)
     pid_sk = pid % SPLIT_K
     pid_mn = pid // SPLIT_K
+
+    # GDC wait: the routing buffers (sorted_token_ids/expert_ids/
+    # num_tokens_post_padded) come from the immediately preceding align and
+    # sanitize kernels; wait before consuming them.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
@@ -259,6 +293,10 @@ def _moe_lora_shrink_splitk_kernel(
         a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
 
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     accumulator = accumulator.to(c_ptr.dtype.element_ty)
 
     # Write output
@@ -286,17 +324,23 @@ def _invoke_moe_lora_shrink_splitk(
     N = weight.shape[1]
     K = weight.shape[2]
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
-    BLOCK_SIZE_N = min(config.get("BLOCK_SIZE_N", 64), max(16, N))
-    BLOCK_SIZE_K = config.get("BLOCK_SIZE_K", 64)
+    BLOCK_SIZE_N = triton.next_power_of_2(N)
+    BLOCK_SIZE_K = 256
     GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
 
     num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M)
-    num_n_blocks = triton.cdiv(N, BLOCK_SIZE_N)
+    num_n_blocks = triton.cdiv(
+        N, BLOCK_SIZE_N
+    )  # == 1, BLOCK_SIZE_N == next_pow2(N) >= N
     base_grid = num_m_blocks * num_n_blocks
+    # Single source of truth shared with the caller's zero-intermediate decision:
+    # split-K accumulation REQUIRES a pre-zeroed output, so the predicted and
+    # launched SPLIT_K must never diverge.
     SPLIT_K = _get_moe_lora_shrink_split_k(weight, sorted_token_ids, config)
 
     grid = (SPLIT_K * base_grid,)
 
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _moe_lora_shrink_splitk_kernel[grid](
         hidden_states,
         weight,
@@ -320,8 +364,10 @@ def _invoke_moe_lora_shrink_splitk(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=GROUP_SIZE_M,
         SPLIT_K=SPLIT_K,
+        ENABLE_PDL=enable_pdl,
         num_warps=config.get("num_warps", 4),
         num_stages=config.get("num_stages", 4),
+        **pdl_kwargs,
     )
 
 
@@ -330,16 +376,29 @@ def _get_moe_lora_shrink_split_k(
     sorted_token_ids: torch.Tensor,
     config: dict[str, Any],
 ) -> int:
+    """Rank-tiered split-K occupancy fill (PR #26899).
+
+    The K reduction (e.g. 7168 / 256 = 28 iters) dominates this skinny-N grouped
+    GEMV, so splitting K stays useful well past full SM occupancy -- a plain
+    `1 if base_grid >= num_sm else ...` rule collapses SPLIT_K too early and
+    costs up to ~2x at the decode/prefill border. Skinnier ranks want more
+    splits (their output tile carries less work). The target / tiers were picked
+    from an offline per-M B200 sweep over E in {48,96,384}, N in {16,32,64};
+    this heuristic lands within ~5% of the per-shape tuned optimum across the
+    decode regime.
+
+    Block sizes must mirror _invoke_moe_lora_shrink_splitk (BLOCK_SIZE_N =
+    next_pow2(N) -> one N block; BLOCK_SIZE_K = 256).
+    """
     N = weight.shape[1]
     K = weight.shape[2]
     block_size_m = config["BLOCK_SIZE_M"]
-    block_size_n = min(config.get("BLOCK_SIZE_N", 64), max(16, N))
-    block_size_k = config.get("BLOCK_SIZE_K", 64)
+    block_size_k = 256
     num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], block_size_m)
-    num_n_blocks = triton.cdiv(N, block_size_n)
-    base_grid = num_m_blocks * num_n_blocks
+    base_grid = num_m_blocks  # num_n_blocks == 1: BLOCK_SIZE_N == next_pow2(N) >= N
+    target = 512 if N <= 16 else 384 if N <= 32 else 256
     max_split_k = max(1, K // block_size_k)
-    return min(max_split_k, max(1, 128 // base_grid)) if base_grid < 128 else 1
+    return max(1, min(triton.cdiv(target, base_grid), max_split_k, 8))
 
 
 # Rank-specialized LoRA-B expand kernel lives in lora/trtllm_moe/.
@@ -641,6 +700,23 @@ def _merged_experts_fused_moe_lora_add_impl(
             }
         return cfg
 
+    def _get_shrink_stage_config(weight: torch.Tensor, M: int) -> dict[str, Any]:
+        """Heuristic launch config for the LoRA A (shrink) stage.
+
+        Only BLOCK_SIZE_M / num_warps / num_stages are chosen here (a simple
+        decode/prefill rule). SPLIT_K is intentionally NOT set: the launcher
+        derives it from the post-alignment grid, see _invoke_moe_lora_shrink_splitk.
+        M is the number of input tokens; N (= weight.shape[1]) is the LoRA rank.
+        """
+        N = weight.shape[1]
+        if M < 512:  # decode / small batch: pin a small block, latency-bound
+            return {
+                "BLOCK_SIZE_M": 16,
+                "num_warps": 4 if (M <= 4 or N >= 32) else 2,
+                "num_stages": 3,
+            }
+        return {"BLOCK_SIZE_M": 32, "num_warps": 2, "num_stages": 2}  # prefill
+
     def _align_block_size(
         topk_ids: torch.Tensor,
         block_size: int,
@@ -773,14 +849,15 @@ def _merged_experts_fused_moe_lora_add_impl(
     num_experts_a = lora_a.shape[1]
     num_experts_b = lora_b.shape[1]
 
-    a_stage_config = _get_stage_config(lora_a_virtual, input_top_k)
+    a_stage_config = _get_shrink_stage_config(
+        lora_a_virtual, token_lora_mapping.shape[0]
+    )
     if envs.SGLANG_OPT_LORA_SHRINK_TUNE.get():
-        # Tuned decode shrink config: skinny GEMM (M=tokens small, N=rank, K=in large).
+        # GB200 hand-tune knob (test-only) on top of PR #26899's heuristic config. The launcher
+        # pins BLOCK_SIZE_N (next_pow2(rank)) and BLOCK_SIZE_K (256), so only M/warps/stages apply.
         a_stage_config = {
             **a_stage_config,
             "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": max_lora_rank,
-            "BLOCK_SIZE_K": 256,
             "num_warps": 4,
             "num_stages": 4,
         }

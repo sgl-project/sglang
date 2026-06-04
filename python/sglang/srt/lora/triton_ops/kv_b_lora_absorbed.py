@@ -48,7 +48,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
 
 # ---------------------------------------------------------------------------
@@ -71,10 +74,23 @@ from sglang.srt.lora.utils import LoRABatchInfo
 # ---------------------------------------------------------------------------
 
 _BLOCK_S = 16
-_STEP_A_BLOCK_K = 64  # contraction over qk_nope (~128) or kv_lora_rank (~512)
-_STEP_A_BLOCK_N = 16  # output is rank
-_STEP_B_BLOCK_K = 16  # contraction is rank
-_STEP_B_BLOCK_N = 64  # output is kv_lora_rank (~512) or v_head_dim (~128)
+
+
+def _dense_1adapter(batch_info: LoRABatchInfo):
+    """(slot, rank, scaling) for the single-adapter cuBLAS path, else None.
+
+    cuBLAS beats the SGMM kernels in every measured regime for step_a_q
+    (per-head bmm), step_b_q, and step_a_v (one flattened (S*H, .) GEMM each)
+    -- with one adapter the head axis multiplies GEMM M by H, so there is no
+    small-M regime. step_b_v stays Triton (bmm + add_ loses there).
+    """
+    if batch_info.use_cuda_graph or batch_info.uniform_weight_index is None:
+        return None
+    return (
+        batch_info.uniform_weight_index,
+        batch_info.uniform_rank,
+        batch_info.uniform_scaling,
+    )
 
 
 def _num_segments(batch_info: LoRABatchInfo) -> int:
@@ -133,9 +149,11 @@ def _step_a_q_kernel(
     # meta
     FULL_K: tl.constexpr,  # per-head row stride in B (qk_nope + v_head_dim)
     SORTED_BY_ADAPTER: tl.constexpr,
+    K_DIV: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -182,11 +200,16 @@ def _step_a_q_kernel(
         head_id * FULL_K
     )  # row offset for this head's K-half (i in [0, qk_nope))
 
+    # GDC wait: ensure the prior kernel (producer of x) has fully completed
+    # before consuming its output.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
         k_mask = cur_k < K
-        safe_k = tl.minimum(cur_k, K - 1)
+        safe_k = cur_k if K_DIV else tl.minimum(cur_k, K - 1)
 
         # x[s, h, k]
         x_tile = tl.load(
@@ -210,6 +233,10 @@ def _step_a_q_kernel(
         )
 
         partial_sum += tl.dot(x_tile, w_tile)
+
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     partial_sum = partial_sum.to(x.dtype.element_ty)
     out_offs = (
@@ -240,17 +267,29 @@ def step_a_q_fwd(
     """
     S, H, qk_nope_dim = q_nope.shape
     rank = B_buf.shape[-1]
+
+    dense = _dense_1adapter(batch_info)
+    if dense is not None:
+        wi, r, _ = dense
+        # (S,H,r) view of a (H,S,r)-contiguous bmm result; step_b_q's dense
+        # path flattens in (h,s) order, so the chain needs no copies.
+        w_kc = B_buf[wi].view(H, full_K_per_head, -1)[:, :qk_nope_dim, :r]
+        return torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
+
+    block_n = triton.next_power_of_2(rank)  # output N == rank -> one tile
     out = torch.empty((S, H, rank), device=q_nope.device, dtype=q_nope.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
+    _STEP_A_Q_BLOCK_K = 128
 
     grid = (
-        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
+        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, block_n),
         H,
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     _step_a_q_kernel[grid](
         q_nope,
@@ -276,9 +315,12 @@ def step_a_q_fwd(
         num_segments,
         FULL_K=full_K_per_head,
         SORTED_BY_ADAPTER=sorted_by_adapter,
+        K_DIV=(qk_nope_dim % _STEP_A_Q_BLOCK_K == 0),
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_A_BLOCK_N,
-        BLOCK_K=_STEP_A_BLOCK_K,
+        BLOCK_N=block_n,
+        BLOCK_K=_STEP_A_Q_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out
 
@@ -322,9 +364,11 @@ def _step_b_q_kernel(
     num_segments,
     # meta
     SORTED_BY_ADAPTER: tl.constexpr,
+    N_DIV: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -365,7 +409,12 @@ def _step_b_q_kernel(
     row_mask = s_offset < seg_len
     safe_row = tl.minimum(s_physical, S - 1)
     n_mask = n_offset[None, :] < N
-    safe_n = tl.minimum(n_offset, N - 1)
+    safe_n = n_offset if N_DIV else tl.minimum(n_offset, N - 1)
+
+    # GDC wait: ensure the prior kernel (producer of x) has fully completed
+    # before consuming its output.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):
@@ -395,6 +444,10 @@ def _step_b_q_kernel(
 
         partial_sum += tl.dot(x_tile, w_tile)
 
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
 
@@ -405,8 +458,7 @@ def _step_b_q_kernel(
         + safe_n[None, :] * b_stride_n
     )
     out_mask = row_mask[:, None] & n_mask
-    partial_sum += tl.load(base + base_offs, mask=out_mask, other=0.0)
-    tl.store(base + base_offs, partial_sum, mask=out_mask)
+    tl.atomic_add(base + base_offs, partial_sum, mask=out_mask, sem="relaxed")
 
 
 def step_b_q_fwd(
@@ -429,17 +481,38 @@ def step_b_q_fwd(
     """
     S, H, rank = q_lora_a.shape
     kv_lora_rank = A_buf.shape[-1]
+
+    dense = _dense_1adapter(batch_info)
+    if dense is not None:
+        wi, r, scaling = dense
+        # Flatten (S,H) in whichever order base_output's storage allows
+        # without a copy (the absorbed q path passes a transpose view of a
+        # (H,S,kv)-contiguous bmm result). x is small; reshape may copy it.
+        base2d = x2d = None
+        if base_output.is_contiguous():
+            base2d = base_output.view(-1, kv_lora_rank)
+            x2d = q_lora_a[..., :r].reshape(-1, r)
+        elif base_output.transpose(0, 1).is_contiguous():
+            base2d = base_output.transpose(0, 1).view(-1, kv_lora_rank)
+            x2d = q_lora_a[..., :r].transpose(0, 1).reshape(-1, r)
+        if base2d is not None:
+            base2d.addmm_(x2d, A_buf[wi, :r, :], alpha=scaling)
+            return base_output
+
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
+    _STEP_B_Q_BLOCK_N = 128
+    _STEP_B_BLOCK_K = 16
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S)
-        * triton.cdiv(kv_lora_rank, _STEP_B_BLOCK_N),
+        * triton.cdiv(kv_lora_rank, _STEP_B_Q_BLOCK_N),
         H,
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     _step_b_q_kernel[grid](
         q_lora_a,
@@ -464,9 +537,12 @@ def step_b_q_fwd(
         batch_info.scalings,
         num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
+        N_DIV=(kv_lora_rank % _STEP_B_Q_BLOCK_N == 0),
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_B_BLOCK_N,
+        BLOCK_N=_STEP_B_Q_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return base_output
 
@@ -509,9 +585,11 @@ def _step_a_v_kernel(
     num_segments,
     # meta
     SORTED_BY_ADAPTER: tl.constexpr,
+    K_DIV: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -552,11 +630,16 @@ def _step_a_v_kernel(
     safe_row = tl.minimum(s_physical, S - 1)
     safe_n = tl.minimum(n_offset, N_eff - 1)
 
+    # GDC wait: ensure the prior kernel (producer of x) has fully completed
+    # before consuming its output.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         cur_k = k_block * BLOCK_K + k_offset
         k_mask = cur_k < K
-        safe_k = tl.minimum(cur_k, K - 1)
+        safe_k = cur_k if K_DIV else tl.minimum(cur_k, K - 1)
 
         # x[s, h, k]
         x_tile = tl.load(
@@ -581,6 +664,10 @@ def _step_a_v_kernel(
         )
 
         partial_sum += tl.dot(x_tile, w_tile)
+
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     partial_sum = partial_sum.to(x.dtype.element_ty)
     out_offs = (
@@ -609,17 +696,28 @@ def step_a_v_fwd(
     """
     S, H, kv_lora_rank = attn_output.shape
     rank = A_buf.shape[1]
+
+    dense = _dense_1adapter(batch_info)
+    if dense is not None and attn_output.is_contiguous():
+        wi, r, _ = dense
+        return torch.mm(attn_output.view(-1, kv_lora_rank), A_buf[wi, :r, :].t()).view(
+            S, H, r
+        )
+
+    block_n = triton.next_power_of_2(rank)
     out = torch.empty((S, H, rank), device=attn_output.device, dtype=attn_output.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
+    _STEP_A_V_BLOCK_K = 256
 
     grid = (
-        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
+        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, block_n),
         H,
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     _step_a_v_kernel[grid](
         attn_output,
@@ -643,9 +741,12 @@ def step_a_v_fwd(
         batch_info.permutation,
         num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
+        K_DIV=(kv_lora_rank % _STEP_A_V_BLOCK_K == 0),
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_A_BLOCK_N,
-        BLOCK_K=_STEP_A_BLOCK_K,
+        BLOCK_N=block_n,
+        BLOCK_K=_STEP_A_V_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out
 
@@ -692,9 +793,11 @@ def _step_b_v_kernel(
     FULL_K: tl.constexpr,  # qk_nope + v_head_dim
     QK_NOPE_OFFSET: tl.constexpr,  # offset of V-half within each head's row block
     SORTED_BY_ADAPTER: tl.constexpr,
+    N_DIV: tl.constexpr,  # N % BLOCK_N == 0 -> drop safe_n (keep the store coalesced)
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     batch_id = tl.program_id(axis=2)
     head_id = tl.program_id(axis=1)
@@ -734,10 +837,15 @@ def _step_b_v_kernel(
     row_mask = s_offset < seg_len
     safe_row = tl.minimum(s_physical, S - 1)
     n_mask = n_offset[None, :] < N
-    safe_n = tl.minimum(n_offset, N - 1)
+    safe_n = n_offset if N_DIV else tl.minimum(n_offset, N - 1)
 
     # V-half row base for this head: h*FULL_K + qk_nope
     head_row_base = head_id * FULL_K + QK_NOPE_OFFSET
+
+    # GDC wait: ensure the prior kernel (producer of x) has fully completed
+    # before consuming its output.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):
@@ -768,6 +876,10 @@ def _step_b_v_kernel(
 
         partial_sum += tl.dot(x_tile, w_tile)
 
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
 
@@ -777,8 +889,7 @@ def _step_b_v_kernel(
         + safe_n[None, :] * b_stride_n
     )
     out_mask = row_mask[:, None] & n_mask
-    partial_sum += tl.load(base + base_offs, mask=out_mask, other=0.0)
-    tl.store(base + base_offs, partial_sum, mask=out_mask)
+    tl.atomic_add(base + base_offs, partial_sum, mask=out_mask, sem="relaxed")
 
 
 def step_b_v_fwd(
@@ -808,14 +919,17 @@ def step_b_v_fwd(
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
     segment_grid = _segment_grid_size(batch_info, num_segments)
+    _STEP_B_V_BLOCK_N = 64
+    _STEP_B_BLOCK_K = 16
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S)
-        * triton.cdiv(v_head_dim, _STEP_B_BLOCK_N),
+        * triton.cdiv(v_head_dim, _STEP_B_V_BLOCK_N),
         H,
         segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
 
     _step_b_v_kernel[grid](
         attn_lora_a,
@@ -842,8 +956,11 @@ def step_b_v_fwd(
         FULL_K=full_K_per_head,
         QK_NOPE_OFFSET=qk_nope_head_dim,
         SORTED_BY_ADAPTER=sorted_by_adapter,
+        N_DIV=(v_head_dim % _STEP_B_V_BLOCK_N == 0),
         BLOCK_S=_BLOCK_S,
-        BLOCK_N=_STEP_B_BLOCK_N,
+        BLOCK_N=_STEP_B_V_BLOCK_N,
         BLOCK_K=_STEP_B_BLOCK_K,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return base_output

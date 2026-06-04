@@ -2,8 +2,16 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
+from sglang.srt.lora.triton_ops.kernel_utils import (
+    _resolve_token_positions,
+    get_pdl_launch_metadata,
+)
 from sglang.srt.lora.utils import LoRABatchInfo
+
+# Minimum total_tokens * rank for the single-adapter cuBLAS path; below this
+# the Triton kernel is faster (crossover measured at output_dim=1536/GPU:
+# cuBLAS wins rank64 from S>=256 and rank16 only from S>=2048).
+_CUBLAS_MIN_S_RANK = 16384
 
 
 @triton.jit
@@ -36,6 +44,7 @@ def _gate_up_lora_b_kernel(
     BLOCK_K: tl.constexpr,
     # For fused output scaling
     scalings,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """
     This kernel packs 2 sgemms (gate/up) into a single kernel. The multiplication
@@ -105,6 +114,11 @@ def _gate_up_lora_b_kernel(
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
+    # GDC wait: ensure the prior kernel (producer of x) has fully completed
+    # before consuming its output.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
@@ -119,10 +133,16 @@ def _gate_up_lora_b_kernel(
             & (n_offset[None, :] < output_dim),
             other=0.0,
         )
-        partial_sum += tl.dot(x_tile.to(w_tile.dtype), w_tile)  # cast fused: split-K returns fp32, plain path bf16 (no-op)
+        partial_sum += tl.dot(
+            x_tile.to(w_tile.dtype), w_tile
+        )  # cast fused: split-K returns fp32, plain path bf16 (no-op)
 
         x_ptrs += BLOCK_K * x_stride_1
         w_ptrs += BLOCK_K * w_stride_2
+
+    # All input reads are done; hint the runtime to launch the dependent kernel.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     # Store result to output matrix
     partial_sum *= scaling
@@ -135,6 +155,32 @@ def _gate_up_lora_b_kernel(
     output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < output_dim)
     partial_sum += tl.load(output_ptr, mask=output_mask)
     tl.store(output_ptr, partial_sum, mask=output_mask)
+
+
+def _gate_up_lora_b_cublas(
+    x: torch.Tensor,
+    gate_up_lora_b: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    output_dim: int,
+    base_output: torch.Tensor,
+) -> torch.Tensor:
+    """Single-adapter dense path: one cuBLAS addmm_ per gate/up slice.
+
+    The LoRA-A output is rank-packed (slice i at columns [i*rank, (i+1)*rank)),
+    matching the Triton kernel's K = min(K, rank) slice stride. Slices are
+    disjoint output regions, so in-place addmm_ writes never collide.
+    """
+    r = batch_info.uniform_rank
+    if base_output is None:
+        base_output = torch.zeros(
+            (x.shape[0], 2 * output_dim), device=x.device, dtype=x.dtype
+        )
+    w = gate_up_lora_b[batch_info.uniform_weight_index]
+    x_scaled = x[:, : 2 * r] * batch_info.uniform_scaling
+    for i in range(2):
+        lo, hi = i * output_dim, (i + 1) * output_dim
+        base_output[:, lo:hi].addmm_(x_scaled[:, i * r : (i + 1) * r], w[lo:hi, :r].t())
+    return base_output
 
 
 def gate_up_lora_b_fwd(
@@ -160,6 +206,15 @@ def gate_up_lora_b_fwd(
     r = gate_up_lora_b.shape[-1]
     assert input_dim == 2 * r
 
+    if (
+        batch_info.uniform_weight_index is not None
+        and not batch_info.use_cuda_graph
+        and s * batch_info.uniform_rank >= _CUBLAS_MIN_S_RANK
+    ):
+        return _gate_up_lora_b_cublas(
+            x, gate_up_lora_b, batch_info, output_dim, base_output
+        )
+
     BLOCK_S = 16
     BLOCK_R = 16
     BLOCK_OUT = 64
@@ -176,6 +231,7 @@ def gate_up_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _gate_up_lora_b_kernel[grid_b](
         x,
         gate_up_lora_b,
@@ -199,6 +255,8 @@ def gate_up_lora_b_fwd(
         BLOCK_OUT,
         BLOCK_R,
         batch_info.scalings,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
 
     return output
