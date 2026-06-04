@@ -34,8 +34,8 @@ export const Nemotron3UltraDeployment = () => {
       name: 'model',
       title: 'Model',
       items: [
-        { id: 'bf16',   label: 'BF16',   default: true  },
-        { id: 'nvfp4',  label: 'NVFP4',  default: false, subtitle: 'Blackwell only' },
+        { id: 'bf16',   label: 'BF16',   default: false },
+        { id: 'nvfp4',  label: 'NVFP4',  default: true,  subtitle: 'Blackwell only' },
       ]
     },
     hardware: {
@@ -86,8 +86,8 @@ export const Nemotron3UltraDeployment = () => {
       name: 'mtp',
       title: 'Multi-token Prediction (MTP)',
       items: [
-        { id: 'enabled',  label: 'Enabled',  default: false },
-        { id: 'disabled', label: 'Disabled', default: true  }
+        { id: 'enabled',  label: 'Enabled',  default: true  },
+        { id: 'disabled', label: 'Disabled', default: false }
       ],
       // On Blackwell, the flashinfer default breaks the spec-v2 overlap scheduler, so override to trtllm_mha
       commandRule: (value, state) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --mamba-scheduler-strategy extra_buffer' + (['b200', 'gb200', 'b300', 'gb300'].includes(state.hardware) ? ' \\\n  --attention-backend trtllm_mha' : '') : null
