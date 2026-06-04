@@ -31,6 +31,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     is_hip,
+    is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -38,6 +39,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -398,7 +400,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             # ROCm's argmax tie-breaks differently from CUDA's softmax+max
             # path on FP8 logits, which corrupts MTP draft selection on AMD.
             # Keep the fastpath CUDA-only.
-            if self.topk == 1 and not _is_hip:
+            if self.topk == 1 and not _is_hip and not _is_npu:
                 ret.topk_index = torch.argmax(
                     ret.next_token_logits, dim=-1, keepdim=True
                 )
