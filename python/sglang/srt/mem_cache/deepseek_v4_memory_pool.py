@@ -444,6 +444,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c128_state_pool_size: int,
         page_size: int,
         swa_page_size: int,
+        sliding_window: int,
         dtype: torch.dtype,
         state_dtype: torch.dtype,
         qk_nope_head_dim: int,
@@ -499,6 +500,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         stage_ratios = compression_ratios[self._stage_start : self._stage_end]
 
         assert page_size % swa_page_size == 0
+        self.sliding_window = sliding_window
 
         self.swa_size = swa_size
         self.swa_window_size = swa_page_size
@@ -539,11 +541,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
-                swa_ring_size=swa_page_size + spec_extra,
+                swa_ring_size=self.sliding_window + spec_extra,
             )
 
-            self.unified_swa_window = swa_page_size
-            self.unified_swa_ring_size = swa_page_size + spec_extra
+            self.unified_swa_window = self.sliding_window
+            self.unified_swa_ring_size = self.sliding_window + spec_extra
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
         else:
             self.unified_kv_pool = None
