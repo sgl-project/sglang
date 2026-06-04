@@ -97,7 +97,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.utils import is_deepep_class_backend
+from sglang.srt.layers.moe.utils import use_rank_local_fused_shared_experts
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -520,7 +520,10 @@ class TopK(MultiPlatformOp):
         # FIXME: router_logits should be of size (0, num_experts)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if self.topk_config.num_fused_shared_experts > 0 and is_deepep_class_backend():
+        if (
+            self.topk_config.num_fused_shared_experts > 0
+            and use_rank_local_fused_shared_experts()
+        ):
             n = self.topk_config.num_fused_shared_experts
             topk_output = topk_output._replace(
                 topk_ids=topk_output.topk_ids.new_empty(
@@ -1362,7 +1365,7 @@ def _post_process_topk_ids(
         # EPLB dispatch must only remap the routed expert columns.
         # The shared expert column (value = n_routed_experts) would be out-of-bounds
         # for the logical-to-physical dispatch table.
-        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+        if num_fused_shared_experts > 0 and use_rank_local_fused_shared_experts():
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = _biased_grouped_topk_postprocess(
@@ -1397,7 +1400,7 @@ def _post_process_topk_ids(
 
     # DeepEP: remap to interleaved expert layout where each rank's shared
     # expert has a unique ID for dispatch routing.
-    if num_fused_shared_experts > 0 and is_deepep_class_backend():
+    if num_fused_shared_experts > 0 and use_rank_local_fused_shared_experts():
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None

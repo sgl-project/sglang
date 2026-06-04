@@ -548,6 +548,33 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertEqual(server_args.moe_a2a_backend, "deepep")
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
+    def test_waterfill_keeps_explicit_megamoe_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="megamoe",
+            enable_deepep_waterfill=True,
+            disable_shared_experts_fusion=True,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_a2a_backend, "megamoe")
+        self.assertFalse(server_args.disable_shared_experts_fusion)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+    def test_waterfill_uses_megamoe_env(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="none",
+            enable_deepep_waterfill=True,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        with server_args_module.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.override(True):
+            server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_a2a_backend, "megamoe")
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
     def test_waterfill_supports_deepep_low_latency_mode(self):
         server_args = ServerArgs(
             model_path="dummy",

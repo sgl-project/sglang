@@ -53,7 +53,10 @@ from sglang.srt.layers.moe.topk import (
     TopKOutput,
     TopKOutputChecker,
 )
-from sglang.srt.layers.moe.utils import RoutingMethodType, is_deepep_class_backend
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    use_rank_local_fused_shared_experts as is_deepep_class_backend,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
