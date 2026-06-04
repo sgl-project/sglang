@@ -144,6 +144,7 @@ CORE_METRIC_FIELDS = (
     "dp_rank",
     "num_running_reqs",
     "num_waiting_reqs",
+    "num_waiting_uncached_tokens",
     "num_used_tokens",
     "num_total_tokens",
     "max_total_num_tokens",
@@ -218,6 +219,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     dp_rank: int = 0
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    num_waiting_uncached_tokens: int = 0
     num_used_tokens: int = 0
     num_total_tokens: int = 0
     max_total_num_tokens: int = 0
@@ -292,6 +294,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
             "dp_rank": self.dp_rank,
             "num_running_reqs": self.num_running_reqs,
             "num_waiting_reqs": self.num_waiting_reqs,
+            "num_waiting_uncached_tokens": self.num_waiting_uncached_tokens,
             "num_used_tokens": self.num_used_tokens,
             "num_total_tokens": self.num_total_tokens,
             "max_total_num_tokens": self.max_total_num_tokens,
