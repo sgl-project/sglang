@@ -276,6 +276,7 @@ class DiffusionTestCase:
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
     run_multi_lora_api_check: bool = False
+    run_consistency_check_on_rocm: bool = False
 
     def __post_init__(self) -> None:
         if self.sampling_params is None:

@@ -564,7 +564,9 @@ class DiffusionServerBase:
         content: bytes,
     ) -> None:
         """Validate output consistency against ground truth using CLIP similarity."""
-        if os.environ.get("SGLANG_SKIP_CONSISTENCY", "0") == "1":
+        skip = os.environ.get("SGLANG_SKIP_CONSISTENCY", "0") == "1"
+        opt_in = current_platform.is_hip() and case.run_consistency_check_on_rocm
+        if skip and not opt_in:
             logger.info(
                 f"[Consistency] Skipping consistency check for {case.id} (SGLANG_SKIP_CONSISTENCY=1)"
             )
