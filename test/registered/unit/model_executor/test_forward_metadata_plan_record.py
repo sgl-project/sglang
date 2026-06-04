@@ -95,8 +95,7 @@ class TestPlannerGuard(CustomTestCase):
         fb.assert_replan_backend(backend)  # same object -> ok
 
     def test_different_backend_trips(self):
-        # The exact unsound opt-in: planned by A, re-planned by B (e.g. a
-        # site whose draft_extend backend differs from the runner backend).
+        # The unsound opt-in: planned by A, re-planned by B.
         planner, other = object(), object()
         fb = _make_batch()
         fb.mark_forward_metadata_ready(replan_equivalent=True, planner=planner)
