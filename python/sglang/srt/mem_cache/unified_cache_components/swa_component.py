@@ -594,7 +594,7 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            # Require a full sliding window. 
+            # Require a full sliding window.
             sw_pages = (
                 self.sliding_window_size + self.cache.page_size - 1
             ) // self.cache.page_size
@@ -715,7 +715,11 @@ class SWAComponent(TreeComponent):
             else 0
         )
         target = insert_result.inserted_host_node if insert_result else None
-        if target is None or window_require_pages == 0 or loaded_pages < window_require_pages:
+        if (
+            target is None
+            or window_require_pages == 0
+            or loaded_pages < window_require_pages
+        ):
             self._release_swa_host(host_indices)
             return
 

@@ -2050,9 +2050,7 @@ class UnifiedRadixCacheSuite:
         return cons
 
     def _consume_prefetch(self, cons, seq, req_id):
-        cons.prefetch_from_storage(
-            req_id, cons.root_node, array("q", seq), None, None
-        )
+        cons.prefetch_from_storage(req_id, cons.root_node, array("q", seq), None, None)
         self._run_prefetch_to_completion(cons, req_id)
         cons.drain_storage_control_queues()
 
@@ -2123,7 +2121,8 @@ class UnifiedRadixCacheSuite:
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         self.assertEqual(m.host_hit_length, len(seq))
         self.assertTrue(
-            self._swa_host_on_path(cons, seq), "SWA must be adopted when all ranks have it"
+            self._swa_host_on_path(cons, seq),
+            "SWA must be adopted when all ranks have it",
         )
         self.assertIn(2, min_sizes)
         cons.sanity_check()
@@ -3843,4 +3842,3 @@ del _cfg, _name
 
 if __name__ == "__main__":
     unittest.main()
-
