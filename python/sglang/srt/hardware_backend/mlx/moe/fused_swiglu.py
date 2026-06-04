@@ -358,7 +358,10 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
         _aot_warmed.add(key)
         logger.info(
             "Path B AOT: warmed fused kernel dtype=%s K=%d N=%d T=%d",
-            dtype, K, N, T,
+            dtype,
+            K,
+            N,
+            T,
         )
 
 
