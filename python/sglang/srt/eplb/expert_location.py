@@ -25,6 +25,7 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.utils import is_npu
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
@@ -593,7 +594,21 @@ def compute_initial_expert_location_metadata(
 
     # TODO unify with the utils function
     if data.endswith(".pt"):
-        data_dict = torch.load(data, weights_only=True)
+        if not is_npu():
+            data_dict = torch.load(data, weights_only=True)
+        else:
+            # Because pickle serialization embeds NPU-specific deserialization functions, PyTorch's weights_only=True
+            # will also reject unknown torch_npu.* global objects due to its security whitelist mechanism during deserialization. 
+            # Therefore, modifying the registered safe globals is necessary.
+            import torch_npu.utils.storage
+            import torch_npu.npu._format
+            # Ref: https://docs.pytorch.org/docs/2.12/notes/serialization.html#weights-only-allowlist
+            # Context-manager that adds certain globals as safe for weights_only load.
+            with torch.serialization.safe_globals([
+                torch_npu.utils.storage._rebuild_npu_tensor,
+                torch_npu.npu._format.Format,
+            ]):
+                data_dict = torch.load(data, weights_only=True)
     elif data.endswith(".json"):
         data_dict = json.loads(Path(data).read_text())
     else:
