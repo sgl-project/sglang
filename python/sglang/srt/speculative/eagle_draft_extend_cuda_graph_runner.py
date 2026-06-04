@@ -108,7 +108,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.padded_static_len = -1
 
         # Attention backend
-        self.num_tokens_per_bs = self.speculative_num_steps + 1
+        # Size cuda-graph buffers by num_draft_tokens (full tree width), not
+        # num_steps + 1, or topk > 1 draft-extend overflows them.
+        self.num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
@@ -374,9 +376,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
 
         def run_once():
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
