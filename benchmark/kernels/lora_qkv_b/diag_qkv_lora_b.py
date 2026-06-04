@@ -218,8 +218,10 @@ def run_diag(
 
 def verify(args, device) -> None:
     """Assert the parametrized atomic mode == production qkv_lora_b_fwd (bitwise) and
-    matches the fp32 ref within tol, on both presets."""
+    matches the fp32 ref within tol, on both presets. Raises SystemExit(1) on any
+    mismatch so it works as a hard guardrail in automated runs."""
     dtype = torch.bfloat16
+    failures = 0
     for preset, slice_dims in PRESETS.items():
         n_slices = len(slice_dims)
         s = args.bs
@@ -252,10 +254,6 @@ def verify(args, device) -> None:
         ref = ref_qkv_b(x, w, off, args.scaling, args.rank, base)
         bitwise = torch.equal(prod, diag)
         err = float((diag.float() - ref).abs().max())
-        print(
-            f"{preset:<12s} atomic==production bitwise={bitwise} "
-            f"diag_vs_ref_abs_err={err:.3e} {'OK' if bitwise and err < 5e-2 else 'FAIL'}"
-        )
         # load_add_store on disjoint tiles must also equal ref (probe sanity).
         las = run_diag(
             x,
@@ -271,7 +269,14 @@ def verify(args, device) -> None:
             4,
         )
         las_err = float((las.float() - ref).abs().max())
-        print(f"{preset:<12s} load_add_store_vs_ref_abs_err={las_err:.3e}")
+        ok = bitwise and err < 5e-2 and las_err < 5e-2
+        failures += int(not ok)
+        print(
+            f"{'OK  ' if ok else 'FAIL'} {preset:<12s} atomic==production bitwise={bitwise} "
+            f"diag_vs_ref_abs_err={err:.3e} load_add_store_vs_ref_abs_err={las_err:.3e}"
+        )
+    if failures:
+        raise SystemExit(1)
 
 
 def make_groups(preset, s, rank, dtype, device, l2_mult, max_groups):

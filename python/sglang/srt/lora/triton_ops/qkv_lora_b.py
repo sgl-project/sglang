@@ -155,8 +155,10 @@ def _qkv_lora_b_kernel(
     output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < n_size)
     if STORE_WRITEBACK:
         # The expand-add output tiles are disjoint across all programs in this launch
-        # (distinct s-rows / n-cols / slice / segment), so a plain read-add-write is
-        # correct and avoids the bf16 narrow-tile atomic (the dominant decode cost).
+        # (distinct s-rows / n-cols / slice / segment), so each element is RMW'd by
+        # exactly one program -- a plain read-add-write is correct and avoids the bf16
+        # narrow-tile atomic (the dominant decode cost). base_output is a same-stream
+        # data dependency (base GEMM before apply_lora), not a concurrent writer.
         partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
         tl.store(output_ptr, partial_sum, mask=output_mask)
     else:
