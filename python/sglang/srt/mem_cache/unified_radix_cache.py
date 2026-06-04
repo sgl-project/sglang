@@ -1121,9 +1121,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if len(key):
                 child_key = key.child_key(self.page_size)
 
-        result = InsertResult(
-            prefix_len=matched_length,
-        )
+        result = InsertResult(prefix_len=matched_length, total_len=total_len)
         if len(key) == 0:
             if (
                 node is not self.root_node
@@ -1662,6 +1660,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             transfers.append(
                 PoolTransfer(
                     name=spec.pool_name,
+                    keys=indices_source.keys,
                     hit_policy=spec.hit_policy,
                     indices_from_pool=spec.indices_from_pool,
                 )
@@ -1850,6 +1849,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             return True
+        if (
+            completed
+            and getattr(operation, "pool_transfers", None)
+            and not getattr(operation, "pool_transfers_done", True)
+        ):
+            can_terminate = False
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
