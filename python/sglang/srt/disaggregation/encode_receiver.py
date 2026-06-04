@@ -9,6 +9,7 @@ import weakref
 from abc import ABC, abstractmethod
 from array import array
 from collections import OrderedDict, defaultdict
+from contextlib import asynccontextmanager
 from enum import IntEnum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -16,8 +17,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import aiohttp
 import numpy as np
 import torch
+import uvicorn
 import zmq
 import zmq.asyncio
+from aiohttp import ClientSession, ClientTimeout
+from fastapi import FastAPI
+from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import (
@@ -47,9 +52,9 @@ if TYPE_CHECKING:
 class EncoderBootstrapServer:
     """Lightweight bootstrap server for dynamic encoder discovery.
 
-    Mirrors the design of :class:`CommonKVBootstrapServer`: an ``aiohttp`` web
-    application running in a daemon thread with its own asyncio event loop.
-    Encoder workers POST/DELETE their URLs as they come online or shut down.
+    Built on FastAPI + uvicorn to match the style of
+    :mod:`sglang.srt.entrypoints.http_server`.  Runs in a daemon thread so
+    the language-only tokenizer manager's main loop is unblocked.
 
     The set of registered URLs is exposed as the ``urls`` list passed in at
     construction time.  Callers that want to observe registrations without
@@ -58,6 +63,11 @@ class EncoderBootstrapServer:
     internal lock, and the receiver simply reads ``self.encode_urls`` (the
     same list).  When ``urls`` is ``None`` the server allocates its own list,
     accessible through :meth:`list_urls`.
+
+    Health-check tuning is controlled by env vars
+    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL`` (seconds; 0 disables)
+    and ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT`` (seconds).  Explicit
+    constructor args take precedence over the env vars.
     """
 
     def __init__(
@@ -65,22 +75,70 @@ class EncoderBootstrapServer:
         host: str,
         port: int,
         urls: Optional[List[str]] = None,
-        health_check_interval: float = 10.0,
-        health_check_timeout: float = 2.0,
+        health_check_interval: Optional[float] = None,
+        health_check_timeout: Optional[float] = None,
     ):
-        from aiohttp import web
 
         self.host = host
         self.port = port
-        self.app = web.Application()
         self._urls: List[str] = urls if urls is not None else []
         self._lock = threading.Lock()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._runner: Optional[web.AppRunner] = None
-        self._health_check_task: Optional[asyncio.Task] = None
-        self._health_check_interval = health_check_interval
-        self._health_check_timeout = health_check_timeout
-        self._setup_routes()
+        self._server: Optional["uvicorn.Server"] = None  # set in _run_server
+        self._health_check_interval = (
+            health_check_interval
+            if health_check_interval is not None
+            else envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL.get()
+        )
+        self._health_check_timeout = (
+            health_check_timeout
+            if health_check_timeout is not None
+            else envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT.get()
+        )
+
+        @asynccontextmanager
+        async def lifespan(fast_api_app: FastAPI):
+            task: Optional[asyncio.Task] = None
+            if self._health_check_interval > 0:
+                task = asyncio.create_task(self._health_check_loop())
+            try:
+                yield
+            finally:
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        self.app = FastAPI(lifespan=lifespan, openapi_url=None)
+
+        @self.app.get("/health")
+        async def _health() -> Response:
+            return Response("OK")
+
+        @self.app.post("/register_encoder_url")
+        async def _register(data: dict):
+            url = data.get("url") if isinstance(data, dict) else None
+            if not url:
+                return ORJSONResponse(
+                    {"error": "Missing or empty 'url' field"}, status_code=400
+                )
+            self.register(url)
+            return Response("OK")
+
+        @self.app.delete("/unregister_encoder_url")
+        async def _unregister(data: dict):
+            url = data.get("url") if isinstance(data, dict) else None
+            if not url:
+                return ORJSONResponse(
+                    {"error": "Missing or empty 'url' field"}, status_code=400
+                )
+            self.unregister(url)
+            return Response("OK")
+
+        @self.app.get("/list_encoder_urls")
+        async def _list():
+            return {"encoder_urls": self.list_urls()}
 
         self.thread = threading.Thread(
             target=self._run_server, daemon=True, name="EncoderBootstrap"
@@ -115,55 +173,6 @@ class EncoderBootstrapServer:
             return list(self._urls)
 
     # ------------------------------------------------------------------ #
-    # HTTP layer                                                         #
-    # ------------------------------------------------------------------ #
-    def _setup_routes(self):
-        self.app.router.add_post("/register_encoder_url", self._handle_register)
-        self.app.router.add_delete("/unregister_encoder_url", self._handle_unregister)
-        self.app.router.add_get("/list_encoder_urls", self._handle_list)
-        self.app.router.add_get("/health", self._handle_health)
-
-    async def _handle_health(self, request):
-        from aiohttp import web
-
-        return web.Response(text="OK", status=200)
-
-    async def _handle_register(self, request):
-        from aiohttp import web
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON body"}, status=400)
-        url = data.get("url")
-        if not url:
-            return web.json_response(
-                {"error": "Missing or empty 'url' field"}, status=400
-            )
-        self.register(url)
-        return web.Response(text="OK", status=200)
-
-    async def _handle_unregister(self, request):
-        from aiohttp import web
-
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON body"}, status=400)
-        url = data.get("url")
-        if not url:
-            return web.json_response(
-                {"error": "Missing or empty 'url' field"}, status=400
-            )
-        self.unregister(url)
-        return web.Response(text="OK", status=200)
-
-    async def _handle_list(self, request):
-        from aiohttp import web
-
-        return web.json_response({"encoder_urls": self.list_urls()}, status=200)
-
-    # ------------------------------------------------------------------ #
     # Health check                                                       #
     # ------------------------------------------------------------------ #
     async def _probe(self, session, url: str) -> bool:
@@ -175,7 +184,6 @@ class EncoderBootstrapServer:
 
     async def _health_check_loop(self):
         """Probe each registered encoder periodically and evict dead ones."""
-        from aiohttp import ClientSession, ClientTimeout
 
         timeout = ClientTimeout(total=self._health_check_timeout)
         while True:
@@ -207,49 +215,33 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
-        from aiohttp import web
 
+        config = uvicorn.Config(
+            self.app,
+            host=self.host,
+            port=self.port,
+            log_level="warning",
+            access_log=False,
+            loop="auto",
+        )
+        self._server = uvicorn.Server(config)
+        logger.info(
+            f"EncoderBootstrapServer starting on {self.host}:{self.port} "
+            f"(health_check every {self._health_check_interval}s, "
+            f"timeout {self._health_check_timeout}s)"
+        )
         try:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-
-            access_log = None
-            if logger.getEffectiveLevel() <= logging.DEBUG:
-                access_log = self.app.logger
-
-            self._runner = web.AppRunner(self.app, access_log=access_log)
-            self._loop.run_until_complete(self._runner.setup())
-
-            site = web.TCPSite(self._runner, host=self.host, port=self.port)
-            self._loop.run_until_complete(site.start())
-            if self._health_check_interval > 0:
-                self._health_check_task = self._loop.create_task(
-                    self._health_check_loop()
-                )
-            logger.info(
-                f"EncoderBootstrapServer started on {self.host}:{self.port} "
-                f"(health_check every {self._health_check_interval}s)"
-            )
-            self._loop.run_forever()
+            self._server.run()
         except Exception as e:
             logger.error(f"EncoderBootstrapServer error: {e}", exc_info=True)
-        finally:
-            if self._runner is not None:
-                try:
-                    self._loop.run_until_complete(self._runner.cleanup())
-                except Exception:
-                    pass
-            if self._loop is not None:
-                self._loop.close()
 
     def close(self):
-        if self._loop is not None and self._loop.is_running():
-            if self._health_check_task is not None:
-                self._loop.call_soon_threadsafe(self._health_check_task.cancel)
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            logger.info("Stopping EncoderBootstrapServer loop...")
+        if self._server is not None:
+            # uvicorn polls should_exit on its own event loop; thread-safe.
+            self._server.should_exit = True
+            logger.info("Stopping EncoderBootstrapServer...")
         if self.thread.is_alive():
-            self.thread.join(timeout=2)
+            self.thread.join(timeout=5)
             logger.info("EncoderBootstrapServer thread stopped")
 
 
