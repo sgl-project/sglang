@@ -165,10 +165,6 @@ def _patch_rope_parameters_validation():
             and rope_theta is not None
             and "rope_theta" not in rope_scaling
         )
-        # Do NOT inject rope_theta into config_dict before from_dict: remote-code
-        # models (e.g. MiniCPM-2B-128k, Phi-3-vision) call _rope_scaling_validation()
-        # inside __init__ and fail if they see unexpected extra fields.
-        # Instead, inject into the returned config object after validation has passed.
         result = original(cls, config_dict, **kwargs)
         if needs_rope_theta:
             result_rs = getattr(result, "rope_scaling", None)
