@@ -46,20 +46,17 @@ from sglang.srt.layers.attention.dsv4.unified_kv_kernels.store import _scatter_r
 @triton.jit
 def _swa_scatter_kernel(
     kv_ptr,  # [T, D] bf16
-    state_slot_ptr,  # [T] int32
-    positions_ptr,  # [T] int32
-    final_pos_ptr,  # [T] int32 (req's last position)
+    state_slot_ptr,  # [T] int
+    positions_ptr,  # [T] int
+    final_pos_ptr,  # [T] int
     unified_ptr,  # [pages, D] bf16
     n_rows,
-    cs,  # SWA ring per-slot stride / modulo (win_with_spec)
+    cs,  # SWA ring per-slot stride
     win: tl.constexpr,
     D: tl.constexpr,
     HAS_FINAL: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """One program per token: compute ring slot = state_slot*cs + pos%cs and
-    scatter the K row into unified_kv, skipping tokens outside the final SWA window
-    (pos <= final_pos - win) so >win prefill chunks don't race on aliased slots."""
     row = tl.program_id(0)
     if row >= n_rows:
         return
@@ -78,32 +75,24 @@ def _swa_scatter_kernel(
 
 def store_swa_into_unified(
     *,
-    kv: torch.Tensor,  # [T, head_dim] bf16, already norm+rope'd by the model
+    kv: torch.Tensor,  # [T, head_dim] bf16
     state_slot: torch.Tensor,  # [T] int
     positions: torch.Tensor,  # [T] int
     unified_kv: torch.Tensor,  # [pages, head_dim] bf16
-    win: int,  # SWA attention window length (final-window filter)
-    cs: int,  # SWA ring stride / modulo (win_with_spec; == win when no spec)
+    win: int,  # SWA attention window length
+    cs: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
 ) -> None:
-    """Fused single-Triton-kernel SWA ring scatter (loc compute + window filter +
-    row scatter in one launch).
-
-    During prefill a chunk can contain >win tokens of one request; tokens cs apart
-    alias to the same ring slot. A parallel scatter of all of them RACES and an older
-    token may win, corrupting the ring decode later reads. So we only write each
-    request's FINAL window: positions in (final_pos - win, final_pos]. Those are <=win
-    <= cs consecutive positions -> distinct ring slots -> race-free. For decode
-    (final_pos==pos) every token qualifies.
-    """
-    kv = kv.to(unified_kv.dtype).contiguous()
     n_rows, D = kv.shape
     if n_rows == 0:
         return
-    state_slot = state_slot.to(torch.int32).contiguous()
-    positions = positions.to(torch.int32).contiguous()
+
+    assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
+    assert state_slot.is_contiguous() and positions.is_contiguous()
+    assert fp_arg.is_contiguous()
+
     has_final = final_pos is not None
-    fp_arg = final_pos.to(torch.int32).contiguous() if has_final else positions
+    fp_arg = final_pos if has_final else positions
     _swa_scatter_kernel[(n_rows,)](
         kv,
         state_slot,
