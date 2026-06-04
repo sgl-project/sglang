@@ -442,11 +442,12 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
-
+        # Continuation chunks of an already-running chunked req. Their prefix
+        # was credited to log_hit_tokens on the first chunk, so per-tier
+        # cached-token stats must not count them again.
+        self.continuation_chunk_reqs = []
         self.log_hit_tokens = 0
-
         self.reprocessed_log_hit_tokens = 0
-
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -642,12 +643,7 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        self._update_prefill_budget(
-            prefix_len,
-            trunc_len,
-            0,
-            req.retracted_stain,
-        )
+        self._update_prefill_budget(prefix_len, trunc_len, 0, req.retracted_stain)
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -706,6 +702,7 @@ class PrefillAdder:
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
+        self.continuation_chunk_reqs.append(req)
         self._update_prefill_budget(
             0,
             req.extend_input_len,
@@ -985,10 +982,7 @@ class PrefillAdder:
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
-                    prefix_len,
-                    trunc_len,
-                    0,
-                    req.retracted_stain,
+                    prefix_len, trunc_len, 0, req.retracted_stain
                 )
 
         return self.budget_state()

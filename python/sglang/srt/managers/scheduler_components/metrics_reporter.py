@@ -81,14 +81,20 @@ class PrefillStats:
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
     ):
+        # Skip continuation chunks of a chunked prefill: their prefix was
+        # already credited (to both log_hit_tokens and the per-tier split) on
+        # the first chunk, and re-reading req.cached_tokens_* here would count
+        # the same hit once per chunk.
+        continuation_reqs = getattr(adder, "continuation_chunk_reqs", [])
+        split_reqs = [req for req in adder.can_run_list if req not in continuation_reqs]
         log_hit_tokens_device = sum(
-            getattr(req, "cached_tokens_device", 0) for req in adder.can_run_list
+            getattr(req, "cached_tokens_device", 0) for req in split_reqs
         )
         log_hit_tokens_host = sum(
-            getattr(req, "cached_tokens_host", 0) for req in adder.can_run_list
+            getattr(req, "cached_tokens_host", 0) for req in split_reqs
         )
         log_hit_tokens_storage = sum(
-            getattr(req, "cached_tokens_storage", 0) for req in adder.can_run_list
+            getattr(req, "cached_tokens_storage", 0) for req in split_reqs
         )
 
         return cls(
