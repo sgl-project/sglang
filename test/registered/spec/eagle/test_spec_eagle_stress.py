@@ -27,6 +27,7 @@ class TestEagle3Perf(Eagle3Base, SpecPerfKit):
     """Decode throughput (max_new_tokens=1) on EAGLE3 spec v2."""
 
     disable_overlap = False
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
 
 
 class TestEagleLlama2Retract(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
