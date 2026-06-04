@@ -2513,7 +2513,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
-        self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
+        if self.req_pool_indices_cpu is None:
+            self.req_pool_indices_cpu = self.req_pool_indices.detach().to(
+                device="cpu", dtype=torch.int64
+            )
+        else:
+            self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -2567,9 +2572,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
-        self.req_pool_indices_cpu = torch.cat(
-            [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
-        )
+        if self.req_pool_indices_cpu is None or other.req_pool_indices_cpu is None:
+            self.req_pool_indices_cpu = self.req_pool_indices.detach().to(
+                device="cpu", dtype=torch.int64
+            )
+        else:
+            self.req_pool_indices_cpu = torch.cat(
+                [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
+            )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None

@@ -493,6 +493,7 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    SGLANG_HISPARSE_CPU_SHARE = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

@@ -5,6 +5,7 @@ from typing import List, NamedTuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -12,7 +13,10 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool_host import (
+    MLATokenToKVPoolHost,
+    create_shared_memory_host_tensor_allocator,
+)
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
@@ -59,6 +63,11 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
+        self.tp_group = tp_group
+        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self._share_cpu_host_cache = False
+        self._write_host_cache = True
+        self._has_pending_shared_backup = False
 
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
@@ -82,6 +91,13 @@ class HiSparseCoordinator:
             self.mem_pool_device: HiSparseDSATokenToKVPool = (
                 self.token_to_kv_pool_allocator.get_kvcache()
             )
+            shared_allocator = (
+                create_shared_memory_host_tensor_allocator(
+                    self.tp_group, "hisparse_dsa_host"
+                )
+                if envs.SGLANG_HISPARSE_CPU_SHARE.get()
+                else None
+            )
             self.mem_pool_host = MLATokenToKVPoolHost(
                 device_pool=self.mem_pool_device,
                 host_to_device_ratio=host_to_device_ratio,
@@ -89,7 +105,11 @@ class HiSparseCoordinator:
                 page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                allocator=shared_allocator,
             )
+            if shared_allocator is not None:
+                self._share_cpu_host_cache = True
+                self._write_host_cache = shared_allocator.is_writer
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
@@ -128,9 +148,6 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
-
-        self.tp_group = tp_group
-        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
@@ -219,12 +236,13 @@ class HiSparseCoordinator:
         start_event.record()
         with device_module.stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                io_backend="kernel",
-            )
+            if self._write_host_cache:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    io_backend="kernel",
+                )
             finish_event.record()
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_staging_stream)
@@ -446,6 +464,13 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.detach().to(device="cpu", dtype=torch.int64)
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = req_pool_indices.detach().to(
+                device="cpu", dtype=torch.int64
+            )
+
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -564,6 +589,11 @@ class HiSparseCoordinator:
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
+        if self._share_cpu_host_cache:
+            self._has_pending_shared_backup = True
+        if not self._write_host_cache:
+            return
+
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
             self.decode_backup_stream.wait_stream(schedule_stream)
@@ -587,6 +617,17 @@ class HiSparseCoordinator:
         self._has_pending_backup = True
 
     def wait_for_pending_backup(self) -> None:
+        if not self._has_pending_backup and not self._has_pending_shared_backup:
+            return
+
+        if self._share_cpu_host_cache and self._has_pending_shared_backup:
+            if self._has_pending_backup:
+                self._backup_done_event.synchronize()
+                self._has_pending_backup = False
+            torch.distributed.barrier(group=self.tp_group)
+            self._has_pending_shared_backup = False
+            return
+
         if not self._has_pending_backup:
             return
         self._backup_done_event.wait(device_module.current_stream())
@@ -684,6 +725,15 @@ class HiSparseCoordinator:
 
         return top_k_indices
 
+    def _wait_for_staging_backup_before_free(self) -> None:
+        if not self._share_cpu_host_cache:
+            self.write_staging_stream.synchronize()
+            return
+
+        if self._write_host_cache:
+            self.write_staging_stream.synchronize()
+        torch.distributed.barrier(group=self.tp_group)
+
     def abort_staging_request(self, req: Req) -> None:
         """Remove a request from the staging queue and free its host + device resources.
 
@@ -695,7 +745,7 @@ class HiSparseCoordinator:
             act for act in self.ack_staging_queue if act.req is not req
         ]
         # Wait for any in-flight staging DMA to complete before freeing
-        self.write_staging_stream.synchronize()
+        self._wait_for_staging_backup_before_free()
 
         prefill_len = len(req.fill_ids)
         allocated_locs = self.req_to_token_pool.req_to_token[
