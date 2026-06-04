@@ -315,8 +315,16 @@ class TestMergedExpertsGatedGateUpLoRA(CustomTestCase):
 
         output = torch.zeros(bs, top_k, 2 * inter, device=device, dtype=dtype)
         merged_experts_fused_moe_lora_add(
-            output, hidden, lora_a, lora_b, topk_ids, topk_weights, tlm,
-            False, False, False,
+            output,
+            hidden,
+            lora_a,
+            lora_b,
+            topk_ids,
+            topk_weights,
+            tlm,
+            False,
+            False,
+            False,
         )
 
         xf = hidden.float()
@@ -329,11 +337,17 @@ class TestMergedExpertsGatedGateUpLoRA(CustomTestCase):
                 up_ref = (xf[m] @ up_a_f[e].t()) @ up_b_f[e].t()
                 got = output[m, k].float()
                 torch.testing.assert_close(
-                    got[:inter], gate_ref, rtol=2e-2, atol=2e-3,
+                    got[:inter],
+                    gate_ref,
+                    rtol=2e-2,
+                    atol=2e-3,
                     msg=f"gate half mismatch (m={m}, k={k}, e={e})",
                 )
                 torch.testing.assert_close(
-                    got[inter:], up_ref, rtol=2e-2, atol=2e-3,
+                    got[inter:],
+                    up_ref,
+                    rtol=2e-2,
+                    atol=2e-3,
                     msg=f"up half mismatch (m={m}, k={k}, e={e}) -- up must use up_A",
                 )
 
