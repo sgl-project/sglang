@@ -76,10 +76,13 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 - `--model-path &#123;MODEL&#125;`: model path or Hugging Face model ID
 - `--lora-path &#123;PATH&#125;` and `--lora-nickname &#123;NAME&#125;`: load a LoRA adapter
+- `--lora-merge-mode &#123;auto|merge|dynamic&#125;`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus &#123;N&#125;`: number of GPUs to use
+- `--performance-mode &#123;manual|auto|speed|memory&#125;` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
 - `--tp-size &#123;N&#125;`: tensor parallelism size, mainly for encoders
 - `--sp-degree &#123;N&#125;`: sequence parallelism size
 - `--ulysses-degree &#123;N&#125;` and `--ring-degree &#123;N&#125;`: USP parallelism controls
+- `--enable-cfg-parallel &#123;true|false&#125;`: enable or explicitly disable CFG parallelism
 - `--attention-backend &#123;BACKEND&#125;`: attention backend for native SGLang pipelines
 - `--component-attention-backends &#123;MAP&#125;`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config &#123;CONFIG&#125;`: attention backend configuration
