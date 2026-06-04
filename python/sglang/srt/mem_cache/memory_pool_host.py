@@ -737,7 +737,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=False,  # temporary buffer, no need to pin
+            pin_memory=self.pin_memory,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
@@ -1238,7 +1238,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             ),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=False,  # temporary buffer, no need to pin
+            pin_memory=self.pin_memory,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
