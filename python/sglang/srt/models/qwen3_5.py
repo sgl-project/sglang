@@ -918,14 +918,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # SGLang stores cos|sin concatenated along last dim; aiter wants them split.
         cos, sin = self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
 
-        # mRoPE (Qwen3-VL) passes a 2-D [3, T] position tensor (temporal/height/width
-        # sections). The aiter fused kernel indexes positions as 1-D [T] via stride(0),
-        # so a [3, T] tensor strides out of bounds -> GPU memory fault. For text tokens
-        # the three sections are identical sequential positions, so section 0 is the
-        # correct 1-D form; make it contiguous for the kernel's stride assumptions.
-        if positions.dim() > 1:
-            positions = positions[0].contiguous()
-
         result = _aiter_fused_qkv_split_qk_norm_rope_cache(
             qkv=qkv,
             q_weight=self.q_norm.weight,
@@ -973,11 +965,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         # ROCm fused path: split + QK-norm + RoPE + KV-cache-write in one kernel.
         # Skip the subsequent in-attention cache write because the kernel did it.
-        # Partial rotary (rope dim < head dim, e.g. factor 0.25) is handled by the
-        # kernel itself: it derives the rotary span from the cos/sin table width
-        # (cos_sin_cache is built at width head_dim * partial_rotary_factor) and
-        # passes the non-rotated tail through unchanged.
-        use_aiter_fused = _aiter_fused_qkv_split_qk_norm_rope_cache is not None
+        # The fused kernel only does plain 1-D RoPE, so keep VL models (which use
+        # mRoPE with 2-D [3, T] positions) out of it; they use the native path.
+        use_aiter_fused = (
+            _aiter_fused_qkv_split_qk_norm_rope_cache is not None
+            and positions.dim() == 1
+        )
 
         if use_aiter_fused:
             q, k, v, gate = self._prepare_qkv_aiter_fused(
