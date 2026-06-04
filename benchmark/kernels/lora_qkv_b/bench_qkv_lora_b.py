@@ -13,9 +13,10 @@ distinct callsites with different shapes:
     x [64, 48], B [1, 2560, 16]. e2e grid (128, 3, 1).
 
 Decode batch_info is the merged single-adapter segment exactly as production builds it:
-bs=1, seg_lens=[64], permutation=[64] (SORTED_BY_ADAPTER=True), uniform adapter slot 0,
-rank 16, scaling 2.0, use_cuda_graph=True (so the cuBLAS fast path never dispatches,
-matching decode inside CUDA graph).
+bs=1, seg_lens=[64], permutation=[64] (SORTED_BY_ADAPTER=True), adapter slot 0, rank 16,
+scaling 2.0, use_cuda_graph=True. The cuBLAS fast path never dispatches here: it needs
+output_offset_cpu (None at this callsite) and, since the lora-mq-a merge, the
+SGLANG_OPT_LORA_CUBLAS(_QKV) env opt-in.
 
 Benchmark methodology (decode kernels are ~10us, L2-resident if naively looped):
   * ``triton.testing.do_bench_cudagraph`` -- the whole rotation sweep is captured in one
@@ -74,8 +75,9 @@ def make_merged_decode_batch_info(
     """The production single-adapter decode batch info: all ``s`` tokens merged into ONE
     segment (bs=1), with a token permutation (SORTED_BY_ADAPTER=True).
 
-    ``use_cuda_graph=True`` like real decode, which also keeps qkv_lora_b_fwd off the
-    cuBLAS fast path (additionally guarded by output_offset_cpu=None at this callsite).
+    ``use_cuda_graph=True`` like real decode; the cuBLAS fast path is off because
+    output_offset_cpu=None here (and it additionally needs the SGLANG_OPT_LORA_CUBLAS
+    env opt-in since the lora-mq-a merge).
     """
     permutation = torch.arange(s, dtype=torch.int32, device=device)
     if shuffle_permutation:
@@ -91,9 +93,7 @@ def make_merged_decode_batch_info(
         max_len=s,
         seg_lens=torch.tensor([s], dtype=torch.int64, device=device),
         permutation=permutation,
-        uniform_weight_index=0,
-        uniform_rank=rank,
-        uniform_scaling=scaling,
+        single_adapter=(0, rank),
     )
 
 
@@ -306,8 +306,10 @@ def main():
             )
             for x, w, off, base in groups
         ]
+        # Mirror of qkv_lora_b_fwd's launch geometry (BLOCK_S=16, BLOCK_OUT=128 since
+        # the lora-mq-a merge; was 64 in the e2e SHAPECAP capture).
         grid = (
-            triton.cdiv(s, 16) * triton.cdiv(max_out, 64),
+            triton.cdiv(s, 16) * triton.cdiv(max_out, 128),
             n_slices,
             1,
         )

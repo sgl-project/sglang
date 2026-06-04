@@ -7,11 +7,11 @@ single rank-16 adapter (SHAPECAP capture 2026-06-04), one entry per distinct mod
 signature -- see ``SHAPES`` below (in_proj_qkvz / qkv_proj / o_proj / shared expert
 gate_up+down / lm_head).
 
-Dispatch note (measured e2e): in the merged single-adapter decode batch, production
-``sgemm_lora_a_fwd`` takes the ``F.linear`` fast path (the Triton shrink kernel never
-runs); the Triton kernels of record for decode are the three *_lora_b expands. The
-bench therefore reports, for every lora_a shape, BOTH the production ``F.linear`` path
-and the Triton kernel path (the latter for optimization reference).
+Dispatch note: in the pre-merge e2e capture, production ``sgemm_lora_a_fwd`` took the
+``F.linear`` fast path in the merged single-adapter decode batch; since the lora-mq-a
+merge that path needs the ``SGLANG_OPT_LORA_CUBLAS(_A)`` env opt-in and the default is
+the Triton kernel. The bench reports BOTH paths for every lora_a shape (the env variant
+is labeled ``F.linear(env)``).
 
 Decode batch_info reproduces production: merged single segment (bs=1, seg_lens=[64]),
 permutation (SORTED_BY_ADAPTER=True), uniform adapter slot 0 / rank 16 / scaling 2.0,
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 
 import torch
 import triton
@@ -82,12 +83,12 @@ def make_merged_decode_batch_info(
     rank: int,
     scaling: float,
     device,
-    with_single_adapter: bool,
     shuffle_permutation: bool = False,
 ) -> LoRABatchInfo:
     """Production single-adapter decode batch info: one merged segment (bs=1) with a
-    token permutation. ``with_single_adapter`` toggles sgemm_lora_a_fwd's dispatch:
-    True -> production F.linear fast path, False -> the Triton kernel path."""
+    token permutation. Since the lora-mq-a merge, sgemm_lora_a_fwd's F.linear fast
+    path is selected by the SGLANG_OPT_LORA_CUBLAS(_A) env (see cublas_a_env), not by
+    batch_info fields."""
     permutation = torch.arange(s, dtype=torch.int32, device=device)
     if shuffle_permutation:
         permutation = permutation[torch.randperm(s, device=device)]
@@ -102,10 +103,7 @@ def make_merged_decode_batch_info(
         max_len=s,
         seg_lens=torch.tensor([s], dtype=torch.int64, device=device),
         permutation=permutation,
-        uniform_weight_index=0,
-        uniform_rank=rank,
-        uniform_scaling=scaling,
-        single_adapter=(0, rank) if with_single_adapter else None,
+        single_adapter=(0, rank),
     )
 
 
@@ -212,30 +210,49 @@ def bench_us_rotated(calls, rep_ms: int) -> float:
 
 
 def variants_for(name, kernel):
-    """sgemm_a gets both dispatch paths; the expand kernels only have the Triton path."""
+    """sgemm_a gets both dispatch paths; the expand kernels only have the Triton path
+    by default (their cuBLAS alternatives need SGLANG_OPT_LORA_CUBLAS_* opt-ins)."""
     if kernel == "sgemm_a":
-        return [("triton", False), ("F.linear(prod)", True)]
-    return [("triton", None)]
+        return [("triton", False), ("F.linear(env)", True)]
+    return [("triton", False)]
+
+
+class cublas_a_env:
+    """Scoped SGLANG_OPT_LORA_CUBLAS_A=1 (read live by envs.*.get() at each call):
+    selects sgemm_lora_a_fwd's cuBLAS/F.linear path, the pre-merge production decode
+    dispatch (post-merge default is the Triton kernel)."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+
+    def __enter__(self):
+        if self.enabled:
+            os.environ["SGLANG_OPT_LORA_CUBLAS_A"] = "1"
+
+    def __exit__(self, *exc):
+        if self.enabled:
+            os.environ.pop("SGLANG_OPT_LORA_CUBLAS_A", None)
+        return False
 
 
 def run_correctness(args, shapes, dtype, device) -> None:
     failures = 0
     for shuffle in [False, True]:
         for name, kernel, spec in shapes:
-            for variant, single_adapter in variants_for(name, kernel):
+            for variant, use_cublas_a in variants_for(name, kernel):
                 bi = make_merged_decode_batch_info(
                     args.bs,
                     args.rank,
                     args.scaling,
                     device,
-                    with_single_adapter=bool(single_adapter),
                     shuffle_permutation=shuffle,
                 )
                 x, weights, base = make_inputs(
                     name, kernel, spec, args.bs, args.rank, dtype, device
                 )
                 base_run = base.clone() if base is not None else None
-                out = make_call(kernel, spec, x, weights, base_run, bi)()
+                with cublas_a_env(use_cublas_a):
+                    out = make_call(kernel, spec, x, weights, base_run, bi)()
                 if kernel != "sgemm_a":
                     out = base_run
                 ref = ref_output(
@@ -299,14 +316,8 @@ def main():
 
     s = args.bs
     for name, kernel, spec in shapes:
-        for variant, single_adapter in variants_for(name, kernel):
-            bi = make_merged_decode_batch_info(
-                s,
-                args.rank,
-                args.scaling,
-                device,
-                with_single_adapter=bool(single_adapter),
-            )
+        for variant, use_cublas_a in variants_for(name, kernel):
+            bi = make_merged_decode_batch_info(s, args.rank, args.scaling, device)
             group_bytes = group_bytes_of(kernel, spec, s, args.rank)
             num_groups = args.num_groups or auto_num_groups(
                 group_bytes, args.l2_mult, args.min_groups, args.max_groups
@@ -318,17 +329,19 @@ def main():
             calls = [make_call(kernel, spec, x, w, base, bi) for x, w, base in groups]
 
             if args.mode == "profile":
-                for _ in range(2):
-                    calls[0]()
-                torch.cuda.synchronize()
-                for _ in range(args.iters):
-                    for call in calls:
-                        call()
-                torch.cuda.synchronize()
+                with cublas_a_env(use_cublas_a):
+                    for _ in range(2):
+                        calls[0]()
+                    torch.cuda.synchronize()
+                    for _ in range(args.iters):
+                        for call in calls:
+                            call()
+                    torch.cuda.synchronize()
                 print(f"PROFILE {name} [{variant}]: {args.iters} x {num_groups} groups")
                 continue
 
-            us = bench_us_rotated(calls, args.rep_ms)
+            with cublas_a_env(use_cublas_a):
+                us = bench_us_rotated(calls, args.rep_ms)
             dims = " ".join(f"{k}={v}" for k, v in spec.items())
             print(
                 f"BENCH {name:<22s} [{variant:<14s}] s={s} r={args.rank} {dims:<22s} "
