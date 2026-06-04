@@ -13,7 +13,11 @@ register_cuda_ci(est_time=64, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_cuda_ci(est_time=256, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=64, suite="jit-kernel-unit-test-amd")
 
-DEVICE = "cuda"
+try:
+    DEVICE = get_device()
+except RuntimeError:
+    DEVICE = None
+
 DTYPE = torch.bfloat16
 MAX_SEQ_LEN = 131072  # common seq length
 ROPE_BASE = 10000.0
@@ -170,6 +174,9 @@ def test_rope(
     is_neox: bool,
     dtype: torch.dtype,
 ) -> None:
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
     num_qo_heads = num_kv_heads * gqa_ratio
     q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=dtype)
     k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=dtype)
@@ -195,6 +202,9 @@ def test_rope(
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     """Ensure both int32 and int64 position tensors work correctly."""
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
     batch_size, num_qo_heads, num_kv_heads, rope_dim = 16384, 16, 2, 128
     is_neox = True
 
@@ -224,6 +234,9 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
 def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
     if head_dim < rope_dim:
         pytest.skip("Invalid config: head_dim must be >= rope_dim.")
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
     num_qo_heads, num_kv_heads = 8, 2
 
     q = torch.randn(batch_size, num_qo_heads, head_dim, device=DEVICE, dtype=DTYPE)
@@ -259,6 +272,9 @@ def test_fused_rope_store(
     is_neox: bool,
 ) -> None:
     """Test fused RoPE + KV cache store against separate RoPE + manual store."""
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
     from sglang.kernels.ops.attention.rope import apply_rope_inplace_with_kvcache
 
     num_qo_heads = num_kv_heads * gqa_ratio
