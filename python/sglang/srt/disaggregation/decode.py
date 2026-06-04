@@ -1314,13 +1314,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-            assert kv_loc is not None, (
-                f"KV cache is full! Bug in memory estimation. "
-                f"available={self.token_to_kv_pool_allocator.available_size()}, "
-                f"required_alloc={required_alloc_tokens}, fill={fill_len}, "
-                f"page_size={self.token_to_kv_pool_allocator.page_size}, "
-                f"req={req.rid}"
-            )
 
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(

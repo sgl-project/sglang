@@ -1982,11 +1982,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def get_contiguous_buf_infos(self):
         """Return per-layer page-row buffers for PD direct-to-host transfer."""
-        if self.layout != "layer_first":
-            raise ValueError(
-                f"{self.pool_name} contiguous transfer info requires layer_first "
-                f"layout, got {self.layout}."
-            )
+        assert self.data_ptrs is not None
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
@@ -2010,11 +2006,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
         if host_indices.numel() == 0:
             return
-        if self.layout != "layer_first" or io_backend != "kernel":
-            raise ValueError(
-                f"{self.pool_name} non-page-aligned token backup only supports "
-                f"layer_first/kernel, got {self.layout}/{io_backend}"
-            )
         assert self.data_ptrs is not None
         transfer_cache_dsv4_mla(
             src_ptrs=self.device_ptrs,
@@ -2035,11 +2026,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
         if host_indices.numel() == 0:
             return
-        if self.layout != "layer_first" or io_backend != "kernel":
-            raise ValueError(
-                f"{self.pool_name} DSV4 token load only supports "
-                f"layer_first/kernel, got {self.layout}/{io_backend}"
-            )
         assert self.data_ptrs is not None
         transfer_cache_dsv4_mla(
             src_ptrs=self.data_ptrs,
