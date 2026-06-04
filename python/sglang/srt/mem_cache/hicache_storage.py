@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 import torch
 
@@ -465,26 +465,16 @@ class HiCacheFile(HiCacheStorage):
         while (
             free - value_bytes < self.min_free_bytes and self._lru and attempts_left > 0
         ):
-            evict_stem, evict_size = self._lru.popitem(last=False)
-            if evict_stem in self._pending_writes:
-                # In-flight reservations may not have a committed file yet.
-                self._lru[evict_stem] = evict_size
+            outcome, freed = self._evict_one_lru_locked()
+            if outcome == "stop":
+                break
+            if outcome == "skipped":
                 attempts_left -= 1
                 continue
-            tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
-            try:
-                os.remove(tensor_path)
-                self._total_bytes -= evict_size
-                free += evict_size  # approximation: tmpfs frees on unlink
-            except FileNotFoundError:
-                self._total_bytes -= evict_size
-            except OSError as e:
-                logger.warning(
-                    f"HiCacheFile free-space eviction failed for {evict_stem}: {e}"
-                )
-                self._lru[evict_stem] = evict_size
-                self._lru.move_to_end(evict_stem, last=False)
-                break
+            # "evicted" / "missing": an entry left the index. freed is the disk
+            # space actually reclaimed (0 if the file was already gone); tmpfs
+            # frees on unlink so we can credit it back to the free estimate.
+            free += freed
             attempts_left = len(self._lru)
         # Re-probe: external writers may have changed free space meanwhile.
         fs = self._fs_stats()
@@ -518,6 +508,43 @@ class HiCacheFile(HiCacheStorage):
             self._lru[stem] = size
             self._total_bytes += size
 
+    def _evict_one_lru_locked(self) -> Tuple[str, int]:
+        """Evict the single oldest evictable LRU entry. Caller holds _lock.
+
+        Single source of truth for the pop / skip-pending-write / unlink /
+        ``_total_bytes`` accounting shared by cap-based eviction
+        (`_evict_locked`) and free-space eviction (`_enforce_free_space_locked`).
+        Returns ``(outcome, freed_bytes)``:
+
+        - ``("evicted", n)``: oldest file unlinked, ``n`` bytes reclaimed from disk.
+        - ``("missing", 0)``: file was already gone; ``_total_bytes`` corrected,
+          but no disk space was reclaimed.
+        - ``("skipped", 0)``: oldest entry is an in-flight write; re-pinned at MRU
+          so the writer is not evicted out from under itself.
+        - ``("stop", 0)``: nothing evictable (empty index) or the unlink failed
+          (entry re-pinned at LRU); the caller should stop its eviction loop.
+        """
+        if not self._lru:
+            return "stop", 0
+        evict_stem, evict_size = self._lru.popitem(last=False)  # oldest
+        if evict_stem in self._pending_writes:
+            # Keep in-flight reservations; their file isn't committed yet.
+            self._lru[evict_stem] = evict_size
+            return "skipped", 0
+        tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
+        try:
+            os.remove(tensor_path)
+            self._total_bytes -= evict_size
+            return "evicted", evict_size
+        except FileNotFoundError:
+            self._total_bytes -= evict_size
+            return "missing", 0
+        except OSError as e:
+            logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
+            self._lru[evict_stem] = evict_size
+            self._lru.move_to_end(evict_stem, last=False)
+            return "stop", 0
+
     def _evict_locked(self, needed_bytes: int) -> None:
         """Evict LRU entries until total + needed <= cap*ratio. Caller holds _lock."""
         if self.max_size_bytes <= 0:
@@ -527,25 +554,16 @@ class HiCacheFile(HiCacheStorage):
         evicted_bytes = 0
         attempts_left = len(self._lru)
         while self._total_bytes > target and self._lru and attempts_left > 0:
-            evict_stem, evict_size = self._lru.popitem(last=False)  # oldest
-            if evict_stem in self._pending_writes:
-                # Keep in-flight reservations; their file isn't committed yet.
-                self._lru[evict_stem] = evict_size
+            outcome, freed = self._evict_one_lru_locked()
+            if outcome == "stop":
+                break
+            if outcome == "skipped":
                 attempts_left -= 1
                 continue
-            tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
-            try:
-                os.remove(tensor_path)
-                self._total_bytes -= evict_size
+            if outcome == "evicted":
                 evicted_count += 1
-                evicted_bytes += evict_size
-            except FileNotFoundError:
-                self._total_bytes -= evict_size
-            except OSError as e:
-                logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
-                self._lru[evict_stem] = evict_size
-                self._lru.move_to_end(evict_stem, last=False)
-                break
+                evicted_bytes += freed
+            # "evicted" / "missing": an entry left the index; reset the budget.
             attempts_left = len(self._lru)
         if evicted_count:
             logger.debug(
