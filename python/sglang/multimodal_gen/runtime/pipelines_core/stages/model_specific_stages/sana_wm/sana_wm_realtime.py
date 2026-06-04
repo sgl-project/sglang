@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from .realtime import (
     SanaWMRealtimeSession,
 )
+from .sana_wm_base import configure_sana_wm_ltx2_vae_for_long_video
 from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     SanaWMLTX2RefinerStage,
@@ -488,7 +489,10 @@ class SanaWMRealtimeStage(PipelineStage):
         image_tensor = pil_to_model_tensor(image, device=device, dtype=vae_dtype)
         with _deterministic_vae_encode_context():
             posterior = self.vae.encode(image_tensor.to(device=device, dtype=vae_dtype)).latent_dist
-            z = posterior.mode()
+            # float32 normalization, matching the batch path's
+            # SanaWMBeforeDenoisingStage._vae_encode_image (z.float() before
+            # mean/std math) so the cond latent is bit-identical across paths.
+            z = posterior.mode().float()
         mean, std = _vae_stats(self.vae, z)
         scaling_factor = _vae_scaling_factor(self.vae)
         z = (z - mean) * scaling_factor / std
@@ -950,6 +954,9 @@ class SanaWMRealtimeStage(PipelineStage):
         # (use_declared_component moves the module without re-casting).
         transformer = self.transformer.to(device=device).eval()
         self.vae = self.vae.to(device=device, dtype=vae_dtype).eval()
+        # Same LTX-2 tiling/framewise knobs the batch path applies before every
+        # VAE use (encode + decode), so the cond-frame encode matches bitwise.
+        configure_sana_wm_ltx2_vae_for_long_video(self.vae, server_args.pipeline_config)
         batch.enable_sequence_shard = int(server_args.sp_degree or 1) > 1
 
         with set_forward_context(
