@@ -1262,6 +1262,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ptr_list = []
         indices = indices.tolist()
         if self.layout == "page_first_kv_split":
+            # TODO (iforgetmyname): merge mla kv
             k_buffer_data_ptr = self.k_buffer.data_ptr()
             v_buffer_data_ptr = self.v_buffer.data_ptr()
             for index in range(0, len(indices), self.page_size):
