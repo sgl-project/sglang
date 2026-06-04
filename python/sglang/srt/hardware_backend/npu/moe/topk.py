@@ -61,7 +61,7 @@ def fused_topk_npu(
             group_select_mode=(1 if use_grouped_topk else 0),
             renorm=0,
             norm_type=(
-                0 if topk_config.scoring_func == "softmax" else 1
+                1 if correction_bias is not None else 0
             ),  # 1 for sigmoid, 0 for softmax
             routed_scaling_factor=(
                 1 if renormalize else topk_config.routed_scaling_factor
