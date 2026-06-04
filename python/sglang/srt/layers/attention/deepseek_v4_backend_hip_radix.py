@@ -959,7 +959,7 @@ class DeepseekV4HipRadixBackend(
             csa_len=core.c4_sparse_topk_lengths,
             c128_page_indices=core.c128_page_indices,
             csa_width=core.c4_sparse_page_indices.shape[1],
-            win=pool.unified_swa_pages,
+            win=pool.unified_swa_window,
             cs=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
         )

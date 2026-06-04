@@ -539,11 +539,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 memory_saver_adapter=self.memory_saver_adapter,
                 custom_mem_pool=self.custom_mem_pool,
-                swa_ring_size=DeepSeekV4UnifiedKVPool.WIN + spec_extra,
+                swa_ring_size=swa_page_size + spec_extra,
             )
 
-            self.unified_swa_window = DeepSeekV4UnifiedKVPool.WIN
-            self.unified_swa_ring_size = DeepSeekV4UnifiedKVPool.WIN + spec_extra
+            self.unified_swa_window = swa_page_size
+            self.unified_swa_ring_size = swa_page_size + spec_extra
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
         else:
             self.unified_kv_pool = None

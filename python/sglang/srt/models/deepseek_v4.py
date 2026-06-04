@@ -784,16 +784,16 @@ class MQALayer(nn.Module):
             )
             kv = None
 
-        if use_cp:
-            # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
-            # write to the FlashMLA cache after gather.
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-            kv = cp_all_gather_rerange_output(
-                kv.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
+            if not unified and use_cp:
+                # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
+                # write to the FlashMLA cache after gather.
+                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                kv = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
@@ -801,7 +801,7 @@ class MQALayer(nn.Module):
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-            if use_cp:
+            elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
