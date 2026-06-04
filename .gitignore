@@ -276,8 +276,5 @@ sgl-kernel/csrc/**/*_musa/
 *.ply
 *.npz
 artifacts/
-.claude/
+.claude/scheduled_tasks.lock
 .humanize/
-
-# Local scratch / dev notebooks (not for PR)
-scratch/
