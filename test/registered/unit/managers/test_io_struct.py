@@ -483,6 +483,59 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.custom_logit_processor, ["processor1", "processor2"])
 
+    def test_extra_key_normalization(self):
+        """Test normalization of extra_key for batch processing."""
+        # No extra_key -> list of None per batch item
+        req = GenerateReqInput(text=["Hello", "World"])
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, [None, None])
+
+        # Single (scalar) extra_key is shared across the batch
+        req = GenerateReqInput(text=["Hello", "World"], extra_key="tenant-shared")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-shared", "tenant-shared"])
+
+        # List extra_key is kept per-item (the bug: previously passed whole list
+        # to every sub-request, crashing radix-cache prefix matching)
+        req = GenerateReqInput(
+            text=["Hello", "World"], extra_key=["tenant-A", "tenant-B"]
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-A", "tenant-B"])
+
+        # Scalar extra_key expands with parallel sampling
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key="tenant-shared",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-shared"] * 4)
+
+        # List extra_key expands with parallel sampling, matching text/lora_path
+        # ([a, b] * n), so extra_key[i] lines up with text[i].
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(
+            req.extra_key, ["tenant-A", "tenant-B", "tenant-A", "tenant-B"]
+        )
+
+        # A single (non-batch) request keeps its scalar extra_key untouched
+        req = GenerateReqInput(text="Hello", extra_key="tenant-A")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, "tenant-A")
+
+    def test_extra_key_error_cases(self):
+        """Test invalid extra_key configurations raise a clear error."""
+        # List extra_key length must match the batch size
+        with self.assertRaises(ValueError):
+            req = GenerateReqInput(text=["Hello", "World"], extra_key=["only-one"])
+            req.normalize_batch_and_arguments()
+
     def test_session_params_handling(self):
         """Test handling of session_params."""
         # Test with dict
@@ -517,6 +570,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             modalities=["image", "image"],
             lora_path=["path1", "path2"],
             custom_logit_processor=["processor1", "processor2"],
+            extra_key=["tenant-A", "tenant-B"],
             return_hidden_states=True,
         )
         req.normalize_batch_and_arguments()
@@ -537,7 +591,12 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.modalities, "image")
         self.assertEqual(item0.lora_path, "path1")
         self.assertEqual(item0.custom_logit_processor, "processor1")
+        self.assertEqual(item0.extra_key, "tenant-A")
         self.assertEqual(item0.return_hidden_states, True)
+
+        # The second item must get its own indexed extra_key, not the whole list
+        item1 = req[1]
+        self.assertEqual(item1.extra_key, "tenant-B")
 
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
