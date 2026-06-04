@@ -444,8 +444,8 @@ class SchedulerDisaggregationPrefillMixin:
         """Pre-compute state indices for hybrid models and attach to each req.
 
         Mirrors the state_indices computation in send_kv_chunk, but stores
-        the result on req.pipelined_state_indices so that run_batch_pipelined
-        can pass it through the last send_layer call.
+        the result on req.pipelined_state_indices so the final metadata send
+        can pass it through after KV data is enqueued.
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
@@ -517,15 +517,19 @@ class SchedulerDisaggregationPrefillMixin:
         if self.ps.pp_size > 1:
             return 0
 
-        # Universal guard: model must implement forward_split_prefill to use
-        # pipelined transfer. Models without it (e.g. Mamba-only, hybrid models
-        # that haven't added support) safely fallback to the normal path.
-        model = self.tp_worker.model_runner.model
-        if not hasattr(model, "forward_split_prefill"):
+        # Only models that explicitly opt in can use layer-pipelined transfer.
+        # A plain forward_split_prefill method is too broad: several models use
+        # it for other split-prefill flows but have not been audited for per-layer
+        # KV handoff ordering.
+        model_runner = self.tp_worker.model_runner
+        model = model_runner.model
+        if not getattr(model, "supports_layer_pipelined_kv_transfer", False):
             logger.debug(
-                "Pipeline skip: model %s lacks forward_split_prefill",
+                "Pipeline skip: model %s does not opt in to layer-pipelined KV transfer",
                 type(model).__name__,
             )
+            return 0
+        if not hasattr(model, "forward_split_prefill"):
             return 0
 
         # DP attention requires prepare_mlp_sync_batch() which forward_split_prefill
@@ -694,9 +698,9 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue.
         Adapted from process_batch_result_prefill.
 
-        When pipelined=True, or req.pipelined_kv_sent is set by
-        run_batch_pipelined, KV data was already sent per-layer, so only the
-        metadata buffer is set here instead of calling send_kv_chunk.
+        Requests with req.pipelined_kv_sent set by run_batch_pipelined already
+        sent KV data per-layer, so this writes metadata before sending the final
+        metadata/status transfer.
         """
         (
             logits_output,
@@ -816,10 +820,14 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
 
-                if pipelined or getattr(req, "pipelined_kv_sent", False):
-                    # KV already sent per-layer in run_batch_pipelined.
-                    # Only set the metadata buffer here.
+                if getattr(req, "pipelined_kv_sent", False):
+                    # KV data was already sent per-layer. Write metadata first,
+                    # then enqueue the final metadata/status transfer so the
+                    # worker cannot race ahead and send stale aux buffers.
                     self.disagg_metadata_buffers.set_buf(req)
+                    req.disagg_kv_sender.send_final_metadata(
+                        getattr(req, "pipelined_state_indices", None)
+                    )
                 else:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()

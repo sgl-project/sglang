@@ -3200,7 +3200,7 @@ class Scheduler(
             req_page_indices_list.append(page_indices)
 
         # Pre-compute state indices for hybrid models (Mamba/SWA/DSA).
-        # Attached to req so the last send_layer call can pass them through.
+        # Attached to req so the final metadata send can pass them through.
         self._prepare_pipelined_state_indices(batch)
 
         # Initialize split prefill
@@ -3233,9 +3233,6 @@ class Scheduler(
                         layer_id=layer_id,
                         cuda_event=cuda_event,
                         is_last=is_last,
-                        state_indices=(
-                            req.pipelined_state_indices if is_last else None
-                        ),
                     )
                 if is_last_group:
                     req.pipelined_kv_sent = True

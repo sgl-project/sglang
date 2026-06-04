@@ -40,7 +40,11 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -542,13 +546,9 @@ class TpModelWorker(BaseTpWorker):
         self,
         batch: ScheduleBatch,
     ) -> ForwardBatch:
-        """Initialize a ForwardBatch for layer-pipelined split prefill.
-
-        Keeps forward_mode as EXTEND so that LogitsProcessor correctly
-        extracts last-token logits. The split is controlled solely via
-        split_index, not forward_mode.
-        """
+        """Initialize a ForwardBatch for layer-pipelined split prefill."""
         forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch.forward_mode = ForwardMode.SPLIT_PREFILL
         forward_batch.split_index = 0
         return forward_batch
 
@@ -564,14 +564,14 @@ class TpModelWorker(BaseTpWorker):
         Returns (LogitsProcessorOutput, event) for the final group
         (when split_index reaches num_hidden_layers).
         """
-        logits_output = self.model_runner.forward_split_prefill(
+        out = self.model_runner.forward(
             forward_batch,
             reinit_attn_backend=(forward_batch.split_index == 0),
-            forward_count=forward_count,
+            split_forward_count=forward_count,
         )
         event = torch.cuda.Event()
         event.record()
-        return logits_output, event
+        return out.logits_output, event
 
     def forward_batch_generation_split_sample(
         self,

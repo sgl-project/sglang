@@ -5,12 +5,13 @@ across different prompt lengths and verifies the adaptive group_size logic
 correctly falls back to the normal path for short prompts.
 """
 
-import os
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -28,18 +29,23 @@ class TestDisaggregationPipelined(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        # Enable layer-pipelined KV transfer on prefill
-        os.environ["SGLANG_PIPELINED_KV_TRANSFER"] = "1"
-        # Use a low min_tokens threshold so the pipeline path is exercised
-        # even with shorter eval prompts
-        os.environ["SGLANG_PIPELINE_MIN_TOKENS"] = "64"
-        cls.launch_all()
+        cls._env_stack = ExitStack()
+        cls._env_stack.enter_context(envs.SGLANG_PIPELINED_KV_TRANSFER.override(True))
+        cls._env_stack.enter_context(envs.SGLANG_PIPELINE_MIN_TOKENS.override(64))
+        try:
+            cls.launch_all()
+        except Exception:
+            cls._env_stack.close()
+            raise
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_PIPELINED_KV_TRANSFER", None)
-        os.environ.pop("SGLANG_PIPELINE_MIN_TOKENS", None)
-        super().tearDownClass()
+        try:
+            super().tearDownClass()
+        finally:
+            env_stack = getattr(cls, "_env_stack", None)
+            if env_stack is not None:
+                env_stack.close()
 
     def test_gsm8k(self):
         """Validate end-to-end correctness with pipelined transfer on GSM8K."""
@@ -141,18 +147,24 @@ class TestDisaggregationPipelinedGroupSize(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        os.environ["SGLANG_PIPELINED_KV_TRANSFER"] = "1"
-        os.environ["SGLANG_PIPELINE_MIN_TOKENS"] = "64"
-        # Force a specific group_size to test non-adaptive path
-        os.environ["SGLANG_PIPELINE_GROUP_SIZE"] = "5"
-        cls.launch_all()
+        cls._env_stack = ExitStack()
+        cls._env_stack.enter_context(envs.SGLANG_PIPELINED_KV_TRANSFER.override(True))
+        cls._env_stack.enter_context(envs.SGLANG_PIPELINE_MIN_TOKENS.override(64))
+        cls._env_stack.enter_context(envs.SGLANG_PIPELINE_GROUP_SIZE.override(5))
+        try:
+            cls.launch_all()
+        except Exception:
+            cls._env_stack.close()
+            raise
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_PIPELINED_KV_TRANSFER", None)
-        os.environ.pop("SGLANG_PIPELINE_MIN_TOKENS", None)
-        os.environ.pop("SGLANG_PIPELINE_GROUP_SIZE", None)
-        super().tearDownClass()
+        try:
+            super().tearDownClass()
+        finally:
+            env_stack = getattr(cls, "_env_stack", None)
+            if env_stack is not None:
+                env_stack.close()
 
     def test_gsm8k(self):
         """Validate correctness with fixed group_size=5."""

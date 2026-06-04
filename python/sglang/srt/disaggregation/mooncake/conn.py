@@ -1899,7 +1899,6 @@ class MooncakeKVSender(CommonKVSender):
         """Enqueue a single layer's KV transfer for layer-pipelined mode."""
         kv_indices, index_slice, should_skip = self._prepare_layer_send_indices(
             kv_indices,
-            is_last,
         )
         if should_skip:
             return
@@ -1908,15 +1907,33 @@ class MooncakeKVSender(CommonKVSender):
             self.bootstrap_room,
             kv_indices,
             index_slice,
-            is_last_chunk=is_last,
-            aux_index=self.aux_index if is_last else None,
-            state_indices=state_indices if is_last else None,
+            is_last_chunk=False,
             layer_id=layer_id,
             cuda_event=cuda_event,
             trace_ctx=self.trace_ctx.copy_for_thread(),
         )
         if is_last:
-            self._record_transfer_indices(kv_indices, state_indices)
+            self._record_transfer_indices(kv_indices, None)
+
+    def send_final_metadata(
+        self,
+        state_indices: Optional[List[int]] = None,
+    ):
+        index_slice, should_skip = self._prepare_final_metadata_send()
+        if should_skip:
+            return
+
+        empty_kv_indices = np.array([], dtype=np.int32)
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            empty_kv_indices,
+            index_slice,
+            is_last_chunk=True,
+            aux_index=self.aux_index,
+            state_indices=state_indices,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+        )
+        self._record_transfer_indices(empty_kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

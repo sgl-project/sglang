@@ -142,6 +142,15 @@ class BaseKVSender(ABC):
             f"{type(self).__name__} does not support layer-pipelined KV transfer"
         )
 
+    def send_final_metadata(
+        self,
+        state_indices: Optional[List[int]] = None,
+    ):
+        """Send final metadata after layer-pipelined KV transfer."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support layer-pipelined KV transfer"
+        )
+
     def pop_decode_prefix_len(self) -> int:
         return 0
 
