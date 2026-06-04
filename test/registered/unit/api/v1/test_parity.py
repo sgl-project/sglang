@@ -58,6 +58,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "image_max_dynamic_patch",
         "input_embeds",
         "log_metrics",
+        "lora_backfill_paths",
         "lora_id",
         "max_dynamic_patch",
         "min_dynamic_patch",
