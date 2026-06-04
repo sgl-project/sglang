@@ -47,6 +47,8 @@ XPU_SERVER_ARGS = [
     "--disable-overlap-schedule",
     "--page-size",
     "64",
+    "--mem-fraction-static",
+    "0.70",
     "--attention-backend",
     "intel_xpu",
     "--model-impl",
