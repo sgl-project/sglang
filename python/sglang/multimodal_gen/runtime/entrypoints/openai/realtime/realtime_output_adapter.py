@@ -451,8 +451,6 @@ class RawRGBRealtimeOutputAdapter:
         content_type = result.raw_frame_content_type
         if result.raw_frame_batches is None:
             return empty_frame_send_stats(content_type)
-        if batch.block_idx == 0:
-            self.reset()
 
         frame_metadata = (
             result.raw_frame_metadata or _raw_rgb_frame_metadata(batch)
