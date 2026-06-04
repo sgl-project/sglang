@@ -51,6 +51,8 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
+    assign_extend_cache_locs,
+    fill_accepted_out_cache_loc,
     fill_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import (
@@ -84,6 +86,7 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
     log_info_on_rank0,
+    next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
