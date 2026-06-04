@@ -408,13 +408,6 @@ class QuarkConfig(QuantizationConfig):
         )
         return is_mx_fp4_weight and is_static_fp8_activation
 
-    def _is_fp8_w4a8(
-        self,
-        weight_quant: Optional[dict[str, Any]],
-        input_quant: Optional[dict[str, Any]],
-    ) -> bool:
-        return self._is_mx_w4a8(weight_quant, input_quant)
-
     def _find_matched_config(
         self, layer_name: str, module: torch.nn.Module
     ) -> dict[str, Any]:
