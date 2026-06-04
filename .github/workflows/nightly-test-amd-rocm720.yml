@@ -255,7 +255,6 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
       - name: Accuracy Test MI35x ROCm 7.2 (2-GPU GLM-5.1-MXFP4 GSM8K)
         timeout-minutes: 120
@@ -1561,7 +1560,6 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
       - name: Accuracy Test ROCm 7.2 (8-GPU GLM-5.1 DSA)
         timeout-minutes: 120
@@ -1608,7 +1606,6 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-5.1 DSA)
         timeout-minutes: 180
@@ -1658,7 +1655,6 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-5-MXFP4)
         timeout-minutes: 180
