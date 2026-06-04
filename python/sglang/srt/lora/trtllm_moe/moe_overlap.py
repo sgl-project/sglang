@@ -69,6 +69,9 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
     from sglang.srt.layers.moe.utils import RoutingMethodType
     from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
     from sglang.srt.lora.triton_ops import merged_experts_fused_moe_lora_add
+    from sglang.srt.lora.trtllm_moe.shared_add_overlap import (
+        maybe_overlap_staged_shared_add,
+    )
     from sglang.srt.utils.common import next_power_of_2
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
@@ -226,7 +229,7 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
 
     output = moe_result
 
-    def _run_down_lora(out, stage="all", intermediate_buffer=None):
+    def _run_down_lora(out, stage="all", intermediate_buffer=None, expand_wait_event=None):
         return merged_experts_fused_moe_lora_add(
             output=out,
             hidden_states=activation_lora_input.view(-1, quant_info.intermediate_size),
@@ -246,7 +249,14 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
             local_num_experts=quant_info.local_num_experts,
             stage=stage,
             intermediate_buffer=intermediate_buffer,
+            expand_wait_event=expand_wait_event,
         )
+
+    # Shared-add overlap: the trtllm op above already finalized `output`, so the
+    # staged shared-expert add (if any) can run on the producer (main) stream
+    # concurrent with the down-LoRA shrink below; the expand waits on it via
+    # expand_wait_event before atomic-adding into the same buffer.
+    shared_add_done = maybe_overlap_staged_shared_add(output)
 
     if down_overlap:
         # Fork at "base down GEMM done": ONLY the shrink (gemm A) + routing prep run on the
@@ -272,9 +282,14 @@ def fused_experts_none_to_sgl_flashinfer_trtllm_fp8_lora_two_stream(
             _LORA_OVERLAP_EVENTS.append(gemm2_done_event)
             _LORA_OVERLAP_EVENTS.append(shrink_done_event)
         torch.cuda.current_stream().wait_event(shrink_done_event)
-        _run_down_lora(output, stage="expand", intermediate_buffer=down_intermediate)
+        _run_down_lora(
+            output,
+            stage="expand",
+            intermediate_buffer=down_intermediate,
+            expand_wait_event=shared_add_done,
+        )
     else:
-        _run_down_lora(output)
+        _run_down_lora(output, expand_wait_event=shared_add_done)
     return StandardCombineInput(hidden_states=output)
 
 

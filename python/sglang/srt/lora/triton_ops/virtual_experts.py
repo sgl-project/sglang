@@ -639,6 +639,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     local_num_experts: int | None = None,
     stage: str = "all",
     intermediate_buffer: torch.Tensor | None = None,
+    expand_wait_event: "torch.cuda.Event | None" = None,
 ) -> "torch.Tensor | None":
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -960,6 +961,12 @@ def _merged_experts_fused_moe_lora_add_impl(
     )
 
     intermediate_flat = intermediate.view(-1, max_lora_rank)
+    # Shared-add overlap: the expand below adds into the SAME output buffer the
+    # overlapped shared-expert add (enqueued on the main stream by the LoRA
+    # dispatch) is writing — wait for it here, right before the expand launch,
+    # so the shrink + stage-B routing above still overlap the add.
+    if expand_wait_event is not None:
+        torch.cuda.current_stream().wait_event(expand_wait_event)
     # The rank-specialized direct expand-add doesn't support the shared-outer
     # LoRA-B layout; fall back to the generic kernel for that case instead of
     # asserting, so adapters with experts_shared_outer_loras still work.
@@ -1065,6 +1072,7 @@ def merged_experts_fused_moe_lora_add(
     local_num_experts: int | None = None,
     stage: str = "all",
     intermediate_buffer: torch.Tensor | None = None,
+    expand_wait_event: "torch.cuda.Event | None" = None,
 ) -> "torch.Tensor | None":
     """Public API: wraps the registered op with routing_cache support."""
     return _merged_experts_fused_moe_lora_add_impl(
@@ -1086,4 +1094,5 @@ def merged_experts_fused_moe_lora_add(
         local_num_experts=local_num_experts,
         stage=stage,
         intermediate_buffer=intermediate_buffer,
+        expand_wait_event=expand_wait_event,
     )
