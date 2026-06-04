@@ -160,14 +160,17 @@ def _patch_rope_parameters_validation():
     def patched(cls, config_dict, **kwargs):
         rope_scaling = config_dict.get("rope_scaling")
         rope_theta = config_dict.get("rope_theta")
-        if (
+        needs_rope_theta = (
             isinstance(rope_scaling, dict)
             and rope_theta is not None
             and "rope_theta" not in rope_scaling
-        ):
-            config_dict = config_dict.copy()
-            config_dict["rope_scaling"] = {**rope_scaling, "rope_theta": rope_theta}
-        return original(cls, config_dict, **kwargs)
+        )
+        result = original(cls, config_dict, **kwargs)
+        if needs_rope_theta:
+            result_rs = getattr(result, "rope_scaling", None)
+            if isinstance(result_rs, dict) and "rope_theta" not in result_rs:
+                result_rs["rope_theta"] = rope_theta
+        return result
 
     PretrainedConfig.from_dict = patched
 
