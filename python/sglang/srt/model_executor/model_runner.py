@@ -2975,22 +2975,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            resolve_flashinfer_allreduce_fusion_backend,
-        )
-
-        # TODO(wenscarl): remove this constraint once
-        # https://github.com/flashinfer-ai/flashinfer/pull/3304 is merged
-        # (kernel-side FTZ-safe sentinel check removes the PCG-replay hang).
-        # This is specific to the MNNVL backend; the TRTLLM backend does not
-        # use the MNNVL Lamport path that triggers the replay hang.
-        if resolve_flashinfer_allreduce_fusion_backend(self.server_args) == "mnnvl":
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because MNNVL allreduce fusion is enabled",
-            )
-            return
-
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
