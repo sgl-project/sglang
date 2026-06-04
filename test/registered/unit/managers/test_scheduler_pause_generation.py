@@ -43,6 +43,10 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
                 full_evictable_size=0,
             )
         )
+        # pause_generation zeros gen_throughput and flushes KV events.
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        scheduler.kv_events_publisher = MagicMock()
         return scheduler
 
     def test_inplace_only_sets_flag(self):
