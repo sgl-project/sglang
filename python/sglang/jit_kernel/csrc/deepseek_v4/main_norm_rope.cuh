@@ -520,7 +520,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        const float other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, data[i], mask, kWarpThreads);
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }
@@ -735,7 +735,7 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        const float other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, data[i], mask, kWarpThreads);
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }

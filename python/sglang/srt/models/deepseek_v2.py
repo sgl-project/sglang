@@ -559,6 +559,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        self.is_deepseek_v4 = is_deepseek_v4
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
@@ -613,7 +614,7 @@ class DeepseekV2MoE(nn.Module):
             routing_method_type=getattr(
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
-            swiglu_limit=getattr(config, "swiglu_limit", None),
+            swiglu_limit=None,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -651,17 +652,9 @@ class DeepseekV2MoE(nn.Module):
                     else None
                 ),
             )
-            # DSV4 override: ungrouped sqrtsoftplus + fp4 expert layout flag.
             if is_deepseek_v4:
                 topk_kwargs.update(
-                    use_grouped_topk=False,
-                    scoring_func=config.scoring_func,
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
-                    apply_routed_scaling_factor_on_output=(
-                        True
-                        if _use_aiter
-                        else self.experts.should_fuse_routed_scaling_factor_in_topk
-                    ),
                 )
             self.topk = TopK(**topk_kwargs)
 
@@ -698,7 +691,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
-                swiglu_limit=getattr(config, "swiglu_limit", None),
+                swiglu_limit=None,
                 prefix=add_prefix("shared_experts", prefix),
                 **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
@@ -905,12 +898,16 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if self.is_deepseek_v4:
+            if shared_output is not None and not self._shared_expert_tp1:
+                final_hidden_states += shared_output
+        else:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -1019,12 +1016,16 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, gemm_output_zero_allocator
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if self.is_deepseek_v4:
+            if shared_output is not None and not self._shared_expert_tp1:
+                final_hidden_states += shared_output
+        else:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -1994,7 +1995,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
-                swiglu_limit=getattr(config, "swiglu_limit", None),
+                swiglu_limit=None,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

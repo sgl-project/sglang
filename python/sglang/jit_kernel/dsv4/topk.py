@@ -65,9 +65,11 @@ _PLAN_METADATA_INTS_PER_BATCH = 4
 
 
 def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
-    module = _jit_topk_v2_module(512)  # does not matter
     bs = seq_lens.shape[0]
-    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    metadata = seq_lens.new_zeros(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    if is_hip_runtime():
+        return metadata
+    module = _jit_topk_v2_module(512)  # does not matter
     module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
 

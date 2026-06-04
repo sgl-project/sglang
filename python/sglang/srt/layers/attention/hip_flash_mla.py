@@ -70,14 +70,15 @@ def flash_mla_with_kvcache_torch(
     extra_topk_length: Optional[torch.Tensor] = None,
 ):
 
-    from sglang.srt.flashmla_tests import quant as flashmla_quant
-    from sglang.srt.flashmla_tests.lib import (
-        ExtraTestParamForDecode,
+    from sglang.srt.layers.attention.flashmla_torch_fallback import (
+        ExtraDecodeParams,
+        FP8KVCacheLayout,
         KVScope,
-        TestcaseForDecode,
-        TestParam,
+        SparseDecodeInputs,
+        SparseDecodeParams,
+        dequantize_k_cache,
+        ref_sparse_attn_decode,
     )
-    from sglang.srt.flashmla_tests.ref import ref_sparse_attn_decode
 
     assert block_table is None
     assert cache_seqlens is None
@@ -86,47 +87,23 @@ def flash_mla_with_kvcache_torch(
     b, s_q, h_q, d_qk = q.shape
     d_v = head_dim_v
 
-    fp8_layout = flashmla_quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+    fp8_layout = FP8KVCacheLayout.MODEL1_FP8Sparse
 
-    p = TestParam(
+    p = SparseDecodeParams(
         s_q=s_q,
-        s_kv="unused",
-        topk="unused",
         h_q=h_q,
         h_kv=1,
         d_qk=d_qk,
         d_v=d_v,
-        decode=ExtraTestParamForDecode(
+        decode=ExtraDecodeParams(
             b=b,
-            is_varlen="unused",
-            have_zero_seqlen_k="unused",
-            extra_s_k="unused",
-            extra_topk="unused",
-            extra_block_size="unused",
-            have_extra_topk_length="unused",
         ),
-        # unused?
-        seed=-1,
-        check_correctness=True,
-        is_all_indices_invalid=False,
-        num_runs=10,
-        have_attn_sink=True,
-        have_topk_length=True,
     )
 
     blocked_k_quantized = k_cache
-    blocked_k = flashmla_quant.dequantize_k_cache(
-        blocked_k_quantized.view(FP8_DTYPE), fp8_layout
-    )
-    # blocked_k_requantized = flashmla_quant.quantize_k_cache(blocked_k, fp8_layout)
-    # assert torch.testing.assert_allclose(blocked_k_requantized.byte(), blocked_k_quantized.byte())
+    blocked_k = dequantize_k_cache(blocked_k_quantized.view(FP8_DTYPE), fp8_layout)
     kv_scope = KVScope(
-        t="unused",
-        cache_seqlens="unused",
-        block_table="unused",
         blocked_k=blocked_k,
-        blocked_k_quantized=blocked_k_quantized,
-        abs_indices="unused",
         indices_in_kvcache=indices,
         topk_length=topk_length,
     )
@@ -134,24 +111,16 @@ def flash_mla_with_kvcache_torch(
     extra_kv_scope = None
     if extra_k_cache is not None:
         extra_blocked_k_quantized = extra_k_cache
-        extra_blocked_k = flashmla_quant.dequantize_k_cache(
+        extra_blocked_k = dequantize_k_cache(
             extra_blocked_k_quantized.view(FP8_DTYPE), fp8_layout
         )
-        # extra_blocked_k_requantized = flashmla_quant.quantize_k_cache(extra_blocked_k, fp8_layout)
-        # assert torch.testing.assert_allclose(extra_blocked_k_requantized.byte(), extra_blocked_k_quantized.byte())
         extra_kv_scope = KVScope(
-            t="unused",
-            cache_seqlens="unused",
-            block_table="unused",
             blocked_k=extra_blocked_k,
-            blocked_k_quantized=extra_blocked_k_quantized,
-            abs_indices="unused",
             indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=extra_topk_length,
         )
 
-    t = TestcaseForDecode(
-        p="unused",
+    t = SparseDecodeInputs(
         q=q,
         attn_sink=attn_sink,
         sm_scale=softmax_scale,
@@ -179,26 +148,7 @@ def flash_mla_with_kvcache_torch(
 
 
 def _assert_close(pack_ref, pack_fast):
-    import sglang.srt.flashmla_tests.kernelkit as kk
-
     out_ref, lse_ref = pack_ref
     out_fast, lse_fast = pack_fast
-
-    # the copied threshold is too strict, not checked why
-    # copied from: test_flash_mla_sparse_decoding.py
-    # is_out_correct = kk.check_is_allclose(
-    #     "out", out_fast, out_ref, abs_tol=1e-3, rel_tol=2.01 / 128, cos_diff_tol=5e-6
-    # )
-    # is_lse_correct = kk.check_is_allclose(
-    #     "lse", lse_fast, lse_ref, abs_tol=1e-6, rel_tol=8.01 / 65536
-    # )
-
-    # loosen thresh
-    is_out_correct = kk.check_is_allclose(
-        "out", out_fast, out_ref, abs_tol=1e-2, rel_tol=10.0, cos_diff_tol=5e-6
-    )
-    is_lse_correct = kk.check_is_allclose(
-        "lse", lse_fast, lse_ref, abs_tol=1e-6, rel_tol=8.01 / 65536
-    )
-
-    assert is_out_correct and is_lse_correct, f"{is_out_correct=} {is_lse_correct=}"
+    torch.testing.assert_close(out_fast, out_ref, atol=1e-2, rtol=10.0)
+    torch.testing.assert_close(lse_fast, lse_ref, atol=1e-6, rtol=8.01 / 65536)
