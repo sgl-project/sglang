@@ -29,6 +29,21 @@ export const Nemotron3UltraDeployment = () => {
   const verifiedTpForModelHardware = (model, hardware) =>
     [...new Set(VERIFIED_CONFIGS.filter((c) => c.model === model && c.hardware === hardware).map((c) => c.tp))];
 
+  // DP attention is verified at dp=2 for BF16, and dp in {2,4,8} for NVFP4. SGLang
+  // requires tp_size % dp_size == 0, so dp is capped at both the selected TP and the
+  // max verified TP for this model+hardware (whichever is smaller).
+  const dpCandidatesForModel = (model) => (model === 'bf16' ? ['2'] : ['2', '4', '8']);
+
+  const maxVerifiedTpForModelHardware = (model, hardware) => {
+    const tps = verifiedTpForModelHardware(model, hardware).map(Number);
+    return tps.length ? Math.max(...tps) : 0;
+  };
+
+  const verifiedDpForModelHardwareTp = (model, hardware, tp) => {
+    const cap = Math.min(Number(tp) || 0, maxVerifiedTpForModelHardware(model, hardware));
+    return dpCandidatesForModel(model).filter((d) => Number(d) <= cap);
+  };
+
   const options = {
     model: {
       name: 'model',
@@ -81,6 +96,45 @@ export const Nemotron3UltraDeployment = () => {
           };
         });
       }
+    },
+    dpattention: {
+      name: 'dpattention',
+      title: 'DP Attention',
+      getDynamicItems: (values) => {
+        const allowed = new Set(verifiedDpForModelHardwareTp(values.model, values.hardware, values.tp));
+        const base = [
+          { id: 'disabled', label: 'Disabled', subtitle: 'Low latency',    default: true },
+          { id: '2',        label: 'DP=2',      subtitle: 'High throughput' },
+          { id: '4',        label: 'DP=4',      subtitle: 'High throughput' },
+          { id: '8',        label: 'DP=8',      subtitle: 'High throughput' }
+        ];
+        return base.map((it) => {
+          if (it.id === 'disabled') return it;
+          const ok = allowed.has(it.id);
+          return {
+            ...it,
+            disabled: !ok,
+            disabledReason: ok ? '' : `DP=${it.id} is not verified for ${values.model.toUpperCase()} on ${values.hardware.toUpperCase()} at TP=${values.tp}`
+          };
+        });
+      },
+      // dp_size must divide tp_size; only emit when the selected DP is valid for the current TP.
+      commandRule: (value, state) =>
+        value && value !== 'disabled' &&
+        dpCandidatesForModel(state.model).includes(value) &&
+        Number(value) <= Number(state.tp)
+          ? `--dp ${value} \\\n  --enable-dp-attention`
+          : null
+    },
+    ep: {
+      name: 'ep',
+      title: 'Expert Parallel (EP)',
+      items: [
+        { id: 'enabled',  label: 'Enabled', subtitle: 'EP = TP' },
+        { id: 'disabled', label: 'Disabled', default: true }
+      ],
+      // This MoE only supports ep_size == 1 or ep_size == tp_size; when on, EP equals TP.
+      commandRule: (value, state) => value === 'enabled' ? `--ep ${state.tp}` : null
     },
     mtp: {
       name: 'mtp',
