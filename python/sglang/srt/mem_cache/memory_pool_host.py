@@ -1982,37 +1982,25 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def get_contiguous_buf_infos(self):
         """Return per-layer page-row buffers for PD direct-to-host transfer."""
-        assert self.data_ptrs is not None
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        if indices.numel() % self.slot_page_size != 0:
-            raise ValueError(
-                f"{self.pool_name} transfer indices must be page-aligned, "
-                f"got numel={indices.numel()}, slot_page_size={self.slot_page_size}"
-            )
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
 
-    def _backup_tokens_from_device_all_layer(
-        self, host_indices: torch.Tensor, device_indices: torch.Tensor, io_backend: str
-    ) -> None:
+    def _has_transfer_indices(
+        self, host_indices: torch.Tensor | None, device_indices: torch.Tensor | None
+    ) -> bool:
+        if host_indices is None or device_indices is None:
+            return False
         if host_indices.numel() != device_indices.numel():
             raise ValueError(
-                f"{self.pool_name} token backup index size mismatch: "
+                f"{self.pool_name} transfer index size mismatch: "
                 f"host={host_indices.numel()}, device={device_indices.numel()}"
             )
-        if host_indices.numel() == 0:
-            return
-        assert self.data_ptrs is not None
-        transfer_cache_dsv4_mla(
-            src_ptrs=self.device_ptrs,
-            dst_ptrs=self.data_ptrs,
-            src_indices=device_indices.to(dtype=torch.int64),
-            dst_indices=host_indices.to(dtype=torch.int64),
-        )
+        return host_indices.numel() > 0
 
     def get_size_per_token(self):
         return self.item_bytes
@@ -2053,20 +2041,26 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        if host_indices is None or device_indices is None:
+        if not self._has_transfer_indices(host_indices, device_indices):
             return
         if (
-            host_indices.numel() != device_indices.numel()
-            or host_indices.numel() % self.slot_page_size != 0
+            host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
         ):
-            self._backup_tokens_from_device_all_layer(
-                host_indices, device_indices, io_backend
+            # DSV4 C4 token data is split inside a paged row:
+            # [value0..value63][scale0..scale63].  Non-page-aligned decode
+            # backups must copy one token's value and scale separately instead
+            # of treating the token as a contiguous byte range.
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.device_ptrs,
+                dst_ptrs=self.data_ptrs,
+                src_indices=device_indices.to(dtype=torch.int64),
+                dst_indices=host_indices.to(dtype=torch.int64),
             )
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
-            assert self.data_ptrs is not None
             transfer_kv_all_layer_mla(
                 src_layers=self.device_ptrs,
                 dst_layers=self.data_ptrs,
@@ -2109,20 +2103,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        if host_indices is None or device_indices is None:
-            return
-        if host_indices.numel() != device_indices.numel():
-            raise ValueError(
-                f"{self.pool_name} token load index size mismatch: "
-                f"host={host_indices.numel()}, device={device_indices.numel()}"
-            )
-        if host_indices.numel() == 0:
+        if not self._has_transfer_indices(host_indices, device_indices):
             return
         if (
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
-            assert self.data_ptrs is not None
+            # Same DSV4 C4 layout issue as backup: one token is split between
+            # the value and scale regions inside a paged row, so token-granular
+            # preload must use the DSV4 token-copy helper.
             transfer_cache_dsv4_mla(
                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
                 dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
