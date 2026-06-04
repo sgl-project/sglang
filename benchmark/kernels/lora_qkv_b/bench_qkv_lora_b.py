@@ -227,8 +227,9 @@ def run_correctness(args, dtype, device) -> None:
         ]:
             cases.append((f"{preset}/{name}", slice_dims, spec, 16, 2.0))
         # rank / scaling variants (tile-overlap proof is rank-independent, but K and
-        # BLOCK_R=next_pow2(r) tail masks differ for r in {8, 64}).
-        cases.append((f"{preset}/rank8", slice_dims, ("merged", 64, False), 8, 2.0))
+        # BLOCK_R=next_pow2(r) widen the tile). rank<16 is not a standalone shape here:
+        # tl.dot needs K>=16, so a rank-8 adapter runs with a width-16 padded buffer in
+        # production (BLOCK_R stays 16); we cover the wider rank=64 instead.
         cases.append((f"{preset}/rank64", slice_dims, ("merged", 64, False), 64, 2.0))
         cases.append((f"{preset}/scaling1", slice_dims, ("merged", 64, False), 16, 1.0))
         # seg_len==0 / interspersed empty segments exercise the early-return branch.
