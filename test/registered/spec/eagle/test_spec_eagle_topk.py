@@ -1,7 +1,9 @@
 """topk > 1 tree drafting (EAGLE3 topk16 + EAGLE/Llama-2 topk8).
 
-topk > 1 always routes to spec v1; flashinfer is pinned (topk > 1 can't use fa3).
-Runs on the cheap (5090) runner -- functional sanity only, no perf/stress.
+topk > 1 routes to spec v1, except page_size==1 which can also stay on spec v2
+(overlap). flashinfer is pinned because this runs on the cheap (5090) runner,
+where fa3 (Hopper-only) isn't available -- functional sanity only, no perf/stress.
+(topk > 1 on fa3 is covered on the Hopper runner in test_spec_eagle_fa3.py.)
 """
 
 import unittest
@@ -16,7 +18,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=840, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=1180, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
@@ -29,6 +31,13 @@ class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogp
     acc_length_thres = 3.1
     batch_accept_len_thres = 1.75
     gsm8k_accept_len_thres = 2.4  # EAGLE3 topk16 gsm8k accept ~2.48
+
+
+class TestEagle3Topk16SpecV2(TestEagle3Topk16, SpecFeatureKit):
+    """EAGLE3 topk=16 tree on spec v2 (overlap, page1): guards the v2 tree path's
+    accepted-path compaction, validated by logprob_spec_v2_match."""
+
+    disable_overlap = False
 
 
 class TestEagleLlama2Suite(
