@@ -87,9 +87,7 @@ class TestKimiK2Detector(CustomTestCase):
 
     def test_detect_and_parse_single_tool_call(self):
         """Standard single tool call in canonical KimiK2 format."""
-        text = _wrap_section(
-            _make_call("get_weather", 0, '{"city": "Beijing"}')
-        )
+        text = _wrap_section(_make_call("get_weather", 0, '{"city": "Beijing"}'))
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
@@ -112,9 +110,7 @@ class TestKimiK2Detector(CustomTestCase):
     def test_detect_and_parse_text_before_tool_call(self):
         """Normal text preceding the section should appear in normal_text."""
         prefix = "Sure, let me check that for you. "
-        text = prefix + _wrap_section(
-            _make_call("get_weather", 0, '{"city": "Tokyo"}')
-        )
+        text = prefix + _wrap_section(_make_call("get_weather", 0, '{"city": "Tokyo"}'))
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
@@ -122,9 +118,7 @@ class TestKimiK2Detector(CustomTestCase):
 
     def test_detect_and_parse_tool_call_with_multiple_arguments(self):
         text = _wrap_section(
-            _make_call(
-                "get_weather", 0, '{"city": "London", "unit": "celsius"}'
-            )
+            _make_call("get_weather", 0, '{"city": "London", "unit": "celsius"}')
         )
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
@@ -154,9 +148,7 @@ class TestKimiK2Detector(CustomTestCase):
         """Streaming returns incremental partial calls; the accumulated stream
         across all chunks should reconstruct the full tool call."""
         detector = KimiK2Detector()
-        full = _wrap_section(
-            _make_call("get_weather", 0, '{"city": "Beijing"}')
-        )
+        full = _wrap_section(_make_call("get_weather", 0, '{"city": "Beijing"}'))
         # Split at boundaries that exercise the buffering logic.
         # The exact chunk boundaries should not affect the accumulated result.
         cut1 = full.index("<|tool_call_begin|>")
@@ -182,9 +174,7 @@ class TestKimiK2Detector(CustomTestCase):
     def test_streaming_normal_text_only(self):
         """Streaming pure normal text should yield it back with no tool calls."""
         detector = KimiK2Detector()
-        result = detector.parse_streaming_increment(
-            "Hello! Let me help. ", self.tools
-        )
+        result = detector.parse_streaming_increment("Hello! Let me help. ", self.tools)
         self.assertEqual(result.normal_text, "Hello! Let me help. ")
         self.assertEqual(len(result.calls), 0)
 
