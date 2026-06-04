@@ -438,7 +438,12 @@ def main():
             "num_warps": num_warps,
         }
         topk_ids, topk_weights, tlm = make_routing_inputs(
-            args.bs, ep, device, seed=args.seed, routing=args.routing, skew_a=args.skew_a
+            args.bs,
+            ep,
+            device,
+            seed=args.seed,
+            routing=args.routing,
+            skew_a=args.skew_a,
         )
 
         if args.mode == "sweep":
