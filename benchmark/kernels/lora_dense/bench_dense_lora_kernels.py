@@ -60,6 +60,23 @@ SHAPES = [
 ]
 
 
+def disable_pdl(modules) -> None:
+    """Launch kernels without PDL (launch_pdl/gdc_wait). The default PDL launch lets
+    back-to-back identical kernels in the bench graph overlap launch tails, reporting
+    a faster per-call time than an e2e nsys duration, which includes the gdc_wait
+    stall on a DIFFERENT (often slower) producer kernel. --no-pdl gives the
+    standalone-execution number for comparing against e2e profile durations."""
+    import sglang.srt.lora.triton_ops.kernel_utils as _ku
+
+    def no_pdl():
+        return False, {}
+
+    _ku.get_pdl_launch_metadata = no_pdl
+    for mod in modules:
+        mod.get_pdl_launch_metadata = no_pdl
+    globals()["get_pdl_launch_metadata"] = no_pdl
+
+
 def make_merged_decode_batch_info(
     s: int,
     rank: int,
@@ -260,7 +277,16 @@ def main():
     ap.add_argument("--iters", type=int, default=4, help="profile-mode eager sweeps")
     ap.add_argument("--tol", type=float, default=5e-2)
     ap.add_argument("--rtol", type=float, default=1e-2)
+    ap.add_argument(
+        "--no-pdl", action="store_true", help="disable PDL (see disable_pdl docstring)"
+    )
     args = ap.parse_args()
+    if args.no_pdl:
+        import sglang.srt.lora.triton_ops.gate_up_lora_b as _g
+        import sglang.srt.lora.triton_ops.sgemm_lora_a as _a
+        import sglang.srt.lora.triton_ops.sgemm_lora_b as _b
+
+        disable_pdl([_a, _b, _g])
 
     device = "cuda"
     dtype = torch.bfloat16

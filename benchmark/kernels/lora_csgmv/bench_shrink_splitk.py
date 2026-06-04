@@ -68,6 +68,23 @@ PROJ = {
 }
 
 
+def disable_pdl(modules) -> None:
+    """Launch kernels without PDL (launch_pdl/gdc_wait). The default PDL launch lets
+    back-to-back identical kernels in the bench graph overlap launch tails, reporting
+    a faster per-call time than an e2e nsys duration, which includes the gdc_wait
+    stall on a DIFFERENT (often slower) producer kernel. --no-pdl gives the
+    standalone-execution number for comparing against e2e profile durations."""
+    import sglang.srt.lora.triton_ops.kernel_utils as _ku
+
+    def no_pdl():
+        return False, {}
+
+    _ku.get_pdl_launch_metadata = no_pdl
+    for mod in modules:
+        mod.get_pdl_launch_metadata = no_pdl
+    globals()["get_pdl_launch_metadata"] = no_pdl
+
+
 def production_stage_config(proj: str, num_input_tokens: int) -> dict:
     """Mirror of ``_get_shrink_stage_config`` (virtual_experts.py) for the decode
     regime: BLOCK_SIZE_M=16; warps 4 unless the LoRA-A N < 32 (then 2); stages 3.
@@ -357,6 +374,9 @@ def main():
     )
     ap.add_argument("--skew-a", type=float, default=0.9)
     ap.add_argument(
+        "--no-pdl", action="store_true", help="disable PDL (see disable_pdl docstring)"
+    )
+    ap.add_argument(
         "--num-groups",
         type=int,
         default=0,
@@ -369,6 +389,10 @@ def main():
     ap.add_argument("--iters", type=int, default=4, help="profile-mode eager sweeps")
     ap.add_argument("--tol", type=float, default=5e-2)
     args = ap.parse_args()
+    if args.no_pdl:
+        import sglang.srt.lora.triton_ops.virtual_experts as _ve
+
+        disable_pdl([_ve])
 
     device = "cuda"
     dtype = torch.bfloat16
