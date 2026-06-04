@@ -45,9 +45,7 @@ class TestEagleLlama2Fa3Page256(
     page_size = 256
     chunked_prefill_size = 4096  # must be divisible by page_size (256)
     cuda_graph_max_bs = 5
-    env_overrides = EagleLlama2Base.env_overrides + (
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
-    )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
 
 
 if __name__ == "__main__":

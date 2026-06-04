@@ -66,7 +66,10 @@ class SpecEagleServerBase(CustomTestCase):
     trust_remote_code = True
 
     # -- extras --
-    # env_overrides: iterable of (env_var_obj, value) applied only around launch.
+    # env_overrides: (env_var_obj, value) pairs applied only around launch.
+    # Declare ONLY this class's own overrides; the fixture merges them across the
+    # MRO (base first, derived last) so a subclass never restates a base's
+    # overrides -- single source of truth. Same env in base+derived: derived wins.
     env_overrides = ()
     extra_args = ()
 
@@ -106,6 +109,15 @@ class SpecEagleServerBase(CustomTestCase):
         return args
 
     @classmethod
+    def _merged_env_overrides(cls):
+        # Merge env_overrides down the MRO (base first, derived last) so each
+        # class declares only its own; derived wins for a repeated env var.
+        merged = []
+        for klass in reversed(cls.__mro__):
+            merged.extend(klass.__dict__.get("env_overrides", ()))
+        return merged
+
+    @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         # Alias so kit methods can use either name.
@@ -116,7 +128,7 @@ class SpecEagleServerBase(CustomTestCase):
             stack.enter_context(
                 envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True)
             )
-            for env_var, value in cls.env_overrides:
+            for env_var, value in cls._merged_env_overrides():
                 stack.enter_context(env_var.override(value))
             cls.process = popen_launch_server(
                 cls.model,

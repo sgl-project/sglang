@@ -52,18 +52,14 @@ class TestEagleLlama2Suite(
 ):
     """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases)."""
 
-    env_overrides = EagleLlama2Base.env_overrides + (
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
-    )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
 
 
 class TestEagleLlama2Chunked4(EagleLlama2Base, SpecCorrectnessKit):
     """Correctness under tiny chunked prefill."""
 
     chunked_prefill_size = 4
-    env_overrides = EagleLlama2Base.env_overrides + (
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
-    )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
 
 
 class TestEagleLlama3TokenMap(EagleLlama2Base, SpecAccuracyKit):
@@ -79,9 +75,7 @@ class TestEagleLlama3TokenMap(EagleLlama2Base, SpecAccuracyKit):
         "--speculative-token-map",
         "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
     )
-    env_overrides = EagleLlama2Base.env_overrides + (
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
-    )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
 
 
 if __name__ == "__main__":

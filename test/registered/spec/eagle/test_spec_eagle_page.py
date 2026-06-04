@@ -32,18 +32,14 @@ class TestEagleLlama2Page4Topk1(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit
     spec_topk = 1
     spec_tokens = 6
     page_size = 4
-    env_overrides = EagleLlama2Base.env_overrides + (
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
-    )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
 
 
 class TestEagleLlama2Page4Topk8(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
     """Llama-2 topk>1 tree + page_size=4 (spec v1); busy-time pool check."""
 
     page_size = 4
-    env_overrides = EagleLlama2Base.env_overrides + (
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
-    )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
 
 
 if __name__ == "__main__":

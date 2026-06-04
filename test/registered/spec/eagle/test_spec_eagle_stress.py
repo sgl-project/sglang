@@ -36,7 +36,6 @@ class TestEagleLlama2Retract(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
     max_running_requests = 64
     extra_args = ("--max-total-tokens", 4500)  # small KV to trigger retract
     env_overrides = (
-        (envs.SGLANG_ENABLE_SPEC_V2, False),
         (envs.SGLANG_TEST_RETRACT, True),
         (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
     )
@@ -61,15 +60,12 @@ class TestEagle3Topk16V2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
 
 class TestEagleLlama2AbortAll(EagleLlama2Base, AbortAllMixin):
     abort_all_max_new_tokens = 4000
-    env_overrides = EagleLlama2Base.env_overrides + (
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
-    )
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
 
 
 class TestEagleLlama2WaitingTimeout(EagleLlama2Base, WaitingTimeoutMixin):
     max_running_requests = 1
     env_overrides = (
-        (envs.SGLANG_ENABLE_SPEC_V2, False),
         (envs.SGLANG_REQ_WAITING_TIMEOUT, 0.001),
         (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
     )
@@ -79,7 +75,6 @@ class TestEagleLlama2RunningTimeout(EagleLlama2Base, RunningTimeoutTwoWaveMixin)
     # Regression: https://github.com/sgl-project/sglang/pull/18760
     max_running_requests = 16
     env_overrides = (
-        (envs.SGLANG_ENABLE_SPEC_V2, False),
         (envs.SGLANG_REQ_RUNNING_TIMEOUT, 3),
         (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
     )
