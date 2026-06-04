@@ -30,6 +30,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Optional, Type, Union
 
 import msgspec
+import numpy as np
 import torch
 from pydantic import PlainValidator
 from zmq import Socket
@@ -45,6 +46,7 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 
@@ -1649,16 +1651,25 @@ class GetInternalStateReq(BaseReqIpc, kw_only=True):
 
 
 class GetInternalStateReqOutput(BaseReqIpc, kw_only=True):
-    internal_state: Dict[Any, Any]
+    server_args: ServerArgs
+    last_gen_throughput: float
+    memory_usage: Dict[str, Union[float, int]]
+    effective_max_running_requests_per_dp: int
+    avg_spec_accept_length: Optional[float] = None
+    step_time_dict: Optional[Dict[str, float]] = None
 
 
+# The ServerArgs has a lot of fields with different types
+# let's use object to make it serialize/deserialize via pickle for now
 class SetInternalStateReq(BaseReqIpc, kw_only=True):
-    server_args: Dict[str, Any]
+    server_args: Dict[str, object]
 
 
+# The ServerArgs has a lot of fields with different types
+# let's use object to make it serialize/deserialize via pickle for now
 class SetInternalStateReqOutput(BaseReqIpc, kw_only=True):
     updated: bool
-    server_args: Dict[str, Any]
+    server_args: Dict[str, object]
 
 
 @dataclass
@@ -2095,10 +2106,19 @@ def enc_hook(obj: Any) -> Any:
         return (obj.shape, tensor_dtype, raw_data)
     elif isinstance(obj, array):
         return (obj.typecode, obj.tobytes())
+    elif isinstance(obj, np.floating):
+        return float(obj)
     else:
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
             logger.info(f"Object of type {type(obj)} is encoding with pickle.")
-        return pickle.dumps(obj)
+        try:
+            return pickle.dumps(obj)
+        except Exception as e:
+            if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
+                logger.info(
+                    f"Return None since failed to encode object of type {type(obj)} with pickle: {e}"
+                )
+            return None
 
 
 def dec_hook(tp: Type, obj: Any) -> Any:
@@ -2117,7 +2137,14 @@ def dec_hook(tp: Type, obj: Any) -> Any:
             logger.info(
                 f"Object of type {type(obj)} and {str(tp)} is decoding with pickle."
             )
-        return pickle.loads(obj)
+        try:
+            return pickle.loads(obj)
+        except Exception as e:
+            if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
+                logger.info(
+                    f"Return None since failed to decode object of type {type(obj)} with pickle: {e}"
+                )
+            return None
 
 
 _struct_types = tuple(

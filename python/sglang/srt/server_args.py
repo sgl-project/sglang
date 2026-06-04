@@ -559,10 +559,12 @@ class ServerArgs:
     enable_lora: Optional[bool] = None
     enable_lora_overlap_loading: Optional[bool] = None
     max_lora_rank: Optional[int] = None
-    lora_target_modules: Optional[Union[set[str], List[str]]] = None
-    lora_paths: Optional[
-        Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]
-    ] = None
+    lora_target_modules: Optional[List[str]] = (
+        None  # Optional[Union[set[str], List[str]]]
+    )
+    lora_paths: Optional[Any] = (
+        None  # Optional[Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]]
+    )
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"

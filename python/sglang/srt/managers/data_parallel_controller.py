@@ -382,7 +382,7 @@ class DataParallelController:
             connected_clients = 0
             while connected_clients < expected_clients:
                 # Wait for client handshake
-                client_rank = rep_socket.recv().decode()
+                client_rank = sock_recv(rep_socket)
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client

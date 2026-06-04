@@ -1561,7 +1561,7 @@ class Scheduler(
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
                 else:
                     if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output, recv_req)
+                        sock_send(self.ipc_channels.recv_from_rpc, output)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -3462,9 +3462,9 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
-        ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
-        ret["memory_usage"] = {
+        server_args = get_global_server_args()
+        last_gen_throughput = self.metrics_reporter.last_gen_throughput
+        memory_usage = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
@@ -3472,24 +3472,30 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
-        ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        effective_max_running_requests_per_dp = self.max_running_requests
 
+        avg_spec_accept_length = None
         if (
             not self.spec_algorithm.is_none()
             and self.metrics_reporter.spec_total_num_forward_ct > 0
         ):
-            ret["avg_spec_accept_length"] = (
+            avg_spec_accept_length = (
                 self.metrics_reporter.spec_total_num_accept_tokens
                 / self.metrics_reporter.spec_total_num_forward_ct
             )
 
+        step_time_dict = None
         if RECORD_STEP_TIME:
-            ret["step_time_dict"] = self.metrics_reporter.step_time_dict
+            step_time_dict = self.metrics_reporter.step_time_dict
 
-        # This field is not serializable.
-        ret.pop("model_config", None)
-
-        return GetInternalStateReqOutput(internal_state=ret)
+        return GetInternalStateReqOutput(
+            server_args=server_args,
+            last_gen_throughput=last_gen_throughput,
+            memory_usage=memory_usage,
+            effective_max_running_requests_per_dp=effective_max_running_requests_per_dp,
+            avg_spec_accept_length=avg_spec_accept_length,
+            step_time_dict=step_time_dict,
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

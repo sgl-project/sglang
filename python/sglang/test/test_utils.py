@@ -106,11 +106,11 @@ DEFAULT_TARGET_MODEL_EAGLE = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
 
 # EAGLE3 model
-DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_TARGET_MODEL_EAGLE3 = "unsloth/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
 
 # DFLASH model
-DEFAULT_TARGET_MODEL_DFLASH = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_TARGET_MODEL_DFLASH = "unsloth/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_DFLASH = "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
 
 # EAGLE2 with DP-Attention models
@@ -118,8 +118,8 @@ DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
 
 # Standalone speculative decoding models
-DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_TARGET_MODEL_STANDALONE = "unsloth/Meta-Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_STANDALONE = "unsloth/Meta-Llama-3.2-1B-Instruct"
 
 # N-gram speculative decoding models
 DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
