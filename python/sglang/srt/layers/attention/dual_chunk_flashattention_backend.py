@@ -21,7 +21,9 @@ from sglang.jit_kernel.flash_attention import (
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionMetadata,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -171,6 +173,35 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         start_head = self.num_heads * get_tensor_model_parallel_rank()
         end_head = start_head + self.num_heads
         return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+
+        if in_capture:
+            self._bind_metadata_buffers(bs, req_pool_indices, forward_mode)
+
+        self._apply_cuda_graph_metadata(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=forward_mode,
+        )
+
+        if in_capture and forward_mode.is_decode_or_idle():
+            # Restore max_seq_len scalars — replay sets actual values but CUDA
+            # graph needs the safe upper bound baked in at capture time.
+            md = self.forward_metadata
+            md.max_seq_len = self.max_context_len
+            md.max_seq_len_intra = self.max_context_len
+            md.max_seq_len_succ = self.max_context_len
+            md.max_seq_len_inter = self.max_context_len
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -532,16 +563,13 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             ),
         }
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _bind_metadata_buffers(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[None],
     ):
+        """Allocate persistent metadata buffers for CUDA graph capture."""
         metadata = DualChunkFlashAttentionMetadata()
 
         if forward_mode.is_decode_or_idle():
@@ -580,19 +608,17 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+    def _apply_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[None],
-        seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: torch.Tensor = None,
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
+        """Shared capture+replay body for the cuda-graph init path.
+
+        Public entry: :py:meth:`init_forward_metadata_out_graph`.
+        """
         assert forward_mode.is_decode()
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]

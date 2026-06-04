@@ -299,6 +299,25 @@ class BypassedTopKOutput(NamedTuple):
         )
 
 
+def _make_round_robin_expert_ids(
+    num_tokens: int,
+    topk: int,
+    num_experts: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    layer_id: Optional[int] = None,
+) -> torch.Tensor:
+    if topk == 0:
+        return torch.empty((num_tokens, 0), device=device, dtype=dtype)
+
+    step = max(num_experts // topk, 1)
+    layer_offset = 0 if layer_id is None else layer_id
+    offsets = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(1)
+    steps = torch.arange(topk, device=device, dtype=dtype).unsqueeze(0) * step
+    return (offsets + layer_offset + steps) % num_experts
+
+
 # -------------------------------- TopK ---------------------------------------
 
 
@@ -1219,6 +1238,38 @@ def biased_grouped_topk_gpu(
                 renormalize,
                 scaling,
             )
+        elif (
+            _is_xpu
+            and num_expert_group == 1
+            and topk_group == 1
+            and num_fused_shared_experts == 0
+            and num_experts <= 256
+            and topk <= 8
+        ):
+            if not apply_routed_scaling_factor_on_output:
+                scaling = 1.0
+
+            num_tokens = gating_output.shape[0]
+
+            topk_values = torch.empty(
+                (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+            )
+            topk_indices = torch.empty(
+                (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+            )
+
+            if num_tokens == 0:
+                return topk_values, topk_indices
+
+            topk_sigmoid(
+                topk_values,
+                topk_indices,
+                gating_output,
+                renormalize,
+                correction_bias,
+            )
+            return topk_values * scaling, topk_indices
+
         else:
             return biased_grouped_topk_impl(
                 hidden_states,
@@ -1533,17 +1584,42 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    if envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get():
-        # Benchmark-only: override gating with uniform round-robin expert assignment
+    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+    simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    if simulate_uniform_experts and simulate_round_robin_experts:
+        raise ValueError(
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
+        )
+
+    if simulate_uniform_experts:
+        # Benchmark-only: override gating with random-offset uniform expert assignment
         # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
         num_tokens, k = topk_ids.shape
         num_experts = router_logits.shape[1]
-        offsets = torch.randint(0, num_experts, (num_tokens, 1), device=topk_ids.device)
-        steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
-        topk_ids = ((offsets + steps * (num_experts // k)) % num_experts).to(
-            topk_ids.dtype
+        if k > 0:
+            offsets = torch.randint(
+                0, num_experts, (num_tokens, 1), device=topk_ids.device
+            )
+            steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
+            step = max(num_experts // k, 1)
+            topk_ids = ((offsets + steps * step) % num_experts).to(topk_ids.dtype)
+            topk_weights = torch.ones_like(topk_weights) / k
+    elif simulate_round_robin_experts:
+        # Benchmark-only: override gating with deterministic expert assignment
+        # to avoid routing noise from dummy/random weights. Do NOT use in production.
+        num_tokens, k = topk_ids.shape
+        num_experts = router_logits.shape[1]
+        topk_ids = _make_round_robin_expert_ids(
+            num_tokens,
+            k,
+            num_experts,
+            device=topk_ids.device,
+            dtype=topk_ids.dtype,
+            layer_id=layer_id,
         )
-        topk_weights = torch.ones_like(topk_weights) / k
+        if k > 0:
+            topk_weights = torch.full_like(topk_weights, 1.0 / k)
 
     topk_ids, topk_weights = _post_process_topk_ids(
         topk_ids=topk_ids,
