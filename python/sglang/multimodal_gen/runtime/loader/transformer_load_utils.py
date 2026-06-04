@@ -16,6 +16,7 @@ from typing import Callable, Optional
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -361,12 +362,14 @@ def resolve_transformer_quant_load_spec(
     component_model_path: str,
     model_cls: type[nn.Module],
     cls_name: str,
+    arch_config: DiTArchConfig | None = None,
 ) -> TransformerQuantLoadSpec:
     quant_config = _resolve_quant_config(
         hf_config=hf_config,
         server_args=server_args,
         safetensors_list=safetensors_list,
         component_model_path=component_model_path,
+        arch_config=arch_config,
     )
 
     if quant_config is not None:
@@ -480,6 +483,7 @@ def _resolve_quant_config(
     server_args: ServerArgs,
     safetensors_list: list[str],
     component_model_path: str,
+    arch_config: DiTArchConfig | None = None,
 ) -> Optional[QuantizationConfig]:
     """
     resolve quant config from checkpoints' metadata
@@ -506,7 +510,7 @@ def _resolve_quant_config(
             if quant_config is not None:
                 return quant_config
 
-    arch_config = server_args.pipeline_config.dit_config.arch_config
+    arch_config = arch_config or server_args.pipeline_config.dit_config.arch_config
     param_names_mapping_dict = arch_config.param_names_mapping
     reverse_param_names_mapping_dict = getattr(
         arch_config, "reverse_param_names_mapping", None

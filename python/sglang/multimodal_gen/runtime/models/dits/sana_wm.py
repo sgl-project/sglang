@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import tensor_parallel_rms_norm
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -188,6 +189,417 @@ def _sana_wm_sequence_shard_enabled(sp_size: int) -> bool:
 def _sana_wm_linear(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     out = module(x)
     return out[0] if isinstance(out, tuple) else out
+
+
+class _SanaWMLinearSequential(nn.Sequential):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        for module in self:
+            input = _sana_wm_linear(module, input)
+        return input
+
+
+def _sana_wm_column_parallel_or_linear(
+    input_size: int,
+    output_size: int,
+    *,
+    bias: bool = True,
+    gather_output: bool = False,
+    fallback_to_replicated: bool = False,
+) -> nn.Module:
+    tp_size = _sana_wm_tp_world_size()
+    if tp_size <= 1:
+        return nn.Linear(input_size, output_size, bias=bias)
+    if output_size % tp_size != 0:
+        if fallback_to_replicated:
+            return nn.Linear(input_size, output_size, bias=bias)
+        raise ValueError(
+            "SANA-WM tensor parallelism requires column-parallel output_size "
+            f"to be divisible by tp_size, got output_size={output_size}, "
+            f"tp_size={tp_size}."
+        )
+    return ColumnParallelLinear(
+        input_size,
+        output_size,
+        bias=bias,
+        gather_output=gather_output,
+    )
+
+
+def _sana_wm_row_parallel_or_linear(
+    input_size: int,
+    output_size: int,
+    *,
+    bias: bool = True,
+    input_is_parallel: bool = True,
+) -> nn.Module:
+    tp_size = _sana_wm_tp_world_size()
+    if tp_size <= 1:
+        return nn.Linear(input_size, output_size, bias=bias)
+    if input_size % tp_size != 0:
+        raise ValueError(
+            "SANA-WM tensor parallelism requires row-parallel input_size "
+            f"to be divisible by tp_size, got input_size={input_size}, "
+            f"tp_size={tp_size}."
+        )
+    return RowParallelLinear(
+        input_size,
+        output_size,
+        bias=bias,
+        input_is_parallel=input_is_parallel,
+    )
+
+
+class _SanaWMColumnParallelConvNd(nn.Module):
+    _conv_fn: Callable
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias: bool = True,
+        gather_output: bool = False,
+        paired_output: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = 1
+        self.gather_output = gather_output
+        self.paired_output = paired_output
+        self.tp_size = _sana_wm_tp_world_size()
+        self.tp_rank = _sana_wm_tp_rank()
+
+        if self.tp_size <= 1:
+            self.local_out_channels = out_channels
+        elif paired_output:
+            if out_channels % (2 * self.tp_size) != 0:
+                raise ValueError(
+                    "SANA-WM paired column-parallel conv requires out_channels "
+                    f"to be divisible by 2*tp_size, got out_channels={out_channels}, "
+                    f"tp_size={self.tp_size}."
+                )
+            self.local_out_channels = out_channels // self.tp_size
+        else:
+            if out_channels % self.tp_size != 0:
+                raise ValueError(
+                    "SANA-WM column-parallel conv requires out_channels to be "
+                    f"divisible by tp_size, got out_channels={out_channels}, "
+                    f"tp_size={self.tp_size}."
+                )
+            self.local_out_channels = out_channels // self.tp_size
+
+        self.weight = nn.Parameter(
+            torch.empty(self.local_out_channels, in_channels, *kernel_size)
+        )
+        set_weight_attrs(
+            self.weight,
+            {
+                "output_dim": 0,
+                "weight_loader": self.weight_loader,
+            },
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.local_out_channels))
+            set_weight_attrs(
+                self.bias,
+                {
+                    "output_dim": 0,
+                    "weight_loader": self.weight_loader,
+                },
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_channels * math.prod(self.kernel_size)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def _local_output_shard(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        if self.tp_size <= 1 or tuple(loaded_weight.shape) == tuple(
+            self.weight.shape
+        ):
+            return loaded_weight
+        if self.paired_output:
+            half = loaded_weight.shape[0] // 2
+            local_half = half // self.tp_size
+            start = self.tp_rank * local_half
+            first = loaded_weight.narrow(0, start, local_half)
+            second = loaded_weight.narrow(0, half + start, local_half)
+            return torch.cat((first, second), dim=0)
+        shard_size = self.local_out_channels
+        start = self.tp_rank * shard_size
+        return loaded_weight.narrow(0, start, shard_size)
+
+    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim == 0 and tuple(param.shape) != tuple(loaded_weight.shape):
+            loaded_weight = self._local_output_shard(loaded_weight)
+        assert param.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self._conv_fn(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+        if self.gather_output and self.tp_size > 1:
+            out = tensor_model_parallel_all_gather(out.contiguous(), dim=1)
+        return out
+
+
+class _SanaWMColumnParallelConv2d(_SanaWMColumnParallelConvNd):
+    _conv_fn = staticmethod(F.conv2d)
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias: bool = True,
+        gather_output: bool = False,
+        paired_output: bool = False,
+    ) -> None:
+        kernel_size = nn.modules.utils._pair(kernel_size)
+        stride = nn.modules.utils._pair(stride)
+        padding = nn.modules.utils._pair(padding)
+        dilation = nn.modules.utils._pair(dilation)
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+            gather_output=gather_output,
+            paired_output=paired_output,
+        )
+
+
+class _SanaWMColumnParallelConv3d(_SanaWMColumnParallelConvNd):
+    _conv_fn = staticmethod(F.conv3d)
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias: bool = True,
+        gather_output: bool = False,
+    ) -> None:
+        kernel_size = nn.modules.utils._triple(kernel_size)
+        stride = nn.modules.utils._triple(stride)
+        padding = nn.modules.utils._triple(padding)
+        dilation = nn.modules.utils._triple(dilation)
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+            gather_output=gather_output,
+        )
+
+
+class _SanaWMPairedDepthwiseConv2d(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = nn.modules.utils._pair(kernel_size)
+        self.stride = nn.modules.utils._pair(stride)
+        self.padding = nn.modules.utils._pair(padding)
+        self.dilation = nn.modules.utils._pair(dilation)
+        self.tp_size = _sana_wm_tp_world_size()
+        self.tp_rank = _sana_wm_tp_rank()
+        if self.tp_size <= 1:
+            self.local_channels = channels
+        else:
+            if channels % (2 * self.tp_size) != 0:
+                raise ValueError(
+                    "SANA-WM paired depthwise conv requires channels to be "
+                    f"divisible by 2*tp_size, got channels={channels}, "
+                    f"tp_size={self.tp_size}."
+                )
+            self.local_channels = channels // self.tp_size
+        self.out_channels = self.local_channels
+        self.groups = self.local_channels
+        self.weight = nn.Parameter(
+            torch.empty(self.local_channels, 1, *self.kernel_size)
+        )
+        set_weight_attrs(
+            self.weight,
+            {
+                "output_dim": 0,
+                "weight_loader": self.weight_loader,
+            },
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.local_channels))
+            set_weight_attrs(
+                self.bias,
+                {
+                    "output_dim": 0,
+                    "weight_loader": self.weight_loader,
+                },
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = math.prod(self.kernel_size)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def _local_channel_shard(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        if self.tp_size <= 1 or tuple(loaded_weight.shape) == tuple(
+            self.weight.shape
+        ):
+            return loaded_weight
+        half = loaded_weight.shape[0] // 2
+        local_half = half // self.tp_size
+        start = self.tp_rank * local_half
+        first = loaded_weight.narrow(0, start, local_half)
+        second = loaded_weight.narrow(0, half + start, local_half)
+        return torch.cat((first, second), dim=0)
+
+    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim == 0 and tuple(param.shape) != tuple(loaded_weight.shape):
+            loaded_weight = self._local_channel_shard(loaded_weight)
+        assert param.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+
+
+class _SanaWMRowParallelConv2d(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = nn.modules.utils._pair(kernel_size)
+        self.stride = nn.modules.utils._pair(stride)
+        self.padding = nn.modules.utils._pair(padding)
+        self.dilation = nn.modules.utils._pair(dilation)
+        self.groups = 1
+        self.tp_size = _sana_wm_tp_world_size()
+        self.tp_rank = _sana_wm_tp_rank()
+        if self.tp_size <= 1:
+            self.local_in_channels = in_channels
+        else:
+            if in_channels % self.tp_size != 0:
+                raise ValueError(
+                    "SANA-WM row-parallel conv requires in_channels to be "
+                    f"divisible by tp_size, got in_channels={in_channels}, "
+                    f"tp_size={self.tp_size}."
+                )
+            self.local_in_channels = in_channels // self.tp_size
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, self.local_in_channels, *self.kernel_size)
+        )
+        set_weight_attrs(
+            self.weight,
+            {
+                "input_dim": 1,
+                "weight_loader": self.weight_loader,
+            },
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+            set_weight_attrs(
+                self.bias,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.local_in_channels * math.prod(self.kernel_size)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        input_dim = getattr(param, "input_dim", None)
+        if input_dim == 1 and tuple(param.shape) != tuple(loaded_weight.shape):
+            shard_size = param.shape[input_dim]
+            start = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(input_dim, start, shard_size)
+        assert param.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = None if self.tp_rank > 0 else self.bias
+        out = F.conv2d(
+            x,
+            self.weight,
+            bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+        if self.tp_size > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out
 
 
 def _sana_wm_all_gather_hidden(x: torch.Tensor, tp_size: int) -> torch.Tensor:
@@ -930,9 +1342,23 @@ class PatchEmbedMS3D(nn.Module):
         kernel_size = kernel_size or patch_size
         assert patch_size[0] == 1, "Temporal patch must be 1 for SANA-WM."
         self.patch_size = patch_size
-        self.proj = nn.Conv3d(
-            in_chans, embed_dim, kernel_size=kernel_size, stride=patch_size, bias=bias
-        )
+        if _sana_wm_tp_world_size() > 1:
+            self.proj = _SanaWMColumnParallelConv3d(
+                in_chans,
+                embed_dim,
+                kernel_size=kernel_size,
+                stride=patch_size,
+                bias=bias,
+                gather_output=True,
+            )
+        else:
+            self.proj = nn.Conv3d(
+                in_chans,
+                embed_dim,
+                kernel_size=kernel_size,
+                stride=patch_size,
+                bias=bias,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)  # (B, D, T, H, W)
@@ -944,12 +1370,24 @@ class _UpstreamMlp(nn.Module):
         self, in_features: int, hidden_features: int, out_features: int
     ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
+        self.fc1 = _sana_wm_column_parallel_or_linear(
+            in_features,
+            hidden_features,
+            bias=True,
+            gather_output=False,
+        )
         self.act = nn.GELU(approximate="tanh")
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+        self.fc2 = _sana_wm_row_parallel_or_linear(
+            hidden_features,
+            out_features,
+            bias=True,
+            input_is_parallel=True,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)))
+        x = _sana_wm_linear(self.fc1, x)
+        x = self.act(x)
+        return _sana_wm_linear(self.fc2, x)
 
 
 class CaptionEmbedder(nn.Module):
@@ -977,8 +1415,12 @@ class T2IFinalLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(
-            hidden_size, math.prod(patch_size) * out_channels, bias=True
+        self.linear = _sana_wm_column_parallel_or_linear(
+            hidden_size,
+            math.prod(patch_size) * out_channels,
+            bias=True,
+            gather_output=True,
+            fallback_to_replicated=True,
         )
         self.scale_shift_table = nn.Parameter(
             torch.randn(2, hidden_size) / hidden_size**0.5
@@ -1000,8 +1442,7 @@ class T2IFinalLayer(nn.Module):
             x = self.norm_final(x).reshape(B, num_frames, tokens_per_frame, D)
             x = x * (1 + scale) + shift
             x = x.reshape(B, N, D)
-        return self.linear(x)
-
+        return _sana_wm_linear(self.linear, x)
 
 
 def _sinusoidal_timestep_embedding(
@@ -1024,10 +1465,20 @@ class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+        self.mlp = _SanaWMLinearSequential(
+            _sana_wm_column_parallel_or_linear(
+                frequency_embedding_size,
+                hidden_size,
+                bias=True,
+                gather_output=False,
+            ),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            _sana_wm_row_parallel_or_linear(
+                hidden_size,
+                hidden_size,
+                bias=True,
+                input_is_parallel=True,
+            ),
         )
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
@@ -1057,12 +1508,47 @@ class GLUMBConvTemp(nn.Module):
         self, in_features: int, hidden_features: int, t_kernel_size: int = 3
     ) -> None:
         super().__init__()
-        self.inverted_conv = _ConvLayer(
-            nn.Conv2d(in_features, hidden_features * 2, 1, 1, 0, bias=True),
-            act=nn.SiLU(inplace=False),
-        )
-        self.depth_conv = _ConvLayer(
-            nn.Conv2d(
+        tp_size = _sana_wm_tp_world_size()
+        if tp_size > 1:
+            inverted_conv = _SanaWMColumnParallelConv2d(
+                in_features,
+                hidden_features * 2,
+                1,
+                1,
+                0,
+                bias=True,
+                gather_output=False,
+                paired_output=True,
+            )
+            depth_conv = _SanaWMPairedDepthwiseConv2d(
+                hidden_features * 2,
+                3,
+                1,
+                1,
+                bias=True,
+            )
+            point_conv = _SanaWMRowParallelConv2d(
+                hidden_features,
+                in_features,
+                1,
+                1,
+                0,
+                bias=False,
+            )
+            t_conv = _SanaWMColumnParallelConv2d(
+                in_features,
+                in_features,
+                kernel_size=(t_kernel_size, 1),
+                stride=1,
+                padding=(t_kernel_size // 2, 0),
+                bias=False,
+                gather_output=True,
+            )
+        else:
+            inverted_conv = nn.Conv2d(
+                in_features, hidden_features * 2, 1, 1, 0, bias=True
+            )
+            depth_conv = nn.Conv2d(
                 hidden_features * 2,
                 hidden_features * 2,
                 3,
@@ -1070,24 +1556,31 @@ class GLUMBConvTemp(nn.Module):
                 1,
                 groups=hidden_features * 2,
                 bias=True,
-            ),
+            )
+            point_conv = nn.Conv2d(hidden_features, in_features, 1, 1, 0, bias=False)
+            t_conv = nn.Conv2d(
+                in_features,
+                in_features,
+                kernel_size=(t_kernel_size, 1),
+                stride=1,
+                padding=(t_kernel_size // 2, 0),
+                bias=False,
+            )
+        self.inverted_conv = _ConvLayer(
+            inverted_conv,
+            act=nn.SiLU(inplace=False),
+        )
+        self.depth_conv = _ConvLayer(
+            depth_conv,
             act=None,
         )
         self.point_conv = _ConvLayer(
-            nn.Conv2d(hidden_features, in_features, 1, 1, 0, bias=False),
+            point_conv,
             act=None,
         )
         self.glu_act = nn.SiLU(inplace=False)
 
-        t_padding = t_kernel_size // 2
-        self.t_conv = nn.Conv2d(
-            in_features,
-            in_features,
-            kernel_size=(t_kernel_size, 1),
-            stride=1,
-            padding=(t_padding, 0),
-            bias=False,
-        )
+        self.t_conv = t_conv
         nn.init.zeros_(self.t_conv.weight)
 
     def _apply_spatial(self, x: torch.Tensor) -> torch.Tensor:
@@ -1142,17 +1635,22 @@ def _compute_frame_gates(
     x: torch.Tensor,  # (B, N, C)
     HW: Tuple[int, int, int],
     heads: int,
-    beta_proj: nn.Linear,
-    gate_proj: nn.Linear,
+    beta_proj: nn.Module,
+    gate_proj: nn.Module,
     dt_bias: torch.Tensor,
     A_log: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, N, C = x.shape
     T, H, W = HW
     S = H * W
-    beta = beta_proj(x).sigmoid().reshape(B, T, S, heads).permute(0, 3, 1, 2)
+    beta = (
+        _sana_wm_linear(beta_proj, x)
+        .sigmoid()
+        .reshape(B, T, S, heads)
+        .permute(0, 3, 1, 2)
+    )
     x_frame = x.reshape(B, T, S, C).mean(dim=2)
-    a_out = gate_proj(x_frame).float()
+    a_out = _sana_wm_linear(gate_proj, x_frame).float()
     dt = dt_bias.float().view(1, 1, -1)
     A_val = A_log.float().exp().view(1, 1, -1)
     decay = (-A_val * F.softplus(a_out + dt)).exp().transpose(1, 2)  # (B, H, T)
@@ -1666,7 +2164,12 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
         else:
             self.qkv = nn.Linear(in_dim, 3 * out_dim, bias=False)
-        self.proj = nn.Linear(out_dim, out_dim, bias=True)
+        if self.use_tp:
+            self.proj = RowParallelLinear(
+                out_dim, out_dim, bias=True, input_is_parallel=True
+            )
+        else:
+            self.proj = nn.Linear(out_dim, out_dim, bias=True)
 
         if qk_norm:
             self.q_norm = _RMSNorm(in_dim, eps=1e-5)
@@ -1680,12 +2183,25 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             self.k_norm_cam = nn.Identity()
 
         # GDN-specific (also held by softmax variant for state_dict compat)
-        self.beta_proj = nn.Linear(in_dim, heads, bias=True)
-        self.gate_proj = nn.Linear(in_dim, heads, bias=True)
+        if self.use_tp:
+            self.beta_proj = ColumnParallelLinear(
+                in_dim, heads, bias=True, gather_output=False
+            )
+            self.gate_proj = ColumnParallelLinear(
+                in_dim, heads, bias=True, gather_output=False
+            )
+        else:
+            self.beta_proj = nn.Linear(in_dim, heads, bias=True)
+            self.gate_proj = nn.Linear(in_dim, heads, bias=True)
         self.A_log = nn.Parameter(torch.log(torch.empty(heads).uniform_(0, 16)))
         self.dt_bias = nn.Parameter(torch.full((heads,), -5.0))
         self.register_buffer("recall_gate", torch.zeros(1))
-        self.output_gate = nn.Linear(in_dim, out_dim, bias=True)
+        if self.use_tp:
+            self.output_gate = ColumnParallelLinear(
+                in_dim, out_dim, bias=True, gather_output=False
+            )
+        else:
+            self.output_gate = nn.Linear(in_dim, out_dim, bias=True)
 
         conv_hidden_size = self.local_out_dim if self.use_tp else out_dim
         if conv_kernel_size > 0 and not softmax_main:
@@ -1715,7 +2231,12 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             self.q_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
             self.k_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
             self.v_proj_cam = nn.Linear(in_dim, out_dim, bias=True)
-        self.out_proj_cam = nn.Linear(out_dim, out_dim, bias=True)
+        if self.use_tp:
+            self.out_proj_cam = ColumnParallelLinear(
+                out_dim, out_dim, bias=True, gather_output=False
+            )
+        else:
+            self.out_proj_cam = nn.Linear(out_dim, out_dim, bias=True)
         nn.init.zeros_(self.out_proj_cam.weight)
         nn.init.zeros_(self.out_proj_cam.bias)
         if conv_kernel_size > 0 and not softmax_main:
@@ -2389,19 +2910,23 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             k = k.reshape(B, N, self.local_heads, self.dim)
             qkv = torch.stack((q, k, v), dim=2).contiguous()
 
+        gate_heads = self.local_heads if self.use_tp else self.heads
+        dt_bias = self.dt_bias
+        A_log = self.A_log
+        if self.use_tp:
+            head_start = self.tp_rank * self.local_heads
+            dt_bias = dt_bias.narrow(0, head_start, self.local_heads)
+            A_log = A_log.narrow(0, head_start, self.local_heads)
+
         beta, decay = _compute_frame_gates(
             x,
             HW,
-            self.heads,
+            gate_heads,
             self.beta_proj,
             self.gate_proj,
-            self.dt_bias,
-            self.A_log,
+            dt_bias,
+            A_log,
         )
-        if self.use_tp:
-            head_start = self.tp_rank * self.local_heads
-            beta = beta.narrow(1, head_start, self.local_heads)
-            decay = decay.narrow(1, head_start, self.local_heads)
 
         k_scale = (self.dim**-0.5) * (S**-0.5)
         triton_out = self._try_triton_main_gdn(
@@ -2414,7 +2939,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         )
         if triton_out is not None:
             out = triton_out.reshape(B, N, local_C)
-            out = _sana_wm_all_gather_hidden(out, self.tp_size)
             return out, beta, decay
 
         preprocessed = self._try_triton_qkv_gdn_preprocess(
@@ -2475,7 +2999,6 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         ).to(dtype)
 
         out = out.permute(0, 3, 1, 2).reshape(B, N, local_C)
-        out = _sana_wm_all_gather_hidden(out, self.tp_size)
         return out, beta, decay
 
     def _main_branch_softmax(
@@ -2534,8 +3057,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if out is None:
             out = self.softmax_attn(q_in, k_in, v_in)
         out = out.reshape(B, N, local_C)
-        return _sana_wm_all_gather_hidden(out, self.tp_size)
-
+        return out
 
     def _cam_branch(
         self,
@@ -2624,7 +3146,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 else triton_out_bhnd
             )
             out = out_bhnd.permute(0, 2, 1, 3).reshape(B, N, local_C)
-            return _sana_wm_all_gather_hidden(out, self.tp_size)
+            return out
 
         q = _sana_wm_tp_rms_norm(
             q.reshape(B, N, local_C),
@@ -2708,7 +3230,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         # apply inverse UCPE projection on output
         out_bhnd = apply_o(out_bhnd)
         out = out_bhnd.permute(0, 2, 1, 3).reshape(B, N, local_C)
-        return _sana_wm_all_gather_hidden(out, self.tp_size)
+        return out
 
     def _cam_branch_softmax(
         self,
@@ -2806,8 +3328,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         )
         out_bhnd = apply_o(out_bhnd) if triton_out_bhnd is None else triton_out_bhnd
         out = out_bhnd.transpose(1, 2).reshape(B, N, local_C)
-        return _sana_wm_all_gather_hidden(out, self.tp_size)
-
+        return out
 
     def forward(
         self,
@@ -2861,15 +3382,17 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     rotary_emb=rotary_emb,
                     raymats_flat=raymats_flat,
                 )
-            combined = main_raw + self.out_proj_cam(cam_raw)
+            if self.use_tp:
+                cam_raw = _sana_wm_all_gather_hidden(cam_raw, self.tp_size)
+            combined = main_raw + _sana_wm_linear(self.out_proj_cam, cam_raw)
         else:
             combined = main_raw
 
         # Shared output gate + shared output projection. Upstream evaluates
         # the SiLU gate in fp32 and multiplies before casting for proj.
-        gate = F.silu(self.output_gate(x).to(torch.float32))
+        gate = F.silu(_sana_wm_linear(self.output_gate, x).to(torch.float32))
         combined = combined * gate
-        out = self.proj(combined.to(self.proj.weight.dtype))
+        out = _sana_wm_linear(self.proj, combined.to(self.proj.weight.dtype))
         return out
 
 
@@ -2909,7 +3432,12 @@ class MultiHeadCrossAttention(nn.Module):
         else:
             self.q_linear = nn.Linear(d_model, d_model, bias=True)
             self.kv_linear = nn.Linear(d_model, d_model * 2, bias=True)
-        self.proj = nn.Linear(d_model, d_model, bias=True)
+        if self.use_tp:
+            self.proj = RowParallelLinear(
+                d_model, d_model, bias=True, input_is_parallel=True
+            )
+        else:
+            self.proj = nn.Linear(d_model, d_model, bias=True)
         if qk_norm:
             self.q_norm = _RMSNorm(d_model, eps=1e-6)
             self.k_norm = _RMSNorm(d_model, eps=1e-6)
@@ -2952,8 +3480,7 @@ class MultiHeadCrossAttention(nn.Module):
         attn_mask = mask.bool() if mask is not None else None
         out = self.attn(q, k, v, attn_mask=attn_mask)  # (B, N, H, D)
         out = out.reshape(B, N, self.local_d_model)
-        out = _sana_wm_all_gather_hidden(out, self.tp_size)
-        return self.proj(out)
+        return _sana_wm_linear(self.proj, out)
 
 
 # ---------------------------------------------------------------------------
@@ -3028,7 +3555,12 @@ class SanaWMBlock(nn.Module):
         )
 
         if use_chunk_plucker_post_attn:
-            self.plucker_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+            self.plucker_proj = _sana_wm_column_parallel_or_linear(
+                hidden_size,
+                hidden_size,
+                bias=True,
+                gather_output=True,
+            )
             nn.init.zeros_(self.plucker_proj.weight)
             nn.init.zeros_(self.plucker_proj.bias)
         else:
@@ -3105,7 +3637,7 @@ class SanaWMBlock(nn.Module):
 
         # Plücker post-attn injection (zero-init linear)
         if self.plucker_proj is not None and plucker_emb is not None:
-            x = x + self.plucker_proj(plucker_emb)
+            x = x + _sana_wm_linear(self.plucker_proj, plucker_emb)
 
         # Cross-attention
         x = x + self.cross_attn(x, y, mask=mask)
@@ -3186,9 +3718,14 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.t_embedder = TimestepEmbedder(self.inner_dim, frequency_embedding_size=256)
-        self.t_block = nn.Sequential(
+        self.t_block = _SanaWMLinearSequential(
             nn.SiLU(),
-            nn.Linear(self.inner_dim, 6 * self.inner_dim, bias=True),
+            _sana_wm_column_parallel_or_linear(
+                self.inner_dim,
+                6 * self.inner_dim,
+                bias=True,
+                gather_output=True,
+            ),
         )
 
         self.y_embedder = CaptionEmbedder(

@@ -9,7 +9,12 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_group,
+    get_tp_rank,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
 )
@@ -88,6 +93,90 @@ def _sana_wm_should_do_cfg(batch: Req) -> bool:
     return bool(getattr(batch, "do_classifier_free_guidance", False)) or (
         _sana_wm_effective_guidance_scale(batch) > 1.0
         and _sana_wm_has_negative_condition(batch)
+    )
+
+
+def _sana_wm_stage_tp_world_size() -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 1
+    try:
+        return get_tp_world_size()
+    except AssertionError:
+        return 1
+
+
+def _sana_wm_stage_tp_rank() -> int:
+    if _sana_wm_stage_tp_world_size() <= 1:
+        return 0
+    try:
+        return get_tp_rank()
+    except AssertionError:
+        return 0
+
+
+def _sana_wm_is_tp_rank0() -> bool:
+    return _sana_wm_stage_tp_rank() == 0
+
+
+def _sana_wm_broadcast_tensor_dict_from_tp_rank0(
+    tensor_dict: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if _sana_wm_stage_tp_world_size() <= 1:
+        if tensor_dict is None:
+            raise RuntimeError("SANA-WM TP broadcast payload is missing on rank 0.")
+        return tensor_dict
+    broadcasted = get_tp_group().broadcast_tensor_dict(tensor_dict, src=0)
+    if broadcasted is None:
+        raise RuntimeError("SANA-WM TP broadcast returned no payload.")
+    return broadcasted
+
+
+def _pack_sana_wm_text_outputs(
+    outputs: tuple[
+        list[torch.Tensor],
+        list[torch.Tensor | None],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[list[int]],
+    ],
+) -> dict[str, Any]:
+    embeds, masks, pooled, embeds_masks, seq_lens = outputs
+    return {
+        "embeds_count": len(embeds),
+        "embeds": {str(index): tensor for index, tensor in enumerate(embeds)},
+        "masks_count": len(masks),
+        "masks": {str(index): tensor for index, tensor in enumerate(masks)},
+        "pooled_count": len(pooled),
+        "pooled": {str(index): tensor for index, tensor in enumerate(pooled)},
+        "embeds_masks_count": len(embeds_masks),
+        "embeds_masks": {
+            str(index): tensor for index, tensor in enumerate(embeds_masks)
+        },
+        "seq_lens": seq_lens,
+    }
+
+
+def _unpack_sana_wm_text_outputs(
+    payload: dict[str, Any],
+) -> tuple[
+    list[torch.Tensor],
+    list[torch.Tensor | None],
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[list[int]],
+]:
+    def ordered_tensors(name: str) -> list[Any]:
+        values = payload.get(name, {})
+        return [
+            values[str(index)] for index in range(int(payload.get(f"{name}_count", 0)))
+        ]
+
+    return (
+        ordered_tensors("embeds"),
+        ordered_tensors("masks"),
+        ordered_tensors("pooled"),
+        ordered_tensors("embeds_masks"),
+        payload.get("seq_lens", []),
     )
 
 
@@ -462,6 +551,13 @@ def _align_sana_wm_cfg_text_conditions(
 
 
 class SanaWMTextEncodingStage(TextEncodingStage):
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        if _sana_wm_stage_tp_world_size() > 1 and not _sana_wm_is_tp_rank0():
+            return []
+        return super().component_uses(server_args, stage_name)
+
     @staticmethod
     def _text_encoder_max_length(server_args: ServerArgs) -> int:
         encoder_cfg = server_args.pipeline_config.text_encoder_configs[0]
@@ -510,6 +606,26 @@ class SanaWMTextEncodingStage(TextEncodingStage):
                 seq_lens.append([int(x) for x in mask.long().sum(dim=-1).tolist()])
         return seq_lens
 
+    def _encode_text_on_tp_rank0(
+        self,
+        *args,
+        **kwargs,
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor | None],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[list[int]],
+    ]:
+        if _sana_wm_stage_tp_world_size() <= 1:
+            return self.encode_text(*args, **kwargs)
+
+        payload = None
+        if _sana_wm_is_tp_rank0():
+            payload = _pack_sana_wm_text_outputs(self.encode_text(*args, **kwargs))
+        payload = _sana_wm_broadcast_tensor_dict_from_tp_rank0(payload)
+        return _unpack_sana_wm_text_outputs(payload)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if len(self.text_encoders) != 1:
@@ -539,7 +655,7 @@ class SanaWMTextEncodingStage(TextEncodingStage):
             pooler_embeds_list,
             prompt_embeds_masks_list,
             _prompt_seq_lens_list,
-        ) = self.encode_text(
+        ) = self._encode_text_on_tp_rank0(
             prompt_text,
             server_args,
             encoder_index=[0],
@@ -582,7 +698,7 @@ class SanaWMTextEncodingStage(TextEncodingStage):
                 neg_pooler_embeds_list,
                 neg_embeds_masks_list,
                 _neg_seq_lens_list,
-            ) = self.encode_text(
+            ) = self._encode_text_on_tp_rank0(
                 negative_prompt,
                 server_args,
                 encoder_index=[0],

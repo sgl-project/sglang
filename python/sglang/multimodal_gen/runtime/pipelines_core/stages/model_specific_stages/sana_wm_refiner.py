@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMDecodingStage,
+    _sana_wm_broadcast_tensor_dict_from_tp_rank0,
+    _sana_wm_is_tp_rank0,
+    _sana_wm_stage_tp_world_size,
     log_sana_wm_tensor_stats,
     sana_wm_diagnostics_enabled,
 )
@@ -93,13 +96,13 @@ def _truthy_flag(value: Any) -> bool:
     return False
 
 
-def sana_wm_skip_refiner_enabled(batch: Req | None = None) -> bool:
-    if os.getenv("SGLANG_SANA_WM_SKIP_REFINER", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+def sana_wm_skip_refiner_enabled(
+    batch: Req | None = None,
+    pipeline_config: Any | None = None,
+) -> bool:
+    if _truthy_flag(getattr(pipeline_config, "sana_wm_skip_refiner", False)):
+        return True
+    if _truthy_flag(os.getenv("SGLANG_SANA_WM_SKIP_REFINER", "")):
         return True
     if batch is None:
         return False
@@ -130,6 +133,27 @@ def _is_current_cfg_main_rank() -> bool:
         return get_classifier_free_guidance_rank() == 0
     except AssertionError:
         return True
+
+
+def _configured_tp_size(server_args: Any) -> int:
+    try:
+        return max(int(getattr(server_args, "tp_size", 1) or 1), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _is_current_world_main_rank() -> bool:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+
+def _is_current_refiner_execution_rank(server_args: Any) -> bool:
+    if getattr(server_args, "enable_cfg_parallel", False):
+        return _is_current_cfg_main_rank()
+    if _configured_tp_size(server_args) > 1:
+        return _is_current_world_main_rank()
+    return True
 
 
 def _pack_text_embeds(
@@ -190,6 +214,24 @@ def _unwrap_diffusers_ltx2_refiner(transformer: nn.Module) -> nn.Module:
 def _uses_diffusers_ltx2_refiner(transformer: nn.Module) -> bool:
     transformer = _unwrap_diffusers_ltx2_refiner(transformer)
     return transformer.__class__.__name__ == "LTX2VideoTransformer3DModel"
+
+
+def _uses_native_sana_wm_refiner(transformer: nn.Module) -> bool:
+    return transformer.__class__.__name__ == "SanaWMLTX2VideoRefiner"
+
+
+def _uses_tp_parallel_refiner(transformer: nn.Module, server_args: Any) -> bool:
+    return (
+        _uses_native_sana_wm_refiner(transformer)
+        and _configured_tp_size(server_args) > 1
+        and not getattr(server_args, "enable_cfg_parallel", False)
+    )
+
+
+def _uses_native_refiner_tp_group(transformer: nn.Module, server_args: Any) -> bool:
+    return _uses_native_sana_wm_refiner(transformer) and _configured_tp_size(
+        server_args
+    ) > 1
 
 
 def _as_additive_attention_mask(
@@ -415,22 +457,42 @@ class SanaWMLTX2RefinerStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
+        if _uses_tp_parallel_refiner(self.transformer, self.server_args):
+            return StageParallelismType.REPLICATED
         if getattr(self.server_args, "enable_cfg_parallel", False):
             return StageParallelismType.MAIN_RANK_ONLY
+        if _configured_tp_size(self.server_args) > 1:
+            return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
         return StageParallelismType.REPLICATED
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        if sana_wm_skip_refiner_enabled():
+        if sana_wm_skip_refiner_enabled(
+            pipeline_config=getattr(server_args, "pipeline_config", None)
+        ):
             return []
         if (
-            getattr(server_args, "enable_cfg_parallel", False)
-            and not _is_current_cfg_main_rank()
+            not _uses_tp_parallel_refiner(self.transformer, server_args)
+            and not _is_current_refiner_execution_rank(server_args)
         ):
             return []
 
         stage_name = self._component_stage_name(stage_name)
+        if (
+            _uses_native_refiner_tp_group(self.transformer, server_args)
+            and not _sana_wm_is_tp_rank0()
+        ):
+            return [
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="transformer_2",
+                    target_dtype=self.dtype,
+                    memory_intensive=True,
+                    allow_prefetch=False,
+                )
+            ]
+
         return [
             ComponentUse(
                 stage_name=stage_name,
@@ -469,6 +531,37 @@ class SanaWMLTX2RefinerStage(PipelineStage):
 
     @torch.inference_mode()
     def _encode_prompts(
+        self,
+        prompts: list[str],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._should_broadcast_prompt_encoding_over_tp():
+            payload = None
+            if _sana_wm_is_tp_rank0():
+                prompt_embeds, attention_mask = self._encode_prompts_local(
+                    prompts, device
+                )
+                payload = {
+                    "prompt_embeds": prompt_embeds,
+                    "attention_mask": attention_mask,
+                }
+            payload = _sana_wm_broadcast_tensor_dict_from_tp_rank0(payload)
+            return (
+                payload["prompt_embeds"].to(device=device, dtype=self.dtype),
+                payload["attention_mask"].to(device=device),
+            )
+
+        return self._encode_prompts_local(prompts, device)
+
+    def _should_broadcast_prompt_encoding_over_tp(self) -> bool:
+        server_args = getattr(self, "server_args", None)
+        return (
+            _uses_native_refiner_tp_group(self.transformer, server_args)
+            and _sana_wm_stage_tp_world_size() > 1
+        )
+
+    @torch.inference_mode()
+    def _encode_prompts_local(
         self,
         prompts: list[str],
         device: torch.device,
@@ -750,12 +843,15 @@ class SanaWMLTX2RefinerStage(PipelineStage):
                 f"got {tuple(batch.latents.shape)}."
             )
 
-        if sana_wm_skip_refiner_enabled(batch):
+        if sana_wm_skip_refiner_enabled(
+            batch,
+            pipeline_config=getattr(server_args, "pipeline_config", None),
+        ):
             if batch.extra is None:
                 batch.extra = {}
             batch.extra["sana_wm_refiner_applied"] = False
             self.log_info(
-                "SANA-WM LTX-2 refiner skipped by SGLANG_SANA_WM_SKIP_REFINER."
+                "SANA-WM LTX-2 refiner skipped by config or request flag."
             )
             return batch
 

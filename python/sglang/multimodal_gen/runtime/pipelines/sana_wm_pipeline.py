@@ -4,8 +4,15 @@ import os
 
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
+    SanaWMPipelineConfig,
+    normalize_sana_wm_refiner_backend,
+    normalize_sana_wm_two_stage_residency,
+)
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    PipelineComponentLoader,
+)
 from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     VanillaD2HStrategy,
@@ -45,6 +52,105 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_SANA_WM_REFINER_BACKEND_ENV = "SGLANG_SANA_WM_REFINER_BACKEND"
+_SANA_WM_TWO_STAGE_RESIDENCY_ENV = "SGLANG_SANA_WM_TWO_STAGE_RESIDENCY"
+_SANA_WM_NATIVE_REFINER_CLASS = "SanaWMLTX2VideoRefiner"
+
+
+def _nonempty_config_string(value) -> str | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _resolve_sana_wm_startup_choice(
+    server_args: ServerArgs,
+    *,
+    field_name: str,
+    env_name: str,
+    normalizer,
+) -> str:
+    mode = _nonempty_config_string(getattr(server_args, field_name, None))
+    if mode is not None:
+        return normalizer(mode, strict=False, name=f"server_args.{field_name}")
+
+    pipeline_config = getattr(server_args, "pipeline_config", None)
+    pipeline_mode = _nonempty_config_string(getattr(pipeline_config, field_name, None))
+    if pipeline_mode is not None and pipeline_mode.lower() != "auto":
+        return normalizer(
+            pipeline_mode,
+            strict=False,
+            name=f"pipeline_config.{field_name}",
+        )
+
+    mode = _nonempty_config_string(os.getenv(env_name))
+    if mode is not None:
+        return normalizer(mode, strict=False, name=env_name)
+
+    if pipeline_mode is not None:
+        return normalizer(
+            pipeline_mode,
+            strict=False,
+            name=f"pipeline_config.{field_name}",
+        )
+
+    return normalizer("auto", strict=False, name=field_name)
+
+
+def _configured_sana_wm_refiner_backend(server_args: ServerArgs) -> str:
+    mode = _resolve_sana_wm_startup_choice(
+        server_args,
+        field_name="sana_wm_refiner_backend",
+        env_name=_SANA_WM_REFINER_BACKEND_ENV,
+        normalizer=normalize_sana_wm_refiner_backend,
+    )
+    if mode != "auto":
+        return mode
+
+    try:
+        tp_size = max(int(getattr(server_args, "tp_size", 1) or 1), 1)
+    except (TypeError, ValueError):
+        tp_size = 1
+    return "native" if tp_size > 1 else "official"
+
+
+def _configured_sana_wm_two_stage_residency(server_args: ServerArgs) -> str:
+    return _resolve_sana_wm_startup_choice(
+        server_args,
+        field_name="sana_wm_two_stage_residency",
+        env_name=_SANA_WM_TWO_STAGE_RESIDENCY_ENV,
+        normalizer=normalize_sana_wm_two_stage_residency,
+    )
+
+
+def _sana_wm_dit_num_attention_heads(dit_config) -> int | None:
+    arch = getattr(dit_config, "arch_config", None)
+    num_heads = getattr(arch, "num_attention_heads", None)
+    if num_heads is None:
+        return None
+    return int(num_heads)
+
+
+def _sana_wm_common_tp_sizes(*num_heads_values: int) -> list[int]:
+    if not num_heads_values:
+        return []
+    max_candidate = min(num_heads_values)
+    return [
+        candidate
+        for candidate in range(1, max_candidate + 1)
+        if all(num_heads % candidate == 0 for num_heads in num_heads_values)
+    ]
+
+
+def _configured_sana_wm_cfg_parallel_degree(server_args: ServerArgs) -> int:
+    if not getattr(server_args, "enable_cfg_parallel", False):
+        return 1
+    try:
+        return max(int(getattr(server_args, "cfg_parallel_degree", 2) or 2), 1)
+    except (TypeError, ValueError):
+        return 2
+
 
 class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
     """SANA-WM TI2V pipeline (single-stage)."""
@@ -69,8 +175,7 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         if tp_size > 1:
             pipeline_config = getattr(server_args, "pipeline_config", None)
             dit_config = getattr(pipeline_config, "dit_config", None)
-            arch = getattr(dit_config, "arch_config", None)
-            num_heads = getattr(arch, "num_attention_heads", None)
+            num_heads = _sana_wm_dit_num_attention_heads(dit_config)
             if num_heads is not None and num_heads % tp_size != 0:
                 raise ValueError(
                     "SANA-WM tensor parallelism requires num_attention_heads "
@@ -82,6 +187,15 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
                 "parallelism remains disabled.",
                 tp_size,
             )
+
+        if getattr(server_args, "enable_cfg_parallel", False):
+            cfg_parallel_degree = _configured_sana_wm_cfg_parallel_degree(server_args)
+            if cfg_parallel_degree > 2:
+                raise ValueError(
+                    "SANA-WM CFG parallelism only has two useful branches "
+                    "(positive and negative prompt). "
+                    f"Expected cfg_parallel_degree <= 2, got {cfg_parallel_degree}."
+                )
 
         sp_degree = getattr(server_args, "sp_degree", 1) or 1
         if sp_degree != 1:
@@ -126,9 +240,9 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         # between denoising and VAE decoding.
         self._maybe_add_refiner_stage(server_args)
 
-        self._add_decoding_stage()
+        self._add_decoding_stage(server_args)
 
-    def _add_decoding_stage(self) -> None:
+    def _add_decoding_stage(self, server_args: ServerArgs | None = None) -> None:
         self.add_stage(
             SanaWMDecodingStage(
                 vae=self.get_module("vae"),
@@ -170,15 +284,55 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         "connectors",
         "transformer_2",
     )
-    _TWO_STAGE_RESIDENCY_ENV = "SGLANG_SANA_WM_TWO_STAGE_RESIDENCY"
-    _TWO_STAGE_RESIDENCY_MODES = frozenset(("auto", "resident", "sequential"))
+    _TWO_STAGE_RESIDENCY_ENV = _SANA_WM_TWO_STAGE_RESIDENCY_ENV
+
+    @staticmethod
+    def _validate_parallelism_args(server_args: ServerArgs) -> None:
+        SanaWMPipeline._validate_parallelism_args(server_args)
+        SanaWMTwoStagePipeline._validate_native_refiner_tp_args(server_args)
+
+    @staticmethod
+    def _validate_native_refiner_tp_args(server_args: ServerArgs) -> None:
+        tp_size = getattr(server_args, "tp_size", 1) or 1
+        if tp_size <= 1:
+            return
+
+        pipeline_config = getattr(server_args, "pipeline_config", None)
+        if sana_wm_skip_refiner_enabled(pipeline_config=pipeline_config):
+            return
+        if _configured_sana_wm_refiner_backend(server_args) != "native":
+            return
+
+        stage1_heads = _sana_wm_dit_num_attention_heads(
+            getattr(pipeline_config, "dit_config", None)
+        )
+        refiner_heads = _sana_wm_dit_num_attention_heads(
+            getattr(pipeline_config, "refiner_dit_config", None)
+        )
+        if stage1_heads is None or refiner_heads is None:
+            return
+        if refiner_heads % tp_size == 0:
+            return
+
+        valid_tp_sizes = _sana_wm_common_tp_sizes(stage1_heads, refiner_heads)
+        raise ValueError(
+            "SANA-WM two-stage native refiner tensor parallelism requires "
+            "tp_size to divide both stage-1 num_attention_heads "
+            f"({stage1_heads}) and refiner num_attention_heads ({refiner_heads}). "
+            f"Valid common tp_size values: {valid_tp_sizes}; got tp_size={tp_size}. "
+            "Use tp_size=2 or tp_size=4 for the two-stage native refiner path, "
+            "or set sana_wm_refiner_backend=official / sana_wm_skip_refiner=true."
+        )
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        self._validate_native_refiner_tp_args(server_args)
         super().initialize_pipeline(server_args)
-        if sana_wm_skip_refiner_enabled():
+        if sana_wm_skip_refiner_enabled(
+            pipeline_config=getattr(server_args, "pipeline_config", None)
+        ):
             logger.info(
                 "SANA-WM refiner component loading skipped by "
-                "SGLANG_SANA_WM_SKIP_REFINER."
+                "sana_wm_skip_refiner or SGLANG_SANA_WM_SKIP_REFINER."
             )
             return
         self._load_refiner_modules(server_args)
@@ -218,6 +372,8 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         return os.path.join(refiner_root, rel_subpath)
 
     def _load_refiner_modules(self, server_args: ServerArgs) -> None:
+        backend = _configured_sana_wm_refiner_backend(server_args)
+        logger.info("SANA-WM refiner backend resolved to %s.", backend)
         for module_name, subpath in self._REFINER_SUB_MODULES:
             component_path = self._resolve_refiner_component_path(
                 server_args, module_name, subpath
@@ -227,13 +383,38 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
                 module_name,
                 component_path,
             )
-            module, memory_usage = self._load_official_refiner_component(
-                module_name,
-                component_path,
-                server_args,
-            )
+            if module_name == "transformer_2" and backend == "native":
+                module, memory_usage = self._load_native_refiner_transformer(
+                    component_path,
+                    server_args,
+                )
+            else:
+                module, memory_usage = self._load_official_refiner_component(
+                    module_name,
+                    component_path,
+                    server_args,
+                )
             self.modules[module_name] = module
             self.memory_usages[module_name] = memory_usage
+
+    @staticmethod
+    def _load_native_refiner_transformer(
+        component_path: str,
+        server_args: ServerArgs,
+    ):
+        module, memory_usage = PipelineComponentLoader.load_component(
+            component_name="transformer_2",
+            component_model_path=component_path,
+            transformers_or_diffusers="diffusers",
+            server_args=server_args,
+            component_architecture=_SANA_WM_NATIVE_REFINER_CLASS,
+        )
+        if module.__class__.__name__ != _SANA_WM_NATIVE_REFINER_CLASS:
+            raise RuntimeError(
+                "SANA-WM native refiner backend expected "
+                f"{_SANA_WM_NATIVE_REFINER_CLASS}, got {module.__class__.__name__}."
+            )
+        return module, memory_usage
 
     @staticmethod
     def _load_official_refiner_component(
@@ -285,19 +466,14 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         return module, memory_usage or 0.0
 
     @classmethod
-    def _two_stage_residency_mode(cls) -> str:
-        mode = os.getenv(cls._TWO_STAGE_RESIDENCY_ENV, "auto").strip().lower()
-        if not mode:
-            return "auto"
-        if mode in cls._TWO_STAGE_RESIDENCY_MODES:
-            return mode
-        logger.warning(
-            "Ignoring invalid %s=%r. Expected one of %s; using 'auto'.",
-            cls._TWO_STAGE_RESIDENCY_ENV,
-            mode,
-            sorted(cls._TWO_STAGE_RESIDENCY_MODES),
+    def _two_stage_residency_mode(cls, server_args: ServerArgs | None = None) -> str:
+        if server_args is not None:
+            return _configured_sana_wm_two_stage_residency(server_args)
+        return normalize_sana_wm_two_stage_residency(
+            os.getenv(cls._TWO_STAGE_RESIDENCY_ENV, "auto"),
+            strict=False,
+            name=cls._TWO_STAGE_RESIDENCY_ENV,
         )
-        return "auto"
 
     @staticmethod
     def _has_conflicting_two_stage_memory_policy(server_args: ServerArgs) -> bool:
@@ -325,11 +501,11 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
     def _should_use_two_stage_sequential_residency(
         self, server_args: ServerArgs
     ) -> tuple[bool, str]:
-        mode = self._two_stage_residency_mode()
+        mode = self._two_stage_residency_mode(server_args)
         if mode == "resident":
-            return False, f"{self._TWO_STAGE_RESIDENCY_ENV}=resident"
+            return False, "sana_wm_two_stage_residency=resident"
         if mode == "sequential":
-            return True, f"{self._TWO_STAGE_RESIDENCY_ENV}=sequential"
+            return True, "sana_wm_two_stage_residency=sequential"
 
         if self._has_conflicting_two_stage_memory_policy(server_args):
             return False, "FSDP or DiT layerwise offload is active"
@@ -363,7 +539,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         weights on GPU while the refiner starts loading, which exhausts H100
         memory even for small smoke inputs.  Auto mode applies this conservative
         residency only for those high-risk combinations; users can force either
-        path with SGLANG_SANA_WM_TWO_STAGE_RESIDENCY=resident|sequential.
+        path with sana_wm_two_stage_residency=resident|sequential.
         """
         should_configure, reason = self._should_use_two_stage_sequential_residency(
             server_args
@@ -371,9 +547,9 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         if not should_configure:
             logger.info(
                 "SANA-WM two-stage sequential residency disabled: %s. "
-                "Set %s=sequential to force the memory-safe path.",
+                "Set sana_wm_two_stage_residency=sequential to force the "
+                "memory-safe path.",
                 reason,
-                self._TWO_STAGE_RESIDENCY_ENV,
             )
             return
 
@@ -392,14 +568,16 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
         if configured:
             logger.info(
                 "SANA-WM two-stage sequential residency enabled (%s) for "
-                "components: %s. Set %s=resident to force the GPU-resident path.",
+                "components: %s. Set sana_wm_two_stage_residency=resident to "
+                "force the GPU-resident path.",
                 reason,
                 configured,
-                self._TWO_STAGE_RESIDENCY_ENV,
             )
 
     def _maybe_add_refiner_stage(self, server_args: ServerArgs) -> None:
-        if sana_wm_skip_refiner_enabled():
+        if sana_wm_skip_refiner_enabled(
+            pipeline_config=getattr(server_args, "pipeline_config", None)
+        ):
             return
         self.add_stage(
             SanaWMLTX2RefinerStage(
@@ -412,9 +590,11 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             "sana_wm_refiner",
         )
 
-    def _add_decoding_stage(self) -> None:
-        if sana_wm_skip_refiner_enabled():
-            return super()._add_decoding_stage()
+    def _add_decoding_stage(self, server_args: ServerArgs | None = None) -> None:
+        if sana_wm_skip_refiner_enabled(
+            pipeline_config=getattr(server_args, "pipeline_config", None)
+        ):
+            return super()._add_decoding_stage(server_args)
         self.add_stage(
             SanaWMRefinerDecodingStage(
                 vae=self.get_module("vae"),

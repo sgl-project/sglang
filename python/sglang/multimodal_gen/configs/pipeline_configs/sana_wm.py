@@ -8,6 +8,9 @@ import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
+from sglang.multimodal_gen.configs.models.dits.sana_wm_refiner import (
+    SanaWMRefinerConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
@@ -22,6 +25,72 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+SANA_WM_REFINER_BACKENDS: tuple[str, ...] = ("auto", "official", "native")
+SANA_WM_TWO_STAGE_RESIDENCY_MODES: tuple[str, ...] = (
+    "auto",
+    "resident",
+    "sequential",
+)
+
+
+def _normalize_sana_wm_choice(
+    value,
+    *,
+    default: str,
+    valid_values: tuple[str, ...],
+    name: str,
+    strict: bool,
+) -> str:
+    mode = default if value is None else str(value).strip().lower()
+    if not mode:
+        mode = default
+    if mode in valid_values:
+        return mode
+
+    if strict:
+        raise ValueError(
+            f"{name} must be one of {sorted(valid_values)}, got {value!r}."
+        )
+
+    logger.warning(
+        "Ignoring invalid %s=%r. Expected one of %s; using %r.",
+        name,
+        value,
+        sorted(valid_values),
+        default,
+    )
+    return default
+
+
+def normalize_sana_wm_refiner_backend(
+    value,
+    *,
+    strict: bool = True,
+    name: str = "sana_wm_refiner_backend",
+) -> str:
+    return _normalize_sana_wm_choice(
+        value,
+        default="auto",
+        valid_values=SANA_WM_REFINER_BACKENDS,
+        name=name,
+        strict=strict,
+    )
+
+
+def normalize_sana_wm_two_stage_residency(
+    value,
+    *,
+    strict: bool = True,
+    name: str = "sana_wm_two_stage_residency",
+) -> str:
+    return _normalize_sana_wm_choice(
+        value,
+        default="auto",
+        valid_values=SANA_WM_TWO_STAGE_RESIDENCY_MODES,
+        name=name,
+        strict=strict,
+    )
 
 
 def sana_wm_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -66,6 +135,12 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # --- DiT ---
     dit_config: DiTConfig = field(default_factory=SanaWMConfig)
+    refiner_dit_config: DiTConfig = field(default_factory=SanaWMRefinerConfig)
+
+    # --- SANA-WM runtime controls ---
+    sana_wm_refiner_backend: str = "auto"
+    sana_wm_two_stage_residency: str = "auto"
+    sana_wm_skip_refiner: bool = False
 
     # --- VAE: LTX-2 (128ch, 8× temporal, 32× spatial) ---
     vae_config: VAEConfig = field(default_factory=LTXVideoVAEConfig)
@@ -81,6 +156,13 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # Load both encoder and decoder (need encoder for first-frame conditioning)
     def __post_init__(self):
+        self.sana_wm_refiner_backend = normalize_sana_wm_refiner_backend(
+            self.sana_wm_refiner_backend
+        )
+        self.sana_wm_two_stage_residency = normalize_sana_wm_two_stage_residency(
+            self.sana_wm_two_stage_residency
+        )
+
         if hasattr(self.dit_config, "apply_user_flags_to_arch_config"):
             self.dit_config.apply_user_flags_to_arch_config()
 
@@ -140,15 +222,18 @@ class SanaWMPipelineConfig(PipelineConfig):
     # --- Deployment ---
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
-            # The SANA-WM DiT is small enough to stay resident on high-memory
-            # GPUs even when the LTX-2 refiner is loaded. Avoid the expensive
-            # post-denoising CPU offload in that case.
+            # Sana-WM has tensor-parallel native DiTs for both stages. Treat
+            # offload/layerwise/FSDP as memory fallbacks instead of the default
+            # throughput path.
+            auto_full_device_tp_size_candidates=(2, 4),
+            auto_disable_default_layerwise_offload_min_available_memory_gb=70,
             auto_disable_component_offload_min_available_memory_gb=70,
-            auto_disable_component_offload_components=("dit",),
-            # Conservative auto-FSDP gate for the 720p world-model path. Users
-            # can still force FSDP explicitly on smaller cards.
-            fsdp_auto_min_available_memory_gb=60,
+            auto_disable_component_offload_components=(
+                "dit",
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
         )
 
     # --- Latent shape ---
