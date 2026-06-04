@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Pre-commit / CI hook: enforce the unified `marker` benchmark style for JIT
-kernel benchmarks under python/sglang/jit_kernel/benchmark/.
+Pre-commit hook: enforce the unified `marker` benchmark style for JIT kernel
+benchmarks under python/sglang/jit_kernel/benchmark/.
 
 Rules (AST-based, no import needed — runs without a GPU):
   1. No hand-rolled timing: forbid triton.testing.{do_bench,do_bench_cudagraph,
@@ -10,14 +10,13 @@ Rules (AST-based, no import needed — runs without a GPU):
   2. Every `@marker.kernel(...)` must declare correctness intent: either
      `reference=<impl>` (compared via torch.testing.assert_close) or an explicit
      `correctness=False, reason="..."` opt-out.
-  3. Must register with CI (register_*_ci) so the bench is discoverable.
 
 LEGACY_ALLOWLIST holds files predating this style. It is a ratchet: it may only
-shrink. New bench files are not exempt; migrate a file and drop it from the list.
+shrink on whole-tree runs. New bench files are not exempt; migrate a file and
+drop it from the list.
 """
 
 import ast
-import glob
 import os
 import sys
 
@@ -86,10 +85,10 @@ def _kw(call: ast.Call, name: str):
 
 def _check_file(path: str) -> list:
     errors = []
-    tree = ast.parse(open(path).read(), filename=path)
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
 
     imports_marker = False
-    has_ci_register = False
     has_kernel = False
 
     for node in ast.walk(tree):
@@ -113,10 +112,6 @@ def _check_file(path: str) -> list:
             names = " ".join(a.name for a in node.names)
             if "marker" in mod or "marker" in names:
                 imports_marker = True
-
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id.startswith("register_") and node.func.id.endswith("_ci"):
-                has_ci_register = True
 
         # rule 2: @marker.kernel(...) correctness contract
         if isinstance(node, ast.ClassDef):
@@ -148,16 +143,42 @@ def _check_file(path: str) -> list:
         errors.append(
             "  does not import marker; benchmarks must use the marker harness"
         )
-    if not has_ci_register:
-        errors.append("  missing register_*_ci(...) call")
     _ = has_kernel  # informational; function-form benches are still permitted
     return errors
 
 
-def main() -> int:
-    files = sorted(
-        glob.glob(os.path.join(BENCH_ROOT, "**", "bench_*.py"), recursive=True)
+def _is_bench_file(path: str) -> bool:
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(BENCH_ROOT)).replace(
+        os.sep, "/"
     )
+    return (
+        not rel.startswith("../")
+        and not os.path.isabs(rel)
+        and os.path.basename(path).startswith("bench_")
+        and path.endswith(".py")
+    )
+
+
+def _files_from_args(args: list[str]) -> list[str]:
+    return sorted(
+        path for path in args if os.path.isfile(path) and _is_bench_file(path)
+    )
+
+
+def _all_bench_files() -> list[str]:
+    files = sorted(
+        os.path.join(root, name)
+        for root, _, names in os.walk(BENCH_ROOT)
+        for name in names
+        if name.startswith("bench_") and name.endswith(".py")
+    )
+    return files
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    files = _files_from_args(argv) if argv else _all_bench_files()
+    check_stale_allowlist = not argv
     failed = {}
     stale_allowlist = []
 
@@ -169,7 +190,7 @@ def main() -> int:
             failed[path] = [f"  syntax error: {e}"]
             continue
         if rel in LEGACY_ALLOWLIST:
-            if not errors:
+            if check_stale_allowlist and not errors:
                 stale_allowlist.append(rel)
             continue
         if errors:

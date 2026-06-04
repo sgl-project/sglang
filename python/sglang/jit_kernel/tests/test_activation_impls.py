@@ -48,18 +48,19 @@ KERNELS = {
 IMPLS = list(KERNELS)
 OPS = ["silu", "gelu", "gelu_tanh"]
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
-# Adversarial shapes (odd/tiny/non-power-of-two), not the "nice" bench grid.
+# Adversarial shapes (odd batches/tiny/non-power-of-two), not the "nice" bench grid.
+# The activation kernels require vector-aligned hidden dimensions.
 SHAPES = get_ci_test_range(
     full_range=[
         (1, 16),
-        (7, 18),
+        (7, 32),
         (83, 1024),
         (3, 5, 16),
         (2, 3, 512),
         (1, 17, 4096),
         (4096, 8192),
     ],
-    ci_range=[(7, 18), (2, 3, 512)],
+    ci_range=[(7, 32), (2, 3, 512)],
 )
 
 

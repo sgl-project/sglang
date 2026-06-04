@@ -628,8 +628,13 @@ class Kernel(Generic[K]):
         self.rtol = getattr(self._instance, "rtol", rtol)
         self.atol = getattr(self._instance, "atol", atol)
         self._fn_params = dict(inspect.signature(self._instance.inputs).parameters)
+        self._run_params = dict(inspect.signature(self._instance.run).parameters)
         self._configs: BENCH_CONFIG = []
         self._seen_args: set = set()
+        assert line_arg in self._run_params, (
+            f"line_arg {line_arg!r} is not a parameter of {self._name}.run; "
+            f"available: {list(self._run_params)}"
+        )
         if correctness:
             assert reference is not None, (
                 f"{self._name}: set reference=<one of {self._line_vals}>, "
@@ -703,12 +708,24 @@ class Kernel(Generic[K]):
 
     def _bench_one(self, impl: Any, base_io: "Inputs", cold: bool) -> BenchResult:
         bio = base_io.clone()
+        bench_kwargs = {
+            "graph_clone_args": "all" if cold else None,
+            "graph_clone_kwargs": "all" if cold else None,
+        }
+        if hasattr(self._instance, "bench_kwargs"):
+            custom_bench_kwargs = self._instance.bench_kwargs(
+                impl, *bio.args, **bio.kwargs
+            )
+            assert isinstance(custom_bench_kwargs, dict), (
+                f"{self._name}.bench_kwargs must return a dict of marker.do_bench "
+                f"keyword arguments, got {type(custom_bench_kwargs).__name__}"
+            )
+            bench_kwargs.update(custom_bench_kwargs)
         return do_bench(
             self._instance.run,
             input_args=(impl, *bio.args),
             input_kwargs=bio.kwargs,
-            graph_clone_args="all" if cold else None,
-            graph_clone_kwargs="all" if cold else None,
+            **bench_kwargs,
         )
 
     def run(
@@ -898,6 +915,7 @@ def kernel(
         class MyKernel:
             def inputs(self, dim): ...
             def run(self, impl, x): ...
+            def bench_kwargs(self, impl, x): ...  # optional marker.do_bench kwargs
     """
 
     def decorator(cls: type) -> Kernel:

@@ -74,14 +74,25 @@ def _make_expert_ids(num_tokens: int, skip_ratio: float) -> torch.Tensor:
 class ActivationMulFilter:
     def inputs(self, op_name: str, dim: int, batch_size: int, skip_ratio: float):
         x = create_random(batch_size, dim * 2)
-        expert_ids = _make_expert_ids(batch_size, skip_ratio)
+        expert_ids = _make_expert_ids(batch_size, skip_ratio).to(x.device)
         return marker.io(x, op_name=op_name, expert_ids=expert_ids)
 
     def run(self, impl: str, x: torch.Tensor, op_name: str, expert_ids: torch.Tensor):
         jit_fn = silu_and_mul_jit if op_name == "silu" else gelu_and_mul_jit
         if impl == "filtered":
-            return jit_fn(x, expert_ids=expert_ids.to(x.device), expert_step=1)
+            return jit_fn(x, expert_ids=expert_ids, expert_step=1)
         return jit_fn(x)
+
+    def bench_kwargs(
+        self, impl: str, x: torch.Tensor, op_name: str, expert_ids: torch.Tensor
+    ):
+        real_skip_ratio = (expert_ids == -1).sum().item() / expert_ids.numel()
+        effective_bytes = int(x.nbytes * (1 - real_skip_ratio) * 1.5)
+        return {
+            "memory_args": None,
+            "memory_output": None,
+            "extra_memory_footprint": effective_bytes,
+        }
 
 
 if __name__ == "__main__":
