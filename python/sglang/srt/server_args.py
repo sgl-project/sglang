@@ -4051,12 +4051,19 @@ class ServerArgs:
                     logger.warning(
                         "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
                     )
-                elif (
-                    is_hip() and envs.SGLANG_USE_AITER.get()
-                ) and is_mxfp4_quant_format:
+                elif (is_hip() and envs.SGLANG_USE_AITER.get()) and (
+                    is_mxfp4_quant_format or is_quark_w4a8_mxfp4_format
+                ):
+                    # The Quark W4A8 MXFP4-FP8 MoE scheme only builds its
+                    # `self.runner` when the resolved backend is AITER, so we
+                    # must steer auto-resolution onto the aiter path here
+                    # (`MoeRunnerBackend.AITER` is picked downstream when the
+                    # backend is left at "auto" and AITER is supported).
                     self.moe_runner_backend = "auto"
                     logger.warning(
-                        "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
+                        "Detected ROCm and MXFP4 (native or Quark W4A8) "
+                        "quantization format for GPT-OSS model, enabling "
+                        "aiter MXFP4 MOE kernel."
                     )
                     # Keep the default gate/up INTERLEAVE layout selected by
                     # the native MXFP4 AITER path.
