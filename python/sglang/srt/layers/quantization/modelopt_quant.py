@@ -2570,7 +2570,7 @@ class PerTokenNvFp4Config(ModelOptQuantConfig):
                 if self.is_checkpoint_fp8_serialized:
                     return Fp8MoEMethod(self)
                 return None
-            from sglang.srt.layers.quantization.modelopt_nvfp4_online import (
+            from sglang.srt.layers.quantization.nvfp4_online import (
                 ModelOptPerTokenNvFp4FusedMoEMethod,
             )
 
