@@ -10,6 +10,7 @@
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
 /python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
+/python/sglang/multimodal_gen/test/server/ascend  @ping1jing2 @ssshinigami @Makcum888e @e-martirosian
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/compilation @hebiao064 @Oasis-Git
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
@@ -40,11 +41,12 @@
 /python/sglang/srt/layers/attention/vision.py @mickqian @yuan-luo @yhyang201
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong
 /python/sglang/srt/layers/quantization/quark @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
-/python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu
+/python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/managers/scheduler_pp_mixin.py @ShangmingCai @XucSh
 /python/sglang/srt/managers/tokenizer_manager_score_mixin.py @sundar24295s @chanh @fortunecookiee
-/python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077 @hzh0425 @ispobock
+/python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077 @hzh0425 @ispobock @alphabetc1
+/python/sglang/srt/mem_cache/allocator @hnyls2002 @ispobock @alphabetc1
 /python/sglang/srt/mem_cache/storage/mooncake_store/embedding_cache_controller.py @liusy58
 /python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py @liusy58
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
@@ -82,14 +84,15 @@
 /benchmark/prefill_only/bench_score.py @sundar24295s @chanh @fortunecookiee
 /test/srt/ascend @ping1jing2 @iforgetmyname
 /test/srt/test_modelopt* @Edwardf0t1
-/python/sglang/srt/layers/gemma4_fused_ops.py @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1 @kpham-sgl
-/python/sglang/srt/function_call/gemma4_detector.py @CatherineSue @JustinTong0323 @kpham-sgl
-/python/sglang/srt/models/gemma4_*.py @kpham-sgl
-/python/sglang/srt/multimodal/processors/gemma4.py @mickqian @JustinTong0323 @yhyang201 @yuan-luo @kpham-sgl
-/docs_new/cookbook/autoregressive/Google/Gemma4.mdx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl
-/docs_new/src/snippets/autoregressive/gemma4-deployment.jsx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl
+/python/sglang/srt/layers/gemma4_fused_ops.py @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1 @kpham-sgl @pyc96
+/python/sglang/srt/function_call/gemma4_detector.py @CatherineSue @JustinTong0323 @kpham-sgl @pyc96
+/python/sglang/srt/models/gemma4_*.py @kpham-sgl @pyc96
+/python/sglang/srt/multimodal/processors/gemma4.py @mickqian @JustinTong0323 @yhyang201 @yuan-luo @kpham-sgl @pyc96
+/docs_new/cookbook/autoregressive/Google/Gemma4.mdx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl @pyc96
+/docs_new/src/snippets/autoregressive/gemma4-deployment.jsx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl @pyc96
 /python/sglang/srt/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/srt/speculative/adaptive_*.py @Qiaolin-Yu @alphabetc1
 /python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl
-/python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl @pyc96
 /python/sglang/jit_kernel/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/jit_kernel/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl

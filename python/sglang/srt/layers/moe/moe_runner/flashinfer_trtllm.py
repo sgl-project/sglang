@@ -876,9 +876,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
         from flashinfer import SfLayout, nvfp4_quantize
 
+        e4m3_max = 448.0
+        if (
+            envs.FLASHINFER_NVFP4_4OVER6.get()
+            and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+        ):
+            e4m3_max = 256.0
+
         hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / (448.0 * 6.0),
+            1.0 / (e4m3_max * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
         )
@@ -899,6 +906,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     activation_type = get_activation_type(
         runner_config.activation, is_gated=runner_config.is_gated
     )
+
+    # Build per-expert clamp-limit tensor from the per-layer scalar.
+    _clamp_val = runner_config.gemm1_clamp_limit
+    if _clamp_val is not None:
+        gemm1_clamp_limit = torch.full(
+            (quant_info.local_num_experts,),
+            _clamp_val,
+            dtype=torch.float32,
+            device=hs_fp4.device,
+        )
+    else:
+        gemm1_clamp_limit = None
 
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
@@ -924,6 +943,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
             )
 
+    # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
+    if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
+        use_routed_topk = True
+
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
 
@@ -940,7 +963,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
@@ -984,7 +1007,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,

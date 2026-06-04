@@ -8,14 +8,15 @@ export const Qwen35Deployment = () => {
   //   27B, 9B, 4B, 2B, 0.8B
   //
   // GPU requirements (BF16):
-  //   397B-A17B: H100 tp=16, H200 tp=8, B200 tp=8, B300 tp=4, MI300X tp=8, MI325X tp=4, MI355X tp=4
-  //   122B-A10B: H100 tp=4,  H200 tp=2, B200 tp=2, B300 tp=1, MI300X tp=2, MI325X tp=1, MI355X tp=1
-  //   35B-A3B:   H100 tp=1,  H200 tp=1, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
-  //   27B/9B/4B/2B/0.8B: tp=1 on all hardware (including MI300X, MI325X, MI355X)
+  //   397B-A17B: H100 tp=16 (2 nodes), H200 tp=8, B200 tp=8, B300 tp=4, MI300X tp=8, MI325X tp=4, MI355X tp=4
+  //   122B-A10B: H100 tp=4,  H200 tp=4, B200 tp=2, B300 tp=2, MI300X tp=2, MI325X tp=1, MI355X tp=1
+  //   35B-A3B:   H100 tp=1 (tp=2 w/ MTP), H200 tp=1, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
+  //   27B:       H100 tp=1 (tp=2 w/ MTP); tp=1 on all other hardware
+  //   9B/4B/2B/0.8B: tp=1 on all hardware (including MI300X, MI325X, MI355X)
   //
   // GPU requirements (FP8, where available):
   //   397B-A17B: H100 tp=8, H200 tp=8 ep=8, B200 tp=4, B300 tp=2, MI300X tp=4, MI325X tp=2, MI355X tp=2
-  //   122B-A10B: H100 tp=2, H200 tp=1, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
+  //   122B-A10B: H100 tp=2 (tp=4 w/ MTP), H200 tp=2, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
   //   35B-A3B:   H100 tp=1, H200 tp=1, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
   //   27B:       tp=1 on all hardware (including MI300X, MI325X, MI355X)
   //
@@ -142,7 +143,7 @@ export const Qwen35Deployment = () => {
 
   const modelConfigs = {
     '397b': {
-      h100:   { bf16: { tp: 16, mem: 0.8 }, fp8: { tp: 8, mem: 0.8 } },
+      h100:   { bf16: { tp: 16, mem: 0.8, multinode: true, nnodes: 2 }, fp8: { tp: 8, mem: 0.8 } },
       h200:   { bf16: { tp: 8,  mem: 0.8 }, fp8: { tp: 8, ep: 8, mem: 0.8 } },
       b200:   { bf16: { tp: 8,  mem: 0.8 }, fp8: { tp: 4, mem: 0.8 }, fp4: { tp: 4, mem: 0.85 } },
       b300:   { bf16: { tp: 4,  mem: 0.8 }, fp8: { tp: 2, mem: 0.8 }, fp4: { tp: 2, mem: 0.8 } },
@@ -151,16 +152,16 @@ export const Qwen35Deployment = () => {
       mi355x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } }
     },
     '122b': {
-      h100:   { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } },
-      h200:   { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      h100:   { bf16: { tp: 4, mem: 0.88 }, fp8: { tp: 2, mem: 0.8 } },
+      h200:   { bf16: { tp: 4 },            fp8: { tp: 2 } },
       b200:   { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      b300:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      b300:   { bf16: { tp: 2 },           fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } }
     },
     '35b': {
-      h100:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      h100:   { bf16: { tp: 1, mem: 0.88 }, fp8: { tp: 1, mem: 0.8 } },
       h200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -266,17 +267,42 @@ export const Qwen35Deployment = () => {
     setValues(prev => ({ ...prev, [optionName]: value }));
   };
 
+  // Multi-node flag template — mirrors DeepSeek-V4 cookbook's multiNodeFlags.
+  // Each launcher must be invoked on every node with <node-rank> set to its rank
+  // (0 on the head node) and <node0-ip> resolvable from every node.
+  const multiNodeFlags = (nnodes) => [
+    `--nnodes ${nnodes}`,
+    `--node-rank <node-rank>`,
+    `--dist-init-addr <node0-ip>:20000`,
+  ];
+
+  const prependMultiNodeNote = (cmd, nnodes) =>
+    `# Multi-node (${nnodes} nodes). Run the same command on every node with:\n` +
+    `#   <node-rank> = 0 on the head node, 1..${nnodes - 1} on the others\n` +
+    `#   <node0-ip>  = IP of the head node (reachable from all others)\n` +
+    cmd;
+
   // Generate command — must produce byte-identical output to sgl-cookbook's
   // config.generateCommand(values) for every valid combination.
   const generateCommand = () => {
     const { model, hardware, quantization, speculative, mambaCache } = values;
 
-    const hwConfig = modelConfigs[model]?.[hardware]?.[quantization];
+    let hwConfig = modelConfigs[model]?.[hardware]?.[quantization];
     if (!hwConfig) {
       if (quantization === 'fp4') {
         return '# FP4 requires B200/B300 (Blackwell) and is only available for Qwen3.5-397B-A17B';
       }
       return '# Please select a valid hardware and quantization combination';
+    }
+
+    // 35B / 27B H100 BF16 with MTP: bump TP to 2 and skip --mem-fraction-static.
+    // Spread the base spec so any future fields (multinode, ep, ...) survive.
+    if ((model === '35b' || model === '27b') && hardware === 'h100' && quantization === 'bf16' && speculative === 'enabled') {
+      hwConfig = { ...hwConfig, tp: 2, mem: undefined };
+    }
+    // 122B H100 FP8 with MTP: bump TP to 4 and skip --mem-fraction-static.
+    if (model === '122b' && hardware === 'h100' && quantization === 'fp8' && speculative === 'enabled') {
+      hwConfig = { ...hwConfig, tp: 4, mem: undefined };
     }
 
     let modelName;
@@ -291,6 +317,8 @@ export const Qwen35Deployment = () => {
     const tpValue = hwConfig.tp;
     const epValue = hwConfig.ep;
     const memFraction = hwConfig.mem;
+    const isMultinode = !!hwConfig.multinode;
+    const nnodes = hwConfig.nnodes || 1;
 
     // Initialize the base command
     let cmd = `sglang serve --model-path ${modelName}`;
@@ -300,11 +328,26 @@ export const Qwen35Deployment = () => {
     if (epValue) {
       cmd += ` \\\n  --expert-parallel-size ${epValue}`;
     }
+    // Multi-node wiring goes right after --tp / --expert-parallel-size so the
+    // distributed-init flags sit next to the parallelism flags they configure.
+    if (isMultinode) {
+      for (const flag of multiNodeFlags(nnodes)) {
+        cmd += ` \\\n  ${flag}`;
+      }
+    }
 
-    // Force Mamba V1 for AMD GPUs (V2 requires FLA backend)
-    // Force Mamba V2 when MTP is enabled
+    // Force Mamba V1 for AMD GPUs (V2 requires FLA backend).
+    // Force Mamba V2 when MTP is enabled.
+    // Dense models with MTP off: force V1 — values.mambaCache is not
+    // re-resolved on a speculative toggle (useEffect deps are hardware/model),
+    // so it can stay at 'v2' from a prior MTP-on state. Reading it directly
+    // would emit a spurious --mamba-scheduler-strategy extra_buffer. The UI
+    // radio is hidden for dense models, so users can't manually correct it.
+    // MoE keeps the old behavior — the UI radio is the recovery path there.
     const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
-    const actualMambaCache = amdGpus.includes(hardware) ? 'v1' : (speculative === 'enabled' ? 'v2' : mambaCache);
+    const actualMambaCache = amdGpus.includes(hardware)
+      ? 'v1'
+      : (speculative === 'enabled' ? 'v2' : (MOE_MODELS.has(model) ? mambaCache : 'v1'));
 
     // Apply commandRules from options (reasoning, toolcall, speculative, mambaCache)
     // Skip quantization and model (handled via model name)
@@ -318,8 +361,11 @@ export const Qwen35Deployment = () => {
     // Iterate options in order, applying commandRules
     for (const [key, option] of Object.entries(options)) {
       if (key === 'quantization' || key === 'model') continue;
-      // Skip options that don't pass their condition
-      if (option.condition && !option.condition(values)) continue;
+      // Skip options that don't pass their condition. mambaCache is special:
+      // its condition gates only the UI radio (hidden for dense models), but
+      // the rule still fires for dense models on NVIDIA + MTP to emit
+      // --mamba-scheduler-strategy extra_buffer.
+      if (option.condition && !option.condition(values) && (key !== 'mambaCache' || speculative !== 'enabled')) continue;
       const rule = commandRules[key];
       if (rule) {
         const adjustedValue = key === 'mambaCache' ? actualMambaCache : values[key];
@@ -328,6 +374,11 @@ export const Qwen35Deployment = () => {
           cmd += ` \\\n  ${result}`;
         }
       }
+    }
+
+    // Enable NCCL symmetric memory for H100 FP8 deployments.
+    if (hardware === 'h100' && quantization === 'fp8' && hwConfig.tp > 1) {
+      cmd += ` \\\n  --enable-symm-mem`;
     }
 
     // Chunked prefill tuning for H200 FP8 + MTP (validated on H200 only)
@@ -367,6 +418,13 @@ export const Qwen35Deployment = () => {
       }
     }
 
+    // Workaround: FlashInfer autotune's warmup dummy_run trips a CUDA grid-dim
+    // overflow in the GDN packed_decode Triton kernel (B*HV >= 65536). Remove
+    // once the kernel is fixed upstream.
+    if (hardware === 'b300' && quantization === 'bf16' && (model === '0.8b' || model === '2b')) {
+      cmd += ` \\\n  --max-running-requests 4064`;
+    }
+
     // FP4-specific backend settings
     if (quantization === 'fp4') {
       cmd += ' \\\n  --quantization modelopt_fp4';
@@ -381,7 +439,13 @@ export const Qwen35Deployment = () => {
     }
 
     // Add memory fraction last
-    cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
+    if (memFraction !== undefined) {
+      cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
+    }
+
+    if (isMultinode) {
+      cmd = prependMultiNodeNote(cmd, nnodes);
+    }
 
     return cmd;
   };

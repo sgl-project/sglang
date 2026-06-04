@@ -300,10 +300,10 @@ SGLang Model Gateway (former Router)
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://'your prefill ip1':8000 8998 \
-    --prefill http://'your prefill ip2':8000 8999 \
-    --prefill http://'your prefill ip3':8000 9000 \
-    --decode http://'your decode ip1':8001 \
+    --prefill http://<your_prefill_ip1>:8000 8998 \
+    --prefill http://<your_prefill_ip2>:8000 8999 \
+    --prefill http://<your_prefill_ip3>:8000 9000 \
+    --decode http://<your_decode_ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
 ```
