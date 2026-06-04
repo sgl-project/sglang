@@ -160,9 +160,7 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         # is_some() is called on spec algos in overlap_utils.py; a CustomSpecAlgo
         # must answer it the same way the enum does (True iff not NONE).
         self.assertEqual(self.algo.is_some(), not self.algo.is_none())
-        self.assertEqual(
-            SpeculativeAlgorithm.EAGLE.is_some(), self.algo.is_some()
-        )
+        self.assertEqual(SpeculativeAlgorithm.EAGLE.is_some(), self.algo.is_some())
 
     def test_supports_spec_v2_follows_supports_overlap(self):
         # Plugin registered with supports_overlap=False -> not spec_v2.
