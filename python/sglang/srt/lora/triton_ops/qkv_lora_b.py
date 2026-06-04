@@ -236,13 +236,12 @@ def qkv_lora_b_fwd(
 
     BLOCK_S = 16
     BLOCK_R = triton.next_power_of_2(r)
-    store_writeback = envs.SGLANG_OPT_LORA_QKV_B_STORE.get()
-    # Atomic path stays BLOCK_OUT=64: 128 halves the grid (96->48 programs on Kimi
-    # r16 bs64) and slows the atomic kernel ~60% (11.4->18.5us, B200) -- fewer
-    # programs worsen bf16 atomic contention. The store path has no atomic, so it is
-    # purely occupancy-bound: BLOCK_OUT=32 doubles the grid and is ~15% faster
-    # (decode tile sweep, GB200). See 2026-06-04 diagnosis.
-    BLOCK_OUT = 32 if store_writeback else 64
+    # BLOCK_OUT stays 64: with the 1-adapter cuBLAS dispatch the Triton path
+    # only runs for decode-sized batches, where 128 halves the grid (96->48
+    # programs on Kimi r16 bs64) and slows the kernel ~60% (11.4->18.5us, B200).
+    # Re-swept for the store path on GB200: 32 vs 64 is within noise (one preset
+    # marginally each way), so the single value is kept for both writebacks.
+    BLOCK_OUT = 64
 
     grid_b = (
         triton.cdiv(batch_info.max_len, BLOCK_S)
@@ -257,6 +256,7 @@ def qkv_lora_b_fwd(
         output = base_output
 
     sorted_by_adapter = batch_info.permutation is not None
+    store_writeback = envs.SGLANG_OPT_LORA_QKV_B_STORE.get()
     enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _qkv_lora_b_kernel[grid_b](
         x,
