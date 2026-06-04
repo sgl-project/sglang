@@ -114,12 +114,13 @@ concurrency:
 
 jobs:
   call-gate:
-    # On `pull_request` and on the 6h ('0 */6 * * *') cron the dsv4 jobs are the only
-    # ones that run. Skipping the gate for those triggers cascades a skip to
-    # check-changes (which `needs` it) and therefore to every existing test job, so
-    # only the dsv4 jobs run there. The daily '30 17 * * *' cron, workflow_dispatch and
-    # workflow_call keep the gate; the daily cron runs the full suite + both dsv4 jobs.
-    if: github.event_name != 'pull_request' && github.event.schedule != '0 */6 * * *'
+    # Runs on PRs (pr-gate.yml enforces the run-ci label / blocks drafts), the daily
+    # '30 17 * * *' cron, workflow_dispatch and workflow_call. It is skipped only on the
+    # 6h ('0 */6 * * *') cron, which cascades a skip to check-changes and every existing
+    # test job, so that cron runs the two dsv4 jobs only. On PRs the existing jobs are
+    # additionally kept off via the change-detection guard in check-changes, so only the
+    # dsv4 jobs run there -- and only when this gate passes (they `needs` it).
+    if: github.event.schedule != '0 */6 * * *'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
   check-changes:
@@ -172,7 +173,9 @@ jobs:
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
-        if: steps.run-mode.outputs.run_all_tests != 'true'
+        # On pull_request only the dsv4 jobs run; skip change detection on PRs so the
+        # per-stage outputs stay 'false' and the existing test jobs are gated off.
+        if: steps.run-mode.outputs.run_all_tests != 'true' && github.event_name != 'pull_request'
         with:
           filters: |
             main_package:
@@ -1090,12 +1093,14 @@ jobs:
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
-  # On `pull_request` and the 6h ('0 */6 * * *') cron these are the ONLY jobs that run
-  # (every other job is gated off via call-gate); they also run on the daily cron
-  # alongside the full suite. On PR they hard-fail (so a failure blocks merge); on any
-  # scheduled run they pass --continue-on-error. No `needs`, so they are independent of
-  # change detection and stay selectable via workflow_dispatch / workflow_call full runs.
+  # On `pull_request` and the 6h ('0 */6 * * *') cron these are the ONLY jobs that run;
+  # they also run on the daily cron alongside the full suite. On PRs they run only when
+  # call-gate succeeds, i.e. the PR carries the run-ci label (and is not a draft), so
+  # they are gated just like every other PR test job. On PR they hard-fail (a failure
+  # blocks merge); on any scheduled run they pass --continue-on-error. They stay
+  # selectable via workflow_dispatch / run on workflow_call full runs.
   dsv4-flash-fp8-amd-rocm720:
+    needs: [call-gate]
     if: |
       always() && !cancelled() &&
       (
@@ -1103,7 +1108,7 @@ jobs:
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (
-            (github.event_name == 'pull_request') ||
+            (github.event_name == 'pull_request' && needs.call-gate.result == 'success') ||
             (github.event_name == 'schedule') ||
             inputs.run_all_tests
           )
@@ -1146,6 +1151,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   dsv4-pro-fp8-amd-rocm720:
+    needs: [call-gate]
     if: |
       always() && !cancelled() &&
       (
@@ -1153,7 +1159,7 @@ jobs:
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (
-            (github.event_name == 'pull_request') ||
+            (github.event_name == 'pull_request' && needs.call-gate.result == 'success') ||
             (github.event_name == 'schedule') ||
             inputs.run_all_tests
           )
