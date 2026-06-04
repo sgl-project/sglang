@@ -445,7 +445,43 @@ python3 -m sglang.bench_serving \
 - **Test Results:**
 
 ```text Output
-TBD — benchmark numbers will be filled in once the official run completes on the day-0 cluster.
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 256
+Successful requests:                     4096
+Benchmark duration (s):                  1184.58
+Total input tokens:                      2081726
+Total input text tokens:                 2081726
+Total generated tokens:                  2087288
+Total generated tokens (retokenized):    1990224
+Request throughput (req/s):              3.46
+Input token throughput (tok/s):          1757.35
+Output token throughput (tok/s):         1762.05
+Peak output token throughput (tok/s):    3150.00
+Peak concurrent requests:                266
+Total token throughput (tok/s):          3519.40
+Concurrency:                             249.55
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   72169.95
+Median E2E Latency (ms):                 71994.47
+P90 E2E Latency (ms):                    99898.56
+P99 E2E Latency (ms):                    107119.61
+---------------Time to First Token----------------
+Mean TTFT (ms):                          40057.33
+Median TTFT (ms):                        41375.93
+P99 TTFT (ms):                           46377.89
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          63.15
+Median TPOT (ms):                        63.65
+P99 TPOT (ms):                           78.16
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           63.14
+Median ITL (ms):                         35.92
+P95 ITL (ms):                            178.10
+P99 ITL (ms):                            182.10
+Max ITL (ms):                            2466.36
+==================================================
 ```
 
 ### 5.2 Accuracy Benchmark
