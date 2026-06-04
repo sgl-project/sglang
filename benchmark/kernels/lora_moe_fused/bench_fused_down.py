@@ -80,14 +80,17 @@ def _fused_moe_lora_down_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    N_TILES_PER_BLOCK: tl.constexpr,
 ):
     """Fused rank-R shrink+expand for the LoRA down projection (1-adapter EP decode).
 
-    Grid = (num_m_blocks, num_n_blocks). Each program owns one expert m-block and one
-    N tile. The rank-R shrink s[BLOCK_M, R] is recomputed per N tile (A_down is only
-    R*K = 16*512 small), then expanded into this N tile and atomic-added (weighted)
-    into the token row. ``num_n_blocks > 1`` raises occupancy past the ~93-block
-    shrink-only grid that sits under one wave.
+    Grid = (num_m_blocks, num_n_blocks). Each program owns one expert m-block and a
+    span of ``N_TILES_PER_BLOCK`` consecutive N tiles. The rank-R shrink s[BLOCK_M, R]
+    is computed ONCE (in registers) and reused across this program's N tiles, then each
+    tile is expanded and atomic-added (weighted) into the token row. With
+    N_TILES_PER_BLOCK = ceil(N/BLOCK_N) and num_n_blocks=1 the shrink is computed once
+    per expert (no redundancy) while the internal N loop gives software-pipelined
+    memory-level parallelism to hide DRAM latency at the ~93-block (under one wave) grid.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -107,7 +110,7 @@ def _fused_moe_lora_down_kernel(
     offs_r = tl.arange(0, R).to(tl.int64)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    # ---- shrink: s[BLOCK_M, R] = act[offs_token, :] @ A_down[e]^T ----
+    # ---- shrink (once): s[BLOCK_M, R] = act[offs_token, :] @ A_down[e]^T ----
     a_act_ptrs = act_ptr + (offs_token[:, None] * stride_am + offs_k[None, :] * stride_ak)
     a_w_ptrs = (
         a_ptr
@@ -127,23 +130,25 @@ def _fused_moe_lora_down_kernel(
         a_w_ptrs += BLOCK_SIZE_K * stride_a_k
     s = s.to(b_ptr.dtype.element_ty)
 
-    # ---- expand: delta[BLOCK_M, BLOCK_N] = s @ B_down[e][n_tile]^T ----
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    b_ptrs = (
-        b_ptr
-        + off_expert * stride_b_e
-        + (offs_r[:, None] * stride_b_r + offs_n[None, :] * stride_b_n)
-    )
-    bw = tl.load(b_ptrs, mask=offs_n[None, :] < N, other=0.0)
-    delta = tl.dot(s, bw, out_dtype=tl.float32)
-
     moe_w = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
-    delta = delta * moe_w[:, None]
-
     offs_out = offs_token // router_topk
-    out_ptrs = out_ptr + offs_out[:, None] * stride_om + offs_n[None, :] * stride_on
-    out_mask = token_mask[:, None] & (offs_n[None, :] < N)
-    tl.atomic_add(out_ptrs, delta.to(out_ptr.dtype.element_ty), mask=out_mask)
+
+    # ---- expand: loop this program's N tiles, reusing s ----
+    for t in range(0, N_TILES_PER_BLOCK):
+        n_base = (pid_n * N_TILES_PER_BLOCK + t) * BLOCK_SIZE_N
+        offs_n = n_base + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        n_mask = offs_n < N
+        b_ptrs = (
+            b_ptr
+            + off_expert * stride_b_e
+            + (offs_r[:, None] * stride_b_r + offs_n[None, :] * stride_b_n)
+        )
+        bw = tl.load(b_ptrs, mask=n_mask[None, :], other=0.0)
+        delta = tl.dot(s, bw, out_dtype=tl.float32)
+        delta = delta * moe_w[:, None]
+        out_ptrs = out_ptr + offs_out[:, None] * stride_om + offs_n[None, :] * stride_on
+        out_mask = token_mask[:, None] & n_mask[None, :]
+        tl.atomic_add(out_ptrs, delta.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
 def invoke_fused_down(
@@ -160,13 +165,19 @@ def invoke_fused_down(
     block_n: int,
     num_warps: int,
     num_stages: int,
+    n_split: int = 0,
 ):
     N = b_down.shape[1]
     K = a_down.shape[2]
     R = a_down.shape[1]
     block_k = min(256, K)
     num_m_blocks = triton.cdiv(sorted_token_ids.shape[0], block_m)
-    num_n_blocks = triton.cdiv(N, block_n)
+    total_n_tiles = triton.cdiv(N, block_n)
+    # n_split = number of grid blocks along N; each handles total_n_tiles/n_split tiles
+    # internally (shrink computed once per grid block, reused across its tiles).
+    # n_split=0 -> one grid block per expert (shrink once, full internal N loop).
+    num_n_blocks = n_split if n_split > 0 else 1
+    n_tiles_per_block = triton.cdiv(total_n_tiles, num_n_blocks)
     grid = (num_m_blocks, num_n_blocks)
     _fused_moe_lora_down_kernel[grid](
         act,
@@ -195,6 +206,7 @@ def invoke_fused_down(
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_K=block_k,
+        N_TILES_PER_BLOCK=n_tiles_per_block,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -317,7 +329,8 @@ def main():
     ap.add_argument("--routing", choices=["uniform", "skewed"], default="skewed")
     ap.add_argument("--skew-a", type=float, default=0.9)
     ap.add_argument("--block-m", type=int, default=16)
-    ap.add_argument("--block-n", type=int, default=256)
+    ap.add_argument("--block-n", type=int, default=128)
+    ap.add_argument("--n-split", type=int, default=0, help="grid blocks along N (0=shrink-once full internal N loop)")
     ap.add_argument("--num-warps", type=int, default=4)
     ap.add_argument("--num-stages", type=int, default=2)
     ap.add_argument("--rep-ms", type=int, default=400)
@@ -341,7 +354,7 @@ def main():
                 out = torch.zeros(args.bs, SPEC["n"], device=device, dtype=dtype)
                 invoke_fused_down(
                     act, a_down, b_down, out, topk_weights, topk_ids, *routing_pack,
-                    args.block_m, args.block_n, args.num_warps, args.num_stages,
+                    args.block_m, args.block_n, args.num_warps, args.num_stages, args.n_split,
                 )
                 ref = ref_fused_down(act, a_down, b_down, topk_ids, topk_weights, ep)
                 got = out.float()
@@ -368,7 +381,7 @@ def main():
             (lambda act, a_down, b_down, out, topk_weights, topk_ids, routing: (
                 lambda: invoke_fused_down(
                     act, a_down, b_down, out, topk_weights, topk_ids, *routing,
-                    args.block_m, args.block_n, args.num_warps, args.num_stages,
+                    args.block_m, args.block_n, args.num_warps, args.num_stages, args.n_split,
                 )
             ))(act, a_down, b_down, out, topk_weights, topk_ids, routing)
         )
