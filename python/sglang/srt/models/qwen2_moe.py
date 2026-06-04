@@ -71,6 +71,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputCheck
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_deepep_class_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -343,7 +344,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return None
         shared_out = self.shared_expert_gate(hidden_states)
         shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
-        return F.sigmoid(shared_logits)
+        w = F.sigmoid(shared_logits)
+        # This block runs only on the AMD AITER shared_expert_fusion path
+        # Allreduce-EP path: the fused shared expert occupies a single global
+        # slot loaded onto every EP rank (see FusedMoE.__init__: num_shared_slots
+        # == num_fused_shared_experts when not is_deepep_class_backend()). Every
+        # rank therefore computes the same full shared output, and the
+        # post-experts all_reduce sums it ep_size times. Pre-scale the per-token
+        # routing weight by 1/ep_size to cancel this, mirroring DeepSeek-V2's
+        # fused_shared_experts_scaling_factor pattern.
+        moe_ep_size = get_moe_expert_parallel_world_size()
+        if moe_ep_size > 1 and not is_deepep_class_backend():
+            w = w / float(moe_ep_size)
+        return w
 
     def _append_shared_to_topk_output(
         self,
