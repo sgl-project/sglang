@@ -234,7 +234,7 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         weight_scale: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
-        if getattr(self.quant_config, "use_mxfp8", False):
+        if self.quant_config.use_mxfp8:
             raise ValueError(
                 "--quantization per_token_nvfp4 does not support online "
                 "requantization from MXFP8 expert checkpoints."
