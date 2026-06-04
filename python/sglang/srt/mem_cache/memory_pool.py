@@ -27,7 +27,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -367,6 +367,12 @@ class MambaPool:
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
+        # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
+        # When non-None, `alloc(1)` consumes the next slot from this iterator
+        # instead of calling `_do_alloc(1)` per request. Reset to None outside
+        # a group window so `alloc` falls through to the per-call path.
+        self._alloc_iter: Optional[Iterator] = None
+
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
@@ -377,7 +383,29 @@ class MambaPool:
     def available_size(self):
         return len(self.free_slots)
 
+    # -- Batched alloc for match_prefix --
+    def alloc_group_begin(self, num_reqs: int):
+        self._alloc_iter = None
+        if num_reqs > 0:
+            result = self._do_alloc(num_reqs)
+            if result is not None:
+                self._alloc_iter = iter(result.split(1))
+
+    def alloc_group_end(self):
+        if self._alloc_iter is not None:
+            remaining = list(self._alloc_iter)
+            if remaining:
+                self.free(torch.cat(remaining))
+        self._alloc_iter = None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if self._alloc_iter is not None and need_size == 1:
+            slot = next(self._alloc_iter, None)
+            if slot is not None:
+                return slot
+        return self._do_alloc(need_size)
+
+    def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
 
