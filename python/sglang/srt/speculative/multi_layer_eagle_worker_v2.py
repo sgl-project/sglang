@@ -516,11 +516,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 + batch_result.accept_lens
                 - 1
             )
-            # NOTE: this non-graph path runs the per-step forwards without any
-            # pre-plan (see warning above). Mark the batch so the forward path
-            # keeps skipping metadata init — preserves the pre-existing
-            # behavior; the latent issue is tracked by the warning.
-            forward_batch.mark_forward_metadata_ready()
 
         for step in range(self.speculative_num_steps):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
@@ -535,8 +530,14 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
-                # Skip relies on the unconditional mark above (pre-existing
-                # no-pre-plan behavior preserved verbatim).
+                if not forward_batch.forward_mode.is_idle():
+                    self.draft_runner_list[step].attn_backend.init_forward_metadata(
+                        forward_batch
+                    )
+                    # Own-backend plan -> re-plan equivalent; allow post-pad
+                    # re-plan. The per-step re-mark re-records padded shapes,
+                    # so later steps skip.
+                    forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
