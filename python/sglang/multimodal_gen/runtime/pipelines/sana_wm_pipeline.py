@@ -200,11 +200,14 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         sp_degree = getattr(server_args, "sp_degree", 1) or 1
         if sp_degree != 1:
             raise ValueError(
-                "SANA-WM does not support true sequence parallelism yet. "
-                "Its stage-1 DiT has layout-dependent non-attention operators "
-                "(GDN scan, GLUMBConvTemp, camera UCPE, and Plucker conditioning) "
-                "that need explicit state/reduction/halo exchange before tokens "
-                f"can be sharded. Use TP/FSDP/CFG instead of --sp-degree {sp_degree}."
+                "SANA-WM does not support sequence parallelism, so --sp-degree "
+                f"must be 1; got sp_degree={sp_degree}. The stage-1 DiT contains "
+                "layout-dependent cross-frame operators (bidirectional GDN scan, "
+                "GLUMBConvTemp temporal convolution, camera UCPE, and Plucker "
+                "conditioning). Sharding the time/sequence dimension would require "
+                "operator-aware state or halo exchange and can otherwise be slower "
+                "or incorrect. Use tensor parallelism instead, e.g. tp_size=2 or "
+                "tp_size=4."
             )
 
     def create_pipeline_stages(self, server_args: ServerArgs):

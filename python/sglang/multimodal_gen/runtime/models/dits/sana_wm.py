@@ -181,8 +181,11 @@ def _sana_wm_sequence_shard_enabled(sp_size: int) -> bool:
     if sp_size <= 1:
         return False
     raise NotImplementedError(
-        "SANA-WM does not support true sequence parallelism yet. "
-        "Use TP/FSDP/CFG instead of SP."
+        "SANA-WM does not support sequence parallelism. Its stage-1 DiT has "
+        "layout-dependent cross-frame operators (bidirectional GDN scan, "
+        "GLUMBConvTemp temporal convolution, camera UCPE, and Plucker "
+        "conditioning) that require operator-aware state/halo exchange. "
+        "Use tensor parallelism (tp_size=2 or tp_size=4) instead of SP."
     )
 
 
