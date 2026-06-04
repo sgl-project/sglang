@@ -754,6 +754,10 @@ def invoke_fused_moe_kernel(
         assert not (
             use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16
         ), "gated A remap is only supported for unquantized LoRA expand kernels"
+        # The A-TMA path (a_desc) loads A in the `a_desc is not None` branch, which
+        # bypasses the GATED_A_INPUT column remap entirely -- it would silently fall
+        # back to reading gate-shrink for the up half. Disallow the combination.
+        assert not a_use_tma, "gated A remap is not supported with A TMA"
         assert A.shape[1] >= 2 * B.shape[2]
         assert gated_a_n_half > 0
         assert (

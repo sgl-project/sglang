@@ -704,6 +704,19 @@ def _merged_experts_fused_moe_lora_add_impl(
     # deltas. This matches the classic path (_add_lora_gate_up_delta) numerically.
     expand_rank = lora_b_virtual.shape[-1]
     is_gated = max_lora_rank > expand_rank
+    gated_a_n_half = (lora_b_virtual.shape[1] // 2) if is_gated else 0
+    expand_config = b_stage_config
+    if is_gated:
+        # The in-kernel gate/up split needs the gate/up output boundary (gated_a_n_half)
+        # to land on a BLOCK_SIZE_N tile boundary, else a tile would straddle the two
+        # halves. Clamp the expand tile to a power-of-2 divisor of n_half (n_half is a
+        # power-of-2-multiple MLP dim, so this terminates) instead of crashing on an
+        # ill-aligned tuned config. BLOCK_SIZE_N only affects this expand's tiling.
+        block_n = b_stage_config["BLOCK_SIZE_N"]
+        while gated_a_n_half % block_n != 0:
+            block_n //= 2
+        if block_n != b_stage_config["BLOCK_SIZE_N"]:
+            expand_config = {**b_stage_config, "BLOCK_SIZE_N": block_n}
     invoke_fused_moe_kernel(
         intermediate.view(-1, max_lora_rank),
         lora_b_virtual,
@@ -719,7 +732,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         num_tokens_post_padded,
         mul_routed_weight,
         1,
-        b_stage_config,
+        expand_config,
         tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
         False,
         False,
@@ -731,7 +744,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         add_output_mask=token_lora_mask,
         router_topk=topk_ids.shape[1],
         gated_a_input=is_gated,
-        gated_a_n_half=(lora_b_virtual.shape[1] // 2) if is_gated else 0,
+        gated_a_n_half=gated_a_n_half,
     )
 
 
