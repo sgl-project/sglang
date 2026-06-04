@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
@@ -164,12 +163,17 @@ class SchedulerInvariantChecker:
         """
         # After decode: running_batch IS last_batch (same object), count once.
         # After prefill: they differ, both hold uncached tokens.
-        batches = [self.get_last_batch()]
+        # Use identity (is / is not), not membership or ==: ScheduleBatch's
+        # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
+        last_batch = self.get_last_batch()
+        running_batch = self.get_running_batch()
+        batches = [last_batch]
         if (
-            self.get_running_batch() not in (None, self.get_last_batch())
-            and not self.get_running_batch().is_empty()
+            running_batch is not None
+            and running_batch is not last_batch
+            and not running_batch.is_empty()
         ):
-            batches.append(self.get_running_batch())
+            batches.append(running_batch)
 
         full_uncached = 0
         swa_uncached = 0
@@ -194,13 +198,6 @@ class SchedulerInvariantChecker:
 
     def self_check_during_busy(self):
         if self.get_last_batch() is None:
-            return
-
-        spec_topk = self.server_args.speculative_eagle_topk or 1
-        if spec_topk > 1:
-            warnings.warn(
-                "Runtime memory check (busy) is not supported when speculation topk > 1."
-            )
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
