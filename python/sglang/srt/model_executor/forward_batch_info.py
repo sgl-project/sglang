@@ -34,8 +34,6 @@ from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
@@ -47,17 +45,16 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
+from sglang.srt.model_executor.triton_ops.position import compute_position_triton
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cuda,
@@ -69,6 +66,7 @@ from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -979,6 +977,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
+        # Local import: a module-level cp_utils import here is circular (#27014).
+        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -991,11 +992,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
-        # make sure that each rank has the same number of tokens to do collective communication and
-        # we can divide the tokens into 2 * CP chunks for load balance.
-        attn_cp_size = get_attention_cp_size()
+        # make sure that each rank has the same number of tokens to do collective communication.
+        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
+        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
+        # prefill with NaN draft logits, see #23269).
+        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
+        cp_align_size = get_cp_padding_align_size()
         for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size * 2)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1082,9 +1086,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
-        self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
-            bs - self.seq_lens.shape[0]
-        )
+        # Keep gpu_only batches sync-free: leave seq_lens_sum None and let the
+        # attention backend over-allocate from an upper bound (see #26738).
+        if self.seq_lens_sum is not None:
+            self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
+                bs - self.seq_lens.shape[0]
+            )
         self.seq_lens = self._pad_tensor_to_size(
             self.seq_lens, bs, value=seq_len_fill_value
         )
@@ -1171,7 +1178,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
-
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
         self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
         bs = self.batch_size
@@ -1235,6 +1241,46 @@ def enable_num_token_non_padded():
     return get_moe_expert_parallel_world_size() > 1
 
 
+def build_inner_fb_view(
+    forward_batch: ForwardBatch,
+    *,
+    bs: int,
+    forward_mode: ForwardMode,
+    encoder_lens: Optional[torch.Tensor] = None,
+):
+    """Build a ForwardBatch-like view for MultiStep draft wrapper dispatch.
+
+    MultiStep draft wrappers (FlashInferMultiStepDraftBackend,
+    AiterMultiStepDraftBackend, TritonMultiStepDraftBackend, etc.) need
+    to dispatch to per-step inner backends'
+    :py:meth:`AttentionBackend.init_forward_metadata_out_graph` with an
+    overridden ``forward_mode`` (typically pinned to ``DECODE``) and
+    sometimes overridden ``encoder_lens``. The result is a thin
+    namespace mirroring just the fields backend init reads, avoiding
+    the cost of allocating a real ``ForwardBatch``.
+
+    ``actual_forward_mode`` carries the original runtime
+    ``forward_batch.forward_mode`` (e.g., spec-decode draft) so backends
+    that check it for IDLE substitution (DSV4) see the unaltered value.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        batch_size=bs,
+        forward_mode=forward_mode,
+        actual_forward_mode=forward_batch.forward_mode,
+        input_ids=getattr(forward_batch, "input_ids", None),
+        positions=getattr(forward_batch, "positions", None),
+        req_pool_indices=forward_batch.req_pool_indices,
+        seq_lens=forward_batch.seq_lens,
+        seq_lens_sum=forward_batch.seq_lens_sum,
+        seq_lens_cpu=forward_batch.seq_lens_cpu,
+        encoder_lens=encoder_lens,
+        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        spec_info=forward_batch.spec_info,
+    )
+
+
 class PPProxyTensors:
     # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
     tensors: Dict[str, torch.Tensor]
@@ -1282,62 +1328,6 @@ def compute_position(
             extend_prefix_lens, extend_seq_lens
         )
     return positions, extend_start_loc
-
-
-def compute_position_triton(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
-):
-    """Compute positions. It is a fused version of `compute_position_torch`."""
-    batch_size = extend_seq_lens.shape[0]
-    has_prefix = extend_prefix_lens.shape[0] == batch_size
-
-    positions = torch.empty(
-        extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
-    )
-    extend_start_loc = torch.empty(
-        batch_size, dtype=torch.int32, device=extend_seq_lens.device
-    )
-
-    # Launch kernel
-    compute_position_kernel[(batch_size,)](
-        positions,
-        extend_start_loc,
-        extend_prefix_lens,
-        extend_seq_lens,
-        has_prefix,
-    )
-
-    return positions, extend_start_loc
-
-
-@triton.jit
-def compute_position_kernel(
-    positions,
-    extend_start_loc,
-    extend_prefix_lens,
-    extend_seq_lens,
-    has_prefix: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0).to(tl.int64)
-
-    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
-    seq_len = tl.load(extend_seq_lens + pid)
-
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_seq_lens + i)
-
-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        tl.store(
-            positions + cumsum_start + offset,
-            prefix_len + offset,
-            mask=offset < seq_len,
-        )
-    tl.store(extend_start_loc + pid, cumsum_start)
 
 
 def compute_position_torch(
