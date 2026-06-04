@@ -54,6 +54,7 @@ def _emit(name: str, policy: str, ms: float, args: argparse.Namespace) -> None:
                 "ms": ms,
                 "batch": args.batch,
                 "seq": args.seq,
+                "kv_seq": args.kv_seq or args.seq,
                 "hidden": args.hidden,
                 "heads": args.heads,
                 "head_dim": args.head_dim,
@@ -100,6 +101,7 @@ def bench_norm_scale_shift(args: argparse.Namespace) -> None:
 
 def bench_sdpa(args: argparse.Namespace) -> None:
     dtype = _dtype(args.dtype)
+    kv_seq = args.kv_seq or args.seq
     q = torch.randn(
         args.batch,
         args.heads,
@@ -108,8 +110,15 @@ def bench_sdpa(args: argparse.Namespace) -> None:
         device="cuda",
         dtype=dtype,
     )
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    k = torch.randn(
+        args.batch,
+        args.heads,
+        kv_seq,
+        args.head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    v = torch.randn_like(k)
 
     policies = {
         "torch_default": None,
@@ -136,6 +145,7 @@ def bench_sdpa(args: argparse.Namespace) -> None:
 
 def bench_attention_backends(args: argparse.Namespace) -> None:
     dtype = _dtype(args.dtype)
+    kv_seq = args.kv_seq or args.seq
     q = torch.randn(
         args.batch,
         args.seq,
@@ -144,8 +154,15 @@ def bench_attention_backends(args: argparse.Namespace) -> None:
         device="cuda",
         dtype=dtype,
     )
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    k = torch.randn(
+        args.batch,
+        kv_seq,
+        args.heads,
+        args.head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    v = torch.randn_like(k)
     q_sdpa = q.transpose(1, 2)
     k_sdpa = k.transpose(1, 2)
     v_sdpa = v.transpose(1, 2)
@@ -157,7 +174,7 @@ def bench_attention_backends(args: argparse.Namespace) -> None:
         softmax_scale=scale,
         num_kv_heads=args.heads,
     )
-    metadata = FlashAttentionMetadata(max_seqlen_q=args.seq, max_seqlen_k=args.seq)
+    metadata = FlashAttentionMetadata(max_seqlen_q=args.seq, max_seqlen_k=kv_seq)
 
     policies = {
         "fa": lambda: flash.forward(q, k, v, attn_metadata=metadata),
@@ -190,6 +207,7 @@ def bench_attention_backends(args: argparse.Namespace) -> None:
 
 def bench_local_attention_autotune(args: argparse.Namespace) -> None:
     dtype = _dtype(args.dtype)
+    kv_seq = args.kv_seq or args.seq
     q = torch.randn(
         args.batch,
         args.seq,
@@ -198,9 +216,16 @@ def bench_local_attention_autotune(args: argparse.Namespace) -> None:
         device="cuda",
         dtype=dtype,
     )
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    metadata = FlashAttentionMetadata(max_seqlen_q=args.seq, max_seqlen_k=args.seq)
+    k = torch.randn(
+        args.batch,
+        kv_seq,
+        args.heads,
+        args.head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    v = torch.randn_like(k)
+    metadata = FlashAttentionMetadata(max_seqlen_q=args.seq, max_seqlen_k=kv_seq)
     with global_force_attn_backend_context_manager(AttentionBackendEnum.FA):
         layer = LocalAttention(
             num_heads=args.heads,
@@ -244,6 +269,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seq", type=int, default=4096)
+    parser.add_argument("--kv-seq", type=int, default=None)
     parser.add_argument("--hidden", type=int, default=3072)
     parser.add_argument("--heads", type=int, default=24)
     parser.add_argument("--head-dim", type=int, default=128)
