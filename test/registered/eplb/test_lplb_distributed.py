@@ -119,6 +119,73 @@ def test_dispatch_probability_matches_torch_reference():
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="This test requires CUDA",
+)
+def test_solve_ipm_matches_torch_reference():
+    """The fused CUDA IPM kernel and the pure-torch reference should agree to
+    a small tolerance on a *real* LPLB LP. They are NOT bit-equivalent — the
+    kernel factors the KKT system with a hand-written block Cholesky while the
+    reference uses torch.linalg.solve (LU) — so we compare with allclose and
+    print the max abs difference (the numerical-difference number the review
+    asked about).
+
+    The LP is built the way LPLBSolver does (Big-M column + normalized
+    counts), because an arbitrary random Ax=b never satisfies the solver's
+    convergence test (the Big-M slack must reach ~0) and both backends would
+    just return the 0.5 non-convergence sentinel — agreeing trivially without
+    exercising the solve. Single-rank, any CUDA GPU."""
+    from sglang.jit_kernel.lplb.cuda_solver import solve_ipm as cuda_solve_ipm
+    from sglang.jit_kernel.lplb.torch_solver import solve_ipm_torch_reference
+    from sglang.srt.eplb.lplb_solver import LPLBSolver
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    phy2log, log2phy, num_valid = _make_metadata()
+    solver = LPLBSolver(
+        phy2log=phy2log.to(device),
+        log2phy=log2phy.to(device),
+        num_gpus=NUM_GPUS,
+        ep_group=None,
+        logical_to_all_physical_map_num_valid=num_valid.to(device),
+    )
+
+    # Realistic counts: the replicated expert (logical 0) carries heavy load
+    # to distribute across its 3 physical copies; the rest are moderate. This
+    # gives the barrier method a well-posed instance that converges in 5 iters.
+    global_counts = torch.tensor(
+        [120.0, 30.0, 25.0, 20.0], dtype=torch.float32, device=device
+    )
+
+    # Reconstruct the LP exactly as LPLBSolver._solve builds it.
+    counts_norm = global_counts / global_counts.sum().clamp(min=1.0)
+    t1 = counts_norm[solver.log_single]
+    b1 = counts_norm[solver.log_replicated]
+    b2 = -(solver.B1 @ t1).flatten()
+    b = torch.cat([b1, b2])
+    big_M_col = b - solver._A_base_row_sum
+    A_full = torch.hstack([solver.A_base, big_M_col.unsqueeze(1)])
+
+    cuda_x = cuda_solve_ipm(A_full, b, solver.c_vec)
+    torch_x = solve_ipm_torch_reference(A_full, b, solver.c_vec)
+
+    converged = not torch.allclose(cuda_x, torch.full_like(cuda_x, 0.5))
+    max_diff = (cuda_x - torch_x).abs().max().item()
+    print(
+        f"\n[ipm-compare] converged={converged}  max|cuda-torch|={max_diff:.3e}  "
+        f"cuda={[round(v,4) for v in cuda_x.tolist()]}  "
+        f"torch={[round(v,4) for v in torch_x.tolist()]}"
+    )
+    assert converged, (
+        "IPM returned the 0.5 non-convergence sentinel — the comparison would "
+        "be trivial. Adjust the LP instance so it converges."
+    )
+    assert torch.allclose(cuda_x, torch_x, atol=1e-2, rtol=1e-2), (
+        f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
+    )
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < NUM_GPUS,
     reason=f"This test requires at least {NUM_GPUS} CUDA devices",
 )

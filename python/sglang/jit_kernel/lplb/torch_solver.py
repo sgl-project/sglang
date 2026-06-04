@@ -134,3 +134,59 @@ def solve_ipm(
             f"LPLB fused solver requires float32; got A.dtype={A.dtype}."
         )
     return _FUSED_SOLVE_IPM(A, b, c, num_iters=num_iters)
+
+
+def solve_ipm_torch_reference(
+    A: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    num_iters: int = 5,
+) -> torch.Tensor:
+    """Pure-torch reference for the fused IPM kernel — testing only.
+
+    Mirrors the barrier-method iteration in ``csrc/lplb/ipm.cuh``
+    step-for-step so the two can be compared numerically:
+
+      x <- 1
+      for _ in range(num_iters):
+          ax2  = A * x^2            # (NC, NV)
+          ax2a = ax2 @ A^T          # (NC, NC) KKT matrix
+          delta = solve(ax2a, ax2 @ c)
+          r     = delta^T @ A       # (NV,)
+          d     = x * (c - r)
+          alpha = 0.999 / d_max  (or 1.0 if d_max <= 1e-9)
+          x    *= 1 - alpha * d
+      write 0.5 everywhere on non-convergence.
+
+    NOT bit-equivalent to the kernel: the kernel factors the KKT system
+    with a hand-written block Cholesky while this uses
+    ``torch.linalg.solve`` (LU). The two agree to a small tolerance
+    (the numerical difference being the whole point of the comparison
+    test). This function is never on the production path — the fused
+    kernel is the only LP solver at runtime.
+    """
+    nc, nv = A.shape
+    assert b.shape == (nc,), f"b shape mismatch: {b.shape} vs ({nc},)"
+    assert c.shape == (nv,), f"c shape mismatch: {c.shape} vs ({nv},)"
+
+    x = torch.ones(nv, device=A.device, dtype=torch.float32)
+    d_max = torch.tensor(0.0, device=A.device, dtype=torch.float32)
+    for _ in range(num_iters):
+        ax2 = A * (x * x).unsqueeze(0)  # (NC, NV)
+        ax2a = ax2 @ A.t()  # (NC, NC)
+        ax2c = ax2 @ c  # (NC,)
+        # Match the kernel's 1e-12 pivot clamp via a tiny diagonal jitter so
+        # a (near-)singular KKT system stays solvable instead of raising.
+        ax2a = ax2a + 1e-12 * torch.eye(nc, device=A.device, dtype=torch.float32)
+        delta = torch.linalg.solve(ax2a, ax2c)  # (NC,)
+        r = A.t() @ delta  # (NV,)
+        d = x * (c - r)  # (NV,)
+        d_max = d.max()
+        alpha = 0.999 / d_max if d_max > 1e-9 else torch.tensor(1.0, device=A.device)
+        x = x * (1.0 - alpha * d)
+
+    max_residual = (A @ x - b).abs().max()
+    converged = (d_max < 0.1) and (0 <= x[-1] < 1e-4) and (max_residual < 0.05)
+    if not converged:
+        return torch.full((nv,), 0.5, device=A.device, dtype=torch.float32)
+    return x
