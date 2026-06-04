@@ -15,13 +15,11 @@
 
 import dataclasses
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import triton
-import triton.language as tl
 from torch import nn
-from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -41,9 +39,9 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
-    compute_temp_top_p_normalized_logprobs,
     get_token_ids_logprobs_chunk,
     get_token_ids_logprobs_prefill,
     get_top_logprobs_chunk,
@@ -56,11 +54,38 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import (
+    is_cpu,
+    is_npu,
+    is_pin_memory_available,
+    use_intel_amx_backend,
+)
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+
+# When set, LogitsProcessor.forward returns an empty output and skips the
+# LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
+# attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
+# and its [batch * dp_size, vocab] output OOMs under DP attention with a
+# tight mem_fraction_static.
+_in_autotune_dummy_run = False
+
+
+def get_in_autotune_dummy_run() -> bool:
+    return _in_autotune_dummy_run
+
+
+@contextmanager
+def autotune_dummy_run_mode():
+    global _in_autotune_dummy_run
+    _in_autotune_dummy_run = True
+    try:
+        yield
+    finally:
+        _in_autotune_dummy_run = False
 
 
 @dataclasses.dataclass
@@ -126,9 +151,7 @@ class LogitsMetadata:
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # logits and logprobs post processing
-    temp_scaled_logprobs: bool = False
     temperature: torch.Tensor = None
-    top_p_normalized_logprobs: bool = False
     top_p: torch.Tensor = None
 
     # DP attention metadata. Not needed when DP attention is not used.
@@ -205,7 +228,6 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
@@ -297,6 +319,12 @@ class LogitsProcessor(nn.Module):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
+        # Autotune dummy run discards this output; see _in_autotune_dummy_run.
+        # Placed before the MIS / DLLM / common dispatch so all three LM-head
+        # paths are skipped.
+        if _in_autotune_dummy_run:
+            return LogitsProcessorOutput(next_token_logits=None)
+
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
@@ -356,9 +384,6 @@ class LogitsProcessor(nn.Module):
             )
 
         # Start to process input logprobs
-        # Normalize the logprob w/o temperature, top-p
-        self._expand_metadata_for_logprobs(logits_metadata, pruned_states.device)
-
         # Determine whether to use chunked or non-chunked logits processing.
         # Skip chunking if:
         # 1. Chunking is disabled
@@ -539,10 +564,14 @@ class LogitsProcessor(nn.Module):
             # Build the index tensors via pinned host memory + non-blocking H2D
             # so the small copy doesn't drain the stream.
             sample_indices = torch.tensor(
-                sample_indices, dtype=torch.int64, pin_memory=True
+                sample_indices,
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(),
             ).to(pruned_states.device, non_blocking=True)
             input_logprob_indices = torch.tensor(
-                input_logprob_indices, dtype=torch.int64, pin_memory=True
+                input_logprob_indices,
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(),
             ).to(pruned_states.device, non_blocking=True)
 
         return (
@@ -607,29 +636,8 @@ class LogitsProcessor(nn.Module):
 
         return hidden_states_to_store
 
-    def _expand_metadata_for_logprobs(
-        self, logits_metadata: LogitsMetadata, device: torch.device
-    ):
-        pruned_lens = torch.tensor(
-            logits_metadata.extend_logprob_pruned_lens_cpu,
-            dtype=torch.int64,
-            pin_memory=True,
-        ).to(device, non_blocking=True)
-        if logits_metadata.temp_scaled_logprobs:
-            logits_metadata.temperature = torch.repeat_interleave(
-                logits_metadata.temperature.view(-1),
-                pruned_lens,
-            ).view(-1, 1)
-        if logits_metadata.top_p_normalized_logprobs:
-            logits_metadata.top_p = torch.repeat_interleave(
-                logits_metadata.top_p,
-                pruned_lens,
-            )
-
     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
-        input_logprobs = compute_temp_top_p_normalized_logprobs(
-            input_logits, logits_metadata
-        )
+        input_logprobs = torch.nn.functional.log_softmax(input_logits, dim=-1)
 
         # Get the logprob of top-k tokens
         if logits_metadata.extend_return_top_logprob:
@@ -752,26 +760,8 @@ class LogitsProcessor(nn.Module):
 
             # Compute the logprobs of the chunk
             chunk_input_logprobs = chunk_logits[chunk_indices]
-            # Only index per-token arrays when the corresponding feature is active.
-            # Otherwise these tensors can be per-sequence (or scalars), which can
-            # cause out-of-bounds indexing on GPU.
-            chunk_temperature = (
-                logits_metadata.temperature[global_indices]
-                if logits_metadata.temp_scaled_logprobs
-                and logits_metadata.temperature is not None
-                else None
-            )
-            chunk_top_p = (
-                logits_metadata.top_p[global_indices]
-                if logits_metadata.top_p_normalized_logprobs
-                and logits_metadata.top_p is not None
-                else None
-            )
-            chunk_input_logprobs = compute_temp_top_p_normalized_logprobs(
-                chunk_input_logprobs,
-                logits_metadata,
-                chunk_top_p,
-                chunk_temperature,
+            chunk_input_logprobs = torch.nn.functional.log_softmax(
+                chunk_input_logprobs, dim=-1
             )
 
             # For each chunk, we need to get the slice of the token_to_seq_idx
@@ -1108,55 +1098,3 @@ class LogitsProcessor(nn.Module):
             # They should be moved to GenerationBatchResult to keep this class clean.
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
-
-
-@triton.jit
-def fused_softcap_kernel(
-    full_logits_ptr,
-    softcapping_value,
-    ncols,
-    row_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(1).to(tl.int64)
-    pid = tl.program_id(0).to(tl.int64)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < ncols
-
-    # Load values
-    row_ptr = full_logits_ptr + row * row_stride
-    x = tl.load(row_ptr + offsets, mask=mask)
-
-    # Perform operations in-place
-    x = x / softcapping_value
-    x = libdevice.tanh(x)
-    x = x * softcapping_value
-
-    # Store result
-    tl.store(row_ptr + offsets, x, mask=mask)
-
-
-def fused_softcap(full_logits, final_logit_softcapping):
-    if full_logits.is_contiguous():
-        nrows, ncols = 1, full_logits.numel()
-        row_stride = ncols
-    else:
-        assert full_logits.ndim == 2, "non-contiguous softcap requires 2D tensor"
-        assert (
-            full_logits.stride(1) == 1
-        ), "non-contiguous softcap requires contiguous columns"
-        nrows, ncols = full_logits.shape
-        row_stride = full_logits.stride(0)
-
-    BLOCK_SIZE = 1024
-    grid = ((ncols + BLOCK_SIZE - 1) // BLOCK_SIZE, nrows)
-
-    fused_softcap_kernel[grid](
-        full_logits_ptr=full_logits,
-        softcapping_value=final_logit_softcapping,
-        ncols=ncols,
-        row_stride=row_stride,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return full_logits

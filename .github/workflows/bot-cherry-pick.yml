@@ -20,15 +20,10 @@ permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: cherry-pick-${{ github.event.inputs.target_branch }}
-  cancel-in-progress: false
-
 jobs:
   cherry-pick:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
-    environment: 'prod'
     steps:
       - name: Validate inputs
         env:

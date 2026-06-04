@@ -17,6 +17,7 @@ import asyncio
 import copy
 import importlib.util
 import json
+import math
 import os
 import random
 import shutil
@@ -615,13 +616,16 @@ async def async_request_sglang_generate(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        sampling_params = {
+            "temperature": args.temperature,
+            "max_new_tokens": request_func_input.output_len,
+            "ignore_eos": not args.disable_ignore_eos,
+        }
+        if args.top_p < 1.0:
+            sampling_params["top_p"] = args.top_p
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
@@ -1716,6 +1720,11 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "return_logprob"):
         args.return_logprob = False
 
+    if not hasattr(args, "temperature"):
+        args.temperature = 0.0
+    if not hasattr(args, "top_p"):
+        args.top_p = 1.0
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -1930,6 +1939,44 @@ def run_benchmark(args_: argparse.Namespace):
     )
 
 
+def _finite_positive_float(value) -> float:
+    """argparse type for a finite, strictly positive float."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite float > 0, got {value!r}"
+        ) from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
+    return parsed
+
+
+def _validate_parsed_gsp_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject malformed GSP distribution/alpha combinations at parse time.
+
+    Invoked from the CLI entry point right after ``parser.parse_args()`` so
+    users see a clear argparse-style error before any server, model, or
+    tokenizer setup runs and masks the real cause with an unrelated network
+    failure.
+    """
+    distribution = getattr(args, "gsp_group_distribution", None)
+    alpha = getattr(args, "gsp_zipf_alpha", None)
+    if distribution == "zipf" and alpha is None:
+        parser.error(
+            "--gsp-group-distribution=zipf requires --gsp-zipf-alpha "
+            "(a finite float > 0)"
+        )
+    if distribution == "uniform" and alpha is not None:
+        parser.error(
+            "--gsp-zipf-alpha is only meaningful with "
+            "--gsp-group-distribution=zipf; remove --gsp-zipf-alpha "
+            "or set --gsp-group-distribution=zipf"
+        )
+
+
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, [])
@@ -1982,11 +2029,25 @@ if __name__ == "__main__":
             "image",
             "mooncake",
             "longbench_v2",
+            "speed-bench",
         ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--speed-bench-category",
+        type=str,
+        default=None,
+        choices=["low_entropy", "mixed", "high_entropy"],
+        help="Category filter for the speed-bench dataset.",
+    )
+    parser.add_argument(
+        "--speed-bench-output-len",
+        type=int,
+        default=512,
+        help="Fixed output length for speed-bench requests (default: 512).",
     )
     parser.add_argument(
         "--model",
@@ -2151,6 +2212,18 @@ if __name__ == "__main__":
         "--disable-ignore-eos",
         action="store_true",
         help="Disable ignoring EOS.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling parameter.",
     )
     parser.add_argument(
         "--extra-request-body",
@@ -2352,6 +2425,37 @@ if __name__ == "__main__":
         action="store_true",
         help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
     )
+    group.add_argument(
+        "--gsp-group-distribution",
+        type=str,
+        choices=["uniform", "zipf"],
+        default="uniform",
+        help=(
+            "Prefix-group sampling distribution for generated-shared-prefix. "
+            "'uniform' (default) assigns each group an equal number of requests. "
+            "'zipf' samples each request's group by rank with "
+            "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha); rank starts at 1 "
+            "and group index 0 is the hottest. Requires --gsp-zipf-alpha "
+            "(a finite float > 0) when set to 'zipf'. Total request count is "
+            "still num_groups * prompts_per_group, identical to uniform mode; "
+            "only the per-request group assignment changes. The on-disk "
+            "dataset cache uses a distinct key per (group_distribution, "
+            "zipf_alpha), so uniform-mode caches are never mixed with "
+            "zipf-mode caches and zipf runs with different alpha use "
+            "separate files."
+        ),
+    )
+    group.add_argument(
+        "--gsp-zipf-alpha",
+        type=_finite_positive_float,
+        default=None,
+        help=(
+            "Zipf exponent alpha for --gsp-group-distribution=zipf, with "
+            "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha) and rank starting "
+            "at 1. Must be a finite float strictly greater than 0; larger "
+            "values concentrate requests on lower-ranked (hotter) groups."
+        ),
+    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",
@@ -2399,4 +2503,5 @@ if __name__ == "__main__":
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
     args = parser.parse_args()
+    _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)
