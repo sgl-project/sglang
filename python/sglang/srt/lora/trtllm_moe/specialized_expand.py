@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.kernel_utils import get_pdl_launch_metadata
+
 
 
 @triton.jit
@@ -50,6 +52,7 @@ def _moe_lora_expand_add_kernel(
     BLOCK_SIZE_R: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     GATED_A_HALF: tl.constexpr,
+    ENABLE_PDL: tl.constexpr = False,
 ):
     """Rank-specialized LoRA-B expand for virtual-expert LoRA.
 
@@ -62,6 +65,12 @@ def _moe_lora_expand_add_kernel(
     ``GATED_A_HALF == 0`` is the non-gated path (read ``[0:R]`` for all tiles).
     """
     pid = tl.program_id(0)
+    # GDC wait: the routing buffers (sorted_token_ids / expert_ids /
+    # num_tokens_post_padded) come from the preceding align kernel; wait before
+    # consuming them. The intermediate (A) is produced by an earlier shrink that
+    # is ordered before this align, so it is already visible.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -117,6 +126,11 @@ def _moe_lora_expand_add_kernel(
         mask=(offs_n[None, :] < N) & rank_mask[:, None],
         other=0.0,
     )
+
+    # All input reads (routing, A intermediate, B weight) are issued; hint the
+    # runtime that the dependent (successor) kernel may begin launching.
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
     accumulator = tl.dot(a, b, out_dtype=tl.float32)
     if MUL_ROUTED_WEIGHT:
@@ -197,6 +211,7 @@ def _invoke_moe_lora_expand_add(
         * triton.cdiv(N, block_size_n),
     )
 
+    enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _moe_lora_expand_add_kernel[grid](
         intermediate,
         weight,
@@ -223,6 +238,8 @@ def _invoke_moe_lora_expand_add(
         BLOCK_SIZE_R=block_size_r,
         GROUP_SIZE_M=group_size_m,
         GATED_A_HALF=gated_a_half,
+        ENABLE_PDL=enable_pdl,
         num_warps=config.get("num_warps", 4),
         num_stages=1,
+        **pdl_kwargs,
     )
