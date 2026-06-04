@@ -110,6 +110,7 @@ curl -s http://127.0.0.1:30000/v1/videos \
     "input_reference": "/path/to/first_frame.png",
     "num_frames": 321,
     "seed": 42,
+    "fps": 16,
     "diffusers_kwargs": {
       "action": "w-80,wl-80,l-80,wj-80",
       "intrinsics": "/path/to/intrinsics.npy"
@@ -123,6 +124,7 @@ curl -s http://127.0.0.1:30000/v1/videos \
 | `input_reference` | first-frame image — a server-side path, an `http(s)://` URL, or (multipart) an uploaded file |
 | `num_frames` | total pixel frames (e.g. `321` → 41 latent frames, 13 chunks; output 704×1280) |
 | `seed` | RNG seed (default `42`) |
+| `fps` | output frame rate — **pass `16`** (SANA-WM's native rate). The generic `/v1/videos` default is `24`, which would encode the same frames at 24 fps and make the clip play ~25% shorter |
 | `diffusers_kwargs.action` | camera action-DSL string (§7) |
 | `diffusers_kwargs.intrinsics` | path to a camera-intrinsics `.npy` (per-frame `(T,3,3)`) or an inline 3×3 / `(T,3,3)` list |
 
