@@ -376,6 +376,11 @@ export const Qwen35Deployment = () => {
       }
     }
 
+    // Enable NCCL symmetric memory for H100 FP8 deployments.
+    if (hardware === 'h100' && quantization === 'fp8' && hwConfig.tp > 1) {
+      cmd += ` \\\n  --enable-symm-mem`;
+    }
+
     // Chunked prefill tuning for H200 FP8 + MTP (validated on H200 only)
     if (hardware === 'h200' && quantization === 'fp8' && speculative === 'enabled') {
       cmd += ` \\\n  --max-running-requests 128`;

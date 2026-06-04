@@ -142,7 +142,7 @@ from sglang.srt.model_executor.breakable_cuda_graph_runner import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
-    DecodeInputBuffers,
+    _allocate_decode_buffers,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -2410,15 +2410,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
-        if backend_str not in [
+        moe_needs_autotune = backend_str in [
             "flashinfer_trtllm",
-            # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
-            # "flashinfer_trtllm_routed",
+            "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
             "flashinfer_cutedsl",
-            # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
-            # "flashinfer_cutlass",
-        ]:
+            "flashinfer_cutlass",
+        ]
+
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
+
+        model_uses_fp4 = self.model_config.quantization in (
+            "modelopt_fp4",
+            "modelopt_mixed",
+        )
+        fp4_gemm_needs_autotune = model_uses_fp4 and (
+            get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
+            or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+        )
+
+        if not (moe_needs_autotune or fp4_gemm_needs_autotune):
             return False
 
         major, _ = torch.cuda.get_device_capability()
@@ -2566,7 +2579,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
-        buffers: DecodeInputBuffers = DecodeInputBuffers.create(
+        buffers = _allocate_decode_buffers(
             device=self.device,
             max_bs=batch_size,
             max_num_token=num_tokens,
