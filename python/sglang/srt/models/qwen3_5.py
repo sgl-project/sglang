@@ -71,6 +71,7 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -897,7 +898,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def _prepare_qkv_aiter_fused(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        pool = forward_batch.token_to_kv_pool
+        # NOTE: ForwardBatch carries no kv-pool handle on this tree; use the
+        # canonical backend accessor (same pool RadixAttention writes into).
+        pool = get_token_to_kv_pool()
         k_buffer = pool.get_key_buffer(self.attn.layer_id)
         v_buffer = pool.get_value_buffer(self.attn.layer_id)
 
@@ -914,6 +917,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # SGLang stores cos|sin concatenated along last dim; aiter wants them split.
         cos, sin = self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
+
+        # mRoPE (Qwen3-VL) passes a 2-D [3, T] position tensor (temporal/height/width
+        # sections). The aiter fused kernel indexes positions as 1-D [T] via stride(0),
+        # so a [3, T] tensor strides out of bounds -> GPU memory fault. For text tokens
+        # the three sections are identical sequential positions, so section 0 is the
+        # correct 1-D form; make it contiguous for the kernel's stride assumptions.
+        if positions.dim() > 1:
+            positions = positions[0].contiguous()
 
         result = _aiter_fused_qkv_split_qk_norm_rope_cache(
             qkv=qkv,
@@ -932,14 +943,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             attn_output_gate=self.attn_output_gate,
             gated_qkv_layout="interleaved",
             kv_cache_layout="NHD",
-            # TODO: thread FP8 KV scales when fp8_kv cache is enabled.
-            k_scale=getattr(self.attn, "k_scale", None),
-            v_scale=getattr(self.attn, "v_scale", None),
+            # FP8 KV cache: k_scale / v_scale are per-tensor dequant scales (0-dim
+            # device tensors) populated by Fp8KVCacheMethod, or None for a bf16 cache.
+            # The kernel applies (1 / scale) before the fp8 cache write, matching the
+            # token_to_kv_pool `cache_k.div_(k_scale)` convention; when None it writes
+            # the cache unscaled.
+            k_scale=self.attn.k_scale,
+            v_scale=self.attn.v_scale,
             eps=self.q_norm.variance_epsilon,
         )
 
         if self.attn_output_gate:
             q, gate, k, v = result
+            # Kernel returns gate as [T, qh, head_dim]; flatten to [T, qh*head_dim]
+            # to match the (flattened) attn_output for the elementwise gate multiply,
+            # matching the native path's gate shape.
+            gate = gate.reshape(gate.shape[0], -1)
         else:
             q, k, v = result
             gate = None
@@ -954,11 +973,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         # ROCm fused path: split + QK-norm + RoPE + KV-cache-write in one kernel.
         # Skip the subsequent in-attention cache write because the kernel did it.
-        # Partial rotary (rope dim < head dim) isn't wired into the kernel yet.
-        use_aiter_fused = (
-            _aiter_fused_qkv_split_qk_norm_rope_cache is not None
-            and self.partial_rotary_factor == 1.0
-        )
+        # Partial rotary (rope dim < head dim, e.g. factor 0.25) is handled by the
+        # kernel itself: it derives the rotary span from the cos/sin table width
+        # (cos_sin_cache is built at width head_dim * partial_rotary_factor) and
+        # passes the non-rotated tail through unchanged.
+        use_aiter_fused = _aiter_fused_qkv_split_qk_norm_rope_cache is not None
 
         if use_aiter_fused:
             q, k, v, gate = self._prepare_qkv_aiter_fused(
