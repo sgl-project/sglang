@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
     mla_quantize_and_rope_for_fp8,
 )
@@ -388,7 +389,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             (batch_size, max_blocks), -1, dtype=torch.int32, device=device
         )
 
-        create_flashmla_kv_indices_triton[(batch_size,)](
+        create_flashmla_kv_indices_triton[
+            (
+                batch_size,
+                get_num_kv_index_blocks_flashmla(max_blocks, self.page_size),
+            )
+        ](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
@@ -534,7 +540,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
 
         # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[(bs,)](
+        create_flashmla_kv_indices_triton[
+            (
+                bs,
+                get_num_kv_index_blocks_flashmla(
+                    metadata.block_kv_indices.shape[1], self.page_size
+                ),
+            )
+        ](
             self.req_to_token,
             req_pool_indices[:bs],
             seq_lens,

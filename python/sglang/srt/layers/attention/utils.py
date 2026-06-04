@@ -20,6 +20,9 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    get_num_kv_index_blocks_flashmla as get_num_kv_index_blocks_flashmla,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
     get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
 )
 from sglang.srt.layers.attention.triton_ops.pad import (
