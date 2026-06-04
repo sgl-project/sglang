@@ -942,7 +942,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
+            kv_transfer_page_size = page_size
             if self.scheduler.enable_hisparse:
+                # Direct-to-host sends host/C4 rows; keep allocator.page_size
+                # logical and use the compressed page size only for these indices.
+                kv_transfer_page_size = getattr(
+                    self.token_to_kv_pool_allocator,
+                    "hisparse_page_size",
+                    page_size,
+                )
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
                     dst_kv_indices[: origin_input_len - prefix_len]
@@ -973,13 +981,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
-                state_page_size = (
-                    self.token_to_kv_pool.swa_page_size
-                    if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-                    else page_size
-                )
                 window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, state_page_size)
+                window_start = page_align_floor(window_start, page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
@@ -989,7 +992,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), state_page_size
+                    window_kv_indices_swa.cpu().numpy(), page_size
                 )
 
             def _dsa_payload():
@@ -1018,7 +1021,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
