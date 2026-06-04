@@ -16,6 +16,7 @@ def multigpu_bench_main(
     main_fn: Callable[[], None],
     *,
     pre_launch_fn: Optional[Callable[[List[int]], None]] = None,
+    timeout: Optional[int] = None,
 ) -> None:
     """cudalib-style multi-GPU benchmark entry point.
 
@@ -36,6 +37,10 @@ def multigpu_bench_main(
     ``pre_launch_fn`` (kw-only) runs once in the outer process before any
     torchrun child starts, receiving the runnable world sizes. Use it for
     parallel JIT precompilation so torchrun children hit a warm disk cache.
+
+    ``timeout`` (kw-only, seconds) bounds each per-world-size torchrun
+    invocation. Defaults to ``None`` (wait indefinitely) since benchmark sweeps
+    can legitimately run long; set it to fail fast on a hung worker.
     """
 
     def inner() -> int:
@@ -50,6 +55,7 @@ def multigpu_bench_main(
         inner=inner,
         kind="benchmark",
         pre_launch_fn=pre_launch_fn,
+        timeout=timeout,
     )
 
 

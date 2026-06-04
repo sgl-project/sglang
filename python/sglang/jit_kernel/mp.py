@@ -114,6 +114,7 @@ def multigpu_launch(
     inner: Callable[[], int],
     kind: str,
     pre_launch_fn: Optional[Callable[[List[int]], None]] = None,
+    timeout: Optional[int] = None,
 ) -> NoReturn | None:
     """Shared torchrun-based launcher.
 
@@ -127,6 +128,10 @@ def multigpu_launch(
     any ``--num-gpu`` override). Use it for parallel JIT precompilation so the
     on-disk kernel cache is warm by the time the torchrun children import
     their kernels.
+
+    `timeout`, if given, bounds each per-world-size torchrun invocation (in
+    seconds). On expiry the child's whole process group is killed and the
+    launcher exits non-zero. `None` (the default) waits indefinitely.
     """
     pid_key = env_key + "_PID"
     if env_key in os.environ:
@@ -185,8 +190,11 @@ def multigpu_launch(
         proc = subprocess.Popen(cmd, start_new_session=True)
         pgid = proc.pid
         returncode = -1
+        timed_out = False
         try:
-            returncode = proc.wait()
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
         finally:
             _kill_descendants(os.getpid())
             _kill_pgroup(pgid)
@@ -194,6 +202,9 @@ def multigpu_launch(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+        if timed_out:
+            logger.error(f"{kind} (nproc={N}) timed out after {timeout} seconds")
+            sys.exit(1)
         if returncode != 0:
             logger.error(f"{kind} failed with {N} GPUs (exit {returncode})")
             sys.exit(returncode)
