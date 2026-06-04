@@ -86,6 +86,7 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+_CAMERA_MODULATION_CACHE_MIN_FREE_BYTES = 8 * 1024**3
 
 if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -1288,6 +1289,34 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         )
 
     @staticmethod
+    def _camera_modulation_cache_required_bytes(
+        c2ws_plucker_emb: torch.Tensor,
+        num_blocks: int,
+    ) -> int:
+        return (
+            2
+            * num_blocks
+            * c2ws_plucker_emb.numel()
+            * c2ws_plucker_emb.element_size()
+        )
+
+    @staticmethod
+    def _camera_modulation_cache_has_memory(
+        c2ws_plucker_emb: torch.Tensor,
+        num_blocks: int,
+    ) -> bool:
+        if not c2ws_plucker_emb.is_cuda:
+            return True
+        required_bytes = (
+            CausalLingBotWorldTransformer3DModel._camera_modulation_cache_required_bytes(
+                c2ws_plucker_emb,
+                num_blocks,
+            )
+        )
+        free_bytes, _ = torch.cuda.mem_get_info(c2ws_plucker_emb.device)
+        return free_bytes >= required_bytes + _CAMERA_MODULATION_CACHE_MIN_FREE_BYTES
+
+    @staticmethod
     def _camera_modulation_cache_enabled(
         forward_batch,
         *,
@@ -1305,6 +1334,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         self,
         forward_batch,
         cache_key: tuple | None,
+        c2ws_plucker_emb: torch.Tensor | None,
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
         if cache_key is None:
             return None
@@ -1312,10 +1342,22 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         if cache is None:
             return None
 
-        if cache.get("key") != cache_key:
+        if cache.get("key") == cache_key:
+            return cache["blocks"]
+
+        if (
+            c2ws_plucker_emb is None
+            or not self._camera_modulation_cache_has_memory(
+                c2ws_plucker_emb,
+                len(self.blocks),
+            )
+        ):
             cache.clear()
-            cache["key"] = cache_key
-            cache["blocks"] = {}
+            return None
+
+        cache.clear()
+        cache["key"] = cache_key
+        cache["blocks"] = {}
         return cache["blocks"]
 
     def _prepare_cached_time_embeddings(
@@ -1444,7 +1486,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 device=hidden_states.device,
             )
         camera_modulation_cache = self._get_camera_modulation_cache(
-            forward_batch, camera_modulation_cache_key
+            forward_batch, camera_modulation_cache_key, c2ws_plucker_emb
         )
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (

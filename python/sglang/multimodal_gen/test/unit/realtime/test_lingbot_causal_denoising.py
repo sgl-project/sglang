@@ -213,20 +213,55 @@ def test_lingbot_camera_modulation_cache_reuses_until_key_changes():
     model = CausalLingBotWorldTransformer3DModel.__new__(
         CausalLingBotWorldTransformer3DModel
     )
+    model.blocks = [object()]
     batch = SimpleNamespace(extra={})
     c2ws_plucker_emb = torch.randn(1, 3, 4)
 
     cache_key = model._camera_modulation_cache_key(c2ws_plucker_emb)
-    cache = model._get_camera_modulation_cache(batch, cache_key)
+    cache = model._get_camera_modulation_cache(batch, cache_key, c2ws_plucker_emb)
     scale_shift = (torch.ones(1), torch.zeros(1))
     cache[0] = scale_shift
 
-    reused = model._get_camera_modulation_cache(batch, cache_key)
+    reused = model._get_camera_modulation_cache(batch, cache_key, c2ws_plucker_emb)
     assert reused[0] is scale_shift
 
-    changed_key = model._camera_modulation_cache_key(torch.randn(1, 4, 4))
-    reset = model._get_camera_modulation_cache(batch, changed_key)
+    changed_emb = torch.randn(1, 4, 4)
+    changed_key = model._camera_modulation_cache_key(changed_emb)
+    reset = model._get_camera_modulation_cache(batch, changed_key, changed_emb)
     assert reset == {}
+
+
+def test_lingbot_camera_modulation_cache_skips_when_memory_guard_fails(monkeypatch):
+    model = CausalLingBotWorldTransformer3DModel.__new__(
+        CausalLingBotWorldTransformer3DModel
+    )
+    model.blocks = [object()]
+    batch = SimpleNamespace(extra={"lingbot_camera_modulation": {"stale": True}})
+    c2ws_plucker_emb = torch.randn(1, 3, 4)
+    cache_key = model._camera_modulation_cache_key(c2ws_plucker_emb)
+
+    monkeypatch.setattr(
+        CausalLingBotWorldTransformer3DModel,
+        "_camera_modulation_cache_has_memory",
+        staticmethod(lambda *_: False),
+    )
+
+    cache = model._get_camera_modulation_cache(batch, cache_key, c2ws_plucker_emb)
+
+    assert cache is None
+    assert batch.extra["lingbot_camera_modulation"] == {}
+
+
+def test_lingbot_camera_modulation_cache_memory_estimate():
+    c2ws_plucker_emb = torch.empty(1, 3, 4, dtype=torch.float16)
+
+    assert (
+        CausalLingBotWorldTransformer3DModel._camera_modulation_cache_required_bytes(
+            c2ws_plucker_emb,
+            num_blocks=5,
+        )
+        == 2 * 5 * c2ws_plucker_emb.numel() * c2ws_plucker_emb.element_size()
+    )
 
 
 def test_lingbot_camera_modulation_cache_enabled_policy():
