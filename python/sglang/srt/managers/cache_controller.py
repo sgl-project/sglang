@@ -57,8 +57,16 @@ device_module = get_device_module()
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        # The last layer's event doubles as finish_event; together with
+        # start_event it is used for elapsed_time() in transfer metrics, which
+        # requires both events to be created with enable_timing=True.
+        self.load_events = [
+            device_module.Event(enable_timing=(i == num_layers - 1))
+            for i in range(num_layers)
+        ]
+        self.start_event = device_module.Event(
+            enable_timing=True
+        )  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -756,8 +764,10 @@ class HiCacheController:
         )
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        # enable_timing so record_l1_l2_transfer_complete can use
+        # elapsed_time() for the actual transfer duration.
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
 
         token_count = int(host_indices.numel())
         start_time_ns = time.perf_counter_ns()

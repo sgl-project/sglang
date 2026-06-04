@@ -152,6 +152,8 @@ def build_kv_only_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=params.enable_metrics,
+        extra_metric_labels=server_args.extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -236,6 +238,8 @@ def build_hybrid_swa_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=params.enable_metrics,
+        extra_metric_labels=server_args.extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -489,6 +493,8 @@ def build_deepseek_v4_hicache_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=params.enable_metrics,
+        extra_metric_labels=server_args.extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -569,6 +575,8 @@ def build_hybrid_mamba_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=params.enable_metrics,
+        extra_metric_labels=server_args.extra_metric_labels,
     )
     return host_pool_group, cache_controller
 
@@ -641,6 +649,8 @@ def build_anchor_sidecar_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        enable_metrics=params.enable_metrics,
+        extra_metric_labels=server_args.extra_metric_labels,
     )
     return host_pool_group, cache_controller
 

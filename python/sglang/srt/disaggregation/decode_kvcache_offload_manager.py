@@ -99,6 +99,8 @@ class DecodeKVCacheOffloadManager:
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
+            enable_metrics=server_args.enable_metrics,
+            extra_metric_labels=server_args.extra_metric_labels,
         )
 
         self.ongoing_offload = {}
