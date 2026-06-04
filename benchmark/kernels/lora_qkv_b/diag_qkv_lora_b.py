@@ -259,9 +259,10 @@ def mode_x2(args, device) -> None:
     dtype = torch.bfloat16
     s = args.bs
     bi = make_merged_decode_batch_info(s, args.rank, args.scaling, device)
-    print(f"=== X2 tile/warps sweep (writeback=atomic) ===")
+    wb = {"atomic": 0, "load_add_store": 1, "store": 2}[args.wb]
+    print(f"=== X2 tile/warps sweep (writeback={args.wb}) ===")
     block_s_list = [16, 32, 64]
-    block_out_list = [32, 64, 128, 256]
+    block_out_list = [16, 32, 64, 128, 256]
     warps_list = [2, 4, 8]
     for preset in PRESETS:
         groups, ng, max_out, n_slices = make_groups(
@@ -276,7 +277,7 @@ def mode_x2(args, device) -> None:
                     calls = [
                         (lambda x=x, w=w, off=off, base=base, bs_=bs_, bo=bo, nw=nw:
                          run_diag(x, w, bi, off, max_out, base, n_slices,
-                                  WB_ATOMIC, bs_, bo, nw))
+                                  wb, bs_, bo, nw))
                         for x, w, off, base in groups
                     ]
                     try:
@@ -295,6 +296,8 @@ def mode_x2(args, device) -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["x3", "x2", "verify"], default="x3")
+    ap.add_argument("--wb", choices=["atomic", "load_add_store", "store"],
+                    default="atomic", help="writeback mode for x2 sweep")
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--scaling", type=float, default=2.0)
