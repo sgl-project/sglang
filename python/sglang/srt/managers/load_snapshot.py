@@ -28,7 +28,8 @@ transport backends are supported:
 Shared memory does not work across nodes, so multi-node DP attention
 requires the ZMQ transport.  The ``ZmqShmLoadSnapshotReader`` on node 0
 receives snapshots from all schedulers via zmq PUSH/PULL and writes them
-into the local SHM file.  All readers (tokenizer, dp_controller) on
+into the local SHM file.  All readers (TokenizerManager,
+DataParallelController) on
 node 0 then read from SHM.
 
 ``zmq_reader_owner()`` decides which process on node 0 binds the zmq
@@ -96,30 +97,30 @@ def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
     same zmq PULL endpoint.  Instead, the single ``MultiTokenizerRouter``
     process owns the socket (polls zmq -> SHM) and every worker reads SHM.
     """
-    if getattr(server_args, "tokenizer_worker_num", 1) > 1:
-        return "router"
-    return "tokenizer"
+    if server_args.tokenizer_worker_num > 1:
+        return "MultiTokenizerRouter"
+    return "TokenizerManager"
 
 
 def zmq_reader_owner(server_args, caller: str) -> bool:
     """Decide which process owns the zmq PULL socket.
 
-    Exactly one of ``"dp_controller"``, ``"tokenizer"``, or ``"router"`` must
-    return True when zmq mode is active.  The owner polls zmq -> SHM; the
-    others read SHM.
+    Exactly one of ``"DataParallelController"``, ``"TokenizerManager"``, or
+    ``"MultiTokenizerRouter"`` must return True when zmq mode is active.  The
+    owner polls zmq -> SHM; the others read SHM.
 
     Rules:
-      - Non-zero node_rank: no tokenizer, dp_controller only launches
-        schedulers and waits -> nobody owns it.
-      - dp_size == 1: no dp_controller exists -> tokenizer-side owner owns it.
-      - dp_size > 1, load-aware method: dp_controller polls on every
-        dispatch via refresh_load_budget() -> dp_controller owns it.
-      - dp_size > 1, round-robin / other: dp_controller never reads
+      - Non-zero node_rank: no TokenizerManager, DataParallelController only
+        launches schedulers and waits -> nobody owns it.
+      - dp_size == 1: no DataParallelController exists -> tokenizer-side owner
+        owns it.
+      - dp_size > 1, load-aware method: DataParallelController polls on every
+        dispatch via refresh_load_budget() -> DataParallelController owns it.
+      - dp_size > 1, round-robin / other: DataParallelController never reads
         load data -> tokenizer-side owner owns it (polls on /v1/loads calls).
 
-    The tokenizer-side owner is the ``MultiTokenizerRouter`` (caller
-    ``"router"``) in multi-tokenizer mode, otherwise the single tokenizer
-    manager (caller ``"tokenizer"``).
+    The tokenizer-side owner is the ``"MultiTokenizerRouter"`` caller in
+    multi-tokenizer mode, otherwise the ``"TokenizerManager"`` caller.
     """
     if not should_use_zmq(server_args):
         return False
@@ -129,7 +130,7 @@ def zmq_reader_owner(server_args, caller: str) -> bool:
     if server_args.dp_size == 1:
         return caller == tokenizer_owner
     if server_args.load_balance_method.lower() in _LOAD_AWARE_METHODS:
-        return caller == "dp_controller"
+        return caller == "DataParallelController"
     return caller == tokenizer_owner
 
 
@@ -644,8 +645,8 @@ class ZmqShmLoadSnapshotReader:
     def poll(self) -> None:
         """Drain the zmq PULL socket into SHM.
 
-        Public entry point so an owner process (e.g. the multi-tokenizer
-        router) can keep SHM fresh without touching internals.
+        Public entry point so an owner process (e.g. MultiTokenizerRouter) can
+        keep SHM fresh without touching internals.
         """
         self._poll()
 
@@ -713,8 +714,9 @@ def create_load_snapshot_reader(server_args, port_args, caller: str):
     """Create a load snapshot reader.
 
     Args:
-        caller: ``"dp_controller"``, ``"tokenizer"``, or ``"router"`` --
-            determines who binds the zmq PULL socket when zmq mode is active.
+        caller: ``"DataParallelController"``, ``"TokenizerManager"``, or
+            ``"MultiTokenizerRouter"`` -- determines who binds the zmq PULL
+            socket when zmq mode is active.
     """
     dp_size = server_args.dp_size
     if zmq_reader_owner(server_args, caller):

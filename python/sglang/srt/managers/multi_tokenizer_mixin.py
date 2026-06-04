@@ -387,13 +387,14 @@ class MultiTokenizerRouter:
         )
 
         # In multi-tokenizer mode the N TokenizerWorker processes cannot each
-        # bind the zmq PULL socket used for load snapshots, so the single router
-        # process owns it (zmq -> SHM) and the workers read SHM only. Drain it
-        # event-driven via the socket's fd instead of polling on a timer.
+        # bind the zmq PULL socket used for load snapshots, so the single
+        # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
+        # read SHM only. Drain it event-driven via the socket's fd instead of
+        # polling on a timer.
         self.load_snapshot_reader = None
-        if zmq_reader_owner(server_args, "router"):
+        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
             self.load_snapshot_reader = create_load_snapshot_reader(
-                server_args, port_args, caller="router"
+                server_args, port_args, caller="MultiTokenizerRouter"
             )
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
