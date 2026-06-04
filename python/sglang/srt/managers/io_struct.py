@@ -917,6 +917,12 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            # NOTE: this constructor is an explicit allowlist, so any request-scoped
+            # field not listed here is silently dropped when an n>1 batch is sliced.
+            # Other fields still affected by this are tracked in #27216 (multimodal
+            # tiling), #27217 (EPD/disaggregation), #27218 (session_params), and
+            # #27231 (background).
+            routing_key=self.routing_key,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
