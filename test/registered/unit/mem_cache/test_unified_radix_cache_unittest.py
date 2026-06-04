@@ -169,6 +169,40 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
+class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
+    def test_get_prefix_hash_values_not_shared_across_calls(self):
+        """Regression guard for cached mutable prefix hash lists (#26177)."""
+
+        def make_node():
+            return UnifiedTreeNode(tree_components=(ComponentType.FULL,))
+
+        root = make_node()
+        n1 = make_node()
+        n1.parent = root
+        n1.hash_value = ["h1"]
+        n2 = make_node()
+        n2.parent = n1
+        n2.hash_value = ["h2"]
+        n3 = make_node()
+        n3.parent = n2
+        n3.hash_value = ["h3"]
+
+        first = n3.get_prefix_hash_values(n2)
+        self.assertEqual(first, ["h1", "h2"])
+
+        # Mimic downstream storage code that extends `prefix_keys` in place.
+        first += ["h3"]
+
+        second = n3.get_prefix_hash_values(n2)
+        self.assertEqual(second, ["h1", "h2"])
+        self.assertIsNot(second, first)
+
+        n4 = make_node()
+        n4.parent = n3
+        n4.hash_value = ["h4"]
+        self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
+
+
 def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
     server_args = ServerArgs(model_path="dummy", page_size=cfg.page_size)
@@ -427,6 +461,42 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         tree.evict_host(len(seq))
         removed_cpu = self._removed_events(tree, StorageMedium.CPU)
         self.assertCountEqual([e.block_hashes[0] for e in removed_cpu], stored_hashes)
+
+    def test_hicache_split_pending_write_through_publishes_fragments(self):
+        tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        self._init_hicache(tree)
+        tree.take_events()
+
+        self._insert(tree, allocator, [1, 2, 3, 4])
+        node = self._leaf_for(tree, [1, 2, 3, 4])
+        backed_up = tree.write_backup(node, write_back=True)
+        self.assertGreater(backed_up, 0)
+
+        # Split the node while its write-through DMA is still pending.
+        self._insert(tree, allocator, [1, 2, 5, 6])
+        self.assertEqual(self._stored_events(tree, StorageMedium.CPU), [])
+
+        # Each fragment must also be persisted to L3 on ack: lock_node only
+        # holds the suffix after the split.
+        tree.enable_storage = True
+        with mock.patch.object(tree, "write_backup_storage") as backup_storage:
+            tree.writing_check(write_back=True)
+        self.assertEqual(
+            [
+                list(call.args[0].key.token_ids)
+                for call in backup_storage.call_args_list
+            ],
+            [[1, 2], [3, 4]],
+        )
+
+        # Both split fragments must be published, with intact parentage.
+        stored_cpu = self._stored_events(tree, StorageMedium.CPU)
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_cpu],
+            [[1, 2], [3, 4]],
+        )
+        self.assertIsNone(stored_cpu[0].parent_block_hash)
+        self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
 
     def test_hicache_reinsert_evicted_node_emits_gpu_store(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)

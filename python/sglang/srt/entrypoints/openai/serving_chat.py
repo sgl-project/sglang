@@ -174,7 +174,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self.is_gemma4 = (
             hasattr(self.tokenizer_manager.model_config, "hf_config")
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
+            and self.tokenizer_manager.model_config.hf_config.model_type
+            in ("gemma4", "gemma4_unified")
         )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
