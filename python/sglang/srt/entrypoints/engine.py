@@ -352,7 +352,7 @@ class Engine(EngineScoreMixin, EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
-        require_reasoning: bool = False,
+        require_reasoning: Optional[bool] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -367,7 +367,6 @@ class Engine(EngineScoreMixin, EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
-        require_reasoning: Optional[bool] = None,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         reasoning_effort: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
@@ -417,7 +416,6 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
-            require_reasoning=require_reasoning,
             priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -468,7 +466,7 @@ class Engine(EngineScoreMixin, EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
-        require_reasoning: bool = False,
+        require_reasoning: Optional[bool] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -483,7 +481,6 @@ class Engine(EngineScoreMixin, EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
-        require_reasoning: Optional[bool] = None,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         reasoning_effort: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
@@ -533,7 +530,6 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
-            require_reasoning=require_reasoning,
             priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
