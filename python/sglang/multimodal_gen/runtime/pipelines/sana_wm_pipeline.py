@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMDenoisingStage,
     SanaWMTextEncodingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
     OfficialDiffusersLTX2RefinerModule,
     OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
@@ -97,7 +97,7 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         if getattr(server_args.pipeline_config, "streaming", False):
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming import (
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
                 SanaWMStreamingDenoisingStage,
             )
 
@@ -121,7 +121,7 @@ class SanaWMPipeline(LoRAPipeline, ComposedPipelineBase):
         if server_args is not None and getattr(
             server_args.pipeline_config, "streaming", False
         ):
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming import (
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
                 SanaWMStreamingDecodingStage,
             )
 
@@ -294,7 +294,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             dtype=default_sana_wm_refiner_dtype(server_args),
         )
         if getattr(pc, "streaming", False) and getattr(pc, "refiner_chunked", True):
-            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming_refiner import (
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming_refiner import (
                 SanaWMStreamingRefinerStage,
             )
 

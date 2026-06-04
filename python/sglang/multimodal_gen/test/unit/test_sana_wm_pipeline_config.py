@@ -45,7 +45,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     parse_sana_wm_action_string,
     sana_wm_action_to_camera_to_world,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
     OfficialDiffusersLTX2RefinerModule,
     OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
@@ -63,7 +63,7 @@ from sglang.multimodal_gen.test.test_utils import DEFAULT_SANA_WM_MODEL_NAME_FOR
 
 _SANA_WM_REFINER_STAGE_MODULE = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages."
-    "model_specific_stages.sana_wm_refiner"
+    "model_specific_stages.sana_wm.refiner"
 )
 
 
@@ -1044,7 +1044,7 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
         serial = neg + guidance_scale * (pos - neg)
 
         with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.cfg_model_parallel_all_reduce",
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.sana_wm_base.cfg_model_parallel_all_reduce",
             side_effect=lambda partial: partial + (1.0 - guidance_scale) * neg,
         ):
             combined_from_pos_rank = SanaWMDenoisingStage._combine_cfg_parallel_noise(
@@ -1052,7 +1052,7 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
             )
 
         with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.cfg_model_parallel_all_reduce",
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.sana_wm_base.cfg_model_parallel_all_reduce",
             side_effect=lambda partial: partial + guidance_scale * pos,
         ):
             combined_from_neg_rank = SanaWMDenoisingStage._combine_cfg_parallel_noise(

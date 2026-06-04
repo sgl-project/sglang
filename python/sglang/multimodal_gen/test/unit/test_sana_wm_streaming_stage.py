@@ -32,7 +32,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _SLOT_TYPE_FLAG,
     _SLOT_V,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
     SanaWMStreamingDenoisingStage as Stage,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args

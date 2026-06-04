@@ -42,7 +42,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_sana_wm_self_for
     SanaWMSelfForcingSamplerConfig,
     SanaWMSelfForcingScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+from .sana_wm_base import (
     SanaWMDenoisingStage,
     _align_sana_wm_cfg_text_conditions,
     _cat_optional_tensors,

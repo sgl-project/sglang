@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import _NUM_STREAM_CACHE_
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming import (
+from .streaming import (
     SanaWMStreamingDenoisingStage,
 )
 

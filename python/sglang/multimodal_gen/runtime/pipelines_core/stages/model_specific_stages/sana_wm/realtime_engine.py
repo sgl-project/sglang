@@ -74,10 +74,10 @@ class SanaWMRealtimeEngine:
 
     def reset(self, prompt, image_path, intrinsics=None, init_keys="w"):
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+        from .sana_wm_base import (
             _first_tensor, _SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY,
         )
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_realtime import (
+        from .realtime import (
             SanaWMRealtimeSession,
         )
         self._intrinsics = intrinsics  # path / array / None (-> heuristic centered)
@@ -121,10 +121,10 @@ class SanaWMRealtimeEngine:
             self._build_refiner_runner(prompt, first_latent)
 
     def _build_refiner_runner(self, prompt, first_latent):
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
+        from .refiner import (
             STAGE_2_DISTILLED_SIGMA_VALUES, _unwrap_diffusers_ltx2_refiner,
         )
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_streaming_refiner import (
+        from .streaming_refiner import (
             RefinerChunkRunner, _RefinerCore,
         )
         rs = self._refiner_stage
@@ -142,7 +142,7 @@ class SanaWMRealtimeEngine:
 
     def _build_camera(self, total_T_lat):
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+        from .sana_wm_base import (
             _SANA_WM_CONDITION_IMAGE_PREPROCESS_KEY,
         )
         num_pixel = (total_T_lat - 1) * STRIDE + 1

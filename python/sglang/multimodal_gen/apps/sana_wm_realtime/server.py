@@ -109,7 +109,7 @@ def main():
             "/ws with HTTP 403.\n  Fix:  pip install websockets")
 
     import uvicorn
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_realtime_engine import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_engine import (
         SanaWMRealtimeEngine,
     )
 

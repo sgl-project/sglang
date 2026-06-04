@@ -29,7 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
+from .sana_wm_base import (
     SanaWMDecodingStage,
     log_sana_wm_tensor_stats,
     sana_wm_diagnostics_enabled,

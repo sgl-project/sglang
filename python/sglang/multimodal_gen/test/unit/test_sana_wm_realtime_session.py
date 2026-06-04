@@ -19,7 +19,7 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm import (
 )
 from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import SanaWMTransformer3DModel
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_realtime import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime import (
     SanaWMRealtimeSession,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args

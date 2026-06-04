@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer impor
     unpack_latents,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm_refiner import (
+from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     SanaWMLTX2RefinerStage,
     _refiner_config_value,
