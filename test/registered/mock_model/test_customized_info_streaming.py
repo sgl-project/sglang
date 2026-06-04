@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
 import unittest
+from typing import TYPE_CHECKING, List
 
 import torch
 
