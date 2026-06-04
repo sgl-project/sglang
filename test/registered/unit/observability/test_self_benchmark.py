@@ -8,6 +8,7 @@ import unittest
 from collections import deque
 from tempfile import TemporaryDirectory
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.self_benchmark import (
     BenchmarkPhase,
     BenchmarkPoint,
@@ -53,6 +54,7 @@ def _make_scheduler(output_path: str):
         max_req_len=32,
         max_prefill_tokens=64,
         page_size=1,
+        disaggregation_mode=DisaggregationMode.NULL,
         ps=types.SimpleNamespace(dp_rank=0),
         result_queue=deque(),
         waiting_queue=[],
@@ -129,6 +131,54 @@ class TestSelfBenchmark(unittest.TestCase):
             benchmark._results[0].fpms[0]["scheduled_requests"]["num_decode_requests"],
             2,
         )
+
+    def test_decode_grid_preserves_room_for_one_decode_token(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.max_req_input_len = 16
+        scheduler.max_req_len = 12
+        scheduler.max_total_num_tokens = 64
+
+        benchmark = SelfBenchmark(scheduler)
+
+        decode_points = [p for p in benchmark._grid if p.point_type == "decode"]
+        self.assertGreater(len(decode_points), 0)
+        self.assertLessEqual(
+            max(p.context_length for p in decode_points),
+            10,
+        )
+
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.max_req_input_len = 128
+        scheduler.max_req_len = 128
+        scheduler.max_total_num_tokens = 100
+        scheduler.page_size = 16
+
+        benchmark = SelfBenchmark(scheduler)
+
+        decode_points = [p for p in benchmark._grid if p.point_type == "decode"]
+        self.assertGreater(len(decode_points), 0)
+        self.assertLessEqual(
+            max(p.context_length for p in decode_points),
+            80,
+        )
+
+    def test_disaggregated_workers_only_build_supported_grid(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.server_args.benchmark_mode = "decode"
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+
+        benchmark = SelfBenchmark(scheduler)
+
+        self.assertEqual(benchmark._grid, [])
+        self.assertEqual(benchmark._inject_warmup(), 0)
+
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.server_args.benchmark_mode = "agg"
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+
+        benchmark = SelfBenchmark(scheduler)
+
+        self.assertTrue(all(p.point_type == "decode" for p in benchmark._grid))
 
 
 if __name__ == "__main__":
