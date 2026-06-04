@@ -2014,26 +2014,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             dst_indices=host_indices.to(dtype=torch.int64),
         )
 
-    def load_to_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
-    ):
-        if host_indices is None or device_indices is None:
-            return
-        if host_indices.numel() != device_indices.numel():
-            raise ValueError(
-                f"{self.pool_name} token load index size mismatch: "
-                f"host={host_indices.numel()}, device={device_indices.numel()}"
-            )
-        if host_indices.numel() == 0:
-            return
-        assert self.data_ptrs is not None
-        transfer_cache_dsv4_mla(
-            src_ptrs=self.data_ptrs,
-            dst_ptrs=self.device_ptrs,
-            src_indices=host_indices.to(dtype=torch.int64),
-            dst_indices=device_indices.to(dtype=torch.int64),
-        )
-
     def get_size_per_token(self):
         return self.item_bytes
 
@@ -2130,6 +2110,25 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
         if host_indices is None or device_indices is None:
+            return
+        if host_indices.numel() != device_indices.numel():
+            raise ValueError(
+                f"{self.pool_name} token load index size mismatch: "
+                f"host={host_indices.numel()}, device={device_indices.numel()}"
+            )
+        if host_indices.numel() == 0:
+            return
+        if (
+            host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
+        ):
+            assert self.data_ptrs is not None
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
+                dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
+                src_indices=host_indices.to(dtype=torch.int64),
+                dst_indices=device_indices.to(dtype=torch.int64),
+            )
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)

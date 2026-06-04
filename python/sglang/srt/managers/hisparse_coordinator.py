@@ -287,15 +287,6 @@ class HiSparseCoordinator:
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 
-        if self.is_dsv4_hisparse:
-            self.mem_pool_host.load_to_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_locs,
-                io_backend="kernel",
-            )
-            return
-
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
