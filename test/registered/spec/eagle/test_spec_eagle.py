@@ -32,7 +32,7 @@ _KITS = (
 
 class _Core(Eagle3Base):
     # Busy-time pool accounting check.
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagle3Overlap(_Core, *_KITS):

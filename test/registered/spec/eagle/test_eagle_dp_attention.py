@@ -62,7 +62,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
         ]
         with (
             envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
         ):
             cls.process = popen_launch_server(
                 cls.model,

@@ -27,7 +27,7 @@ class TestEagle3Perf(Eagle3Base, SpecPerfKit):
     """Decode throughput (max_new_tokens=1) on EAGLE3 spec v2."""
 
     disable_overlap = False
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagleLlama2Retract(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
@@ -37,7 +37,7 @@ class TestEagleLlama2Retract(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
     extra_args = ("--max-total-tokens", 4500)  # small KV to trigger retract
     env_overrides = (
         (envs.SGLANG_TEST_RETRACT, True),
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
+        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
     )
 
 
@@ -54,20 +54,20 @@ class TestEagle3Topk16V2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
     extra_args = ("--max-total-tokens", 4500)  # small KV to trigger retract
     env_overrides = (
         (envs.SGLANG_TEST_RETRACT, True),
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
+        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
     )
 
 
 class TestEagleLlama2AbortAll(EagleLlama2Base, AbortAllMixin):
     abort_all_max_new_tokens = 4000
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagleLlama2WaitingTimeout(EagleLlama2Base, WaitingTimeoutMixin):
     max_running_requests = 1
     env_overrides = (
         (envs.SGLANG_REQ_WAITING_TIMEOUT, 0.001),
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
+        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
     )
 
 
@@ -76,7 +76,7 @@ class TestEagleLlama2RunningTimeout(EagleLlama2Base, RunningTimeoutTwoWaveMixin)
     max_running_requests = 16
     env_overrides = (
         (envs.SGLANG_REQ_RUNNING_TIMEOUT, 3),
-        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),
+        (envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),
     )
 
 

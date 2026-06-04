@@ -23,7 +23,7 @@ class TestEagle3Parity(SpecParityKit, Eagle3Base):
     """
 
     disable_overlap = False
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 if __name__ == "__main__":

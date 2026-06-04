@@ -34,14 +34,14 @@ class TestEagle3Triton(
     cuda_graph_max_bs = 64
     gsm8k_num_examples = 1000
     gsm8k_check_accept_len = False
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagleLlama2Triton(EagleLlama2Base, SpecAccuracyKit, SpecFeatureKit):
     """EAGLE/Llama-2 topk=8 on triton (spec v1); busy-time pool check."""
 
     attention_backend = "triton"
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 2),)
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 if __name__ == "__main__":
