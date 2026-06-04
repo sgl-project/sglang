@@ -414,9 +414,6 @@ class BreakableCudaGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
-            # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             return self._run_forward(forward_batch, num_tokens)
 
         with forward_context(
