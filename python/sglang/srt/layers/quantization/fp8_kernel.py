@@ -344,78 +344,227 @@ def _per_token_group_quant_8bit_raw(
     return x_q, x_s
 
 
-def _per_token_group_quant_8bit_fuse_silu_and_mul(
+# backward compatibility
+per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
+
+
+@triton.jit
+def _fused_silu_mul_per_token_group_quant_8bit_kernel(
+    x_ptr,
+    out_q_ptr,
+    out_s_ptr,
+    masked_m_ptr,
+    stride_x_b,
+    stride_x_m,
+    stride_x_n,
+    stride_q_b,
+    stride_q_m,
+    stride_q_n,
+    stride_s_b,
+    stride_s_m,
+    stride_s_n,
+    num_rows,
+    half_n,
+    groups_per_row,
+    group_size,
+    eps,
+    bit8_min,
+    bit8_max,
+    HAS_MASKED_M: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_group = pid % groups_per_row
+    row_flat = pid // groups_per_row
+    batch_id = row_flat // num_rows
+    row_id = row_flat % num_rows
+
+    row_is_valid = True
+    if HAS_MASKED_M:
+        row_is_valid = row_id < tl.load(masked_m_ptr + batch_id)
+
+    cols = row_group * group_size + tl.arange(0, BLOCK)
+    col_mask = cols < half_n
+    valid_mask = col_mask & row_is_valid
+
+    x_row_ptr = x_ptr + batch_id * stride_x_b + row_id * stride_x_m
+    gate = tl.load(x_row_ptr + cols * stride_x_n, mask=valid_mask, other=0.0).to(
+        tl.float32
+    )
+    up = tl.load(
+        x_row_ptr + (half_n + cols) * stride_x_n,
+        mask=valid_mask,
+        other=0.0,
+    ).to(tl.float32)
+    y = gate * tl.sigmoid(gate) * up
+
+    absmax = tl.maximum(tl.max(tl.abs(y), axis=0), eps)
+    scale = absmax / bit8_max
+    y_q = tl.clamp(y / scale, bit8_min, bit8_max).to(out_q_ptr.dtype.element_ty)
+
+    out_q_row_ptr = out_q_ptr + batch_id * stride_q_b + row_id * stride_q_m
+    tl.store(out_q_row_ptr + cols * stride_q_n, y_q, mask=valid_mask)
+    tl.store(
+        out_s_ptr
+        + batch_id * stride_s_b
+        + row_id * stride_s_m
+        + row_group * stride_s_n,
+        scale,
+        mask=row_is_valid,
+    )
+
+
+def _fused_silu_mul_per_token_group_quant_8bit(
     x: torch.Tensor,
     group_size: int,
     dst_dtype: torch.dtype,
+    eps: float,
     column_major_scales: bool,
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
     masked_m: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Another way to implement (can be used in e.g. comparison tests)
-    # from sgl_kernel import silu_and_mul
-    # x_after_silu_and_mul = silu_and_mul(x)
-    # return per_token_group_quant_fp8(
-    #     x_after_silu_and_mul,
-    #     group_size=group_size,
-    #     eps=eps,
-    #     column_major_scales=column_major_scales,
-    #     scale_tma_aligned=scale_tma_aligned,
-    #     scale_ue8m0=scale_ue8m0,
-    # )
-
     from deep_gemm import transform_sf_into_required_layout
 
-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert x.dim() in (2, 3), "`x` must be 2D or 3D"
+    assert x.shape[-1] % 2 == 0, "the last dimension of `x` must be even"
 
-    assert column_major_scales
-    assert scale_tma_aligned
-    assert scale_ue8m0
+    if _is_hip:
+        if dst_dtype == torch.int8:
+            bit8_max = 127.0
+        else:
+            bit8_max = 224.0
+        bit8_min = -bit8_max
+    else:
+        if dst_dtype == torch.int8:
+            info = torch.iinfo(dst_dtype)
+        else:
+            info = torch.finfo(dst_dtype)
+        bit8_max = info.max
+        bit8_min = info.min
 
     needs_unsqueeze = x.dim() == 2
     if needs_unsqueeze:
-        num_tokens, _ = x.shape
         x = x.unsqueeze(0)
-        assert masked_m is None
-        masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
 
-    # Use `zeros` for easier testing
-    output = torch.zeros(
-        (*x.shape[:-1], x.shape[-1] // 2),
-        device=x.device,
-        dtype=dst_dtype,
-    )
-    # Use `zeros` for easier testing
-    output_scale_for_kernel = torch.zeros(
-        (*x.shape[:-1], x.shape[-1] // 2 // group_size),
-        device=x.device,
-        dtype=torch.float32,
-    )
-    silu_and_mul_masked_post_quant_fwd(
-        input=x,
-        output=output,
-        output_scale=output_scale_for_kernel,
-        quant_group_size=group_size,
-        masked_m=masked_m,
-        scale_ue8m0=scale_ue8m0,
+    batch_size, num_rows, two_n = x.shape
+    half_n = two_n // 2
+    assert (
+        half_n % group_size == 0
+    ), "the post-silu hidden size must be divisible by `group_size`"
+
+    if masked_m is not None:
+        assert masked_m.dim() == 1, "`masked_m` must be 1D"
+        assert masked_m.shape[0] == batch_size, "`masked_m` shape mismatch"
+        masked_m = masked_m.contiguous().to(dtype=torch.int32, device=x.device)
+
+    output = (
+        torch.zeros((batch_size, num_rows, half_n), device=x.device, dtype=dst_dtype)
+        if masked_m is not None
+        else torch.empty(
+            (batch_size, num_rows, half_n), device=x.device, dtype=dst_dtype
+        )
     )
 
-    assert group_size == 128
-    output_scale = transform_sf_into_required_layout(
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        output_scale_for_kernel = (
+            torch.zeros(
+                (batch_size, num_rows, half_n // group_size),
+                device=x.device,
+                dtype=torch.float32,
+            )
+            if masked_m is not None
+            else torch.empty(
+                (batch_size, num_rows, half_n // group_size),
+                device=x.device,
+                dtype=torch.float32,
+            )
+        )
+        output_scale = None
+    else:
+        output_scale_for_kernel = create_per_token_group_quant_fp8_output_scale(
+            x_shape=output.shape,
+            device=output.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=False,
+        )
+        output_scale = output_scale_for_kernel
+
+    groups_per_row = half_n // group_size
+    BLOCK = triton.next_power_of_2(group_size)
+    num_warps = min(max(BLOCK // 256, 1), 8)
+
+    _fused_silu_mul_per_token_group_quant_8bit_kernel[
+        (batch_size * num_rows * groups_per_row,)
+    ](
+        x,
+        output,
         output_scale_for_kernel,
-        num_groups=output.shape[0],
-        mn=output.shape[-2],
-        k=output.shape[-1],
-        recipe=(1, group_size, group_size),
-        is_sfa=True,
+        masked_m,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output_scale_for_kernel.stride(0),
+        output_scale_for_kernel.stride(1),
+        output_scale_for_kernel.stride(2),
+        num_rows,
+        half_n,
+        groups_per_row,
+        group_size,
+        eps,
+        bit8_min,
+        bit8_max,
+        HAS_MASKED_M=masked_m is not None,
+        BLOCK=BLOCK,
+        num_warps=num_warps,
+        num_stages=1,
     )
+
+    if scale_ue8m0:
+        assert group_size == 128
+        output_scale = transform_sf_into_required_layout(
+            output_scale_for_kernel,
+            num_groups=output.shape[0],
+            mn=output.shape[-2],
+            k=output.shape[-1],
+            recipe=(1, group_size, group_size),
+            is_sfa=True,
+        )
 
     if needs_unsqueeze:
         output = output.squeeze(0)
         output_scale = output_scale.squeeze(0)
 
     return output, output_scale
+
+
+def _per_token_group_quant_8bit_fuse_silu_and_mul(
+    x: torch.Tensor,
+    group_size: int,
+    dst_dtype: torch.dtype,
+    eps: float,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+    masked_m: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _fused_silu_mul_per_token_group_quant_8bit(
+        x=x,
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        eps=eps,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+        masked_m=masked_m,
+    )
 
 
 def per_token_group_quant_8bit(
@@ -434,6 +583,7 @@ def per_token_group_quant_8bit(
             x=x,
             group_size=group_size,
             dst_dtype=dst_dtype,
+            eps=eps,
             column_major_scales=column_major_scales,
             scale_tma_aligned=scale_tma_aligned,
             scale_ue8m0=scale_ue8m0,
@@ -495,6 +645,299 @@ def create_per_token_group_quant_fp8_output_scale(
         )
 
 
+@triton.jit
+def _fused_rms_group_quant_fp8_kernel(
+    x_ptr,
+    z_ptr,
+    w_ptr,
+    out_q_ptr,
+    out_s_ptr,
+    out_u_ptr,
+    res_ptr,
+    stride_xm,
+    stride_xn,
+    stride_zm,
+    stride_zn,
+    stride_qm,
+    stride_qn,
+    stride_sm,
+    stride_sn,
+    stride_um,
+    stride_un,
+    rms_eps,
+    quant_eps,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    has_residual: tl.constexpr,
+    has_gate: tl.constexpr,
+    has_unquantized_out: tl.constexpr,
+    gemma_style: tl.constexpr,
+    hidden_size: tl.constexpr,
+    group_size: tl.constexpr,
+    num_groups: tl.constexpr,
+    reduce_block: tl.constexpr,
+    emulate_bf16_requant: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    sumsq = 0.0
+    for off in tl.static_range(0, hidden_size, reduce_block):
+        offs = off + tl.arange(0, reduce_block)
+        mask = offs < hidden_size
+        x = tl.load(x_ptr + pid * stride_xm + offs * stride_xn, mask=mask, other=0.0)
+        if has_residual:
+            r = tl.load(
+                res_ptr + pid * stride_xm + offs * stride_xn, mask=mask, other=0.0
+            )
+            x = x + r
+            tl.store(res_ptr + pid * stride_xm + offs * stride_xn, x, mask=mask)
+        xf = x.to(tl.float32)
+        sumsq += tl.sum(xf * xf, axis=0)
+
+    rms = tl.rsqrt(sumsq / hidden_size + rms_eps)
+
+    for gid in tl.static_range(0, num_groups):
+        offs = gid * group_size + tl.arange(0, group_size)
+        mask = offs < hidden_size
+        x = tl.load(x_ptr + pid * stride_xm + offs * stride_xn, mask=mask, other=0.0)
+        if has_residual:
+            x = tl.load(
+                res_ptr + pid * stride_xm + offs * stride_xn, mask=mask, other=0.0
+            )
+        w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+        wf = w.to(tl.float32)
+        if gemma_style:
+            wf = wf + 1.0
+        y = x.to(tl.float32) * rms * wf
+        if has_gate:
+            z = tl.load(
+                z_ptr + pid * stride_zm + offs * stride_zn, mask=mask, other=0.0
+            ).to(tl.float32)
+            y = y * (z * tl.sigmoid(z))
+        if emulate_bf16_requant:
+            y_for_quant = y.to(tl.bfloat16).to(tl.float32)
+        else:
+            y_for_quant = y
+
+        absmax = tl.max(tl.abs(y_for_quant), axis=0)
+        scale = tl.maximum(absmax / fp8_max, quant_eps)
+        tl.store(out_s_ptr + pid * stride_sm + gid * stride_sn, scale)
+
+        q = tl.minimum(tl.maximum(y_for_quant / scale, fp8_min), fp8_max)
+        q_fp8 = q.to(tl.float8e4nv)
+        tl.store(out_q_ptr + pid * stride_qm + offs * stride_qn, q_fp8, mask=mask)
+        if has_unquantized_out:
+            y_out = y.to(out_u_ptr.dtype.element_ty)
+            tl.store(out_u_ptr + pid * stride_um + offs * stride_un, y_out, mask=mask)
+
+
+def sglang_fused_rms_fp8_group_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    group_size: int = 128,
+    dtype_quant: torch.dtype = fp8_dtype,
+    res1: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    quant_eps: float = 1e-10,
+    gemma_style: bool = False,
+    column_major_scales: bool = True,
+    scale_tma_aligned: bool = False,
+    output_unquantized_inp1: bool = False,
+    emulate_bf16_requant: bool = False,
+):
+    assert _is_cuda, "sglang_fused_rms_fp8_group_quant is CUDA-only"
+    assert x.dim() == 2, "expected 2D input"
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert weight.dim() == 1, "expected 1D weight"
+    assert weight.numel() == x.shape[-1], "weight and hidden size mismatch"
+    assert x.shape[-1] % group_size == 0, "hidden size must be divisible by group_size"
+    assert dtype_quant == fp8_dtype, "only fp8 dtype is supported"
+
+    if res1 is not None:
+        assert res1.shape == x.shape, "residual shape mismatch"
+        assert res1.is_contiguous(), "`res1` is not contiguous"
+    if gate is not None:
+        assert gate.shape == x.shape, "gate shape mismatch"
+        assert gate.is_contiguous(), "`gate` is not contiguous"
+
+    out_q = torch.empty_like(x, dtype=dtype_quant)
+    out_u = torch.empty_like(x) if output_unquantized_inp1 else out_q
+    out_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=x.shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=False,
+    )
+
+    m, n = x.shape
+    num_groups = n // group_size
+    reduce_block = 256
+    grid = (m,)
+    _fused_rms_group_quant_fp8_kernel[grid](
+        x,
+        gate,
+        weight,
+        out_q,
+        out_s,
+        out_u,
+        res1,
+        x.stride(0),
+        x.stride(1),
+        gate.stride(0) if gate is not None else 0,
+        gate.stride(1) if gate is not None else 0,
+        out_q.stride(0),
+        out_q.stride(1),
+        out_s.stride(0),
+        out_s.stride(1),
+        out_u.stride(0),
+        out_u.stride(1),
+        variance_epsilon,
+        quant_eps,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        has_residual=res1 is not None,
+        has_gate=gate is not None,
+        has_unquantized_out=output_unquantized_inp1,
+        gemma_style=gemma_style,
+        hidden_size=n,
+        group_size=group_size,
+        num_groups=num_groups,
+        reduce_block=reduce_block,
+        emulate_bf16_requant=emulate_bf16_requant,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    return (out_q, out_s), (out_u if output_unquantized_inp1 else None), None, res1
+
+
+@triton.jit
+def _fused_sigmoid_mul_group_quant_fp8_kernel(
+    x_ptr,
+    gate_ptr,
+    out_q_ptr,
+    out_s_ptr,
+    stride_xm,
+    stride_xn,
+    stride_gm,
+    stride_gn,
+    stride_qm,
+    stride_qn,
+    stride_sm,
+    stride_sn,
+    quant_eps,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    hidden_size: tl.constexpr,
+    group_size: tl.constexpr,
+    num_groups: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    for gid in tl.static_range(0, num_groups):
+        offs = gid * group_size + tl.arange(0, group_size)
+        mask = offs < hidden_size
+
+        x = tl.load(x_ptr + pid * stride_xm + offs * stride_xn, mask=mask, other=0.0)
+        gate = tl.load(
+            gate_ptr + pid * stride_gm + offs * stride_gn, mask=mask, other=0.0
+        )
+        y = x.to(tl.float32) * tl.sigmoid(gate.to(tl.float32))
+
+        absmax = tl.max(tl.abs(y), axis=0)
+        scale = tl.maximum(absmax / fp8_max, quant_eps)
+        tl.store(out_s_ptr + pid * stride_sm + gid * stride_sn, scale)
+
+        q = tl.minimum(tl.maximum(y / scale, fp8_min), fp8_max)
+        q_fp8 = q.to(tl.float8e4nv)
+        tl.store(out_q_ptr + pid * stride_qm + offs * stride_qn, q_fp8, mask=mask)
+
+
+def sglang_fused_sigmoid_mul_fp8_group_quant(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    group_size: int = 128,
+    dtype_quant: torch.dtype = fp8_dtype,
+    quant_eps: float = 1e-10,
+    column_major_scales: bool = True,
+    scale_tma_aligned: bool = True,
+    scale_ue8m0: bool = False,
+):
+    assert _is_cuda, "sglang_fused_sigmoid_mul_fp8_group_quant is CUDA-only"
+    assert x.dim() == 2, "expected 2D input"
+    assert gate.dim() == 2, "expected 2D gate"
+    assert x.shape == gate.shape, "x and gate shape mismatch"
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert gate.is_contiguous(), "`gate` is not contiguous"
+    assert x.shape[-1] % group_size == 0, "hidden size must be divisible by group_size"
+    assert dtype_quant == fp8_dtype, "only fp8 dtype is supported"
+
+    out_q = torch.empty_like(x, dtype=dtype_quant)
+
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        out_s_for_kernel = torch.empty(
+            (x.shape[0], x.shape[1] // group_size),
+            device=x.device,
+            dtype=torch.float32,
+        )
+    else:
+        out_s_for_kernel = create_per_token_group_quant_fp8_output_scale(
+            x_shape=x.shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=False,
+        )
+
+    m, n = x.shape
+    num_groups = n // group_size
+    grid = (m,)
+    _fused_sigmoid_mul_group_quant_fp8_kernel[grid](
+        x,
+        gate,
+        out_q,
+        out_s_for_kernel,
+        x.stride(0),
+        x.stride(1),
+        gate.stride(0),
+        gate.stride(1),
+        out_q.stride(0),
+        out_q.stride(1),
+        out_s_for_kernel.stride(0),
+        out_s_for_kernel.stride(1),
+        quant_eps,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        hidden_size=n,
+        group_size=group_size,
+        num_groups=num_groups,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    if scale_ue8m0:
+        from deep_gemm import transform_sf_into_required_layout
+
+        assert group_size == 128
+        out_s = transform_sf_into_required_layout(
+            out_s_for_kernel,
+            num_groups=None,
+            mn=out_q.shape[0],
+            k=out_q.shape[1],
+            recipe=(1, group_size, group_size),
+            is_sfa=True,
+        )
+    else:
+        out_s = out_s_for_kernel
+
+    return out_q, out_s
+
+
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -510,6 +953,18 @@ def sglang_per_token_group_quant_fp8(
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
+
+    if fuse_silu_and_mul:
+        return _per_token_group_quant_8bit_fuse_silu_and_mul(
+            x=x,
+            group_size=group_size,
+            dst_dtype=fp8_dtype,
+            eps=eps,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+            masked_m=masked_m,
+        )
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 

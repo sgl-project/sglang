@@ -18,6 +18,7 @@ import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
+import nvtx
 import torch
 import torch.nn as nn
 import triton
@@ -37,6 +38,7 @@ from sglang.srt.configs.qwen3_5 import (
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers import deep_gemm_wrapper
 
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -64,6 +66,10 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_fused_rms_fp8_group_quant,
+    sglang_fused_sigmoid_mul_fp8_group_quant,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -440,7 +446,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
-        seq_len, _ = hidden_states.shape
+        if isinstance(hidden_states, torch.Tensor):
+            seq_len, _ = hidden_states.shape
+            hidden_states_qkvz = hidden_states
+            hidden_states_ba = hidden_states
+        else:
+            assert len(hidden_states) == 3, "quantized output should have 3 members"
+            seq_len, _ = hidden_states[0].shape
+            hidden_states_ba = hidden_states[0]  # unquantized output
+            hidden_states_qkvz = hidden_states[1:3]  # quantized output
+
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
@@ -448,13 +463,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states_qkvz)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba, _ = self.in_proj_ba(hidden_states_ba)
             current_stream.wait_stream(self.alt_stream)
         else:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states_qkvz)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states_ba)
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -525,6 +540,40 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad = torch.zeros_like(z)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
+
+        out_proj_quant_method = getattr(self.out_proj, "quant_method", None)
+        out_proj_backend = getattr(out_proj_quant_method, "w8a8_block_fp8_linear", None)
+        use_fused_rms_fp8_group_quant = (
+            _is_cuda
+            and out_proj_quant_method is not None
+            and getattr(out_proj_quant_method, "block_quant", False)
+            and not getattr(out_proj_quant_method, "use_mxfp8", False)
+            and out_proj_backend is not None
+            and getattr(self.norm, "group_size", None) is None
+            and getattr(self.norm, "norm_before_gate", False)
+            and getattr(self.norm, "activation", "swish") == "swish"
+        )
+
+        if use_fused_rms_fp8_group_quant:
+            group_size = out_proj_quant_method.quant_config.weight_block_size[1]
+            (core_attn_out_q, core_attn_out_s), _, _, _ = (
+                sglang_fused_rms_fp8_group_quant(
+                    x=core_attn_out,
+                    gate=z,
+                    weight=self.norm.weight,
+                    variance_epsilon=self.norm.eps,
+                    group_size=group_size,
+                    column_major_scales=False,
+                    scale_tma_aligned=False,
+                    output_unquantized_inp1=False,
+                    emulate_bf16_requant=False,
+                )
+            )
+            core_attn_out_q = core_attn_out_q.reshape(z_shape_og)
+            core_attn_out_q = core_attn_out_q.reshape(*core_attn_out_q.shape[:-2], -1)
+            core_attn_out_s = core_attn_out_s.reshape(*core_attn_out_q.shape[:-1], -1)
+            output, _ = self.out_proj((core_attn_out_q, core_attn_out_s))
+            return output
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
@@ -616,27 +665,45 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=kwargs.get(
-                    "captured_last_layer_outputs", None
-                ),
+        in_proj_qkvz = getattr(self.linear_attn, "in_proj_qkvz", None)
+        qkv_weight = getattr(in_proj_qkvz, "weight", None)
+        if qkv_weight is None:
+            qkv_weight = getattr(in_proj_qkvz, "weight_packed", None)
+        quant_format = (
+            "fp8"
+            if (
+                _is_cuda
+                and qkv_weight is not None
+                and qkv_weight.dtype == getattr(torch, "float8_e4m3fn", None)
             )
+            else ""
         )
+
+        with nvtx.annotate("prepare_attn", color="blue"):
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=kwargs.get(
+                        "captured_last_layer_outputs", None
+                    ),
+                    quant_format=quant_format,
+                )
+            )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(
-                hidden_states,
-                forward_batch,
-            )
+            with nvtx.annotate("linear_attn", color="green"):
+                hidden_states = self.linear_attn(
+                    hidden_states,
+                    forward_batch,
+                )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        with nvtx.annotate("prepare_mlp", color="orange"):
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -647,23 +714,28 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        with nvtx.annotate(
+            f"mlp,{use_reduce_scatter=},{should_allreduce_fusion=}", color="yellow"
+        ):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
+
+        with nvtx.annotate("postprocess_layer", color="grey"):
+            if should_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
+            else:
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 
@@ -847,6 +919,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return q, k
 
     def forward_prepare_native(self, positions, hidden_states):
+        if isinstance(hidden_states, tuple):
+            assert len(hidden_states) == 3, "quantized output should have 3 members"
+            hidden_states_unquantized = hidden_states[0]
+            hidden_states = hidden_states[1:3]
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -911,6 +987,31 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
+            o_proj_quant_method = getattr(self.o_proj, "quant_method", None)
+            o_proj_backend = getattr(o_proj_quant_method, "w8a8_block_fp8_linear", None)
+            use_fused_sigmoid_mul_fp8_group_quant = (
+                _is_cuda
+                and o_proj_quant_method is not None
+                and getattr(o_proj_quant_method, "block_quant", False)
+                and not getattr(o_proj_quant_method, "use_mxfp8", False)
+                and o_proj_backend is not None
+                and attn_output.ndim == 2
+                and gate.ndim == 2
+            )
+
+            if use_fused_sigmoid_mul_fp8_group_quant:
+                group_size = o_proj_quant_method.quant_config.weight_block_size[1]
+                q_input, x_scale = sglang_fused_sigmoid_mul_fp8_group_quant(
+                    x=attn_output,
+                    gate=gate,
+                    group_size=group_size,
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                )
+                output, _ = self.o_proj((q_input, x_scale))
+                return output
+
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
@@ -926,26 +1027,43 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
+        qkv_weight = getattr(self.qkv_proj, "weight", None)
+        if qkv_weight is None:
+            qkv_weight = getattr(self.qkv_proj, "weight_packed", None)
+        quant_format = (
+            "fp8"
+            if (
+                _is_cuda
+                and qkv_weight is not None
+                and qkv_weight.dtype == getattr(torch, "float8_e4m3fn", None)
             )
+            else ""
         )
+
+        with nvtx.annotate("prepare_attn", color="blue"):
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                    quant_format=quant_format,
+                )
+            )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            with nvtx.annotate("self_attention", color="green"):
+                hidden_states = self.self_attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        with nvtx.annotate("prepare_mlp", color="orange"):
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -955,23 +1073,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        with nvtx.annotate(
+            f"mlp,{use_reduce_scatter=},{should_allreduce_fusion=}", color="yellow"
+        ):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
+        with nvtx.annotate("postprocess_layer", color="grey"):
+            if should_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
+            else:
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 
@@ -1154,17 +1276,18 @@ class Qwen3_5ForCausalLM(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
-                )
+                with nvtx.annotate(f"layers {layer_idx}", color="red"):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
 
             # Process deepstack embeddings if provided
             if (
